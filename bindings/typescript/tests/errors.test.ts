@@ -15,10 +15,10 @@ import {
   IdentityError,
   McpError,
   mapBridgeError,
+  OutletError,
   PermissionError,
   ScpError,
   StorageError,
-  ToolError,
   TransportError,
   UcanPermissionError,
   ValidationError,
@@ -77,11 +77,11 @@ describe("ScpError hierarchy", () => {
     expect(err.name).toBe("TransportError");
   });
 
-  it("ToolError extends ScpError", () => {
-    const err = new ToolError("tool failed", "SCP-TOOL-6001");
+  it("OutletError extends ScpError", () => {
+    const err = new OutletError("tool failed", "SCP-TOOL-6001");
     expect(err).toBeInstanceOf(ScpError);
-    expect(err).toBeInstanceOf(ToolError);
-    expect(err.name).toBe("ToolError");
+    expect(err).toBeInstanceOf(OutletError);
+    expect(err.name).toBe("OutletError");
   });
 
   it("ValidationError extends ScpError", () => {
@@ -188,9 +188,9 @@ describe("mapBridgeError", () => {
     expect(err.code).toBe("SCP-TRANS-5001");
   });
 
-  it("maps tool error codes to ToolError", () => {
+  it("maps tool error codes to OutletError", () => {
     const err = mapBridgeError(new Error("[SCP-TOOL-6001] tool error: failed"));
-    expect(err).toBeInstanceOf(ToolError);
+    expect(err).toBeInstanceOf(OutletError);
     expect(err.code).toBe("SCP-TOOL-6001");
   });
 

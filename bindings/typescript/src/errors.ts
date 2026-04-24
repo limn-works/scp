@@ -107,11 +107,31 @@ export class TransportError extends ScpError {
   }
 }
 
-/** Tool registration, invocation, verification failures. */
-export class ToolError extends ScpError {
+/** Outlet registration, invocation, verification failures.
+ *
+ * Error-code prefix remains `SCP-TOOL-*` (§9.18 — registered namespace);
+ * only the class vocabulary is outlet-renamed.
+ */
+export class OutletError extends ScpError {
   constructor(message: string, code: string) {
     super(message, code);
-    this.name = "ToolError";
+    this.name = "OutletError";
+  }
+}
+
+/** Referenced outlet does not exist in the context's registry. */
+export class OutletNotFoundError extends OutletError {
+  constructor(message: string, code = "SCP-TOOL-6100") {
+    super(message, code);
+    this.name = "OutletNotFoundError";
+  }
+}
+
+/** Outlet invocation failed during execution. */
+export class OutletExecutionError extends OutletError {
+  constructor(message: string, code = "SCP-TOOL-6200") {
+    super(message, code);
+    this.name = "OutletExecutionError";
   }
 }
 
@@ -222,7 +242,7 @@ const ERROR_PREFIX_MAP: ReadonlyArray<readonly [string, ScpErrorConstructor]> = 
   ["SCP-PERM-", UcanPermissionError],
   ["SCP-CRYPTO-", CryptoError],
   ["SCP-TRANS-", TransportError],
-  ["SCP-TOOL-", ToolError],
+  ["SCP-TOOL-", OutletError],
   ["SCP-VALID-", ValidationError],
   ["SCP-STORAGE-", StorageError],
   ["SCP-ATTEST-", AttestationError],

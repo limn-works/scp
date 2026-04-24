@@ -35,8 +35,16 @@ export declare class TransportError extends ScpError {
   readonly name: "TransportError";
 }
 
-export declare class ToolError extends ScpError {
-  readonly name: "ToolError";
+export declare class OutletError extends ScpError {
+  readonly name: "OutletError";
+}
+
+export declare class OutletNotFoundError extends OutletError {
+  readonly name: "OutletNotFoundError";
+}
+
+export declare class OutletExecutionError extends OutletError {
+  readonly name: "OutletExecutionError";
 }
 
 export declare class ValidationError extends ScpError {
@@ -73,14 +81,14 @@ export interface Provenance {
   readonly signature: Uint8Array;
 }
 
-export interface ToolCost {
+export interface OutletCost {
   readonly amount: number;
   readonly currency: string;
   readonly payee: string;
   readonly costFormula?: string;
 }
 
-export interface ToolDefinition {
+export interface OutletDefinition {
   readonly name: string;
   readonly description: string;
   readonly inputSchema: Record<string, unknown>;
@@ -88,7 +96,7 @@ export interface ToolDefinition {
   readonly operator: Identity | string;
   readonly testVectors?: TestVector[];
   readonly implementationHash?: Uint8Array;
-  readonly cost?: ToolCost;
+  readonly cost?: OutletCost;
 }
 
 export interface TestVector {
@@ -97,14 +105,184 @@ export interface TestVector {
   readonly description: string;
 }
 
-export interface ToolResult {
+export interface OutletResult {
   readonly output: Record<string, unknown>;
   readonly provenance: Provenance;
 }
 
+export type SessionId = string & { readonly __brand: "SessionId" };
+export type OutletId = string & { readonly __brand: "OutletId" };
+export type DID = string & { readonly __brand: "DID" };
+
+export interface InvocationCaveats {
+  readonly amountMaxPerCall?: number;
+  readonly amountMaxCumulative?: number;
+  readonly validFrom?: number;
+  readonly validUntil?: number;
+  readonly hoursOfDay?: number;
+  readonly daysOfWeek?: number;
+  readonly maxCalls?: number;
+  readonly rateWindow?: number;
+  readonly inputSchema?: Readonly<Record<string, unknown>>;
+  readonly allowedAdapters?: readonly string[];
+  readonly allowedTargetDids?: readonly string[];
+  readonly originKind?: "Query" | "Action";
+}
+
+export interface InvokeCrossContextOptions {
+  readonly target: string;
+  readonly outletId: string;
+  readonly input: Readonly<Record<string, unknown>>;
+  readonly ucan: string;
+  readonly chainDepth?: number;
+  readonly proofTokens?: readonly string[];
+}
+
+export interface OutletStreamChunk {
+  readonly requestId: Uint8Array;
+  readonly sequence: number;
+  readonly payloadType: "data" | "progress" | "end" | "error";
+  readonly value?: unknown;
+  readonly pct?: number;
+  readonly note?: string;
+  readonly aggregate?: unknown;
+  readonly provenance?: Readonly<Record<string, unknown>>;
+  readonly executionTimeMs?: number;
+  readonly code?: string;
+  readonly message?: string;
+  readonly terminal?: boolean;
+}
+
+export interface Aggregate {
+  readonly value: unknown;
+  readonly provenance?: Readonly<Record<string, unknown>>;
+  readonly executionTimeMs?: number;
+}
+
+export declare class InvocationHandle
+  implements PromiseLike<Aggregate>, AsyncIterable<OutletStreamChunk>
+{
+  then<TResult1 = Aggregate, TResult2 = never>(
+    onfulfilled?: ((value: Aggregate) => TResult1 | PromiseLike<TResult1>) | null,
+    onrejected?: ((reason: unknown) => TResult2 | PromiseLike<TResult2>) | null,
+  ): PromiseLike<TResult1 | TResult2>;
+  [Symbol.asyncIterator](): AsyncIterator<OutletStreamChunk>;
+}
+
+export declare class OutletNamespace {
+  readonly sessions: OutletSessionsNamespace;
+  readonly offers: OutletOffersNamespace;
+  register(definition: OutletDefinition): Promise<string>;
+  invoke(
+    outletId: string,
+    input: Readonly<Record<string, unknown>>,
+    options?: {
+      ucanToken?: string;
+      invokerDid?: string;
+      proofTokens?: readonly string[];
+      spendingUcan?: string;
+    },
+  ): InvocationHandle;
+  update(outletId: string, definition: OutletDefinition, updaterDid?: string): Promise<string>;
+  get(outletId: string): Promise<Readonly<Record<string, unknown>>>;
+  list(): Promise<readonly string[]>;
+  verify(outletId: string): Promise<{
+    outletId: string;
+    passed: boolean;
+    failures: readonly string[];
+  }>;
+  deregister(outletId: string, actorDid?: string): Promise<void>;
+  invokeCrossContext(options: InvokeCrossContextOptions): Promise<{
+    output: Record<string, unknown>;
+    sourceContextId: string;
+    targetContextId: string;
+    invokerDid: string;
+    chainDepth: number;
+    timestamp: number;
+  }>;
+}
+
+export declare class OutletSessionsNamespace {
+  open(outletId: string, sourceContextId: string, ttlSeconds?: number): Promise<SessionId>;
+  invoke(
+    sessionId: SessionId,
+    input: Readonly<Record<string, unknown>>,
+    invokerDid: string,
+    ucanToken: string,
+    proofTokens?: readonly string[],
+  ): Promise<{
+    output: Record<string, unknown>;
+    sessionId: SessionId;
+    contextId: string;
+    invokerDid: string;
+    timestamp: number;
+  }>;
+  close(sessionId: SessionId): Promise<void>;
+}
+
+export declare class OutletOffersNamespace {
+  propose(
+    outletId: string,
+    targetContextId: string,
+    rateLimitJson?: string,
+  ): Promise<Readonly<Record<string, unknown>>>;
+  accept(interfaceJson: string): Promise<Readonly<Record<string, unknown>>>;
+  revoke(interfaceIdHex: string): Promise<Readonly<Record<string, unknown>>>;
+  list(): Promise<ReadonlyArray<Readonly<Record<string, unknown>>>>;
+}
+
+export declare function newSessionId(): SessionId;
+export declare function sessionId(raw: string): SessionId;
+export declare function validateSessionId(raw: string, nowMs?: number): asserts raw is SessionId;
+
+export declare class CaveatBuilder {
+  spendingCap(args: { perCall?: number; cumulative?: number }): this;
+  timeBounded(args: {
+    validFrom?: number;
+    validUntil?: number;
+    hoursOfDay?: number;
+    daysOfWeek?: number;
+  }): this;
+  rateLimited(args: { maxCalls?: number; rateWindow?: number }): this;
+  forTarget(args: {
+    allowedTargetDids?: readonly string[];
+    allowedAdapters?: readonly string[];
+  }): this;
+  inputSchema(schema: Readonly<Record<string, unknown>>): this;
+  originKind(kind: "Query" | "Action"): this;
+  build(): InvocationCaveats;
+}
+
+export declare const caveats: {
+  spendingCap: (args: { perCall?: number; cumulative?: number }) => CaveatBuilder;
+  timeBounded: (args: {
+    validFrom?: number;
+    validUntil?: number;
+    hoursOfDay?: number;
+    daysOfWeek?: number;
+  }) => CaveatBuilder;
+  rateLimited: (args: { maxCalls?: number; rateWindow?: number }) => CaveatBuilder;
+  forTarget: (args: {
+    allowedTargetDids?: readonly string[];
+    allowedAdapters?: readonly string[];
+  }) => CaveatBuilder;
+  builder: () => CaveatBuilder;
+};
+
+export declare function defineOutletDefinition(params: {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: Readonly<Record<string, unknown>>;
+  readonly outputSchema: Readonly<Record<string, unknown>>;
+  readonly operator: string;
+  readonly testVectors?: readonly TestVector[];
+  readonly implementationHash?: Uint8Array;
+  readonly cost?: OutletCost;
+}): OutletDefinition;
+
 export interface ContextParams {
   readonly ceiling: string[];
-  readonly tools?: ToolDefinition[];
+  readonly tools?: OutletDefinition[];
   readonly roles?: Record<string, string[]>;
   readonly ttl?: number;
   readonly memoryScope?: "ephemeral" | "summary" | "full";
@@ -205,7 +383,8 @@ export declare class Context {
     input: Record<string, unknown>,
     identity: Identity,
     ucanToken: string,
-  ): Promise<ToolResult>;
+  ): Promise<OutletResult>;
+  readonly outlets: OutletNamespace;
   leave(): Promise<void>;
   close(): Promise<void>;
 }
@@ -280,7 +459,7 @@ export declare function connectMcpStdio(
 
 export declare class McpClient {
   static connect(url: string): Promise<McpClient>;
-  listTools(): Promise<ToolDefinition[]>;
+  listTools(): Promise<OutletDefinition[]>;
   callTool(name: string, input: Record<string, unknown>): Promise<Record<string, unknown>>;
   close(): Promise<void>;
 }

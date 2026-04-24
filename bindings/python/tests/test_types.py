@@ -3,7 +3,7 @@
 Covers:
 - Exception hierarchy (ScpError and all subclasses)
 - Message and Provenance dataclasses
-- ToolDefinition and TestVector dataclasses
+- OutletDefinition and TestVector dataclasses (outlet module)
 - Enums (MemoryScope, SourceType, DiscoveryMethod, ProvenanceQuality, Capability)
 - Bridge error mapping
 
@@ -18,13 +18,13 @@ from scp_sdk.errors import (
     ContextError,
     CryptoError,
     IdentityError,
+    OutletError,
     ScpError,
-    ToolError,
     TransportError,
     UcanPermissionError,
     ValidationError,
 )
-from scp_sdk.tools import TestVector, ToolDefinition
+from scp_sdk.outlets import OutletDefinition, TestVector
 from scp_sdk.types import (
     Capability,
     CeilingPolicy,
@@ -127,12 +127,12 @@ class TestExceptionSubclasses:
     def test_transport_error_default_code(self) -> None:
         assert TransportError("x").code == "SCP-TRANS-5000"
 
-    def test_tool_error_is_scp_error(self) -> None:
-        err = ToolError("tool not found")
+    def test_outlet_error_is_scp_error(self) -> None:
+        err = OutletError("outlet not found")
         assert isinstance(err, ScpError)
 
-    def test_tool_error_default_code(self) -> None:
-        assert ToolError("x").code == "SCP-TOOL-6000"
+    def test_outlet_error_default_code(self) -> None:
+        assert OutletError("x").code == "SCP-TOOL-6000"
 
     def test_validation_error_is_scp_error(self) -> None:
         err = ValidationError("schema mismatch")
@@ -148,7 +148,7 @@ class TestExceptionSubclasses:
             UcanPermissionError,
             CryptoError,
             TransportError,
-            ToolError,
+            OutletError,
             ValidationError,
         ]
         for cls in subclasses:
@@ -169,6 +169,7 @@ class TestBridgeErrorMap:
             "CryptoError",
             "TransportError",
             "ToolError",
+            "OutletError",
             "ValidationError",
         }
         assert set(BRIDGE_ERROR_MAP.keys()) == expected_keys
@@ -288,7 +289,7 @@ class TestProvenance:
 
 
 # -----------------------------------------------------------------------
-# ToolDefinition and TestVector dataclass tests
+# OutletDefinition and TestVector dataclass tests
 # -----------------------------------------------------------------------
 
 
@@ -310,11 +311,11 @@ class TestTestVector:
         assert tv.description == ""
 
 
-class TestToolDefinition:
-    """Tests for the ToolDefinition dataclass."""
+class TestOutletDefinition:
+    """Tests for the OutletDefinition dataclass."""
 
     def test_tool_definition_required_fields(self) -> None:
-        tool = ToolDefinition(
+        tool = OutletDefinition(
             name="recipe_search",
             description="Search recipes by ingredients",
             input_schema={"type": "object"},
@@ -334,7 +335,7 @@ class TestToolDefinition:
             input={"query": "cake"},
             expected_output={"results": ["chocolate cake"]},
         )
-        tool = ToolDefinition(
+        tool = OutletDefinition(
             name="recipe_search",
             description="Search recipes",
             input_schema={},
@@ -347,7 +348,7 @@ class TestToolDefinition:
         assert tool.test_vectors[0].input == {"query": "cake"}
 
     def test_tool_definition_with_implementation_hash(self) -> None:
-        tool = ToolDefinition(
+        tool = OutletDefinition(
             name="hasher",
             description="Hash tool",
             input_schema={},
@@ -358,7 +359,7 @@ class TestToolDefinition:
         assert tool.implementation_hash == b"\xde\xad\xbe\xef"
 
     def test_tool_definition_operator_can_be_string(self) -> None:
-        tool = ToolDefinition(
+        tool = OutletDefinition(
             name="t",
             description="d",
             input_schema={},
@@ -511,7 +512,7 @@ class TestPackageReExports:
         assert scp_sdk.UcanPermissionError is UcanPermissionError
         assert scp_sdk.CryptoError is CryptoError
         assert scp_sdk.TransportError is TransportError
-        assert scp_sdk.ToolError is ToolError
+        assert scp_sdk.OutletError is OutletError
         assert scp_sdk.ValidationError is ValidationError
 
     def test_types_accessible_from_top_level(self) -> None:
@@ -522,7 +523,7 @@ class TestPackageReExports:
         assert scp_sdk.SourceType is SourceType
 
     def test_tools_accessible_from_top_level(self) -> None:
-        assert scp_sdk.ToolDefinition is ToolDefinition
+        assert scp_sdk.OutletDefinition is OutletDefinition
         assert scp_sdk.TestVector is TestVector
 
     def test_site_config_accessible_from_top_level(self) -> None:

@@ -565,39 +565,48 @@ export interface Capability {
 // Tools
 // ---------------------------------------------------------------------------
 
-/** Definition of a tool that can be registered in a context. */
-export interface ToolDefinition {
-  /** Human-readable tool name. */
+/** Definition of an outlet that can be registered in a context (§5.4.1). */
+export interface OutletDefinitionInternal {
+  /** Human-readable outlet name. */
   readonly name: string;
-  /** Tool description. */
+  /** Outlet description. */
   readonly description: string;
-  /** JSON Schema for tool input. */
+  /** JSON Schema for outlet input. */
   readonly inputSchema: Readonly<Record<string, unknown>>;
-  /** JSON Schema for tool output. */
+  /** JSON Schema for outlet output. */
   readonly outputSchema: Readonly<Record<string, unknown>>;
-  /** DID of the tool operator (responsible party) or Identity reference. */
+  /** DID of the outlet operator (responsible party) or Identity reference. */
   readonly operator: string;
   /** Test vectors for integrity verification. */
   readonly testVectors?: readonly TestVector[];
   /** SHA-256 hash of the implementation binary. */
   readonly implementationHash?: Uint8Array;
-  /** Optional per-invocation cost metadata (spec section 5.4.1). */
-  readonly cost?: ToolCost;
+  /** Optional per-invocation cost metadata (§5.4.1). */
+  readonly cost?: OutletCostInternal;
 }
 
-/** Per-invocation cost metadata for a tool (spec section 5.4.1). */
-export interface ToolCost {
+// Internal bridge compat alias — downstream TS-internal code uses
+// `ToolDefinition` as the bridge type name. The public export is
+// `OutletDefinition` in `outlets.ts`.
+// biome-ignore lint/suspicious/noShadowRestrictedNames: internal bridge alias.
+export type ToolDefinition = OutletDefinitionInternal;
+
+/** Per-invocation cost metadata for an outlet (§5.4.1). */
+export interface OutletCostInternal {
   /** Cost per invocation in the smallest currency unit. */
   readonly amount: number;
   /** ISO 4217 or protocol-defined currency code. */
   readonly currency: string;
-  /** DID of the payment recipient. May differ from the tool operator. */
+  /** DID of the payment recipient. May differ from the outlet operator. */
   readonly payee: string;
-  /** Optional pricing formula identifier for dynamic pricing (spec section 19.4). */
+  /** Optional pricing formula identifier for dynamic pricing (§19.4). */
   readonly costFormula?: string;
 }
 
-/** A test vector for tool verification. */
+// Internal bridge compat alias.
+export type ToolCost = OutletCostInternal;
+
+/** A test vector for outlet verification (§5.4.1). */
 export interface TestVector {
   /** Test input as a JSON object. */
   readonly input: Readonly<Record<string, unknown>>;
@@ -608,12 +617,12 @@ export interface TestVector {
 }
 
 // ---------------------------------------------------------------------------
-// Tool invocation
+// Outlet invocation
 // ---------------------------------------------------------------------------
 
-/** Result of verifying a tool against its test vectors. */
-export interface ToolVerificationResult {
-  /** The verified tool's ID. */
+/** Result of verifying an outlet against its test vectors. */
+export interface OutletVerificationResultInternal {
+  /** The verified outlet's ID. */
   readonly toolId: string;
   /** `true` if all test vectors passed. */
   readonly passed: boolean;
@@ -621,25 +630,36 @@ export interface ToolVerificationResult {
   readonly failures: readonly string[];
 }
 
-/** Result of creating a stateful tool session (spec section 6.2.1). */
-export interface ToolSessionResult {
-  /** The unique session ID (UUID). */
+// Internal bridge compat alias — the Rust NAPI/UniFFI binding emits a
+// field named `toolId` for cross-bridge historical reasons; the SDK
+// surface exposes `outletId` via `OutletNamespace.verify`.
+export type ToolVerificationResult = OutletVerificationResultInternal;
+
+/** Result of creating a stateful outlet session (§6.2.1). */
+export interface OutletSessionOpenResult {
+  /** The unique session ID (UUIDv7 per §6.2.1.1). */
   readonly sessionId: string;
 }
 
-/** Result of invoking a tool within a stateful session, with provenance metadata (spec section 6.2.1). */
-export interface ToolSessionInvokeResult {
-  /** The serialized output from the tool invocation (JSON string). */
+// Internal bridge compat alias.
+export type ToolSessionResult = OutletSessionOpenResult;
+
+/** Result of invoking an outlet within a stateful session (§6.2.1). */
+export interface OutletSessionInvokeResult {
+  /** The serialized output from the outlet invocation (JSON string). */
   readonly output: string;
   /** The session ID this invocation was executed within. */
   readonly sessionId: string;
-  /** The context ID in which the tool was invoked. */
+  /** The context ID in which the outlet was invoked. */
   readonly contextId: string;
   /** The DID of the invoker. */
   readonly invokerDid: string;
   /** Unix timestamp (milliseconds since epoch) of the invocation. */
   readonly timestamp: number;
 }
+
+// Internal bridge compat alias.
+export type ToolSessionInvokeResult = OutletSessionInvokeResult;
 
 /** Result of a cross-context tool invocation (spec section 6.2). */
 export interface CrossContextInvocationResult {

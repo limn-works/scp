@@ -15,7 +15,7 @@ import type { BridgeMode, ShadowStatus } from "../bridge";
 import {
   EconomicPolicyUnsupportedOnWasm,
   IdentityError,
-  ToolError,
+  OutletError,
   TransportError,
   WasmCannotValidateSpendingUcan,
 } from "../errors";
@@ -1238,7 +1238,7 @@ export function createWasmBridge(): Bridge {
       // silently dropping it — paid tool invocations require the
       // native (NAPI) bridge until the WASM economy path lands.
       if (spendingUcan !== undefined && spendingUcan !== null) {
-        throw new ToolError(
+        throw new OutletError(
           "spendingUcan is not supported by the WASM bridge — paid tool " +
             "invocations require the native (NAPI) bridge or the Python / " +
             "Swift / Kotlin SDKs (ADR-034). See issue #1606.",
@@ -1297,7 +1297,7 @@ export function createWasmBridge(): Bridge {
       _chainDepth: number,
       _proofTokens?: readonly string[],
     ): Promise<string> {
-      throw new ToolError(
+      throw new OutletError(
         "toolInvokeCrossContext is not available in the WASM bridge (ADR-034). " +
           "Use the native (NAPI) bridge for cross-context tool invocation.",
         "SCP-TOOL-6040",
@@ -1311,7 +1311,7 @@ export function createWasmBridge(): Bridge {
       _sourceContextId: string,
       _ttlSeconds?: number,
     ): Promise<string> {
-      throw new ToolError(
+      throw new OutletError(
         "toolSessionCreate is not available in the WASM bridge (ADR-034). " +
           "Use the native (NAPI) bridge for stateful tool sessions.",
         "SCP-TOOL-6040",
@@ -1326,7 +1326,7 @@ export function createWasmBridge(): Bridge {
       _ucanToken: string,
       _proofTokens?: readonly string[],
     ): Promise<string> {
-      throw new ToolError(
+      throw new OutletError(
         "toolSessionInvoke is not available in the WASM bridge (ADR-034). " +
           "Use the native (NAPI) bridge for stateful tool sessions.",
         "SCP-TOOL-6040",
@@ -1334,7 +1334,7 @@ export function createWasmBridge(): Bridge {
     },
 
     async toolSessionClose(_handle: BridgeContextHandle, _sessionId: string): Promise<void> {
-      throw new ToolError(
+      throw new OutletError(
         "toolSessionClose is not available in the WASM bridge (ADR-034). " +
           "Use the native (NAPI) bridge for stateful tool sessions.",
         "SCP-TOOL-6040",

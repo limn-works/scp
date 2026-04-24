@@ -5,10 +5,6 @@ corresponds to a specific error domain and carries a human-readable
 ``message`` and a machine-readable ``code`` following the format
 ``SCP-{CATEGORY}-{NUMBER}`` (see ``.docs/standards/sdk-common.md``).
 
-The hierarchy wraps bridge-level ``ScpPyError`` variants from the
-``_scp_core`` PyO3 extension when available, adding Pythonic ergonomics
-and additional context.
-
 Exception hierarchy::
 
     ScpError (root)
@@ -17,11 +13,18 @@ Exception hierarchy::
     +-- UcanPermissionError   -- UCAN capability validation
     +-- CryptoError           -- Encryption, decryption, signature
     +-- TransportError        -- Network, relay, connection
-    +-- ToolError             -- Tool registration, invocation, verification
+    +-- OutletError           -- Outlet registration, invocation, verification
+    |   +-- OutletNotFoundError
+    |   +-- OutletExecutionError
     +-- ValidationError       -- Input validation, schema, parameters
 
 Note: The permission error is named ``UcanPermissionError`` to avoid
 shadowing Python's built-in ``PermissionError``.
+
+The error-code prefix ``SCP-TOOL-*`` is retained per §9.18 — error codes
+are a registered namespace and renames would invalidate every logged
+error and every error-code assertion in downstream consumers. Only the
+class names use outlet vocabulary; the wire codes remain ``SCP-TOOL-*``.
 """
 
 from __future__ import annotations
@@ -35,7 +38,6 @@ class ScpError(Exception):
         code: Machine-readable error code (format: ``SCP-{CATEGORY}-{NUMBER}``).
     """
 
-    #: Default error code for the base class.
     _default_code: str = "SCP-UNKNOWN-0000"
 
     def __init__(self, message: str, code: str | None = None) -> None:
@@ -63,11 +65,7 @@ class ContextError(ScpError):
 
 
 class UcanPermissionError(ScpError):
-    """UCAN capability validation failure.
-
-    Named ``UcanPermissionError`` instead of ``PermissionError`` to avoid
-    shadowing Python's built-in ``PermissionError``.
-    """
+    """UCAN capability validation failure."""
 
     _default_code: str = "SCP-PERM-3000"
 
@@ -88,10 +86,27 @@ class TransportError(ScpError):
     _default_code: str = "SCP-TRANS-5000"
 
 
-class ToolError(ScpError):
-    """Tool registration, invocation, or verification failure."""
+class OutletError(ScpError):
+    """Outlet registration, invocation, or verification failure.
+
+    Error-code prefix remains ``SCP-TOOL-*`` — the wire namespace is a
+    registered identifier (§9.18) and the rename is vocabulary-only at
+    the class level.
+    """
 
     _default_code: str = "SCP-TOOL-6000"
+
+
+class OutletNotFoundError(OutletError):
+    """Referenced outlet does not exist in the context's registry."""
+
+    _default_code: str = "SCP-TOOL-6100"
+
+
+class OutletExecutionError(OutletError):
+    """Outlet invocation failed during execution."""
+
+    _default_code: str = "SCP-TOOL-6200"
 
 
 class ValidationError(ScpError):
@@ -104,16 +119,14 @@ class ValidationError(ScpError):
 # Mapping from bridge error variant names to SDK exceptions.
 # ---------------------------------------------------------------------------
 
-#: Maps ``ScpPyError`` variant names (from ``_scp_core``) to SDK exception
-#: classes.  Used by bridge integration code to translate Rust-side errors
-#: into the correct Python exception.
 BRIDGE_ERROR_MAP: dict[str, type[ScpError]] = {
     "IdentityError": IdentityError,
     "ContextError": ContextError,
     "UcanError": UcanPermissionError,
     "CryptoError": CryptoError,
     "TransportError": TransportError,
-    "ToolError": ToolError,
+    "ToolError": OutletError,
+    "OutletError": OutletError,
     "ValidationError": ValidationError,
 }
 
@@ -123,8 +136,10 @@ __all__ = [
     "ContextError",
     "CryptoError",
     "IdentityError",
+    "OutletError",
+    "OutletExecutionError",
+    "OutletNotFoundError",
     "ScpError",
-    "ToolError",
     "TransportError",
     "UcanPermissionError",
     "ValidationError",

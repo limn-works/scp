@@ -7,7 +7,7 @@ and shared enums for building agents and applications on top of SCP.
 Usage::
 
     import scp_sdk
-    from scp_sdk import Identity, Context, ToolDefinition, evaluate_trust
+    from scp_sdk import Identity, Context, OutletDefinition, evaluate_trust
 
     # Or via namespace alias:
     import scp_sdk as scp
@@ -31,6 +31,7 @@ try:
 except ImportError:
     pass  # Native extension not available (pure-Python / mocked tests)
 
+from scp_sdk import caveats
 from scp_sdk.auth import (
     ScpIdAuthentication,
     ScpIdChallenge,
@@ -78,8 +79,10 @@ from scp_sdk.errors import (
     ContextError,
     CryptoError,
     IdentityError,
+    OutletError,
+    OutletExecutionError,
+    OutletNotFoundError,
     ScpError,
-    ToolError,
     TransportError,
     UcanPermissionError,
     ValidationError,
@@ -154,6 +157,21 @@ from scp_sdk.media import (
 from scp_sdk.media import (
     verify_sender_attribution as media_verify_sender_attribution,
 )
+from scp_sdk.outlets import (
+    Aggregate,
+    InvocationCaveats,
+    InvocationHandle,
+    InvokeCrossContextOptions,
+    OutletCost,
+    OutletDefinition,
+    OutletNamespace,
+    OutletOffersNamespace,
+    OutletSessionsNamespace,
+    OutletStreamChunk,
+    SessionId,
+    TestVector,
+    new_session_id,
+)
 from scp_sdk.provenance import (
     attach as provenance_attach,
 )
@@ -164,18 +182,6 @@ from scp_sdk.provenance import (
 from scp_sdk.scp import SCP
 from scp_sdk.server import Node, Relay
 from scp_sdk.sync import classify_offline, get_policy, run_sync
-from scp_sdk.tools import (
-    TestVector,
-    ToolCost,
-    ToolDefinition,
-    interface_accept,
-    interface_expose,
-    interface_revoke,
-    invoke_cross_context,
-    session_close,
-    session_create,
-    session_invoke,
-)
 from scp_sdk.transport import TransportConfig, TransportStatus, connect_relay, relay_status
 from scp_sdk.trust import (
     PARTICIPATION_FACT_VARIANTS,
@@ -219,6 +225,7 @@ __all__ = [
     "PARTICIPATION_FACT_VARIANTS",
     "PARTICIPATION_THRESHOLD_OPERATORS",
     "SCP",
+    "Aggregate",
     "AssetEntry",
     "Attestation",
     "BatchPublishResult",
@@ -243,6 +250,9 @@ __all__ = [
     "Identity",
     "IdentityAttestation",
     "IdentityError",
+    "InvocationCaveats",
+    "InvocationHandle",
+    "InvokeCrossContextOptions",
     "McpClient",
     "McpProvenance",
     "McpServer",
@@ -253,6 +263,15 @@ __all__ = [
     "MemoryScope",
     "Message",
     "Node",
+    "OutletCost",
+    "OutletDefinition",
+    "OutletError",
+    "OutletExecutionError",
+    "OutletNamespace",
+    "OutletNotFoundError",
+    "OutletOffersNamespace",
+    "OutletSessionsNamespace",
+    "OutletStreamChunk",
     "ParticipationFact",
     "ParticipationProfile",
     "ParticipationThreshold",
@@ -268,13 +287,11 @@ __all__ = [
     "ScpIdAuthentication",
     "ScpIdChallenge",
     "ScpIdResponse",
+    "SessionId",
     "ShadowStatus",
     "SiteConfig",
     "SourceType",
     "TestVector",
-    "ToolCost",
-    "ToolDefinition",
-    "ToolError",
     "TransportConfig",
     "TransportError",
     "TransportStatus",
@@ -296,6 +313,7 @@ __all__ = [
     "budget_grant",
     "budget_record_spend",
     "budget_remaining",
+    "caveats",
     "check_chain_depth",
     "check_media_capability",
     "check_policy_lock",
@@ -318,10 +336,6 @@ __all__ = [
     "get_policy",
     "get_stdio_allowlist",
     "handle_ttl_expiry",
-    "interface_accept",
-    "interface_expose",
-    "interface_revoke",
-    "invoke_cross_context",
     "list_governance_proposals",
     "media_activate_session",
     "media_create_answer",
@@ -334,6 +348,7 @@ __all__ = [
     "media_send_signaling",
     "media_verify_sender_attribution",
     "mint",
+    "new_session_id",
     "normalize_address",
     "parse_address",
     "policy_requires_payment",
@@ -356,9 +371,6 @@ __all__ = [
     "scpid_sign",
     "scpid_verify",
     "serve_mcp",
-    "session_close",
-    "session_create",
-    "session_invoke",
     "suspend",
     "validate",
     "validate_admission",

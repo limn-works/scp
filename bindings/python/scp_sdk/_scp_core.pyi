@@ -254,34 +254,23 @@ class PyMessageReceiver:
     def __anext__(self) -> Future[PyMessage | None]: ...
 
 # ---------------------------------------------------------------------------
-# Tool types (crates/scp-ffi/src/tools.rs)
+# Outlet types (crates/scp-ffi/src/outlets.rs)
 # ---------------------------------------------------------------------------
 
-class ToolRegistration:
-    """Tool registration data.
-
-    Contains the metadata needed to register a tool in an SCP context:
-    name, description, JSON Schema, and test vectors.
-    """
+class OutletRegistration:
+    """Outlet registration data (§5.4.1)."""
 
     name: str
     description: str
     schema: Any
     test_vectors: list[Any]
 
-    def __init__(
-        self,
-        name: str,
-        description: str,
-        schema: Any,
-        test_vectors: list[Any],
-    ) -> None: ...
     def __repr__(self) -> str: ...
 
-class ToolVerificationResult:
-    """Result of verifying a tool against its test vectors."""
+class OutletVerificationResult:
+    """Result of verifying an outlet against its registered test vectors."""
 
-    tool_id: str
+    outlet_id: str
     passed: bool
     failures: list[str]
 
@@ -601,169 +590,57 @@ def py_context_receive(handle: PyContextHandle) -> PyMessageReceiver:
     ...
 
 # ---------------------------------------------------------------------------
-# Tool bridge functions (crates/scp-ffi/src/tools.rs)
+# Outlet bridge functions (crates/scp-ffi/src/outlets.rs)
+#
+# Python-facing names use the ``context_outlet_*`` convention, matching the
+# ``#[pyo3(name = "context_outlet_*")]`` attributes on the Rust side.
+# Error codes remain ``SCP-TOOL-*`` (registered namespace per §9.18) — only
+# the function/class vocabulary is renamed.
 # ---------------------------------------------------------------------------
 
-def tool_register(context_id: str, registration: dict[str, Any]) -> str:
-    """Register a tool in an SCP context.
-
-    Args:
-        context_id: The ID of the context to register the tool in.
-        registration: A dict containing tool registration data (``name``,
-            ``description``, ``schema``, ``test_vectors``, ``operator_did``,
-            and optional ``cost`` dict with ``amount`` (int), ``currency``
-            (str), ``payee`` (str DID), and optional ``cost_formula`` (str)).
-
-    Returns:
-        The tool ID (string) assigned to the registered tool.
-
-    Raises:
-        ContextError: If registration fails.
-    """
+def context_outlet_register(context_id: str, registration: dict[str, Any]) -> str:
+    """Register an outlet in an SCP context. Returns the outlet id."""
     ...
 
-def tool_invoke(
+def context_outlet_invoke(
     context_id: str,
-    tool_id: str,
+    outlet_id: str,
     input: dict[str, Any],
     identity_did: str,
-    ucan_token: str,
+    ucan_token: str | None = None,
     proof_tokens: list[str] | None = None,
     spending_ucan: str | None = None,
 ) -> Any:
-    """Invoke a tool within an SCP context.
-
-    Validates the UCAN token for tool invocation authorization before
-    dispatching. The UCAN must contain a ``tool_invoke:{tool_id}`` or
-    ``tool_invoke:*`` capability scoped to the context. Tool invocation
-    flows through the runtime's full economy pipeline
-    (``ContextManager.invoke_tool_with_economy``): per-invocation
-    pricing, velocity tracking, escalation, budget enforcement, payment
-    escrow, and the Matrix-style hard rate limit are all enforced
-    inside the runtime.
-
-    Args:
-        context_id: The ID of the context containing the tool.
-        tool_id: The ID of the tool to invoke.
-        input: A dict of input parameters matching the tool's input schema.
-        identity_did: The DID of the invoking identity.
-        ucan_token: JWT-encoded UCAN token authorizing the invocation.
-            Must contain ``tool_invoke:{tool_id}`` or ``tool_invoke:*``
-            capability.
-        proof_tokens: Optional list of encoded parent UCAN token strings
-            for delegation chain verification.
-        spending_ucan: Optional JWT-encoded spending UCAN
-            (``SpendingCapability``). Required when the context's
-            ``EconomicPolicy`` prices this tool above zero
-            (AND-composition per spec section 19.5). May be ``None`` for
-            free tools.
-
-    Returns:
-        A dict containing the tool's JSON-compatible output.
-
-    Raises:
-        UcanError: If the UCAN token is invalid, expired, revoked, or
-            lacks the required tool invocation capability.
-        ContextError: If the context is not connected, the tool is not
-            found, or input/output validation fails. Carries embedded
-            ``SCP-ECON-12010`` (budget exceeded), ``SCP-ECON-12061``
-            (invalid spending UCAN), or ``SCP-ECON-12090`` (rate limit
-            exceeded) codes for paid-action failures.
-    """
+    """Invoke an outlet within an SCP context (§5.4, §19.5)."""
     ...
 
-def tool_verify(context_id: str, tool_id: str) -> ToolVerificationResult:
-    """Verify a tool against its registered test vectors.
-
-    Args:
-        context_id: The ID of the context containing the tool.
-        tool_id: The ID of the tool to verify.
-
-    Returns:
-        A ``ToolVerificationResult`` with the tool ID, pass/fail status,
-        and any failure messages.
-
-    Raises:
-        ContextError: If verification fails.
-    """
+def context_outlet_verify(context_id: str, outlet_id: str) -> OutletVerificationResult:
+    """Verify an outlet against its registered test vectors."""
     ...
 
-def tool_invoke_cross_context(
+def context_outlet_invoke_cross_context(
     source_context_id: str,
     target_context_id: str,
-    tool_id: str,
+    outlet_id: str,
     input: dict[str, Any],
     invoker_did: str,
     ucan_token: str,
     chain_depth: int,
     proof_tokens: list[str] | None = None,
 ) -> Any:
-    """Invoke a tool across context boundaries.
-
-    The source context initiates the call and the target context contains
-    the tool. Both contexts must have approved the interface before calls
-    are permitted. Rate limits and chain depth are enforced per spec
-    section 6.2.
-
-    Args:
-        source_context_id: The ID of the calling context.
-        target_context_id: The ID of the context containing the tool.
-        tool_id: The ID of the tool to invoke.
-        input: A dict of input parameters matching the tool's input schema.
-        invoker_did: The DID of the participant invoking the tool.
-        ucan_token: JWT-encoded UCAN token authorizing the invocation.
-            Must contain ``tool_invoke:{tool_id}`` or ``tool_invoke:*``
-            capability. Validated against the target context's ceiling.
-        chain_depth: Current cross-context chain depth (0 for first hop).
-        proof_tokens: Optional list of encoded parent UCAN token strings
-            for delegation chain verification.
-
-    Returns:
-        A dict containing the tool's JSON-compatible output.
-
-    Raises:
-        UcanError: If the UCAN token is invalid, expired, revoked, or
-            lacks the required tool invocation capability.
-        ContextError: If either context is not connected, the tool is not
-            found, chain depth is exceeded, or the interface is not
-            approved.
-    """
+    """Invoke an outlet across context boundaries (§6.2)."""
     ...
 
-def tool_session_create(
+def context_outlet_session_open(
     context_id: str,
-    tool_id: str,
+    outlet_id: str,
     source_context_id: str,
     ttl_seconds: int | None = None,
 ) -> str:
-    """Create a stateful tool session.
-
-    Sessions enable multi-turn workflows with state preservation across
-    invocations. Each session is subject to per-caller caps (default: 1000
-    concurrent sessions per caller, per spec §6.2.1 and ADR-043).
-
-    Sessions without a TTL persist for the lifetime of the context
-    (spec section 6.2.1).
-
-    Args:
-        context_id: The context containing the tool.
-        tool_id: The tool to create a session for.
-        source_context_id: The calling context (session cap tracked per
-            caller).
-        ttl_seconds: Optional time-to-live for the session, in seconds.
-            ``None`` means the session persists for the lifetime of the
-            context.
-
-    Returns:
-        The session ID (UUID string).
-
-    Raises:
-        ContextError: If the context is not connected, the tool is not
-            found, or the per-caller session cap is exceeded.
-    """
+    """Open a stateful outlet session (§6.2.1, §6.2.1.1)."""
     ...
 
-def tool_session_invoke(
+def context_outlet_session_invoke(
     context_id: str,
     session_id: str,
     input: dict[str, Any],
@@ -771,113 +648,61 @@ def tool_session_invoke(
     ucan_token: str,
     proof_tokens: list[str] | None = None,
 ) -> Any:
-    """Invoke a tool within an active session.
-
-    Each call is individually governed: the invoker must hold ``ToolInvoke``
-    capability and present a valid UCAN token. Session state is carried
-    forward across invocations.
-
-    Args:
-        context_id: The context containing the tool session.
-        session_id: The session to invoke within.
-        input: A dict of input parameters matching the tool's input schema.
-        invoker_did: The DID of the invoker (capability checked per call).
-        ucan_token: JWT-encoded UCAN token authorizing the invocation.
-            Must contain ``tool_invoke:{tool_id}`` or ``tool_invoke:*``
-            capability.
-        proof_tokens: Optional list of encoded parent UCAN token strings
-            for delegation chain verification.
-
-    Returns:
-        A dict containing the tool's JSON-compatible output.
-
-    Raises:
-        UcanError: If the UCAN token is invalid, expired, revoked, or
-            lacks the required tool invocation capability.
-        ContextError: If the session is not found, has expired, or the
-            invoker lacks capability.
-    """
+    """Invoke an outlet within an active session."""
     ...
 
-def tool_session_close(context_id: str, session_id: str) -> None:
-    """Close a stateful tool session.
-
-    Removes the session from the store, releasing the caller's session
-    slot. After closing, any further invocations with this session ID
-    will fail.
-
-    Args:
-        context_id: The context containing the tool session.
-        session_id: The session to close.
-
-    Raises:
-        ContextError: If the context is not connected or the session is
-            not found.
-    """
+def context_outlet_session_close(context_id: str, session_id: str) -> None:
+    """Close a stateful outlet session."""
     ...
 
-# ---------------------------------------------------------------------------
-# Bidirectional consent protocol (crates/scp-ffi/src/tools.rs, §6.2.0.1)
-# ---------------------------------------------------------------------------
-
-def tool_interface_expose(
+def context_outlet_update(
     context_id: str,
-    tool_id: str,
+    outlet_id: str,
+    registration: dict[str, Any],
+    updater_did: str,
+) -> str:
+    """Update an outlet registration in-place."""
+    ...
+
+def context_outlet_deregister(
+    context_id: str, outlet_id: str, actor_did: str
+) -> None:
+    """Deregister an outlet from the context."""
+    ...
+
+def context_outlet_list(context_id: str) -> list[str]:
+    """List outlet ids registered in the context."""
+    ...
+
+def context_outlet_get(context_id: str, outlet_id: str) -> str:
+    """Return the outlet registration as a JSON string."""
+    ...
+
+# ---------------------------------------------------------------------------
+# Bidirectional consent protocol (crates/scp-ffi/src/outlets.rs, §6.2.0.1)
+# ---------------------------------------------------------------------------
+
+def context_outlet_interface_offer(
+    context_id: str,
+    outlet_id: str,
     target_context_id: str,
     rate_limit_json: str | None = None,
 ) -> str:
-    """Expose a tool interface for cross-context sharing (step 1).
-
-    Args:
-        context_id: The source context ID.
-        tool_id: The ID of the tool to expose.
-        target_context_id: The target context to expose the tool to.
-        rate_limit_json: Optional per-interface rate limit as JSON.
-
-    Returns:
-        The ToolInterface as a JSON string.
-
-    Raises:
-        ToolError: If the caller is not an admin or the tool is not found.
-        ValidationError: If rate_limit_json is malformed.
-    """
+    """Offer an outlet interface to a target context (step 1)."""
     ...
 
-def tool_interface_accept(
+def context_outlet_interface_accept(
     context_id: str,
     interface_json: str,
 ) -> str:
-    """Accept a cross-context tool interface (step 4).
-
-    Args:
-        context_id: The target context ID.
-        interface_json: The ToolInterface JSON string to accept.
-
-    Returns:
-        The updated ToolInterface JSON string.
-
-    Raises:
-        ToolError: If the caller is not an admin or context mismatch.
-        ValidationError: If interface_json is malformed.
-    """
+    """Accept a cross-context outlet interface (step 4)."""
     ...
 
-def tool_interface_revoke(
+def context_outlet_interface_revoke(
     context_id: str,
     interface_id_hex: str,
 ) -> str:
-    """Revoke a cross-context tool interface (step 5).
-
-    Args:
-        context_id: The revoking context ID.
-        interface_id_hex: The 32-byte interface/offer ID as hex.
-
-    Returns:
-        The InterfaceRevoked event as a JSON string.
-
-    Raises:
-        ValidationError: If interface_id_hex is invalid.
-    """
+    """Revoke a cross-context outlet interface (step 5)."""
     ...
 
 # ---------------------------------------------------------------------------

@@ -4188,7 +4188,7 @@ public func FfiConverterTypeDataProvenance_lower(_ value: DataProvenance) -> Rus
  */
 public struct Event {
     /**
-     * The event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"ToolInvoked"`).
+     * The event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"OutletInvoked"`).
      */
     public var eventType: String
     /**
@@ -4212,7 +4212,7 @@ public struct Event {
     // declare one manually.
     public init(
         /**
-         * The event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"ToolInvoked"`).
+         * The event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"OutletInvoked"`).
          */eventType: String, 
         /**
          * DID of the actor who produced this event.
@@ -4408,7 +4408,7 @@ public struct McpInvokeResult {
      */
     public var isError: Bool
     /**
-     * Source of the result, formatted as `"mcp:{tool_name}"`.
+     * Source of the result, formatted as `"mcp:{outlet_name}"`.
      */
     public var source: String
     /**
@@ -4434,7 +4434,7 @@ public struct McpInvokeResult {
          * Whether the tool call resulted in an error.
          */isError: Bool, 
         /**
-         * Source of the result, formatted as `"mcp:{tool_name}"`.
+         * Source of the result, formatted as `"mcp:{outlet_name}"`.
          */source: String, 
         /**
          * DID of the invoking agent.
@@ -4910,6 +4910,278 @@ public func FfiConverterTypeMessage_lift(_ buf: RustBuffer) throws -> Message {
 #endif
 public func FfiConverterTypeMessage_lower(_ value: Message) -> RustBuffer {
     return FfiConverterTypeMessage.lower(value)
+}
+
+
+/**
+ * Tool definition for registration in a context.
+ *
+ * See ADR-010 (Tool Registry) and spec §5.4.1 (Tools).
+ */
+public struct OutletDefinition {
+    /**
+     * Human-readable tool name.
+     */
+    public var name: String
+    /**
+     * Tool description.
+     */
+    public var description: String
+    /**
+     * JSON Schema for tool input (as a JSON string).
+     */
+    public var inputSchemaJson: String
+    /**
+     * JSON Schema for tool output (as a JSON string).
+     */
+    public var outputSchemaJson: String
+    /**
+     * DID of the tool operator (responsible party).
+     */
+    public var operatorDid: String
+    /**
+     * Test vectors for integrity verification (serialized as JSON string).
+     */
+    public var testVectorsJson: String?
+    /**
+     * SHA-256 hash of the implementation binary (32 bytes).
+     */
+    public var implementationHash: Data?
+    /**
+     * Optional per-invocation cost metadata (spec §5.4.1).
+     */
+    public var cost: ToolCostDefinition?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Human-readable tool name.
+         */name: String, 
+        /**
+         * Tool description.
+         */description: String, 
+        /**
+         * JSON Schema for tool input (as a JSON string).
+         */inputSchemaJson: String, 
+        /**
+         * JSON Schema for tool output (as a JSON string).
+         */outputSchemaJson: String, 
+        /**
+         * DID of the tool operator (responsible party).
+         */operatorDid: String, 
+        /**
+         * Test vectors for integrity verification (serialized as JSON string).
+         */testVectorsJson: String?, 
+        /**
+         * SHA-256 hash of the implementation binary (32 bytes).
+         */implementationHash: Data?, 
+        /**
+         * Optional per-invocation cost metadata (spec §5.4.1).
+         */cost: ToolCostDefinition?) {
+        self.name = name
+        self.description = description
+        self.inputSchemaJson = inputSchemaJson
+        self.outputSchemaJson = outputSchemaJson
+        self.operatorDid = operatorDid
+        self.testVectorsJson = testVectorsJson
+        self.implementationHash = implementationHash
+        self.cost = cost
+    }
+}
+
+#if compiler(>=6)
+extension OutletDefinition: Sendable {}
+#endif
+
+
+extension OutletDefinition: Equatable, Hashable {
+    public static func ==(lhs: OutletDefinition, rhs: OutletDefinition) -> Bool {
+        if lhs.name != rhs.name {
+            return false
+        }
+        if lhs.description != rhs.description {
+            return false
+        }
+        if lhs.inputSchemaJson != rhs.inputSchemaJson {
+            return false
+        }
+        if lhs.outputSchemaJson != rhs.outputSchemaJson {
+            return false
+        }
+        if lhs.operatorDid != rhs.operatorDid {
+            return false
+        }
+        if lhs.testVectorsJson != rhs.testVectorsJson {
+            return false
+        }
+        if lhs.implementationHash != rhs.implementationHash {
+            return false
+        }
+        if lhs.cost != rhs.cost {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(name)
+        hasher.combine(description)
+        hasher.combine(inputSchemaJson)
+        hasher.combine(outputSchemaJson)
+        hasher.combine(operatorDid)
+        hasher.combine(testVectorsJson)
+        hasher.combine(implementationHash)
+        hasher.combine(cost)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletDefinition: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletDefinition {
+        return
+            try OutletDefinition(
+                name: FfiConverterString.read(from: &buf), 
+                description: FfiConverterString.read(from: &buf), 
+                inputSchemaJson: FfiConverterString.read(from: &buf), 
+                outputSchemaJson: FfiConverterString.read(from: &buf), 
+                operatorDid: FfiConverterString.read(from: &buf), 
+                testVectorsJson: FfiConverterOptionString.read(from: &buf), 
+                implementationHash: FfiConverterOptionData.read(from: &buf), 
+                cost: FfiConverterOptionTypeToolCostDefinition.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutletDefinition, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.name, into: &buf)
+        FfiConverterString.write(value.description, into: &buf)
+        FfiConverterString.write(value.inputSchemaJson, into: &buf)
+        FfiConverterString.write(value.outputSchemaJson, into: &buf)
+        FfiConverterString.write(value.operatorDid, into: &buf)
+        FfiConverterOptionString.write(value.testVectorsJson, into: &buf)
+        FfiConverterOptionData.write(value.implementationHash, into: &buf)
+        FfiConverterOptionTypeToolCostDefinition.write(value.cost, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletDefinition_lift(_ buf: RustBuffer) throws -> OutletDefinition {
+    return try FfiConverterTypeOutletDefinition.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletDefinition_lower(_ value: OutletDefinition) -> RustBuffer {
+    return FfiConverterTypeOutletDefinition.lower(value)
+}
+
+
+/**
+ * Result of verifying a tool against its test vectors.
+ *
+ * See ADR-010 (Tool Registry).
+ */
+public struct OutletVerificationResult {
+    /**
+     * The verified tool's ID.
+     */
+    public var outletId: String
+    /**
+     * `true` if all test vectors passed.
+     */
+    public var passed: Bool
+    /**
+     * Failure messages for vectors that did not pass. Empty on success.
+     */
+    public var failures: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The verified tool's ID.
+         */outletId: String, 
+        /**
+         * `true` if all test vectors passed.
+         */passed: Bool, 
+        /**
+         * Failure messages for vectors that did not pass. Empty on success.
+         */failures: [String]) {
+        self.outletId = outletId
+        self.passed = passed
+        self.failures = failures
+    }
+}
+
+#if compiler(>=6)
+extension OutletVerificationResult: Sendable {}
+#endif
+
+
+extension OutletVerificationResult: Equatable, Hashable {
+    public static func ==(lhs: OutletVerificationResult, rhs: OutletVerificationResult) -> Bool {
+        if lhs.outletId != rhs.outletId {
+            return false
+        }
+        if lhs.passed != rhs.passed {
+            return false
+        }
+        if lhs.failures != rhs.failures {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(outletId)
+        hasher.combine(passed)
+        hasher.combine(failures)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeOutletVerificationResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> OutletVerificationResult {
+        return
+            try OutletVerificationResult(
+                outletId: FfiConverterString.read(from: &buf), 
+                passed: FfiConverterBool.read(from: &buf), 
+                failures: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: OutletVerificationResult, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.outletId, into: &buf)
+        FfiConverterBool.write(value.passed, into: &buf)
+        FfiConverterSequenceString.write(value.failures, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletVerificationResult_lift(_ buf: RustBuffer) throws -> OutletVerificationResult {
+    return try FfiConverterTypeOutletVerificationResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeOutletVerificationResult_lower(_ value: OutletVerificationResult) -> RustBuffer {
+    return FfiConverterTypeOutletVerificationResult.lower(value)
 }
 
 
@@ -5674,278 +5946,6 @@ public func FfiConverterTypeToolCostDefinition_lift(_ buf: RustBuffer) throws ->
 #endif
 public func FfiConverterTypeToolCostDefinition_lower(_ value: ToolCostDefinition) -> RustBuffer {
     return FfiConverterTypeToolCostDefinition.lower(value)
-}
-
-
-/**
- * Tool definition for registration in a context.
- *
- * See ADR-010 (Tool Registry) and spec §5.4.1 (Tools).
- */
-public struct ToolDefinition {
-    /**
-     * Human-readable tool name.
-     */
-    public var name: String
-    /**
-     * Tool description.
-     */
-    public var description: String
-    /**
-     * JSON Schema for tool input (as a JSON string).
-     */
-    public var inputSchemaJson: String
-    /**
-     * JSON Schema for tool output (as a JSON string).
-     */
-    public var outputSchemaJson: String
-    /**
-     * DID of the tool operator (responsible party).
-     */
-    public var operatorDid: String
-    /**
-     * Test vectors for integrity verification (serialized as JSON string).
-     */
-    public var testVectorsJson: String?
-    /**
-     * SHA-256 hash of the implementation binary (32 bytes).
-     */
-    public var implementationHash: Data?
-    /**
-     * Optional per-invocation cost metadata (spec §5.4.1).
-     */
-    public var cost: ToolCostDefinition?
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * Human-readable tool name.
-         */name: String, 
-        /**
-         * Tool description.
-         */description: String, 
-        /**
-         * JSON Schema for tool input (as a JSON string).
-         */inputSchemaJson: String, 
-        /**
-         * JSON Schema for tool output (as a JSON string).
-         */outputSchemaJson: String, 
-        /**
-         * DID of the tool operator (responsible party).
-         */operatorDid: String, 
-        /**
-         * Test vectors for integrity verification (serialized as JSON string).
-         */testVectorsJson: String?, 
-        /**
-         * SHA-256 hash of the implementation binary (32 bytes).
-         */implementationHash: Data?, 
-        /**
-         * Optional per-invocation cost metadata (spec §5.4.1).
-         */cost: ToolCostDefinition?) {
-        self.name = name
-        self.description = description
-        self.inputSchemaJson = inputSchemaJson
-        self.outputSchemaJson = outputSchemaJson
-        self.operatorDid = operatorDid
-        self.testVectorsJson = testVectorsJson
-        self.implementationHash = implementationHash
-        self.cost = cost
-    }
-}
-
-#if compiler(>=6)
-extension ToolDefinition: Sendable {}
-#endif
-
-
-extension ToolDefinition: Equatable, Hashable {
-    public static func ==(lhs: ToolDefinition, rhs: ToolDefinition) -> Bool {
-        if lhs.name != rhs.name {
-            return false
-        }
-        if lhs.description != rhs.description {
-            return false
-        }
-        if lhs.inputSchemaJson != rhs.inputSchemaJson {
-            return false
-        }
-        if lhs.outputSchemaJson != rhs.outputSchemaJson {
-            return false
-        }
-        if lhs.operatorDid != rhs.operatorDid {
-            return false
-        }
-        if lhs.testVectorsJson != rhs.testVectorsJson {
-            return false
-        }
-        if lhs.implementationHash != rhs.implementationHash {
-            return false
-        }
-        if lhs.cost != rhs.cost {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(name)
-        hasher.combine(description)
-        hasher.combine(inputSchemaJson)
-        hasher.combine(outputSchemaJson)
-        hasher.combine(operatorDid)
-        hasher.combine(testVectorsJson)
-        hasher.combine(implementationHash)
-        hasher.combine(cost)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeToolDefinition: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ToolDefinition {
-        return
-            try ToolDefinition(
-                name: FfiConverterString.read(from: &buf), 
-                description: FfiConverterString.read(from: &buf), 
-                inputSchemaJson: FfiConverterString.read(from: &buf), 
-                outputSchemaJson: FfiConverterString.read(from: &buf), 
-                operatorDid: FfiConverterString.read(from: &buf), 
-                testVectorsJson: FfiConverterOptionString.read(from: &buf), 
-                implementationHash: FfiConverterOptionData.read(from: &buf), 
-                cost: FfiConverterOptionTypeToolCostDefinition.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: ToolDefinition, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.name, into: &buf)
-        FfiConverterString.write(value.description, into: &buf)
-        FfiConverterString.write(value.inputSchemaJson, into: &buf)
-        FfiConverterString.write(value.outputSchemaJson, into: &buf)
-        FfiConverterString.write(value.operatorDid, into: &buf)
-        FfiConverterOptionString.write(value.testVectorsJson, into: &buf)
-        FfiConverterOptionData.write(value.implementationHash, into: &buf)
-        FfiConverterOptionTypeToolCostDefinition.write(value.cost, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeToolDefinition_lift(_ buf: RustBuffer) throws -> ToolDefinition {
-    return try FfiConverterTypeToolDefinition.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeToolDefinition_lower(_ value: ToolDefinition) -> RustBuffer {
-    return FfiConverterTypeToolDefinition.lower(value)
-}
-
-
-/**
- * Result of verifying a tool against its test vectors.
- *
- * See ADR-010 (Tool Registry).
- */
-public struct ToolVerificationResult {
-    /**
-     * The verified tool's ID.
-     */
-    public var toolId: String
-    /**
-     * `true` if all test vectors passed.
-     */
-    public var passed: Bool
-    /**
-     * Failure messages for vectors that did not pass. Empty on success.
-     */
-    public var failures: [String]
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * The verified tool's ID.
-         */toolId: String, 
-        /**
-         * `true` if all test vectors passed.
-         */passed: Bool, 
-        /**
-         * Failure messages for vectors that did not pass. Empty on success.
-         */failures: [String]) {
-        self.toolId = toolId
-        self.passed = passed
-        self.failures = failures
-    }
-}
-
-#if compiler(>=6)
-extension ToolVerificationResult: Sendable {}
-#endif
-
-
-extension ToolVerificationResult: Equatable, Hashable {
-    public static func ==(lhs: ToolVerificationResult, rhs: ToolVerificationResult) -> Bool {
-        if lhs.toolId != rhs.toolId {
-            return false
-        }
-        if lhs.passed != rhs.passed {
-            return false
-        }
-        if lhs.failures != rhs.failures {
-            return false
-        }
-        return true
-    }
-
-    public func hash(into hasher: inout Hasher) {
-        hasher.combine(toolId)
-        hasher.combine(passed)
-        hasher.combine(failures)
-    }
-}
-
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeToolVerificationResult: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ToolVerificationResult {
-        return
-            try ToolVerificationResult(
-                toolId: FfiConverterString.read(from: &buf), 
-                passed: FfiConverterBool.read(from: &buf), 
-                failures: FfiConverterSequenceString.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: ToolVerificationResult, into buf: inout [UInt8]) {
-        FfiConverterString.write(value.toolId, into: &buf)
-        FfiConverterBool.write(value.passed, into: &buf)
-        FfiConverterSequenceString.write(value.failures, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeToolVerificationResult_lift(_ buf: RustBuffer) throws -> ToolVerificationResult {
-    return try FfiConverterTypeToolVerificationResult.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeToolVerificationResult_lower(_ value: ToolVerificationResult) -> RustBuffer {
-    return FfiConverterTypeToolVerificationResult.lower(value)
 }
 
 
@@ -7143,7 +7143,7 @@ public enum ScpError: Swift.Error {
     case Transport(msg: String, code: String
     )
     /**
-     * A tool operation failed (registration, invocation, verification).
+     * An outlet operation failed (registration, invocation, verification).
      */
     case Tool(msg: String, code: String
     )
@@ -11292,25 +11292,6 @@ public func identityCreate(custody: String)async throws  -> Identity  {
         )
 }
 /**
- * Creates an identity link attestation for an external platform identity.
- *
- * See spec §3.5.1, §3.5.2.
- */
-public func identityCreateLinkAttestation(identity: Identity, platform: String, handle: String, proof: String, verificationMethod: String, platformId: String?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_identity_create_link_attestation(FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(platform),FfiConverterString.lower(handle),FfiConverterString.lower(proof),FfiConverterString.lower(verificationMethod),FfiConverterOptionString.lower(platformId)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
  * Creates a new SCP identity with an agent signing key.
  *
  * Same as `identity_create` but also generates an `#agent` verification
@@ -11494,22 +11475,6 @@ public func identityMigrate(identity: Identity)async throws  -> Identity  {
             liftFunc: FfiConverterTypeIdentity_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
-}
-/**
- * Removes an identity link attestation by its ID.
- *
- * Returns `true` if the attestation was found and removed, `false` if the
- * DID is not in the identity custody registry or the attestation was not found.
- *
- * See spec §3.5.1.
- */
-public func identityRemoveLinkAttestation(did: String, attestationId: String) -> Bool  {
-    return try!  FfiConverterBool.lift(try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_func_identity_remove_link_attestation(
-        FfiConverterString.lower(did),
-        FfiConverterString.lower(attestationId),$0
-    )
-})
 }
 /**
  * Resolves a DID to its document.
@@ -11721,7 +11686,7 @@ public func mcpClientDisconnect(handle: String)async throws   {
  * # Arguments
  *
  * * `handle` — The client handle returned by `mcp_client_connect_*`.
- * * `tool_name` — The name of the external tool to invoke.
+ * * `outlet_name` — The name of the external tool to invoke.
  * * `input_json` — Tool input parameters as a JSON string.
  * * `context_id` — The SCP context ID for provenance tracking.
  * * `invoker_did` — The DID of the invoking identity.
@@ -11736,11 +11701,11 @@ public func mcpClientDisconnect(handle: String)async throws   {
  * invocation fails. Returns `ScpError::Validation` if input JSON is
  * malformed.
  */
-public func mcpClientInvoke(handle: String, toolName: String, inputJson: String, contextId: String, invokerDid: String)async throws  -> McpInvokeResult  {
+public func mcpClientInvoke(handle: String, outletName: String, inputJson: String, contextId: String, invokerDid: String)async throws  -> McpInvokeResult  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_mcp_client_invoke(FfiConverterString.lower(handle),FfiConverterString.lower(toolName),FfiConverterString.lower(inputJson),FfiConverterString.lower(contextId),FfiConverterString.lower(invokerDid)
+                uniffi_scp_ffi_uniffi_fn_func_mcp_client_invoke(FfiConverterString.lower(handle),FfiConverterString.lower(outletName),FfiConverterString.lower(inputJson),FfiConverterString.lower(contextId),FfiConverterString.lower(invokerDid)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -12174,6 +12139,430 @@ public func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: Str
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
             liftFunc: FfiConverterTypeNodeHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Deregisters (removes) an outlet from the context.
+ *
+ * The caller must be either the registered operator of the outlet or an
+ * admin of the context.
+ */
+public func outletDeregister(handle: ContextHandle, outletId: String, actorDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_deregister(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(outletId),FfiConverterString.lower(actorDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Retrieves an outlet registration as a JSON string.
+ *
+ * Returns `ScpError::Tool` (`SCP-TOOL-6002`) if the outlet is not found.
+ */
+public func outletGet(handle: ContextHandle, outletId: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_get(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(outletId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Accepts a cross-context tool interface (§6.2.0.1 step 4).
+ *
+ * Sets `approved_by_target = true` on the interface. Both approvals must be
+ * `true` before calls are permitted.
+ *
+ * # Arguments
+ *
+ * * `handle` — The target context handle (the one accepting).
+ * * `interface_json` — The `OutletInterface` JSON string to accept.
+ *
+ * # Returns
+ *
+ * The updated `OutletInterface` JSON string with `approved_by_target = true`.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Tool` if the caller is not an admin or the target context
+ * does not match.
+ */
+public func outletInterfaceAccept(handle: ContextHandle, interfaceJson: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_interface_accept(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(interfaceJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
+ *
+ * The caller (admin of the source context) proposes sharing a specific tool
+ * with a target context. Returns the `OutletInterface` as a JSON string with
+ * `approved_by_source = true` and `approved_by_target = false`.
+ *
+ * # Arguments
+ *
+ * * `handle` — The source context handle.
+ * * `outlet_id` — The ID of the tool to expose.
+ * * `target_context_id` — The target context to expose the tool to.
+ * * `rate_limit_json` — Optional per-interface rate limit as a JSON string.
+ *
+ * # Returns
+ *
+ * A JSON string of the created `OutletInterface`.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Tool` if the caller is not an admin or the tool is not found.
+ */
+public func outletInterfaceOffer(handle: ContextHandle, outletId: String, targetContextId: String, rateLimitJson: String?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_interface_offer(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(outletId),FfiConverterString.lower(targetContextId),FfiConverterOptionString.lower(rateLimitJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Revokes a cross-context tool interface (§6.2.0.1 step 5).
+ *
+ * Either context may revoke unilaterally. Returns an `InterfaceRevoked` event
+ * as a JSON string.
+ *
+ * # Arguments
+ *
+ * * `handle` — The revoking context handle.
+ * * `interface_id_hex` — The 32-byte interface/offer ID as a hex string.
+ *
+ * # Returns
+ *
+ * A JSON string of the `InterfaceRevoked` event.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Validation` if `interface_id_hex` is not valid hex or
+ * not 32 bytes.
+ */
+public func outletInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_interface_revoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(interfaceIdHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Invokes a tool within an SCP context, fully wired through the
+ * `ContextManager::invoke_outlet_with_economy` pipeline.
+ *
+ * This is the SINGLE entry point for tool invocation through the
+ * `UniFFI` bridge (Swift + Kotlin). Per-invocation pricing, spending
+ * UCAN AND-composition (§19.5), per-DID velocity tracking, escalation
+ * (§19.7), budget enforcement, payment escrow, the Matrix-style hard
+ * rate limit, and `ToolEconomyTicket` rollback are all enforced inside
+ * the runtime wrapper. The `UniFFI` bridge no longer reimplements any
+ * of those concerns.
+ *
+ * # Arguments
+ *
+ * * `handle` — The context containing the tool.
+ * * `outlet_id` — The ID of the tool to invoke.
+ * * `input_json` — Tool input parameters as a JSON string.
+ * * `identity` — The identity of the invoker (used for capability checking).
+ * * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+ * Must contain `outlet_call:{outlet_id}` or `outlet_call:*` capability.
+ * The full 11-step ADR-016 validation pipeline is executed before
+ * tool dispatch. See spec §6.2, §8, ADR-016, and issue #319.
+ * * `proof_tokens` — Optional list of encoded parent UCAN tokens for
+ * delegation chain traversal (ADR-016 step 3).
+ * * `spending_ucan_jwt` — Optional JWT-encoded spending UCAN
+ * (`SpendingCapability`) for paid tool invocations. Required when an
+ * `EconomicPolicy` priced the tool above zero (§19.5
+ * AND-composition). May be `nil`/`null` for free tools.
+ *
+ * # Returns
+ *
+ * The tool output as a JSON string.
+ *
+ * # Errors
+ *
+ * - `ScpError::Tool` (tool-invocation error range) — tool not found, schema
+ * mismatch, execution failure.
+ * - `ScpError::Permission` (`SCP-PERM-3001`) — invalid, expired,
+ * revoked, or capability-deficient UCAN token.
+ * - `ScpError::Context` (`SCP-ECON-12090`) — hard rate limit exceeded.
+ * - `ScpError::Context` (`SCP-ECON-12010`) — per-DID budget exceeded.
+ * - `ScpError::Context` (`SCP-ECON-12061`) — invalid spending UCAN.
+ */
+public func outletInvoke(handle: ContextHandle, outletId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?, spendingUcanJwt: String?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_invoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(outletId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterOptionString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens),FfiConverterOptionString.lower(spendingUcanJwt)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Invokes a tool across context boundaries.
+ *
+ * Validates UCAN authorization against the target context and chain depth
+ * per spec section 6.2 (max 3 hops).
+ *
+ * # Arguments
+ *
+ * * `source_handle` — The calling context.
+ * * `target_handle` — The context containing the tool.
+ * * `outlet_id` — The tool to invoke.
+ * * `input_json` — Tool input as a JSON string.
+ * * `identity` — The invoker's identity.
+ * * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+ * Validated against the TARGET context's ceiling using the full 11-step
+ * ADR-016 pipeline.
+ * * `chain_depth` — Current chain depth (0 for first hop).
+ * * `proof_tokens` — Optional list of encoded parent UCAN tokens for
+ * delegation chain traversal.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Permission` if the UCAN token is invalid, expired,
+ * revoked, or lacks the required tool invocation capability.
+ * Returns `ScpError::Tool` if chain depth exceeded or contexts not active.
+ */
+public func outletInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, outletId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_invoke_cross_context(FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(outletId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterUInt8.lower(chainDepth),FfiConverterOptionSequenceString.lower(proofTokens)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Lists all outlet IDs registered in a context.
+ */
+public func outletList(handle: ContextHandle)async throws  -> [String]  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_list(FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Registers a tool in an SCP context.
+ *
+ * # Arguments
+ *
+ * * `handle` — The context to register the tool in.
+ * * `definition` — Tool definition including name, schema, and test vectors.
+ *
+ * # Returns
+ *
+ * The tool ID string assigned to the registered tool.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Tool` if the context is not active, registration
+ * fails (permission denied, schema invalid, duplicate name, etc.).
+ */
+public func outletRegister(handle: ContextHandle, definition: OutletDefinition)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_register(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeOutletDefinition_lower(definition)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Closes a stateful tool session.
+ *
+ * Removes the session from the store, releasing the caller's session slot.
+ */
+public func outletSessionClose(handle: ContextHandle, sessionId: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_session_close(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Invokes a tool within an active session.
+ *
+ * Each call is individually governed: the invoker must present a valid
+ * UCAN token. Session state is carried forward and the call count is
+ * incremented on success.
+ *
+ * # Arguments
+ *
+ * * `handle` — The context containing the tool session.
+ * * `session_id` — The session to invoke within.
+ * * `input_json` — Tool input parameters as a JSON string.
+ * * `identity` — The identity of the invoker.
+ * * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
+ * Validated using the full 11-step ADR-016 pipeline.
+ * * `proof_tokens` — Optional list of encoded parent UCAN tokens for
+ * delegation chain traversal.
+ *
+ * # Returns
+ *
+ * The tool output as a JSON string.
+ */
+public func outletSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_session_invoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Creates a stateful tool session.
+ *
+ * Sessions enable multi-turn workflows with TTL and per-caller caps
+ * (default: 1000 concurrent sessions per caller, per spec §6.2.1 and ADR-043).
+ *
+ * # Returns
+ *
+ * The session ID (UUID string).
+ */
+public func outletSessionOpen(handle: ContextHandle, outletId: String, sourceContextId: String, ttlSeconds: UInt64?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_session_open(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(outletId),FfiConverterString.lower(sourceContextId),FfiConverterOptionUInt64.lower(ttlSeconds)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Updates an existing outlet registration.
+ *
+ * Wraps [`scp_core::context::tools::update_outlet`]. The caller must be
+ * either the registered operator of the outlet or an admin of the context.
+ *
+ * # Arguments
+ *
+ * * `handle` — The context containing the outlet.
+ * * `outlet_id` — The ID of the outlet to update.
+ * * `definition` — The new outlet definition.
+ * * `updater_did` — The DID of the caller performing the update.
+ */
+public func outletUpdate(handle: ContextHandle, outletId: String, definition: OutletDefinition, updaterDid: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_update(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(outletId),FfiConverterTypeOutletDefinition_lower(definition),FfiConverterString.lower(updaterDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Verifies a tool against its registered test vectors.
+ *
+ * # Arguments
+ *
+ * * `handle` — The context containing the tool.
+ * * `outlet_id` — The ID of the tool to verify.
+ *
+ * # Returns
+ *
+ * A `OutletVerificationResult` with pass/fail status and failure messages.
+ *
+ * # Errors
+ *
+ * Returns `ScpError::Tool` if the tool is not found in the context.
+ */
+public func outletVerify(handle: ContextHandle, outletId: String)async throws  -> OutletVerificationResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_outlet_verify(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(outletId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeOutletVerificationResult_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -12672,34 +13061,6 @@ public func scpidChallenge(audience: String, ttlSeconds: UInt64)throws  -> Strin
 })
 }
 /**
- * Signs an SCPID challenge with the identity's key (§3.11.3).
- *
- * Selects the appropriate signing key (`#active` or `#agent`) from the
- * identity handle, and produces a signed SCPID response as a JSON string.
- *
- * # Arguments
- *
- * * `identity` — The identity handle (from `identity_create`).
- * * `signing_key_id` — `"#active"` or `"#agent"`.
- * * `challenge_json` — JSON string of the challenge (from [`scpid_challenge`]).
- *
- * # Errors
- *
- * Returns `ScpError::Validation` if `signing_key_id` is invalid or the
- * challenge JSON is malformed.
- * Returns `ScpError::Identity` if the identity has no agent key when
- * `#agent` is requested, or if signing fails.
- */
-public func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_scpid_sign(
-        FfiConverterTypeIdentity_lower(identity),
-        FfiConverterString.lower(signingKeyId),
-        FfiConverterString.lower(challengeJson),$0
-    )
-})
-}
-/**
  * Verifies a signed SCPID response against the original challenge (§3.11.4).
  *
  * Resolves the signer's DID document via the global production DID resolver
@@ -12822,347 +13183,6 @@ public func tombstoneMigratedContext(handle: ContextHandle)async throws   {
             completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
             freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
             liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Accepts a cross-context tool interface (§6.2.0.1 step 4).
- *
- * Sets `approved_by_target = true` on the interface. Both approvals must be
- * `true` before calls are permitted.
- *
- * # Arguments
- *
- * * `handle` — The target context handle (the one accepting).
- * * `interface_json` — The `ToolInterface` JSON string to accept.
- *
- * # Returns
- *
- * The updated `ToolInterface` JSON string with `approved_by_target = true`.
- *
- * # Errors
- *
- * Returns `ScpError::Tool` if the caller is not an admin or the target context
- * does not match.
- */
-public func toolInterfaceAccept(handle: ContextHandle, interfaceJson: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_interface_accept(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(interfaceJson)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
- *
- * The caller (admin of the source context) proposes sharing a specific tool
- * with a target context. Returns the `ToolInterface` as a JSON string with
- * `approved_by_source = true` and `approved_by_target = false`.
- *
- * # Arguments
- *
- * * `handle` — The source context handle.
- * * `tool_id` — The ID of the tool to expose.
- * * `target_context_id` — The target context to expose the tool to.
- * * `rate_limit_json` — Optional per-interface rate limit as a JSON string.
- *
- * # Returns
- *
- * A JSON string of the created `ToolInterface`.
- *
- * # Errors
- *
- * Returns `ScpError::Tool` if the caller is not an admin or the tool is not found.
- */
-public func toolInterfaceExpose(handle: ContextHandle, toolId: String, targetContextId: String, rateLimitJson: String?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_interface_expose(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(targetContextId),FfiConverterOptionString.lower(rateLimitJson)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Revokes a cross-context tool interface (§6.2.0.1 step 5).
- *
- * Either context may revoke unilaterally. Returns an `InterfaceRevoked` event
- * as a JSON string.
- *
- * # Arguments
- *
- * * `handle` — The revoking context handle.
- * * `interface_id_hex` — The 32-byte interface/offer ID as a hex string.
- *
- * # Returns
- *
- * A JSON string of the `InterfaceRevoked` event.
- *
- * # Errors
- *
- * Returns `ScpError::Validation` if `interface_id_hex` is not valid hex or
- * not 32 bytes.
- */
-public func toolInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_interface_revoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(interfaceIdHex)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Invokes a tool within an SCP context, fully wired through the
- * `ContextManager::invoke_tool_with_economy` pipeline.
- *
- * This is the SINGLE entry point for tool invocation through the
- * `UniFFI` bridge (Swift + Kotlin). Per-invocation pricing, spending
- * UCAN AND-composition (§19.5), per-DID velocity tracking, escalation
- * (§19.7), budget enforcement, payment escrow, the Matrix-style hard
- * rate limit, and `ToolEconomyTicket` rollback are all enforced inside
- * the runtime wrapper. The `UniFFI` bridge no longer reimplements any
- * of those concerns.
- *
- * # Arguments
- *
- * * `handle` — The context containing the tool.
- * * `tool_id` — The ID of the tool to invoke.
- * * `input_json` — Tool input parameters as a JSON string.
- * * `identity` — The identity of the invoker (used for capability checking).
- * * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
- * Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
- * The full 11-step ADR-016 validation pipeline is executed before
- * tool dispatch. See spec §6.2, §8, ADR-016, and issue #319.
- * * `proof_tokens` — Optional list of encoded parent UCAN tokens for
- * delegation chain traversal (ADR-016 step 3).
- * * `spending_ucan_jwt` — Optional JWT-encoded spending UCAN
- * (`SpendingCapability`) for paid tool invocations. Required when an
- * `EconomicPolicy` priced the tool above zero (§19.5
- * AND-composition). May be `nil`/`null` for free tools.
- *
- * # Returns
- *
- * The tool output as a JSON string.
- *
- * # Errors
- *
- * - `ScpError::Tool` (tool-invocation error range) — tool not found, schema
- * mismatch, execution failure.
- * - `ScpError::Permission` (`SCP-PERM-3001`) — invalid, expired,
- * revoked, or capability-deficient UCAN token.
- * - `ScpError::Context` (`SCP-ECON-12090`) — hard rate limit exceeded.
- * - `ScpError::Context` (`SCP-ECON-12010`) — per-DID budget exceeded.
- * - `ScpError::Context` (`SCP-ECON-12061`) — invalid spending UCAN.
- */
-public func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?, spendingUcanJwt: String?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_invoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterOptionString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens),FfiConverterOptionString.lower(spendingUcanJwt)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Invokes a tool across context boundaries.
- *
- * Validates UCAN authorization against the target context and chain depth
- * per spec section 6.2 (max 3 hops).
- *
- * # Arguments
- *
- * * `source_handle` — The calling context.
- * * `target_handle` — The context containing the tool.
- * * `tool_id` — The tool to invoke.
- * * `input_json` — Tool input as a JSON string.
- * * `identity` — The invoker's identity.
- * * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
- * Validated against the TARGET context's ceiling using the full 11-step
- * ADR-016 pipeline.
- * * `chain_depth` — Current chain depth (0 for first hop).
- * * `proof_tokens` — Optional list of encoded parent UCAN tokens for
- * delegation chain traversal.
- *
- * # Errors
- *
- * Returns `ScpError::Permission` if the UCAN token is invalid, expired,
- * revoked, or lacks the required tool invocation capability.
- * Returns `ScpError::Tool` if chain depth exceeded or contexts not active.
- */
-public func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_invoke_cross_context(FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(toolId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterUInt8.lower(chainDepth),FfiConverterOptionSequenceString.lower(proofTokens)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Registers a tool in an SCP context.
- *
- * # Arguments
- *
- * * `handle` — The context to register the tool in.
- * * `definition` — Tool definition including name, schema, and test vectors.
- *
- * # Returns
- *
- * The tool ID string assigned to the registered tool.
- *
- * # Errors
- *
- * Returns `ScpError::Tool` if the context is not active, registration
- * fails (permission denied, schema invalid, duplicate name, etc.).
- */
-public func toolRegister(handle: ContextHandle, definition: ToolDefinition)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_register(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeToolDefinition_lower(definition)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Closes a stateful tool session.
- *
- * Removes the session from the store, releasing the caller's session slot.
- */
-public func toolSessionClose(handle: ContextHandle, sessionId: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_session_close(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Creates a stateful tool session.
- *
- * Sessions enable multi-turn workflows with TTL and per-caller caps
- * (default: 1000 concurrent sessions per caller, per spec §6.2.1 and ADR-043).
- *
- * # Returns
- *
- * The session ID (UUID string).
- */
-public func toolSessionCreate(handle: ContextHandle, toolId: String, sourceContextId: String, ttlSeconds: UInt64?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_session_create(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(sourceContextId),FfiConverterOptionUInt64.lower(ttlSeconds)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Invokes a tool within an active session.
- *
- * Each call is individually governed: the invoker must present a valid
- * UCAN token. Session state is carried forward and the call count is
- * incremented on success.
- *
- * # Arguments
- *
- * * `handle` — The context containing the tool session.
- * * `session_id` — The session to invoke within.
- * * `input_json` — Tool input parameters as a JSON string.
- * * `identity` — The identity of the invoker.
- * * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
- * Validated using the full 11-step ADR-016 pipeline.
- * * `proof_tokens` — Optional list of encoded parent UCAN tokens for
- * delegation chain traversal.
- *
- * # Returns
- *
- * The tool output as a JSON string.
- */
-public func toolSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_session_invoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Verifies a tool against its registered test vectors.
- *
- * # Arguments
- *
- * * `handle` — The context containing the tool.
- * * `tool_id` — The ID of the tool to verify.
- *
- * # Returns
- *
- * A `ToolVerificationResult` with pass/fail status and failure messages.
- *
- * # Errors
- *
- * Returns `ScpError::Tool` if the tool is not found in the context.
- */
-public func toolVerify(handle: ContextHandle, toolId: String)async throws  -> ToolVerificationResult  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_verify(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeToolVerificationResult_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
 }
@@ -13773,9 +13793,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 29652) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create_link_attestation() != 17272) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_create_with_agent_key() != 42821) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13795,9 +13812,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_migrate() != 37096) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_remove_link_attestation() != 27338) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_identity_resolve() != 4675) {
@@ -13821,7 +13835,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_mcp_client_disconnect() != 20983) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_mcp_client_invoke() != 33699) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_mcp_client_invoke() != 60387) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_mcp_client_list_tools() != 63936) {
@@ -13891,6 +13905,48 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_node_start_local() != 1895) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_deregister() != 15394) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_get() != 59668) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_interface_accept() != 21974) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_interface_offer() != 55225) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_interface_revoke() != 42432) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_invoke() != 24732) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_invoke_cross_context() != 49171) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_list() != 53070) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_register() != 11638) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_session_close() != 12165) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_session_invoke() != 60351) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_session_open() != 64561) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_update() != 25232) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_outlet_verify() != 34961) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_petname_get_for_context() != 17935) {
@@ -13974,9 +14030,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_scpid_challenge() != 19241) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scpid_sign() != 52365) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_scpid_verify() != 37844) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13996,36 +14049,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_tombstone_migrated_context() != 35616) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_interface_accept() != 52020) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_interface_expose() != 47674) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_interface_revoke() != 31068) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke() != 24933) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke_cross_context() != 26371) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_register() != 20572) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_session_close() != 13245) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_session_create() != 26995) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_session_invoke() != 57907) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_verify() != 15916) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_transport_connect() != 52412) {

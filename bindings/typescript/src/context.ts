@@ -308,10 +308,33 @@ export class Context implements AsyncDisposable {
   /** Whether this context has been left or closed. */
   private _disposed = false;
 
+  /** Lazy-constructed outlets namespace — created on first access. */
+  private _outlets: import("./outlets").OutletNamespace | null = null;
+
   private constructor(contextId: string, handle: BridgeContextHandle, identityDid: string) {
     this.contextId = contextId;
     this._handle = handle;
     this._identityDid = identityDid;
+  }
+
+  /**
+   * The outlet surface for this context (SCP-OUT-006).
+   *
+   * Exposes the full outlet verb set (`register` / `invoke` / `update` /
+   * `get` / `list` / `verify` / `deregister` / `invokeCrossContext`) and
+   * two sub-namespaces: `ctx.outlets.sessions` and `ctx.outlets.offers`.
+   *
+   * `ctx.outlets.invoke(id, input)` returns an {@link InvocationHandle}
+   * that is BOTH awaitable (resolves to an `Aggregate`) and async-iterable
+   * (yields `OutletStreamChunk`). One method, two consumption styles.
+   */
+  get outlets(): import("./outlets").OutletNamespace {
+    if (this._outlets === null) {
+      // Inline import to avoid a cycle at module-load time.
+      const { OutletNamespace } = require("./outlets") as typeof import("./outlets");
+      this._outlets = new OutletNamespace(this._handle, this._identityDid);
+    }
+    return this._outlets;
   }
 
   /**
@@ -495,7 +518,7 @@ export class Context implements AsyncDisposable {
    *
    * @param definition - The tool definition.
    * @returns The assigned tool ID.
-   * @throws {ToolError} If registration fails.
+   * @throws {OutletError} If registration fails.
    */
   async registerTool(definition: ToolDefinition): Promise<string> {
     this.assertActive();
@@ -528,7 +551,7 @@ export class Context implements AsyncDisposable {
    *   resolution and `spendingUcan` for paid tool invocations
    *   (`SpendingCapability` AND-composition per spec section 19.5).
    * @returns The tool output as a parsed JSON object.
-   * @throws {ToolError} If invocation fails or the tool is not found.
+   * @throws {OutletError} If invocation fails or the tool is not found.
    * @throws {UcanPermissionError} If the UCAN token is invalid, expired,
    *   revoked, or lacks the required tool invocation capability.
    */
@@ -565,7 +588,7 @@ export class Context implements AsyncDisposable {
    *
    * @param toolId - The ID of the tool to verify.
    * @returns The verification result.
-   * @throws {ToolError} If verification fails.
+   * @throws {OutletError} If verification fails.
    */
   async verifyTool(toolId: string): Promise<ToolVerificationResult> {
     this.assertActive();
@@ -592,7 +615,7 @@ export class Context implements AsyncDisposable {
    * @param targetContextId - The target context to expose the tool to.
    * @param rateLimitJson - Optional per-interface rate limit as a JSON string.
    * @returns The ToolInterface as a JSON string.
-   * @throws {ToolError} If the caller is not an admin or the tool is not found.
+   * @throws {OutletError} If the caller is not an admin or the tool is not found.
    */
   async exposeToolInterface(
     toolId: string,
@@ -616,7 +639,7 @@ export class Context implements AsyncDisposable {
    *
    * @param interfaceJson - The ToolInterface JSON string to accept.
    * @returns The updated ToolInterface as a JSON string.
-   * @throws {ToolError} If the caller is not an admin or context mismatch.
+   * @throws {OutletError} If the caller is not an admin or context mismatch.
    */
   async acceptToolInterface(interfaceJson: string): Promise<string> {
     this.assertActive();

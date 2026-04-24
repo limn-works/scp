@@ -68,16 +68,32 @@ export {
 } from "./context";
 
 // ---------------------------------------------------------------------------
-// Tools
+// Outlets
 // ---------------------------------------------------------------------------
 
+export type {
+  Aggregate,
+  DID,
+  InvocationCaveats,
+  InvokeCrossContextOptions,
+  OutletCost,
+  OutletDefinition,
+  OutletId,
+  OutletStreamChunk,
+  SessionId,
+} from "./outlets";
 export {
-  defineToolDefinition,
-  toolInvokeCrossContext,
-  toolSessionClose,
-  toolSessionCreate,
-  toolSessionInvoke,
-} from "./tools";
+  CaveatBuilder,
+  caveats,
+  defineOutletDefinition,
+  InvocationHandle,
+  newSessionId,
+  OutletNamespace,
+  OutletOffersNamespace,
+  OutletSessionsNamespace,
+  sessionId,
+  validateSessionId,
+} from "./outlets";
 
 // ---------------------------------------------------------------------------
 // Trust
@@ -254,10 +270,12 @@ export {
   IdentityError,
   McpError,
   mapBridgeError,
+  OutletError,
+  OutletExecutionError,
+  OutletNotFoundError,
   PermissionError,
   ScpError,
   StorageError,
-  ToolError,
   TransportError,
   UcanPermissionError,
   ValidationError,

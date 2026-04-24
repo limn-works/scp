@@ -14,7 +14,7 @@ import { _validateEconomicPolicyJson, Context } from "../src/context";
 import { ContextError, ValidationError } from "../src/errors";
 import { Identity } from "../src/identity";
 import { _resetBridge, _setBridge } from "../src/internal/bridge";
-import { defineToolDefinition } from "../src/tools";
+import { defineOutletDefinition } from "../src/outlets";
 import { Transport } from "../src/transport";
 import type { ConsequenceRule as ConsequenceRuleTypeAlias } from "../src/types";
 import { delegateUcan, mintUcan } from "../src/ucan";
@@ -240,7 +240,7 @@ describe("Tool runtime (mock bridge)", () => {
       }),
     );
 
-    const def = defineToolDefinition({
+    const def = defineOutletDefinition({
       name: "echo-tool",
       description: "Echoes input",
       inputSchema: { type: "object" },
@@ -264,7 +264,7 @@ describe("Tool runtime (mock bridge)", () => {
       }),
     );
 
-    const def = defineToolDefinition({
+    const def = defineOutletDefinition({
       name: "add-tool",
       description: "Adds two numbers",
       inputSchema: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } } },
@@ -303,7 +303,7 @@ describe("Tool runtime (mock bridge)", () => {
       }),
     );
 
-    const def = defineToolDefinition({
+    const def = defineOutletDefinition({
       name: "noop-tool",
       description: "Does nothing",
       inputSchema: { type: "object" },
@@ -329,7 +329,7 @@ describe("Tool runtime (mock bridge)", () => {
       }),
     );
 
-    const def = defineToolDefinition({
+    const def = defineOutletDefinition({
       name: "noop-tool-2",
       description: "Does nothing",
       inputSchema: { type: "object" },
@@ -355,7 +355,7 @@ describe("Tool runtime (mock bridge)", () => {
       }),
     );
 
-    const def = defineToolDefinition({
+    const def = defineOutletDefinition({
       name: "revoked-test-tool",
       description: "Test revocation",
       inputSchema: { type: "object" },
@@ -387,7 +387,7 @@ describe("Tool runtime (mock bridge)", () => {
       }),
     );
 
-    const def = defineToolDefinition({
+    const def = defineOutletDefinition({
       name: "multiply",
       description: "Multiplies two numbers",
       inputSchema: { type: "object" },
@@ -421,7 +421,7 @@ describe("Tool runtime (mock bridge)", () => {
       }),
     );
 
-    const def = defineToolDefinition({
+    const def = defineOutletDefinition({
       name: "broken",
       description: "A broken tool",
       inputSchema: { type: "object" },
@@ -474,7 +474,7 @@ describe("Tool runtime (mock bridge)", () => {
       }),
     );
 
-    const def = defineToolDefinition({
+    const def = defineOutletDefinition({
       name: "paid-echo",
       description: "Paid echo tool for C4 wiring test",
       inputSchema: { type: "object" },
@@ -520,7 +520,7 @@ describe("Tool runtime (mock bridge)", () => {
       ceiling: ["tools:register", "tools:invoke"],
     });
 
-    const def = defineToolDefinition({
+    const def = defineOutletDefinition({
       name: "sdk-paid-echo",
       description: "SDK paid echo tool for C4 wiring test",
       inputSchema: { type: "object" },
@@ -559,7 +559,7 @@ describe("Tool runtime (mock bridge)", () => {
       ceiling: ["tools:register", "tools:invoke"],
     });
 
-    const def = defineToolDefinition({
+    const def = defineOutletDefinition({
       name: "sdk-free-echo",
       description: "SDK free echo tool",
       inputSchema: { type: "object" },
@@ -848,8 +848,8 @@ describe("Transport runtime (mock bridge)", () => {
 // ---------------------------------------------------------------------------
 
 describe("SDK class wiring (type-safe delegation)", () => {
-  it("defineToolDefinition validates and constructs ToolDefinition", () => {
-    const def = defineToolDefinition({
+  it("defineOutletDefinition validates and constructs ToolDefinition", () => {
+    const def = defineOutletDefinition({
       name: "test",
       description: "desc",
       inputSchema: { type: "object" },
@@ -861,9 +861,9 @@ describe("SDK class wiring (type-safe delegation)", () => {
     expect(def.operator).toBe("did:dht:z6MkTest");
   });
 
-  it("defineToolDefinition rejects empty name", () => {
+  it("defineOutletDefinition rejects empty name", () => {
     expect(() =>
-      defineToolDefinition({
+      defineOutletDefinition({
         name: "",
         description: "desc",
         inputSchema: {},
@@ -903,7 +903,7 @@ describe("Trust evaluation runtime (mock bridge)", () => {
     );
 
     // Register and invoke a tool to generate ToolInvoked events
-    const def = defineToolDefinition({
+    const def = defineOutletDefinition({
       name: "calc",
       description: "Calculator",
       inputSchema: { type: "object" },
