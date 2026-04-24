@@ -6850,8 +6850,11 @@ impl Scp {
         // `Option<Vec<u8>>`; we immediately narrow to `[u8; 32]` via
         // `TryFrom` and surface a length mismatch as `SCP-VALID-7007`.
         // A seed paired with a non-InMemory custody type is caught
-        // below as `SCP-VALID-7009`.
-        let testing_seed_bytes: Option<[u8; 32]> = match testing_seed {
+        // below as `SCP-VALID-7009`. Wrap the narrowed array in
+        // `Zeroizing` so the seed bytes are wiped when dropped — they
+        // feed `Ed25519 SigningKey::from_bytes` inside the custody's
+        // RNG.
+        let testing_seed_bytes: Option<zeroize::Zeroizing<[u8; 32]>> = match testing_seed {
             None => None,
             Some(bytes) => {
                 let arr: [u8; 32] =
@@ -6859,7 +6862,7 @@ impl Scp {
                         msg: format!("testing_seed must be exactly 32 bytes, got {}", bytes.len()),
                         code: codes::VALID_7007.to_owned(),
                     })?;
-                Some(arr)
+                Some(zeroize::Zeroizing::new(arr))
             }
         };
 
@@ -6912,9 +6915,13 @@ impl Scp {
                             //
                             // When `testing_seed` is supplied, the custody is
                             // backed by a deterministic RNG (ADR-046 parity).
-                            let in_memory = testing_seed_bytes.map_or_else(
+                            // Deref through `Zeroizing<[u8; 32]>` so the seed
+                            // bytes are wiped at end-of-scope. `from_seed_bytes`
+                            // consumes a by-value Copy of the inner array,
+                            // discarded inside `StdRng::from_seed`.
+                            let in_memory = testing_seed_bytes.as_ref().map_or_else(
                                 InMemoryKeyCustody::new,
-                                InMemoryKeyCustody::from_seed_bytes,
+                                |seed| InMemoryKeyCustody::from_seed_bytes(**seed),
                             );
                             let key_custody = Arc::new(OpaqueInMemoryKeyCustody(in_memory));
                             let dht = DidDht::new();

@@ -993,6 +993,48 @@ impl WasmDIDDocument {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
+/// Narrows a caller-supplied `testing_seed` byte slice to a
+/// zeroize-wrapped `[u8; 32]`.
+///
+/// The caller-supplied `testing_seed` parameter is a parity-harness
+/// affordance (ADR-046), not a production API — mirrors how the
+/// other three bridges gate `signed_at_override` behind `testing`.
+/// Production WASM bundles reject any non-None seed with
+/// `SCP-VALID-7008`; the testing build consumes the 32 bytes to drive
+/// `StdRng::from_seed` in `identity_create`. A length mismatch
+/// surfaces as `SCP-VALID-7007`.
+///
+/// Wrapping in `Zeroizing` immediately on the FFI boundary ensures the
+/// seed bytes are wiped when dropped — they feed `StdRng::from_seed`
+/// below and produce the Ed25519 `#0`/`#active` private keys.
+fn narrow_testing_seed(
+    testing_seed: Option<&[u8]>,
+) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, JsValue> {
+    match testing_seed {
+        None => Ok(None),
+        #[cfg(feature = "testing")]
+        Some(bytes) => {
+            let arr = <[u8; 32]>::try_from(bytes).map_err(|_| {
+                ScpWasmError::Validation {
+                    message: format!("testing_seed must be exactly 32 bytes, got {}", bytes.len()),
+                    code: codes::VALID_7007.to_owned(),
+                }
+                .into_js()
+            })?;
+            Ok(Some(zeroize::Zeroizing::new(arr)))
+        }
+        #[cfg(not(feature = "testing"))]
+        Some(_) => Err(ScpWasmError::Validation {
+            message: "`testing_seed` parameter requires the `testing` feature — not available \
+                      in production WASM builds"
+                .to_owned(),
+            code: codes::VALID_7008.to_owned(),
+        }
+        .into_js()
+        .into()),
+    }
+}
+
 /// Creates a new SCP identity.
 ///
 /// Generates an Ed25519 keypair using the browser's cryptographic random
@@ -1030,39 +1072,10 @@ pub fn identity_create(custody: String, testing_seed: Option<Vec<u8>>) -> Promis
             .into());
         }
 
-        // The caller-supplied `testing_seed` parameter is a parity-harness
-        // affordance (ADR-046), not a production API — mirrors how the
-        // other three bridges gate `signed_at_override` behind
-        // `testing`. Production WASM bundles reject any non-None seed
-        // with SCP-VALID-7008; the testing build consumes the 32 bytes
-        // to drive `StdRng::from_seed` below (a length mismatch there
-        // surfaces as SCP-VALID-7007). Note this is independent of the
-        // spec §3.2.1 two-key model, which stays unconditional: the
-        // no-seed path still derives a distinct `#active` key from
-        // `OsRng` in every build.
-        let testing_seed_bytes: Option<[u8; 32]> = match testing_seed.as_deref() {
-            None => None,
-            #[cfg(feature = "testing")]
-            Some(bytes) => Some(<[u8; 32]>::try_from(bytes).map_err(|_| {
-                ScpWasmError::Validation {
-                    message: format!("testing_seed must be exactly 32 bytes, got {}", bytes.len()),
-                    code: codes::VALID_7007.to_owned(),
-                }
-                .into_js()
-            })?),
-            #[cfg(not(feature = "testing"))]
-            Some(_) => {
-                return Err(ScpWasmError::Validation {
-                    message:
-                        "`testing_seed` parameter requires the `testing` feature — not available \
-                              in production WASM builds"
-                            .to_owned(),
-                    code: codes::VALID_7008.to_owned(),
-                }
-                .into_js()
-                .into());
-            }
-        };
+        // Narrow + zeroize-wrap `testing_seed` — gated by the `testing`
+        // feature. See `narrow_testing_seed` for the full rationale.
+        let testing_seed_bytes: Option<zeroize::Zeroizing<[u8; 32]>> =
+            narrow_testing_seed(testing_seed.as_deref())?;
 
         // Per spec §3.2.1, every SCP identity has two distinct Ed25519
         // keys: `#0` (the identity key, DID-deriving, never rotates) and
@@ -1088,17 +1101,23 @@ pub fn identity_create(custody: String, testing_seed: Option<Vec<u8>>) -> Promis
         let (signing_key, active_signing_key_bytes): (
             ed25519_dalek::SigningKey,
             zeroize::Zeroizing<[u8; 32]>,
-        ) = testing_seed_bytes.map_or_else(random_two_key, |s| {
-            use rand::{RngCore, SeedableRng};
-            let mut rng = rand::rngs::StdRng::from_seed(s);
-            let mut identity_key_bytes = zeroize::Zeroizing::new([0u8; 32]);
-            rng.fill_bytes(identity_key_bytes.as_mut());
-            let identity_key = ed25519_dalek::SigningKey::from_bytes(&identity_key_bytes);
-            // Consume the next 32 bytes for the distinct #active key.
-            let mut active_bytes = zeroize::Zeroizing::new([0u8; 32]);
-            rng.fill_bytes(active_bytes.as_mut());
-            (identity_key, active_bytes)
-        });
+        ) = testing_seed_bytes
+            .as_ref()
+            .map_or_else(random_two_key, |s| {
+                use rand::{RngCore, SeedableRng};
+                // Deref through `Zeroizing<[u8; 32]>` — one unavoidable
+                // by-value Copy goes into `StdRng::from_seed`, which
+                // discards it after consuming the seed. The outer
+                // wrapper is wiped at end-of-scope.
+                let mut rng = rand::rngs::StdRng::from_seed(**s);
+                let mut identity_key_bytes = zeroize::Zeroizing::new([0u8; 32]);
+                rng.fill_bytes(identity_key_bytes.as_mut());
+                let identity_key = ed25519_dalek::SigningKey::from_bytes(&identity_key_bytes);
+                // Consume the next 32 bytes for the distinct #active key.
+                let mut active_bytes = zeroize::Zeroizing::new([0u8; 32]);
+                rng.fill_bytes(active_bytes.as_mut());
+                (identity_key, active_bytes)
+            });
         #[cfg(not(feature = "testing"))]
         let (signing_key, active_signing_key_bytes): (
             ed25519_dalek::SigningKey,

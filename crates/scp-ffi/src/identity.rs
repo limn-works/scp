@@ -466,12 +466,21 @@ fn parse_custody(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), ScpPyErr
 #[cfg(feature = "allow_in_memory_custody")]
 fn parse_custody_with_seed(
     custody: &str,
-    testing_seed: Option<[u8; 32]>,
+    testing_seed: Option<zeroize::Zeroizing<[u8; 32]>>,
 ) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     match custody {
         "in_memory" => {
+            // Deref through `Zeroizing<[u8; 32]>` so the seed bytes are
+            // wiped when `testing_seed` is dropped at the end of this
+            // scope. `from_seed_bytes` takes `[u8; 32]` by value (Copy),
+            // so one unavoidable stack copy is consumed by the RNG —
+            // that copy lives only inside `InMemoryKeyCustody`'s
+            // `StdRng::from_seed`, which discards it after seeding.
             let kc = testing_seed
-                .map_or_else(InMemoryKeyCustody::new, InMemoryKeyCustody::from_seed_bytes);
+                .as_ref()
+                .map_or_else(InMemoryKeyCustody::new, |seed| {
+                    InMemoryKeyCustody::from_seed_bytes(**seed)
+                });
             Ok((Arc::new(FfiKeyCustody::InMemory(kc)), custody.to_owned()))
         }
         _ if testing_seed.is_some() => Err(ScpPyError::ValidationError {
@@ -485,7 +494,7 @@ fn parse_custody_with_seed(
 #[cfg(not(feature = "allow_in_memory_custody"))]
 fn parse_custody_with_seed(
     custody: &str,
-    testing_seed: Option<[u8; 32]>,
+    testing_seed: Option<zeroize::Zeroizing<[u8; 32]>>,
 ) -> Result<(Arc<FfiKeyCustody>, String), ScpPyError> {
     if testing_seed.is_some() {
         return Err(ScpPyError::ValidationError {
@@ -668,19 +677,19 @@ impl crate::scp::PyScp {
         // bytes. Mismatched length is `SCP-VALID-7007` (format error);
         // seed-plus-wrong-custody is `SCP-VALID-7009` and is raised by
         // `parse_custody_with_seed` below.
-        let testing_seed_array: Option<[u8; 32]> = match testing_seed {
+        // Wrap in `Zeroizing` immediately on the FFI boundary so the
+        // 32 seed bytes are wiped when dropped, not left on the stack.
+        // The seed feeds `Ed25519 SigningKey::from_bytes` inside
+        // `InMemoryKeyCustody::from_seed_bytes`, so the same hygiene
+        // we apply to other private-key material applies here.
+        let testing_seed_array: Option<zeroize::Zeroizing<[u8; 32]>> = match testing_seed {
             None => None,
-            Some(bytes) => {
-                Some(
-                    <[u8; 32]>::try_from(bytes).map_err(|_| ScpPyError::ValidationError {
-                        message: format!(
-                            "testing_seed must be exactly 32 bytes, got {}",
-                            bytes.len()
-                        ),
-                        code: scp_ffi_common::error_codes::VALID_7007.to_owned(),
-                    })?,
-                )
-            }
+            Some(bytes) => Some(zeroize::Zeroizing::new(
+                <[u8; 32]>::try_from(bytes).map_err(|_| ScpPyError::ValidationError {
+                    message: format!("testing_seed must be exactly 32 bytes, got {}", bytes.len()),
+                    code: scp_ffi_common::error_codes::VALID_7007.to_owned(),
+                })?,
+            )),
         };
         let (key_custody, custody_str) = parse_custody_with_seed(custody, testing_seed_array)?;
         let rt = crate::runtime()?;

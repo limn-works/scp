@@ -319,8 +319,11 @@ impl Scp {
         // so we fail early rather than panicking in
         // `InMemoryKeyCustody::from_seed_bytes`. A length mismatch is
         // `SCP-VALID-7007`; a seed paired with a non-InMemory custody
-        // surfaces later as `SCP-VALID-7009`.
-        let testing_seed_bytes: Option<[u8; 32]> = match testing_seed {
+        // surfaces later as `SCP-VALID-7009`. The seed bytes feed
+        // `Ed25519 SigningKey::from_bytes` inside the custody's RNG, so
+        // we wrap the narrowed `[u8; 32]` in `Zeroizing` immediately to
+        // wipe them when dropped rather than leaving them on the stack.
+        let testing_seed_bytes: Option<zeroize::Zeroizing<[u8; 32]>> = match testing_seed {
             None => None,
             Some(buf) => {
                 let slice: &[u8] = buf.as_ref();
@@ -333,7 +336,7 @@ impl Scp {
                         code: codes::VALID_7007.to_owned(),
                     })
                 })?;
-                Some(arr)
+                Some(zeroize::Zeroizing::new(arr))
             }
         };
 
@@ -346,8 +349,16 @@ impl Scp {
                 use scp_identity::DidDht;
                 use scp_platform::testing::InMemoryKeyCustody;
 
+                // Deref through `Zeroizing<[u8; 32]>` so the wrapper
+                // drops (and wipes) at the end of this scope. The inner
+                // `[u8; 32]` is consumed by value by `from_seed_bytes`
+                // (one unavoidable Copy) and then discarded inside
+                // `StdRng::from_seed`.
                 let in_memory = testing_seed_bytes
-                    .map_or_else(InMemoryKeyCustody::new, InMemoryKeyCustody::from_seed_bytes);
+                    .as_ref()
+                    .map_or_else(InMemoryKeyCustody::new, |seed| {
+                        InMemoryKeyCustody::from_seed_bytes(**seed)
+                    });
                 let key_custody = Arc::new(crate::identity::OpaqueInMemoryKeyCustody(in_memory));
                 let dht = DidDht::new();
                 let (scp_identity, document) = dht
