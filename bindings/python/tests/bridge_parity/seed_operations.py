@@ -214,7 +214,8 @@ EXPECTED_SEEDED_DID = "did:dht:zjerxoow7gsm8suaqfsc86txbreganh7chorzwwh4crbh7imb
 
 def _py_identity_create(ctx: OpContext) -> dict[str, Any]:
     seed = bytes.fromhex(PARITY_SEED_HEX)
-    identity = ctx.scp_core.py_identity_create("in_memory", seed)
+    scp = ctx.scp_core.SCP()
+    identity = scp.identity_create("in_memory", seed)
     return {
         "did": identity.did,
         "custody": "in_memory",
@@ -269,9 +270,10 @@ OP_IDENTITY_CREATE = OpSpec(
 
 
 def _py_context_create(ctx: OpContext) -> dict[str, Any]:
-    identity = ctx.scp_core.py_identity_create("in_memory")
+    scp = ctx.scp_core.SCP()
+    identity = scp.identity_create("in_memory")
     params = {"name": "parity-test", "mode": "encrypted"}
-    handle = ctx.scp_core.py_context_create(identity.did, params)
+    handle = scp.context_create(identity.did, params)
     return {
         "context_id": handle.context_id,
         "creator_did": identity.did,
@@ -313,8 +315,9 @@ OP_CONTEXT_CREATE = OpSpec(
 
 
 def _py_invalid_sign(ctx: OpContext) -> dict[str, Any]:
+    scp = ctx.scp_core.SCP()
     try:
-        ctx.scp_core.scpid_sign(
+        scp.scpid_sign(
             "did:dht:znevercreatednevercreatednevercreatednevercreated",
             "#active",
             '{"protocol":"scpid/1","nonce":"00","audience":"x","issued_at":0,"expires_at":0}',
@@ -369,11 +372,10 @@ OP_INVALID_CAPABILITY = OpSpec(
 
 
 def _py_event_log_append(ctx: OpContext) -> dict[str, Any]:
-    identity = ctx.scp_core.py_identity_create("in_memory")
-    handle = ctx.scp_core.py_context_create(
-        identity.did, {"name": "parity-elog", "mode": "encrypted"}
-    )
-    events = ctx.scp_core.event_log_query(handle.context_id, None)
+    scp = ctx.scp_core.SCP()
+    identity = scp.identity_create("in_memory")
+    handle = scp.context_create(identity.did, {"name": "parity-elog", "mode": "encrypted"})
+    events = scp.event_log_query(handle.context_id, None)
     first = events[0] if events else None
     if first is None:
         return {"event_count": 0, "first_event_type": "", "first_sequence": 0}
@@ -460,9 +462,10 @@ def _pinned_challenge_json(audience: str = "https://parity-test.example.com") ->
 
 def _py_sign_message(ctx: OpContext) -> dict[str, Any]:
     seed = bytes.fromhex(PARITY_SEED_HEX)
-    identity = ctx.scp_core.py_identity_create("in_memory", seed)
+    scp = ctx.scp_core.SCP()
+    identity = scp.identity_create("in_memory", seed)
     challenge_json = _pinned_challenge_json()
-    response_json = ctx.scp_core.scpid_sign(
+    response_json = scp.scpid_sign(
         identity.did,
         "#active",
         challenge_json,
@@ -543,12 +546,13 @@ _TOOL_SCHEMA: dict[str, Any] = {
 
 
 def _py_tool_register(ctx: OpContext) -> dict[str, Any]:
-    identity = ctx.scp_core.py_identity_create("in_memory")
-    handle = ctx.scp_core.py_context_create(
+    scp = ctx.scp_core.SCP()
+    identity = scp.identity_create("in_memory")
+    handle = scp.context_create(
         identity.did,
         {"name": "parity-tools", "mode": "encrypted", "ceiling": _TOOL_CEILING},
     )
-    tool_id = ctx.scp_core.tool_register(
+    tool_id = scp.tool_register(
         handle.context_id,
         {
             "name": _TOOL_NAME,
@@ -611,12 +615,13 @@ _UCAN_REQUESTED_CAPS = ["messages:read"]
 
 
 def _py_ucan_mint(ctx: OpContext) -> dict[str, Any]:
-    identity = ctx.scp_core.py_identity_create("in_memory")
-    handle = ctx.scp_core.py_context_create(
+    scp = ctx.scp_core.SCP()
+    identity = scp.identity_create("in_memory")
+    handle = scp.context_create(
         identity.did,
         {"name": "parity-ucan", "mode": "encrypted", "ceiling": _UCAN_CEILING},
     )
-    token = ctx.scp_core.ucan_mint(handle.context_id, _UCAN_MEMBER_DID, _UCAN_REQUESTED_CAPS)
+    token = scp.ucan_mint(handle.context_id, _UCAN_MEMBER_DID, _UCAN_REQUESTED_CAPS)
     return {
         "issuer": token.issuer,
         "audience": token.audience,
@@ -686,14 +691,13 @@ _EXPECTED_MALFORMED_UCAN_CODE = "SCP-PERM-3001"
 
 
 def _py_ucan_validate_malformed(ctx: OpContext) -> dict[str, Any]:
-    identity = ctx.scp_core.py_identity_create("in_memory")
-    handle = ctx.scp_core.py_context_create(
+    scp = ctx.scp_core.SCP()
+    identity = scp.identity_create("in_memory")
+    handle = scp.context_create(
         identity.did, {"name": "parity-ucan-v", "mode": "encrypted", "ceiling": _UCAN_CEILING}
     )
     try:
-        # SCP-DEFAULT-INSTANCE-OK: parity harness mirrors user-facing Python
-        # caller behavior — the default-instance façade IS what this op tests.
-        ctx.scp_core.ucan_validate(
+        scp.ucan_validate(
             handle.context_id,
             _MALFORMED_UCAN,
             # Any well-formed capability string — the malformed-JWT
@@ -758,7 +762,8 @@ OP_UCAN_VALIDATE_MALFORMED = OpSpec(
 
 
 def _py_transport_status(ctx: OpContext) -> dict[str, Any]:
-    status = ctx.scp_core.transport_status()
+    scp = ctx.scp_core.SCP()
+    status = scp.transport_status()
     return {
         "connected": status.connected,
         "relay_url": status.relay_url,
@@ -803,11 +808,10 @@ _EVENT_LOG_FILTER = {"event_type": "ContextCreated"}
 
 
 def _py_event_log_query_filtered(ctx: OpContext) -> dict[str, Any]:
-    identity = ctx.scp_core.py_identity_create("in_memory")
-    handle = ctx.scp_core.py_context_create(
-        identity.did, {"name": "parity-elog-f", "mode": "encrypted"}
-    )
-    events = ctx.scp_core.event_log_query(handle.context_id, _EVENT_LOG_FILTER)
+    scp = ctx.scp_core.SCP()
+    identity = scp.identity_create("in_memory")
+    handle = scp.context_create(identity.did, {"name": "parity-elog-f", "mode": "encrypted"})
+    events = scp.event_log_query(handle.context_id, _EVENT_LOG_FILTER)
     first = events[0] if events else None
     return {
         "event_count": len(events),
@@ -868,9 +872,10 @@ OP_EVENT_LOG_FILTERED = OpSpec(
 
 
 def _py_unregistered_did_rejected(ctx: OpContext) -> dict[str, Any]:
+    scp = ctx.scp_core.SCP()
     challenge_json = _pinned_challenge_json()
     try:
-        ctx.scp_core.scpid_sign(FAKE_UNREGISTERED_DID, "#active", challenge_json)
+        scp.scpid_sign(FAKE_UNREGISTERED_DID, "#active", challenge_json)
     except Exception as err:
         err_type = type(err).__name__
         code = getattr(err, "code", None) or _extract_code(str(err))
