@@ -791,6 +791,25 @@ pub fn expect_fixed_bytes<const N: usize>(bytes: &[u8], field: &str) -> Result<[
         .map_err(|_| format!("{field} must be exactly {N} bytes, got {}", bytes.len()))
 }
 
+/// Narrows a byte slice to a zeroize-wrapped `Zeroizing<[u8; N]>`.
+///
+/// Same contract as [`expect_fixed_bytes`], but the returned array is
+/// wrapped in `zeroize::Zeroizing` so it is overwritten when dropped.
+/// Use for private-key material (sender keys, bridge credential keys,
+/// any 32-byte Ed25519/X25519 seed): the common shape is `raw Vec<u8>
+/// → narrow → Zeroizing<[u8; 32]>` and this helper eliminates the
+/// repeated `Zeroizing::new(expect_fixed_bytes::<32>(...))` dance.
+///
+/// # Errors
+///
+/// Same as [`expect_fixed_bytes`] — length-mismatch string.
+pub fn expect_fixed_bytes_zeroized<const N: usize>(
+    bytes: &[u8],
+    field: &str,
+) -> Result<zeroize::Zeroizing<[u8; N]>, String> {
+    expect_fixed_bytes::<N>(bytes, field).map(zeroize::Zeroizing::new)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1597,5 +1616,34 @@ mod tests {
         let bytes = [0_u8; 10];
         let err = expect_fixed_bytes::<32>(&bytes, "session_key").unwrap_err();
         assert!(err.starts_with("session_key must be exactly 32 bytes"));
+    }
+
+    // -- Zeroize-wrapped narrowing --
+
+    #[test]
+    fn expect_fixed_bytes_zeroized_accepts_exact_length() {
+        let bytes = [7_u8; 32];
+        let wrapped: zeroize::Zeroizing<[u8; 32]> =
+            expect_fixed_bytes_zeroized(&bytes, "sender_key").unwrap();
+        // Deref through Zeroizing to compare array contents.
+        assert_eq!(*wrapped, [7_u8; 32]);
+    }
+
+    #[test]
+    fn expect_fixed_bytes_zeroized_rejects_wrong_length() {
+        let bytes = [0_u8; 31];
+        let err = expect_fixed_bytes_zeroized::<32>(&bytes, "sender_key").unwrap_err();
+        assert_eq!(err, "sender_key must be exactly 32 bytes, got 31");
+    }
+
+    /// Confirms that `Zeroizing<[u8; N]>` carries the `ZeroizeOnDrop`
+    /// marker trait — this is the whole point of the helper. If the
+    /// zeroize crate ever drops this impl, the helper loses its
+    /// security guarantee and the migration sites should be revisited.
+    #[test]
+    fn zeroizing_fixed_array_is_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<zeroize::Zeroizing<[u8; 32]>>();
+        assert_zeroize_on_drop::<zeroize::Zeroizing<[u8; 64]>>();
     }
 }
