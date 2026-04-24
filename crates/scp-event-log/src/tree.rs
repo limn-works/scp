@@ -129,7 +129,7 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
 /// The `signature` field is empty. This means:
 ///
 /// - A compromised in-process attacker with write access to the `EventLog`
-///   could inject fabricated events (e.g., fake `ToolInvokedEvent` entries)
+///   could inject fabricated events (e.g., fake `OutletInvokedEvent` entries)
 ///   that pass sequence and hash-chain validation but carry no proof of origin.
 /// - External verifiers cannot distinguish between legitimate unsigned events
 ///   and injected ones — both have empty signatures.
@@ -143,7 +143,8 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
 /// legitimate callers:
 ///
 /// - `FfiBridgeProvider::invoke_tool` in `crates/scp-ffi/src/mcp.rs`
-///   (emits `ToolInvokedEvent` per ADR-010 criterion 3)
+///   (emits `OutletInvokedEvent` per ADR-010 criterion 3, superseded by
+///   ADR-049 for outlet terminology)
 /// - Test code
 ///
 /// # Migration plan
@@ -384,8 +385,30 @@ pub fn compute_event_canonical_hash(event: &Event) -> Vec<u8> {
 
 /// Returns a stable numeric tag for each event type variant.
 ///
-/// Used in canonical hash computation. The tag values are protocol constants
-/// and must never change.
+/// Used in canonical hash computation and in the Merkle leaf preimage. The
+/// tag values are protocol constants and must never change.
+///
+/// # ADR-049 outlet rename (hard break)
+///
+/// The pre-rename `Tool*` variants held tags 9–13. Per spec §5.14.10 / ADR-049,
+/// the `Outlet*` successors are renumbered into the 80–88 band:
+///
+/// | Outlet variant | Tag |
+/// |---|---|
+/// | `OutletRegistered` | 80 |
+/// | `OutletUpdated` | 81 |
+/// | `OutletDeregistered` | 82 |
+/// | `OutletInvoked` | 83 |
+/// | `OutletCancel` | 84 |
+/// | `OutletVerified` | 85 |
+/// | `OutletInterfaceOffered` | 86 |
+/// | `OutletInterfaceAccepted` | 87 |
+/// | `OutletInterfaceRevoked` | 88 |
+///
+/// Every new tag differs from every legacy `Tool*` tag by at least `0x10`
+/// (bit 4 set) so a pre-rename event log hashed under the legacy tag space
+/// cannot satisfy a post-rename canonical-hash check. Tags 9–13 are
+/// permanently retired — they are not reused.
 #[must_use]
 pub const fn event_type_tag(event_type: &EventType) -> u16 {
     match event_type {
@@ -398,11 +421,9 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::RoleAssigned => 6,
         EventType::TokenRevoked => 7,
         EventType::MessageSent => 8,
-        EventType::ToolRegistered => 9,
-        EventType::ToolUpdated => 10,
-        EventType::ToolInvoked => 11,
-        EventType::ToolVerified => 12,
-        EventType::ToolInterfaceEstablished => 13,
+        // Tags 9..=13 are the permanently retired pre-rename Tool* band.
+        // Do not reuse these tags — the OldFormatRejected path relies on
+        // their absence from the post-rename variant set.
         EventType::GovernanceAction => 14,
         EventType::ConsistencyCheckpoint => 15,
         EventType::AbsenceProofRequested => 16,
@@ -427,6 +448,17 @@ pub const fn event_type_tag(event_type: &EventType) -> u16 {
         // Provenance event types (issue #586)
         EventType::ProvenanceAttached => 34,
         EventType::ProvenanceReceived => 35,
+        // Outlet event types (ADR-049, spec §5.4 / §5.14.10). Tags 80..=88
+        // — bit 4 set, ≥ 0x10 offset from every retired Tool* tag.
+        EventType::OutletRegistered => 80,
+        EventType::OutletUpdated => 81,
+        EventType::OutletDeregistered => 82,
+        EventType::OutletInvoked => 83,
+        EventType::OutletCancel => 84,
+        EventType::OutletVerified => 85,
+        EventType::OutletInterfaceOffered => 86,
+        EventType::OutletInterfaceAccepted => 87,
+        EventType::OutletInterfaceRevoked => 88,
     }
 }
 
@@ -905,7 +937,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // all 21 event types are valid
+    // all event types are valid for append (post ADR-049 rename)
     // -----------------------------------------------------------------------
 
     #[test]
@@ -924,11 +956,16 @@ mod tests {
             EventType::RoleAssigned,
             EventType::TokenRevoked,
             EventType::MessageSent,
-            EventType::ToolRegistered,
-            EventType::ToolUpdated,
-            EventType::ToolInvoked,
-            EventType::ToolVerified,
-            EventType::ToolInterfaceEstablished,
+            // Outlet event types (ADR-049, spec §5.4 / §5.14.10).
+            EventType::OutletRegistered,
+            EventType::OutletUpdated,
+            EventType::OutletDeregistered,
+            EventType::OutletInvoked,
+            EventType::OutletCancel,
+            EventType::OutletVerified,
+            EventType::OutletInterfaceOffered,
+            EventType::OutletInterfaceAccepted,
+            EventType::OutletInterfaceRevoked,
             EventType::GovernanceAction,
             EventType::ConsistencyCheckpoint,
             EventType::AbsenceProofRequested,
@@ -962,7 +999,7 @@ mod tests {
             prev_hash = leaf_hash;
         }
 
-        assert_eq!(event_count(&log), 26);
+        assert_eq!(event_count(&log), 30);
     }
 
     // -----------------------------------------------------------------------
@@ -1072,12 +1109,12 @@ mod tests {
         let mut log = EventLog::new("ctx-unsigned-test".to_owned());
 
         let event = Event {
-            event_type: EventType::ToolInvoked,
+            event_type: EventType::OutletInvoked,
             actor_did: "did:dht:z6MkTest".into(),
             timestamp: 1_000_000,
             sequence: 0,
             payload: EventPayload {
-                data: b"tool invoked payload".to_vec(),
+                data: b"outlet invoked payload".to_vec(),
             },
             prev_hash: GENESIS_PREV_HASH,
             signature: Vec::new(), // No signature required.
@@ -1110,7 +1147,7 @@ mod tests {
         let mut log = EventLog::new("ctx-unsigned-seq".to_owned());
 
         let event0 = Event {
-            event_type: EventType::ToolInvoked,
+            event_type: EventType::OutletInvoked,
             actor_did: "did:dht:z6MkTest".into(),
             timestamp: 1_000_000,
             sequence: 0,
@@ -1126,7 +1163,7 @@ mod tests {
 
         // Second event with correct prev_hash.
         let event1 = Event {
-            event_type: EventType::ToolInvoked,
+            event_type: EventType::OutletInvoked,
             actor_did: "did:dht:z6MkTest".into(),
             timestamp: 1_000_001,
             sequence: 1,
@@ -1151,7 +1188,7 @@ mod tests {
         let mut log = EventLog::new("ctx-unsigned-seq-err".to_owned());
 
         let event = Event {
-            event_type: EventType::ToolInvoked,
+            event_type: EventType::OutletInvoked,
             actor_did: "did:dht:z6MkTest".into(),
             timestamp: 1_000_000,
             sequence: 5, // Wrong: should be 0.
@@ -1182,7 +1219,7 @@ mod tests {
         let mut log = EventLog::new("ctx-unsigned-prev-err".to_owned());
 
         let event = Event {
-            event_type: EventType::ToolInvoked,
+            event_type: EventType::OutletInvoked,
             actor_did: "did:dht:z6MkTest".into(),
             timestamp: 1_000_000,
             sequence: 0,

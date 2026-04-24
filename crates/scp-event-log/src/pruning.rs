@@ -1034,8 +1034,8 @@ mod tests {
         assert!(is_structural_event(&EventType::ConsistencyCheckpoint));
 
         assert!(!is_structural_event(&EventType::MessageSent));
-        assert!(!is_structural_event(&EventType::ToolInvoked));
-        assert!(!is_structural_event(&EventType::ToolVerified));
+        assert!(!is_structural_event(&EventType::OutletInvoked));
+        assert!(!is_structural_event(&EventType::OutletVerified));
         assert!(!is_structural_event(&EventType::KeyEpochAdvance));
     }
 
