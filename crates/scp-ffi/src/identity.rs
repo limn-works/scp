@@ -682,6 +682,16 @@ impl crate::scp::PyScp {
         // The seed feeds `Ed25519 SigningKey::from_bytes` inside
         // `InMemoryKeyCustody::from_seed_bytes`, so the same hygiene
         // we apply to other private-key material applies here.
+        //
+        // Unlike the UniFFI / NAPI / WASM bridges, PyO3 hands us a
+        // `&[u8]` borrow straight from the caller's `PyBytes` — the
+        // narrowing below copies through `<[u8; 32]>::try_from(&[u8])`
+        // with no intermediate `Vec` on the Rust side, so there is no
+        // bridge-owned heap buffer to wipe. The caller's `PyBytes` is
+        // owned by the Python interpreter and is not ours to mutate:
+        // Python callers are responsible for zeroing their own byte
+        // string (e.g. by reusing a `bytearray` and clearing it) after
+        // this call returns.
         let testing_seed_array: Option<zeroize::Zeroizing<[u8; 32]>> = testing_seed
             .map(|bytes| {
                 scp_ffi_common::validate::expect_fixed_bytes::<32>(bytes, "testing_seed").map_err(

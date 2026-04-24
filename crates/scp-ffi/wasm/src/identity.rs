@@ -1004,35 +1004,56 @@ impl WasmDIDDocument {
 /// `StdRng::from_seed` in `identity_create`. A length mismatch
 /// surfaces as `SCP-VALID-7007`.
 ///
-/// Wrapping in `Zeroizing` immediately on the FFI boundary ensures the
-/// seed bytes are wiped when dropped — they feed `StdRng::from_seed`
-/// below and produce the Ed25519 `#0`/`#active` private keys.
+/// Wrapping the narrowed array in `Zeroizing` ensures the seed bytes
+/// are wiped when dropped — they feed `StdRng::from_seed` below and
+/// produce the Ed25519 `#0`/`#active` private keys.
+///
+/// The function takes ownership of the source `Vec<u8>` and zeroes
+/// its heap buffer before it drops. Leaving the source un-zeroed
+/// means the original 32 seed bytes linger in the allocator's
+/// freelist until overwritten, and — because WASM linear memory is
+/// same-origin-readable from JS — any same-origin script can recover
+/// them until the memory is reused (bug-catcher + security round 2).
+/// JS callers are separately responsible for zeroing their own
+/// `Uint8Array` after calling, but this bridge should not amplify
+/// their exposure.
 fn narrow_testing_seed(
-    testing_seed: Option<&[u8]>,
+    testing_seed: Option<Vec<u8>>,
 ) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, JsValue> {
-    match testing_seed {
-        None => Ok(None),
-        #[cfg(feature = "testing")]
-        Some(bytes) => {
-            let arr = scp_ffi_common::validate::expect_fixed_bytes::<32>(bytes, "testing_seed")
-                .map_err(|message| {
-                    ScpWasmError::Validation {
-                        message,
-                        code: codes::VALID_7007.to_owned(),
-                    }
-                    .into_js()
-                })?;
-            Ok(Some(zeroize::Zeroizing::new(arr)))
-        }
-        #[cfg(not(feature = "testing"))]
-        Some(_) => Err(ScpWasmError::Validation {
+    let Some(mut source) = testing_seed else {
+        return Ok(None);
+    };
+
+    #[cfg(feature = "testing")]
+    {
+        let narrowed = scp_ffi_common::validate::expect_fixed_bytes::<32>(&source, "testing_seed")
+            .map_err(|message| {
+                ScpWasmError::Validation {
+                    message,
+                    code: codes::VALID_7007.to_owned(),
+                }
+                .into_js()
+            })?;
+        use zeroize::Zeroize;
+        source.zeroize();
+        Ok(Some(zeroize::Zeroizing::new(narrowed)))
+    }
+
+    #[cfg(not(feature = "testing"))]
+    {
+        // Wipe the source even on the rejection path — the caller
+        // supplied bytes, we must not let them linger regardless of
+        // whether we accept them.
+        use zeroize::Zeroize;
+        source.zeroize();
+        Err(ScpWasmError::Validation {
             message: "`testing_seed` parameter requires the `testing` feature — not available \
                       in production WASM builds"
                 .to_owned(),
             code: codes::VALID_7008.to_owned(),
         }
         .into_js()
-        .into()),
+        .into())
     }
 }
 
@@ -1047,6 +1068,12 @@ fn narrow_testing_seed(
 ///
 /// * `custody` — The custody type string. Must be `"js_custody"` or
 ///   `"in_memory"` for browser targets.
+/// * `testing_seed` — Parity-harness affordance (ADR-046). Consumed and
+///   zeroed inside the bridge. **JS caller responsibility:** WASM
+///   linear memory is same-origin-readable from JS, so the caller's
+///   source `Uint8Array` must also be zeroed after this call returns
+///   — the bridge cannot reach through the `wasm-bindgen` boundary
+///   to wipe the JS-side buffer.
 ///
 /// # Returns
 ///
@@ -1074,9 +1101,12 @@ pub fn identity_create(custody: String, testing_seed: Option<Vec<u8>>) -> Promis
         }
 
         // Narrow + zeroize-wrap `testing_seed` — gated by the `testing`
-        // feature. See `narrow_testing_seed` for the full rationale.
+        // feature. `narrow_testing_seed` takes ownership of the source
+        // `Vec<u8>` and zeroes its heap buffer before it drops, since
+        // WASM linear memory is same-origin-readable by JS and freed
+        // bytes stay observable until the allocator reuses them.
         let testing_seed_bytes: Option<zeroize::Zeroizing<[u8; 32]>> =
-            narrow_testing_seed(testing_seed.as_deref())?;
+            narrow_testing_seed(testing_seed)?;
 
         // Per spec §3.2.1, every SCP identity has two distinct Ed25519
         // keys: `#0` (the identity key, DID-deriving, never rotates) and

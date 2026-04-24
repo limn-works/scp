@@ -6854,18 +6854,26 @@ impl Scp {
         // `Zeroizing` so the seed bytes are wiped when dropped — they
         // feed `Ed25519 SigningKey::from_bytes` inside the custody's
         // RNG.
-        let testing_seed_bytes: Option<zeroize::Zeroizing<[u8; 32]>> = testing_seed
-            .as_deref()
-            .map(|bytes| {
-                scp_ffi_common::validate::expect_fixed_bytes::<32>(bytes, "testing_seed").map_err(
-                    |msg| ScpError::Validation {
-                        msg,
-                        code: codes::VALID_7007.to_owned(),
-                    },
-                )
-            })
-            .transpose()?
-            .map(zeroize::Zeroizing::new);
+        //
+        // Take ownership of the `Vec<u8>` carrying the seed across the
+        // FFI boundary and zero its heap buffer before it drops.
+        // Otherwise the allocator's freelist retains the bytes for the
+        // process lifetime even after the narrow copy lands in
+        // `Zeroizing<[u8; 32]>` (bug-catcher + security round 2).
+        let testing_seed_bytes: Option<zeroize::Zeroizing<[u8; 32]>> = match testing_seed {
+            None => None,
+            Some(mut source) => {
+                let narrowed =
+                    scp_ffi_common::validate::expect_fixed_bytes::<32>(&source, "testing_seed")
+                        .map_err(|msg| ScpError::Validation {
+                            msg,
+                            code: codes::VALID_7007.to_owned(),
+                        })?;
+                use zeroize::Zeroize;
+                source.zeroize();
+                Some(zeroize::Zeroizing::new(narrowed))
+            }
+        };
 
         runtime()
             .spawn(async move {

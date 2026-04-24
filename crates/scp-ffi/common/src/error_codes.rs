@@ -513,16 +513,18 @@ pub const VALID_7005: &str = "SCP-VALID-7005";
 pub const VALID_7006: &str = "SCP-VALID-7006";
 /// Validation format error.
 ///
-/// Used when a caller passed bytes that are malformed or of the wrong
-/// length — e.g. a parity-harness seed that is not exactly 32 bytes, or
-/// a `signed_at_override` `BigInt` that cannot be represented losslessly
-/// as a `u64`.
+/// Used for malformed or wrong-shape byte input at the FFI boundary —
+/// e.g. a parity-harness `testing_seed` that is not exactly 32 bytes,
+/// or a `signed_at_override` `BigInt` that cannot be represented
+/// losslessly as a `u64`. Enum-like string mismatches (unknown custody
+/// type, unknown transport mode) use `VALID_7005` (invalid field
+/// value) instead.
 pub const VALID_7007: &str = "SCP-VALID-7007";
 /// Testing-only feature requires the `testing` feature flag.
 ///
 /// Returned by FFI entry points when a caller supplies a parity-harness
-/// affordance (`seed` on `identity_create`, `signed_at_override` on
-/// `scpid_sign`) in a build that was NOT compiled with the `testing`
+/// affordance (`testing_seed` on `identity_create`, `signed_at_override`
+/// on `scpid_sign`) in a build that was NOT compiled with the `testing`
 /// feature enabled. These are ADR-046 cross-bridge parity-harness
 /// inputs, not production APIs — production bundles reject them with
 /// this code.

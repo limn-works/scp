@@ -323,19 +323,32 @@ impl Scp {
         // `Ed25519 SigningKey::from_bytes` inside the custody's RNG, so
         // we wrap the narrowed `[u8; 32]` in `Zeroizing` immediately to
         // wipe them when dropped rather than leaving them on the stack.
-        let testing_seed_bytes: Option<zeroize::Zeroizing<[u8; 32]>> = testing_seed
-            .as_ref()
-            .map(|buf| {
-                scp_ffi_common::validate::expect_fixed_bytes::<32>(buf.as_ref(), "testing_seed")
-                    .map_err(|message| {
-                        NapiError::from(ScpNapiError::Validation {
-                            message,
-                            code: codes::VALID_7007.to_owned(),
-                        })
-                    })
-            })
-            .transpose()?
-            .map(zeroize::Zeroizing::new);
+        //
+        // The `Buffer` argument is backed by a V8 `ArrayBuffer` owned by
+        // the JS side — its memory is not ours to mutate and is held by
+        // the JS GC until the caller drops their reference. To keep the
+        // Rust side clean we copy to an owned `Vec<u8>`, narrow, then
+        // `zeroize` the owned copy before it drops (bug-catcher +
+        // security round 2). JS callers are responsible for zeroing
+        // their own `Uint8Array` after calling — the SDK wrapper
+        // documents this requirement.
+        let testing_seed_bytes: Option<zeroize::Zeroizing<[u8; 32]>> = match testing_seed {
+            None => None,
+            Some(buf) => {
+                let mut owned: Vec<u8> = buf.as_ref().to_vec();
+                let narrowed =
+                    scp_ffi_common::validate::expect_fixed_bytes::<32>(&owned, "testing_seed")
+                        .map_err(|message| {
+                            NapiError::from(ScpNapiError::Validation {
+                                message,
+                                code: codes::VALID_7007.to_owned(),
+                            })
+                        })?;
+                use zeroize::Zeroize;
+                owned.zeroize();
+                Some(zeroize::Zeroizing::new(narrowed))
+            }
+        };
 
         let bi = &*self.inner;
         ensure_did_resolver_initialized_on(bi);
