@@ -1157,6 +1157,36 @@ pub(super) struct PseudonymAnnouncement {
 /// with a null byte when deserialized from `MessagePack`).
 pub(super) const PSEUDONYM_ANNOUNCEMENT_TAG: &str = "\0scp:pseudonym-announce:v1";
 
+/// Per-context routing strategy (§9.10.4, §5.14).
+///
+/// Encrypted contexts use per-member pseudonym routing IDs derived via
+/// `KeyCustody::derive_pseudonym` so relays cannot correlate a member's
+/// subscriptions across contexts. Broadcast contexts use a publicly
+/// derivable `SHA-256(context_id)` routing ID because author identity is
+/// visible in the `BroadcastEnvelope` anyway (spec §5.14).
+///
+/// Exactly one variant is present per context; there is no Option or
+/// "unknown" state. Constructors build the correct variant from
+/// [`ContextMode`] at creation/join/restore time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind")]
+pub enum ContextRouting {
+    /// Encrypted context. The local member's pseudonym is pre-derived at the
+    /// FFI boundary. Other members' pseudonyms are learned via
+    /// [`PseudonymAnnouncement`] MLS application messages and keyed by DID
+    /// so `send_message` can fan out to each member's pseudonym.
+    Encrypted {
+        /// This member's pseudonym-derived routing ID.
+        #[serde(with = "serde_bytes")]
+        local_pseudonym: [u8; 32],
+        /// Known members' pseudonym routing IDs, keyed by DID string.
+        pseudonym_registry: HashMap<String, [u8; 32]>,
+    },
+    /// Broadcast context. Uses `SHA-256(context_id)` as the shared routing ID
+    /// per spec §5.14; no pseudonym state is retained.
+    Broadcast,
+}
+
 /// Internal state tracked by the manager for each context.
 pub(super) struct PerContextState {
     /// Monotonic generation counter. Assigned on insertion into the contexts
