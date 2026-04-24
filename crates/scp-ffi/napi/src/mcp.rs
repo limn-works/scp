@@ -70,7 +70,7 @@ pub struct NapiMcpInvokeResult {
     pub content_json: String,
     /// Whether the tool call resulted in an error.
     pub is_error: bool,
-    /// Source of the result, formatted as `"mcp:{tool_name}"`.
+    /// Source of the result, formatted as `"mcp:{outlet_name}"`.
     pub source: String,
     /// DID of the invoking agent.
     pub invoked_by: String,
@@ -413,8 +413,10 @@ impl ContextProvider for McpNapiBridgeProvider {
         _tool_name: &str,
         _arguments: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
+        // MCP trait uses canonical `tool` vocabulary; bridge still uses
+        // outlet-era naming internally (see OUT-007 lexical translator).
         Err(
-            "tool invocation through MCP server requires ContextManager tool registry integration"
+            "tool invocation through MCP server requires ContextManager outlet registry integration"
                 .to_owned(),
         )
     }
@@ -759,7 +761,7 @@ pub async fn mcp_client_list_tools(
 #[allow(clippy::needless_pass_by_value)]
 pub async fn mcp_client_invoke(
     handle: &NapiMcpClientHandle,
-    tool_name: String,
+    outlet_name: String,
     input_json: String,
     context_id: String,
     invoker_did: String,
@@ -789,7 +791,7 @@ pub async fn mcp_client_invoke(
     })?;
 
     let result = client_guard
-        .invoke(&tool_name, input, &context_id, &invoker_did)
+        .invoke(&outlet_name, input, &context_id, &invoker_did)
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Transport {
                 message: format!("tools/call failed: {e}"),

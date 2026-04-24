@@ -31,7 +31,7 @@ const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/manager/lifecycle.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/queries.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/standing.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/tools.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/manager/outlets.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/trust_recovery.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/ttl_close.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/manager/mod.rs"),
@@ -47,14 +47,14 @@ const WASM_CONSEQUENCE_SRC: &str =
     include_str!("../../../../crates/scp-ffi/wasm/src/consequence.rs");
 
 // Non-WASM FFI bridge sources. PR #1606 / C4 wired all 3 of these to
-// `ContextManager::invoke_tool_with_economy` so per-invocation pricing,
+// `ContextManager::invoke_outlet_with_economy` so per-invocation pricing,
 // spending UCAN, velocity tracking, budget enforcement, and the hard
 // rate limit are enforced for Python / Node / Swift / Kotlin clients.
 // The structural assertions in `c4_tool_invoke_economy_*` below pin
 // the bridge → runtime delegation so a future refactor cannot silently
 // regress to the bypass path.
-const PYO3_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/tools.rs");
-const NAPI_TOOLS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/tools.rs");
+const PYO3_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/outlets.rs");
+const NAPI_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/outlets.rs");
 const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
 
 // Transport layer sources for Batch 3 assertions
@@ -497,63 +497,63 @@ fn governance_enforces_economic_policy() {
 
 #[test]
 fn invoke_tool_with_economy_wires_escalation_and_rollback() {
-    // The manager wrapper must (a) call the free invoke_tool, (b) record the
+    // The manager wrapper must (a) call the free invoke_outlet, (b) record the
     // new velocity entry so compute_escalated_cost sees it, (c) thread the
-    // per-context velocity_tracker and message_pricing into ToolEconomyContext,
+    // per-context velocity_tracker and message_pricing into OutletEconomyContext,
     // and (d) roll back the velocity entry on invocation failure.
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "invoke_tool"),
-        "invoke_tool_with_economy must delegate to invoke_tool"
+        fn_body_contains(MANAGER_SRC, "invoke_outlet_with_economy", "invoke_outlet"),
+        "invoke_outlet_with_economy must delegate to invoke_outlet"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "record_message"),
-        "invoke_tool_with_economy must record the invocation for velocity tracking"
+        fn_body_contains(MANAGER_SRC, "invoke_outlet_with_economy", "record_message"),
+        "invoke_outlet_with_economy must record the invocation for velocity tracking"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "velocity_tracker"),
-        "invoke_tool_with_economy must thread velocity_tracker into ToolEconomyContext"
+        fn_body_contains(MANAGER_SRC, "invoke_outlet_with_economy", "velocity_tracker"),
+        "invoke_outlet_with_economy must thread velocity_tracker into OutletEconomyContext"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "message_pricing"),
-        "invoke_tool_with_economy must thread message_pricing into ToolEconomyContext"
+        fn_body_contains(MANAGER_SRC, "invoke_outlet_with_economy", "message_pricing"),
+        "invoke_outlet_with_economy must thread message_pricing into OutletEconomyContext"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", ".rollback("),
-        "invoke_tool_with_economy must roll back the velocity entry on failure \
+        fn_body_contains(MANAGER_SRC, "invoke_outlet_with_economy", ".rollback("),
+        "invoke_outlet_with_economy must roll back the velocity entry on failure \
          via the F5 identity-based `rollback(token)` API"
     );
 }
 
-/// D4: `invoke_tool_with_economy` must reference the hard rate limit.
+/// D4: `invoke_outlet_with_economy` must reference the hard rate limit.
 /// Enforced structurally so a future refactor cannot silently drop
 /// the Matrix Synapse–style defense-in-depth cap on the tool path.
 #[test]
 fn invoke_tool_with_economy_enforces_hard_rate_limit() {
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "hard_rate_limit"),
-        "invoke_tool_with_economy must reference hard_rate_limit so the Matrix Synapse–style \
+        fn_body_contains(MANAGER_SRC, "invoke_outlet_with_economy", "hard_rate_limit"),
+        "invoke_outlet_with_economy must reference hard_rate_limit so the Matrix Synapse–style \
          defense-in-depth cap is enforced on the tool path (D4)"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_tool_with_economy", "try_consume"),
-        "invoke_tool_with_economy must call try_consume on the hard rate limit token bucket \
+        fn_body_contains(MANAGER_SRC, "invoke_outlet_with_economy", "try_consume"),
+        "invoke_outlet_with_economy must call try_consume on the hard rate limit token bucket \
          before any Phase 1 bookkeeping — mirrors enforce_send_economy at messaging.rs:346"
     );
 }
 
-/// D4: every Phase 1 failure branch in `invoke_tool_with_economy`
+/// D4: every Phase 1 failure branch in `invoke_outlet_with_economy`
 /// MUST refund the hard rate limit token. We expect at least 3 inline
 /// refund sites: `economy_pre_check` failure, `record_spend` failure,
 /// and `authorize_tool_payment` failure. Dropping any branch leaks a
 /// rate-limit token on failure.
 #[test]
 fn invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
-    let body = extract_fn_body(MANAGER_SRC, "invoke_tool_with_economy")
-        .expect("invoke_tool_with_economy body must exist");
+    let body = extract_fn_body(MANAGER_SRC, "invoke_outlet_with_economy")
+        .expect("invoke_outlet_with_economy body must exist");
     let refund_sites = body.matches("hard_rate_limit.refund").count();
     assert!(
         refund_sites >= 3,
-        "invoke_tool_with_economy must have at least 3 inline hard_rate_limit.refund sites \
+        "invoke_outlet_with_economy must have at least 3 inline hard_rate_limit.refund sites \
          (economy_pre_check failure, record_spend failure, authorize_tool_payment failure); \
          found {refund_sites}. Dropping any branch leaks a rate-limit token on failure."
     );
@@ -576,14 +576,14 @@ fn invoke_tool_with_economy_releases_lock_before_executor() {
     //       authorize) and once in Phase 3 (post-invocation bookkeeping).
     //       A single lock acquisition would imply the lock is held across
     //       the executor future.
-    // Phase B: invoke_tool_with_economy uses lock_context (Phase 1) and
+    // Phase B: invoke_outlet_with_economy uses lock_context (Phase 1) and
     // relock_context (Phase 3) instead of bare self.contexts.lock().await.
     // The lock is dropped between phases so the executor future runs unlocked.
-    let body = extract_fn_body(MANAGER_SRC, "invoke_tool_with_economy")
-        .expect("invoke_tool_with_economy body must exist");
+    let body = extract_fn_body(MANAGER_SRC, "invoke_outlet_with_economy")
+        .expect("invoke_outlet_with_economy body must exist");
     assert!(
         body.contains("lock_context") && body.contains("relock_context"),
-        "invoke_tool_with_economy must use lock_context (Phase 1) and \
+        "invoke_outlet_with_economy must use lock_context (Phase 1) and \
          relock_context (Phase 3) for per-context locking with generation check"
     );
 }
@@ -701,7 +701,7 @@ fn wasm_send_message_inspects_spending_ucan_and_economic_policy() {
 // C4 (#1606) — Bridge tool-invoke economy wiring
 //
 // All 3 non-WASM FFI bridges (PyO3, NAPI, UniFFI) MUST route tool
-// invocation through `ContextManager::invoke_tool_with_economy`. The
+// invocation through `ContextManager::invoke_outlet_with_economy`. The
 // previous bypass path called `try_consume_hard_rate_limit_*` directly
 // against the bridge-owned tool registry, which disabled per-invocation
 // pricing, spending UCAN AND-composition, velocity tracking, budget
@@ -717,8 +717,8 @@ fn wasm_send_message_inspects_spending_ucan_and_economic_policy() {
 #[test]
 fn c4_pyo3_tool_invoke_routes_through_invoke_tool_with_economy() {
     assert!(
-        fn_body_contains(PYO3_TOOLS_SRC, "py_tool_invoke", "invoke_tool_with_economy"),
-        "PyO3 py_tool_invoke must call ContextManager::invoke_tool_with_economy \
+        fn_body_contains(PYO3_OUTLETS_SRC, "py_outlet_invoke", "invoke_outlet_with_economy"),
+        "PyO3 py_outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). Calling try_consume_hard_rate_limit_blocking against \
          a bridge-owned registry instead disables per-invocation pricing, \
          spending UCAN, velocity tracking, and budget enforcement for Python \
@@ -729,28 +729,28 @@ fn c4_pyo3_tool_invoke_routes_through_invoke_tool_with_economy() {
 #[test]
 fn c4_pyo3_tool_invoke_accepts_spending_ucan() {
     // The bridge MUST accept the spending UCAN parameter — the
-    // runtime's `invoke_tool_with_economy` requires it for §19.5
+    // runtime's `invoke_outlet_with_economy` requires it for §19.5
     // AND-composition on paid actions.
     let body =
-        extract_fn_body(PYO3_TOOLS_SRC, "py_tool_invoke").expect("py_tool_invoke body must exist");
+        extract_fn_body(PYO3_OUTLETS_SRC, "py_outlet_invoke").expect("py_outlet_invoke body must exist");
     assert!(
         body.contains("spending_ucan"),
-        "PyO3 py_tool_invoke must accept and forward a spending UCAN argument \
+        "PyO3 py_outlet_invoke must accept and forward a spending UCAN argument \
          (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
         body.contains("parse_ucan"),
-        "PyO3 py_tool_invoke must parse the spending UCAN JWT into a UcanToken \
-         before passing it to invoke_tool_with_economy."
+        "PyO3 py_outlet_invoke must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_outlet_with_economy."
     );
 }
 
 #[test]
 fn c4_napi_tool_invoke_routes_through_invoke_tool_with_economy() {
     assert!(
-        fn_body_contains(NAPI_TOOLS_SRC, "tool_invoke", "invoke_tool_with_economy"),
-        "NAPI tool_invoke must call ContextManager::invoke_tool_with_economy \
+        fn_body_contains(NAPI_OUTLETS_SRC, "outlet_invoke", "invoke_outlet_with_economy"),
+        "NAPI outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). The previous bypass path called \
          try_consume_hard_rate_limit against the bridge-owned tool registry, \
          disabling per-invocation pricing, spending UCAN, velocity tracking, \
@@ -761,17 +761,17 @@ fn c4_napi_tool_invoke_routes_through_invoke_tool_with_economy() {
 #[test]
 fn c4_napi_tool_invoke_accepts_spending_ucan() {
     let body =
-        extract_fn_body(NAPI_TOOLS_SRC, "tool_invoke").expect("NAPI tool_invoke body must exist");
+        extract_fn_body(NAPI_OUTLETS_SRC, "outlet_invoke").expect("NAPI outlet_invoke body must exist");
     assert!(
         body.contains("spending_ucan_jwt"),
-        "NAPI tool_invoke must accept and forward a spending_ucan_jwt argument \
+        "NAPI outlet_invoke must accept and forward a spending_ucan_jwt argument \
          (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
         body.contains("parse_ucan"),
-        "NAPI tool_invoke must parse the spending UCAN JWT into a UcanToken \
-         before passing it to invoke_tool_with_economy."
+        "NAPI outlet_invoke must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_outlet_with_economy."
     );
 }
 
@@ -850,10 +850,10 @@ fn wasm_set_economic_policy_governance_rejects_paid_policy() {
 #[test]
 fn c4_uniffi_tool_invoke_routes_through_invoke_tool_with_economy() {
     // `extract_fn_body` returns the first match, which is the
-    // top-level `tool_invoke` (not `tool_invoke_cross_context`).
+    // top-level `outlet_invoke` (not `outlet_invoke_cross_context`).
     assert!(
-        fn_body_contains(UNIFFI_BRIDGE_SRC, "tool_invoke", "invoke_tool_with_economy"),
-        "UniFFI tool_invoke must call ContextManager::invoke_tool_with_economy \
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_invoke", "invoke_outlet_with_economy"),
+        "UniFFI outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). The previous bypass path called \
          try_consume_hard_rate_limit against the bridge-owned tool registry, \
          disabling per-invocation pricing, spending UCAN, velocity tracking, \
@@ -863,18 +863,18 @@ fn c4_uniffi_tool_invoke_routes_through_invoke_tool_with_economy() {
 
 #[test]
 fn c4_uniffi_tool_invoke_accepts_spending_ucan() {
-    let body = extract_fn_body(UNIFFI_BRIDGE_SRC, "tool_invoke")
-        .expect("UniFFI tool_invoke body must exist");
+    let body = extract_fn_body(UNIFFI_BRIDGE_SRC, "outlet_invoke")
+        .expect("UniFFI outlet_invoke body must exist");
     assert!(
         body.contains("spending_ucan_jwt"),
-        "UniFFI tool_invoke must accept and forward a spending_ucan_jwt argument \
+        "UniFFI outlet_invoke must accept and forward a spending_ucan_jwt argument \
          (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
         body.contains("parse_ucan"),
-        "UniFFI tool_invoke must parse the spending UCAN JWT into a UcanToken \
-         before passing it to invoke_tool_with_economy."
+        "UniFFI outlet_invoke must parse the spending UCAN JWT into a UcanToken \
+         before passing it to invoke_outlet_with_economy."
     );
 }
 

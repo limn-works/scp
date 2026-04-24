@@ -66,7 +66,7 @@ use scp_core::context::builder::{
 use scp_core::context::manager::{ContextManager, ContextPersistence};
 use scp_core::context::providers::ProtocolRepositoryContextBridge;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
-use scp_core::context::tools::ToolRegistry;
+use scp_core::context::tools::OutletRegistry;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
@@ -141,11 +141,11 @@ macro_rules! pyscp_check_handle {
 /// A sync tool handler function that takes JSON input and returns JSON output.
 ///
 /// Stored in the FFI bridge state when Python callers register tool handlers
-/// via [`register_tool_handler`]. The FFI bridge dispatches tool invocations
+/// via [`register_outlet_handler`]. The FFI bridge dispatches tool invocations
 /// through these handlers instead of echoing validated input.
 ///
 /// See SCP-212 and ADR-010 for the handler registration design.
-pub type ToolHandler =
+pub type OutletHandler =
     Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
@@ -696,7 +696,7 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // `Arc<EncryptingAdapter>` is released when the `PyBridgeInstance`
         // is dropped.
         // Clear the typed per-context FFI state registry so per-context
-        // `ToolRegistry`, `EventLog`, receive channel senders, and
+        // `OutletRegistry`, `EventLog`, receive channel senders, and
         // registered tool handlers drop.
         self.ffi_bridge_state.clear();
         // Clear MCP registries so server shutdown senders and client
@@ -1293,7 +1293,7 @@ fn ffi_state_registry() -> &'static DashMap<String, FfiBridgeState> {
 /// and `mcp.rs`, plus FFI-specific message channel and tool handler state.
 pub struct FfiBridgeState {
     /// Tool registry for this context.
-    pub tool_registry: ToolRegistry,
+    pub outlet_registry: OutletRegistry,
     /// Event log (Merkle tree) for this context.
     pub event_log: EventLog,
     /// Role state tracking member capabilities.
@@ -1316,13 +1316,13 @@ pub struct FfiBridgeState {
     /// Registered tool handlers keyed by tool ID.
     ///
     /// Python callers register callable handlers via
-    /// [`register_tool_handler`]. When a tool is invoked through
-    /// `FfiBridgeProvider::invoke_tool`, the handler is looked up here and
+    /// [`register_outlet_handler`]. When a tool is invoked through
+    /// `FfiBridgeProvider::invoke_outlet`, the handler is looked up here and
     /// called with the validated JSON input. If no handler is registered,
     /// the invocation falls back to echoing the validated input.
     ///
     /// See SCP-212 for the handler registration design.
-    pub tool_handlers: HashMap<String, ToolHandler>,
+    pub outlet_handlers: HashMap<String, OutletHandler>,
     /// Sender half of the receive channel (SCP-216).
     ///
     /// Stored here so that the transport layer (and `deliver_message`) can
@@ -1342,7 +1342,7 @@ pub struct FfiBridgeState {
     /// Session store for stateful tool sessions (spec section 6.2.1).
     ///
     /// Stores active tool sessions keyed by session ID. Sessions are created
-    /// via `py_tool_session_create` and cleaned up on context close.
+    /// via `py_outlet_session_open` and cleaned up on context close.
     pub session_store: scp_core::context::tools::SessionStore,
 }
 
@@ -1354,13 +1354,13 @@ pub const RECEIVE_BUFFER_CAPACITY: usize = 1000;
 
 /// Registers FFI-specific state for a new context.
 ///
-/// Creates a [`ToolRegistry`], [`EventLog`], [`ContextRoleState`], and
+/// Creates a [`OutletRegistry`], [`EventLog`], [`ContextRoleState`], and
 /// [`RevocationList`] for the context. The creator DID is assigned admin
 /// capabilities (all capabilities in the ceiling).
 ///
 /// `user_ceiling` contains user-provided ceiling strings in colon format
-/// (e.g. `"tool:invoke:*"`). These are converted to UCAN underscore format
-/// (e.g. `"tool_invoke:*"`) via `Capability::new` + `ucan_capability_name`.
+/// (e.g. `"outlet:call:*"`). These are converted to UCAN underscore format
+/// (e.g. `"outlet_call:*"`) via `Capability::new` + `ucan_capability_name`.
 /// Pass an empty slice to use the default ceiling.
 ///
 /// # Errors
@@ -1383,7 +1383,7 @@ pub fn register_ffi_state(
             )));
         }
         Entry::Vacant(vacant) => {
-            let tool_registry = ToolRegistry::new();
+            let outlet_registry = OutletRegistry::new();
             let event_log = EventLog::new(context_id.to_owned());
             let ceiling = default_ceiling();
             let ceiling_strings = if user_ceiling.is_empty() {
@@ -1407,14 +1407,14 @@ pub fn register_ffi_state(
             let nonce_tracker = NonceTracker::new(context_id.to_owned(), SystemClock);
 
             let state = FfiBridgeState {
-                tool_registry,
+                outlet_registry,
                 event_log,
                 role_state,
                 revocation_list,
                 nonce_tracker,
                 ceiling_strings,
                 creator_did: creator_did.to_owned(),
-                tool_handlers: HashMap::new(),
+                outlet_handlers: HashMap::new(),
                 message_tx: None,
                 message_rx: None,
                 session_store: scp_core::context::tools::SessionStore::new(),
@@ -1470,29 +1470,29 @@ pub fn context_ids_for_member(member_did: &str) -> Vec<String> {
 /// Registers a tool handler for a specific tool in a context.
 ///
 /// The handler is a sync closure that takes JSON input and returns JSON
-/// output. It is called by `FfiBridgeProvider::invoke_tool` when the
+/// output. It is called by `FfiBridgeProvider::invoke_outlet` when the
 /// tool is invoked via MCP. The handler must already have a corresponding
-/// tool registration in the context's `ToolRegistry` (registered via
-/// `py_tool_register`).
+/// tool registration in the context's `OutletRegistry` (registered via
+/// `py_outlet_register`).
 ///
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the context is not found or the
-/// tool is not registered in the context's `ToolRegistry`.
-pub fn register_tool_handler(
+/// tool is not registered in the context's `OutletRegistry`.
+pub fn register_outlet_handler(
     context_id: &str,
-    tool_id: &str,
-    handler: ToolHandler,
+    outlet_id: &str,
+    handler: OutletHandler,
 ) -> Result<(), ScpPyError> {
     with_ffi_state(context_id, |st| {
         // Verify the tool exists in the registry before accepting a handler.
-        if st.tool_registry.get(tool_id).is_none() {
+        if st.outlet_registry.get(outlet_id).is_none() {
             return Err(ScpPyError::context(format!(
-                "tool '{tool_id}' not found in context '{context_id}' \
+                "tool '{outlet_id}' not found in context '{context_id}' \
                  -- register the tool before adding a handler"
             )));
         }
-        st.tool_handlers.insert(tool_id.to_owned(), handler);
+        st.outlet_handlers.insert(outlet_id.to_owned(), handler);
         Ok(())
     })
 }
@@ -2375,8 +2375,8 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// User-provided ceiling strings in colon format (e.g. `"tool:invoke:*"`)
-    /// must be converted to UCAN underscore format (e.g. `"tool_invoke:*"`)
+    /// User-provided ceiling strings in colon format (e.g. `"outlet:call:*"`)
+    /// must be converted to UCAN underscore format (e.g. `"outlet_call:*"`)
     /// when stored in `FfiBridgeState.ceiling_strings`. Without this
     /// conversion, `mint_ucan` ceiling checks fail because the minted
     /// capability name (underscore format) doesn't match the stored
@@ -2387,10 +2387,10 @@ mod tests {
         let creator = "did:dht:z6MkCeilingConv";
 
         let user_ceiling = vec![
-            "tool:invoke:*".to_owned(),
+            "outlet:call:*".to_owned(),
             "messages:write".to_owned(),
             "context:child:create".to_owned(),
-            "tool:invoke:calculator".to_owned(),
+            "outlet:call:calculator".to_owned(),
         ];
 
         register_context(&ctx_id, creator, &user_ceiling).unwrap();
@@ -2399,16 +2399,16 @@ mod tests {
 
         // Compound resources must have underscores joining their segments.
         assert!(
-            ceiling.contains("tool_invoke:*"),
-            "expected 'tool_invoke:*' but got: {ceiling:?}"
+            ceiling.contains("outlet_call:*"),
+            "expected 'outlet_call:*' but got: {ceiling:?}"
         );
         assert!(
             ceiling.contains("context_child:create"),
             "expected 'context_child:create' but got: {ceiling:?}"
         );
         assert!(
-            ceiling.contains("tool_invoke:calculator"),
-            "expected 'tool_invoke:calculator' but got: {ceiling:?}"
+            ceiling.contains("outlet_call:calculator"),
+            "expected 'outlet_call:calculator' but got: {ceiling:?}"
         );
         // Simple two-segment capabilities should pass through unchanged.
         assert!(
@@ -2417,8 +2417,8 @@ mod tests {
         );
         // Raw colon-format strings must NOT be present.
         assert!(
-            !ceiling.contains("tool:invoke:*"),
-            "raw 'tool:invoke:*' should not be in ceiling: {ceiling:?}"
+            !ceiling.contains("outlet:call:*"),
+            "raw 'outlet:call:*' should not be in ceiling: {ceiling:?}"
         );
         assert!(
             !ceiling.contains("context:child:create"),
@@ -2439,14 +2439,14 @@ mod tests {
 
         let ceiling = with_ffi_state(&ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
 
-        // Default ceiling must include tool_invoke:* (not tool:invoke:*).
+        // Default ceiling must include outlet_invoke:* (not tool:invoke:*).
         assert!(
-            ceiling.contains("tool_invoke:*"),
-            "default ceiling should contain 'tool_invoke:*' but got: {ceiling:?}"
+            ceiling.contains("outlet_call:*"),
+            "default ceiling should contain 'outlet_call:*' but got: {ceiling:?}"
         );
         assert!(
-            !ceiling.contains("tool:invoke:*"),
-            "default ceiling should not contain raw 'tool:invoke:*': {ceiling:?}"
+            !ceiling.contains("outlet:call:*"),
+            "default ceiling should not contain raw 'outlet:call:*': {ceiling:?}"
         );
 
         remove_context(&ctx_id);

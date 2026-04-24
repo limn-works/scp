@@ -12,7 +12,7 @@
 //! ```
 //!
 //! - `context_id`: The context identifier, or `*` for wildcard (all contexts).
-//! - `resource`: The resource type (e.g., `messages`, `tool_invoke`, `member`,
+//! - `resource`: The resource type (e.g., `messages`, `outlet_invoke`, `member`,
 //!   `role`, `context`).
 //! - `action`: The action on the resource (e.g., `read`, `write`, `invite`,
 //!   `assign`, `close`, `assistant`).
@@ -69,7 +69,7 @@ use super::UcanError;
 pub struct CapabilityUri {
     /// The context identifier, or `None` for wildcard (`*`).
     context_id: Option<String>,
-    /// The resource type (e.g., `"messages"`, `"tool_invoke"`, `"member"`).
+    /// The resource type (e.g., `"messages"`, `"outlet_call"`, `"member"`).
     resource: String,
     /// The action on the resource (e.g., `"read"`, `"write"`, `"invite"`).
     action: String,
@@ -108,7 +108,7 @@ impl CapabilityUri {
         self.context_id.as_deref()
     }
 
-    /// Returns the resource type (e.g., `"messages"`, `"tool_invoke"`).
+    /// Returns the resource type (e.g., `"messages"`, `"outlet_call"`).
     #[must_use]
     pub fn resource(&self) -> &str {
         &self.resource
@@ -148,8 +148,8 @@ impl CapabilityUri {
     /// A wildcard URI matches any URI with the same resource and action.
     /// A specific URI matches only URIs with the same context ID, resource,
     /// and action. A wildcard action (`"*"`) on the granting URI matches any
-    /// action on the same resource (e.g., `tool_invoke:*` grants
-    /// `tool_invoke:calculator`).
+    /// action on the same resource (e.g., `outlet_invoke:*` grants
+    /// `outlet_invoke:calculator`).
     ///
     /// This is used during capability matching in UCAN validation: a token's
     /// attenuation must match the required capability.
@@ -181,12 +181,12 @@ impl CapabilityUri {
     /// Checks if this capability is within the context's capability ceiling.
     ///
     /// The ceiling is a set of capability names in `{resource}:{action}` format
-    /// (e.g., `"messages:write"`, `"tool_invoke:assistant"`). This performs a
+    /// (e.g., `"messages:write"`, `"outlet_call:assistant"`). This performs a
     /// constant-time set membership test as specified by ADR-016.
     ///
     /// A wildcard entry `{resource}:*` in the ceiling covers all actions on
-    /// that resource. For example, `"tool_invoke:*"` in the ceiling allows
-    /// `tool_invoke:calculator`, `tool_invoke:assistant`, etc.
+    /// that resource. For example, `"outlet_call:*"` in the ceiling allows
+    /// `outlet_invoke:calculator`, `outlet_invoke:assistant`, etc.
     ///
     /// # Arguments
     ///
@@ -371,9 +371,9 @@ mod tests {
 
     #[test]
     fn parse_tool_invoke_assistant() {
-        let uri: CapabilityUri = "scp:ctx:abc123/tool_invoke:assistant".parse().unwrap();
+        let uri: CapabilityUri = "scp:ctx:abc123/outlet_invoke:assistant".parse().unwrap();
         assert_eq!(uri.context_id(), Some("abc123"));
-        assert_eq!(uri.resource(), "tool_invoke");
+        assert_eq!(uri.resource(), "outlet_call");
         assert_eq!(uri.action(), "assistant");
     }
 
@@ -497,7 +497,7 @@ mod tests {
         let uris = [
             "scp:ctx:abc123/messages:write",
             "scp:ctx:abc123/messages:read",
-            "scp:ctx:abc123/tool_invoke:assistant",
+            "scp:ctx:abc123/outlet_invoke:assistant",
             "scp:ctx:abc123/member:invite",
             "scp:ctx:abc123/role:assign",
             "scp:ctx:abc123/context:close",
@@ -607,40 +607,40 @@ mod tests {
 
     #[test]
     fn matches_wildcard_action_grants_specific_action() {
-        // tool_invoke:* grants tool_invoke:calculator (#1326)
-        let granted = CapabilityUri::new("abc123", "tool_invoke", "*");
-        let required = CapabilityUri::new("abc123", "tool_invoke", "calculator");
+        // outlet_invoke:* grants outlet_invoke:calculator (#1326)
+        let granted = CapabilityUri::new("abc123", "outlet_call", "*");
+        let required = CapabilityUri::new("abc123", "outlet_call", "calculator");
         assert!(granted.matches(&required));
     }
 
     #[test]
     fn matches_wildcard_action_grants_any_action_on_same_resource() {
-        let granted = CapabilityUri::new("abc123", "tool_invoke", "*");
-        let required_a = CapabilityUri::new("abc123", "tool_invoke", "assistant");
-        let required_b = CapabilityUri::new("abc123", "tool_invoke", "calculator");
+        let granted = CapabilityUri::new("abc123", "outlet_call", "*");
+        let required_a = CapabilityUri::new("abc123", "outlet_call", "assistant");
+        let required_b = CapabilityUri::new("abc123", "outlet_call", "calculator");
         assert!(granted.matches(&required_a));
         assert!(granted.matches(&required_b));
     }
 
     #[test]
     fn matches_wildcard_action_does_not_cross_resources() {
-        let granted = CapabilityUri::new("abc123", "tool_invoke", "*");
+        let granted = CapabilityUri::new("abc123", "outlet_call", "*");
         let required = CapabilityUri::new("abc123", "messages", "write");
         assert!(!granted.matches(&required));
     }
 
     #[test]
     fn matches_wildcard_action_with_wildcard_context() {
-        let granted = CapabilityUri::wildcard("tool_invoke", "*");
-        let required = CapabilityUri::new("any-ctx", "tool_invoke", "calculator");
+        let granted = CapabilityUri::wildcard("outlet_call", "*");
+        let required = CapabilityUri::new("any-ctx", "outlet_call", "calculator");
         assert!(granted.matches(&required));
     }
 
     #[test]
     fn matches_specific_action_does_not_satisfy_wildcard_action_requirement() {
         // A specific grant cannot satisfy a wildcard action requirement.
-        let granted = CapabilityUri::new("abc123", "tool_invoke", "calculator");
-        let required = CapabilityUri::new("abc123", "tool_invoke", "*");
+        let granted = CapabilityUri::new("abc123", "outlet_call", "calculator");
+        let required = CapabilityUri::new("abc123", "outlet_call", "*");
         assert!(!granted.matches(&required));
     }
 
@@ -653,7 +653,7 @@ mod tests {
         let ceiling: HashSet<String> = [
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ]
         .into_iter()
         .collect();
@@ -690,15 +690,15 @@ mod tests {
 
     #[test]
     fn is_within_ceiling_wildcard_action_covers_specific() {
-        // "tool_invoke:*" in ceiling allows tool_invoke:calculator (#1326)
-        let ceiling: HashSet<String> = ["tool_invoke:*".to_owned()].into_iter().collect();
-        let uri = CapabilityUri::new("abc123", "tool_invoke", "calculator");
+        // "outlet_call:*" in ceiling allows outlet_invoke:calculator (#1326)
+        let ceiling: HashSet<String> = ["outlet_call:*".to_owned()].into_iter().collect();
+        let uri = CapabilityUri::new("abc123", "outlet_call", "calculator");
         assert!(uri.is_within_ceiling(&ceiling));
     }
 
     #[test]
     fn is_within_ceiling_wildcard_action_does_not_cross_resources() {
-        let ceiling: HashSet<String> = ["tool_invoke:*".to_owned()].into_iter().collect();
+        let ceiling: HashSet<String> = ["outlet_call:*".to_owned()].into_iter().collect();
         let uri = CapabilityUri::new("abc123", "messages", "write");
         assert!(!uri.is_within_ceiling(&ceiling));
     }
@@ -707,12 +707,12 @@ mod tests {
     fn is_within_ceiling_exact_match_preferred_over_wildcard() {
         // Both exact and wildcard are present — exact match takes the fast path.
         let ceiling: HashSet<String> = [
-            "tool_invoke:calculator".to_owned(),
-            "tool_invoke:*".to_owned(),
+            "outlet_call:calculator".to_owned(),
+            "outlet_call:*".to_owned(),
         ]
         .into_iter()
         .collect();
-        let uri = CapabilityUri::new("abc123", "tool_invoke", "calculator");
+        let uri = CapabilityUri::new("abc123", "outlet_call", "calculator");
         assert!(uri.is_within_ceiling(&ceiling));
     }
 
@@ -725,7 +725,7 @@ mod tests {
         let ceiling: HashSet<String> = [
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ]
         .into_iter()
         .collect();
@@ -856,7 +856,7 @@ mod tests {
         fn arb_resource() -> impl Strategy<Value = String> {
             prop_oneof![
                 Just("messages".to_owned()),
-                Just("tool_invoke".to_owned()),
+                Just("outlet_call".to_owned()),
                 Just("member".to_owned()),
                 Just("role".to_owned()),
                 Just("context".to_owned()),

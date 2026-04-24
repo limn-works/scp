@@ -2,15 +2,15 @@
 //!
 //! Exposes SCP tool operations to Python:
 //!
-//! - [`py_tool_register`] — Register a tool in a context (returns tool ID).
-//! - [`py_tool_invoke`] — Invoke a tool (returns JSON-compatible output).
-//! - [`py_tool_verify`] — Verify a tool against its test vectors.
+//! - [`py_outlet_register`] — Register a tool in a context (returns tool ID).
+//! - [`py_outlet_invoke`] — Invoke a tool (returns JSON-compatible output).
+//! - [`py_outlet_verify`] — Verify a tool against its test vectors.
 //!
 //! # Types
 //!
-//! - [`PyToolRegistration`] — Tool registration data (name, description,
+//! - [`PyOutletRegistration`] — Tool registration data (name, description,
 //!   schema, test vectors).
-//! - [`PyToolVerificationResult`] — Verification result (tool ID, pass/fail,
+//! - [`PyOutletVerificationResult`] — Verification result (tool ID, pass/fail,
 //!   failure messages).
 //!
 //! See ADR-013 in `.docs/adrs/phase-3.md` §4 for the bridge specification.
@@ -25,7 +25,7 @@ use crate::types::{json_to_py_dict, py_dict_to_json};
 use crate::validate;
 
 // ---------------------------------------------------------------------------
-// PyToolRegistration
+// PyOutletRegistration
 // ---------------------------------------------------------------------------
 
 /// Tool registration data exposed to Python.
@@ -36,9 +36,9 @@ use crate::validate;
 /// tool's input and output.
 ///
 /// See ADR-010 (tool registration) and ADR-013 §4 (bridge layer).
-#[pyclass(name = "ToolRegistration")]
+#[pyclass(name = "OutletRegistration")]
 #[derive(Debug)]
-pub struct PyToolRegistration {
+pub struct PyOutletRegistration {
     /// Human-readable tool name.
     #[pyo3(get)]
     pub name: String,
@@ -57,7 +57,7 @@ pub struct PyToolRegistration {
 }
 
 #[pymethods]
-impl PyToolRegistration {
+impl PyOutletRegistration {
     /// Creates a new tool registration.
     ///
     /// # Arguments
@@ -85,7 +85,7 @@ impl PyToolRegistration {
 
     fn __repr__(&self) -> String {
         format!(
-            "ToolRegistration(name={:?}, description={:?}, test_vectors={})",
+            "OutletRegistration(name={:?}, description={:?}, test_vectors={})",
             self.name,
             self.description,
             self.test_vectors.len()
@@ -94,19 +94,19 @@ impl PyToolRegistration {
 }
 
 // ---------------------------------------------------------------------------
-// PyToolVerificationResult
+// PyOutletVerificationResult
 // ---------------------------------------------------------------------------
 
 /// Result of verifying a tool against its test vectors.
 ///
-/// Returned by [`py_tool_verify`]. Contains the tool ID, overall pass/fail
+/// Returned by [`py_outlet_verify`]. Contains the tool ID, overall pass/fail
 /// status, and a list of failure messages (empty if all vectors passed).
-#[pyclass(name = "ToolVerificationResult")]
+#[pyclass(name = "OutletVerificationResult")]
 #[derive(Debug, Clone)]
-pub struct PyToolVerificationResult {
+pub struct PyOutletVerificationResult {
     /// The verified tool's ID.
     #[pyo3(get)]
-    pub tool_id: String,
+    pub outlet_id: String,
 
     /// `True` if all test vectors passed.
     #[pyo3(get)]
@@ -118,11 +118,11 @@ pub struct PyToolVerificationResult {
 }
 
 #[pymethods]
-impl PyToolVerificationResult {
+impl PyOutletVerificationResult {
     fn __repr__(&self) -> String {
         format!(
-            "ToolVerificationResult(tool_id={:?}, passed={}, failures={})",
-            self.tool_id,
+            "OutletVerificationResult(outlet_id={:?}, passed={}, failures={})",
+            self.outlet_id,
             self.passed,
             self.failures.len()
         )
@@ -150,10 +150,10 @@ impl PyToolVerificationResult {
 /// Raises `ContextError` if the context is not connected to the runtime
 /// or if registration fails (permission denied, schema invalid, etc.).
 ///
-/// See ADR-013 §4: `py_tool_register(handle, registration) -> str`.
+/// See ADR-013 §4: `py_outlet_register(handle, registration) -> str`.
 #[pyfunction]
-#[pyo3(name = "tool_register")]
-pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> PyResult<String> {
+#[pyo3(name = "outlet_register")]
+pub fn py_outlet_register(context_id: &str, registration: &Bound<'_, PyDict>) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
 
     // Extract registration fields from the Python dict.
@@ -171,7 +171,7 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
         .extract()?;
 
     // Validate extracted string fields at the bridge boundary.
-    validate::validate_tool_name(&name)?;
+    validate::validate_outlet_name(&name)?;
     validate::validate_did(&operator_did)?;
 
     // Extract schema as JSON. The schema dict should have `input_schema` and
@@ -227,14 +227,14 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
     let cost = extract_cost(registration)?;
 
     // Generate a tool ID from the name (deterministic, human-readable).
-    let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
+    let outlet_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
 
-    // Build the scp-core ToolRegistration.
-    let core_registration = scp_core::context::tools::ToolRegistration {
-        tool_id,
+    // Build the scp-core OutletRegistration.
+    let core_registration = scp_core::context::tools::OutletRegistration {
+        outlet_id,
         name,
         description,
-        schema: scp_core::context::tools::ToolSchema {
+        schema: scp_core::context::tools::OutletSchema {
             input_schema,
             output_schema,
         },
@@ -250,8 +250,8 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
 
     // Look up the context runtime and register the tool.
     let registered_id = crate::runtime::with_context(context_id, |rt| {
-        let (registered_id, _event) = scp_core::context::tools::register_tool(
-            &mut rt.tool_registry,
+        let (registered_id, _event) = scp_core::context::tools::register_outlet(
+            &mut rt.outlet_registry,
             &rt.role_state,
             core_registration,
             &rt.creator_did.clone(),
@@ -265,12 +265,12 @@ pub fn py_tool_register(context_id: &str, registration: &Bound<'_, PyDict>) -> P
 
 /// Validates a UCAN token for tool invocation authorization.
 ///
-/// Runs the full 11-step ADR-016 pipeline, requiring `tool_invoke:{tool_id}`
-/// or `tool_invoke:*` capability. Extracted to keep `py_tool_invoke` within
+/// Runs the full 11-step ADR-016 pipeline, requiring `outlet_call:{outlet_id}`
+/// or `outlet_call:*` capability. Extracted to keep `py_outlet_invoke` within
 /// the 100-line clippy limit.
-fn validate_tool_ucan(
+fn validate_outlet_ucan(
     context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     ucan_token: &str,
     identity_did: &str,
     proof_tokens: Option<&Vec<String>>,
@@ -303,12 +303,12 @@ fn validate_tool_ucan(
             clock: &scp_primitives::SystemClock,
         };
 
-        scp_core::context::tools::validate_tool_invocation_ucan(
-            ucan_token, context_id, tool_id, &mut ctx,
+        scp_core::context::tools::validate_outlet_invocation_ucan(
+            ucan_token, context_id, outlet_id, &mut ctx,
         )
         .map_err(|e| {
             ScpPyError::ucan(format!(
-                "UCAN authorization failed for tool '{tool_id}': {e}"
+                "UCAN authorization failed for tool '{outlet_id}': {e}"
             ))
         })
     })?;
@@ -316,7 +316,7 @@ fn validate_tool_ucan(
 }
 
 /// Invokes a tool within an SCP context, fully wired through the
-/// `ContextManager::invoke_tool_with_economy` pipeline.
+/// `ContextManager::invoke_outlet_with_economy` pipeline.
 ///
 /// This is the SINGLE entry point for tool invocation through the `PyO3`
 /// bridge. Every paid-action concern — per-invocation pricing, spending
@@ -329,26 +329,26 @@ fn validate_tool_ucan(
 /// needed.
 ///
 /// Validates the UCAN token for tool invocation authorization before
-/// dispatching. The UCAN must contain a `tool_invoke:{tool_id}` or
-/// `tool_invoke:*` capability scoped to the context.
+/// dispatching. The UCAN must contain a `outlet_call:{outlet_id}` or
+/// `outlet_call:*` capability scoped to the context.
 ///
 /// Dispatches to a registered tool handler if one exists (registered via
-/// [`crate::runtime::register_tool_handler`]). The runtime validates
+/// [`crate::runtime::register_outlet_handler`]). The runtime validates
 /// input/output schemas and computes the input/output hashes for the
-/// `ToolInvokedEvent`. If no handler is registered, falls back to
+/// `OutletInvokedEvent`. If no handler is registered, falls back to
 /// returning validated input with metadata (schema-only mode), identical
-/// to `FfiBridgeProvider::invoke_tool` in `mcp.rs`.
+/// to `FfiBridgeProvider::invoke_outlet` in `mcp.rs`.
 ///
 /// # Arguments
 ///
 /// * `context_id` — The ID of the context containing the tool.
-/// * `tool_id` — The ID of the tool to invoke.
+/// * `outlet_id` — The ID of the tool to invoke.
 /// * `input` — A Python dict of input parameters matching the tool's
 ///   input schema.
 /// * `identity_did` — The DID of the invoking identity (used for
 ///   capability checking).
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Must contain `outlet_call:{outlet_id}` or `outlet_call:*` capability.
 ///   Validated using the full 11-step ADR-016 pipeline.
 /// * `spending_ucan` — Optional JWT-encoded spending UCAN
 ///   (`SpendingCapability`) for paid tool invocations. Required when an
@@ -371,18 +371,18 @@ fn validate_tool_ucan(
 /// underlying tool dispatch fails. Callers should consult `.code` rather
 /// than string-matching `.message`.
 ///
-/// See ADR-013 §4: `py_tool_invoke(handle, tool_id, input, identity) -> PyObject`.
+/// See ADR-013 §4: `py_outlet_invoke(handle, outlet_id, input, identity) -> PyObject`.
 /// See SCP-212 for the handler registration and dispatch design.
 /// See spec §6.2, §8, §19.5, §19.7, ADR-016, and issue #319.
 #[pyfunction]
-#[pyo3(name = "tool_invoke")]
-#[pyo3(signature = (context_id, tool_id, input, identity_did, ucan_token, proof_tokens=None, spending_ucan=None))]
+#[pyo3(name = "outlet_invoke")]
+#[pyo3(signature = (context_id, outlet_id, input, identity_did, ucan_token, proof_tokens=None, spending_ucan=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 #[allow(clippy::too_many_arguments)] // Bridge mirrors the runtime's economy entry point.
-pub fn py_tool_invoke(
+pub fn py_outlet_invoke(
     py: Python<'_>,
     context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     input: &Bound<'_, PyDict>,
     identity_did: &str,
     ucan_token: &str,
@@ -390,7 +390,7 @@ pub fn py_tool_invoke(
     spending_ucan: Option<&str>,
 ) -> PyResult<PyObject> {
     validate::validate_context_id(context_id)?;
-    validate::validate_tool_id(tool_id)?;
+    validate::validate_outlet_id(outlet_id)?;
     validate::validate_did(identity_did)?;
     validate::validate_ucan_token(ucan_token)?;
     if let Some(jwt) = spending_ucan {
@@ -409,9 +409,9 @@ pub fn py_tool_invoke(
     // nonce tracker, capability ceiling, proof resolver). The runtime
     // wrapper does NOT re-validate the action UCAN — it enforces the
     // economy/budget/spending side. See spec §6.2, §8, ADR-016, #319.
-    validate_tool_ucan(
+    validate_outlet_ucan(
         context_id,
-        tool_id,
+        outlet_id,
         ucan_token,
         identity_did,
         proof_tokens.as_ref(),
@@ -433,29 +433,29 @@ pub fn py_tool_invoke(
 
     // Snapshot the bridge-owned tool registry and (optionally) the
     // registered handler closure BEFORE entering the runtime call. The
-    // runtime requires a `&ToolRegistry` so we clone the registry once
+    // runtime requires a `&OutletRegistry` so we clone the registry once
     // (cheap — Vec of registrations); the handler is an `Arc<dyn Fn>`
     // so cloning is a refcount bump. Doing this OUTSIDE the runtime
     // call keeps the bridge-side DashMap shard lock acquisition split
     // from the runtime's `contexts` mutex, matching the lock-split
     // discipline in `mcp.rs`.
     let ctx_id_owned = context_id.to_owned();
-    let tool_id_owned = tool_id.to_owned();
+    let outlet_id_owned = outlet_id.to_owned();
     let identity_did_owned = identity_did.to_owned();
     let (registry, handler) = crate::runtime::with_context(context_id, |rt| {
         Ok((
-            rt.tool_registry.clone(),
-            rt.tool_handlers.get(tool_id).cloned(),
+            rt.outlet_registry.clone(),
+            rt.outlet_handlers.get(outlet_id).cloned(),
         ))
     })?;
 
     // Build the executor closure. The runtime invokes the executor in
-    // Phase 2 of `invoke_tool_with_economy` WITHOUT holding the
+    // Phase 2 of `invoke_outlet_with_economy` WITHOUT holding the
     // `contexts` mutex. The closure dispatches to a registered Python
     // handler when present and falls back to schema-only echo mode
     // otherwise (matching the prior PyO3 behavior).
     let ctx_id_for_executor = ctx_id_owned.clone();
-    let tool_id_for_executor = tool_id_owned.clone();
+    let outlet_id_for_executor = outlet_id_owned.clone();
     let identity_did_for_executor = identity_did_owned.clone();
     let executor = move |input: serde_json::Value| {
         let handler = handler.clone();
@@ -464,7 +464,7 @@ pub fn py_tool_invoke(
             handler.map_or_else(
                 || {
                     Ok(serde_json::json!({
-                        "tool": tool_id_for_executor,
+                        "tool": outlet_id_for_executor,
                         "context": ctx_id_for_executor,
                         "status": "validated",
                         "input_valid": true,
@@ -474,7 +474,7 @@ pub fn py_tool_invoke(
                 },
                 |h| {
                     h(input).map_err(|e| {
-                        format!("tool handler for '{tool_id_for_executor}' failed: {e}")
+                        format!("tool handler for '{outlet_id_for_executor}' failed: {e}")
                     })
                 },
             )
@@ -487,15 +487,15 @@ pub fn py_tool_invoke(
     // multi-thread global runtime is safe (matches `py_context_send`).
     let manager = crate::runtime::context_manager()?;
     let invoker_did_typed: scp_primitives::DID = identity_did_owned.into();
-    let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id_owned.as_str());
+    let outlet_id_typed = scp_core::context::tools::OutletId::from(outlet_id_owned.as_str());
     let rt = crate::runtime()?;
     let outcome = rt
         .block_on(async {
             manager
-                .invoke_tool_with_economy(
+                .invoke_outlet_with_economy(
                     &ctx_id_owned,
                     &registry,
-                    &tool_id_typed,
+                    &outlet_id_typed,
                     input_json,
                     &invoker_did_typed,
                     spending_ucan_token.as_ref(),
@@ -508,7 +508,7 @@ pub fn py_tool_invoke(
 
     // Mark the time of last successful invocation for any future
     // observability hooks. (`outcome.event` carries the canonical
-    // `ToolInvokedEvent` — the transport / event-log layer is the one
+    // `OutletInvokedEvent` — the transport / event-log layer is the one
     // responsible for signing and appending to the Merkle log.)
     let _ = outcome.event;
 
@@ -520,11 +520,11 @@ pub fn py_tool_invoke(
 /// # Arguments
 ///
 /// * `context_id` — The ID of the context containing the tool.
-/// * `tool_id` — The ID of the tool to verify.
+/// * `outlet_id` — The ID of the tool to verify.
 ///
 /// # Returns
 ///
-/// A [`PyToolVerificationResult`] with the tool ID, overall pass/fail
+/// A [`PyOutletVerificationResult`] with the tool ID, overall pass/fail
 /// status, and any failure messages.
 ///
 /// # Errors
@@ -532,26 +532,26 @@ pub fn py_tool_invoke(
 /// Raises `ContextError` if the context is not connected or the tool
 /// is not found.
 ///
-/// See ADR-013 §4: `py_tool_verify(handle, tool_id) -> PyToolVerificationResult`.
+/// See ADR-013 §4: `py_outlet_verify(handle, outlet_id) -> PyOutletVerificationResult`.
 #[pyfunction]
-#[pyo3(name = "tool_verify")]
-pub fn py_tool_verify(context_id: &str, tool_id: &str) -> PyResult<PyToolVerificationResult> {
+#[pyo3(name = "outlet_verify")]
+pub fn py_outlet_verify(context_id: &str, outlet_id: &str) -> PyResult<PyOutletVerificationResult> {
     validate::validate_context_id(context_id)?;
-    validate::validate_tool_id(tool_id)?;
+    validate::validate_outlet_id(outlet_id)?;
     // Look up the context and verify the tool against its test vectors.
     // The executor returns the expected output (identity function) since the
     // bridge layer has no external tool executor. This verifies the test
     // vector structure is intact.
     let result = crate::runtime::with_context(context_id, |rt| {
-        let (verification_result, _event) = scp_core::context::tools::verify_tool(
-            &rt.tool_registry,
-            tool_id,
+        let (verification_result, _event) = scp_core::context::tools::verify_outlet(
+            &rt.outlet_registry,
+            outlet_id,
             // Identity executor: returns the expected output for each vector.
             // This validates the test vector structure; real execution verification
             // happens when a full executor is connected.
             |input| {
                 // Look up the tool to find the matching test vector.
-                if let Some(registration) = rt.tool_registry.get(tool_id) {
+                if let Some(registration) = rt.outlet_registry.get(outlet_id) {
                     for vector in &registration.test_vectors {
                         if vector.input == *input {
                             return vector.expected_output.clone();
@@ -567,7 +567,7 @@ pub fn py_tool_verify(context_id: &str, tool_id: &str) -> PyResult<PyToolVerific
         Ok(verification_result)
     })?;
 
-    // Convert to PyToolVerificationResult.
+    // Convert to PyOutletVerificationResult.
     let failures: Vec<String> = result
         .vector_results
         .iter()
@@ -575,8 +575,8 @@ pub fn py_tool_verify(context_id: &str, tool_id: &str) -> PyResult<PyToolVerific
         .map(|r| r.description.clone())
         .collect();
 
-    Ok(PyToolVerificationResult {
-        tool_id: result.tool_id,
+    Ok(PyOutletVerificationResult {
+        outlet_id: result.outlet_id,
         passed: result.integrity_ok,
         failures,
     })
@@ -638,7 +638,7 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
 /// `payee` (str DID), and optional `cost_formula` (str). Per spec §5.4.1.
 fn extract_cost(
     registration: &Bound<'_, PyDict>,
-) -> PyResult<Option<scp_core::context::tools::ToolCost>> {
+) -> PyResult<Option<scp_core::context::tools::OutletCost>> {
     let meta_obj = match registration.get_item("cost")? {
         Some(val) if !val.is_none() => val,
         _ => return Ok(None),
@@ -669,7 +669,7 @@ fn extract_cost(
         .map(|v| v.extract())
         .transpose()?;
 
-    Ok(Some(scp_core::context::tools::ToolCost {
+    Ok(Some(scp_core::context::tools::OutletCost {
         amount,
         currency,
         payee: payee.into(),
@@ -685,7 +685,7 @@ fn extract_cost(
 /// Returns `SCP-VALID-7037` on validation failure (aligned with NAPI bridge).
 fn extract_test_vectors(
     registration: &Bound<'_, PyDict>,
-) -> PyResult<Vec<scp_core::context::tools::TestVector>> {
+) -> PyResult<Vec<scp_core::context::tools::OutletTestVector>> {
     let vectors_obj = match registration.get_item("test_vectors")? {
         Some(val) if !val.is_none() => val,
         _ => return Ok(Vec::new()),
@@ -723,7 +723,7 @@ fn extract_test_vectors(
             .unwrap_or("")
             .to_owned();
 
-        result.push(scp_core::context::tools::TestVector {
+        result.push(scp_core::context::tools::OutletTestVector {
             input,
             expected_output,
             description,
@@ -748,11 +748,11 @@ fn extract_test_vectors(
 ///
 /// * `source_context_id` — The ID of the calling context.
 /// * `target_context_id` — The ID of the context containing the tool.
-/// * `tool_id` — The ID of the tool to invoke.
+/// * `outlet_id` — The ID of the tool to invoke.
 /// * `input` — A Python dict of input parameters.
 /// * `invoker_did` — The DID of the participant invoking the tool.
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Must contain `outlet_call:{outlet_id}` or `outlet_call:*` capability.
 ///   Validated against the TARGET context's ceiling using the full 11-step
 ///   ADR-016 pipeline.
 /// * `chain_depth` — Current cross-context chain depth (0 for first hop).
@@ -768,15 +768,15 @@ fn extract_test_vectors(
 /// Raises `ContextError` if either context is not connected, the tool is
 /// not found, chain depth is exceeded, or the interface is not approved.
 #[pyfunction]
-#[pyo3(name = "tool_invoke_cross_context")]
-#[pyo3(signature = (source_context_id, target_context_id, tool_id, input, invoker_did, ucan_token, chain_depth, proof_tokens=None))]
+#[pyo3(name = "outlet_invoke_cross_context")]
+#[pyo3(signature = (source_context_id, target_context_id, outlet_id, input, invoker_did, ucan_token, chain_depth, proof_tokens=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
 #[allow(clippy::too_many_arguments)] // FFI boundary: PyO3 requires explicit params
-pub fn py_tool_invoke_cross_context(
+pub fn py_outlet_invoke_cross_context(
     py: Python<'_>,
     source_context_id: &str,
     target_context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     input: &Bound<'_, PyDict>,
     invoker_did: &str,
     ucan_token: &str,
@@ -785,7 +785,7 @@ pub fn py_tool_invoke_cross_context(
 ) -> PyResult<PyObject> {
     validate::validate_context_id(source_context_id)?;
     validate::validate_context_id(target_context_id)?;
-    validate::validate_tool_id(tool_id)?;
+    validate::validate_outlet_id(outlet_id)?;
     validate::validate_did(invoker_did)?;
     validate::validate_ucan_token(ucan_token)?;
     if let Some(ref tokens) = proof_tokens {
@@ -798,9 +798,9 @@ pub fn py_tool_invoke_cross_context(
     // Primary authorization: UCAN token validation via the full 11-step
     // ADR-016 pipeline against the TARGET context's ceiling.
     // See spec §6.2, §8, ADR-016, and issue #319.
-    validate_tool_ucan(
+    validate_outlet_ucan(
         target_context_id,
-        tool_id,
+        outlet_id,
         ucan_token,
         invoker_did,
         proof_tokens.as_ref(),
@@ -808,16 +808,16 @@ pub fn py_tool_invoke_cross_context(
 
     // Defense-in-depth: check role-state capabilities in the source context.
     let source_has_capability = crate::runtime::with_context(source_context_id, |rt| {
-        Ok(scp_core::context::tools::has_tool_invoke_capability(
+        Ok(scp_core::context::tools::has_outlet_call_capability(
             &rt.role_state,
             invoker_did,
-            tool_id,
+            outlet_id,
         ))
     })?;
 
     if !source_has_capability {
         return Err(ScpPyError::ucan(format!(
-            "invoker '{invoker_did}' does not have ToolInvoke capability for '{tool_id}' in source context"
+            "invoker '{invoker_did}' does not have ToolInvoke capability for '{outlet_id}' in source context"
         ))
         .into());
     }
@@ -840,9 +840,9 @@ pub fn py_tool_invoke_cross_context(
 
     // Invoke the tool in the target context with echo mode.
     let output_json = crate::runtime::with_context(target_context_id, |rt| {
-        let registration = rt.tool_registry.get(tool_id).ok_or_else(|| {
+        let registration = rt.outlet_registry.get(outlet_id).ok_or_else(|| {
             ScpPyError::context(format!(
-                "tool '{tool_id}' not found in target context '{target_context_id}'"
+                "tool '{outlet_id}' not found in target context '{target_context_id}'"
             ))
         })?;
 
@@ -854,11 +854,11 @@ pub fn py_tool_invoke_cross_context(
         .map_err(|e| ScpPyError::validation(format!("input validation failed: {e}")))?;
 
         // Dispatch to handler or echo mode.
-        let output = if let Some(handler) = rt.tool_handlers.get(tool_id) {
+        let output = if let Some(handler) = rt.outlet_handlers.get(outlet_id) {
             let handler = handler.clone();
             let out = handler(input_json.clone()).map_err(|e| {
                 ScpPyError::context(format!(
-                    "cross-context tool handler for '{tool_id}' failed: {e}"
+                    "cross-context tool handler for '{outlet_id}' failed: {e}"
                 ))
             })?;
 
@@ -868,14 +868,14 @@ pub fn py_tool_invoke_cross_context(
             )
             .map_err(|msg| {
                 ScpPyError::validation(format!(
-                    "output validation failed for tool '{tool_id}': {msg}"
+                    "output validation failed for tool '{outlet_id}': {msg}"
                 ))
             })?;
 
             out
         } else {
             serde_json::json!({
-                "tool": tool_id,
+                "tool": outlet_id,
                 "source_context": source_context_id,
                 "target_context": target_context_id,
                 "status": "validated",
@@ -909,7 +909,7 @@ pub fn py_tool_invoke_cross_context(
 /// # Arguments
 ///
 /// * `context_id` — The context containing the tool.
-/// * `tool_id` — The tool to create a session for.
+/// * `outlet_id` — The tool to create a session for.
 /// * `source_context_id` — The calling context (session cap tracked per caller).
 /// * `ttl_seconds` — Optional time-to-live for the session, in seconds.
 ///   `None` means the session persists for the lifetime of the context
@@ -924,22 +924,22 @@ pub fn py_tool_invoke_cross_context(
 /// Raises `ContextError` if the context is not connected, the tool is
 /// not found, or the per-caller session cap is exceeded.
 #[pyfunction]
-#[pyo3(name = "tool_session_create", signature = (context_id, tool_id, source_context_id, ttl_seconds=None))]
-pub fn py_tool_session_create(
+#[pyo3(name = "outlet_session_open", signature = (context_id, outlet_id, source_context_id, ttl_seconds=None))]
+pub fn py_outlet_session_open(
     context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     source_context_id: &str,
     ttl_seconds: Option<u64>,
 ) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
-    validate::validate_tool_id(tool_id)?;
+    validate::validate_outlet_id(outlet_id)?;
     validate::validate_context_id(source_context_id)?;
 
     let session_id = crate::runtime::with_context(context_id, |rt| {
         // Validate tool exists.
-        if !rt.tool_registry.contains(tool_id) {
+        if !rt.outlet_registry.contains(outlet_id) {
             return Err(ScpPyError::context(format!(
-                "tool '{tool_id}' not found in context '{context_id}'"
+                "tool '{outlet_id}' not found in context '{context_id}'"
             )));
         }
 
@@ -963,9 +963,9 @@ pub fn py_tool_session_create(
         let session_id = uuid::Uuid::new_v4().to_string();
         let now_ms = scp_primitives::SystemClock.now_millis();
 
-        let session = scp_core::context::tools::ToolSession {
+        let session = scp_core::context::tools::OutletSession {
             session_id: session_id.clone(),
-            tool_id: tool_id.to_owned(),
+            outlet_id: outlet_id.to_owned(),
             source_context: source_context_id.to_owned(),
             state: serde_json::Value::Null,
             created_at: now_ms,
@@ -994,7 +994,7 @@ pub fn py_tool_session_create(
 /// * `input` — A Python dict of input parameters.
 /// * `invoker_did` — The DID of the invoker (capability checked per call).
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Must contain `outlet_call:{outlet_id}` or `outlet_call:*` capability.
 ///   Validated using the full 11-step ADR-016 pipeline.
 ///
 /// # Returns
@@ -1008,10 +1008,10 @@ pub fn py_tool_session_create(
 /// Raises `ContextError` if the session is not found, has expired, or
 /// the invoker lacks capability.
 #[pyfunction]
-#[pyo3(name = "tool_session_invoke")]
+#[pyo3(name = "outlet_session_invoke")]
 #[pyo3(signature = (context_id, session_id, input, invoker_did, ucan_token, proof_tokens=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Option<Vec<String>>.
-pub fn py_tool_session_invoke(
+pub fn py_outlet_session_invoke(
     py: Python<'_>,
     context_id: &str,
     session_id: &str,
@@ -1030,21 +1030,21 @@ pub fn py_tool_session_invoke(
     }
     let input_json = py_dict_to_json(input)?;
 
-    // Look up the tool_id from the session before UCAN validation so we can
+    // Look up the outlet_id from the session before UCAN validation so we can
     // validate against the correct tool capability.
-    let tool_id_for_ucan = crate::runtime::with_context(context_id, |rt| {
+    let outlet_id_for_ucan = crate::runtime::with_context(context_id, |rt| {
         let session = rt
             .session_store
             .get(session_id)
             .ok_or_else(|| ScpPyError::context(format!("session '{session_id}' not found")))?;
-        Ok(session.tool_id.clone())
+        Ok(session.outlet_id.clone())
     })?;
 
     // Primary authorization: UCAN token validation via the full 11-step
     // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
-    validate_tool_ucan(
+    validate_outlet_ucan(
         context_id,
-        &tool_id_for_ucan,
+        &outlet_id_for_ucan,
         ucan_token,
         invoker_did,
         proof_tokens.as_ref(),
@@ -1066,23 +1066,23 @@ pub fn py_tool_session_invoke(
             )));
         }
 
-        let tool_id = session.tool_id.clone();
+        let outlet_id = session.outlet_id.clone();
         let current_state = session.state.clone();
 
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        if !scp_core::context::tools::has_tool_invoke_capability(
+        if !scp_core::context::tools::has_outlet_call_capability(
             &rt.role_state,
             invoker_did,
-            &tool_id,
+            &outlet_id,
         ) {
             return Err(ScpPyError::ucan(format!(
-                "invoker '{invoker_did}' does not have ToolInvoke capability for '{tool_id}'"
+                "invoker '{invoker_did}' does not have ToolInvoke capability for '{outlet_id}'"
             )));
         }
 
         // Validate input against tool's input schema.
-        if let Some(registration) = rt.tool_registry.get(&tool_id) {
+        if let Some(registration) = rt.outlet_registry.get(&outlet_id) {
             scp_core::context::tools::validate_value_against_schema(
                 &input_json,
                 &registration.schema.input_schema,
@@ -1091,15 +1091,15 @@ pub fn py_tool_session_invoke(
         }
 
         // Execute via handler or echo mode, passing session state.
-        let (new_state, output) = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
+        let (new_state, output) = if let Some(handler) = rt.outlet_handlers.get(&outlet_id) {
             let handler = handler.clone();
             let out = handler(input_json.clone()).map_err(|e| {
-                ScpPyError::context(format!("tool handler for '{tool_id}' failed: {e}"))
+                ScpPyError::context(format!("tool handler for '{outlet_id}' failed: {e}"))
             })?;
             (current_state, out)
         } else {
             let out = serde_json::json!({
-                "tool": tool_id,
+                "tool": outlet_id,
                 "session_id": session_id,
                 "status": "validated",
                 "call_count": session.call_count + 1,
@@ -1136,8 +1136,8 @@ pub fn py_tool_session_invoke(
 /// Raises `ContextError` if the context is not connected or the session
 /// is not found.
 #[pyfunction]
-#[pyo3(name = "tool_session_close")]
-pub fn py_tool_session_close(context_id: &str, session_id: &str) -> PyResult<()> {
+#[pyo3(name = "outlet_session_close")]
+pub fn py_outlet_session_close(context_id: &str, session_id: &str) -> PyResult<()> {
     validate::validate_context_id(context_id)?;
 
     crate::runtime::with_context(context_id, |rt| {
@@ -1159,14 +1159,14 @@ pub fn py_tool_session_close(context_id: &str, session_id: &str) -> PyResult<()>
 /// Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
 ///
 /// The caller (admin of the source context) proposes sharing a specific tool
-/// with a target context. The returned JSON contains the `ToolInterface` with
+/// with a target context. The returned JSON contains the `OutletInterface` with
 /// `approved_by_source = true` and `approved_by_target = false`. The target
-/// context must call [`py_tool_interface_accept`] to complete the handshake.
+/// context must call [`py_outlet_interface_accept`] to complete the handshake.
 ///
 /// # Arguments
 ///
 /// * `context_id` — The source context ID.
-/// * `tool_id` — The ID of the tool to expose.
+/// * `outlet_id` — The ID of the tool to expose.
 /// * `target_context_id` — The target context to expose the tool to.
 /// * `rate_limit_json` — Optional per-interface rate limit as a JSON string.
 ///   When provided, must be a JSON object with `max_calls` (u64) and
@@ -1174,21 +1174,21 @@ pub fn py_tool_session_close(context_id: &str, session_id: &str) -> PyResult<()>
 ///
 /// # Returns
 ///
-/// A JSON string representation of the created `ToolInterface`.
+/// A JSON string representation of the created `OutletInterface`.
 ///
 /// # Errors
 ///
-/// Raises `ToolError` if the caller is not an admin or the tool is not found.
+/// Raises `OutletError` if the caller is not an admin or the tool is not found.
 #[pyfunction]
-#[pyo3(name = "tool_interface_expose", signature = (context_id, tool_id, target_context_id, rate_limit_json=None))]
-pub fn py_tool_interface_expose(
+#[pyo3(name = "outlet_interface_offer", signature = (context_id, outlet_id, target_context_id, rate_limit_json=None))]
+pub fn py_outlet_interface_offer(
     context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     target_context_id: &str,
     rate_limit_json: Option<&str>,
 ) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
-    validate::validate_tool_id(tool_id)?;
+    validate::validate_outlet_id(outlet_id)?;
     validate::validate_context_id(target_context_id)?;
 
     let rate_limit = match rate_limit_json {
@@ -1211,11 +1211,11 @@ pub fn py_tool_interface_expose(
 
         let interface = scp_core::context::tools::interface::expose_tool(
             context_handle.context_id(),
-            &tool_id.to_owned(),
+            &outlet_id.to_owned(),
             &target_context_id.to_owned(),
             &rt.role_state,
             &rt.creator_did,
-            &rt.tool_registry,
+            &rt.outlet_registry,
             rate_limit,
             None,
         )
@@ -1225,7 +1225,7 @@ pub fn py_tool_interface_expose(
         })?;
 
         serde_json::to_string(&interface).map_err(|e| ScpPyError::ContextError {
-            message: format!("failed to serialize ToolInterface: {e}"),
+            message: format!("failed to serialize OutletInterface: {e}"),
             code: codes::TOOL_6031.to_owned(),
         })
     })?)
@@ -1239,23 +1239,23 @@ pub fn py_tool_interface_expose(
 /// # Arguments
 ///
 /// * `context_id` — The target context ID (the one accepting).
-/// * `interface_json` — The `ToolInterface` JSON string to accept (as received
-///   from the source context's `tool_interface_expose` call).
+/// * `interface_json` — The `OutletInterface` JSON string to accept (as received
+///   from the source context's `outlet_interface_offer` call).
 ///
 /// # Returns
 ///
-/// The updated `ToolInterface` JSON string with `approved_by_target = true`.
+/// The updated `OutletInterface` JSON string with `approved_by_target = true`.
 ///
 /// # Errors
 ///
-/// Raises `ToolError` if the caller is not an admin or the interface's target
+/// Raises `OutletError` if the caller is not an admin or the interface's target
 /// context does not match `context_id`.
 #[pyfunction]
-#[pyo3(name = "tool_interface_accept")]
-pub fn py_tool_interface_accept(context_id: &str, interface_json: &str) -> PyResult<String> {
+#[pyo3(name = "outlet_interface_accept")]
+pub fn py_outlet_interface_accept(context_id: &str, interface_json: &str) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
 
-    let mut interface: scp_core::context::tools::interface::ToolInterface =
+    let mut interface: scp_core::context::tools::interface::OutletInterface =
         serde_json::from_str(interface_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid interface_json: {e}"),
             code: codes::VALID_7041.to_owned(),
@@ -1280,7 +1280,7 @@ pub fn py_tool_interface_accept(context_id: &str, interface_json: &str) -> PyRes
         })?;
 
         serde_json::to_string(&interface).map_err(|e| ScpPyError::ContextError {
-            message: format!("failed to serialize ToolInterface: {e}"),
+            message: format!("failed to serialize OutletInterface: {e}"),
             code: codes::TOOL_6033.to_owned(),
         })
     })?)
@@ -1304,8 +1304,8 @@ pub fn py_tool_interface_accept(context_id: &str, interface_json: &str) -> PyRes
 ///
 /// Raises `ValidationError` if `interface_id` is not valid hex or not 32 bytes.
 #[pyfunction]
-#[pyo3(name = "tool_interface_revoke")]
-pub fn py_tool_interface_revoke(context_id: &str, interface_id_hex: &str) -> PyResult<String> {
+#[pyo3(name = "outlet_interface_revoke")]
+pub fn py_outlet_interface_revoke(context_id: &str, interface_id_hex: &str) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
 
     let interface_id_bytes =
@@ -1351,19 +1351,19 @@ pub fn py_tool_interface_revoke(context_id: &str, interface_id_hex: &str) -> PyR
 /// # Errors
 ///
 /// Returns `PyErr` if registration of functions or classes fails.
-pub fn register_tools(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PyToolRegistration>()?;
-    m.add_class::<PyToolVerificationResult>()?;
-    m.add_function(wrap_pyfunction!(py_tool_register, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_invoke, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_verify, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_invoke_cross_context, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_session_create, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_session_invoke, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_session_close, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_interface_expose, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_interface_accept, m)?)?;
-    m.add_function(wrap_pyfunction!(py_tool_interface_revoke, m)?)?;
+pub fn register_outlets(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<PyOutletRegistration>()?;
+    m.add_class::<PyOutletVerificationResult>()?;
+    m.add_function(wrap_pyfunction!(py_outlet_register, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_invoke, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_verify, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_invoke_cross_context, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_session_open, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_session_invoke, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_session_close, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_interface_offer, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_interface_accept, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_interface_revoke, m)?)?;
     Ok(())
 }
 
@@ -1407,7 +1407,7 @@ mod tests {
             schema.set_item("output_schema", PyDict::new(py)).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = py_outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject missing input_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -1439,7 +1439,7 @@ mod tests {
             schema.set_item("input_schema", inner).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = py_outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject missing output_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -1472,7 +1472,7 @@ mod tests {
             schema.set_item("output_schema", output).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = py_outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject non-object input_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -1502,7 +1502,7 @@ mod tests {
             schema.set_item("output_schema", output_list).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = py_outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject non-object output_schema");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -1544,7 +1544,7 @@ mod tests {
             let dict = valid_registration_dict(py);
             dict.set_item("test_vectors", "not-a-list").unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = py_outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject non-list test_vectors");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -1567,7 +1567,7 @@ mod tests {
             let vectors = pyo3::types::PyList::new(py, [42i32]).unwrap();
             dict.set_item("test_vectors", vectors).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = py_outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject non-dict items in test_vectors"
@@ -1594,7 +1594,7 @@ mod tests {
             wrong_type.set_item("not", "a list").unwrap();
             dict.set_item("test_vectors", wrong_type).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = py_outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(result.is_err(), "should reject dict as test_vectors");
             let err_str = format!("{}", result.unwrap_err());
             assert!(
@@ -1645,7 +1645,7 @@ mod tests {
             let dict = valid_registration_dict(py);
             dict.set_item("implementation_hash", 12345).unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = py_outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject non-string implementation_hash"
@@ -1672,7 +1672,7 @@ mod tests {
             dict.set_item("implementation_hash", "abcdef0123456789abcdef0123456789")
                 .unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = py_outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject wrong-length implementation_hash"
@@ -1702,7 +1702,7 @@ mod tests {
             )
             .unwrap();
 
-            let result = py_tool_register("ctx-test-id-000000", &dict.as_borrowed());
+            let result = py_outlet_register("ctx-test-id-000000", &dict.as_borrowed());
             assert!(
                 result.is_err(),
                 "should reject invalid hex in implementation_hash"
@@ -1756,8 +1756,8 @@ mod tests {
 
     /// `registered_at` on a tool registered via the `PyO3` bridge must be a
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
-    /// Calls the actual `py_tool_register` bridge function and inspects the
-    /// stored `ToolRegistration`. Catches the original bug from issue #871.
+    /// Calls the actual `py_outlet_register` bridge function and inspects the
+    /// stored `OutletRegistration`. Catches the original bug from issue #871.
     #[test]
     fn registered_at_is_seconds_epoch() {
         // Use a unique context ID to avoid collisions with concurrent tests.
@@ -1794,14 +1794,14 @@ mod tests {
             schema.set_item("output_schema", output).unwrap();
             dict.set_item("schema", schema).unwrap();
 
-            let tool_id = py_tool_register(&ctx_id, &dict.as_borrowed())
-                .expect("py_tool_register should succeed");
+            let outlet_id = py_outlet_register(&ctx_id, &dict.as_borrowed())
+                .expect("py_outlet_register should succeed");
 
             // Read the stored registration back from the runtime registry.
             let registered_at = crate::runtime::with_ffi_state(&ctx_id, |state| {
                 let reg = state
-                    .tool_registry
-                    .get(&tool_id)
+                    .outlet_registry
+                    .get(&outlet_id)
                     .expect("tool should exist in registry after successful registration");
                 Ok(reg.registered_at)
             })

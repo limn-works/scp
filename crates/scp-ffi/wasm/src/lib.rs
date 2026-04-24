@@ -114,7 +114,7 @@ pub mod sync;
 /// Platform-agnostic time utilities for WASM.
 pub mod time;
 /// Tool registration, invocation, and verification.
-pub mod tools;
+pub mod outlets;
 /// Transport connection and status operations.
 pub mod transport;
 /// Trust engine operations (attestation, challenge, verification).

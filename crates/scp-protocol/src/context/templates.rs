@@ -469,7 +469,7 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
         },
-        // Extends scp:template/tool-interface -- same ceiling and governance,
+        // Extends scp:template/outlet-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
         TemplateId::PaidService => ContextParams {
             mode: ContextMode::Encrypted,

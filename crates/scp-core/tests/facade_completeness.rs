@@ -9,7 +9,7 @@ use scp_core::context::ContextParams;
 use scp_core::context::ContextState;
 use scp_core::context::builder::ContextCreationError;
 use scp_core::context::governance::GovernanceAction;
-use scp_core::context::tools::ToolSchema;
+use scp_core::context::tools::OutletSchema;
 
 // Crypto split
 use scp_core::crypto::access_keys::AccessKeyError;
@@ -38,7 +38,7 @@ fn facade_exposes_protocol_types() {
     let _ = std::any::type_name::<ContextParams>();
     let _ = std::any::type_name::<ContextCreationError>();
     let _ = std::any::type_name::<GovernanceAction>();
-    let _ = std::any::type_name::<ToolSchema>();
+    let _ = std::any::type_name::<OutletSchema>();
 
     // Crypto split
     let _ = std::any::type_name::<SenderKey>();

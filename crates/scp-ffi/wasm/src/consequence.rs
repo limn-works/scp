@@ -384,7 +384,7 @@ mod tests {
         for cap in [
             "messages:read",
             "messages:write",
-            "tool_invoke:*",
+            "outlet_call:*",
             "member:remove",
             "governance:propose",
         ] {
@@ -416,7 +416,7 @@ mod tests {
         for cap in [
             "messages:read",
             "messages:write",
-            "tool_invoke:*",
+            "outlet_call:*",
             "member:remove",
             "governance:propose",
         ] {

@@ -226,7 +226,7 @@ async fn behavioral_record_computation() {
         make_event(EventType::MessageSent, alice, 1000, 0, vec![]),
         make_event(EventType::MessageSent, alice, 1100, 1, vec![]),
         make_event(
-            EventType::ToolInvoked,
+            EventType::OutletInvoked,
             alice,
             1200,
             2,
@@ -241,7 +241,7 @@ async fn behavioral_record_computation() {
     assert_eq!(record.context_id, "ctx-test");
     assert_eq!(record.participation_count, 4);
     assert_eq!(record.participation_duration_seconds, 300); // 1300 - 1000
-    assert_eq!(*record.tool_invocations.get("my-tool").unwrap_or(&0), 1);
+    assert_eq!(*record.outlet_invocations.get("my-tool").unwrap_or(&0), 1);
     assert_eq!(record.context_creation_count, 1);
     assert_eq!(record.computed_at, 2000);
 }
@@ -483,7 +483,7 @@ async fn consequence_rules_evaluation() {
             window: Duration::from_mins(1),
         },
         ConsequenceRule {
-            trigger: ConsequenceTrigger::ToolRateExceeded,
+            trigger: ConsequenceTrigger::OutletRateExceeded,
             action: ConsequenceAction::Enforcement(EnforcementSeverity::SuspendAccess),
             threshold: 2,
             window: Duration::from_mins(2),
@@ -495,8 +495,8 @@ async fn consequence_rules_evaluation() {
         make_event(EventType::MessageSent, alice, 950, 0, vec![]),
         make_event(EventType::MessageSent, alice, 960, 1, vec![]),
         make_event(EventType::MessageSent, alice, 970, 2, vec![]),
-        make_event(EventType::ToolInvoked, alice, 980, 3, b"tool-a".to_vec()),
-        make_event(EventType::ToolInvoked, alice, 990, 4, b"tool-b".to_vec()),
+        make_event(EventType::OutletInvoked, alice, 980, 3, b"tool-a".to_vec()),
+        make_event(EventType::OutletInvoked, alice, 990, 4, b"tool-b".to_vec()),
     ];
 
     let triggered = evaluate_consequence_rules(&rules, &events, alice, 1000);
@@ -540,7 +540,7 @@ async fn action_classification() {
 
     // Category B resources (operational)
     assert_eq!(classify_action("messages"), ActionCategory::CategoryB);
-    assert_eq!(classify_action("tool_invoke"), ActionCategory::CategoryB);
+    assert_eq!(classify_action("outlet_call"), ActionCategory::CategoryB);
     assert_eq!(classify_action("member"), ActionCategory::CategoryB);
     assert_eq!(classify_action("role"), ActionCategory::CategoryB);
     assert_eq!(classify_action("context"), ActionCategory::CategoryB);
@@ -912,7 +912,7 @@ async fn participation_profile_produce_verify() {
     let events = vec![
         make_event(EventType::MessageSent, alice, 1000, 0, vec![]),
         make_event(EventType::MessageSent, alice, 2000, 1, vec![]),
-        make_event(EventType::ToolInvoked, alice, 3000, 2, b"tool-x\0".to_vec()),
+        make_event(EventType::OutletInvoked, alice, 3000, 2, b"tool-x\0".to_vec()),
     ];
 
     let profile = produce_participation_profile(
@@ -931,7 +931,7 @@ async fn participation_profile_produce_verify() {
 
     assert_eq!(profile.subject_did, did(alice));
     assert_eq!(profile.participation_duration_secs, 2000); // 3000 - 1000
-    assert_eq!(profile.tool_invocation_count, 1);
+    assert_eq!(profile.outlet_invocation_count, 1);
     assert_eq!(profile.updated_at, 4000);
     assert_ne!(profile.signature, [0u8; 64]);
 

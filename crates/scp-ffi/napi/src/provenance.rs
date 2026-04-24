@@ -347,7 +347,7 @@ pub fn provenance_update_source_type(
 /// Appends a provenance event (`ProvenanceAttached` or `ProvenanceReceived`)
 /// to the event log for the given context.
 ///
-/// Follows the unsigned-event pattern used by `ToolInvoked` in the MCP bridge.
+/// Follows the unsigned-event pattern used by `OutletInvoked` in the MCP bridge.
 fn append_provenance_event(
     context_id: &str,
     actor_did: &str,

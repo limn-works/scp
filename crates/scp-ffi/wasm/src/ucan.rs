@@ -529,8 +529,8 @@ pub fn ucan_delegate(
 
 /// Validates a UCAN token for tool invocation authorization (WASM bridge).
 ///
-/// Extracts capability from the token and verifies it includes `tool_invoke`
-/// permission for the given `tool_id`. Uses scp-protocol's full 11-step UCAN
+/// Extracts capability from the token and verifies it includes `outlet_invoke`
+/// permission for the given `outlet_id`. Uses scp-protocol's full 11-step UCAN
 /// validation pipeline via extract-validate-writeback.
 ///
 /// See spec §6.2, §8, ADR-016, and issue #319.
@@ -539,16 +539,16 @@ pub fn ucan_delegate(
 ///
 /// Returns an error string if the UCAN token is malformed, the context state
 /// cannot be retrieved, or the 11-step validation pipeline rejects the token.
-pub fn validate_tool_ucan_wasm(
+pub fn validate_outlet_ucan_wasm(
     context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     token: &str,
     identity_did: &str,
 ) -> Result<(), String> {
     let parsed = parse_ucan(token).map_err(|e| format!("malformed UCAN token: {e}"))?;
 
-    // Build the required capability URI: scp:ctx:{context_id}/tool_invoke:{tool_id}
-    let required_capability_str = format!("scp:ctx:{context_id}/tool_invoke:{tool_id}");
+    // Build the required capability URI: scp:ctx:{context_id}/outlet_invoke:{outlet_id}
+    let required_capability_str = format!("scp:ctx:{context_id}/outlet_invoke:{outlet_id}");
     let required_capability: CapabilityUri = required_capability_str
         .parse()
         .map_err(|e: UcanError| format!("invalid capability URI: {e}"))?;
@@ -846,7 +846,7 @@ mod tests {
     fn classify_action_category_b_for_standard_capabilities() {
         let category_b = [
             "messages",
-            "tool_invoke",
+            "outlet_call",
             "member",
             "role",
             "context",
@@ -867,8 +867,8 @@ mod tests {
 
     #[test]
     fn capability_matches_wildcard_action_grants_specific() {
-        let granted = CapabilityUri::new("ctx-1", "tool_invoke", "*");
-        let required = CapabilityUri::new("ctx-1", "tool_invoke", "calculator");
+        let granted = CapabilityUri::new("ctx-1", "outlet_call", "*");
+        let required = CapabilityUri::new("ctx-1", "outlet_call", "calculator");
         assert!(
             granted.matches(&required),
             "wildcard action '*' should match specific action 'calculator'"
@@ -877,18 +877,18 @@ mod tests {
 
     #[test]
     fn capability_matches_wildcard_action_does_not_cross_resources() {
-        let granted = CapabilityUri::new("ctx-1", "tool_invoke", "*");
+        let granted = CapabilityUri::new("ctx-1", "outlet_call", "*");
         let required = CapabilityUri::new("ctx-1", "messages", "write");
         assert!(
             !granted.matches(&required),
-            "wildcard on tool_invoke must not match messages resource"
+            "wildcard on outlet_invoke must not match messages resource"
         );
     }
 
     #[test]
     fn capability_matches_specific_does_not_satisfy_wildcard_requirement() {
-        let granted = CapabilityUri::new("ctx-1", "tool_invoke", "calculator");
-        let required = CapabilityUri::new("ctx-1", "tool_invoke", "*");
+        let granted = CapabilityUri::new("ctx-1", "outlet_call", "calculator");
+        let required = CapabilityUri::new("ctx-1", "outlet_call", "*");
         assert!(
             !granted.matches(&required),
             "specific grant must not satisfy wildcard requirement"
@@ -904,8 +904,8 @@ mod tests {
         let ceiling = default_ceiling().to_ucan_string_set();
         assert!(ceiling.contains("messages:read"), "missing messages:read");
         assert!(ceiling.contains("messages:write"), "missing messages:write");
-        assert!(ceiling.contains("tool:register"), "missing tool:register");
-        assert!(ceiling.contains("tool_invoke:*"), "missing tool_invoke:*");
+        assert!(ceiling.contains("outlet:register"), "missing tool:register");
+        assert!(ceiling.contains("outlet_call:*"), "missing outlet_invoke:*");
         assert!(ceiling.contains("role:assign"), "missing role:assign");
         assert!(ceiling.contains("member:invite"), "missing member:invite");
         assert!(ceiling.contains("member:remove"), "missing member:remove");
@@ -926,21 +926,21 @@ mod tests {
 
     #[test]
     fn ceiling_wildcard_fallback_allows_specific_action() {
-        let cap = CapabilityUri::new("ctx-1", "tool_invoke", "calculator");
-        let ceiling: HashSet<String> = HashSet::from(["tool_invoke:*".to_owned()]);
+        let cap = CapabilityUri::new("ctx-1", "outlet_call", "calculator");
+        let ceiling: HashSet<String> = HashSet::from(["outlet_call:*".to_owned()]);
         assert!(
             cap.is_within_ceiling(&ceiling),
-            "ceiling with 'tool_invoke:*' should cover 'tool_invoke:calculator'"
+            "ceiling with 'outlet_call:*' should cover 'outlet_call:calculator'"
         );
     }
 
     #[test]
     fn ceiling_wildcard_does_not_cross_resources() {
         let cap = CapabilityUri::new("ctx-1", "messages", "write");
-        let ceiling: HashSet<String> = HashSet::from(["tool_invoke:*".to_owned()]);
+        let ceiling: HashSet<String> = HashSet::from(["outlet_call:*".to_owned()]);
         assert!(
             !cap.is_within_ceiling(&ceiling),
-            "ceiling with 'tool_invoke:*' should not cover 'messages:write'"
+            "ceiling with 'outlet_call:*' should not cover 'messages:write'"
         );
     }
 

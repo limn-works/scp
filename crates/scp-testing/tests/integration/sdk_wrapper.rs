@@ -306,15 +306,15 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Tools",
             name: "register",
-            py_patterns: &["ToolDefinition", "class ToolDefinition"],
+            py_patterns: &["OutletDefinition", "class OutletDefinition"],
             ts_patterns: &["registerTool(", "defineToolDefinition"],
-            swift_patterns: &["ToolDefinition", "toolRegister", "InvokeFn"],
+            swift_patterns: &["OutletDefinition", "toolRegister", "InvokeFn"],
             kt_patterns: &["fun toolRegister("],
         },
         ExpectedOp {
             category: "Tools",
             name: "invoke",
-            py_patterns: &["async def invoke(", "tool_invoke"],
+            py_patterns: &["async def invoke(", "outlet_call"],
             ts_patterns: &["async invokeTool(", "toolInvoke"],
             swift_patterns: &["ToolInvocationResult", "toolInvoke", "InvokeFn"],
             kt_patterns: &["fun toolInvoke("],
@@ -322,9 +322,9 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Tools",
             name: "verify",
-            py_patterns: &["TestVector", "class TestVector"],
+            py_patterns: &["TestVector", "class OutletTestVector"],
             ts_patterns: &["verifyTool(", "toolVerify"],
-            swift_patterns: &["ToolVerificationResult", "verifyInclusion"],
+            swift_patterns: &["OutletVerificationResult", "verifyInclusion"],
             kt_patterns: &["fun toolVerify("],
         },
         // --- UCAN ---

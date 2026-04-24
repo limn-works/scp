@@ -26,7 +26,7 @@
 // PyO3 bridge sources
 const PYO3_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/src/identity.rs");
 const PYO3_CONTEXT: &str = include_str!("../../../../crates/scp-ffi/src/context.rs");
-const PYO3_TOOLS: &str = include_str!("../../../../crates/scp-ffi/src/tools.rs");
+const PYO3_OUTLETS: &str = include_str!("../../../../crates/scp-ffi/src/outlets.rs");
 const PYO3_UCAN: &str = include_str!("../../../../crates/scp-ffi/src/ucan.rs");
 const PYO3_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/src/event_log.rs");
 const PYO3_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/src/transport.rs");
@@ -46,7 +46,7 @@ const UNIFFI_BRIDGE: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/
 // NAPI bridge sources
 const NAPI_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/napi/src/identity.rs");
 const NAPI_CONTEXT: &str = include_str!("../../../../crates/scp-ffi/napi/src/context.rs");
-const NAPI_TOOLS: &str = include_str!("../../../../crates/scp-ffi/napi/src/tools.rs");
+const NAPI_OUTLETS: &str = include_str!("../../../../crates/scp-ffi/napi/src/outlets.rs");
 const NAPI_UCAN: &str = include_str!("../../../../crates/scp-ffi/napi/src/ucan.rs");
 const NAPI_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/napi/src/event_log.rs");
 const NAPI_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/napi/src/transport.rs");
@@ -63,7 +63,7 @@ const NAPI_MEDIA: &str = include_str!("../../../../crates/scp-ffi/napi/src/media
 // WASM bridge sources
 const WASM_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/wasm/src/identity.rs");
 const WASM_CONTEXT: &str = include_str!("../../../../crates/scp-ffi/wasm/src/context.rs");
-const WASM_TOOLS: &str = include_str!("../../../../crates/scp-ffi/wasm/src/tools.rs");
+const WASM_OUTLETS: &str = include_str!("../../../../crates/scp-ffi/wasm/src/outlets.rs");
 const WASM_UCAN: &str = include_str!("../../../../crates/scp-ffi/wasm/src/ucan.rs");
 const WASM_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/wasm/src/event_log.rs");
 const WASM_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/wasm/src/transport.rs");
@@ -111,14 +111,17 @@ const PARITY_OPERATIONS: &[(&str, &str, bool)] = &[
     ("events", "context_drain_events", true),
     // Governance
     ("governance", "governance_execute", true),
-    // Tools
-    ("tools", "tool_register", true),
-    ("tools", "tool_invoke", true),
-    ("tools", "tool_verify", true),
-    ("tools", "tool_invoke_cross_context", false),
-    ("tools", "tool_session_create", false),
-    ("tools", "tool_session_invoke", false),
-    ("tools", "tool_session_close", false),
+    // Outlets
+    ("outlets", "outlet_register", true),
+    ("outlets", "outlet_invoke", true),
+    ("outlets", "outlet_verify", true),
+    ("outlets", "outlet_invoke_cross_context", false),
+    ("outlets", "outlet_session_open", false),
+    ("outlets", "outlet_session_invoke", false),
+    ("outlets", "outlet_session_close", false),
+    ("outlets", "outlet_interface_offer", false),
+    ("outlets", "outlet_interface_accept", false),
+    ("outlets", "outlet_interface_revoke", false),
     // UCAN
     ("ucan", "ucan_validate", true),
     ("ucan", "ucan_mint", true),
@@ -357,7 +360,7 @@ fn pyo3_sources() -> Vec<&'static str> {
     vec![
         PYO3_IDENTITY,
         PYO3_CONTEXT,
-        PYO3_TOOLS,
+        PYO3_OUTLETS,
         PYO3_UCAN,
         PYO3_EVENT_LOG,
         PYO3_TRANSPORT,
@@ -376,7 +379,7 @@ fn napi_sources() -> Vec<&'static str> {
     vec![
         NAPI_IDENTITY,
         NAPI_CONTEXT,
-        NAPI_TOOLS,
+        NAPI_OUTLETS,
         NAPI_UCAN,
         NAPI_EVENT_LOG,
         NAPI_TRANSPORT,
@@ -395,7 +398,7 @@ fn wasm_sources() -> Vec<&'static str> {
     vec![
         WASM_IDENTITY,
         WASM_CONTEXT,
-        WASM_TOOLS,
+        WASM_OUTLETS,
         WASM_UCAN,
         WASM_EVENT_LOG,
         WASM_TRANSPORT,
@@ -872,31 +875,31 @@ fn ucan_category_coverage() {
     }
 }
 
-/// Verifies tool operations are present across all bridges.
+/// Verifies outlet operations are present across all bridges.
 #[test]
-fn tools_category_coverage() {
-    let tool_ops: Vec<_> = PARITY_OPERATIONS
+fn outlets_category_coverage() {
+    let outlet_ops: Vec<_> = PARITY_OPERATIONS
         .iter()
-        .filter(|(cat, _, _)| *cat == "tools")
+        .filter(|(cat, _, _)| *cat == "outlets")
         .collect();
 
     let pyo3_srcs = pyo3_sources();
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
-    for &(_, op, _) in &tool_ops {
+    for &(_, op, _) in &outlet_ops {
         assert!(
             pyo3_has_operation(&pyo3_srcs, op),
-            "PyO3 missing tool op: {op}"
+            "PyO3 missing outlet op: {op}"
         );
-        assert!(uniffi_has_operation(op), "UniFFI missing tool op: {op}");
+        assert!(uniffi_has_operation(op), "UniFFI missing outlet op: {op}");
         assert!(
             napi_has_operation(&napi_srcs, op),
-            "NAPI missing tool op: {op}"
+            "NAPI missing outlet op: {op}"
         );
         assert!(
             wasm_has_operation(&wasm_srcs, op),
-            "WASM missing tool op: {op}"
+            "WASM missing outlet op: {op}"
         );
     }
 }
@@ -1037,7 +1040,7 @@ fn discovery_and_provenance_coverage() {
 // bridges + language SDK wrappers. `adjust_relay_price` implemented
 // Matrix-style aggregate pricing adjustment; the authoritative per-DID
 // escalation mechanism (spec §19.7) replaces it and is wired through
-// the existing `context_send_message` and `context_invoke_tool_with_economy`
+// the existing `context_send_message` and `context_invoke_outlet_with_economy`
 // paths, so no new parity operation was added in its place. This is a
 // legitimate removal; the ratchet is reset to the new floor. See commit
 // 2291102.
@@ -1072,10 +1075,10 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "context_drain_events",
     // Governance
     "governance_execute",
-    // Tools (core only — sessions and cross-context are optional)
-    "tool_register",
-    "tool_invoke",
-    "tool_verify",
+    // Outlets (core only — sessions and cross-context are optional)
+    "outlet_register",
+    "outlet_invoke",
+    "outlet_verify",
     // UCAN
     "ucan_validate",
     "ucan_mint",

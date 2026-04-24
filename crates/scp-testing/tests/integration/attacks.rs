@@ -1085,7 +1085,7 @@ async fn observer_role_cannot_write() {
         "observer must NOT have MessagesWrite"
     );
     assert!(
-        !observer.capabilities.contains(&Capability::ToolInvokeAll),
+        !observer.capabilities.contains(&Capability::OutletCallAll),
         "observer must NOT have ToolInvokeAll"
     );
     assert!(
@@ -1284,7 +1284,7 @@ async fn forged_participation_profile_signature_rejected() {
     );
 
     // Forge: tamper with the participation data.
-    profile.tool_invocation_count = 9999;
+    profile.outlet_invocation_count = 9999;
 
     // Signature check should fail after tampering.
     let tampered_signable = profile.signable_bytes();

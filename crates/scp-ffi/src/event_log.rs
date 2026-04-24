@@ -47,7 +47,7 @@ use crate::validate;
 #[derive(Debug)]
 pub struct PyEvent {
     /// The event type (e.g., `"ContextCreated"`, `"MessageSent"`,
-    /// `"ToolInvoked"`).
+    /// `"OutletInvoked"`).
     #[pyo3(get)]
     pub event_type: String,
 

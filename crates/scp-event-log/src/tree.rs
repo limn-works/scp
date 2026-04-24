@@ -106,7 +106,7 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
 /// # Why this exists
 ///
 /// The MCP FFI bridge (`crates/scp-ffi/src/mcp.rs`) calls
-/// `ContextProvider::invoke_tool` synchronously from within the tokio runtime.
+/// `ContextProvider::invoke_outlet` synchronously from within the tokio runtime.
 /// The `KeyCustody` signing trait is async, and calling `block_on` from inside
 /// the tokio runtime panics ("Cannot block the current thread from within a
 /// runtime"). Because signing key material cannot be accessed synchronously,
@@ -142,7 +142,7 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
 /// must control the event content and the `EventLog` reference. Current
 /// legitimate callers:
 ///
-/// - `FfiBridgeProvider::invoke_tool` in `crates/scp-ffi/src/mcp.rs`
+/// - `FfiBridgeProvider::invoke_outlet` in `crates/scp-ffi/src/mcp.rs`
 ///   (emits `OutletInvokedEvent` per ADR-010 criterion 3, superseded by
 ///   ADR-049 for outlet terminology)
 /// - Test code
@@ -153,7 +153,7 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
 /// bridges), this function should be replaced by calls to [`append`] with
 /// properly signed events. The migration path:
 ///
-/// 1. Make `ContextProvider::invoke_tool` async (or use a signing channel).
+/// 1. Make `ContextProvider::invoke_outlet` async (or use a signing channel).
 /// 2. Obtain the actor's `KeyCustody` handle in the FFI bridge.
 /// 3. Sign the event via `KeyCustody::sign()` before appending.
 /// 4. Replace all `append_unsigned_event` call sites with [`append`].

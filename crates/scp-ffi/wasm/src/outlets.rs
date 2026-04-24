@@ -11,7 +11,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use scp_ffi_common::validate::{
-    json_value_type_name, validate_did, validate_tool_id, validate_tool_name, validate_ucan_token,
+    json_value_type_name, validate_did, validate_outlet_id, validate_outlet_name, validate_ucan_token,
 };
 
 use crate::context::WasmContextHandle;
@@ -20,25 +20,25 @@ use crate::manager::with_manager;
 use crate::runtime;
 
 // ---------------------------------------------------------------------------
-// WasmToolVerificationResult
+// WasmOutletVerificationResult
 // ---------------------------------------------------------------------------
 
 /// Result of verifying a tool against its registered test vectors.
 #[wasm_bindgen]
 #[derive(Debug, Clone)]
-pub struct WasmToolVerificationResult {
-    tool_id: String,
+pub struct WasmOutletVerificationResult {
+    outlet_id: String,
     passed: bool,
     failures_json: String,
 }
 
 #[wasm_bindgen]
-impl WasmToolVerificationResult {
+impl WasmOutletVerificationResult {
     /// Returns the ID of the tool that was verified.
     #[must_use]
-    #[wasm_bindgen(getter, js_name = "toolId")]
-    pub fn tool_id(&self) -> String {
-        self.tool_id.clone()
+    #[wasm_bindgen(getter, js_name = outletId)]
+    pub fn outlet_id(&self) -> String {
+        self.outlet_id.clone()
     }
 
     /// Returns whether all test vectors passed.
@@ -114,7 +114,7 @@ fn validate_schema_field(
 /// `SCP-VALID-7037` on any structural violation.
 fn validate_test_vectors(
     def: &serde_json::Value,
-) -> Result<Vec<runtime::TestVector>, ScpWasmError> {
+) -> Result<Vec<runtime::OutletTestVector>, ScpWasmError> {
     let Some(tv_val) = def.get("testVectors") else {
         return Ok(Vec::new());
     };
@@ -157,7 +157,7 @@ fn validate_test_vectors(
                     });
                 }
             };
-            Ok(runtime::TestVector {
+            Ok(runtime::OutletTestVector {
                 input: input.clone(),
                 expected_output: expected_output.clone(),
                 description,
@@ -171,7 +171,7 @@ fn validate_test_vectors(
 // ---------------------------------------------------------------------------
 
 /// Parsed provenance fields: `(implementation_hash, signature, cost, registered_at)`.
-type ProvenanceFields = ([u8; 32], Vec<u8>, Option<runtime::ToolCost>, u64);
+type ProvenanceFields = ([u8; 32], Vec<u8>, Option<runtime::OutletCost>, u64);
 
 /// Parses optional provenance and cost fields from the definition JSON.
 ///
@@ -256,7 +256,7 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
                 .get("costFormula")
                 .and_then(|v| v.as_str())
                 .map(ToOwned::to_owned);
-            Some(runtime::ToolCost {
+            Some(runtime::OutletCost {
                 amount,
                 currency,
                 payee: scp_event_log::DID::from(payee),
@@ -277,7 +277,7 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
 // Rate limit parsing — constructs protocol RateLimit from JSON (F9)
 // ---------------------------------------------------------------------------
 
-use scp_protocol::context::tools::interface::RateLimit;
+use scp_protocol::context::outlets::interface::RateLimit;
 
 /// Parses a rate limit JSON string into the protocol `RateLimit` type.
 ///
@@ -308,7 +308,7 @@ fn parse_rate_limit_json_with_clock(
         .get("burst_allowance")
         .and_then(serde_json::Value::as_u64)
         .map_or(
-            scp_protocol::context::tools::interface::DEFAULT_BURST_ALLOWANCE,
+            scp_protocol::context::outlets::interface::DEFAULT_BURST_ALLOWANCE,
             |v| {
                 #[allow(clippy::cast_possible_truncation)]
                 {
@@ -320,7 +320,7 @@ fn parse_rate_limit_json_with_clock(
     let burst_window_seconds = value
         .get("burst_window_seconds")
         .and_then(serde_json::Value::as_u64)
-        .unwrap_or(scp_protocol::context::tools::interface::DEFAULT_BURST_WINDOW_SECS);
+        .unwrap_or(scp_protocol::context::outlets::interface::DEFAULT_BURST_WINDOW_SECS);
 
     Ok(RateLimit::with_burst(
         max_calls,
@@ -342,7 +342,7 @@ fn parse_rate_limit_json(json: &str) -> Result<RateLimit, String> {
 
 /// Registers a tool in an SCP context.
 ///
-/// Delegates to `WasmContextManager::register_tool`.
+/// Delegates to `WasmContextManager::register_outlet`.
 ///
 /// # Returns
 ///
@@ -354,8 +354,8 @@ fn parse_rate_limit_json(json: &str) -> Result<RateLimit, String> {
 ///   or structurally invalid.
 /// - Rejects with `SCP-VALID-7036` if `outputSchema` is missing, not a JSON
 ///   object, or structurally invalid.
-#[wasm_bindgen]
-pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Promise {
+#[wasm_bindgen(js_name = outletRegister)]
+pub fn outlet_register(context: &WasmContextHandle, definition_json: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
         let def: serde_json::Value = serde_json::from_str(&definition_json).map_err(|e| {
@@ -378,7 +378,7 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
             })?
             .to_owned();
 
-        validate_tool_name(&name).map_err(|e| ScpWasmError::from(e).into_js())?;
+        validate_outlet_name(&name).map_err(|e| ScpWasmError::from(e).into_js())?;
 
         let description = match def.get("description") {
             Some(v) => v
@@ -407,15 +407,15 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
         // dropping entries (aligned with NAPI bridge SCP-VALID-7037).
         let test_vectors = validate_test_vectors(&def).map_err(ScpWasmError::into_js)?;
 
-        let tool_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
+        let outlet_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
 
         let (implementation_hash, signature, cost, registered_at) = parse_provenance_fields(&def)?;
 
-        let registration = runtime::ToolRegistration {
-            tool_id: tool_id.clone(),
+        let registration = runtime::OutletRegistration {
+            outlet_id: outlet_id.clone(),
             name,
             description,
-            schema: runtime::ToolSchema {
+            schema: runtime::OutletSchema {
                 input_schema,
                 output_schema,
             },
@@ -427,27 +427,27 @@ pub fn tool_register(context: &WasmContextHandle, definition_json: String) -> Pr
             signature,
         };
 
-        with_manager(|mgr| mgr.register_tool(&context_id, registration))
+        with_manager(|mgr| mgr.register_outlet(&context_id, registration))
             .map_err(ScpWasmError::into_js)?;
 
-        Ok(JsValue::from_str(&tool_id))
+        Ok(JsValue::from_str(&outlet_id))
     })
 }
 
 /// Invokes a registered tool within an SCP context.
 ///
-/// Delegates to `WasmContextManager::invoke_tool`. When `ucan_token` is
+/// Delegates to `WasmContextManager::invoke_outlet`. When `ucan_token` is
 /// provided, validates the token before dispatch using the WASM-local UCAN
-/// validation pipeline, requiring `tool_invoke:{tool_id}` or `tool_invoke:*`
+/// validation pipeline, requiring `outlet_call:{outlet_id}` or `outlet_call:*`
 /// capability. See spec §6.2, §8, ADR-016, and issue #319.
 ///
 /// # Returns
 ///
 /// `Promise<string>` — resolves to a JSON string of the tool's output.
-#[wasm_bindgen]
-pub fn tool_invoke(
+#[wasm_bindgen(js_name = outletInvoke)]
+pub fn outlet_invoke(
     context: &WasmContextHandle,
-    tool_id: String,
+    outlet_id: String,
     input_json: String,
     identity_did: String,
     ucan_token: Option<String>,
@@ -490,7 +490,7 @@ pub fn tool_invoke(
             .into())
         });
     }
-    if let Err(e) = validate_tool_id(&tool_id) {
+    if let Err(e) = validate_outlet_id(&outlet_id) {
         return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
     }
     if let Err(e) = validate_did(&identity_did) {
@@ -507,10 +507,10 @@ pub fn tool_invoke(
         // 11-step pipeline. See spec §6.2, §8, ADR-016, and issue #319.
         match ucan_token {
             Some(ref token) if !token.is_empty() => {
-                crate::ucan::validate_tool_ucan_wasm(&context_id, &tool_id, token, &identity_did)
+                crate::ucan::validate_outlet_ucan_wasm(&context_id, &outlet_id, token, &identity_did)
                     .map_err(|e| {
                     ScpWasmError::Permission {
-                        message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
+                        message: format!("UCAN authorization failed for tool '{outlet_id}': {e}"),
                         code: codes::PERM_3000.to_owned(),
                     }
                     .into_js()
@@ -536,7 +536,7 @@ pub fn tool_invoke(
         })?;
 
         let result = with_manager(|mgr| {
-            mgr.invoke_tool(&context_id, &tool_id, &parsed_input, &identity_did)
+            mgr.invoke_outlet(&context_id, &outlet_id, &parsed_input, &identity_did)
         })
         .map_err(ScpWasmError::into_js)?;
 
@@ -554,16 +554,16 @@ pub fn tool_invoke(
 
 /// Verifies a tool against its registered test vectors.
 ///
-/// Delegates to `WasmContextManager::verify_tool`.
+/// Delegates to `WasmContextManager::verify_outlet`.
 ///
 /// # Returns
 ///
-/// `Promise<WasmToolVerificationResult>` — resolves to the verification result.
-#[wasm_bindgen]
-pub fn tool_verify(context: &WasmContextHandle, tool_id: String) -> Promise {
+/// `Promise<WasmOutletVerificationResult>` — resolves to the verification result.
+#[wasm_bindgen(js_name = outletVerify)]
+pub fn outlet_verify(context: &WasmContextHandle, outlet_id: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        let (passed, failures) = with_manager(|mgr| mgr.verify_tool(&context_id, &tool_id))
+        let (passed, failures) = with_manager(|mgr| mgr.verify_outlet(&context_id, &outlet_id))
             .map_err(ScpWasmError::into_js)?;
 
         let failures_json = serde_json::to_string(&failures).map_err(|e| {
@@ -574,8 +574,8 @@ pub fn tool_verify(context: &WasmContextHandle, tool_id: String) -> Promise {
             .into_js()
         })?;
 
-        Ok(JsValue::from(WasmToolVerificationResult {
-            tool_id,
+        Ok(JsValue::from(WasmOutletVerificationResult {
+            outlet_id,
             passed,
             failures_json,
         }))
@@ -593,11 +593,11 @@ pub fn tool_verify(context: &WasmContextHandle, tool_id: String) -> Promise {
 /// # Returns
 ///
 /// `Promise<string>` — resolves to a JSON string of the tool's output.
-#[wasm_bindgen]
-pub fn tool_invoke_cross_context(
+#[wasm_bindgen(js_name = outletInvokeCrossContext)]
+pub fn outlet_invoke_cross_context(
     source_context: &WasmContextHandle,
     target_context: &WasmContextHandle,
-    tool_id: String,
+    outlet_id: String,
     input_json: String,
     invoker_did: String,
     ucan_token: String,
@@ -617,11 +617,11 @@ pub fn tool_invoke_cross_context(
             .into_js()
             .into());
         }
-        crate::ucan::validate_tool_ucan_wasm(&target_id, &tool_id, &ucan_token, &invoker_did)
+        crate::ucan::validate_outlet_ucan_wasm(&target_id, &outlet_id, &ucan_token, &invoker_did)
             .map_err(|e| {
                 ScpWasmError::Permission {
                     message: format!(
-                        "UCAN authorization failed for cross-context tool '{tool_id}': {e}"
+                        "UCAN authorization failed for cross-context tool '{outlet_id}': {e}"
                     ),
                     code: codes::PERM_3000.to_owned(),
                 }
@@ -640,7 +640,7 @@ pub fn tool_invoke_cross_context(
             mgr.invoke_tool_cross_context(
                 &source_id,
                 &target_id,
-                &tool_id,
+                &outlet_id,
                 &input,
                 &invoker_did,
                 chain_depth,
@@ -669,10 +669,10 @@ pub fn tool_invoke_cross_context(
 /// # Returns
 ///
 /// `Promise<string>` — resolves to the session ID (UUID).
-#[wasm_bindgen]
-pub fn tool_session_create(
+#[wasm_bindgen(js_name = outletSessionOpen)]
+pub fn outlet_session_open(
     context: &WasmContextHandle,
-    tool_id: String,
+    outlet_id: String,
     source_context_id: String,
     ttl_seconds: Option<u32>,
 ) -> Promise {
@@ -681,7 +681,7 @@ pub fn tool_session_create(
         let session_id = with_manager(|mgr| {
             mgr.session_create(
                 &context_id,
-                &tool_id,
+                &outlet_id,
                 &source_context_id,
                 ttl_seconds.map(u64::from),
             )
@@ -700,8 +700,8 @@ pub fn tool_session_create(
 /// # Returns
 ///
 /// `Promise<string>` — resolves to the tool output as a JSON string.
-#[wasm_bindgen]
-pub fn tool_session_invoke(
+#[wasm_bindgen(js_name = outletSessionInvoke)]
+pub fn outlet_session_invoke(
     context: &WasmContextHandle,
     session_id: String,
     input_json: String,
@@ -710,7 +710,7 @@ pub fn tool_session_invoke(
 ) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        // UCAN authorization: look up the tool_id from the session, then
+        // UCAN authorization: look up the outlet_id from the session, then
         // validate the token via the WASM-local 11-step pipeline.
         // See spec §6.2, §8, ADR-016, and issue #319.
         if ucan_token.is_empty() {
@@ -722,18 +722,18 @@ pub fn tool_session_invoke(
             .into());
         }
 
-        let tool_id_for_ucan = with_manager(|mgr| mgr.session_tool_id(&context_id, &session_id))
+        let outlet_id_for_ucan = with_manager(|mgr| mgr.session_outlet_id(&context_id, &session_id))
             .map_err(ScpWasmError::into_js)?;
 
-        crate::ucan::validate_tool_ucan_wasm(
+        crate::ucan::validate_outlet_ucan_wasm(
             &context_id,
-            &tool_id_for_ucan,
+            &outlet_id_for_ucan,
             &ucan_token,
             &invoker_did,
         )
         .map_err(|e| {
             ScpWasmError::Permission {
-                message: format!("UCAN authorization failed for tool '{tool_id_for_ucan}': {e}"),
+                message: format!("UCAN authorization failed for tool '{outlet_id_for_ucan}': {e}"),
                 code: codes::PERM_3000.to_owned(),
             }
             .into_js()
@@ -768,8 +768,8 @@ pub fn tool_session_invoke(
 /// # Returns
 ///
 /// `Promise<void>` — resolves when the session is closed.
-#[wasm_bindgen]
-pub fn tool_session_close(context: &WasmContextHandle, session_id: String) -> Promise {
+#[wasm_bindgen(js_name = outletSessionClose)]
+pub fn outlet_session_close(context: &WasmContextHandle, session_id: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
         with_manager(|mgr| mgr.session_close(&context_id, &session_id))
@@ -785,7 +785,7 @@ pub fn tool_session_close(context: &WasmContextHandle, session_id: String) -> Pr
 
 /// Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
 ///
-/// Creates a `ToolInterface` JSON with `approved_by_source = true` and
+/// Creates a `OutletInterface` JSON with `approved_by_source = true` and
 /// `approved_by_target = false`. Requires the caller to be an admin of the
 /// source context (matching `scp-core::expose_tool` authorization).
 ///
@@ -795,17 +795,17 @@ pub fn tool_session_close(context: &WasmContextHandle, session_id: String) -> Pr
 ///
 /// # Returns
 ///
-/// `Promise<string>` — resolves to the `ToolInterface` as a JSON string.
-#[wasm_bindgen]
-pub fn tool_interface_expose(
+/// `Promise<string>` — resolves to the `OutletInterface` as a JSON string.
+#[wasm_bindgen(js_name = outletInterfaceOffer)]
+pub fn outlet_interface_offer(
     context: &WasmContextHandle,
-    tool_id: String,
+    outlet_id: String,
     target_context_id: String,
     rate_limit_json: Option<String>,
 ) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        validate_tool_id(&tool_id).map_err(|e| ScpWasmError::from(e).into_js())?;
+        validate_outlet_id(&outlet_id).map_err(|e| ScpWasmError::from(e).into_js())?;
 
         // Resolve the admin DID from the context's creator — mirrors how
         // PyO3/NAPI/UniFFI bridges use `rt.creator_did` internally.
@@ -837,11 +837,11 @@ pub fn tool_interface_expose(
         }
 
         // Validate the tool exists in the source context's registry.
-        let exists = with_manager(|mgr| mgr.tool_exists(&context_id, &tool_id))
+        let exists = with_manager(|mgr| mgr.tool_exists(&context_id, &outlet_id))
             .map_err(ScpWasmError::into_js)?;
         if !exists {
             return Err(ScpWasmError::Tool {
-                message: format!("tool '{tool_id}' not found in context '{context_id}'"),
+                message: format!("tool '{outlet_id}' not found in context '{context_id}'"),
                 code: codes::TOOL_6030.to_owned(),
             }
             .into_js()
@@ -866,7 +866,7 @@ pub fn tool_interface_expose(
         let interface = serde_json::json!({
             "source_context": context_id,
             "target_context": target_context_id,
-            "tool_id": tool_id,
+            "outlet_id": outlet_id,
             "rate_limit": rate_limit,
             "per_caller_rate_limit": {
                 "max_calls_per_caller": 10,
@@ -888,7 +888,7 @@ pub fn tool_interface_expose(
 
         let json_str = serde_json::to_string(&interface).map_err(|e| {
             ScpWasmError::Tool {
-                message: format!("failed to serialize ToolInterface: {e}"),
+                message: format!("failed to serialize OutletInterface: {e}"),
                 code: codes::TOOL_6031.to_owned(),
             }
             .into_js()
@@ -911,9 +911,9 @@ pub fn tool_interface_expose(
 ///
 /// # Returns
 ///
-/// `Promise<string>` — resolves to the updated `ToolInterface` as JSON.
-#[wasm_bindgen]
-pub fn tool_interface_accept(context: &WasmContextHandle, interface_json: String) -> Promise {
+/// `Promise<string>` — resolves to the updated `OutletInterface` as JSON.
+#[wasm_bindgen(js_name = outletInterfaceAccept)]
+pub fn outlet_interface_accept(context: &WasmContextHandle, interface_json: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
         // Resolve the admin DID from the context's creator — mirrors how
@@ -985,7 +985,7 @@ pub fn tool_interface_accept(context: &WasmContextHandle, interface_json: String
 
         let json_str = serde_json::to_string(&interface).map_err(|e| {
             ScpWasmError::Tool {
-                message: format!("failed to serialize ToolInterface: {e}"),
+                message: format!("failed to serialize OutletInterface: {e}"),
                 code: codes::TOOL_6033.to_owned(),
             }
             .into_js()
@@ -1002,8 +1002,8 @@ pub fn tool_interface_accept(context: &WasmContextHandle, interface_json: String
 /// # Returns
 ///
 /// `Promise<string>` — resolves to the `InterfaceRevoked` event as JSON.
-#[wasm_bindgen]
-pub fn tool_interface_revoke(context: &WasmContextHandle, interface_id_hex: String) -> Promise {
+#[wasm_bindgen(js_name = outletInterfaceRevoke)]
+pub fn outlet_interface_revoke(context: &WasmContextHandle, interface_id_hex: String) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
         let interface_id_bytes = hex::decode(&interface_id_hex).map_err(|e| {
@@ -1407,12 +1407,12 @@ mod tests {
         assert_eq!(rl.window, std::time::Duration::from_mins(1));
         assert_eq!(
             rl.burst_allowance,
-            scp_protocol::context::tools::interface::DEFAULT_BURST_ALLOWANCE
+            scp_protocol::context::outlets::interface::DEFAULT_BURST_ALLOWANCE
         );
         assert_eq!(
             rl.burst_window,
             std::time::Duration::from_secs(
-                scp_protocol::context::tools::interface::DEFAULT_BURST_WINDOW_SECS
+                scp_protocol::context::outlets::interface::DEFAULT_BURST_WINDOW_SECS
             )
         );
     }
@@ -1443,12 +1443,12 @@ mod tests {
     fn consent_expose_builds_valid_interface_json() {
         let context_id = "ctx-source";
         let target_context_id = "ctx-target";
-        let tool_id = "tool-calculator";
+        let outlet_id = "tool-calculator";
 
         let interface = serde_json::json!({
             "source_context": context_id,
             "target_context": target_context_id,
-            "tool_id": tool_id,
+            "outlet_id": outlet_id,
             "rate_limit": null,
             "per_caller_rate_limit": {
                 "max_calls_per_caller": 10,
@@ -1472,7 +1472,7 @@ mod tests {
         assert_eq!(interface["approved_by_target"], false);
         assert_eq!(interface["source_context"], context_id);
         assert_eq!(interface["target_context"], target_context_id);
-        assert_eq!(interface["tool_id"], tool_id);
+        assert_eq!(interface["outlet_id"], outlet_id);
         assert!(interface["outbound_policy"].is_object());
         assert!(interface["inbound_policy"].is_null());
 
@@ -1484,7 +1484,7 @@ mod tests {
 
     #[test]
     fn consent_expose_admin_role_check_logic() {
-        // Simulates the admin role check that tool_interface_expose performs.
+        // Simulates the admin role check that outlet_interface_offer performs.
         // "admin" passes; all other roles are rejected.
         let admin_role: Option<&str> = Some("admin");
         let member_role: Option<&str> = Some("member");
@@ -1500,7 +1500,7 @@ mod tests {
         let interface_json = serde_json::json!({
             "source_context": "ctx-source",
             "target_context": "ctx-target",
-            "tool_id": "tool-calc",
+            "outlet_id": "tool-calc",
             "approved_by_source": true,
             "approved_by_target": false,
             "inbound_policy": null
@@ -1519,7 +1519,7 @@ mod tests {
         let interface_json = serde_json::json!({
             "source_context": "ctx-source",
             "target_context": "ctx-target",
-            "tool_id": "tool-calc",
+            "outlet_id": "tool-calc",
             "approved_by_source": true,
             "approved_by_target": false,
             "inbound_policy": null
@@ -1538,13 +1538,13 @@ mod tests {
         let mut interface = serde_json::json!({
             "source_context": "ctx-source",
             "target_context": "ctx-target",
-            "tool_id": "tool-calc",
+            "outlet_id": "tool-calc",
             "approved_by_source": true,
             "approved_by_target": false,
             "inbound_policy": null
         });
 
-        // Simulate the accept logic from tool_interface_accept.
+        // Simulate the accept logic from outlet_interface_accept.
         interface["approved_by_target"] = serde_json::json!(true);
         if interface.get("inbound_policy").is_none() || interface["inbound_policy"].is_null() {
             interface["inbound_policy"] = serde_json::json!({
@@ -1567,7 +1567,7 @@ mod tests {
         let mut interface = serde_json::json!({
             "source_context": "ctx-source",
             "target_context": "ctx-target",
-            "tool_id": "tool-calc",
+            "outlet_id": "tool-calc",
             "approved_by_source": true,
             "approved_by_target": false,
             "inbound_policy": {
@@ -1638,7 +1638,7 @@ mod tests {
         let interface = serde_json::json!({
             "source_context": "ctx-source",
             "target_context": "ctx-target",
-            "tool_id": "tool-calc",
+            "outlet_id": "tool-calc",
             "rate_limit": rl,
             "approved_by_source": true,
             "approved_by_target": false,

@@ -157,8 +157,8 @@ async fn context_params_all_fields() {
         ceiling: vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvokeAll,
-            Capability::ToolRegister,
+            Capability::OutletCallAll,
+            Capability::OutletRegister,
         ],
         ceiling_policy: CeilingPolicy::Governed,
         promotion_policy: PromotionPolicy::Promotable,
@@ -239,7 +239,7 @@ async fn all_template_ids() {
         TemplateId::GroupDiscussion,
         TemplateId::PublicBroadcast,
         TemplateId::GatedBroadcast,
-        TemplateId::ToolInterfaceTemplate,
+        TemplateId::OutletInterfaceTemplate,
         TemplateId::PaidService,
         TemplateId::PaidBroadcast,
         TemplateId::HandleRegistry,
@@ -317,15 +317,15 @@ async fn capability_ceiling_contains() {
     let ceiling = CapabilityCeiling::new([
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolInvokeAll,
+        Capability::OutletCallAll,
     ]);
 
     assert!(ceiling.contains(&Capability::MessagesRead));
     assert!(ceiling.contains(&Capability::MessagesWrite));
-    assert!(ceiling.contains(&Capability::ToolInvokeAll));
+    assert!(ceiling.contains(&Capability::OutletCallAll));
 
     // ToolInvoke("foo") is implicitly contained when ToolInvokeAll is present
-    assert!(ceiling.contains(&Capability::ToolInvoke("foo".to_owned())));
+    assert!(ceiling.contains(&Capability::OutletCall("foo".to_owned())));
 
     // Not in ceiling
     assert!(!ceiling.contains(&Capability::MemberInvite));
@@ -342,8 +342,8 @@ async fn all_capability_variants() {
     let capabilities = vec![
         (Capability::MessagesRead, "messages:read"),
         (Capability::MessagesWrite, "messages:write"),
-        (Capability::ToolInvokeAll, "tool:invoke:*"),
-        (Capability::ToolRegister, "tool:register"),
+        (Capability::OutletCallAll, "outlet:call:*"),
+        (Capability::OutletRegister, "outlet:register"),
         (Capability::MemberInvite, "member:invite"),
         (Capability::MemberRemove, "member:remove"),
         (Capability::RoleAssign, "role:assign"),
@@ -351,15 +351,15 @@ async fn all_capability_variants() {
         (Capability::GovernanceVote, "governance:vote"),
         (Capability::ContextClose, "context:close"),
         (Capability::ChildContextCreate, "context:child:create"),
-        (Capability::ToolInterface, "tool:interface"),
+        (Capability::OutletInterface, "outlet:interface"),
         (Capability::Bridging, "bridging"),
         (Capability::MediaVoice, "media:voice"),
         (Capability::MediaVideo, "media:video"),
         (Capability::MediaScreenShare, "media:screen_share"),
         (Capability::MemberBan, "member:ban"),
         (
-            Capability::ToolInvoke("my-tool".to_owned()),
-            "tool:invoke:my-tool",
+            Capability::OutletCall("my-tool".to_owned()),
+            "outlet:call:my-tool",
         ),
         (Capability::Custom("special".to_owned()), "special"),
     ];
@@ -376,8 +376,8 @@ async fn all_capability_variants() {
     assert_eq!(Capability::new("messages:read"), Capability::MessagesRead);
     assert_eq!(Capability::new("context:close"), Capability::ContextClose);
     assert_eq!(
-        Capability::new("tool:invoke:my-tool"),
-        Capability::ToolInvoke("my-tool".to_owned())
+        Capability::new("outlet:call:my-tool"),
+        Capability::OutletCall("my-tool".to_owned())
     );
     assert_eq!(
         Capability::new("unknown-cap"),
@@ -394,7 +394,7 @@ async fn builtin_roles_capabilities() {
     let ceiling = CapabilityCeiling::new([
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolInvokeAll,
+        Capability::OutletCallAll,
         Capability::MemberInvite,
         Capability::MemberRemove,
         Capability::RoleAssign,
@@ -420,7 +420,7 @@ async fn builtin_roles_capabilities() {
     assert_eq!(member.name, "member");
     assert!(member.capabilities.contains(&Capability::MessagesRead));
     assert!(member.capabilities.contains(&Capability::MessagesWrite));
-    assert!(member.capabilities.contains(&Capability::ToolInvokeAll));
+    assert!(member.capabilities.contains(&Capability::OutletCallAll));
     assert_eq!(member.capabilities.len(), 3);
 
     // Broadcast roles
@@ -538,7 +538,7 @@ async fn ceiling_intersection() {
         ceiling: CapabilityCeiling::new([
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolInvokeAll,
+            Capability::OutletCallAll,
             Capability::ChildContextCreate,
         ]),
         governance_config: scp_core::context::nesting::ParentGovernanceConfig {
@@ -555,7 +555,7 @@ async fn ceiling_intersection() {
         context_id: "parent-b".to_owned(),
         ceiling: CapabilityCeiling::new([
             Capability::MessagesRead,
-            Capability::ToolInvokeAll,
+            Capability::OutletCallAll,
             Capability::MemberInvite,
             Capability::ChildContextCreate,
         ]),
@@ -573,7 +573,7 @@ async fn ceiling_intersection() {
 
     // Only MessagesRead, ToolInvokeAll, and ChildContextCreate are in both
     assert!(intersection.contains(&Capability::MessagesRead));
-    assert!(intersection.contains(&Capability::ToolInvokeAll));
+    assert!(intersection.contains(&Capability::OutletCallAll));
     assert!(intersection.contains(&Capability::ChildContextCreate));
 
     // MessagesWrite is only in parent A, MemberInvite only in parent B

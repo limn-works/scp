@@ -1854,25 +1854,25 @@ pub fn context_reset_ttl_timer(handle: &WasmContextHandle, new_duration_secs: u3
 /// multiple capabilities (e.g., `("governance", "admin")` yields both
 /// `governance:propose` and `governance:vote`).
 ///
-/// The `is_tool` flag indicates the resource path ends with `tools/{name}`,
-/// meaning the action targets a specific tool (not the tools category itself).
+/// The `is_outlet` flag indicates the resource path ends with `outlets/{name}`,
+/// meaning the action targets a specific outlet (not the outlets category itself).
 ///
-/// Core source of truth: `crates/scp-core/src/context/app_sandbox.rs`
+/// Core source of truth: `crates/scp-runtime/src/context/app_sandbox.rs`
 /// `CapabilityEntry::to_capabilities()`.
-fn map_capability_names(category: &str, action: &str, is_tool: bool) -> Vec<String> {
-    match (category, action, is_tool) {
-        // ToolInvoke(specific) -- resource ends with tools/{tool_name}
-        (_, "invoke", true) => vec![format!("tool_invoke:{category}")],
+fn map_capability_names(category: &str, action: &str, is_outlet: bool) -> Vec<String> {
+    match (category, action, is_outlet) {
+        // OutletCall(specific) -- resource ends with outlets/{outlet_name}
+        (_, "invoke", true) => vec![format!("outlet_call:{category}")],
         // MessagesRead -- core accepts ("messaging"|"members", "read")
         ("messaging" | "members", "read", _) => vec!["messages:read".to_owned()],
         // MessagesWrite -- core accepts ("messaging", "write") only
         ("messaging", "write", _) => vec!["messages:write".to_owned()],
         // MemberInvite -- core accepts ("members", "write"|"admin")
         ("members", "write" | "admin", _) => vec!["member:invite".to_owned()],
-        // ToolInvokeAll
-        ("tools", "invoke", _) => vec!["tool_invoke:*".to_owned()],
-        // ToolRegister -- core accepts ("tools", "register"|"admin")
-        ("tools", "register" | "admin", _) => vec!["tool:register".to_owned()],
+        // OutletCallAll
+        ("outlets", "invoke", _) => vec!["outlet_call:*".to_owned()],
+        // OutletRegister -- core accepts ("outlets", "register"|"admin")
+        ("outlets", "register" | "admin", _) => vec!["outlet:register".to_owned()],
         // GovernancePropose -- core accepts ("governance", "write")
         ("governance", "write", _) => vec!["governance:propose".to_owned()],
         // GovernancePropose + GovernanceVote -- core accepts ("governance", "admin")
@@ -1986,11 +1986,11 @@ pub fn sandbox_validate_declaration(
 
         let category = resource.rsplit('/').next().unwrap_or(resource);
         let parts: Vec<&str> = resource.split('/').collect();
-        let is_tool = parts.len() >= 2 && parts[parts.len() - 2] == "tools";
+        let is_outlet = parts.len() >= 2 && parts[parts.len() - 2] == "outlets";
 
         for action_val in &actions {
             let action = action_val.as_str().unwrap_or("");
-            requested.extend(map_capability_names(category, action, is_tool));
+            requested.extend(map_capability_names(category, action, is_outlet));
         }
     }
 
@@ -2000,9 +2000,9 @@ pub fn sandbox_validate_declaration(
 
     for cap in &requested {
         let in_ceiling = ceiling_set.contains(cap.as_str())
-            || (cap.starts_with("tool_invoke:") && ceiling_set.contains("tool_invoke:*"));
+            || (cap.starts_with("outlet_call:") && ceiling_set.contains("outlet_call:*"));
         let in_role = role_set.contains(cap.as_str())
-            || (cap.starts_with("tool_invoke:") && role_set.contains("tool_invoke:*"));
+            || (cap.starts_with("outlet_call:") && role_set.contains("outlet_call:*"));
         if !in_ceiling || !in_role {
             return sandbox_err(&app_did, &format!("capability denied: {cap}"));
         }
@@ -2031,10 +2031,10 @@ pub fn sandbox_check_capability(
     if granted.contains(required_capability.as_str()) {
         return true;
     }
-    // ToolInvokeAll covers any specific ToolInvoke.
-    if required_capability.starts_with("tool_invoke:")
-        && required_capability != "tool_invoke:*"
-        && granted.contains("tool_invoke:*")
+    // OutletCallAll covers any specific OutletCall.
+    if required_capability.starts_with("outlet_call:")
+        && required_capability != "outlet_call:*"
+        && granted.contains("outlet_call:*")
     {
         return true;
     }
@@ -2411,9 +2411,9 @@ fn ceiling_has_tool_caps(ceiling: Option<&serde_json::Value>) -> bool {
             caps.iter().any(|cap| {
                 matches!(
                     cap,
-                    Capability::ToolInvokeAll
-                        | Capability::ToolInvoke(_)
-                        | Capability::ToolRegister
+                    Capability::OutletCallAll
+                        | Capability::OutletCall(_)
+                        | Capability::OutletRegister
                 )
             })
         })
@@ -2426,7 +2426,7 @@ fn params_require_payment(params: &serde_json::Value) -> bool {
         .and_then(|ep| ep.get("cost_schedule"))
         .is_some_and(|cs| {
             cs.get("per_message").is_some_and(|v| !v.is_null())
-                || cs.get("per_tool_invoke").is_some_and(|v| !v.is_null())
+                || cs.get("per_outlet_call").is_some_and(|v| !v.is_null())
                 || cs.get("per_join").is_some_and(|v| !v.is_null())
                 || cs.get("per_period").is_some_and(|v| !v.is_null())
                 || cs.get("per_byte_stored").is_some_and(|v| !v.is_null())
@@ -2810,7 +2810,7 @@ pub fn template_get_params(template_id: String) -> Result<String, JsError> {
                 message: format!(
                     "unknown template ID: {template_id:?} -- valid values: BilateralEphemeral, \
                      BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
-                     GatedBroadcast, scp:template/tool-interface, \
+                     GatedBroadcast, scp:template/outlet-interface, \
                      scp:template/paid-service, scp:template/paid-broadcast, \
                      scp:template/handle-registry (alias: scp:template/discovery-context, \
                      DiscoveryContext)"

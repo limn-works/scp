@@ -18,7 +18,7 @@ pub use scp_ffi_common::validate::{
     MAX_CAPABILITY_URI_LEN, MAX_CONTEXT_DESCRIPTION_LEN, MAX_CONTEXT_ID_LEN, MAX_CONTEXT_NAME_LEN,
     MAX_DEPLOY_ID_LEN, MAX_DID_LEN, MAX_GOVERNANCE_REASON_LEN,
     MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID, MAX_MCP_HANDLE_LEN, MAX_PAYMENT_ADAPTER_REF_LEN,
-    MAX_RELAY_URL_LEN, MAX_ROLE_NAME_LEN, MAX_TOOL_ID_LEN, MAX_TOOL_NAME_LEN,
+    MAX_RELAY_URL_LEN, MAX_ROLE_NAME_LEN, MAX_OUTLET_ID_LEN, MAX_OUTLET_NAME_LEN,
     MAX_TRANSPORT_MODE_LEN, MAX_UCAN_TOKEN_LEN,
 };
 
@@ -55,23 +55,23 @@ pub fn validate_did(did: &str) -> Result<(), ScpPyError> {
     scp_ffi_common::validate::validate_did(did).map_err(|e| ScpPyError::validation(e.message))
 }
 
-/// Validates a tool name string. See [`scp_ffi_common::validate::validate_tool_name`].
+/// Validates an outlet name string. See [`scp_ffi_common::validate::validate_outlet_name`].
 ///
 /// # Errors
 ///
-/// Returns [`ScpPyError`] if the tool name is invalid.
-pub fn validate_tool_name(name: &str) -> Result<(), ScpPyError> {
-    scp_ffi_common::validate::validate_tool_name(name)
+/// Returns [`ScpPyError`] if the outlet name is invalid.
+pub fn validate_outlet_name(name: &str) -> Result<(), ScpPyError> {
+    scp_ffi_common::validate::validate_outlet_name(name)
         .map_err(|e| ScpPyError::validation(e.message))
 }
 
-/// Validates a tool ID string. See [`scp_ffi_common::validate::validate_tool_id`].
+/// Validates an outlet ID string. See [`scp_ffi_common::validate::validate_outlet_id`].
 ///
 /// # Errors
 ///
-/// Returns [`ScpPyError`] if the tool ID is invalid.
-pub fn validate_tool_id(tool_id: &str) -> Result<(), ScpPyError> {
-    scp_ffi_common::validate::validate_tool_id(tool_id)
+/// Returns [`ScpPyError`] if the outlet ID is invalid.
+pub fn validate_outlet_id(outlet_id: &str) -> Result<(), ScpPyError> {
+    scp_ffi_common::validate::validate_outlet_id(outlet_id)
         .map_err(|e| ScpPyError::validation(e.message))
 }
 
@@ -233,28 +233,28 @@ mod tests {
     }
 
     #[test]
-    fn tool_name_valid() {
-        assert!(validate_tool_name("my-tool").is_ok());
+    fn outlet_name_valid() {
+        assert!(validate_outlet_name("my-outlet").is_ok());
     }
 
     #[test]
-    fn tool_name_braces_rejected() {
-        assert!(validate_tool_name("tool-{name}").is_err());
+    fn outlet_name_braces_rejected() {
+        assert!(validate_outlet_name("outlet-{name}").is_err());
     }
 
     #[test]
-    fn tool_name_html_rejected() {
-        assert!(validate_tool_name("<script>tool").is_err());
+    fn outlet_name_html_rejected() {
+        assert!(validate_outlet_name("<script>outlet").is_err());
     }
 
     #[test]
-    fn tool_id_valid() {
-        assert!(validate_tool_id("tool-my-tool").is_ok());
+    fn outlet_id_valid() {
+        assert!(validate_outlet_id("outlet-my-outlet").is_ok());
     }
 
     #[test]
-    fn tool_id_uppercase_rejected() {
-        assert!(validate_tool_id("Tool-Name").is_err());
+    fn outlet_id_uppercase_rejected() {
+        assert!(validate_outlet_id("Outlet-Name").is_err());
     }
 
     #[test]

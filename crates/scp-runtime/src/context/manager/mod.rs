@@ -458,10 +458,10 @@ pub enum GovernanceActionResult {
     MemberRemoved,
     /// A member's role was changed.
     RoleChanged,
-    /// A tool was registered in the context.
+    /// An outlet was registered in the context.
     OutletRegistered,
-    /// A tool was removed from the context.
-    ToolRemoved,
+    /// An outlet was removed from the context.
+    OutletRemoved,
     /// The capability ceiling was modified.
     CeilingModified,
     /// The context was closed.

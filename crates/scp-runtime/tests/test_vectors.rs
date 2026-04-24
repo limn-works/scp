@@ -1204,7 +1204,7 @@ fn domain_separators_are_all_unique() {
         "SCP-PARTICIPATION-V1:",
         "SCP-IDENTITY-LINK-ATTESTATION-V1:",
         "SCP-ACCESS-KEY-REQUEST-V1:",
-        "SCP-TOOL-REGISTRATION-V1:",
+        "SCP-OUTLET-REGISTRATION-V2:",
         "SCP-FORK-ID-V1:",
         "SCP-COMMIT-RANGE-REQ-V1:",
         "SCP-COMMIT-RANGE-RESP-V1:",

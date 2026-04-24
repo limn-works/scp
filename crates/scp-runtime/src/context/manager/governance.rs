@@ -1509,7 +1509,7 @@ impl ContextManager {
             GovernanceAction::RemoveOutlet { outlet_id } => {
                 self.execute_remove_outlet(context_id, outlet_id, pid, actor_did)
                     .await?;
-                Ok(GovernanceActionResult::ToolRemoved)
+                Ok(GovernanceActionResult::OutletRemoved)
             }
             GovernanceAction::ModifyCeiling { new_ceiling } => {
                 self.execute_modify_ceiling(context_id, new_ceiling, pid, actor_did)

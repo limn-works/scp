@@ -32,7 +32,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use base64::Engine as _;
 
 use crate::error::ScpWasmError;
-use crate::runtime::{ToolRegistration, ToolRegistry, validate_value_against_schema};
+use crate::runtime::{OutletRegistration, OutletRegistry, validate_value_against_schema};
 
 use scp_event_log::proof::{Direction, prove_absence, prove_inclusion, verify_inclusion};
 use scp_event_log::tree::{append_unsigned_event, event_count, root};
@@ -169,7 +169,7 @@ fn stored_policy_requires_payment(stored: Option<&str>) -> bool {
 }
 
 /// Type alias for tool handler closures stored per-context.
-type ToolHandlerMap =
+type OutletHandlerMap =
     HashMap<String, Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String>>>;
 
 // ---------------------------------------------------------------------------
@@ -252,9 +252,9 @@ pub(crate) struct PerContextState {
     /// Economic policy.
     economic_policy: Option<String>,
     /// Tool registry.
-    tool_registry: ToolRegistry,
+    outlet_registry: OutletRegistry,
     /// Registered tool handlers keyed by tool ID.
-    tool_handlers: ToolHandlerMap,
+    outlet_handlers: OutletHandlerMap,
     /// Event log (Merkle tree) — canonical `scp-event-log` implementation.
     event_log: EventLog,
     /// UCAN revocation set (token CIDs). Capped at [`WASM_REVOKED_TOKENS_CAP`].
@@ -279,14 +279,14 @@ pub(crate) struct PerContextState {
     /// Uses `BroadcastContext` from scp-protocol per §5.14.2 cohesion invariant.
     broadcast_context: Option<BroadcastContext>,
     /// Stateful tool sessions (spec section 6.2.1).
-    sessions: HashMap<String, WasmToolSession>,
+    sessions: HashMap<String, WasmOutletSession>,
     /// Threshold governance signers (ADR-031 §4b).
     threshold_signers: Vec<String>,
     /// Current threshold value (ADR-031 §4b). `0` means threshold governance
     /// is not configured.
     threshold_value: u32,
     /// Established tool interfaces (spec section 6.2).
-    tool_interfaces: Vec<String>,
+    outlet_interfaces: Vec<String>,
     /// Whether governance is frozen due to conflicting proposals (ADR-031 §7).
     governance_freeze: bool,
     /// Pending governance proposals keyed by proposal ID (hex).
@@ -336,15 +336,15 @@ pub(crate) struct PerContextState {
 
 /// A stateful tool session for the WASM bridge.
 ///
-/// Mirrors `scp_core::context::tools::ToolSession` locally since WASM
+/// Mirrors `scp_core::context::tools::OutletSession` locally since WASM
 /// cannot depend on scp-core (ADR-034).
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields read via pattern matching and clone.
-struct WasmToolSession {
+struct WasmOutletSession {
     /// Unique session identifier.
     session_id: String,
     /// The tool this session is associated with.
-    tool_id: String,
+    outlet_id: String,
     /// The calling context.
     source_context: String,
     /// Opaque session state.
@@ -358,7 +358,7 @@ struct WasmToolSession {
     call_count: u64,
 }
 
-impl WasmToolSession {
+impl WasmOutletSession {
     /// Returns `true` if this session has expired.
     ///
     /// Sessions with `ttl_ms: None` never expire (they persist for the
@@ -457,15 +457,15 @@ impl PerContextState {
     /// Mirrors `ContextRoleState::member_has_capability` in scp-core. In the
     /// default role system (see `builtin_*` functions in scp-core roles.rs):
     /// - "admin" — all capabilities in the ceiling.
-    /// - "moderator" — messages:read, messages:write, `tool_invoke:*`,
+    /// - "moderator" — messages:read, messages:write, `outlet_call:*`,
     ///   member:remove, governance:propose (§5.9 elected moderators pattern).
-    /// - "member" — messages:read, messages:write, `tool_invoke:*`.
-    /// - "author" — messages:write, messages:read, `tool_invoke:*`.
+    /// - "member" — messages:read, messages:write, `outlet_call:*`.
+    /// - "author" — messages:write, messages:read, `outlet_call:*`.
     /// - "observer" — messages:read only.
     /// - "subscriber" — messages:read only (broadcast contexts).
     ///
     /// Capability strings use the UCAN `{resource}:{action}` format where
-    /// compound resources use underscores (e.g. `"tool_invoke:*"`,
+    /// compound resources use underscores (e.g. `"outlet_call:*"`,
     /// `"context:close"`, `"messages:write"`). This matches scp-core's
     /// `Capability::ucan_capability_name()` output and the ceiling string
     /// format, ensuring cross-platform UCAN token exchange works correctly.
@@ -511,7 +511,7 @@ impl PerContextState {
                     capability,
                     "messages:read"
                         | "messages:write"
-                        | "tool_invoke:*"
+                        | "outlet_call:*"
                         | "member:remove"
                         | "governance:propose"
                 );
@@ -521,16 +521,16 @@ impl PerContextState {
                 // Authors: messages r/w, tool invoke — intersected with ceiling.
                 let role_grants = matches!(
                     capability,
-                    "messages:write" | "messages:read" | "tool_invoke:*"
+                    "messages:write" | "messages:read" | "outlet_call:*"
                 );
                 role_grants && in_ceiling(capability)
             }
             "member" => {
                 // Default member capabilities: messages:read, messages:write,
-                // tool_invoke:* — intersected with ceiling.
+                // outlet_invoke:* — intersected with ceiling.
                 let role_grants = matches!(
                     capability,
-                    "messages:read" | "messages:write" | "tool_invoke:*"
+                    "messages:read" | "messages:write" | "outlet_call:*"
                 );
                 role_grants && in_ceiling(capability)
             }
@@ -1103,8 +1103,8 @@ pub(crate) fn make_bare_per_context_state(context_id: &str, creator_did: &str) -
         promotion_policy: None,
         governance: "single_admin".to_owned(),
         economic_policy: None,
-        tool_registry: ToolRegistry::new(),
-        tool_handlers: HashMap::new(),
+        outlet_registry: OutletRegistry::new(),
+        outlet_handlers: HashMap::new(),
         event_log: EventLog::new(context_id.to_owned()),
         revoked_tokens: HashSet::new(),
         seen_nonces: HashMap::new(),
@@ -1117,7 +1117,7 @@ pub(crate) fn make_bare_per_context_state(context_id: &str, creator_did: &str) -
         sessions: HashMap::new(),
         threshold_signers: Vec::new(),
         threshold_value: 0,
-        tool_interfaces: Vec::new(),
+        outlet_interfaces: Vec::new(),
         governance_freeze: false,
         pending_proposals: HashMap::new(),
         resolved_proposals: HashMap::new(),
@@ -1319,8 +1319,8 @@ impl WasmContextManager {
             promotion_policy,
             governance,
             economic_policy,
-            tool_registry: ToolRegistry::new(),
-            tool_handlers: HashMap::new(),
+            outlet_registry: OutletRegistry::new(),
+            outlet_handlers: HashMap::new(),
             event_log: EventLog::new(context_id.to_owned()),
             revoked_tokens: HashSet::new(),
             seen_nonces: HashMap::new(),
@@ -1333,7 +1333,7 @@ impl WasmContextManager {
             sessions: HashMap::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
-            tool_interfaces: Vec::new(),
+            outlet_interfaces: Vec::new(),
             governance_freeze: false,
             pending_proposals: HashMap::new(),
             resolved_proposals: HashMap::new(),
@@ -1866,15 +1866,15 @@ impl WasmContextManager {
     ///
     /// Returns an error if the context is not active, the tool definition
     /// is invalid, or the tool ID is already registered.
-    pub fn register_tool(
+    pub fn register_outlet(
         &mut self,
         context_id: &str,
-        registration: ToolRegistration,
+        registration: OutletRegistration,
     ) -> Result<String, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        let tool_id = registration.tool_id.clone();
-        crate::runtime::tool_registry_insert_unique(&mut ctx.tool_registry, registration).map_err(
+        let outlet_id = registration.outlet_id.clone();
+        crate::runtime::outlet_registry_insert_unique(&mut ctx.outlet_registry, registration).map_err(
             |e| ScpWasmError::Tool {
                 message: e,
                 code: codes::TOOL_6001.to_owned(),
@@ -1882,9 +1882,9 @@ impl WasmContextManager {
         )?;
 
         let actor = ctx.creator_did.clone();
-        ctx.append_log_event(EventType::ToolRegistered, &actor, tool_id.as_bytes());
+        ctx.append_log_event(EventType::OutletRegistered, &actor, outlet_id.as_bytes());
 
-        Ok(tool_id)
+        Ok(outlet_id)
     }
 
     /// Checks whether a tool exists in the context's registry.
@@ -1892,9 +1892,9 @@ impl WasmContextManager {
     /// # Errors
     ///
     /// Returns an error if the context is not found or not active.
-    pub fn tool_exists(&self, context_id: &str, tool_id: &str) -> Result<bool, ScpWasmError> {
+    pub fn tool_exists(&self, context_id: &str, outlet_id: &str) -> Result<bool, ScpWasmError> {
         let ctx = self.require_active_context(context_id)?;
-        Ok(ctx.tool_registry.get(tool_id).is_some())
+        Ok(ctx.outlet_registry.get(outlet_id).is_some())
     }
 
     /// Registers a handler function for a tool.
@@ -1905,25 +1905,25 @@ impl WasmContextManager {
     /// # Errors
     ///
     /// Returns an error if the context is not active or the tool is not found.
-    pub fn register_tool_handler(
+    pub fn register_outlet_handler(
         &mut self,
         context_id: &str,
-        tool_id: &str,
+        outlet_id: &str,
         handler: Box<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String>>,
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        if ctx.tool_registry.get(tool_id).is_none() {
+        if ctx.outlet_registry.get(outlet_id).is_none() {
             return Err(ScpWasmError::Tool {
                 message: format!(
-                    "tool '{tool_id}' not found in context '{context_id}' \
+                    "tool '{outlet_id}' not found in context '{context_id}' \
                      -- register the tool before adding a handler"
                 ),
                 code: codes::TOOL_6002.to_owned(),
             });
         }
 
-        ctx.tool_handlers.insert(tool_id.to_owned(), handler);
+        ctx.outlet_handlers.insert(outlet_id.to_owned(), handler);
         Ok(())
     }
 
@@ -1934,27 +1934,27 @@ impl WasmContextManager {
     ///
     /// Returns an error if the context is not active, the tool is not found,
     /// or schema validation fails.
-    pub fn invoke_tool(
+    pub fn invoke_outlet(
         &mut self,
         context_id: &str,
-        tool_id: &str,
+        outlet_id: &str,
         input_json: &serde_json::Value,
         identity_did: &str,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
         let registration = ctx
-            .tool_registry
-            .get(tool_id)
+            .outlet_registry
+            .get(outlet_id)
             .ok_or_else(|| ScpWasmError::Tool {
-                message: format!("tool '{tool_id}' not found in context '{context_id}'"),
+                message: format!("tool '{outlet_id}' not found in context '{context_id}'"),
                 code: codes::TOOL_6002.to_owned(),
             })?;
 
         // Validate input against the tool's input schema.
         validate_value_against_schema(input_json, &registration.schema.input_schema).map_err(
             |e| ScpWasmError::Tool {
-                message: format!("input schema validation failed for tool '{tool_id}': {e}"),
+                message: format!("input schema validation failed for tool '{outlet_id}': {e}"),
                 code: codes::TOOL_6002.to_owned(),
             },
         )?;
@@ -1962,15 +1962,15 @@ impl WasmContextManager {
         let output_schema = registration.schema.output_schema.clone();
 
         // Dispatch to registered handler if available.
-        let result = if let Some(handler) = ctx.tool_handlers.get(tool_id) {
+        let result = if let Some(handler) = ctx.outlet_handlers.get(outlet_id) {
             let out = handler(input_json.clone()).map_err(|e| ScpWasmError::Tool {
-                message: format!("tool handler for '{tool_id}' failed: {e}"),
+                message: format!("tool handler for '{outlet_id}' failed: {e}"),
                 code: codes::TOOL_6002.to_owned(),
             })?;
 
             validate_value_against_schema(&out, &output_schema).map_err(|msg| {
                 ScpWasmError::Tool {
-                    message: format!("output validation failed for tool '{tool_id}': {msg}"),
+                    message: format!("output validation failed for tool '{outlet_id}': {msg}"),
                     code: codes::TOOL_6002.to_owned(),
                 }
             })?;
@@ -1978,13 +1978,13 @@ impl WasmContextManager {
             out
         } else {
             serde_json::json!({
-                "tool_id": tool_id,
+                "outlet_id": outlet_id,
                 "status": "validated",
                 "input": input_json,
             })
         };
 
-        ctx.append_log_event(EventType::ToolInvoked, identity_did, tool_id.as_bytes());
+        ctx.append_log_event(EventType::OutletInvoked, identity_did, outlet_id.as_bytes());
 
         Ok(result)
     }
@@ -1994,18 +1994,18 @@ impl WasmContextManager {
     /// # Errors
     ///
     /// Returns an error if the context is not found or the tool is not registered.
-    pub fn verify_tool(
+    pub fn verify_outlet(
         &self,
         context_id: &str,
-        tool_id: &str,
+        outlet_id: &str,
     ) -> Result<(bool, Vec<String>), ScpWasmError> {
         let ctx = self.require_context(context_id)?;
 
         let registration = ctx
-            .tool_registry
-            .get(tool_id)
+            .outlet_registry
+            .get(outlet_id)
             .ok_or_else(|| ScpWasmError::Tool {
-                message: format!("tool '{tool_id}' not found in context '{context_id}'"),
+                message: format!("tool '{outlet_id}' not found in context '{context_id}'"),
                 code: codes::TOOL_6003.to_owned(),
             })?;
 
@@ -2048,7 +2048,7 @@ impl WasmContextManager {
         &self,
         source_context_id: &str,
         target_context_id: &str,
-        tool_id: &str,
+        outlet_id: &str,
         input: &serde_json::Value,
         invoker_did: &str,
         chain_depth: u8,
@@ -2078,11 +2078,11 @@ impl WasmContextManager {
 
         // Validate tool exists in target and validate input.
         let registration = target
-            .tool_registry
-            .get(tool_id)
+            .outlet_registry
+            .get(outlet_id)
             .ok_or_else(|| ScpWasmError::Tool {
                 message: format!(
-                    "tool '{tool_id}' not found in target context '{target_context_id}'"
+                    "tool '{outlet_id}' not found in target context '{target_context_id}'"
                 ),
                 code: codes::TOOL_6003.to_owned(),
             })?;
@@ -2097,15 +2097,15 @@ impl WasmContextManager {
         let output_schema = registration.schema.output_schema.clone();
 
         // Dispatch to handler or echo mode.
-        let result = if let Some(handler) = target.tool_handlers.get(tool_id) {
+        let result = if let Some(handler) = target.outlet_handlers.get(outlet_id) {
             let out = handler(input.clone()).map_err(|e| ScpWasmError::Tool {
-                message: format!("cross-context tool handler for '{tool_id}' failed: {e}"),
+                message: format!("cross-context tool handler for '{outlet_id}' failed: {e}"),
                 code: codes::TOOL_6002.to_owned(),
             })?;
 
             validate_value_against_schema(&out, &output_schema).map_err(|msg| {
                 ScpWasmError::Tool {
-                    message: format!("output validation failed for tool '{tool_id}': {msg}"),
+                    message: format!("output validation failed for tool '{outlet_id}': {msg}"),
                     code: codes::TOOL_6002.to_owned(),
                 }
             })?;
@@ -2113,7 +2113,7 @@ impl WasmContextManager {
             out
         } else {
             serde_json::json!({
-                "tool": tool_id,
+                "tool": outlet_id,
                 "source_context": source_context_id,
                 "target_context": target_context_id,
                 "status": "validated",
@@ -2139,7 +2139,7 @@ impl WasmContextManager {
     pub fn session_create(
         &mut self,
         context_id: &str,
-        tool_id: &str,
+        outlet_id: &str,
         source_context_id: &str,
         ttl_seconds: Option<u64>,
     ) -> Result<String, ScpWasmError> {
@@ -2184,9 +2184,9 @@ impl WasmContextManager {
         let session_id = uuid::Uuid::new_v4().to_string();
         let now = crate::time::now_ms();
 
-        let session = WasmToolSession {
+        let session = WasmOutletSession {
             session_id: session_id.clone(),
-            tool_id: tool_id.to_owned(),
+            outlet_id: outlet_id.to_owned(),
             source_context: source_context_id.to_owned(),
             state: serde_json::Value::Null,
             created_at_ms: now,
@@ -2229,12 +2229,12 @@ impl WasmContextManager {
             });
         }
 
-        let tool_id = session.tool_id.clone();
+        let outlet_id = session.outlet_id.clone();
         let current_state = session.state.clone();
         let call_count = session.call_count;
 
         // Validate input against tool's input schema if tool is registered.
-        if let Some(registration) = ctx.tool_registry.get(&tool_id) {
+        if let Some(registration) = ctx.outlet_registry.get(&outlet_id) {
             validate_value_against_schema(input, &registration.schema.input_schema).map_err(
                 |e| ScpWasmError::Tool {
                     message: format!("input validation failed: {e}"),
@@ -2244,15 +2244,15 @@ impl WasmContextManager {
         }
 
         // Execute via handler or echo mode.
-        let (new_state, output) = if let Some(handler) = ctx.tool_handlers.get(&tool_id) {
+        let (new_state, output) = if let Some(handler) = ctx.outlet_handlers.get(&outlet_id) {
             let out = handler(input.clone()).map_err(|e| ScpWasmError::Tool {
-                message: format!("tool handler for '{tool_id}' failed: {e}"),
+                message: format!("tool handler for '{outlet_id}' failed: {e}"),
                 code: codes::TOOL_6002.to_owned(),
             })?;
             (current_state, out)
         } else {
             let out = serde_json::json!({
-                "tool": tool_id,
+                "tool": outlet_id,
                 "session_id": session_id,
                 "status": "validated",
                 "call_count": call_count + 1,
@@ -2274,12 +2274,12 @@ impl WasmContextManager {
     /// Returns the tool ID for an active session.
     ///
     /// Used to look up the tool before UCAN validation so the correct
-    /// `tool_invoke:{tool_id}` capability can be checked.
+    /// `outlet_call:{outlet_id}` capability can be checked.
     ///
     /// # Errors
     ///
     /// Returns an error if the context or session is not found.
-    pub fn session_tool_id(
+    pub fn session_outlet_id(
         &self,
         context_id: &str,
         session_id: &str,
@@ -2292,7 +2292,7 @@ impl WasmContextManager {
                 message: format!("session '{session_id}' not found"),
                 code: codes::TOOL_6018.to_owned(),
             })?;
-        Ok(session.tool_id.clone())
+        Ok(session.outlet_id.clone())
     }
 
     /// Closes a stateful tool session.
@@ -2565,9 +2565,9 @@ impl WasmContextManager {
 
             GovernanceAction::ChangeRole { .. } => "role:assign",
 
-            GovernanceAction::RegisterTool { .. }
-            | GovernanceAction::RemoveTool { .. }
-            | GovernanceAction::EstablishToolInterface { .. } => "tool:register",
+            GovernanceAction::RegisterOutlet { .. }
+            | GovernanceAction::RemoveOutlet { .. }
+            | GovernanceAction::EstablishOutletInterface { .. } => "outlet:register",
 
             GovernanceAction::CloseContext { .. } => "context:close",
 
@@ -2742,23 +2742,23 @@ impl WasmContextManager {
                 }
                 Ok(serde_json::json!({"action": "ChangeRole", "did": did_str, "newRole": new_role}))
             }
-            GovernanceAction::RegisterTool { registration } => {
+            GovernanceAction::RegisterOutlet { registration } => {
                 self.dispatch_register_tool(
                     context_id,
-                    &registration.tool_id,
+                    &registration.outlet_id,
                     &registration.name,
                     &registration.description,
                 )
             }
-            GovernanceAction::RemoveTool { tool_id } => {
+            GovernanceAction::RemoveOutlet { outlet_id } => {
                 let ctx = self.require_active_context_mut(context_id)?;
-                if ctx.tool_registry.remove(tool_id).is_none() {
+                if ctx.outlet_registry.remove(outlet_id).is_none() {
                     return Err(ScpWasmError::Tool {
-                        message: format!("tool '{tool_id}' not found"),
+                        message: format!("tool '{outlet_id}' not found"),
                         code: codes::TOOL_6003.to_owned(),
                     });
                 }
-                Ok(serde_json::json!({"action": "RemoveTool", "toolId": tool_id}))
+                Ok(serde_json::json!({"action": "RemoveTool", "toolId": outlet_id}))
             }
             GovernanceAction::ModifyCeiling { new_ceiling } => {
                 let ctx = self.require_active_context_mut(context_id)?;
@@ -2794,7 +2794,7 @@ impl WasmContextManager {
             | GovernanceAction::AddSigner { .. }
             | GovernanceAction::RemoveSigner { .. }
             | GovernanceAction::ModifyThreshold { .. }
-            | GovernanceAction::EstablishToolInterface { .. }
+            | GovernanceAction::EstablishOutletInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
             | GovernanceAction::RotateContentKeys { .. }
@@ -2965,8 +2965,8 @@ impl WasmContextManager {
             GovernanceAction::AddMember { .. }
             | GovernanceAction::RemoveMember { .. }
             | GovernanceAction::ChangeRole { .. }
-            | GovernanceAction::RegisterTool { .. }
-            | GovernanceAction::RemoveTool { .. }
+            | GovernanceAction::RegisterOutlet { .. }
+            | GovernanceAction::RemoveOutlet { .. }
             | GovernanceAction::ModifyCeiling { .. }
             | GovernanceAction::CloseContext { .. }
             | GovernanceAction::ExtendTtl { .. } => unreachable!(),
@@ -2977,7 +2977,7 @@ impl WasmContextManager {
             | GovernanceAction::AddSigner { .. }
             | GovernanceAction::RemoveSigner { .. }
             | GovernanceAction::ModifyThreshold { .. }
-            | GovernanceAction::EstablishToolInterface { .. }
+            | GovernanceAction::EstablishOutletInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
             | GovernanceAction::RotateContentKeys { .. }
@@ -3155,8 +3155,8 @@ impl WasmContextManager {
             GovernanceAction::AddMember { .. } // 14 upstream (exhaustive, no wildcard)
             | GovernanceAction::RemoveMember { .. }
             | GovernanceAction::ChangeRole { .. }
-            | GovernanceAction::RegisterTool { .. }
-            | GovernanceAction::RemoveTool { .. }
+            | GovernanceAction::RegisterOutlet { .. }
+            | GovernanceAction::RemoveOutlet { .. }
             | GovernanceAction::ModifyCeiling { .. }
             | GovernanceAction::CloseContext { .. }
             | GovernanceAction::ExtendTtl { .. }
@@ -3165,7 +3165,7 @@ impl WasmContextManager {
             | GovernanceAction::SuspendAccess { .. }
             | GovernanceAction::RevokeAccess { .. }
             | GovernanceAction::RestoreAccess { .. } => unreachable!(),
-            GovernanceAction::EstablishToolInterface { .. } // 11 downstream
+            GovernanceAction::EstablishOutletInterface { .. } // 11 downstream
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
             | GovernanceAction::RotateContentKeys { .. }
@@ -3181,7 +3181,7 @@ impl WasmContextManager {
         }
     }
 
-    /// Handles remaining governance actions: `EstablishToolInterface`,
+    /// Handles remaining governance actions: `EstablishOutletInterface`,
     /// `ResetMember`, `ResolveConflict`, `RotateContentKeys`,
     /// `ReconfigureGovernance`, `ProposeContextMigration`,
     /// `CancelContextMigration`.
@@ -3191,12 +3191,12 @@ impl WasmContextManager {
         action: &GovernanceAction,
     ) -> Result<serde_json::Value, ScpWasmError> {
         match action {
-            GovernanceAction::EstablishToolInterface { interface } => {
+            GovernanceAction::EstablishOutletInterface { interface } => {
                 let ctx = self.require_active_context_mut(context_id)?;
                 // Store as JSON string for WASM-local state.
-                ctx.tool_interfaces
+                ctx.outlet_interfaces
                     .push(serde_json::to_string(interface).unwrap_or_default());
-                Ok(serde_json::json!({"action": "EstablishToolInterface"}))
+                Ok(serde_json::json!({"action": "EstablishOutletInterface"}))
             }
             GovernanceAction::ResetMember { did, reason } => {
                 self.dispatch_reset_member(context_id, did, reason)
@@ -3256,8 +3256,8 @@ impl WasmContextManager {
             GovernanceAction::AddMember { .. }
             | GovernanceAction::RemoveMember { .. }
             | GovernanceAction::ChangeRole { .. }
-            | GovernanceAction::RegisterTool { .. }
-            | GovernanceAction::RemoveTool { .. }
+            | GovernanceAction::RegisterOutlet { .. }
+            | GovernanceAction::RemoveOutlet { .. }
             | GovernanceAction::ModifyCeiling { .. }
             | GovernanceAction::CloseContext { .. }
             | GovernanceAction::ExtendTtl { .. }
@@ -3396,8 +3396,8 @@ impl WasmContextManager {
             GovernanceAction::AddMember { .. }
             | GovernanceAction::RemoveMember { .. }
             | GovernanceAction::ChangeRole { .. }
-            | GovernanceAction::RegisterTool { .. }
-            | GovernanceAction::RemoveTool { .. }
+            | GovernanceAction::RegisterOutlet { .. }
+            | GovernanceAction::RemoveOutlet { .. }
             | GovernanceAction::ModifyCeiling { .. }
             | GovernanceAction::CloseContext { .. }
             | GovernanceAction::ExtendTtl { .. }
@@ -3412,7 +3412,7 @@ impl WasmContextManager {
             | GovernanceAction::AddSigner { .. }
             | GovernanceAction::RemoveSigner { .. }
             | GovernanceAction::ModifyThreshold { .. }
-            | GovernanceAction::EstablishToolInterface { .. }
+            | GovernanceAction::EstablishOutletInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
             | GovernanceAction::RotateContentKeys { .. }
@@ -3527,17 +3527,17 @@ impl WasmContextManager {
     fn dispatch_register_tool(
         &mut self,
         context_id: &str,
-        tool_id: &str,
+        outlet_id: &str,
         name: &str,
         description: &str,
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
         let registered_at = crate::time::now_secs();
-        let reg = ToolRegistration {
-            tool_id: tool_id.to_owned(),
+        let reg = OutletRegistration {
+            outlet_id: outlet_id.to_owned(),
             name: name.to_owned(),
             description: description.to_owned(),
-            schema: crate::runtime::ToolSchema {
+            schema: crate::runtime::OutletSchema {
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: serde_json::json!({"type": "object"}),
             },
@@ -3548,13 +3548,13 @@ impl WasmContextManager {
             registered_at,
             signature: Vec::new(),
         };
-        crate::runtime::tool_registry_insert_unique(&mut ctx.tool_registry, reg).map_err(|e| {
+        crate::runtime::outlet_registry_insert_unique(&mut ctx.outlet_registry, reg).map_err(|e| {
             ScpWasmError::Tool {
                 message: e,
                 code: codes::TOOL_6001.to_owned(),
             }
         })?;
-        Ok(serde_json::json!({"action": "RegisterTool", "toolId": tool_id}))
+        Ok(serde_json::json!({"action": "RegisterTool", "toolId": outlet_id}))
     }
 
     /// Helper for `RemoveSigner` governance action.
@@ -4869,8 +4869,8 @@ impl WasmContextManager {
     // -----------------------------------------------------------------------
 
     /// Converts a capability string from the canonical user-facing colon
-    /// format (e.g. `"tool:invoke:*"`) to the UCAN `{resource}:{action}`
-    /// format (e.g. `"tool_invoke:*"`).
+    /// format (e.g. `"outlet:call:*"`) to the UCAN `{resource}:{action}`
+    /// format (e.g. `"outlet_call:*"`).
     ///
     /// The rule: if a capability has more than one colon (compound resource),
     /// join all segments except the last with underscores to form the resource,
@@ -4898,7 +4898,7 @@ impl WasmContextManager {
     /// or defaults matching scp-core's UCAN `{resource}:{action}` format.
     ///
     /// Default capabilities use underscore-format for compound resources
-    /// (e.g. `"tool_invoke:*"`, `"tool:register"`) to match scp-core's
+    /// (e.g. `"outlet_call:*"`, `"outlet:register"`) to match scp-core's
     /// `Capability::ucan_capability_name()` output. This ensures UCAN ceiling
     /// checks (step 8 of validation) pass when tokens minted by scp-core are
     /// validated in the WASM bridge.
@@ -4910,8 +4910,8 @@ impl WasmContextManager {
             [
                 "messages:read",
                 "messages:write",
-                "tool:register",
-                "tool_invoke:*",
+                "outlet:register",
+                "outlet_call:*",
                 "role:assign",
                 "member:invite",
                 "member:remove",
@@ -5105,7 +5105,7 @@ impl WasmContextManager {
             cooldown_until: ctx.cooldown_until.clone(),
             threshold_signers: ctx.threshold_signers.clone(),
             threshold_value: ctx.threshold_value,
-            tool_interfaces: ctx.tool_interfaces.clone(),
+            outlet_interfaces: ctx.outlet_interfaces.clone(),
             governance_freeze: ctx.governance_freeze,
             pruning_policy: ctx.pruning_policy.clone(),
             economic_policy_locked: ctx.economic_policy_locked,
@@ -5334,8 +5334,8 @@ impl WasmContextManager {
             promotion_policy: snap.promotion_policy.clone(),
             governance: snap.governance.clone(),
             economic_policy: snap.economic_policy.clone(),
-            tool_registry: ToolRegistry::new(),
-            tool_handlers: HashMap::new(),
+            outlet_registry: OutletRegistry::new(),
+            outlet_handlers: HashMap::new(),
             event_log: EventLog::new(context_id.clone()),
             revoked_tokens: snap.revoked_tokens.iter().cloned().collect(),
             // v3 import: prefer `seen_nonces_v3` if present, falling back to
@@ -5378,7 +5378,7 @@ impl WasmContextManager {
             sessions: HashMap::new(),
             threshold_signers: snap.threshold_signers.clone(),
             threshold_value: snap.threshold_value,
-            tool_interfaces: snap.tool_interfaces.clone(),
+            outlet_interfaces: snap.outlet_interfaces.clone(),
             governance_freeze: snap.governance_freeze,
             pending_proposals: HashMap::new(),
             // v3 import: reconstruct resolved_proposals from serde_json::Value
@@ -5759,7 +5759,7 @@ struct WasmContextExportSnapshot {
     threshold_value: u32,
     /// Established tool interface JSON strings (§6.2).
     #[serde(default)]
-    tool_interfaces: Vec<String>,
+    outlet_interfaces: Vec<String>,
     /// Whether governance is frozen (ADR-031 §7).
     #[serde(default)]
     governance_freeze: bool,
@@ -5861,9 +5861,9 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_register_tool() {
-        roundtrip(&GovernanceAction::RegisterTool {
+        roundtrip(&GovernanceAction::RegisterOutlet {
             registration: Box::new(from_json(serde_json::json!({
-                "tool_id": "tool-abc",
+                "outlet_id": "tool-abc",
                 "name": "my-tool",
                 "description": "A test tool",
                 "schema": {"input_schema": {}, "output_schema": {}},
@@ -5876,8 +5876,8 @@ mod tests {
 
     #[test]
     fn serde_roundtrip_remove_tool() {
-        roundtrip(&GovernanceAction::RemoveTool {
-            tool_id: "tool-abc".to_owned(),
+        roundtrip(&GovernanceAction::RemoveOutlet {
+            outlet_id: "tool-abc".to_owned(),
         });
     }
 
@@ -5972,13 +5972,13 @@ mod tests {
     }
 
     #[test]
-    fn serde_roundtrip_establish_tool_interface() {
+    fn serde_roundtrip_establish_outlet_interface() {
         let action: GovernanceAction = from_json(serde_json::json!({
-            "EstablishToolInterface": {
+            "EstablishOutletInterface": {
                 "interface": {
                     "source_context": "ctx-src",
                     "target_context": "ctx-tgt",
-                    "tool_id": "tool-1",
+                    "outlet_id": "tool-1",
                     "rate_limit": null,
                     "per_caller_rate_limit": null,
                     "approved_by_source": false,
@@ -6065,7 +6065,7 @@ mod tests {
             "SetEconomicPolicy": {
                 "policy": {
                     "locked": false,
-                    "cost_schedule": {"currency": [85, 83, 68, 0], "per_message": null, "per_tool_invoke": null, "per_join": null, "per_period": null, "per_byte_stored": null},
+                    "cost_schedule": {"currency": [85, 83, 68, 0], "per_message": null, "per_outlet_call": null, "per_join": null, "per_period": null, "per_byte_stored": null},
                     "payment_adapters": [],
                     "pricing_formula": null,
                     "payee": "did:dht:zpayee"
@@ -6125,19 +6125,19 @@ mod tests {
     /// Builds all 28 `GovernanceAction` variants for exhaustive testing.
     ///
     /// Uses JSON deserialization to construct complex inner types (`ContextParams`,
-    /// `ToolRegistration`, etc.) rather than manual struct construction.
+    /// `OutletRegistration`, etc.) rather than manual struct construction.
     fn all_wasm_governance_actions() -> Vec<GovernanceAction> {
         let json_actions: Vec<serde_json::Value> = vec![
             serde_json::json!({"AddMember": {"did": "d", "role": "r"}}),
             serde_json::json!({"RemoveMember": {"did": "d", "reason": null}}),
             serde_json::json!({"ChangeRole": {"did": "d", "new_role": "r"}}),
             serde_json::json!({"RegisterTool": {"registration": {
-                "tool_id": "t", "name": "n", "description": "d",
+                "outlet_id": "t", "name": "n", "description": "d",
                 "schema": {"input_schema": {}, "output_schema": {}},
                 "implementation_hash": vec![0u8; 32], "test_vectors": [],
                 "operator_did": "did:dht:zop"
             }}}),
-            serde_json::json!({"RemoveTool": {"tool_id": "t"}}),
+            serde_json::json!({"RemoveTool": {"outlet_id": "t"}}),
             serde_json::json!({"ModifyCeiling": {"new_ceiling": []}}),
             serde_json::json!({"CloseContext": {"reason": null}}),
             serde_json::json!({"ExtendTtl": {"additional_secs": 1}}),
@@ -6156,9 +6156,9 @@ mod tests {
             serde_json::json!({"AddSigner": {"did": "d"}}),
             serde_json::json!({"RemoveSigner": {"did": "d"}}),
             serde_json::json!({"ModifyThreshold": {"new_threshold": 1}}),
-            serde_json::json!({"EstablishToolInterface": {"interface": {
+            serde_json::json!({"EstablishOutletInterface": {"interface": {
                 "source_context": "ctx-src", "target_context": "ctx-tgt",
-                "tool_id": "tool-1", "rate_limit": null, "per_caller_rate_limit": null,
+                "outlet_id": "tool-1", "rate_limit": null, "per_caller_rate_limit": null,
                 "approved_by_source": false, "approved_by_target": false,
                 "outbound_policy": null, "inbound_policy": null
             }}}),
@@ -6179,7 +6179,7 @@ mod tests {
             }}),
             serde_json::json!({"SetEconomicPolicy": {"policy": {
                 "locked": false,
-                    "cost_schedule": {"currency": [85, 83, 68, 0], "per_message": null, "per_tool_invoke": null, "per_join": null, "per_period": null, "per_byte_stored": null},
+                    "cost_schedule": {"currency": [85, 83, 68, 0], "per_message": null, "per_outlet_call": null, "per_join": null, "per_period": null, "per_byte_stored": null},
                     "payment_adapters": [],
                     "pricing_formula": null,
                     "payee": "did:dht:zpayee"
@@ -6579,8 +6579,8 @@ mod tests {
             promotion_policy: None,
             governance: "single_admin".to_owned(),
             economic_policy: None,
-            tool_registry: ToolRegistry::new(),
-            tool_handlers: HashMap::new(),
+            outlet_registry: OutletRegistry::new(),
+            outlet_handlers: HashMap::new(),
             event_log: EventLog::new(context_id.to_owned()),
             revoked_tokens: HashSet::new(),
             seen_nonces: HashMap::new(),
@@ -6593,7 +6593,7 @@ mod tests {
             sessions: HashMap::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
-            tool_interfaces: Vec::new(),
+            outlet_interfaces: Vec::new(),
             governance_freeze: false,
             pending_proposals: HashMap::new(),
             resolved_proposals: HashMap::new(),
@@ -6690,8 +6690,8 @@ mod tests {
             promotion_policy: None,
             governance: "single_admin".to_owned(),
             economic_policy: None,
-            tool_registry: ToolRegistry::new(),
-            tool_handlers: HashMap::new(),
+            outlet_registry: OutletRegistry::new(),
+            outlet_handlers: HashMap::new(),
             event_log: EventLog::new(context_id.to_owned()),
             revoked_tokens: revoked,
             seen_nonces: HashMap::new(),
@@ -6704,7 +6704,7 @@ mod tests {
             sessions: HashMap::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
-            tool_interfaces: Vec::new(),
+            outlet_interfaces: Vec::new(),
             governance_freeze: false,
             pending_proposals: HashMap::new(),
             resolved_proposals: HashMap::new(),
@@ -6965,7 +6965,7 @@ mod tests {
             cooldown_until: HashMap::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
-            tool_interfaces: Vec::new(),
+            outlet_interfaces: Vec::new(),
             governance_freeze: false,
             pruning_policy: None,
             economic_policy_locked: false,
@@ -7192,7 +7192,7 @@ mod tests {
             "cost_schedule": {
                 "currency": [85, 83, 68, 0],
                 "per_message": 100,
-                "per_tool_invoke": null,
+                "per_outlet_call": null,
                 "per_join": null,
                 "per_period": null,
                 "per_byte_stored": null
@@ -7213,7 +7213,7 @@ mod tests {
             "cost_schedule": {
                 "currency": [85, 83, 68, 0],
                 "per_message": null,
-                "per_tool_invoke": null,
+                "per_outlet_call": null,
                 "per_join": null,
                 "per_period": null,
                 "per_byte_stored": null
@@ -7516,7 +7516,7 @@ mod tests {
             cost_schedule: CostSchedule {
                 currency: CurrencyCode::from("USD"),
                 per_message: Some(Amount(100)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,

@@ -27,7 +27,7 @@ use scp_ffi_uniffi::{
     ContextParams,
     GovernanceModel,
     MemoryScope,
-    ToolDefinition,
+    OutletDefinition,
     // Free functions — bridge trust
     bridge_evaluate_trust,
     // Free functions — broadcast
@@ -75,8 +75,8 @@ use scp_ffi_uniffi::{
     sync_classify_offline,
     sync_classify_offline_custom,
     // Free functions — tools
-    tool_register,
-    tool_verify,
+    outlet_register,
+    outlet_verify,
     // Free functions — transport
     transport_connect,
     // Free functions — UCAN
@@ -95,7 +95,7 @@ fn full_capability_params() -> ContextParams {
         ceiling: vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool:invoke:*".to_owned(),
+            "outlet:call:*".to_owned(),
             "context:close".to_owned(),
             "member:invite".to_owned(),
             "member:remove".to_owned(),
@@ -122,7 +122,7 @@ fn default_encrypted_params() -> ContextParams {
         ceiling: vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool:invoke:*".to_owned(),
+            "outlet:call:*".to_owned(),
         ],
         ceiling_policy: CeilingPolicy::Immutable,
         governance: GovernanceModel::SingleAdmin,
@@ -618,7 +618,7 @@ async fn tool_register_and_verify() {
         .await
         .unwrap();
 
-    let definition = ToolDefinition {
+    let definition = OutletDefinition {
         name: "calculator".to_owned(),
         description: "A simple calculator tool".to_owned(),
         input_schema_json:
@@ -632,11 +632,11 @@ async fn tool_register_and_verify() {
         cost: None,
     };
 
-    let tool_id = tool_register(handle.clone(), definition).await.unwrap();
-    assert!(!tool_id.is_empty(), "Tool ID should be non-empty");
+    let outlet_id = outlet_register(handle.clone(), definition).await.unwrap();
+    assert!(!outlet_id.is_empty(), "Tool ID should be non-empty");
 
     // Verify the registered tool
-    let verification = tool_verify(handle, tool_id).await.unwrap();
+    let verification = outlet_verify(handle, outlet_id).await.unwrap();
     assert!(verification.passed, "Tool verification should pass");
 }
 
@@ -744,7 +744,7 @@ async fn discovery_normalize_trims_whitespace() {
 #[tokio::test]
 async fn discovery_create_query_produces_json() {
     let result = discovery_create_query(
-        Some(vec!["tool:search".to_owned()]),
+        Some(vec!["outlet:search".to_owned()]),
         Some(vec!["rust".to_owned()]),
         None,
     )

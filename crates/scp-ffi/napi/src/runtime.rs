@@ -35,7 +35,7 @@ use scp_core::context::builder::ContextEventLogProvider;
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
 use scp_core::context::providers::MerkleEventLogProvider;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
-use scp_core::context::tools::{SessionStore, ToolRegistry};
+use scp_core::context::tools::{SessionStore, OutletRegistry};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
@@ -437,8 +437,8 @@ impl BridgeInstanceCore for NapiBridgeInstance {
 }
 
 /// A tool handler is a closure that takes validated JSON input and returns
-/// JSON output or an error string. Registered via [`register_tool_handler`].
-pub type ToolHandler =
+/// JSON output or an error string. Registered via [`register_outlet_handler`].
+pub type OutletHandler =
     Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
@@ -1363,13 +1363,13 @@ pub struct UcanContextState {
     /// Role state for capability checking (tool registration, invocation).
     pub role_state: ContextRoleState,
     /// Tool registry for this context (cross-context + session support).
-    pub tool_registry: ToolRegistry,
+    pub outlet_registry: OutletRegistry,
     /// Registered tool handlers keyed by tool ID.
     ///
     /// When a tool is invoked, the handler is looked up here and called with
     /// the validated JSON input. If no handler is registered, the invocation
     /// falls back to echoing the validated input (echo mode).
-    pub tool_handlers: HashMap<String, ToolHandler>,
+    pub outlet_handlers: HashMap<String, OutletHandler>,
     /// Session store for stateful tool sessions (spec section 6.2.1).
     pub session_store: SessionStore,
 }
@@ -1452,8 +1452,8 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
             event_log,
         },
         role_state,
-        tool_registry: ToolRegistry::new(),
-        tool_handlers: HashMap::new(),
+        outlet_registry: OutletRegistry::new(),
+        outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
     };
 
@@ -1535,22 +1535,22 @@ pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpNap
 ///
 /// Returns `ScpNapiError::Context` if the context is not found or the tool
 /// is not registered.
-pub fn register_tool_handler(
+pub fn register_outlet_handler(
     context_id: &str,
-    tool_id: &str,
-    handler: ToolHandler,
+    outlet_id: &str,
+    handler: OutletHandler,
 ) -> Result<(), ScpNapiError> {
     with_context(context_id, |st| {
-        if st.tool_registry.get(tool_id).is_none() {
+        if st.outlet_registry.get(outlet_id).is_none() {
             return Err(ScpNapiError::Context {
                 message: format!(
-                    "tool '{tool_id}' not found in context '{context_id}' \
+                    "tool '{outlet_id}' not found in context '{context_id}' \
                      -- register the tool before adding a handler"
                 ),
                 code: codes::CTX_2023.to_owned(),
             });
         }
-        st.tool_handlers.insert(tool_id.to_owned(), handler);
+        st.outlet_handlers.insert(outlet_id.to_owned(), handler);
         Ok(())
     })
 }
@@ -1638,8 +1638,8 @@ pub fn register_test_context(context_id: &str, creator_did: &str) {
             creator_did: creator_did.to_owned(),
         },
         role_state,
-        tool_registry: ToolRegistry::new(),
-        tool_handlers: HashMap::new(),
+        outlet_registry: OutletRegistry::new(),
+        outlet_handlers: HashMap::new(),
         session_store: SessionStore::new(),
     };
 

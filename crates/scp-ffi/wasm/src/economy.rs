@@ -64,7 +64,7 @@ fn metrics_from_json(metrics: &serde_json::Value) -> ObservableMetrics {
 /// # Arguments
 ///
 /// - `policy_json` — Economic policy as JSON, or `""` / `"null"` for free.
-/// - `action_type` — One of: `"MessageSend"`, `"ToolInvoke"`,
+/// - `action_type` — One of: `"MessageSend"`, `"OutletCall"`,
 ///   `"ContextJoin"`, `"SubscriptionPeriod"`, `"ByteStored"`.
 /// - `metrics_json` — Observable metrics as JSON object.
 #[wasm_bindgen]
@@ -77,7 +77,7 @@ pub fn economy_estimate_cost(
         // Parse action type
         let action_key = match action_type.as_str() {
             "MessageSend" | "message_send" => "per_message",
-            "ToolInvoke" | "tool_invoke" => "per_tool_invoke",
+            "OutletCall" | "outlet_call" => "per_outlet_call",
             "ContextJoin" | "context_join" => "per_join",
             "SubscriptionPeriod" | "subscription_period" => "per_period",
             "ByteStored" | "byte_stored" => "per_byte_stored",
@@ -183,7 +183,7 @@ pub fn economy_policy_requires_payment(policy_json: String) -> Promise {
         let has_cost = policy.get("cost_schedule").is_some_and(|cs| {
             let has_simple = [
                 "per_message",
-                "per_tool_invoke",
+                "per_outlet_call",
                 "per_join",
                 "per_byte_stored",
             ]

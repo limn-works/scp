@@ -135,7 +135,7 @@ pub mod runtime;
 pub mod scp;
 pub mod scpid;
 pub mod sync;
-pub mod tools;
+pub mod outlets;
 pub mod transport;
 pub mod trust;
 pub mod ucan;

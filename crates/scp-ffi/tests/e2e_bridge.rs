@@ -370,10 +370,10 @@ fn tool_register_and_verify() {
         let tv_list = PyList::new(py, &[tv]).unwrap();
         reg.set_item("test_vectors", tv_list).unwrap();
 
-        let tool_id = _scp_core::tools::py_tool_register(&ctx_id, &reg.as_borrowed()).unwrap();
-        assert!(tool_id.contains("test_tool"));
+        let outlet_id = _scp_core::outlets::py_outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
+        assert!(outlet_id.contains("test_tool"));
 
-        let result = _scp_core::tools::py_tool_verify(&ctx_id, &tool_id).unwrap();
+        let result = _scp_core::outlets::py_outlet_verify(&ctx_id, &outlet_id).unwrap();
         assert!(result.passed);
         assert!(result.failures.is_empty());
     });
@@ -392,7 +392,7 @@ fn tool_register_rejects_invalid_context() {
         schema.set_item("output_schema", PyDict::new(py)).unwrap();
         reg.set_item("schema", schema).unwrap();
 
-        let result = _scp_core::tools::py_tool_register("nonexistent-ctx", &reg.as_borrowed());
+        let result = _scp_core::outlets::py_outlet_register("nonexistent-ctx", &reg.as_borrowed());
         assert!(result.is_err());
     });
 }
@@ -412,7 +412,7 @@ fn tool_register_rejects_empty_name() {
         schema.set_item("output_schema", PyDict::new(py)).unwrap();
         reg.set_item("schema", schema).unwrap();
 
-        let result = _scp_core::tools::py_tool_register(&ctx_id, &reg.as_borrowed());
+        let result = _scp_core::outlets::py_outlet_register(&ctx_id, &reg.as_borrowed());
         assert!(result.is_err());
     });
 }
@@ -1012,7 +1012,7 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
         let ctx_id = create_test_context(&did_a);
 
         runtime::with_context(&ctx_id, |rt| {
-            rt.ceiling_strings.insert("tool_invoke:*".to_owned());
+            rt.ceiling_strings.insert("outlet_call:*".to_owned());
             rt.ceiling_strings.insert("messages:write".to_owned());
             Ok(())
         })
@@ -1020,11 +1020,11 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
 
         // Register a tool using the helper.
         let reg = build_tool_reg(py, "cross_domain_tool", &did_a);
-        let tool_id = _scp_core::tools::py_tool_register(&ctx_id, &reg.as_borrowed()).unwrap();
-        assert!(!tool_id.is_empty());
+        let outlet_id = _scp_core::outlets::py_outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
+        assert!(!outlet_id.is_empty());
 
         // Verify tool.
-        let vr = _scp_core::tools::py_tool_verify(&ctx_id, &tool_id).unwrap();
+        let vr = _scp_core::outlets::py_outlet_verify(&ctx_id, &outlet_id).unwrap();
         assert!(vr.passed);
 
         // Append an event and query.

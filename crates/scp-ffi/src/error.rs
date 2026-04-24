@@ -273,7 +273,7 @@ impl From<scp_identity::IdentityError> for ScpPyError {
 
 /// Extracts a leading `SCP-XXX-NNNN` error code from a message body, if any.
 ///
-/// `ContextManager::invoke_tool_with_economy` and several other paths
+/// `ContextManager::invoke_outlet_with_economy` and several other paths
 /// surface category-specific error codes inside `PermissionDenied(String)`
 /// (e.g. `"SCP-ECON-12010: budget exceeded for ..."`,
 /// `"SCP-TOOL-6080: context not active: ..."`). Without this parser the
@@ -412,13 +412,13 @@ impl From<scp_core::context::promotion::PromotionError> for ScpPyError {
     }
 }
 
-// Tool errors → ScpPyError (tools category, matching napi/uniffi bridges)
+// Outlet errors → ScpPyError (outlets category, matching napi/uniffi bridges)
 
-impl From<scp_core::context::tools::ToolError> for ScpPyError {
-    fn from(e: scp_core::context::tools::ToolError) -> Self {
+impl From<scp_core::context::tools::OutletError> for ScpPyError {
+    fn from(e: scp_core::context::tools::OutletError) -> Self {
         Self::ContextError {
             message: format!(
-                "tool operation failed: {e} — check tool registration, permissions, and input schema"
+                "outlet operation failed: {e} — check outlet registration, permissions, and input schema"
             ),
             code: codes::TOOL_6001.to_owned(),
         }
@@ -429,7 +429,7 @@ impl From<scp_core::context::tools::invoke::InvocationError> for ScpPyError {
     fn from(e: scp_core::context::tools::invoke::InvocationError) -> Self {
         Self::ContextError {
             message: format!(
-                "tool invocation failed: {e} — verify tool ID, input, and caller permissions"
+                "outlet invocation failed: {e} — verify outlet ID, input, and caller permissions"
             ),
             code: codes::TOOL_6002.to_owned(),
         }
@@ -440,7 +440,7 @@ impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpPyErro
     fn from(e: scp_core::context::tools::schema::SchemaValidationError) -> Self {
         Self::ValidationError {
             message: format!(
-                "schema validation failed: {e} — check input against the tool's JSON Schema"
+                "schema validation failed: {e} — check input against the outlet's JSON Schema"
             ),
             code: codes::VALID_7001.to_owned(),
         }

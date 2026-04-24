@@ -1,7 +1,7 @@
 //! WASM-local runtime helpers and re-exports from `scp-protocol`.
 //!
-//! Tool registration types (`ToolRegistration`, `TestVector`, `ToolCost`,
-//! `ToolSchema`), `ToolRegistry`, and schema validation functions
+//! Tool registration types (`OutletRegistration`, `TestVector`, `OutletCost`,
+//! `OutletSchema`), `OutletRegistry`, and schema validation functions
 //! (`validate_schema`, `validate_value_against_schema`) are imported from
 //! `scp-protocol`.
 //!
@@ -12,31 +12,31 @@
 //!
 //! See SCP-218 and ADR-022/ADR-034 in `.docs/adrs/phase-4.md`.
 
-// Re-export tool types from scp-protocol for use by manager.rs, tools.rs, etc.
-pub use scp_protocol::context::tools::schema::{
+// Re-export outlet types from scp-protocol for use by manager.rs, outlets.rs, etc.
+pub use scp_protocol::context::outlets::schema::{
     SchemaValidationError, validate_schema, validate_value_against_schema,
 };
-pub use scp_protocol::context::tools::{
-    TestVector, ToolCost, ToolRegistration, ToolRegistry, ToolSchema,
+pub use scp_protocol::context::outlets::{
+    OutletTestVector, OutletCost, OutletRegistration, OutletRegistry, OutletSchema,
 };
 
-/// Inserts a tool registration with duplicate checking.
+/// Inserts an outlet registration with duplicate checking.
 ///
-/// Unlike `ToolRegistry::insert` (which returns the previous registration),
-/// this returns an error if the tool ID is already registered — preserving
+/// Unlike `OutletRegistry::insert` (which returns the previous registration),
+/// this returns an error if the outlet ID is already registered — preserving
 /// the WASM bridge's "register once" semantics.
 ///
 /// # Errors
 ///
-/// Returns an error string if the tool ID is already registered.
-pub fn tool_registry_insert_unique(
-    registry: &mut ToolRegistry,
-    registration: ToolRegistration,
+/// Returns an error string if the outlet ID is already registered.
+pub fn outlet_registry_insert_unique(
+    registry: &mut OutletRegistry,
+    registration: OutletRegistration,
 ) -> Result<(), String> {
-    if registry.contains(&registration.tool_id) {
+    if registry.contains(&registration.outlet_id) {
         return Err(format!(
-            "tool already registered: \"{}\"",
-            registration.tool_id
+            "outlet already registered: \"{}\"",
+            registration.outlet_id
         ));
     }
     registry.insert(registration);

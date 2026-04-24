@@ -2,16 +2,16 @@
 //!
 //! Exposes tool registration, invocation, and verification:
 //!
-//! - [`tool_register`] — Register a tool in a context.
-//! - [`tool_invoke`] — Invoke a tool within a context.
-//! - [`tool_verify`] — Verify a tool against its test vectors.
+//! - [`outlet_register`] — Register a tool in a context.
+//! - [`outlet_invoke`] — Invoke a tool within a context.
+//! - [`outlet_verify`] — Verify a tool against its test vectors.
 //!
 //! See ADR-022 in `.docs/adrs/phase-4.md`.
 
 use napi_derive::napi;
 use scp_ffi_common::error_codes as codes;
 use scp_ffi_common::validate::{
-    validate_did, validate_tool_id, validate_tool_name, validate_ucan_token,
+    validate_did, validate_outlet_id, validate_outlet_name, validate_ucan_token,
 };
 use scp_primitives::Clock;
 
@@ -23,7 +23,7 @@ use crate::error::ScpNapiError;
 /// Performs the full 11-step ADR-016 validation pipeline.
 fn validate_ucan_for_tool(
     context_id: &str,
-    tool_id: &str,
+    outlet_id: &str,
     identity_did: &str,
     ucan_token: &str,
     proof_resolver: &scp_ffi_common::BridgeProofResolver,
@@ -53,25 +53,25 @@ fn validate_ucan_for_tool(
             clock: &scp_primitives::SystemClock,
         };
 
-        scp_core::context::tools::validate_tool_invocation_ucan(
-            ucan_token, context_id, tool_id, &mut ctx,
+        scp_core::context::tools::validate_outlet_invocation_ucan(
+            ucan_token, context_id, outlet_id, &mut ctx,
         )
         .map_err(|e| ScpNapiError::Permission {
-            message: format!("UCAN authorization failed for tool '{tool_id}': {e}"),
+            message: format!("UCAN authorization failed for tool '{outlet_id}': {e}"),
             code: codes::PERM_3001.to_owned(),
         })
     })
 }
 
 // ---------------------------------------------------------------------------
-// NapiToolDefinition — tool definition for registration
+// NapiOutletDefinition — tool definition for registration
 // ---------------------------------------------------------------------------
 
 /// Tool definition for registration in a context.
 ///
 /// See ADR-010 (Tool Registry) and spec §5.4.1 (Tools).
 #[napi(object)]
-pub struct NapiToolDefinition {
+pub struct NapiOutletDefinition {
     /// Human-readable tool name.
     pub name: String,
     /// Tool description.
@@ -87,12 +87,12 @@ pub struct NapiToolDefinition {
     /// SHA-256 hash of the implementation binary (32 bytes).
     pub implementation_hash: Option<Vec<u8>>,
     /// Optional per-invocation cost metadata (spec §5.4.1).
-    pub cost: Option<NapiToolCost>,
+    pub cost: Option<NapiOutletCost>,
 }
 
 /// Per-invocation cost metadata for a tool (spec §5.4.1).
 #[napi(object)]
-pub struct NapiToolCost {
+pub struct NapiOutletCost {
     /// Cost per invocation in the smallest currency unit.
     pub amount: i64,
     /// ISO 4217 or protocol-defined currency code.
@@ -104,14 +104,14 @@ pub struct NapiToolCost {
 }
 
 // ---------------------------------------------------------------------------
-// NapiToolVerificationResult — result of tool verification
+// NapiOutletVerificationResult — result of tool verification
 // ---------------------------------------------------------------------------
 
 /// Result of verifying a tool against its registered test vectors.
 #[napi(object)]
-pub struct NapiToolVerificationResult {
+pub struct NapiOutletVerificationResult {
     /// The verified tool's ID.
-    pub tool_id: String,
+    pub outlet_id: String,
     /// `true` if all test vectors passed.
     pub passed: bool,
     /// Failure messages for vectors that did not pass. Empty on success.
@@ -145,7 +145,7 @@ fn validate_schema_json(json: &str, field_name: &str) -> napi::Result<serde_json
 /// JSON returns `SCP-VALID-7037`.
 fn validate_test_vectors_json(
     json: Option<&str>,
-) -> napi::Result<Vec<scp_core::context::tools::TestVector>> {
+) -> napi::Result<Vec<scp_core::context::tools::OutletTestVector>> {
     json.map_or_else(
         || Ok(Vec::new()),
         |s| {
@@ -207,12 +207,12 @@ fn validate_implementation_hash(bytes: Option<&[u8]>) -> napi::Result<[u8; 32]> 
 ///   schema invalid, duplicate name, etc.) in the full runtime.
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-pub async fn tool_register(
+pub async fn outlet_register(
     handle: &NapiContextHandle,
-    definition: NapiToolDefinition,
+    definition: NapiOutletDefinition,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(handle);
-    validate_tool_name(&definition.name).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_outlet_name(&definition.name).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     let state_str = handle.state()?;
     if state_str != "active" {
@@ -230,8 +230,8 @@ pub async fn tool_register(
 
     let context_id = handle.context_id();
 
-    // Build a scp-core ToolRegistration from the NAPI definition.
-    let tool_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
+    // Build a scp-core OutletRegistration from the NAPI definition.
+    let outlet_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
 
     let input_schema = validate_schema_json(&definition.input_schema_json, "input_schema_json")?;
     let output_schema = validate_schema_json(&definition.output_schema_json, "output_schema_json")?;
@@ -241,18 +241,18 @@ pub async fn tool_register(
     let implementation_hash =
         validate_implementation_hash(definition.implementation_hash.as_deref())?;
 
-    let cost = definition.cost.map(|c| scp_core::context::tools::ToolCost {
+    let cost = definition.cost.map(|c| scp_core::context::tools::OutletCost {
         amount: c.amount.max(0).cast_unsigned(),
         currency: c.currency,
         payee: c.payee.into(),
         cost_formula: c.cost_formula,
     });
 
-    let core_registration = scp_core::context::tools::ToolRegistration {
-        tool_id,
+    let core_registration = scp_core::context::tools::OutletRegistration {
+        outlet_id,
         name: definition.name,
         description: definition.description,
-        schema: scp_core::context::tools::ToolSchema {
+        schema: scp_core::context::tools::OutletSchema {
             input_schema,
             output_schema,
         },
@@ -268,8 +268,8 @@ pub async fn tool_register(
 
     // Register the tool in the context's tool registry.
     let registered_id = crate::runtime::with_context(&context_id, |rt| {
-        let (registered_id, _event) = scp_core::context::tools::register_tool(
-            &mut rt.tool_registry,
+        let (registered_id, _event) = scp_core::context::tools::register_outlet(
+            &mut rt.outlet_registry,
             &rt.role_state,
             core_registration,
             &rt.core.creator_did.clone(),
@@ -286,7 +286,7 @@ pub async fn tool_register(
 }
 
 /// Invokes a tool within an SCP context, fully wired through the
-/// `ContextManager::invoke_tool_with_economy` pipeline.
+/// `ContextManager::invoke_outlet_with_economy` pipeline.
 ///
 /// This is the SINGLE entry point for tool invocation through the NAPI
 /// bridge. Per-invocation pricing, spending UCAN AND-composition
@@ -297,17 +297,17 @@ pub async fn tool_register(
 /// concerns.
 ///
 /// Validates the UCAN token for tool invocation authorization before
-/// dispatching. The UCAN must contain a `tool_invoke:{tool_id}` or
-/// `tool_invoke:*` capability scoped to the context.
+/// dispatching. The UCAN must contain a `outlet_call:{outlet_id}` or
+/// `outlet_call:*` capability scoped to the context.
 ///
 /// # Arguments
 ///
 /// * `handle` — The context containing the tool (must be `"active"`).
-/// * `tool_id` — The ID of the tool to invoke.
+/// * `outlet_id` — The ID of the tool to invoke.
 /// * `input_json` — Tool input parameters as a JSON string.
 /// * `identity_did` — The DID of the invoker (used for capability checking).
 /// * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
-///   Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
+///   Must contain `outlet_call:{outlet_id}` or `outlet_call:*` capability.
 ///   Validated using the full 11-step ADR-016 pipeline.
 /// * `proof_tokens` — Optional encoded parent UCAN tokens for the
 ///   delegation chain (ADR-016 step 3).
@@ -336,9 +336,9 @@ pub async fn tool_register(
 #[napi]
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 #[allow(clippy::too_many_arguments)] // mirrors the runtime's economy entry point
-pub async fn tool_invoke(
+pub async fn outlet_invoke(
     handle: &NapiContextHandle,
-    tool_id: String,
+    outlet_id: String,
     input_json: String,
     identity_did: String,
     ucan_token: String,
@@ -346,7 +346,7 @@ pub async fn tool_invoke(
     spending_ucan_jwt: Option<String>,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(handle);
-    validate_tool_id(&tool_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    validate_outlet_id(&outlet_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&identity_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_ucan_token(&ucan_token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     if let Some(jwt) = spending_ucan_jwt.as_deref() {
@@ -379,7 +379,7 @@ pub async fn tool_invoke(
         })?;
     validate_ucan_for_tool(
         &context_id,
-        &tool_id,
+        &outlet_id,
         &identity_did,
         &ucan_token,
         &proof_resolver,
@@ -402,21 +402,21 @@ pub async fn tool_invoke(
 
     // Snapshot the bridge-owned tool registry and (optionally) the
     // registered handler closure BEFORE entering the runtime call. The
-    // runtime requires `&ToolRegistry`; cloning the registry once is
+    // runtime requires `&OutletRegistry`; cloning the registry once is
     // cheap and avoids holding the bridge UCAN-state DashMap shard
     // lock across the runtime's three-phase lock split.
     let context_id_for_executor = context_id.clone();
-    let tool_id_for_executor = tool_id.clone();
+    let outlet_id_for_executor = outlet_id.clone();
     let identity_for_executor = identity_did.clone();
     let (registry, handler) = crate::runtime::with_context(&context_id, |rt| {
         Ok((
-            rt.tool_registry.clone(),
-            rt.tool_handlers.get(&tool_id).cloned(),
+            rt.outlet_registry.clone(),
+            rt.outlet_handlers.get(&outlet_id).cloned(),
         ))
     })
     .map_err(napi::Error::from)?;
 
-    // Build the executor closure. Phase 2 of `invoke_tool_with_economy`
+    // Build the executor closure. Phase 2 of `invoke_outlet_with_economy`
     // runs WITHOUT holding the `contexts` mutex; the runtime calls the
     // executor exactly once with the validated input value.
     let executor = move |input: serde_json::Value| {
@@ -426,7 +426,7 @@ pub async fn tool_invoke(
             handler.map_or_else(
                 || {
                     Ok(serde_json::json!({
-                        "tool": tool_id_for_executor,
+                        "tool": outlet_id_for_executor,
                         "context": context_id_for_executor,
                         "status": "validated",
                         "input_valid": true,
@@ -436,7 +436,7 @@ pub async fn tool_invoke(
                 },
                 |h| {
                     h(input).map_err(|e| {
-                        format!("tool handler for '{tool_id_for_executor}' failed: {e}")
+                        format!("tool handler for '{outlet_id_for_executor}' failed: {e}")
                     })
                 },
             )
@@ -453,12 +453,12 @@ pub async fn tool_invoke(
 
     let manager = crate::runtime::context_manager()?;
     let invoker_did_typed: scp_primitives::DID = identity_did.into();
-    let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
+    let outlet_id_typed = scp_core::context::tools::OutletId::from(outlet_id.as_str());
     let outcome = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             &context_id,
             &registry,
-            &tool_id_typed,
+            &outlet_id_typed,
             input_value,
             &invoker_did_typed,
             spending_ucan_token.as_ref(),
@@ -468,7 +468,7 @@ pub async fn tool_invoke(
         .await
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    // The runtime built the canonical `ToolInvokedEvent`; the
+    // The runtime built the canonical `OutletInvokedEvent`; the
     // transport / event-log layer is the one responsible for signing
     // and appending it. Pull the JSON output back out for the JS
     // caller.
@@ -485,11 +485,11 @@ pub async fn tool_invoke(
 /// # Arguments
 ///
 /// * `handle` — The context containing the tool (must be `"active"`).
-/// * `tool_id` — The ID of the tool to verify.
+/// * `outlet_id` — The ID of the tool to verify.
 ///
 /// # Returns
 ///
-/// A `Promise<NapiToolVerificationResult>` with pass/fail status.
+/// A `Promise<NapiOutletVerificationResult>` with pass/fail status.
 ///
 /// # Errors
 ///
@@ -498,10 +498,10 @@ pub async fn tool_invoke(
 #[napi]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub async fn tool_verify(
+pub async fn outlet_verify(
     handle: &NapiContextHandle,
-    tool_id: String,
-) -> napi::Result<NapiToolVerificationResult> {
+    outlet_id: String,
+) -> napi::Result<NapiOutletVerificationResult> {
     crate::napi_check_handle!(handle);
     let state_str = handle.state()?;
     if state_str != "active" {
@@ -519,14 +519,14 @@ pub async fn tool_verify(
 
     // Look up the tool and verify against its test vectors (matching PyO3 pattern).
     let result = crate::runtime::with_context(&context_id, |rt| {
-        let (verification_result, _event) = scp_core::context::tools::verify_tool(
-            &rt.tool_registry,
-            &tool_id,
+        let (verification_result, _event) = scp_core::context::tools::verify_outlet(
+            &rt.outlet_registry,
+            &outlet_id,
             // Identity executor: returns the expected output for each vector.
             // This validates the test vector structure; real execution verification
             // happens when a full executor is connected.
             |input| {
-                if let Some(registration) = rt.tool_registry.get(&tool_id) {
+                if let Some(registration) = rt.outlet_registry.get(&outlet_id) {
                     for vector in &registration.test_vectors {
                         if vector.input == *input {
                             return vector.expected_output.clone();
@@ -552,8 +552,8 @@ pub async fn tool_verify(
         .map(|r| r.description.clone())
         .collect();
 
-    Ok(NapiToolVerificationResult {
-        tool_id: result.tool_id,
+    Ok(NapiOutletVerificationResult {
+        outlet_id: result.outlet_id,
         passed: result.integrity_ok,
         failures,
     })
@@ -576,10 +576,10 @@ pub async fn tool_verify(
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
 #[allow(clippy::too_many_arguments)] // FFI boundary: napi-rs requires explicit params
-pub async fn tool_invoke_cross_context(
+pub async fn outlet_invoke_cross_context(
     source_handle: &NapiContextHandle,
     target_handle: &NapiContextHandle,
-    tool_id: String,
+    outlet_id: String,
     input_json: String,
     invoker_did: String,
     ucan_token: String,
@@ -647,7 +647,7 @@ pub async fn tool_invoke_cross_context(
         })?;
     validate_ucan_for_tool(
         &target_context_id,
-        &tool_id,
+        &outlet_id,
         &invoker_did,
         &ucan_token,
         &proof_resolver,
@@ -663,11 +663,11 @@ pub async fn tool_invoke_cross_context(
 
     let output = crate::runtime::with_context(&target_context_id, |rt| {
         let registration = rt
-            .tool_registry
-            .get(&tool_id)
+            .outlet_registry
+            .get(&outlet_id)
             .ok_or_else(|| ScpNapiError::Tool {
                 message: format!(
-                    "tool '{tool_id}' not found in target context '{target_context_id}'"
+                    "tool '{outlet_id}' not found in target context '{target_context_id}'"
                 ),
                 code: codes::TOOL_6002.to_owned(),
             })?;
@@ -683,10 +683,10 @@ pub async fn tool_invoke_cross_context(
         })?;
 
         // Dispatch to handler or echo mode.
-        let output = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
+        let output = if let Some(handler) = rt.outlet_handlers.get(&outlet_id) {
             let handler = handler.clone();
             let out = handler(input_value.clone()).map_err(|e| ScpNapiError::Tool {
-                message: format!("cross-context tool handler for '{tool_id}' failed: {e}"),
+                message: format!("cross-context tool handler for '{outlet_id}' failed: {e}"),
                 code: codes::TOOL_6002.to_owned(),
             })?;
 
@@ -695,14 +695,14 @@ pub async fn tool_invoke_cross_context(
                 &registration.schema.output_schema,
             )
             .map_err(|msg| ScpNapiError::Tool {
-                message: format!("output validation failed for tool '{tool_id}': {msg}"),
+                message: format!("output validation failed for tool '{outlet_id}': {msg}"),
                 code: codes::TOOL_6002.to_owned(),
             })?;
 
             out
         } else {
             serde_json::json!({
-                "tool": tool_id,
+                "tool": outlet_id,
                 "source_context": source_context_id,
                 "target_context": target_context_id,
                 "status": "validated",
@@ -736,9 +736,9 @@ pub async fn tool_invoke_cross_context(
 #[napi]
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
-pub async fn tool_session_create(
+pub async fn outlet_session_open(
     handle: &NapiContextHandle,
-    tool_id: String,
+    outlet_id: String,
     source_context_id: String,
     ttl_seconds: Option<u32>,
 ) -> napi::Result<String> {
@@ -781,9 +781,9 @@ pub async fn tool_session_create(
         let session_id = uuid::Uuid::new_v4().to_string();
         let now_ms = scp_primitives::SystemClock.now_millis();
 
-        let session = scp_core::context::tools::ToolSession {
+        let session = scp_core::context::tools::OutletSession {
             session_id: session_id.clone(),
-            tool_id,
+            outlet_id,
             source_context: source_context_id,
             state: serde_json::Value::Null,
             created_at: now_ms,
@@ -808,7 +808,7 @@ pub async fn tool_session_create(
 #[napi]
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
-pub async fn tool_session_invoke(
+pub async fn outlet_session_invoke(
     handle: &NapiContextHandle,
     session_id: String,
     input_json: String,
@@ -831,9 +831,9 @@ pub async fn tool_session_invoke(
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(handle)?;
 
-    // Look up the tool_id from the session before UCAN validation so we can
+    // Look up the outlet_id from the session before UCAN validation so we can
     // validate against the correct tool capability.
-    let tool_id_for_ucan = crate::runtime::with_context(&context_id, |rt| {
+    let outlet_id_for_ucan = crate::runtime::with_context(&context_id, |rt| {
         let session = rt
             .session_store
             .get(&session_id)
@@ -841,7 +841,7 @@ pub async fn tool_session_invoke(
                 message: format!("session '{session_id}' not found"),
                 code: codes::TOOL_6018.to_owned(),
             })?;
-        Ok(session.tool_id.clone())
+        Ok(session.outlet_id.clone())
     })
     .map_err(napi::Error::from)?;
 
@@ -856,7 +856,7 @@ pub async fn tool_session_invoke(
         })?;
     validate_ucan_for_tool(
         &context_id,
-        &tool_id_for_ucan,
+        &outlet_id_for_ucan,
         &invoker_did,
         &ucan_token,
         &proof_resolver,
@@ -882,7 +882,7 @@ pub async fn tool_session_invoke(
             });
         }
 
-        let tool_id = session.tool_id.clone();
+        let outlet_id = session.outlet_id.clone();
         let current_state = session.state.clone();
         let call_count = session.call_count;
 
@@ -893,7 +893,7 @@ pub async fn tool_session_invoke(
             })?;
 
         // Validate input against tool's input schema if tool is registered.
-        if let Some(registration) = rt.tool_registry.get(&tool_id) {
+        if let Some(registration) = rt.outlet_registry.get(&outlet_id) {
             scp_core::context::tools::validate_value_against_schema(
                 &input_value,
                 &registration.schema.input_schema,
@@ -905,16 +905,16 @@ pub async fn tool_session_invoke(
         }
 
         // Execute via handler or echo mode.
-        let (new_state, output) = if let Some(handler) = rt.tool_handlers.get(&tool_id) {
+        let (new_state, output) = if let Some(handler) = rt.outlet_handlers.get(&outlet_id) {
             let handler = handler.clone();
             let out = handler(input_value).map_err(|e| ScpNapiError::Tool {
-                message: format!("tool handler for '{tool_id}' failed: {e}"),
+                message: format!("tool handler for '{outlet_id}' failed: {e}"),
                 code: codes::TOOL_6002.to_owned(),
             })?;
             (current_state, out)
         } else {
             let out = serde_json::json!({
-                "tool": tool_id,
+                "tool": outlet_id,
                 "session_id": session_id,
                 "status": "validated",
                 "call_count": call_count + 1,
@@ -950,7 +950,7 @@ pub async fn tool_session_invoke(
 #[napi]
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
-pub async fn tool_session_close(
+pub async fn outlet_session_close(
     handle: &NapiContextHandle,
     session_id: String,
 ) -> napi::Result<()> {
@@ -977,23 +977,23 @@ pub async fn tool_session_close(
 /// Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
 ///
 /// The caller (admin of the source context) proposes sharing a specific tool
-/// with a target context. Returns a JSON string of the `ToolInterface` with
+/// with a target context. Returns a JSON string of the `OutletInterface` with
 /// `approved_by_source = true` and `approved_by_target = false`.
 ///
 /// # Returns
 ///
-/// A `Promise<string>` resolving to the `ToolInterface` as JSON.
+/// A `Promise<string>` resolving to the `OutletInterface` as JSON.
 #[napi]
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
-pub async fn tool_interface_expose(
+pub async fn outlet_interface_offer(
     handle: &NapiContextHandle,
-    tool_id: String,
+    outlet_id: String,
     target_context_id: String,
     rate_limit_json: Option<String>,
 ) -> napi::Result<String> {
     crate::napi_check_handle!(handle);
-    scp_ffi_common::validate::validate_tool_id(&tool_id)
+    scp_ffi_common::validate::validate_outlet_id(&outlet_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     scp_ffi_common::validate::validate_context_id(&target_context_id)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -1034,11 +1034,11 @@ pub async fn tool_interface_expose(
 
         let interface = scp_core::context::tools::interface::expose_tool(
             context_handle.context_id(),
-            &tool_id,
+            &outlet_id,
             &target_context_id,
             &rt.role_state,
             &rt.core.creator_did,
-            &rt.tool_registry,
+            &rt.outlet_registry,
             rate_limit,
             None,
         )
@@ -1048,7 +1048,7 @@ pub async fn tool_interface_expose(
         })?;
 
         serde_json::to_string(&interface).map_err(|e| ScpNapiError::Tool {
-            message: format!("failed to serialize ToolInterface: {e}"),
+            message: format!("failed to serialize OutletInterface: {e}"),
             code: codes::TOOL_6031.to_owned(),
         })
     })
@@ -1061,11 +1061,11 @@ pub async fn tool_interface_expose(
 ///
 /// # Returns
 ///
-/// A `Promise<string>` resolving to the updated `ToolInterface` as JSON.
+/// A `Promise<string>` resolving to the updated `OutletInterface` as JSON.
 #[napi]
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
-pub async fn tool_interface_accept(
+pub async fn outlet_interface_accept(
     handle: &NapiContextHandle,
     interface_json: String,
 ) -> napi::Result<String> {
@@ -1084,7 +1084,7 @@ pub async fn tool_interface_accept(
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(handle)?;
 
-    let mut interface: scp_core::context::tools::interface::ToolInterface =
+    let mut interface: scp_core::context::tools::interface::OutletInterface =
         serde_json::from_str(&interface_json).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("invalid interface_json: {e}"),
@@ -1111,7 +1111,7 @@ pub async fn tool_interface_accept(
         })?;
 
         serde_json::to_string(&interface).map_err(|e| ScpNapiError::Tool {
-            message: format!("failed to serialize ToolInterface: {e}"),
+            message: format!("failed to serialize OutletInterface: {e}"),
             code: codes::TOOL_6033.to_owned(),
         })
     })
@@ -1128,7 +1128,7 @@ pub async fn tool_interface_accept(
 #[napi]
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
-pub async fn tool_interface_revoke(
+pub async fn outlet_interface_revoke(
     handle: &NapiContextHandle,
     interface_id_hex: String,
 ) -> napi::Result<String> {
@@ -1268,7 +1268,7 @@ mod tests {
 
     #[test]
     fn validate_test_vectors_json_rejects_wrong_type() {
-        // Valid JSON but not an array of TestVector.
+        // Valid JSON but not an array of OutletTestVector.
         let result = validate_test_vectors_json(Some(r#"{"not": "an array"}"#));
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
@@ -1334,8 +1334,8 @@ mod tests {
 
     /// `registered_at` on a tool registered via the NAPI bridge must be a
     /// seconds-epoch timestamp, not milliseconds or hardcoded 0.
-    /// Calls the actual `tool_register` bridge function and inspects the
-    /// stored `ToolRegistration`. Catches the original bug from issue #871.
+    /// Calls the actual `outlet_register` bridge function and inspects the
+    /// stored `OutletRegistration`. Catches the original bug from issue #871.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn registered_at_is_seconds_epoch() {
         use crate::context::NapiContextHandle;
@@ -1345,7 +1345,7 @@ mod tests {
 
         let handle = NapiContextHandle::test_active(ctx_id.clone(), creator_did.to_owned());
 
-        let definition = NapiToolDefinition {
+        let definition = NapiOutletDefinition {
             name: "napi-timestamp-probe".to_owned(),
             description: "probes registered_at value".to_owned(),
             input_schema_json:
@@ -1358,15 +1358,15 @@ mod tests {
             cost: None,
         };
 
-        let tool_id = tool_register(&handle, definition)
+        let outlet_id = outlet_register(&handle, definition)
             .await
-            .expect("tool_register should succeed");
+            .expect("outlet_register should succeed");
 
         // Read the stored registration back and verify registered_at.
         let registered_at = crate::runtime::with_context(&ctx_id, |rt| {
             let reg = rt
-                .tool_registry
-                .get(&tool_id)
+                .outlet_registry
+                .get(&outlet_id)
                 .expect("tool should exist in registry after registration");
             Ok(reg.registered_at)
         })

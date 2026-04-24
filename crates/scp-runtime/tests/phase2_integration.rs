@@ -378,7 +378,7 @@ async fn phase2_end_to_end_integration() {
     .expect("role state creation");
 
     // Register the calculator tool.
-    let mut tool_registry = OutletRegistry::new();
+    let mut outlet_registry = OutletRegistry::new();
     let calc_registration = OutletRegistration {
         outlet_id: "calculator".to_owned(),
         name: "Calculator".to_owned(),
@@ -407,7 +407,7 @@ async fn phase2_end_to_end_integration() {
         signature: Vec::new(),
     };
     let (outlet_id, _tool_registered_event) = register_outlet(
-        &mut tool_registry,
+        &mut outlet_registry,
         &role_state,
         calc_registration,
         &alice_did,
@@ -617,7 +617,7 @@ async fn phase2_end_to_end_integration() {
 
     let (outlet_output, outlet_invoked_event, _consequences, _receipt) = invoke_outlet(
         &context,
-        &tool_registry,
+        &outlet_registry,
         &role_state,
         &"calculator".to_owned(),
         tool_input,

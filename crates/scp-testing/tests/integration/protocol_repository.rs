@@ -895,7 +895,7 @@ async fn tool_store_load_list_delete_roundtrip() {
     );
 
     // List.
-    let tools = store.list_tools(ctx).await.unwrap();
+    let tools = store.list_outlets(ctx).await.unwrap();
     assert_eq!(tools, vec!["calculator", "search"]);
 
     // Delete.

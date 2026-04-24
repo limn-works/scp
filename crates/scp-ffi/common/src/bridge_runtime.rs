@@ -279,7 +279,7 @@ pub fn build_event_log_provider() -> (
 /// state — the manager does not track UCAN revocation or nonces.
 ///
 /// The NAPI bridge extends this with bridge-specific fields (`role_state`,
-/// `tool_registry`, `tool_handlers`, `session_store`). The `UniFFI` bridge
+/// `outlet_registry`, `outlet_handlers`, `session_store`). The `UniFFI` bridge
 /// uses this as-is (type alias `UcanContextState = UcanContextStateCore`).
 pub struct UcanContextStateCore {
     /// UCAN revocation list for this context.

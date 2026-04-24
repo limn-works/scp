@@ -399,7 +399,7 @@ const VALID_TEMPLATE_IDS: &[&str] = &[
     "GroupDiscussion",
     "PublicBroadcast",
     "GatedBroadcast",
-    "scp:template/tool-interface",
+    "scp:template/outlet-interface",
     "scp:template/paid-service",
     "scp:template/paid-broadcast",
     "HandleRegistry",
@@ -939,7 +939,7 @@ fn py_context_create(identity_did: &str, params: &Bound<'_, PyDict>) -> PyResult
 
     let handle = PyContextHandle::new(context_id.clone(), identity_did.to_owned(), parsed.clone());
 
-    // Register FFI-specific state (ToolRegistry, EventLog, RoleState, RevocationList)
+    // Register FFI-specific state (OutletRegistry, EventLog, RoleState, RevocationList)
     // in the global FFI state registry so that tools/UCAN/event_log bridge functions
     // can look them up by context ID. Also initializes the shared ContextManager.
     crate::runtime::register_context(&context_id, identity_did, &parsed.ceiling)
@@ -1997,8 +1997,8 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             GovernanceActionResult::MemberAdded => "MemberAdded",
             GovernanceActionResult::MemberRemoved => "MemberRemoved",
             GovernanceActionResult::RoleChanged => "RoleChanged",
-            GovernanceActionResult::ToolRegistered => "ToolRegistered",
-            GovernanceActionResult::ToolRemoved => "ToolRemoved",
+            GovernanceActionResult::OutletRegistered => "OutletRegistered",
+            GovernanceActionResult::OutletRemoved => "OutletRemoved",
             GovernanceActionResult::CeilingModified => "CeilingModified",
             GovernanceActionResult::ContextClosed => "ContextClosed",
             GovernanceActionResult::TtlExtended => "TtlExtended",
@@ -2008,7 +2008,7 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
             GovernanceActionResult::SignerRemoved => "SignerRemoved",
             GovernanceActionResult::ThresholdModified => "ThresholdModified",
             GovernanceActionResult::ChildContextCreated => "ChildContextCreated",
-            GovernanceActionResult::ToolInterfaceEstablished => "ToolInterfaceEstablished",
+            GovernanceActionResult::OutletInterfaceEstablished => "OutletInterfaceEstablished",
             GovernanceActionResult::MemberReset => "MemberReset",
             GovernanceActionResult::ConflictResolved => "ConflictResolved",
             GovernanceActionResult::ContextPromoted => "ContextPromoted",
@@ -3633,8 +3633,8 @@ fn py_check_scoped_capability(
         return true;
     }
     // `ToolInvokeAll` covers any `ToolInvoke(specific)`
-    if matches!(&required, Capability::ToolInvoke(_))
-        && granted.contains(&Capability::ToolInvokeAll)
+    if matches!(&required, Capability::OutletCall(_))
+        && granted.contains(&Capability::OutletCallAll)
     {
         return true;
     }
@@ -3928,7 +3928,7 @@ pub fn py_metadata_record_from_json(json_str: String) -> PyResult<String> {
 /// - `"GroupDiscussion"`
 /// - `"PublicBroadcast"`
 /// - `"GatedBroadcast"`
-/// - `"scp:template/tool-interface"`
+/// - `"scp:template/outlet-interface"`
 /// - `"PaidService"`
 /// - `"PaidBroadcast"`
 /// - `"HandleRegistry"`
@@ -4013,8 +4013,8 @@ fn parse_template_id(
         "GroupDiscussion" => Ok(TemplateId::GroupDiscussion),
         "PublicBroadcast" => Ok(TemplateId::PublicBroadcast),
         "GatedBroadcast" => Ok(TemplateId::GatedBroadcast),
-        "scp:template/tool-interface" | "ToolInterfaceTemplate" => {
-            Ok(TemplateId::ToolInterfaceTemplate)
+        "scp:template/outlet-interface" | "OutletInterfaceTemplate" => {
+            Ok(TemplateId::OutletInterfaceTemplate)
         }
         "PaidService" => Ok(TemplateId::PaidService),
         "PaidBroadcast" => Ok(TemplateId::PaidBroadcast),
@@ -4025,7 +4025,7 @@ fn parse_template_id(
         _ => Err(crate::error::ScpPyError::validation(format!(
             "unknown template ID: {template_id:?} — valid values: BilateralEphemeral, \
              BilateralPersistent, Coordination, GroupDiscussion, PublicBroadcast, \
-             GatedBroadcast, scp:template/tool-interface, PaidService, PaidBroadcast, \
+             GatedBroadcast, scp:template/outlet-interface, PaidService, PaidBroadcast, \
              HandleRegistry, scp:template/handle-registry, DiscoveryContext, \
              scp:template/discovery-context"
         ))),
@@ -4719,7 +4719,7 @@ mod tests {
             default_params(),
         );
 
-        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_outlet_call":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
         let result = py_set_economic_policy(&mut handle, json);
         assert!(
             result.is_err(),
@@ -4747,7 +4747,7 @@ mod tests {
     #[test]
     fn get_economic_policy_some() {
         crate::runtime::ensure_bridge_instance();
-        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_tool_invoke":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
+        let json = r#"{"locked":false,"cost_schedule":{"currency":[85,83,68,0],"per_message":1,"per_outlet_call":null,"per_join":null,"per_period":null,"per_byte_stored":null},"payment_adapters":[],"pricing_formula":null,"payee":"did:dht:z6MkPayee"}"#;
         let handle = PyContextHandle::new(
             "ctx-econ-4".to_owned(),
             "did:test:creator".to_owned(),

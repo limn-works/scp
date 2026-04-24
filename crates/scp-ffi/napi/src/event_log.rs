@@ -23,7 +23,7 @@ use crate::error::ScpNapiError;
 /// See ADR-011 (Event Log) and spec section 13 (Event Log).
 #[napi(object)]
 pub struct NapiEvent {
-    /// The event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"ToolInvoked"`).
+    /// The event type (e.g., `"ContextCreated"`, `"MessageSent"`, `"OutletInvoked"`).
     pub event_type: String,
     /// DID of the actor who produced this event.
     pub actor_did: String,

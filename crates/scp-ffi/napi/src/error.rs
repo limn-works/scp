@@ -94,8 +94,8 @@ pub enum ScpNapiError {
         code: String,
     },
 
-    /// A tool operation failed (registration, invocation, verification).
-    #[error("[{code}] tool error: {message}")]
+    /// An outlet operation failed (registration, invocation, verification).
+    #[error("[{code}] outlet error: {message}")]
     Tool {
         /// Human-readable error message.
         message: String,
@@ -263,11 +263,11 @@ impl From<scp_core::context::promotion::PromotionError> for ScpNapiError {
     }
 }
 
-impl From<scp_core::context::tools::ToolError> for ScpNapiError {
-    fn from(e: scp_core::context::tools::ToolError) -> Self {
+impl From<scp_core::context::tools::OutletError> for ScpNapiError {
+    fn from(e: scp_core::context::tools::OutletError) -> Self {
         Self::Tool {
             message: format!(
-                "tool operation failed: {e} — check tool registration, permissions, and input schema"
+                "outlet operation failed: {e} — check outlet registration, permissions, and input schema"
             ),
             code: codes::TOOL_6001.to_owned(),
         }
@@ -278,7 +278,7 @@ impl From<scp_core::context::tools::invoke::InvocationError> for ScpNapiError {
     fn from(e: scp_core::context::tools::invoke::InvocationError) -> Self {
         Self::Tool {
             message: format!(
-                "tool invocation failed: {e} — verify tool ID, input, and caller permissions"
+                "outlet invocation failed: {e} — verify outlet ID, input, and caller permissions"
             ),
             code: codes::TOOL_6002.to_owned(),
         }
@@ -289,7 +289,7 @@ impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpNapiEr
     fn from(e: scp_core::context::tools::schema::SchemaValidationError) -> Self {
         Self::Validation {
             message: format!(
-                "schema validation failed: {e} — check input against the tool's JSON Schema"
+                "schema validation failed: {e} — check input against the outlet's JSON Schema"
             ),
             code: codes::VALID_7001.to_owned(),
         }

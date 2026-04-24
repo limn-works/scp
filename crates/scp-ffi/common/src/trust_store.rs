@@ -352,7 +352,7 @@ mod tests {
             make_event(EventType::MessageSent, subject_did, 1200, 1, vec![]),
             make_event(EventType::GovernanceAction, subject_did, 1400, 2, vec![]),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 subject_did,
                 1600,
                 3,
@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(
             input
                 .participation_record
-                .tool_invocations
+                .outlet_invocations
                 .get("review-tool"),
             Some(&1)
         );

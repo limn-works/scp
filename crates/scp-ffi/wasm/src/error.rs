@@ -101,8 +101,8 @@ pub enum ScpWasmError {
         code: String,
     },
 
-    /// A tool operation failed (registration, invocation, verification).
-    #[error("[{code}] tool error: {message}")]
+    /// An outlet operation failed (registration, invocation, verification).
+    #[error("[{code}] outlet error: {message}")]
     Tool {
         /// Human-readable error message.
         message: String,
