@@ -38,6 +38,11 @@ hex = { workspace = true }
 z-base-32 = { workspace = true }
 ed25519-dalek = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
+# `rand_core` with `getrandom` is used by the always-on
+# `generate_context_id` helper (spec §18.4.1). Compiles on every target
+# the four FFI bridges support, including `wasm32-unknown-unknown` via
+# `getrandom/js` pulled in by WASM's own dep set.
+rand_core = { version = "0.6", features = ["getrandom"] }
 thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }

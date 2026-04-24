@@ -1698,11 +1698,11 @@ impl crate::scp::PyScp {
         // Validate params eagerly (before any async work).
         let parsed = PyContextParams::from_py_dict(params)?;
 
-        // Generate a context ID using cryptographic randomness. In the full
-        // runtime this would come from scp-core's builder flow (MLS group
-        // formation, event log init). Context IDs are pure hex per §18.4.1
-        // for embedding in scp://context/<id> URIs.
-        let context_id = crate::types::generate_context_id();
+        // Spec §18.4.1: context IDs MUST be 64-char lowercase hex so they
+        // embed in `scp://context/<context_id_hex>` URIs. The shared helper
+        // in `scp-ffi-common` is the single source of truth for all four
+        // bridges — see ADR-048 §7a.
+        let context_id = scp_ffi_common::generate_context_id();
 
         let handle = PyContextHandle::new(
             bi,

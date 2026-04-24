@@ -25,6 +25,13 @@ pub mod validate;
 mod bridge_id;
 pub use bridge_id::generate_bridge_id;
 
+// Canonical §18.4.1 context-ID generator — shared across all four
+// bridges so `Scp::context_create` cannot regress to non-hex shapes
+// (see ADR-048 §7a for the UniFFI regression that motivated the
+// extraction).
+mod context_id;
+pub use context_id::generate_context_id;
+
 // ---------------------------------------------------------------------------
 // HTML escaping for event output (XSS prevention)
 // ---------------------------------------------------------------------------

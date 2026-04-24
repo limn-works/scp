@@ -281,14 +281,10 @@ pub fn context_create(identity_did: String, params_json: String) -> Promise {
         validate_min_protocol_version(&params).map_err(ScpWasmError::into_js)?;
 
         // Spec §18.4.1: context IDs MUST be 64-char lowercase hex so they
-        // embed in `scp://context/<context_id_hex>` URIs. Mirrors PyO3's
-        // `generate_context_id` in `crates/scp-ffi/src/types.rs`.
-        let context_id = {
-            use rand_core::RngCore;
-            let mut bytes = [0u8; 32];
-            rand_core::OsRng.fill_bytes(&mut bytes);
-            hex::encode(bytes)
-        };
+        // embed in `scp://context/<context_id_hex>` URIs. The shared helper
+        // in `scp-ffi-common` is the single source of truth for all four
+        // bridges — see ADR-048 §7a.
+        let context_id = scp_ffi_common::generate_context_id();
 
         with_manager(|mgr| mgr.create_context(&context_id, &identity_did, &params))
             .map_err(ScpWasmError::into_js)?;

@@ -453,14 +453,10 @@ pub(crate) async fn context_create_on(
         .map(|id| id.active_signing_key);
 
     // Spec §18.4.1: context IDs MUST be 64-char lowercase hex so they
-    // embed in `scp://context/<context_id_hex>` URIs. Mirrors PyO3's
-    // `generate_context_id` in `crates/scp-ffi/src/types.rs`.
-    let context_id = {
-        use rand::Rng;
-        let mut bytes = [0u8; 32];
-        rand::thread_rng().fill(&mut bytes);
-        hex::encode(bytes)
-    };
+    // embed in `scp://context/<context_id_hex>` URIs. The shared helper
+    // in `scp-ffi-common` is the single source of truth for all four
+    // bridges — see ADR-048 §7a.
+    let context_id = scp_ffi_common::generate_context_id();
     let creator_did = identity.inner.did.clone();
 
     // Parse consequence_rules from params (ADR-017, #1531). Accepts either a
