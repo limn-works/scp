@@ -645,7 +645,8 @@
         "transport_status"
       ],
       "uniffi": [
-        "transport_status"
+        "transport_status",
+        "transport_manager_status"
       ],
       "napi": [
         "transport_status"
