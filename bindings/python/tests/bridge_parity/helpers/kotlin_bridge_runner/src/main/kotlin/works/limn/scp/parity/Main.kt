@@ -427,31 +427,25 @@ private suspend fun opUcanValidateMalformed(args: JsonObject): JsonObject =
     }
 
 @Suppress("UnusedParameter")
-private suspend fun opTransportStatus(args: JsonObject): JsonObject {
-    // UniFFI `Scp.transportStatus(manager: TransportManager)` now REQUIRES
-    // a TransportManager (ADR-048 per-instance routing — no more handleless
-    // probe), and the parity harness has no relay fixture to wire up.
-    // The op is xfailed against uniffi-kotlin/uniffi-swift in
-    // `seed_operations.py` on this basis; surfacing a structured error
-    // here keeps the runner honest so the strict-xfail fails loudly if
-    // the divergence is silently fixed.
-    return buildJsonObject {
-        put(
-            "error",
-            buildJsonObject {
-                put("type", JsonPrimitive("UnsupportedOnUniFFI"))
-                put("code", JsonPrimitive("TEST-PARITY-1004"))
-                put(
-                    "message",
-                    JsonPrimitive(
-                        "uniffi-kotlin: Scp.transportStatus requires a TransportManager; " +
-                            "no handleless probe exposed"
-                    )
-                )
-            }
-        )
+private suspend fun opTransportStatus(args: JsonObject): JsonObject =
+    // ADR-048 §7a: UniFFI now exposes a handleless `transportManagerStatus()`
+    // alongside the handle-taking `transportStatus(manager)`, matching the
+    // PyO3 / NAPI / WASM probe contract. The parity harness drives the
+    // handleless path so no relay fixture is needed on the UniFFI runners.
+    uniffi.scp.Scp().use { scp ->
+        val status = scp.transportManagerStatus()
+        buildJsonObject {
+            put("connected", JsonPrimitive(status.connected))
+            put(
+                "relay_url",
+                status.relayUrl?.let { JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull
+            )
+            put(
+                "latency_ms",
+                status.latencyMs?.let { JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull
+            )
+        }
     }
-}
 
 // Shape-valid `did:dht:z…` DID guaranteed NOT to be in any bridge's
 // identity registry. Mirrors `seed_operations.py::FAKE_UNREGISTERED_DID`.

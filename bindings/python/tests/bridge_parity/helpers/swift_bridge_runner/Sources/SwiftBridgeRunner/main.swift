@@ -490,22 +490,16 @@ func opUcanValidateMalformed(_ req: BridgeRequest) async throws -> [String: JSON
 
 func opTransportStatus(_ req: BridgeRequest) async throws -> [String: JSONValue] {
     _ = req
-    // UniFFI `Scp.transportStatus(manager:)` now requires a non-optional
-    // TransportManager after ADR-048 Phase D (#1549 PR 4) — the prior
-    // handleless probe was deleted along with the default bridge
-    // instance. The parity harness has no relay fixture to produce a
-    // manager. Xfailed against uniffi-kotlin/uniffi-swift in
-    // seed_operations.py; surface a structured runner error so the
-    // strict-xfail still fires loudly if the divergence gets silently
-    // closed.
+    // ADR-048 §7a: UniFFI now exposes a handleless `transportManagerStatus()`
+    // alongside the handle-taking `transportStatus(manager:)`, matching the
+    // PyO3 / NAPI / WASM probe contract. The parity harness drives the
+    // handleless path so no relay fixture is needed on the UniFFI runners.
+    let scp = Scp()
+    let status = try await scp.transportManagerStatus()
     return [
-        "error": .object([
-            "type": .string("UnsupportedOnUniFFI"),
-            "code": .string("TEST-PARITY-1004"),
-            "message": .string(
-                "uniffi-swift: Scp.transportStatus requires a TransportManager; no handleless probe exposed"
-            )
-        ])
+        "connected": .bool(status.connected),
+        "relay_url": status.relayUrl.map(JSONValue.string) ?? .null,
+        "latency_ms": status.latencyMs.map { .number($0) } ?? .null,
     ]
 }
 

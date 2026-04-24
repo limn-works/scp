@@ -786,13 +786,6 @@ OP_TRANSPORT_STATUS = OpSpec(
         ("relay_url", None),
         ("latency_ms", None),
     ),
-    xfail_bridges=("uniffi-kotlin", "uniffi-swift"),
-    xfail_reason=(
-        "UniFFI `Scp.transportStatus(manager)` requires a non-optional "
-        "TransportManager after ADR-048 Phase D; parity harness has no "
-        "relay fixture to produce one. PyO3/NAPI/WASM keep a handleless "
-        "path and match exactly."
-    ),
 )
 
 
