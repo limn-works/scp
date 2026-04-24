@@ -6854,17 +6854,18 @@ impl Scp {
         // `Zeroizing` so the seed bytes are wiped when dropped — they
         // feed `Ed25519 SigningKey::from_bytes` inside the custody's
         // RNG.
-        let testing_seed_bytes: Option<zeroize::Zeroizing<[u8; 32]>> = match testing_seed {
-            None => None,
-            Some(bytes) => {
-                let arr: [u8; 32] =
-                    <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| ScpError::Validation {
-                        msg: format!("testing_seed must be exactly 32 bytes, got {}", bytes.len()),
+        let testing_seed_bytes: Option<zeroize::Zeroizing<[u8; 32]>> = testing_seed
+            .as_deref()
+            .map(|bytes| {
+                scp_ffi_common::validate::expect_fixed_bytes::<32>(bytes, "testing_seed").map_err(
+                    |msg| ScpError::Validation {
+                        msg,
                         code: codes::VALID_7007.to_owned(),
-                    })?;
-                Some(zeroize::Zeroizing::new(arr))
-            }
-        };
+                    },
+                )
+            })
+            .transpose()?
+            .map(zeroize::Zeroizing::new);
 
         runtime()
             .spawn(async move {

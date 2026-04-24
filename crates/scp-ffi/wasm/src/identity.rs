@@ -1014,13 +1014,14 @@ fn narrow_testing_seed(
         None => Ok(None),
         #[cfg(feature = "testing")]
         Some(bytes) => {
-            let arr = <[u8; 32]>::try_from(bytes).map_err(|_| {
-                ScpWasmError::Validation {
-                    message: format!("testing_seed must be exactly 32 bytes, got {}", bytes.len()),
-                    code: codes::VALID_7007.to_owned(),
-                }
-                .into_js()
-            })?;
+            let arr = scp_ffi_common::validate::expect_fixed_bytes::<32>(bytes, "testing_seed")
+                .map_err(|message| {
+                    ScpWasmError::Validation {
+                        message,
+                        code: codes::VALID_7007.to_owned(),
+                    }
+                    .into_js()
+                })?;
             Ok(Some(zeroize::Zeroizing::new(arr)))
         }
         #[cfg(not(feature = "testing"))]

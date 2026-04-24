@@ -323,22 +323,19 @@ impl Scp {
         // `Ed25519 SigningKey::from_bytes` inside the custody's RNG, so
         // we wrap the narrowed `[u8; 32]` in `Zeroizing` immediately to
         // wipe them when dropped rather than leaving them on the stack.
-        let testing_seed_bytes: Option<zeroize::Zeroizing<[u8; 32]>> = match testing_seed {
-            None => None,
-            Some(buf) => {
-                let slice: &[u8] = buf.as_ref();
-                let arr: [u8; 32] = slice.try_into().map_err(|_| {
-                    NapiError::from(ScpNapiError::Validation {
-                        message: format!(
-                            "`testing_seed` must be exactly 32 bytes, got {}",
-                            slice.len()
-                        ),
-                        code: codes::VALID_7007.to_owned(),
+        let testing_seed_bytes: Option<zeroize::Zeroizing<[u8; 32]>> = testing_seed
+            .as_ref()
+            .map(|buf| {
+                scp_ffi_common::validate::expect_fixed_bytes::<32>(buf.as_ref(), "testing_seed")
+                    .map_err(|message| {
+                        NapiError::from(ScpNapiError::Validation {
+                            message,
+                            code: codes::VALID_7007.to_owned(),
+                        })
                     })
-                })?;
-                Some(zeroize::Zeroizing::new(arr))
-            }
-        };
+            })
+            .transpose()?
+            .map(zeroize::Zeroizing::new);
 
         let bi = &*self.inner;
         ensure_did_resolver_initialized_on(bi);

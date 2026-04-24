@@ -682,15 +682,17 @@ impl crate::scp::PyScp {
         // The seed feeds `Ed25519 SigningKey::from_bytes` inside
         // `InMemoryKeyCustody::from_seed_bytes`, so the same hygiene
         // we apply to other private-key material applies here.
-        let testing_seed_array: Option<zeroize::Zeroizing<[u8; 32]>> = match testing_seed {
-            None => None,
-            Some(bytes) => Some(zeroize::Zeroizing::new(
-                <[u8; 32]>::try_from(bytes).map_err(|_| ScpPyError::ValidationError {
-                    message: format!("testing_seed must be exactly 32 bytes, got {}", bytes.len()),
-                    code: scp_ffi_common::error_codes::VALID_7007.to_owned(),
-                })?,
-            )),
-        };
+        let testing_seed_array: Option<zeroize::Zeroizing<[u8; 32]>> = testing_seed
+            .map(|bytes| {
+                scp_ffi_common::validate::expect_fixed_bytes::<32>(bytes, "testing_seed").map_err(
+                    |message| ScpPyError::ValidationError {
+                        message,
+                        code: scp_ffi_common::error_codes::VALID_7007.to_owned(),
+                    },
+                )
+            })
+            .transpose()?
+            .map(zeroize::Zeroizing::new);
         let (key_custody, custody_str) = parse_custody_with_seed(custody, testing_seed_array)?;
         let rt = crate::runtime()?;
 
