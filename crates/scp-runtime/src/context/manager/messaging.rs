@@ -612,29 +612,44 @@ impl ContextManager {
                         "cannot assign sequence: {sender_did} is not a member"
                     )));
                 };
-                // §9.10.4: collect pseudonym routing IDs for fan-out.
-                // Pattern-match on the routing variant; broadcast is handled
-                // above, so we only reach this branch for encrypted contexts.
+                // §9.10.4: encrypted contexts fan out to each member's
+                // pseudonym routing ID. Broadcast is handled above, so we
+                // only reach this branch for encrypted contexts.
                 //
                 // KNOWN LIMITATION (§9.10.4): Fan-out sends the SAME MLS ciphertext to all
                 // routing IDs. A relay can correlate pseudonyms by observing identical blobs.
                 // Per-recipient re-encryption (different nonce per blob) would fix this but
                 // increases bandwidth by O(N). Acceptable until relay-blinding is implemented.
-                let mut routing_ids: Vec<[u8; 32]> = match &ctx.routing {
+                let routing_ids: Vec<[u8; 32]> = match &ctx.routing {
                     super::ContextRouting::Encrypted {
                         pseudonym_registry, ..
-                    } => pseudonym_registry.values().copied().collect(),
+                    } => {
+                        // Defensive sanity check: an encrypted context with
+                        // multiple members but no peer pseudonyms means the
+                        // pseudonym announcement wiring is broken somewhere
+                        // upstream. Log a warning so we catch regressions in
+                        // practice, but still attempt the (empty) fan-out —
+                        // returning an error would be worse than no-op.
+                        if ctx.membership.count() > 1 && pseudonym_registry.is_empty() {
+                            tracing::warn!(
+                                context_id = %context_id,
+                                member_count = ctx.membership.count(),
+                                "encrypted send_message with empty pseudonym registry — \
+                                 peers have not announced routing IDs; message will reach nobody"
+                            );
+                        }
+                        debug_assert!(
+                            ctx.membership.count() <= 1 || !pseudonym_registry.is_empty(),
+                            "encrypted context with >1 member must have peer pseudonyms (§9.10.4)"
+                        );
+                        pseudonym_registry.values().copied().collect()
+                    }
                     super::ContextRouting::Broadcast => {
-                        // Unreachable: broadcast_context.is_none() branch is
-                        // taken above. Defensive fallback to empty fan-out.
+                        // Unreachable: the broadcast_context.is_some() branch
+                        // above owns this case and builds a shared-RID vec.
                         Vec::new()
                     }
                 };
-                let shared_rid = scp_protocol::context::context_routing_id(&context_id);
-                // Transitional: the shared routing ID is also included during
-                // commit 2's staged migration. Commit 3 removes this push and
-                // asserts the registry is non-empty for multi-member contexts.
-                routing_ids.push(shared_rid);
                 (
                     None,
                     ctx.access.access_key_store.get_all(&context_id),

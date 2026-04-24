@@ -4605,30 +4605,32 @@ async fn send_message_encrypted_uses_pseudonym_fanout() {
     let alice_did: DID = "did:key:alice".into();
     let alice_sk = signing_key_for_did(&alice_did);
 
-    // Send a message — should fan out to both Bob's pseudonym and shared routing ID.
+    // Send a message — should fan out to Bob's pseudonym ONLY, not the
+    // shared routing ID. §9.10.4: per-member pseudonym routing is the only
+    // delivery path for encrypted contexts; the shared `context_routing_id`
+    // was removed from the encrypted fan-out in commit 3 of the enum
+    // migration.
     manager
         .send_message(&handle, &alice_did, b"hello", Some(&alice_sk), None, None)
         .await
         .expect("send should succeed");
 
-    // The transport should have received sends to multiple routing IDs.
     let sent_rids = routing_ids.lock().unwrap();
-    assert!(
-        sent_rids.len() >= 2,
-        "expected at least 2 transport sends (pseudonym + shared), got {}",
-        sent_rids.len()
-    );
 
-    // Verify that the shared routing ID is among the sends.
-    let shared_rid = scp_protocol::context::context_routing_id("fanout-ctx");
-    let has_shared = sent_rids.contains(&shared_rid);
-    assert!(has_shared, "shared routing ID must be included in fan-out");
-
-    // Verify that Bob's pseudonym is among the sends.
+    // Bob's pseudonym must be among the sends.
     let has_pseudonym = sent_rids.contains(&[0xBBu8; 32]);
     assert!(
         has_pseudonym,
         "Bob's pseudonym routing ID must be included in fan-out"
+    );
+
+    // Shared routing ID must NOT appear — we only pseudonym-route for
+    // encrypted contexts.
+    let shared_rid = scp_protocol::context::context_routing_id("fanout-ctx");
+    let has_shared = sent_rids.contains(&shared_rid);
+    assert!(
+        !has_shared,
+        "shared routing ID must NOT be included in encrypted fan-out (§9.10.4)"
     );
 }
 
