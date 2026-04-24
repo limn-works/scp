@@ -10716,7 +10716,72 @@ impl Scp {
                 // closure so we can propagate clock errors properly.
                 let fallback_now = scp_primitives::SystemClock.now_secs();
 
-                // Query the event log from per-context UCAN state.
+                // First, try the ContextManager's event log provider — the
+                // authoritative source populated by `create_context`
+                // (`ContextCreated` at step 7) and subsequent manager
+                // operations. The per-context UCAN-state `EventLog` is a
+                // separate tree used for UCAN-layer writes (revocations,
+                // tests bypassing the manager); it starts empty on context
+                // create and never receives the manager's lifecycle events
+                // unless explicitly synced (see `event_log_verify` below).
+                //
+                // Mirrors `scp-ffi/src/event_log.rs::query_manager_entries`
+                // (PyO3) and `scp-ffi-napi/src/event_log.rs::event_log_query_on`
+                // (NAPI). Aligned across PyO3/NAPI/UniFFI — pinned by the
+                // cross-bridge parity harness's `OP_EVENT_LOG_APPEND` and
+                // `OP_EVENT_LOG_FILTERED` (ADR-046).
+                if let Some(manager) = bi.try_context_manager_ready() {
+                    let ctx_id_bytes = scp_core::context::context_id_bytes(&handle.context_id);
+                    if let Ok(Some(entries)) = manager.event_log_entries(&ctx_id_bytes)
+                        && !entries.is_empty()
+                    {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let mut manager_events: Vec<Event> = Vec::new();
+                        for (idx, entry) in entries.iter().enumerate() {
+                            let seq = idx as u64;
+                            if let Some(after) = filter_after_seq
+                                && seq <= after
+                            {
+                                continue;
+                            }
+                            if let Some(before) = filter_before_seq
+                                && seq >= before
+                            {
+                                continue;
+                            }
+                            if let Some(ref et) = filter_event_type
+                                && entry.event != *et
+                            {
+                                continue;
+                            }
+                            if let Some(ref actor) = filter_actor_did
+                                && entry.actor_did != *actor
+                            {
+                                continue;
+                            }
+                            manager_events.push(Event {
+                                event_type: entry.event.clone(),
+                                actor_did: entry.actor_did.clone(),
+                                timestamp: entry.timestamp,
+                                payload_json: serde_json::json!({
+                                    "hash": hex::encode(entry.hash),
+                                })
+                                .to_string(),
+                                sequence: seq,
+                            });
+                            if let Some(lim) = filter_limit
+                                && manager_events.len() >= lim
+                            {
+                                break;
+                            }
+                        }
+                        if !manager_events.is_empty() {
+                            return Ok(manager_events);
+                        }
+                    }
+                }
+
+                // Fallback: query the event log from per-context UCAN state.
                 let events = bi
                     .with_ucan_state(&handle.context_id, |ucan_state| {
                         let event_count = scp_event_log::tree::event_count(&ucan_state.event_log);
@@ -11066,37 +11131,32 @@ impl Scp {
                     DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan, validate_ucan,
                 };
 
-                // Step 1: Parse the UCAN token.
-                let parsed_token = parse_ucan(&token).map_err(|e| ScpError::Permission {
-                    msg: format!("malformed UCAN token: {e}"),
-                    code: codes::PERM_3002.to_owned(),
-                })?;
+                // Step 1: Parse the UCAN token. Route through the canonical
+                // `From<UcanError>` impl so parse failures surface the same
+                // error code as every other bridge (PyO3/NAPI/WASM all map
+                // through `scp_ffi_common::ucan_errors::ucan_error_code`).
+                // The prior ad-hoc `PERM_3002` mapping silently diverged
+                // from the shared classification, which the cross-bridge
+                // parity harness (`OP_UCAN_VALIDATE_MALFORMED`, ADR-046)
+                // catches against the reference PyO3 output.
+                let parsed_token = parse_ucan(&token).map_err(ScpError::from)?;
 
                 // Parse the required capability URI.
-                let required_cap: CapabilityUri =
-                    capability
-                        .parse()
-                        .map_err(
-                            |e: scp_core::crypto::ucan::UcanError| ScpError::Permission {
-                                msg: format!("invalid capability URI '{capability}': {e}"),
-                                code: codes::PERM_3002.to_owned(),
-                            },
-                        )?;
+                let required_cap: CapabilityUri = capability
+                    .parse()
+                    .map_err(|e: scp_core::crypto::ucan::UcanError| ScpError::from(e))?;
 
                 // Determine the presenting agent DID: explicit parameter or token audience.
                 let agent_did = presenting_agent_did
                     .as_deref()
                     .unwrap_or(&parsed_token.payload.aud);
 
-                // Build proof resolver from optional proof tokens.
+                // Build proof resolver from optional proof tokens. Parse errors
+                // use the same shared classification as the root token above.
                 let mut proofs = std::collections::HashMap::new();
                 if let Some(ref tokens) = proof_tokens {
                     for encoded in tokens {
-                        let proof_token =
-                            parse_ucan(encoded).map_err(|e| ScpError::Permission {
-                                msg: format!("malformed proof token: {e}"),
-                                code: codes::PERM_3002.to_owned(),
-                            })?;
+                        let proof_token = parse_ucan(encoded).map_err(ScpError::from)?;
                         let cid = scp_core::crypto::ucan::mint::compute_cid(&proof_token);
                         proofs.insert(cid, proof_token);
                     }
