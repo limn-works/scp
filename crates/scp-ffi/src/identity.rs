@@ -548,9 +548,16 @@ fn parse_custody_inner(custody: &str) -> Result<(Arc<FfiKeyCustody>, String), Sc
             // even when the caller passed the "platform" backward-compat alias.
             Ok((Arc::new(FfiKeyCustody::File(file_kc)), "file".to_owned()))
         }
-        other => Err(ScpPyError::validation(format!(
-            "unknown custody type: {other:?} — expected \"in_memory\", \"file\", or \"platform\""
-        ))),
+        // Align with NAPI + UniFFI: unknown custody strings return the
+        // generic "unrecognised value" code `SCP-VALID-7005` rather than
+        // `SCP-VALID-7001` (reserved for basic malformed-input failures).
+        // See #1549 round-2 api-design review.
+        other => Err(ScpPyError::ValidationError {
+            message: format!(
+                "unknown custody type: {other:?} — expected \"in_memory\", \"file\", or \"platform\""
+            ),
+            code: scp_ffi_common::error_codes::VALID_7005.to_owned(),
+        }),
     }
 }
 
