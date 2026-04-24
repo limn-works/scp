@@ -86,9 +86,9 @@ pub enum ConsequenceTrigger {
     /// time window. Counted from `EventType::MessageSent` events.
     MessageVelocity,
 
-    /// The subject invoked tools at a rate exceeding the threshold within the
-    /// time window. Counted from `EventType::ToolInvoked` events.
-    ToolRateExceeded,
+    /// The subject invoked outlets at a rate exceeding the threshold within
+    /// the time window. Counted from `EventType::OutletInvoked` events.
+    OutletRateExceeded,
 
     /// The subject accumulated warnings (governance actions against them)
     /// exceeding the threshold within the time window. Counted from
@@ -481,7 +481,7 @@ fn validate_severity_shape(
                          index {i}",
                     )));
                 }
-                // Validate Custom(name) / ToolInvoke(id) payload strings.
+                // Validate Custom(name) / OutletCall(id) payload strings.
                 if let Capability::Custom(name) = cap {
                     if name.is_empty() {
                         return Err(ConsequenceValidationError(format!(
@@ -496,12 +496,12 @@ fn validate_severity_shape(
                 } else if let Capability::OutletCall(outlet_id) = cap {
                     if outlet_id.is_empty() {
                         return Err(ConsequenceValidationError(format!(
-                            "SuspendCapability[{i}] ToolInvoke has empty outlet_id",
+                            "SuspendCapability[{i}] OutletCall has empty outlet_id",
                         )));
                     }
                     validate_consequence_string(
                         outlet_id,
-                        &format!("SuspendCapability[{i}] ToolInvoke"),
+                        &format!("SuspendCapability[{i}] OutletCall"),
                         MAX_CONSEQUENCE_STRING_LEN,
                     )?;
                 }
@@ -843,8 +843,8 @@ fn matches_trigger(trigger: &ConsequenceTrigger, event: &Event, subject_did: &st
         ConsequenceTrigger::MessageVelocity => {
             event.actor_did == subject_did && event.event_type == EventType::MessageSent
         }
-        ConsequenceTrigger::ToolRateExceeded => {
-            event.actor_did == subject_did && event.event_type == EventType::ToolInvoked
+        ConsequenceTrigger::OutletRateExceeded => {
+            event.actor_did == subject_did && event.event_type == EventType::OutletInvoked
         }
         ConsequenceTrigger::WarningCount => {
             // Governance actions targeting the subject (actor is someone else,
@@ -986,7 +986,7 @@ mod tests {
     #[test]
     fn tool_rate_triggers_suspend_all() {
         let rules = vec![ConsequenceRule {
-            trigger: ConsequenceTrigger::ToolRateExceeded,
+            trigger: ConsequenceTrigger::OutletRateExceeded,
             action: suspend_all(),
             threshold: 5,
             window: Duration::from_mins(2),
@@ -995,7 +995,7 @@ mod tests {
         let events: Vec<Event> = (0..5)
             .map(|i| {
                 make_event(
-                    EventType::ToolInvoked,
+                    EventType::OutletInvoked,
                     "did:key:alice",
                     900 + i,
                     i,
@@ -1167,7 +1167,7 @@ mod tests {
                 window: Duration::from_mins(1),
             },
             ConsequenceRule {
-                trigger: ConsequenceTrigger::ToolRateExceeded,
+                trigger: ConsequenceTrigger::OutletRateExceeded,
                 action: suspend_all(),
                 threshold: 1,
                 window: Duration::from_mins(1),
@@ -1178,7 +1178,7 @@ mod tests {
             make_event(EventType::MessageSent, "did:key:alice", 950, 0, vec![]),
             make_event(EventType::MessageSent, "did:key:alice", 960, 1, vec![]),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 970,
                 2,
@@ -1473,7 +1473,7 @@ mod tests {
         };
         let err = rule.validate().unwrap_err();
         assert!(
-            err.to_string().contains("ToolInvoke has empty outlet_id"),
+            err.to_string().contains("OutletCall has empty outlet_id"),
             "should reject empty outlet_id, got: {err}"
         );
     }

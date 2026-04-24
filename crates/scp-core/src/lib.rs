@@ -86,15 +86,18 @@ pub mod context {
         pub use scp_runtime::context::governance::timeout;
     }
     pub mod tools {
-        pub use scp_protocol::context::tools::*;
-        pub use scp_runtime::context::tools::invoke;
-        pub use scp_runtime::context::tools::invoke::{
-            InvocationError, has_tool_invoke_capability, invoke_tool,
-            invoke_tool_with_cancellation, validate_tool_invocation_ucan,
+        // Facade left under the `tools` name for SCP-OUT-004; the full
+        // facade rename happens in SCP-OUT-006 (scp-core). Underlying
+        // paths and identifiers are already on the Outlet vocabulary.
+        pub use scp_protocol::context::outlets::*;
+        pub use scp_runtime::context::outlets::invoke;
+        pub use scp_runtime::context::outlets::invoke::{
+            InvocationError, has_outlet_call_capability, invoke_outlet,
+            invoke_outlet_with_cancellation, validate_outlet_invocation_ucan,
         };
-        pub use scp_runtime::context::tools::session;
-        pub use scp_runtime::context::tools::session::{
-            DEFAULT_SESSION_CAP_PER_CALLER, SessionStore, ToolSession, cleanup_expired,
+        pub use scp_runtime::context::outlets::session;
+        pub use scp_runtime::context::outlets::session::{
+            DEFAULT_SESSION_CAP_PER_CALLER, OutletSession, SessionStore, cleanup_expired,
             create_session, invoke_session,
         };
     }

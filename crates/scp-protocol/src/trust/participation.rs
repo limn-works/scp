@@ -52,8 +52,8 @@ pub struct ParticipationRecord {
     /// Duration (seconds) between the subject's first and last event.
     pub participation_duration_seconds: u64,
 
-    /// Tool invocations by tool ID. The tool ID is extracted from the event
-    /// payload's first bytes when the event type is `ToolInvoked`.
+    /// Outlet invocations by outlet ID. The outlet ID is extracted from the
+    /// event payload's first bytes when the event type is `OutletInvoked`.
     pub outlet_invocations: HashMap<OutletId, u64>,
 
     /// Governance actions performed by the subject.
@@ -143,7 +143,7 @@ pub fn compute_participation_record(
         }
 
         match event.event_type {
-            EventType::ToolInvoked if is_subject => {
+            EventType::OutletInvoked if is_subject => {
                 let outlet_id = extract_outlet_id_from_payload(&event.payload.data);
                 *outlet_invocations.entry(outlet_id).or_insert(0) += 1;
             }
@@ -196,7 +196,7 @@ pub fn compute_participation_record(
             // In the current event model, there is no dedicated attestation event
             // type. We track any ToolVerified events as attestation-adjacent
             // activity for the subject.
-            EventType::ToolVerified if is_subject => {
+            EventType::OutletVerified if is_subject => {
                 attestation_history.push(AttestationReference {
                     timestamp: event.timestamp,
                     event_sequence: event.sequence,
@@ -257,11 +257,11 @@ pub const fn meets_threshold(record: &ParticipationRecord) -> bool {
 // Payload extraction helpers
 // ---------------------------------------------------------------------------
 
-/// Extracts a tool ID from a `ToolInvoked` event payload.
+/// Extracts an outlet ID from an `OutletInvoked` event payload.
 ///
-/// Convention: the payload data starts with a UTF-8 tool ID string, terminated
-/// by a null byte or the end of data. If the payload is empty or not valid
-/// UTF-8, returns `"unknown"`.
+/// Convention: the payload data starts with a UTF-8 outlet ID string,
+/// terminated by a null byte or the end of data. If the payload is empty or
+/// not valid UTF-8, returns `"unknown"`.
 fn extract_outlet_id_from_payload(data: &[u8]) -> OutletId {
     let end = data.iter().position(|&b| b == 0).unwrap_or(data.len());
     std::str::from_utf8(&data[..end])
@@ -1007,28 +1007,28 @@ mod tests {
     fn compute_tracks_outlet_invocations() {
         let events = vec![
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 1000,
                 0,
                 b"tool-search\0extra".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 1001,
                 1,
                 b"tool-search".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 1002,
                 2,
                 b"tool-execute".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:bob",
                 1003,
                 3,
@@ -1309,8 +1309,8 @@ mod tests {
     #[test]
     fn compute_tracks_attestation_history() {
         let events = vec![
-            make_event(EventType::ToolVerified, "did:key:alice", 1000, 0, vec![]),
-            make_event(EventType::ToolVerified, "did:key:bob", 1001, 1, vec![]),
+            make_event(EventType::OutletVerified, "did:key:alice", 1000, 0, vec![]),
+            make_event(EventType::OutletVerified, "did:key:bob", 1001, 1, vec![]),
         ];
 
         let record =
@@ -1409,14 +1409,14 @@ mod tests {
                 b"hi".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 1006,
                 6,
                 b"search-tool".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 1007,
                 7,
@@ -1429,7 +1429,7 @@ mod tests {
                 8,
                 b"did:key:bob".to_vec(),
             ),
-            make_event(EventType::ToolVerified, "did:key:alice", 1009, 9, vec![]),
+            make_event(EventType::OutletVerified, "did:key:alice", 1009, 9, vec![]),
         ];
 
         let record =
@@ -2138,21 +2138,21 @@ mod tests {
             make_event(EventType::ContextCreated, actor_did, 1000, 0, vec![]),
             make_event(EventType::MemberJoined, actor_did, 1001, 1, vec![]),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 actor_did,
                 1002,
                 2,
                 b"tool-a".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 actor_did,
                 1003,
                 3,
                 b"tool-b".to_vec(),
             ),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 actor_did,
                 1004,
                 4,
@@ -2179,7 +2179,7 @@ mod tests {
                 7,
                 actor_did.as_bytes().to_vec(),
             ),
-            make_event(EventType::ToolVerified, actor_did, 1008, 8, vec![]),
+            make_event(EventType::OutletVerified, actor_did, 1008, 8, vec![]),
             make_event(EventType::MessageSent, actor_did, 1100, 9, vec![]),
         ]
     }
@@ -2384,7 +2384,7 @@ mod tests {
 
         // Add more tool invocations.
         events.push(make_event(
-            EventType::ToolInvoked,
+            EventType::OutletInvoked,
             "did:key:alice",
             1200,
             10,

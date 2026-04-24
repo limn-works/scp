@@ -556,12 +556,12 @@ pub enum GovernanceAction {
         new_role: String,
     },
     /// Register a new tool in the context.
-    RegisterTool {
+    RegisterOutlet {
         /// The full tool registration descriptor.
         registration: Box<OutletRegistration>,
     },
     /// Remove a tool from the context.
-    RemoveTool {
+    RemoveOutlet {
         /// The identifier of the tool to remove.
         outlet_id: OutletId,
     },
@@ -781,8 +781,8 @@ impl GovernanceAction {
             Self::AddMember { .. } => "AddMember",
             Self::RemoveMember { .. } => "RemoveMember",
             Self::ChangeRole { .. } => "ChangeRole",
-            Self::RegisterTool { .. } => "RegisterTool",
-            Self::RemoveTool { .. } => "RemoveTool",
+            Self::RegisterOutlet { .. } => "RegisterOutlet",
+            Self::RemoveOutlet { .. } => "RemoveOutlet",
             Self::ModifyCeiling { .. } => "ModifyCeiling",
             Self::CloseContext { .. } => "CloseContext",
             Self::ExtendTtl { .. } => "ExtendTtl",
@@ -832,8 +832,8 @@ impl GovernanceAction {
             | Self::RemoveSigner { did } => Some(did),
             Self::TransferAdmin { new_admin } => Some(new_admin),
             Self::ApproveSpend { spender, .. } => Some(spender),
-            Self::RegisterTool { .. }
-            | Self::RemoveTool { .. }
+            Self::RegisterOutlet { .. }
+            | Self::RemoveOutlet { .. }
             | Self::ModifyCeiling { .. }
             | Self::CloseContext { .. }
             | Self::ExtendTtl { .. }
@@ -2105,7 +2105,7 @@ mod tests {
                 did: bob(),
                 new_role: "observer".to_owned(),
             },
-            GovernanceAction::RegisterTool {
+            GovernanceAction::RegisterOutlet {
                 registration: Box::new(OutletRegistration {
                     outlet_id: "search".to_owned(),
                     name: "search".to_owned(),
@@ -2122,7 +2122,7 @@ mod tests {
                     signature: Vec::new(),
                 }),
             },
-            GovernanceAction::RemoveTool {
+            GovernanceAction::RemoveOutlet {
                 outlet_id: "search".to_owned(),
             },
             GovernanceAction::ModifyCeiling {
@@ -2669,7 +2669,7 @@ mod tests {
                 did: bob(),
                 new_role: "observer".to_owned(),
             },
-            GovernanceAction::RegisterTool {
+            GovernanceAction::RegisterOutlet {
                 registration: Box::new(OutletRegistration {
                     outlet_id: "calc".to_owned(),
                     name: "calc".to_owned(),
@@ -2686,7 +2686,7 @@ mod tests {
                     signature: Vec::new(),
                 }),
             },
-            GovernanceAction::RemoveTool {
+            GovernanceAction::RemoveOutlet {
                 outlet_id: "calc".to_owned(),
             },
             GovernanceAction::ModifyCeiling {

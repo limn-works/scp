@@ -936,7 +936,7 @@ mod tests {
             make_event(EventType::MessageSent, "did:key:alice", 1000, 0, vec![]),
             make_event(EventType::MessageSent, "did:key:alice", 1500, 1, vec![]),
             make_event(
-                EventType::ToolInvoked,
+                EventType::OutletInvoked,
                 "did:key:alice",
                 1600,
                 2,
@@ -1175,7 +1175,7 @@ mod tests {
                 window: Duration::from_mins(1),
             },
             ConsequenceRule {
-                trigger: super::super::consequence::ConsequenceTrigger::ToolRateExceeded,
+                trigger: super::super::consequence::ConsequenceTrigger::OutletRateExceeded,
                 action: super::super::consequence::ConsequenceAction::AssignRole {
                     to_role: "observer".to_owned(),
                 },
@@ -1222,14 +1222,14 @@ mod tests {
     fn threshold_counts_with_empty_attestor_set() {
         let mut requirements = HashMap::new();
         requirements.insert(
-            AttestationType::ToolIntegrity,
+            AttestationType::OutletIntegrity,
             ThresholdRequirement::new(2, 3, 0.5),
         );
 
         let attestor_sets = HashMap::new();
 
         let counts = compute_threshold_counts(&requirements, &attestor_sets);
-        let (met, required) = counts.get(&AttestationType::ToolIntegrity).unwrap();
+        let (met, required) = counts.get(&AttestationType::OutletIntegrity).unwrap();
         assert_eq!(*met, 0);
         assert_eq!(*required, 2);
     }
@@ -1242,7 +1242,7 @@ mod tests {
             ThresholdRequirement::new(2, 3, 0.0),
         );
         requirements.insert(
-            AttestationType::ToolIntegrity,
+            AttestationType::OutletIntegrity,
             ThresholdRequirement::new(1, 2, 0.0),
         );
 
@@ -1269,7 +1269,7 @@ mod tests {
         assert_eq!(*required, 2);
 
         // ToolIntegrity: 0 met (no attestors), 1 required.
-        let (met, required) = counts.get(&AttestationType::ToolIntegrity).unwrap();
+        let (met, required) = counts.get(&AttestationType::OutletIntegrity).unwrap();
         assert_eq!(*met, 0);
         assert_eq!(*required, 1);
     }

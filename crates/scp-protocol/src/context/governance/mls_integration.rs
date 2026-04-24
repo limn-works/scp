@@ -94,8 +94,8 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         // affect MLS group membership (ADR-031 §8). Application-level
         // suspensions (SuspendCapability, SuspendAccess) do NOT touch MLS.
         GovernanceAction::ChangeRole { .. }
-        | GovernanceAction::RegisterTool { .. }
-        | GovernanceAction::RemoveTool { .. }
+        | GovernanceAction::RegisterOutlet { .. }
+        | GovernanceAction::RemoveOutlet { .. }
         | GovernanceAction::ModifyCeiling { .. }
         | GovernanceAction::CloseContext { .. }
         | GovernanceAction::ExtendTtl { .. }
@@ -606,7 +606,7 @@ mod tests {
 
     #[test]
     fn classify_register_tool_is_no_mls_change() {
-        let action = GovernanceAction::RegisterTool {
+        let action = GovernanceAction::RegisterOutlet {
             registration: Box::new(OutletRegistration {
                 outlet_id: "search".to_owned(),
                 name: "search".to_owned(),
@@ -628,7 +628,7 @@ mod tests {
 
     #[test]
     fn classify_remove_tool_is_no_mls_change() {
-        let action = GovernanceAction::RemoveTool {
+        let action = GovernanceAction::RemoveOutlet {
             outlet_id: "search".to_owned(),
         };
         assert_eq!(classify_action(&action), MlsImpact::NoMlsChange);

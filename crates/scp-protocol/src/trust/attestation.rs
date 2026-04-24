@@ -90,7 +90,7 @@ pub struct Attestation {
 /// Evidence supporting an attestation claim.
 ///
 /// The structure of evidence depends on the attestation type. For example,
-/// a `ToolIntegrity` attestation might include a hash of the tool binary,
+/// an `OutletIntegrity` attestation might include a hash of the outlet binary,
 /// while an `IdentityLink` attestation might include a signed challenge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationEvidence {
@@ -1146,14 +1146,14 @@ pub(crate) fn canonical_attestation_bytes(
 /// Validates that evidence is present and appropriate for the attestation type.
 ///
 /// Some attestation types require evidence:
-/// - `ToolIntegrity` requires evidence (hash of the tool).
+/// - `OutletIntegrity` requires evidence (hash of the outlet).
 /// - `ParticipationWitness` requires evidence (log reference).
 ///
 /// Other types accept optional evidence without strict requirements.
 fn validate_evidence(attestation: &Attestation) -> Result<(), TrustError> {
     let requires_evidence = matches!(
         attestation.attestation_type,
-        AttestationType::ToolIntegrity | AttestationType::ParticipationWitness
+        AttestationType::OutletIntegrity | AttestationType::ParticipationWitness
     );
 
     if requires_evidence && attestation.evidence.is_none() {
@@ -1566,7 +1566,7 @@ mod tests {
 
         let attestation = make_signed_attestation(
             &signing_key,
-            AttestationType::ToolIntegrity,
+            AttestationType::OutletIntegrity,
             "did:key:issuer",
             "did:key:subject",
             900,
@@ -1597,7 +1597,7 @@ mod tests {
 
         let attestation = make_signed_attestation(
             &signing_key,
-            AttestationType::ToolIntegrity,
+            AttestationType::OutletIntegrity,
             "did:key:issuer",
             "did:key:subject",
             900,
@@ -2002,7 +2002,7 @@ mod tests {
     #[test]
     fn threshold_ignores_wrong_attestation_type() {
         let required_type = AttestationType::Endorsement;
-        let wrong_type = AttestationType::ToolIntegrity;
+        let wrong_type = AttestationType::OutletIntegrity;
 
         let attestors = vec![
             make_attestor(
