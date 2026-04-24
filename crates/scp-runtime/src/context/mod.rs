@@ -36,7 +36,7 @@ pub mod policy;
 pub mod providers;
 pub mod ttl;
 
-pub mod tools;
+pub mod outlets;
 
 use std::sync::Arc;
 

@@ -31,7 +31,7 @@ impl ContextManager {
     ///
     /// When set, `authorize_paid_action`→`complete_paid_action` runs the
     /// full escrow sequence for each paid entry point (`send_message`,
-    /// `join_context`, `invoke_tool`). When `None`, those entry points
+    /// `join_context`, `invoke_outlet`). When `None`, those entry points
     /// still enforce budget tracking but skip the payment rail integration.
     ///
     /// Can be called at any time; takes effect for subsequent actions.
@@ -523,7 +523,7 @@ impl ContextManager {
     /// Test-only method for seeding `MemberBudgetTracker` grants
     /// without going through the full `ApproveSpend` governance
     /// proposal pipeline. Used by integration tests to verify the
-    /// runtime's `invoke_tool_with_economy` deducts budget correctly
+    /// runtime's `invoke_outlet_with_economy` deducts budget correctly
     /// (PR #1606 / C4 — bridge tool-invoke economy wiring). Production
     /// code MUST use the `ApproveSpend` governance action.
     #[cfg(feature = "testing")]
@@ -543,7 +543,7 @@ impl ContextManager {
     /// Returns the remaining budget for a member in a context.
     ///
     /// Test-only accessor for asserting the post-call state of the
-    /// per-DID budget after `invoke_tool_with_economy` runs. Returns
+    /// per-DID budget after `invoke_outlet_with_economy` runs. Returns
     /// zero if the context is unknown.
     #[cfg(feature = "testing")]
     pub async fn remaining_budget_for_test(
@@ -562,7 +562,7 @@ impl ContextManager {
     /// a member in a context within the velocity window.
     ///
     /// Test-only accessor for verifying that
-    /// `invoke_tool_with_economy` records the invocation in the
+    /// `invoke_outlet_with_economy` records the invocation in the
     /// per-DID velocity tracker. The bridges' previous bypass path
     /// did not record velocity at all, so the assertion in PR #1606
     /// C4 needs this hook to fail loudly on regression.

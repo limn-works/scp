@@ -128,7 +128,7 @@ pub struct ContextSnapshot {
     /// copy and fetch the full params only if they differ.
     pub params_hash: [u8; 32],
 
-    /// Tool registrations active at snapshot time.
+    /// Outlet registrations active at snapshot time.
     pub tool_names: Vec<String>,
 
     /// DID of the snapshot creator (for verification).
@@ -631,7 +631,7 @@ pub fn compute_delta(
         }
     }
 
-    // Tool changes
+    // Outlet changes
     let old_tools: HashSet<&str> = old.tool_names.iter().map(String::as_str).collect();
     let new_tools: HashSet<&str> = new.tool_names.iter().map(String::as_str).collect();
 
@@ -1311,7 +1311,7 @@ mod tests {
             vec![
                 "messages:read".to_owned(),
                 "messages:write".to_owned(),
-                "tool:invoke".to_owned(),
+                "outlet:call".to_owned(),
             ],
         );
         // "viewer" removed, "moderator" added

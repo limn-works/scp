@@ -2,7 +2,7 @@
 
 Async runtime orchestration for [SCP](https://github.com/limn-works/scp) (Shared Context Protocol).
 
-Implements context lifecycle management (`ContextManager`), MLS group encryption (`OpenMLS` wrapper), UCAN minting, governance timeout enforcement, persistence bridges, tool invocation, and async identity operations. Depends on `scp-protocol` for pure sync types and `scp-platform` for platform abstraction traits.
+Implements context lifecycle management (`ContextManager`), MLS group encryption (`OpenMLS` wrapper), UCAN minting, governance timeout enforcement, persistence bridges, outlet invocation, and async identity operations. Depends on `scp-protocol` for pure sync types and `scp-platform` for platform abstraction traits.
 
 ## Quick Start
 

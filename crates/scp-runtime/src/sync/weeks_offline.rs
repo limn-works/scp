@@ -703,7 +703,7 @@ pub struct StatePreservation {
     pub local_merkle_root: [u8; 32],
     /// Context metadata (params hash) to verify continuity.
     pub params_hash: [u8; 32],
-    /// Tool names active at reset time.
+    /// Outlet names active at reset time.
     pub active_tools: Vec<String>,
     /// Membership roster at reset time (DID -> role name).
     pub membership_roster: BTreeMap<String, String>,

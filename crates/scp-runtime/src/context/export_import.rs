@@ -313,7 +313,7 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         role_state,
         executed_proposals: HashSet::new(),
         ttl_remaining_secs: snapshot.ttl_remaining_secs,
-        registered_tools: Vec::new(),
+        registered_outlets: Vec::new(),
         read_exclusion_list: HashSet::new(),
         tool_interfaces: Vec::new(),
         threshold_signers: Vec::new(),
@@ -464,7 +464,7 @@ mod tests {
             role_state,
             executed_proposals: HashSet::new(),
             ttl_remaining_secs: None,
-            registered_tools: Vec::new(),
+            registered_outlets: Vec::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
             threshold_value: 0,
@@ -844,7 +844,7 @@ mod tests {
                 "MemberJoined",
                 "RoleAssigned",
                 "MessageSent",
-                "ToolInvoked",
+                "OutletInvoked",
             ],
         );
 

@@ -1,10 +1,10 @@
-//! Tool storage operations for `ProtocolRepository`.
+//! Outlet storage operations for `ProtocolRepository`.
 //!
-//! Implements tool registration and session persistence following the key
+//! Implements outlet registration and session persistence following the key
 //! convention from spec section 17.3:
 //!
 //! ```text
-//! context/{context_id}/tool/{tool_id}
+//! context/{context_id}/tool/{outlet_id}
 //! context/{context_id}/tool_session/{session_id}
 //! ```
 //!
@@ -18,21 +18,21 @@ use super::{ProtocolRepository, StoreError};
 // Type aliases (matching the codebase convention)
 // ---------------------------------------------------------------------------
 
-/// Tool identifier. Matches `type ToolId = String` used elsewhere
+/// Outlet identifier. Matches `type OutletId = String` used elsewhere
 /// in the codebase (e.g., `context/tools/mod.rs`).
-type ToolId = String;
+type OutletId = String;
 
 // ---------------------------------------------------------------------------
 // Key helpers
 // ---------------------------------------------------------------------------
 
-/// Builds the storage key for a tool registration.
+/// Builds the storage key for a outlet registration.
 ///
-/// Format: `context/{context_id}/tool/{tool_id}`
+/// Format: `context/{context_id}/tool/{outlet_id}`
 /// See spec section 17.3.
-fn tool_key(context_id: &str, tool_id: &str) -> Result<String, super::StoreError> {
+fn tool_key(context_id: &str, outlet_id: &str) -> Result<String, super::StoreError> {
     let ctx = super::sanitize_key_component(context_id)?;
-    let tool = super::sanitize_key_component(tool_id)?;
+    let tool = super::sanitize_key_component(outlet_id)?;
     Ok(format!("context/{ctx}/tool/{tool}"))
 }
 
@@ -44,7 +44,7 @@ fn tools_prefix(context_id: &str) -> Result<String, super::StoreError> {
     Ok(format!("context/{ctx}/tool/"))
 }
 
-/// Builds the storage key for a tool session.
+/// Builds the storage key for an outlet session.
 ///
 /// Format: `context/{context_id}/tool_session/{session_id}`
 /// See spec section 17.3.
@@ -59,10 +59,10 @@ fn tool_session_key(context_id: &str, session_id: &str) -> Result<String, super:
 // ---------------------------------------------------------------------------
 
 impl<S: Storage> ProtocolRepository<S> {
-    /// Stores a tool registration within a context.
+    /// Stores a outlet registration within a context.
     ///
     /// The registration data is serialized under
-    /// `context/{context_id}/tool/{tool_id}`.
+    /// `context/{context_id}/tool/{outlet_id}`.
     ///
     /// # Errors
     ///
@@ -71,14 +71,14 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn store_tool(
         &self,
         context_id: &str,
-        tool_id: &str,
+        outlet_id: &str,
         registration: &[u8],
     ) -> Result<(), StoreError> {
-        let key = tool_key(context_id, tool_id)?;
+        let key = tool_key(context_id, outlet_id)?;
         self.store_value(&key, &registration.to_vec()).await
     }
 
-    /// Loads a tool registration from a context.
+    /// Loads a outlet registration from a context.
     ///
     /// Returns `None` if no tool with the given ID exists in the context.
     ///
@@ -89,43 +89,43 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn load_tool(
         &self,
         context_id: &str,
-        tool_id: &str,
+        outlet_id: &str,
     ) -> Result<Option<Vec<u8>>, StoreError> {
-        let key = tool_key(context_id, tool_id)?;
+        let key = tool_key(context_id, outlet_id)?;
         self.load_value(&key).await
     }
 
-    /// Lists all tool IDs registered in a context.
+    /// Lists all outlet IDs registered in a context.
     ///
-    /// Returns tool ID strings extracted from stored keys.
+    /// Returns outlet ID strings extracted from stored keys.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage operation fails.
-    pub async fn list_tools(&self, context_id: &str) -> Result<Vec<ToolId>, StoreError> {
+    pub async fn list_outlets(&self, context_id: &str) -> Result<Vec<OutletId>, StoreError> {
         let prefix = tools_prefix(context_id)?;
         let keys = self.storage.list_keys(&prefix).await?;
-        let tool_ids: Vec<ToolId> = keys
+        let outlet_ids: Vec<OutletId> = keys
             .into_iter()
             .filter_map(|key| key.strip_prefix(&prefix).map(String::from))
             .collect();
-        Ok(tool_ids)
+        Ok(outlet_ids)
     }
 
-    /// Deletes a tool registration from a context.
+    /// Deletes a outlet registration from a context.
     ///
-    /// No-op if the tool does not exist.
+    /// No-op if the outlet does not exist.
     ///
     /// # Errors
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage delete fails.
-    pub async fn delete_tool(&self, context_id: &str, tool_id: &str) -> Result<(), StoreError> {
-        let key = tool_key(context_id, tool_id)?;
+    pub async fn delete_tool(&self, context_id: &str, outlet_id: &str) -> Result<(), StoreError> {
+        let key = tool_key(context_id, outlet_id)?;
         self.storage.delete(&key).await?;
         Ok(())
     }
 
-    /// Stores a tool session within a context.
+    /// Stores an outlet session within a context.
     ///
     /// The session data is serialized under
     /// `context/{context_id}/tool_session/{session_id}`.
@@ -144,7 +144,7 @@ impl<S: Storage> ProtocolRepository<S> {
         self.store_value(&key, &session.to_vec()).await
     }
 
-    /// Loads a tool session from a context.
+    /// Loads an outlet session from a context.
     ///
     /// Returns `None` if no session with the given ID exists.
     ///
@@ -161,7 +161,7 @@ impl<S: Storage> ProtocolRepository<S> {
         self.load_value(&key).await
     }
 
-    /// Deletes a tool session from a context.
+    /// Deletes an outlet session from a context.
     ///
     /// No-op if the session does not exist.
     ///
@@ -195,7 +195,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Tool registration
+    // Outlet registration
     // -------------------------------------------------------------------
 
     #[tokio::test]
@@ -219,7 +219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_tools_returns_all_tool_ids() {
+    async fn list_outlets_returns_all_outlet_ids() {
         let store = make_store();
 
         store
@@ -235,7 +235,7 @@ mod tests {
             .await
             .unwrap();
 
-        let tools = store.list_tools("ctx-1").await.unwrap();
+        let tools = store.list_outlets("ctx-1").await.unwrap();
         assert_eq!(tools, vec!["calculator", "search", "weather"]);
     }
 
@@ -273,7 +273,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Tool sessions
+    // Outlet sessions
     // -------------------------------------------------------------------
 
     #[tokio::test]

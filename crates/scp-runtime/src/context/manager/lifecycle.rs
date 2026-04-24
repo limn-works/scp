@@ -234,7 +234,7 @@ fn post_join_bookkeeping(
 /// Returns the spec §19.7 default per-DID message pricing configuration.
 ///
 /// Every context now uses the same baseline: per-DID escalating cost for
-/// `MessageSend`, `ContextJoin`, and `ToolInvoke`, plus the Matrix-style
+/// `MessageSend`, `ContextJoin`, and `OutletCall`, plus the Matrix-style
 /// hard rate limit. The `_economic_policy` parameter is intentionally
 /// unused — it is kept in the signature so call-sites stay symmetrical
 /// with the old `derive_relay_pricing_config` while documenting that
@@ -526,7 +526,7 @@ impl ContextManager {
                 threshold_value: ctx_snapshot.threshold_value,
                 pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
                 pending_economic_policy_change: ctx_snapshot.pending_economic_policy_change,
-                registered_tools: ctx_snapshot.registered_tools,
+                registered_outlets: ctx_snapshot.registered_outlets,
                 tool_interfaces: ctx_snapshot.tool_interfaces,
                 pruning_policy: ctx_snapshot.pruning_policy,
                 message_pricing: validated_message_pricing,
@@ -1224,7 +1224,7 @@ impl ContextManager {
                 threshold_value: export.snapshot.threshold_value,
                 pending_ceiling_modification: export.snapshot.pending_ceiling_modification,
                 pending_economic_policy_change: export.snapshot.pending_economic_policy_change,
-                registered_tools: export.snapshot.registered_tools,
+                registered_outlets: export.snapshot.registered_outlets,
                 tool_interfaces: export.snapshot.tool_interfaces,
                 pruning_policy: export.snapshot.pruning_policy,
                 message_pricing: validated_message_pricing,
@@ -1464,7 +1464,7 @@ impl ContextManager {
                 threshold_value: initial_threshold_value,
                 pending_ceiling_modification: None,
                 pending_economic_policy_change: None,
-                registered_tools: Vec::new(),
+                registered_outlets: Vec::new(),
                 tool_interfaces: Vec::new(),
                 pruning_policy: None,
                 message_pricing: derive_message_pricing(params.economic_policy.as_ref()),
@@ -1791,7 +1791,7 @@ impl ContextManager {
                 threshold_value: initial_threshold_value,
                 pending_ceiling_modification: None,
                 pending_economic_policy_change: None,
-                registered_tools: Vec::new(),
+                registered_outlets: Vec::new(),
                 tool_interfaces: Vec::new(),
                 pruning_policy: None,
                 message_pricing: derive_message_pricing(params.economic_policy.as_ref()),

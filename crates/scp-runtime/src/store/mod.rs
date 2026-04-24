@@ -24,10 +24,10 @@ pub mod economy;
 pub mod event_log;
 pub mod identity;
 pub mod nonce;
+pub mod outlets;
 pub mod queue;
 pub mod tls;
 pub mod tofu;
-pub mod tools;
 pub mod transport;
 pub mod trust;
 pub mod ucan;
@@ -897,7 +897,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_store_rejects_traversal_tool_id() {
+    async fn tool_store_rejects_traversal_outlet_id() {
         let store =
             ProtocolRepository::new_for_testing(scp_platform::testing::InMemoryStorage::new());
         let result = store

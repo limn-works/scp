@@ -206,7 +206,7 @@ fn paid_policy() -> EconomicPolicy {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(10)),
-            per_tool_invoke: Some(Amount(50)),
+            per_outlet_call: Some(Amount(50)),
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -224,7 +224,7 @@ fn free_policy_no_costs() -> EconomicPolicy {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -343,11 +343,8 @@ fn signed_event(
         EventType::RoleAssigned => 6,
         EventType::TokenRevoked => 7,
         EventType::MessageSent => 8,
-        EventType::ToolRegistered => 9,
-        EventType::ToolUpdated => 10,
-        EventType::ToolInvoked => 11,
-        EventType::ToolVerified => 12,
-        EventType::ToolInterfaceEstablished => 13,
+        // Tags 9..=13 are the permanently retired pre-rename Tool* band
+        // (ADR-049, spec §5.14.10). The Outlet* variants live at 80..=88.
         EventType::GovernanceAction => 14,
         EventType::ConsistencyCheckpoint => 15,
         EventType::AbsenceProofRequested => 16,
@@ -372,6 +369,17 @@ fn signed_event(
         // Provenance event types (issue #586)
         EventType::ProvenanceAttached => 34,
         EventType::ProvenanceReceived => 35,
+        // Outlet event types (ADR-049, spec §5.4 / §5.14.10). Tags 80..=88
+        // — bit 4 set, ≥ 0x10 offset from every retired Tool* tag.
+        EventType::OutletRegistered => 80,
+        EventType::OutletUpdated => 81,
+        EventType::OutletDeregistered => 82,
+        EventType::OutletInvoked => 83,
+        EventType::OutletCancel => 84,
+        EventType::OutletVerified => 85,
+        EventType::OutletInterfaceOffered => 86,
+        EventType::OutletInterfaceAccepted => 87,
+        EventType::OutletInterfaceRevoked => 88,
     };
 
     let mut hasher = Sha256::new();
@@ -438,7 +446,7 @@ fn invariant_1_economic_policy_visible_before_opt_in() {
     assert!(economic_metadata.is_some());
     let p = economic_metadata.unwrap();
     assert_eq!(p.cost_schedule.per_message, Some(Amount(10)));
-    assert_eq!(p.cost_schedule.per_tool_invoke, Some(Amount(50)));
+    assert_eq!(p.cost_schedule.per_outlet_call, Some(Amount(50)));
     assert_eq!(p.cost_schedule.currency, usd());
     assert_eq!(p.payment_adapters, vec!["test"]);
     assert_eq!(p.payee, payee_did());
@@ -453,7 +461,7 @@ fn invariant_1_dynamic_pricing_visible_before_opt_in() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(1)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -614,7 +622,7 @@ async fn invariant_2_authorize_capture_after_spending_check() {
 /// Paid actions with no spending UCAN are rejected.
 ///
 /// (Action capability is verified at the gate layer upstream per spec §19.5
-/// — see the `MessagesWrite` / `ToolInvoke` `member_has_capability` checks
+/// — see the `MessagesWrite` / `OutletCall` `member_has_capability` checks
 /// in the manager modules. This test exercises only the spending side.)
 #[test]
 fn invariant_2_spending_capability_paid_action_rejected_without_ucan() {
@@ -653,7 +661,7 @@ fn invariant_3_no_economic_policy_all_actions_free() {
             cost_schedule: CostSchedule {
                 currency: usd(),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -679,7 +687,7 @@ fn invariant_3_estimate_cost_zero_without_policy() {
     // No policy: all action types are free.
     for action in &[
         PaidActionType::MessageSend,
-        PaidActionType::ToolInvoke,
+        PaidActionType::OutletCall,
         PaidActionType::ContextJoin,
         PaidActionType::SubscriptionPeriod,
         PaidActionType::ByteStored,
@@ -871,7 +879,7 @@ fn invariant_4_payment_history_with_filters() {
         payee: DID::from("did:dht:z6MkAlice"),
         amount: Amount(200),
         currency: usd(),
-        action_type: PaidActionType::ToolInvoke,
+        action_type: PaidActionType::OutletCall,
         context_id: Some("ctx-1".to_owned()),
         adapter_id: "test".to_owned(),
         adapter_proof: vec![0x02],
@@ -1005,7 +1013,7 @@ fn invariant_6_unlocked_policy_update_succeeds() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(10)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1020,7 +1028,7 @@ fn invariant_6_unlocked_policy_update_succeeds() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(20)),      // Updated cost.
-            per_tool_invoke: Some(Amount(100)), // New cost.
+            per_outlet_call: Some(Amount(100)), // New cost.
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1044,7 +1052,7 @@ fn invariant_6_locked_policy_update_rejected() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(10)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1059,7 +1067,7 @@ fn invariant_6_locked_policy_update_rejected() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(20)), // Attempted change.
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1082,7 +1090,7 @@ fn invariant_6_voluntary_lock_transition() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(0)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1308,7 +1316,7 @@ fn invariant_9_auto_accept_blocked_regardless_of_cost_amount() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(1)), // Just 1 cent.
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1343,7 +1351,7 @@ fn invariant_9_pricing_formula_only_blocks_auto_accept() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1381,7 +1389,7 @@ async fn integration_full_lifecycle() {
     // Step 1: Verify policy is inspectable (invariant 1).
     assert!(policy_requires_payment(&policy));
     assert_eq!(policy.cost_schedule.per_message, Some(Amount(10)));
-    assert_eq!(policy.cost_schedule.per_tool_invoke, Some(Amount(50)));
+    assert_eq!(policy.cost_schedule.per_outlet_call, Some(Amount(50)));
 
     // Step 2: Evaluate message cost, authorize, capture.
     let msg_cost = evaluate_cost(&policy, &PaidActionType::MessageSend, &metrics).unwrap();
@@ -1404,7 +1412,7 @@ async fn integration_full_lifecycle() {
     let msg_receipt = adapter.capture(&msg_auth).await.unwrap();
 
     // Step 3: Evaluate tool cost, authorize, capture.
-    let tool_cost = evaluate_cost(&policy, &PaidActionType::ToolInvoke, &metrics).unwrap();
+    let tool_cost = evaluate_cost(&policy, &PaidActionType::OutletCall, &metrics).unwrap();
     assert_eq!(tool_cost, Amount(50));
 
     let tool_auth = adapter
@@ -1414,7 +1422,7 @@ async fn integration_full_lifecycle() {
             tool_cost,
             usd(),
             PaymentMetadata {
-                action_type: PaidActionType::ToolInvoke,
+                action_type: PaidActionType::OutletCall,
                 context_id: Some("ctx-lifecycle".to_owned()),
                 idempotency_key: [1u8; 16],
             },
@@ -1448,7 +1456,7 @@ fn integration_dynamic_pricing() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(1)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -1593,7 +1601,7 @@ fn integration_anti_spam_via_pricing_formula() {
         cost_schedule: CostSchedule {
             currency: usd(),
             per_message: Some(Amount(1)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,

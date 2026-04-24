@@ -1392,16 +1392,16 @@ async fn send_message_produces_valid_outer_envelope() {
 }
 
 // -----------------------------------------------------------------------
-// Cross-context tool invocation provenance (#1536 criteria 1, 5, 6)
+// Cross-context outlet invocation provenance (#1536 criteria 1, 5, 6)
 // -----------------------------------------------------------------------
 
 /// Verifies that `invoke_cross_context` attaches provenance with correct
 /// source context, tool name, and timestamp (#1536 criterion 5).
 #[tokio::test]
 async fn cross_context_tool_invocation_attaches_provenance() {
+    use scp_protocol::context::outlets::interface::{OutletInterface, invoke_cross_context};
+    use scp_protocol::context::outlets::registry::OutletRegistry;
     use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
-    use scp_protocol::context::tools::interface::{ToolInterface, invoke_cross_context};
-    use scp_protocol::context::tools::registry::ToolRegistry;
     use scp_protocol::provenance::attach::{SourceContextInfo, attach_provenance};
     use scp_protocol::provenance::{CounterpartyPolicy, DiscoveryMethod, SourceType};
 
@@ -1410,8 +1410,8 @@ async fn cross_context_tool_invocation_attaches_provenance() {
     let caps = [
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolRegister,
-        Capability::ToolInvokeAll,
+        Capability::OutletRegister,
+        Capability::OutletCallAll,
         Capability::RoleAssign,
     ];
     let ceiling = CapabilityCeiling::new(caps);
@@ -1425,12 +1425,12 @@ async fn cross_context_tool_invocation_attaches_provenance() {
     .unwrap();
 
     // Use insert() directly to bypass schema specificity validation
-    // (this test is about provenance, not tool registration).
-    let mut registry = ToolRegistry::new();
-    registry.insert(test_tool_registration(tid));
+    // (this test is about provenance, not outlet registration).
+    let mut registry = OutletRegistry::new();
+    registry.insert(test_outlet_registration(tid));
 
-    let mut interface = ToolInterface {
-        tool_id: tid.to_owned(),
+    let mut interface = OutletInterface {
+        outlet_id: tid.to_owned(),
         source_context: src.to_owned(),
         target_context: tgt.to_owned(),
         approved_by_source: true,
@@ -1448,7 +1448,7 @@ async fn cross_context_tool_invocation_attaches_provenance() {
         members: vec![did.clone()],
         discovery_method: DiscoveryMethod::OutOfBand,
         data_age: std::time::Duration::from_secs(0),
-        purpose: Some(format!("cross-context tool invocation: {tid}")),
+        purpose: Some(format!("cross-context outlet invocation: {tid}")),
         counterparty_policy: CounterpartyPolicy::Full,
     };
 
@@ -1471,7 +1471,7 @@ async fn cross_context_tool_invocation_attaches_provenance() {
     assert_eq!(source_event.source_context, src);
     assert_eq!(source_event.target_context, tgt);
     assert_eq!(target_event.source_context, src);
-    assert_eq!(source_event.tool_id, tid);
+    assert_eq!(source_event.outlet_id, tid);
 
     // Verify provenance can be independently constructed for the same flow.
     let prov = attach_provenance(
@@ -1482,7 +1482,7 @@ async fn cross_context_tool_invocation_attaches_provenance() {
             members: Vec::new(),
             discovery_method: DiscoveryMethod::SharedContext(src.to_owned()),
             data_age: std::time::Duration::from_secs(0),
-            purpose: Some(format!("cross-context tool invocation: {tid}")),
+            purpose: Some(format!("cross-context outlet invocation: {tid}")),
             counterparty_policy: CounterpartyPolicy::Redacted,
         },
         &src.to_owned(),
@@ -1512,7 +1512,7 @@ async fn evaluate_provenance_quality_for_cross_context_data() {
         members: vec!["did:key:member1".into()],
         discovery_method: DiscoveryMethod::SharedContext("source-ctx".to_owned()),
         data_age: std::time::Duration::from_secs(0),
-        purpose: Some("cross-context tool output".to_owned()),
+        purpose: Some("cross-context outlet output".to_owned()),
         counterparty_policy: CounterpartyPolicy::Full,
     };
 
@@ -1644,7 +1644,7 @@ fn escalation_test_policy() -> scp_protocol::economy::types::EconomicPolicy {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(1)),
-            per_tool_invoke: Some(Amount::new(1)),
+            per_outlet_call: Some(Amount::new(1)),
             per_join: Some(Amount::new(1)),
             per_period: None,
             per_byte_stored: None,
@@ -1778,14 +1778,14 @@ async fn escalation_kicks_in_at_velocity_threshold_10() {
     );
 }
 
-/// Test C: `ContextManager::invoke_tool_with_economy` wires per-DID
-/// escalation into the tool invocation path. After 10 prior velocity
+/// Test C: `ContextManager::invoke_outlet_with_economy` wires per-DID
+/// escalation into the outlet invocation path. After 10 prior velocity
 /// ticks the escalation tier 1 surcharge (+Amount(1)) is layered on
-/// top of the `per_tool_invoke` base cost.
+/// top of the `per_outlet_call` base cost.
 #[tokio::test]
-async fn tool_invoke_escalation_via_managed_wrapper() {
-    use scp_protocol::context::tools::ToolId;
-    use scp_protocol::context::tools::registry::ToolRegistry;
+async fn outlet_call_escalation_via_managed_wrapper() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::context::outlets::registry::OutletRegistry;
     use scp_protocol::economy::types::Amount;
 
     let manager = ContextManager::new(
@@ -1796,10 +1796,10 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
     );
 
     let mut params = governance_params();
-    // Creator needs ToolInvokeAll to pass the tools::invoke auth check.
+    // Creator needs OutletCallAll to pass the outlets::invoke auth check.
     params
         .ceiling
-        .push(scp_protocol::context::params::Capability::ToolInvokeAll);
+        .push(scp_protocol::context::params::Capability::OutletCallAll);
     params.economic_policy = Some(escalation_test_policy());
     let _handle = manager
         .create_context(
@@ -1812,7 +1812,7 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
         .unwrap();
 
     // Prime velocity tracker to ≥10 so escalation tier 1 is already in
-    // effect, grant budget, and synthesize a tool registry. Prime with
+    // effect, grant budget, and synthesize an outlet registry. Prime with
     // recent timestamps so entries stay within the 60-second window.
     let now = manager.clock.now_secs();
     {
@@ -1833,10 +1833,10 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
             .grant(&"did:key:invoker".into(), Amount::new(1_000));
     }
 
-    let mut registry = ToolRegistry::new();
-    registry.insert(test_tool_registration("echo"));
+    let mut registry = OutletRegistry::new();
+    registry.insert(test_outlet_registration("echo"));
 
-    // C1b: spending UCANs on the tool-invoke path are now cryptographically
+    // C1b: spending UCANs on the outlet-call path are now cryptographically
     // validated (iss == actor_did + signature). Use a properly-signed token
     // bound to the invoking DID so the C1b pipeline passes.
     let ucan = dummy_spending_ucan_for(&"did:key:invoker".into());
@@ -1857,10 +1857,10 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
     };
 
     let result = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             "tool-esc-ctx",
             &registry,
-            &ToolId::from("echo"),
+            &OutletId::from("echo"),
             serde_json::json!({}),
             &"did:key:invoker".into(),
             Some(&ucan),
@@ -1889,7 +1889,7 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
     };
     let deducted = before - after;
 
-    // Base per_tool_invoke = 1; with tier-1 escalation the cost is ≥2.
+    // Base per_outlet_call = 1; with tier-1 escalation the cost is ≥2.
     assert!(
         deducted >= 2,
         "expected tool-invoke escalation (base + tier1), deducted: {deducted}"
@@ -1899,7 +1899,7 @@ async fn tool_invoke_escalation_via_managed_wrapper() {
 /// The async variant `try_consume_hard_rate_limit` must be
 /// callable from inside a tokio async context without panicking —
 /// the `_blocking` sibling uses `blocking_lock` which panics inside
-/// an async runtime. NAPI + `UniFFI` tool-invoke paths depend on
+/// an async runtime. NAPI + `UniFFI` outlet-call paths depend on
 /// this.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn try_consume_hard_rate_limit_async_variant_is_safe_from_async_context() {
@@ -2108,14 +2108,14 @@ async fn block_in_place_bridge_pattern_survives_mcp_sync_in_async_call() {
     });
 }
 
-/// The tool-invoke path consumes a hard-rate-limit token before
+/// The outlet-call path consumes a hard-rate-limit token before
 /// any economy bookkeeping, matching the `send_message` path, so a
 /// member rate-limited on `send_message` cannot bypass the cap via
-/// `invoke_tool_with_economy`.
+/// `invoke_outlet_with_economy`.
 #[tokio::test]
-async fn tool_invoke_respects_hard_rate_limit() {
-    use scp_protocol::context::tools::ToolId;
-    use scp_protocol::context::tools::registry::ToolRegistry;
+async fn outlet_call_respects_hard_rate_limit() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::context::outlets::registry::OutletRegistry;
     use scp_protocol::economy::types::Amount;
 
     let manager = ContextManager::new(
@@ -2128,7 +2128,7 @@ async fn tool_invoke_respects_hard_rate_limit() {
     let mut params = governance_params();
     params
         .ceiling
-        .push(scp_protocol::context::params::Capability::ToolInvokeAll);
+        .push(scp_protocol::context::params::Capability::OutletCallAll);
     // Free context — the hard rate limit fires independent of cost.
     let _handle = manager
         .create_context("tool-rl-ctx".into(), params, "did:key:spammer".into(), None)
@@ -2145,13 +2145,13 @@ async fn tool_invoke_respects_hard_rate_limit() {
             .grant(&"did:key:spammer".into(), Amount::new(1_000_000));
     }
 
-    let mut registry = ToolRegistry::new();
-    registry.insert(test_tool_registration("echo"));
+    let mut registry = OutletRegistry::new();
+    registry.insert(test_outlet_registration("echo"));
 
     // A spending UCAN is required because the default message pricing
-    // gives `tool:invoke` a base cost of 1, even without a configured
+    // gives `outlet:call` a base cost of 1, even without a configured
     // economic policy (`derive_message_pricing` returns `spec_default`).
-    // C1b: spending UCANs are cryptographically validated on the tool-invoke
+    // C1b: spending UCANs are cryptographically validated on the outlet-call
     // path; use a signed token bound to the invoking DID with mock_key_resolver.
     // Each call generates a fresh UCAN so nonce replay does not interfere
     // with the rate-limit assertion — the test verifies bucket exhaustion,
@@ -2162,10 +2162,10 @@ async fn tool_invoke_respects_hard_rate_limit() {
     for i in 0..10u8 {
         let ucan = dummy_spending_ucan_for(&spammer);
         let result = manager
-            .invoke_tool_with_economy(
+            .invoke_outlet_with_economy(
                 "tool-rl-ctx",
                 &registry,
-                &ToolId::from("echo"),
+                &OutletId::from("echo"),
                 serde_json::json!({"n": i}),
                 &spammer,
                 Some(&ucan),
@@ -2182,10 +2182,10 @@ async fn tool_invoke_respects_hard_rate_limit() {
     // The 11th in the same tick should be rejected by the token bucket.
     let ucan = dummy_spending_ucan_for(&spammer);
     let result = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             "tool-rl-ctx",
             &registry,
-            &ToolId::from("echo"),
+            &OutletId::from("echo"),
             serde_json::json!({"n": 11}),
             &spammer,
             Some(&ucan),
@@ -2201,8 +2201,8 @@ async fn tool_invoke_respects_hard_rate_limit() {
             ref message,
         } => {
             assert_eq!(
-                resource, "tool_invoke",
-                "resource tag should be tool_invoke"
+                resource, "outlet_call",
+                "resource tag should be outlet_call"
             );
             assert!(
                 message.contains("invoker"),
@@ -2213,15 +2213,15 @@ async fn tool_invoke_respects_hard_rate_limit() {
     }
 }
 
-/// A rejected tool invocation (e.g., execution failure) must
+/// A rejected outlet invocation (e.g., execution failure) must
 /// refund the hard-rate-limit token so a rejected attempt does
 /// not permanently burn bucket capacity. Otherwise an invoker
 /// hitting a failing tool would be rate-limited into silence via
 /// its own failures.
 #[tokio::test]
-async fn tool_invoke_failure_refunds_hard_rate_limit_token() {
-    use scp_protocol::context::tools::ToolId;
-    use scp_protocol::context::tools::registry::ToolRegistry;
+async fn outlet_call_failure_refunds_hard_rate_limit_token() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::context::outlets::registry::OutletRegistry;
     use scp_protocol::economy::types::Amount;
 
     let manager = ContextManager::new(
@@ -2234,7 +2234,7 @@ async fn tool_invoke_failure_refunds_hard_rate_limit_token() {
     let mut params = governance_params();
     params
         .ceiling
-        .push(scp_protocol::context::params::Capability::ToolInvokeAll);
+        .push(scp_protocol::context::params::Capability::OutletCallAll);
     let _handle = manager
         .create_context(
             "tool-rl-refund-ctx".into(),
@@ -2258,17 +2258,17 @@ async fn tool_invoke_failure_refunds_hard_rate_limit_token() {
             .grant(&"did:key:invoker".into(), Amount::new(1_000));
     }
 
-    let mut registry = ToolRegistry::new();
-    registry.insert(test_tool_registration("echo"));
+    let mut registry = OutletRegistry::new();
+    registry.insert(test_outlet_registration("echo"));
 
     // Fire 10 failing invocations — each should fail, each should
     // refund the token, leaving the bucket fully replenished.
     for i in 0..10u8 {
         let _ = manager
-            .invoke_tool_with_economy(
+            .invoke_outlet_with_economy(
                 "tool-rl-refund-ctx",
                 &registry,
-                &ToolId::from("echo"),
+                &OutletId::from("echo"),
                 serde_json::json!({"n": i}),
                 &"did:key:invoker".into(),
                 None,
@@ -2282,10 +2282,10 @@ async fn tool_invoke_failure_refunds_hard_rate_limit_token() {
     // because every prior token was refunded. It should fail on the
     // executor error instead.
     let result = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             "tool-rl-refund-ctx",
             &registry,
-            &ToolId::from("echo"),
+            &OutletId::from("echo"),
             serde_json::json!({"n": 11}),
             &"did:key:invoker".into(),
             None,
@@ -2306,21 +2306,21 @@ async fn tool_invoke_failure_refunds_hard_rate_limit_token() {
 // H17 Gap A: Output validation failure voids escrow + refunds budget
 // -----------------------------------------------------------------------
 //
-// Covers crates/scp-runtime/src/context/tools/invoke.rs Phase 2 →
-// rollback_tool_economy_ticket → void_tool_escrow path. The closest
-// pre-existing test (`tool_invoke_failure_refunds_hard_rate_limit_token`)
+// Covers crates/scp-runtime/src/context/outlets/invoke.rs Phase 2 →
+// rollback_outlet_economy_ticket → void_outlet_escrow path. The closest
+// pre-existing test (`outlet_call_failure_refunds_hard_rate_limit_token`)
 // uses an executor failure but no payment adapter, so the escrow void
 // branch was structurally uncovered before this test landed.
 //
 // Two tests are needed to PROVE the branch:
-//   1. `tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget`
+//   1. `outlet_call_output_validation_failure_voids_escrow_and_refunds_budget`
 //      — failing path: authorize → void → no capture → budget refunded.
-//   2. `tool_invoke_happy_path_captures_escrow_and_deducts_budget`
+//   2. `outlet_call_happy_path_captures_escrow_and_deducts_budget`
 //      — happy path: authorize → capture → no void → budget deducted.
 
 /// A `PaymentAdapter` that records every authorize/capture/void/verify
 /// call into a shared `Vec<AdapterCall>` so tests can assert the exact
-/// adapter call sequence after a tool invocation.
+/// adapter call sequence after a outlet invocation.
 ///
 /// Mirrors `TestAdapter` from `tests/economy_integration.rs` but exposes
 /// a recorded call log instead of failure injection.
@@ -2420,7 +2420,7 @@ impl crate::economy::adapter::PaymentAdapter for RecordingPaymentAdapter {
             payee: auth.payee.clone(),
             amount: auth.amount,
             currency: auth.currency,
-            action_type: scp_protocol::economy::types::PaidActionType::ToolInvoke,
+            action_type: scp_protocol::economy::types::PaidActionType::OutletCall,
             context_id: Some("h17-output-fail-ctx".to_owned()),
             adapter_id: "recording".to_owned(),
             adapter_proof: vec![0xAB],
@@ -2476,16 +2476,16 @@ impl crate::economy::adapter::PaymentAdapter for RecordingPaymentAdapter {
     }
 }
 
-/// Builds a `ToolRegistration` whose output schema requires an object
+/// Builds a `OutletRegistration` whose output schema requires an object
 /// with a numeric `result` field. An executor returning a string fails
-/// schema validation in `invoke_tool_execute_and_validate` step 6.
-fn strict_output_tool_registration(id: &str) -> ToolRegistration {
-    use scp_protocol::context::tools::registry::{TestVector, ToolSchema};
-    ToolRegistration {
-        tool_id: id.to_owned(),
+/// schema validation in `invoke_outlet_execute_and_validate` step 6.
+fn strict_output_tool_registration(id: &str) -> OutletRegistration {
+    use scp_protocol::context::outlets::registry::{OutletSchema, OutletTestVector};
+    OutletRegistration {
+        outlet_id: id.to_owned(),
         name: id.to_owned(),
         description: "strict-output test tool".to_owned(),
-        schema: ToolSchema {
+        schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({
                 "type": "object",
@@ -2496,7 +2496,7 @@ fn strict_output_tool_registration(id: &str) -> ToolRegistration {
             }),
         },
         implementation_hash: [0u8; 32],
-        test_vectors: vec![TestVector {
+        test_vectors: vec![OutletTestVector {
             input: serde_json::json!({}),
             expected_output: serde_json::json!({"result": 42}),
             description: "noop".to_owned(),
@@ -2508,7 +2508,7 @@ fn strict_output_tool_registration(id: &str) -> ToolRegistration {
     }
 }
 
-/// Builds an `EconomicPolicy` with a non-zero `per_tool_invoke` cost so
+/// Builds an `EconomicPolicy` with a non-zero `per_outlet_call` cost so
 /// the escrow path is exercised. Same shape as `escalation_test_policy`,
 /// but isolated to keep this test self-contained.
 fn h17_priced_tool_policy() -> scp_protocol::economy::types::EconomicPolicy {
@@ -2518,7 +2518,7 @@ fn h17_priced_tool_policy() -> scp_protocol::economy::types::EconomicPolicy {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: Some(Amount::new(5)),
+            per_outlet_call: Some(Amount::new(5)),
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -2531,9 +2531,9 @@ fn h17_priced_tool_policy() -> scp_protocol::economy::types::EconomicPolicy {
 
 /// H17 Gap A — failing path:
 ///
-/// Output schema validation failure inside `invoke_tool_execute_and_validate`
-/// must drive the manager wrapper through `rollback_tool_economy_ticket`
-/// which calls `void_tool_escrow` AND restores the per-context budget.
+/// Output schema validation failure inside `invoke_outlet_execute_and_validate`
+/// must drive the manager wrapper through `rollback_outlet_economy_ticket`
+/// which calls `void_outlet_escrow` AND restores the per-context budget.
 ///
 /// Adapter call expectations:
 ///   * EXACTLY ONE `Authorize` (Phase 1)
@@ -2546,9 +2546,9 @@ fn h17_priced_tool_policy() -> scp_protocol::economy::types::EconomicPolicy {
 ///     value (rollback erased the entry recorded in Phase 1)
 #[allow(clippy::too_many_lines)] // exhaustive adapter-call + state assertions
 #[tokio::test]
-async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget() {
-    use scp_protocol::context::tools::ToolId;
-    use scp_protocol::context::tools::registry::ToolRegistry;
+async fn outlet_call_output_validation_failure_voids_escrow_and_refunds_budget() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::context::outlets::registry::OutletRegistry;
     use scp_protocol::economy::types::Amount;
 
     let mut manager = ContextManager::new(
@@ -2565,12 +2565,12 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
     let calls_handle = adapter.calls_handle();
     manager.set_payment_adapter(Arc::new(adapter));
 
-    // Build a context with a paid economic policy and ToolInvokeAll in the
-    // ceiling so the creator can invoke tools.
+    // Build a context with a paid economic policy and OutletCallAll in the
+    // ceiling so the creator can invoke outlets.
     let mut params = governance_params();
     params
         .ceiling
-        .push(scp_protocol::context::params::Capability::ToolInvokeAll);
+        .push(scp_protocol::context::params::Capability::OutletCallAll);
     params.economic_policy = Some(h17_priced_tool_policy());
     let _handle = manager
         .create_context(
@@ -2582,7 +2582,7 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
         .await
         .unwrap();
 
-    // Grant a generous budget so a single per_tool_invoke=5 deduction
+    // Grant a generous budget so a single per_outlet_call=5 deduction
     // doesn't exhaust it. The post-invoke assertion compares before/after
     // remainders to detect any net change.
     let invoker: DID = "did:key:invoker".into();
@@ -2599,7 +2599,7 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
             .grant(&invoker, Amount::new(1_000));
     }
 
-    let mut registry = ToolRegistry::new();
+    let mut registry = OutletRegistry::new();
     registry.insert(strict_output_tool_registration("strict-tool"));
 
     // C1b: use a properly-signed spending UCAN bound to the invoking DID.
@@ -2622,14 +2622,14 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
         (budget, velocity)
     };
 
-    // Invoke the tool. The executor returns a JSON string ("not an object"),
+    // Invoke the outlet. The executor returns a JSON string ("not an object"),
     // which fails the strict output schema → Phase 2 fails →
-    // rollback_tool_economy_ticket → void_tool_escrow.
+    // rollback_outlet_economy_ticket → void_outlet_escrow.
     let result = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             "h17-output-fail-ctx",
             &registry,
-            &ToolId::from("strict-tool"),
+            &OutletId::from("strict-tool"),
             serde_json::json!({}),
             &invoker,
             Some(&ucan),
@@ -2691,11 +2691,11 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
             AdapterCall::Capture { .. } => {}
         }
     }
-    // Authorize amount must equal the policy's per_tool_invoke cost (5).
+    // Authorize amount must equal the policy's per_outlet_call cost (5).
     assert_eq!(
         authorize_amount.map(scp_protocol::economy::Amount::value),
         Some(5),
-        "authorize amount should equal per_tool_invoke=5, got: {authorize_amount:?}"
+        "authorize amount should equal per_outlet_call=5, got: {authorize_amount:?}"
     );
     assert_eq!(
         void_id,
@@ -2728,8 +2728,8 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
         "velocity entry must be rolled back: before={velocity_before}, after={velocity_after}"
     );
 
-    // The wrapper returns the `ToolInvokedEvent` only via the
-    // `ManagedToolInvocationOutput` success branch (not as a
+    // The wrapper returns the `OutletInvokedEvent` only via the
+    // `ManagedOutletInvocationOutput` success branch (not as a
     // `ContextEvent` variant), so a failed invocation cannot leak a
     // success event into the receive buffer. We do, however, drain the
     // receive buffer to confirm no MessageReceived/MessageSent or other
@@ -2738,20 +2738,20 @@ async fn tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget()
     let events = manager.drain_events("h17-output-fail-ctx").await;
     assert!(
         events.is_empty(),
-        "receive buffer should be empty after a rolled-back tool invocation, got: {events:?}"
+        "receive buffer should be empty after a rolled-back outlet invocation, got: {events:?}"
     );
 }
 
 /// H17 Gap A — happy-path regression: with a valid output the same
 /// pipeline must run authorize → capture (no void) and the budget must
 /// actually decrement. Pairing this against
-/// `tool_invoke_output_validation_failure_voids_escrow_and_refunds_budget`
+/// `outlet_call_output_validation_failure_voids_escrow_and_refunds_budget`
 /// proves the void/capture branch is wired both ways.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // DashMap lock pattern adds verbosity
-async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
-    use scp_protocol::context::tools::ToolId;
-    use scp_protocol::context::tools::registry::ToolRegistry;
+async fn outlet_call_happy_path_captures_escrow_and_deducts_budget() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::context::outlets::registry::OutletRegistry;
     use scp_protocol::economy::types::Amount;
 
     let mut manager = ContextManager::new(
@@ -2768,7 +2768,7 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
     let mut params = governance_params();
     params
         .ceiling
-        .push(scp_protocol::context::params::Capability::ToolInvokeAll);
+        .push(scp_protocol::context::params::Capability::OutletCallAll);
     params.economic_policy = Some(h17_priced_tool_policy());
     let _handle = manager
         .create_context(
@@ -2794,7 +2794,7 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
             .grant(&invoker, Amount::new(1_000));
     }
 
-    let mut registry = ToolRegistry::new();
+    let mut registry = OutletRegistry::new();
     registry.insert(strict_output_tool_registration("strict-tool"));
 
     // C1b: use a properly-signed spending UCAN bound to the invoking DID.
@@ -2817,10 +2817,10 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
 
     // Executor returns a valid {result: 42} object — output schema passes.
     let result = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             "h17-happy-ctx",
             &registry,
-            &ToolId::from("strict-tool"),
+            &OutletId::from("strict-tool"),
             serde_json::json!({}),
             &invoker,
             Some(&ucan),
@@ -2830,7 +2830,7 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
         .await;
     assert!(
         result.is_ok(),
-        "happy-path tool invocation must succeed: {result:?}"
+        "happy-path outlet invocation must succeed: {result:?}"
     );
 
     // Adapter call sequence: authorize → capture, no void.
@@ -2860,7 +2860,7 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
         "void must NOT be called on success, got {void_count}: {calls:?}"
     );
 
-    // Budget actually deducted by the per_tool_invoke=5 cost.
+    // Budget actually deducted by the per_outlet_call=5 cost.
     let budget_after = {
         let arc = manager
             .contexts
@@ -2878,7 +2878,7 @@ async fn tool_invoke_happy_path_captures_escrow_and_deducts_budget() {
     assert_eq!(
         budget_before - budget_after,
         5,
-        "happy-path must deduct exactly per_tool_invoke=5, before={budget_before}, after={budget_after}"
+        "happy-path must deduct exactly per_outlet_call=5, before={budget_before}, after={budget_after}"
     );
 }
 
@@ -3364,7 +3364,7 @@ async fn capture_send_payment_success_no_failure_event() {
             cost_schedule: CostSchedule {
                 currency: CurrencyCode([85, 83, 68, 0]),
                 per_message: Some(Amount::new(1)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -3955,34 +3955,34 @@ async fn deliver_incoming_event_log_append_failure_still_delivers() {
 
 // -----------------------------------------------------------------------
 // C1b (PR #1606): full cryptographic spending UCAN validation on the
-// tool-invoke path.
+// outlet-call path.
 //
 // C1 closed the gap for `send_message` and `join_context` by routing their
 // spending UCANs through `validate_spending_ucan_signed`. C4 then routed
-// the PyO3/NAPI/UniFFI bridge tool_invoke exports through
-// `ContextManager::invoke_tool_with_economy`. C1b closes the intersection:
+// the PyO3/NAPI/UniFFI bridge outlet_call exports through
+// `ContextManager::invoke_outlet_with_economy`. C1b closes the intersection:
 // signature + actor-binding + expiry + revocation + nonce replay validation
-// inside `invoke_tool_with_economy`, so that a fabricated or replayed
-// spending UCAN can no longer buy a paid tool invocation.
+// inside `invoke_outlet_with_economy`, so that a fabricated or replayed
+// spending UCAN can no longer buy a paid outlet invocation.
 //
 // These tests mirror the C1 send-path tests (see `tests/governance.rs`:
 // `test_fabricated_spending_ucan_rejected_by_signature`,
-// `test_spending_ucan_iss_must_match_actor_did`, etc.) on the tool path.
+// `test_spending_ucan_iss_must_match_actor_did`, etc.) on the outlet path.
 // Each test sets up a paid context, grants budget, and presents a broken
 // spending UCAN — every failure mode MUST be rejected with SCP-ECON-12065.
 // -----------------------------------------------------------------------
 
-/// Builds a paid context wired for tool invocation: `per_tool_invoke=10`,
+/// Builds a paid context wired for outlet invocation: `per_outlet_call=10`,
 /// `mock_key_resolver` so the C1b signature pipeline has a key to resolve,
-/// invoker granted `ToolInvokeAll`, a registered `echo` tool, and 1000 budget.
+/// invoker granted `OutletCallAll`, a registered `echo` tool, and 1000 budget.
 async fn c1b_paid_tool_context(
     name: &str,
     invoker: &DID,
 ) -> (
     ContextManager,
-    scp_protocol::context::tools::registry::ToolRegistry,
+    scp_protocol::context::outlets::registry::OutletRegistry,
 ) {
-    use scp_protocol::context::tools::registry::ToolRegistry;
+    use scp_protocol::context::outlets::registry::OutletRegistry;
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     let manager = ContextManager::new(
@@ -3995,13 +3995,13 @@ async fn c1b_paid_tool_context(
     let mut params = governance_params();
     params
         .ceiling
-        .push(scp_protocol::context::params::Capability::ToolInvokeAll);
+        .push(scp_protocol::context::params::Capability::OutletCallAll);
     params.economic_policy = Some(EconomicPolicy {
         locked: false,
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: Some(Amount::new(10)),
+            per_outlet_call: Some(Amount::new(10)),
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -4024,17 +4024,17 @@ async fn c1b_paid_tool_context(
             .grant(invoker, Amount::new(1_000));
     }
 
-    let mut registry = ToolRegistry::new();
-    registry.insert(test_tool_registration("echo"));
+    let mut registry = OutletRegistry::new();
+    registry.insert(test_outlet_registration("echo"));
 
     (manager, registry)
 }
 
 /// C1b #1: a spending UCAN with a tampered signature is rejected by
-/// Ed25519 verification when the invoker tries to call a paid tool.
+/// Ed25519 verification when the invoker tries to call a paid outlet.
 #[tokio::test]
-async fn tool_invoke_fabricated_spending_ucan_rejected_by_signature() {
-    use scp_protocol::context::tools::ToolId;
+async fn outlet_call_fabricated_spending_ucan_rejected_by_signature() {
+    use scp_protocol::context::outlets::OutletId;
 
     let invoker: DID = "did:key:c1b-sig-invoker".into();
     let (manager, registry) = c1b_paid_tool_context("c1b-sig-ctx", &invoker).await;
@@ -4048,10 +4048,10 @@ async fn tool_invoke_fabricated_spending_ucan_rejected_by_signature() {
     }
 
     let result = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             "c1b-sig-ctx",
             &registry,
-            &ToolId::from("echo"),
+            &OutletId::from("echo"),
             serde_json::json!({}),
             &invoker,
             Some(&ucan),
@@ -4095,8 +4095,8 @@ async fn tool_invoke_fabricated_spending_ucan_rejected_by_signature() {
 /// signed by the attacker, but presenting it on behalf of the invoker
 /// fails because `iss == attacker != invoker`.
 #[tokio::test]
-async fn tool_invoke_spending_ucan_iss_must_match_invoker() {
-    use scp_protocol::context::tools::ToolId;
+async fn outlet_call_spending_ucan_iss_must_match_invoker() {
+    use scp_protocol::context::outlets::OutletId;
 
     let invoker: DID = "did:key:c1b-iss-invoker".into();
     let attacker: DID = "did:key:c1b-iss-attacker".into();
@@ -4106,10 +4106,10 @@ async fn tool_invoke_spending_ucan_iss_must_match_invoker() {
     let attacker_ucan = dummy_spending_ucan_for(&attacker);
 
     let result = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             "c1b-iss-ctx",
             &registry,
-            &ToolId::from("echo"),
+            &OutletId::from("echo"),
             serde_json::json!({}),
             &invoker,
             Some(&attacker_ucan),
@@ -4137,8 +4137,8 @@ async fn tool_invoke_spending_ucan_iss_must_match_invoker() {
 /// the per-context nonce tracker. The first invoke succeeds; the second
 /// reuses the nonce and must fail fail-closed.
 #[tokio::test]
-async fn tool_invoke_spending_ucan_replay_via_nonce_tracker() {
-    use scp_protocol::context::tools::ToolId;
+async fn outlet_call_spending_ucan_replay_via_nonce_tracker() {
+    use scp_protocol::context::outlets::OutletId;
 
     let invoker: DID = "did:key:c1b-replay-invoker".into();
     let (manager, registry) = c1b_paid_tool_context("c1b-replay-ctx", &invoker).await;
@@ -4147,10 +4147,10 @@ async fn tool_invoke_spending_ucan_replay_via_nonce_tracker() {
 
     // First invoke — fresh nonce, should succeed.
     let first = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             "c1b-replay-ctx",
             &registry,
-            &ToolId::from("echo"),
+            &OutletId::from("echo"),
             serde_json::json!({"call": 1}),
             &invoker,
             Some(&ucan),
@@ -4165,10 +4165,10 @@ async fn tool_invoke_spending_ucan_replay_via_nonce_tracker() {
 
     // Second invoke — SAME ucan, SAME nonce — must be rejected.
     let second = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             "c1b-replay-ctx",
             &registry,
-            &ToolId::from("echo"),
+            &OutletId::from("echo"),
             serde_json::json!({"call": 2}),
             &invoker,
             Some(&ucan),
@@ -4196,10 +4196,10 @@ async fn tool_invoke_spending_ucan_replay_via_nonce_tracker() {
 /// by the expiry check. Without C1b wiring the legacy cap-only check would
 /// happily accept this token.
 #[tokio::test]
-async fn tool_invoke_spending_ucan_expired() {
+async fn outlet_call_spending_ucan_expired() {
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-    use scp_protocol::context::tools::ToolId;
+    use scp_protocol::context::outlets::OutletId;
     use scp_protocol::crypto::ucan::spending::{
         Amount as SpendAmount, CurrencyCode as SpendCcy, SpendingCapability,
     };
@@ -4257,10 +4257,10 @@ async fn tool_invoke_spending_ucan_expired() {
     };
 
     let result = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             "c1b-exp-ctx",
             &registry,
-            &ToolId::from("echo"),
+            &OutletId::from("echo"),
             serde_json::json!({}),
             &invoker,
             Some(&expired_ucan),
@@ -4284,8 +4284,8 @@ async fn tool_invoke_spending_ucan_expired() {
 /// C1b #5: a spending UCAN whose CID has been added to the per-context
 /// revoked set is rejected even though every other check would pass.
 #[tokio::test]
-async fn tool_invoke_spending_ucan_revoked() {
-    use scp_protocol::context::tools::ToolId;
+async fn outlet_call_spending_ucan_revoked() {
+    use scp_protocol::context::outlets::OutletId;
 
     let invoker: DID = "did:key:c1b-revoke-invoker".into();
     let (manager, registry) = c1b_paid_tool_context("c1b-revoke-ctx", &invoker).await;
@@ -4308,10 +4308,10 @@ async fn tool_invoke_spending_ucan_revoked() {
     }
 
     let result = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             "c1b-revoke-ctx",
             &registry,
-            &ToolId::from("echo"),
+            &OutletId::from("echo"),
             serde_json::json!({}),
             &invoker,
             Some(&ucan),
@@ -4333,11 +4333,11 @@ async fn tool_invoke_spending_ucan_revoked() {
 }
 
 /// C1b #6: happy path. A fully signed, in-window, fresh-nonce spending
-/// UCAN bound to the invoker passes the entire pipeline and the tool
+/// UCAN bound to the invoker passes the entire pipeline and the outlet
 /// invocation succeeds AND deducts budget.
 #[tokio::test]
-async fn tool_invoke_happy_path_with_valid_spending_ucan() {
-    use scp_protocol::context::tools::ToolId;
+async fn outlet_call_happy_path_with_valid_spending_ucan() {
+    use scp_protocol::context::outlets::OutletId;
 
     let invoker: DID = "did:key:c1b-happy-invoker".into();
     let (manager, registry) = c1b_paid_tool_context("c1b-happy-ctx", &invoker).await;
@@ -4359,10 +4359,10 @@ async fn tool_invoke_happy_path_with_valid_spending_ucan() {
 
     let ucan = dummy_spending_ucan_for(&invoker);
     let result = manager
-        .invoke_tool_with_economy(
+        .invoke_outlet_with_economy(
             "c1b-happy-ctx",
             &registry,
-            &ToolId::from("echo"),
+            &OutletId::from("echo"),
             serde_json::json!({}),
             &invoker,
             Some(&ucan),
@@ -4376,8 +4376,8 @@ async fn tool_invoke_happy_path_with_valid_spending_ucan() {
         "fully signed in-window fresh-nonce spending UCAN must succeed: {result:?}"
     );
 
-    // Budget MUST have been deducted by at least per_tool_invoke=10.
-    // (escalation may add more; the `tool_invoke_escalation_via_managed_wrapper`
+    // Budget MUST have been deducted by at least per_outlet_call=10.
+    // (escalation may add more; the `outlet_call_escalation_via_managed_wrapper`
     // test covers escalation specifically.)
     let after = {
         let arc = manager
@@ -4395,7 +4395,7 @@ async fn tool_invoke_happy_path_with_valid_spending_ucan() {
     };
     assert!(
         before - after >= 10,
-        "happy-path invoke must deduct at least per_tool_invoke=10: before={before} after={after}"
+        "happy-path invoke must deduct at least per_outlet_call=10: before={before} after={after}"
     );
 }
 

@@ -9,8 +9,8 @@
 //! invitation evaluation pipeline.
 //!
 //! **Hard constraints (non-overridable):**
-//! - Auto-accept NEVER applies to contexts whose ceiling includes any tool-related
-//!   capability (`ToolInvokeAll`, `ToolInvoke(_)`, `ToolRegister`). See
+//! - Auto-accept NEVER applies to contexts whose ceiling includes any outlet-related
+//!   capability (`OutletCallAll`, `OutletCall(_)`, `OutletRegister`). See
 //!   `.docs/standards/sdk-common.md` Auto-Accept Policies.
 //! - Auto-accept NEVER applies to contexts with economic policy requiring payment.
 //!   See `.docs/specs/19-economic-governance.md` section 19.3, 19.14.
@@ -34,7 +34,7 @@ fn storage_key(identity: &DID) -> String {
 }
 
 pub use scp_protocol::context::policy::{
-    AutoAcceptPolicy, RateLimit, TrustRequirement, auto_accept_allowed, has_tool_capabilities,
+    AutoAcceptPolicy, RateLimit, TrustRequirement, auto_accept_allowed, has_outlet_capabilities,
     requires_payment,
 };
 
@@ -226,52 +226,52 @@ mod tests {
             .unwrap();
     }
 
-    // --- Hard rule: tool capabilities ---
+    // --- Hard rule: outlet capabilities ---
 
     #[test]
-    fn tool_capability_blocks_auto_accept() {
+    fn outlet_capability_blocks_auto_accept() {
         let params = ContextParams {
             ceiling: vec![
                 Capability::MessagesRead,
                 Capability::MessagesWrite,
-                Capability::ToolInvokeAll,
+                Capability::OutletCallAll,
             ],
             ..ContextParams::default()
         };
-        assert!(has_tool_capabilities(&params));
+        assert!(has_outlet_capabilities(&params));
         assert!(!auto_accept_allowed(&params));
     }
 
     #[test]
-    fn tool_invoke_specific_blocks_auto_accept() {
+    fn outlet_call_specific_blocks_auto_accept() {
         let params = ContextParams {
             ceiling: vec![
                 Capability::MessagesRead,
-                Capability::ToolInvoke("search".to_owned()),
+                Capability::OutletCall("search".to_owned()),
             ],
             ..ContextParams::default()
         };
-        assert!(has_tool_capabilities(&params));
+        assert!(has_outlet_capabilities(&params));
         assert!(!auto_accept_allowed(&params));
     }
 
     #[test]
-    fn tool_register_blocks_auto_accept() {
+    fn outlet_register_blocks_auto_accept() {
         let params = ContextParams {
-            ceiling: vec![Capability::MessagesRead, Capability::ToolRegister],
+            ceiling: vec![Capability::MessagesRead, Capability::OutletRegister],
             ..ContextParams::default()
         };
-        assert!(has_tool_capabilities(&params));
+        assert!(has_outlet_capabilities(&params));
         assert!(!auto_accept_allowed(&params));
     }
 
     #[test]
-    fn no_tool_capability_allows_auto_accept() {
+    fn no_outlet_capability_allows_auto_accept() {
         let params = ContextParams {
             ceiling: vec![Capability::MessagesRead, Capability::MessagesWrite],
             ..ContextParams::default()
         };
-        assert!(!has_tool_capabilities(&params));
+        assert!(!has_outlet_capabilities(&params));
         assert!(auto_accept_allowed(&params));
     }
 
@@ -286,7 +286,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: Some(Amount(1)),
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: None,
                     per_period: None,
                     per_byte_stored: None,
@@ -322,7 +322,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: None,
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: None,
                     per_period: None,
                     per_byte_stored: None,
@@ -350,7 +350,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: None,
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: None,
                     per_period: None,
                     per_byte_stored: None,
@@ -373,19 +373,19 @@ mod tests {
     // --- Combined hard rules ---
 
     #[test]
-    fn tool_and_payment_both_block_auto_accept() {
+    fn outlet_and_payment_both_block_auto_accept() {
         let params = ContextParams {
             ceiling: vec![
                 Capability::MessagesRead,
                 Capability::MessagesWrite,
-                Capability::ToolInvokeAll,
+                Capability::OutletCallAll,
             ],
             economic_policy: Some(EconomicPolicy {
                 locked: false,
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: None,
-                    per_tool_invoke: Some(Amount(10)),
+                    per_outlet_call: Some(Amount(10)),
                     per_join: None,
                     per_period: None,
                     per_byte_stored: None,
@@ -396,7 +396,7 @@ mod tests {
             }),
             ..ContextParams::default()
         };
-        assert!(has_tool_capabilities(&params));
+        assert!(has_outlet_capabilities(&params));
         assert!(requires_payment(&params));
         assert!(!auto_accept_allowed(&params));
     }
@@ -517,7 +517,7 @@ mod tests {
                 cost_schedule: CostSchedule {
                     currency: CurrencyCode::from("USD"),
                     per_message: None,
-                    per_tool_invoke: None,
+                    per_outlet_call: None,
                     per_join: Some(Amount(100)),
                     per_period: None,
                     per_byte_stored: None,

@@ -89,7 +89,7 @@ fn default_ceiling() -> HashSet<String> {
     [
         "messages:read".to_owned(),
         "messages:write".to_owned(),
-        "tool_invoke:assistant".to_owned(),
+        "outlet_call:assistant".to_owned(),
         "member:invite".to_owned(),
         "role:assign".to_owned(),
         "context:close".to_owned(),
@@ -1311,7 +1311,7 @@ async fn full_pipeline_mint_delegate_parse_validate() {
     let caps = vec![
         "messages:write".to_owned(),
         "messages:read".to_owned(),
-        "tool_invoke:assistant".to_owned(),
+        "outlet_call:assistant".to_owned(),
     ];
 
     // Creator mints root.

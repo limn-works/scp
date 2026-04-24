@@ -661,7 +661,7 @@ mod tests {
             source_context: "ctx-paid".to_string(),
             source_type: SourceType::Persistent,
             counterparties: vec![DID::from("did:dht:z6MkAlice")],
-            purpose: Some("paid tool output".to_string()),
+            purpose: Some("paid outlet output".to_string()),
             discovery_method: DiscoveryMethod::OutOfBand,
             age: Duration::from_mins(1),
             memory_scope: MemoryScope::Full,

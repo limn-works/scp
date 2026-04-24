@@ -145,7 +145,7 @@ fn make_checkpoint(
 
 /// Exercises participation record computation against a checkpoint Merkle root
 /// with 2 participants and 12 events covering `ContextCreated`, `MemberJoined`,
-/// `RoleAssigned`, `MessageSent`, `ToolInvoked`, `GovernanceAction`, `ToolVerified`.
+/// `RoleAssigned`, `MessageSent`, `OutletInvoked`, `GovernanceAction`, `OutletVerified`.
 ///
 /// This is the core assertion of SCP-125 AC6.
 #[tokio::test]
@@ -268,11 +268,11 @@ async fn participation_validation_works_with_checkpointed_log() {
         prev_hash,
     );
 
-    // Event 6: Alice invokes a tool.
+    // Event 6: Alice invokes an outlet.
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::ToolInvoked,
+        EventType::OutletInvoked,
         &did_alice,
         1_000_006,
         6,
@@ -285,7 +285,7 @@ async fn participation_validation_works_with_checkpointed_log() {
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::ToolInvoked,
+        EventType::OutletInvoked,
         &did_alice,
         1_000_007,
         7,
@@ -294,11 +294,11 @@ async fn participation_validation_works_with_checkpointed_log() {
         prev_hash,
     );
 
-    // Event 8: Bob invokes a different tool.
+    // Event 8: Bob invokes a different outlet.
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::ToolInvoked,
+        EventType::OutletInvoked,
         &did_bob,
         1_000_008,
         8,
@@ -320,11 +320,11 @@ async fn participation_validation_works_with_checkpointed_log() {
         prev_hash,
     );
 
-    // Event 10: Alice verifies a tool (attestation-adjacent).
+    // Event 10: Alice verifies an outlet (attestation-adjacent).
     prev_hash = append(
         &mut log,
         &mut all_events,
-        EventType::ToolVerified,
+        EventType::OutletVerified,
         &did_alice,
         1_000_010,
         10,
@@ -373,16 +373,16 @@ async fn participation_validation_works_with_checkpointed_log() {
     assert_eq!(record.participation_count, 8);
     // Duration: 1_000_010 - 1_000_000 = 10 seconds.
     assert_eq!(record.participation_duration_seconds, 10);
-    // Tool invocations: search-tool x2.
-    assert_eq!(record.tool_invocations.len(), 1);
-    assert_eq!(record.tool_invocations.get("search-tool"), Some(&2));
+    // Outlet invocations: search-outlet x2.
+    assert_eq!(record.outlet_invocations.len(), 1);
+    assert_eq!(record.outlet_invocations.get("search-tool"), Some(&2));
     // Governance actions by Alice: 1 (targeting Bob).
     assert_eq!(record.governance_actions_by.len(), 1);
     // Governance actions against Alice: 0.
     assert_eq!(record.governance_actions_against.len(), 0);
     // Role history for Alice: 0 (Alice assigned Bob, not herself).
     assert_eq!(record.role_history.len(), 0);
-    // Attestation history: 1 (ToolVerified event).
+    // Attestation history: 1 (OutletVerified event).
     assert_eq!(record.attestation_history.len(), 1);
     // Context creation: 1.
     assert_eq!(record.context_creation_count, 1);
@@ -403,9 +403,9 @@ async fn participation_validation_works_with_checkpointed_log() {
     assert_eq!(bob_record.participation_count, 4);
     // Duration: 1_000_011 - 1_000_002 = 9 seconds.
     assert_eq!(bob_record.participation_duration_seconds, 9);
-    // Bob's tool invocations: execute-tool x1.
-    assert_eq!(bob_record.tool_invocations.len(), 1);
-    assert_eq!(bob_record.tool_invocations.get("execute-tool"), Some(&1));
+    // Bob's outlet invocations: execute-tool x1.
+    assert_eq!(bob_record.outlet_invocations.len(), 1);
+    assert_eq!(bob_record.outlet_invocations.get("execute-tool"), Some(&1));
     // Bob is the target of Alice's governance action.
     assert_eq!(bob_record.governance_actions_against.len(), 1);
     // Bob was assigned a role.

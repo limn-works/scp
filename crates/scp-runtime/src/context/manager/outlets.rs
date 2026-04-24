@@ -1,13 +1,13 @@
-//! `ContextManager::invoke_tool_with_economy` — tool invocation with
+//! `ContextManager::invoke_outlet_with_economy` — outlet invocation with
 //! per-DID anti-spam escalation wired from per-context governance state.
 //!
 //! This wrapper is the integration point between the free
-//! [`invoke_tool_execute_and_validate`](crate::context::tools::invoke::invoke_tool_execute_and_validate)
+//! [`invoke_outlet_execute_and_validate`](crate::context::outlets::invoke::invoke_outlet_execute_and_validate)
 //! helper and the [`super::ContextManager`] per-context state. It
 //! snapshots economic policy, budget tracker, per-DID velocity tracker,
 //! message pricing config, a real event-log snapshot, consequence rules,
 //! metrics, and participation cache from the context's `GovernanceState`
-//! so that tool invocations participate in the same per-DID anti-spam
+//! so that outlet invocations participate in the same per-DID anti-spam
 //! regime as message sends (spec §19.7).
 //!
 //! # Lock-split invariant
@@ -21,10 +21,10 @@
 //! 1. **Phase 1 — locked:** snapshot all governance state, run
 //!    `economy_pre_check` (pure compute), `record_spend` against the
 //!    per-context budget, and escrow-authorize the payment. A
-//!    [`ToolEconomyTicket`] is assembled from the resulting bookkeeping.
+//!    [`OutletEconomyTicket`] is assembled from the resulting bookkeeping.
 //! 2. **Phase 2 — unlocked:** the `contexts` lock is dropped; the executor
 //!    is dispatched via
-//!    [`invoke_tool_execute_and_validate`](crate::context::tools::invoke::invoke_tool_execute_and_validate)
+//!    [`invoke_outlet_execute_and_validate`](crate::context::outlets::invoke::invoke_outlet_execute_and_validate)
 //!    which performs context-state, capability, schema, timeout, and
 //!    output-schema checks *again* (defensive) using the snapshotted
 //!    handle + role state. On any error the ticket is drained
@@ -34,16 +34,16 @@
 //!    evaluation), then released again for the escrow-capture call.
 //!    Only then is the ticket committed.
 //!
-//! The `ToolEconomyTicket` is `#[must_use]` with a `Drop` guard that
+//! The `OutletEconomyTicket` is `#[must_use]` with a `Drop` guard that
 //! debug-asserts in tests so no future refactor can leak an unbalanced
 //! budget deduction or velocity entry on an untested error branch.
 //!
 //! # Registry ownership
 //!
-//! The wrapper takes the [`ToolRegistry`] and executor as explicit
+//! The wrapper takes the [`OutletRegistry`] and executor as explicit
 //! parameters because the manager does not own a per-context tool
 //! registry today (it lives in the FFI bridge layers). This preserves
-//! the bridge-owned registry invariant while keeping tool invocations
+//! the bridge-owned registry invariant while keeping outlet invocations
 //! within the full governance pipeline.
 
 use std::collections::HashMap;
@@ -51,52 +51,52 @@ use std::future::Future;
 
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
-use scp_protocol::context::tools::ToolId;
-use scp_protocol::context::tools::lifecycle::ToolInvokedEvent;
-use scp_protocol::context::tools::registry::ToolRegistry;
+use scp_protocol::context::outlets::OutletId;
+use scp_protocol::context::outlets::lifecycle::OutletInvokedEvent;
+use scp_protocol::context::outlets::registry::OutletRegistry;
 use scp_protocol::crypto::ucan::UcanToken;
 use scp_protocol::economy::antispam::VelocityRollbackToken;
 use scp_protocol::economy::policy::ObservableMetrics;
 use scp_protocol::economy::types::Amount;
 
-use crate::context::tools::invoke::{
-    self, InvocationError, InvokeExecuteOutcome, ToolEconomyContext, build_tool_event,
-    economy_pre_check, invoke_tool_execute_and_validate, post_tool_invocation_bookkeeping,
+use crate::context::outlets::invoke::{
+    self, InvocationError, InvokeExecuteOutcome, OutletEconomyContext, build_outlet_event,
+    economy_pre_check, invoke_outlet_execute_and_validate, post_outlet_invocation_bookkeeping,
 };
 use crate::economy::adapter::PaymentAdapterDyn;
 use crate::economy::integration::PreparedAction;
 
 use super::{Arc, ContextGeneration, ContextManager};
 
-/// Result of a successful managed tool invocation.
+/// Result of a successful managed outlet invocation.
 #[derive(Debug)]
-pub struct ManagedToolInvocationOutput {
-    /// Tool output JSON.
+pub struct ManagedOutletInvocationOutput {
+    /// Outlet output JSON.
     pub output: serde_json::Value,
     /// Event to append to the event log.
-    pub event: ToolInvokedEvent,
+    pub event: OutletInvokedEvent,
     /// Consequences triggered by the invocation.
     pub consequences: Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
     /// Payment receipt when a payment adapter is configured.
     pub payment_receipt: Option<crate::economy::adapter::PaymentReceipt>,
 }
 
-/// Phase-1 bookkeeping bundle for a tool invocation in flight.
+/// Phase-1 bookkeeping bundle for an outlet invocation in flight.
 ///
-/// Every Phase 1 success produces a [`ToolEconomyTicket`]; every Phase 2
+/// Every Phase 1 success produces a [`OutletEconomyTicket`]; every Phase 2
 /// or Phase 3 error branch MUST drain it through
-/// [`rollback_tool_economy_ticket`] (refund budget + roll back velocity
+/// [`rollback_outlet_economy_ticket`] (refund budget + roll back velocity
 /// entry + void escrow) or commit it through
-/// [`commit_tool_economy_ticket`]. Dropping it without doing one or the
+/// [`commit_outlet_economy_ticket`]. Dropping it without doing one or the
 /// other is a compile-time warning (`#[must_use]`) and a `Drop`
 /// debug-assert so unit tests fail loudly.
 ///
 /// Mirrors [`super::economy::EconomyTicket`] one-for-one; a separate
-/// type exists because the tool path also owns a cloned `PreparedAction`
-/// escrow handle and the void + capture steps use the tool-flavor
-/// adapter helpers in [`crate::context::tools::invoke`].
-#[must_use = "ToolEconomyTicket must be committed or rolled back — dropping leaks budget, velocity, and escrow state"]
-struct ToolEconomyTicket {
+/// type exists because the outlet path also owns a cloned `PreparedAction`
+/// escrow handle and the void + capture steps use the outlet-flavor
+/// adapter helpers in [`crate::context::outlets::invoke`].
+#[must_use = "OutletEconomyTicket must be committed or rolled back — dropping leaks budget, velocity, and escrow state"]
+struct OutletEconomyTicket {
     /// The invoker being charged — needed for every rollback operation.
     actor_did: DID,
     /// The budget amount deducted in Phase 1 (if any).
@@ -112,7 +112,7 @@ struct ToolEconomyTicket {
     /// same policy that was priced against under the Phase 1 lock.
     policy_for_capture: Option<scp_protocol::economy::types::EconomicPolicy>,
     /// Observable metrics captured in Phase 1. Reused by
-    /// [`invoke::complete_tool_payment`] in Phase 3 so the capture step
+    /// [`invoke::complete_outlet_payment`] in Phase 3 so the capture step
     /// sees the same metrics the Phase 1 authorize saw — eliminating a
     /// TOCTOU window where the adapter could diverge from the budget.
     metrics_for_capture: ObservableMetrics,
@@ -127,17 +127,17 @@ struct ToolEconomyTicket {
     consumed: bool,
 }
 
-impl Drop for ToolEconomyTicket {
+impl Drop for OutletEconomyTicket {
     fn drop(&mut self) {
         if !self.consumed {
             tracing::error!(
                 actor_did = %self.actor_did,
                 cost = ?self.deducted_cost,
-                "ToolEconomyTicket dropped without commit or rollback — budget, velocity, and escrow state may be inconsistent"
+                "OutletEconomyTicket dropped without commit or rollback — budget, velocity, and escrow state may be inconsistent"
             );
             debug_assert!(
                 false,
-                "ToolEconomyTicket dropped without commit or rollback for actor {}",
+                "OutletEconomyTicket dropped without commit or rollback for actor {}",
                 self.actor_did
             );
         }
@@ -145,11 +145,11 @@ impl Drop for ToolEconomyTicket {
 }
 
 /// Marks the ticket committed (success path). Returns the deducted cost
-/// so the caller can populate the `ToolInvokedEvent`. Clears
+/// so the caller can populate the `OutletInvokedEvent`. Clears
 /// `needs_hard_rate_limit_refund` so the invariant
 /// "`needs_hard_rate_limit_refund == true` iff a refund is still owed"
 /// holds against any defensive rollback call.
-fn commit_tool_economy_ticket(mut ticket: ToolEconomyTicket) -> Option<Amount> {
+fn commit_outlet_economy_ticket(mut ticket: OutletEconomyTicket) -> Option<Amount> {
     ticket.consumed = true;
     ticket.needs_hard_rate_limit_refund = false;
     ticket.deducted_cost
@@ -170,20 +170,20 @@ fn commit_tool_economy_ticket(mut ticket: ToolEconomyTicket) -> Option<Amount> {
 /// since it is adapter-side state, not manager-side, and the ticket is
 /// still marked consumed so the `Drop` guard stays quiet.
 #[allow(clippy::significant_drop_tightening)]
-async fn rollback_tool_economy_ticket(
+async fn rollback_outlet_economy_ticket(
     manager: &ContextManager,
     context_id: &str,
-    mut ticket: ToolEconomyTicket,
+    mut ticket: OutletEconomyTicket,
 ) {
     ticket.consumed = true;
 
     // Void the adapter-side escrow first so it does not survive the
     // manager-side rollback. This mirrors `void_escrow_and_rollback` in
-    // the free `invoke_tool` path.
+    // the free `invoke_outlet` path.
     if let (Some(adapter), Some(prepared)) =
         (manager.payment_adapter.as_ref(), ticket.escrow.as_ref())
     {
-        invoke::void_tool_escrow(adapter.as_ref(), prepared).await;
+        invoke::void_outlet_escrow(adapter.as_ref(), prepared).await;
     }
 
     // Reacquire the lock and reverse the per-context bookkeeping.
@@ -216,7 +216,7 @@ impl ContextManager {
     /// when the context IS registered AND the sender is over budget.
     ///
     /// SYNC entry point for FFI bridge tool-dispatch paths that do
-    /// not flow through [`Self::invoke_tool_with_economy`] (the
+    /// not flow through [`Self::invoke_outlet_with_economy`] (the
     /// bridges own their own tool registry + handler dispatch
     /// because JS/Python callables live in bridge-side state, not
     /// in the `ContextManager`).
@@ -228,7 +228,7 @@ impl ContextManager {
     ///
     /// An unknown `context_id` returns `true` rather than an error
     /// because the downstream `with_context` call inside the bridge
-    /// will fail with a more specific "tool not found" error, and
+    /// will fail with a more specific "outlet not found" error, and
     /// because there is no rate-limit state to enforce against
     /// without a manager entry.
     ///
@@ -406,13 +406,13 @@ impl ContextManager {
         rx.recv().unwrap_or(false)
     }
 
-    /// Invokes a tool under the full economy pipeline without holding
+    /// Invokes an outlet under the full economy pipeline without holding
     /// the `contexts` mutex across the executor future (spec §19.7).
     ///
     /// This is the single entry point that tool-invoking bridges should
     /// use when they want the runtime to enforce per-DID escalation,
-    /// floor/cap, and velocity tracking for `ToolInvoke` actions. The
-    /// [`ToolRegistry`] and `executor` are passed in because the bridge
+    /// floor/cap, and velocity tracking for `OutletCall` actions. The
+    /// [`OutletRegistry`] and `executor` are passed in because the bridge
     /// layers own the registry — the manager itself does not.
     ///
     /// # Phase discipline
@@ -424,15 +424,15 @@ impl ContextManager {
     /// 1. **Phase 1 (locked):** snapshot governance state, record
     ///    velocity, run `economy_pre_check`, `record_spend` the cost,
     ///    authorize the payment escrow, assemble a
-    ///    [`ToolEconomyTicket`]. The lock is released at the end of
+    ///    [`OutletEconomyTicket`]. The lock is released at the end of
     ///    Phase 1.
     /// 2. **Phase 2 (unlocked):** dispatch the executor via
-    ///    [`invoke_tool_execute_and_validate`]. On any failure the
+    ///    [`invoke_outlet_execute_and_validate`]. On any failure the
     ///    ticket is drained (budget, velocity, escrow).
     /// 3. **Phase 3 (locked then unlocked):** re-acquire the lock for
     ///    post-invocation bookkeeping (participation cache + consequence
     ///    evaluation), release the lock, capture the escrow off-lock,
-    ///    commit the ticket, and build the `ToolInvokedEvent`.
+    ///    commit the ticket, and build the `OutletInvokedEvent`.
     ///
     /// # Errors
     ///
@@ -442,23 +442,23 @@ impl ContextManager {
     /// budget, UCAN composition, schema validation, or consequence
     /// failure. All errors are terminal for the invocation; partial
     /// state mutations (budget, velocity, escrow) are rolled back before
-    /// the error is returned via the `ToolEconomyTicket`.
+    /// the error is returned via the `OutletEconomyTicket`.
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
         clippy::significant_drop_tightening
     )]
-    pub async fn invoke_tool_with_economy<F, Fut>(
+    pub async fn invoke_outlet_with_economy<F, Fut>(
         &self,
         context_id: &str,
-        registry: &ToolRegistry,
-        tool_id: &ToolId,
+        registry: &OutletRegistry,
+        outlet_id: &OutletId,
         input: serde_json::Value,
         invoker_did: &DID,
         spending_ucan: Option<&UcanToken>,
         timeout_ms: Option<u32>,
         executor: F,
-    ) -> Result<ManagedToolInvocationOutput, ContextError>
+    ) -> Result<ManagedOutletInvocationOutput, ContextError>
     where
         F: FnOnce(serde_json::Value) -> Fut,
         Fut: Future<Output = Result<serde_json::Value, String>>,
@@ -471,7 +471,7 @@ impl ContextManager {
         // consequence rules, metrics, real event-log entries), record
         // the velocity entry, run the pure economy pre-check, record
         // the spend, authorize the payment escrow, and assemble a
-        // [`ToolEconomyTicket`]. Phase 1 ends with `drop(contexts)`
+        // [`OutletEconomyTicket`]. Phase 1 ends with `drop(contexts)`
         // so Phase 2 (the executor) runs WITHOUT the lock.
         // ------------------------------------------------------------
         let now_secs = self.clock.now_secs();
@@ -491,7 +491,7 @@ impl ContextManager {
             // a token from the per-invoker bucket BEFORE any
             // bookkeeping so the cap applies even when the cost
             // pipeline is free. Inline rollback paths refund
-            // directly; the `ToolEconomyTicket`-based rollback
+            // directly; the `OutletEconomyTicket`-based rollback
             // consults `needs_hard_rate_limit_refund`.
             if !ctx
                 .governance
@@ -499,7 +499,7 @@ impl ContextManager {
                 .try_consume(invoker_did, now_secs)
             {
                 return Err(ContextError::RateLimited {
-                    resource: "tool_invoke".to_owned(),
+                    resource: "outlet_call".to_owned(),
                     message: "hard rate limit exceeded for invoker".to_owned(),
                 });
             }
@@ -555,7 +555,7 @@ impl ContextManager {
             > = HashMap::new();
 
             let action_cost = {
-                let economy = ToolEconomyContext {
+                let economy = OutletEconomyContext {
                     economic_policy: economic_policy.as_ref(),
                     budget_tracker: &mut ctx.governance.budget_tracker,
                     spending_ucan,
@@ -595,14 +595,14 @@ impl ContextManager {
             // valid-looking spending capability — `economy_pre_check` only
             // verifies the capability shape, not the signature, iss/aud
             // binding, expiry, revocation, or replay nonce. `enforce_economy`
-            // (used by send/join) already runs this pipeline; `invoke_tool_with_economy`
+            // (used by send/join) already runs this pipeline; `invoke_outlet_with_economy`
             // must match. For free actions (`action_cost == 0`) spending UCANs
             // are not required — mirroring `enforce_economy` and `check_spending_capability`.
             if action_cost.0 > 0 {
                 let Some(spending) = spending_ucan else {
                     // Paid action reached this point without a spending UCAN:
                     // `economy_pre_check` would normally reject this via
-                    // `check_tool_spending_capability`, so reaching here is
+                    // `check_outlet_spending_capability`, so reaching here is
                     // a defense-in-depth branch. Roll back and surface the
                     // canonical SCP-ECON-12060 error.
                     ctx.governance
@@ -701,7 +701,7 @@ impl ContextManager {
             // authorize and budget recording.
             let escrow = match (economic_policy.as_ref(), payment_adapter.as_ref()) {
                 (Some(policy), Some(adapter)) => {
-                    match invoke::authorize_tool_payment(
+                    match invoke::authorize_outlet_payment(
                         adapter.as_ref(),
                         policy,
                         context_id,
@@ -732,7 +732,7 @@ impl ContextManager {
                 _ => None,
             };
 
-            let ticket = ToolEconomyTicket {
+            let ticket = OutletEconomyTicket {
                 actor_did: invoker_did.clone(),
                 deducted_cost,
                 velocity_token,
@@ -772,11 +772,11 @@ impl ContextManager {
         // velocity, and escrow are all reversed before propagating the
         // error.
         // ------------------------------------------------------------
-        let outcome = match invoke_tool_execute_and_validate(
+        let outcome = match invoke_outlet_execute_and_validate(
             &handle,
             registry,
             &role_state,
-            tool_id,
+            outlet_id,
             input,
             invoker_did,
             timeout_ms,
@@ -786,7 +786,7 @@ impl ContextManager {
         {
             Ok(o) => o,
             Err(err) => {
-                rollback_tool_economy_ticket(self, context_id, ticket).await;
+                rollback_outlet_economy_ticket(self, context_id, ticket).await;
                 return Err(invocation_error_to_context(err));
             }
         };
@@ -811,7 +811,7 @@ impl ContextManager {
                 // and Phase 3 (generation mismatch / not registered).
                 // Drain the ticket — this will void the escrow, and
                 // the budget/velocity rollback is a best-effort no-op.
-                rollback_tool_economy_ticket(self, context_id, ticket).await;
+                rollback_outlet_economy_ticket(self, context_id, ticket).await;
                 return Err(ContextError::ContextNotRegistered(context_id.to_owned()));
             };
             let ctx = &mut *guard;
@@ -825,7 +825,7 @@ impl ContextManager {
             );
             let consequence_rules = ctx.governance.consequence_rules.clone();
 
-            let triggered = post_tool_invocation_bookkeeping(
+            let triggered = post_outlet_invocation_bookkeeping(
                 &events_for_consequences,
                 invoker_did,
                 context_id,
@@ -837,7 +837,7 @@ impl ContextManager {
             // Enforce triggered consequences while the lock is held,
             // matching the messaging path (messaging.rs:655-668).
             // evaluate_consequence_rules is called inside
-            // post_tool_invocation_bookkeeping; enforcement must happen
+            // post_outlet_invocation_bookkeeping; enforcement must happen
             // here so that consequences are actually applied (not just
             // reported in the output).
             super::governance::enforce_triggered_consequences(
@@ -871,7 +871,7 @@ impl ContextManager {
             ticket.policy_for_capture.as_ref(),
         ) {
             (Some(adapter), Some(prepared), policy_opt) => {
-                match invoke::complete_tool_payment(
+                match invoke::complete_outlet_payment(
                     adapter.as_ref(),
                     policy_opt,
                     prepared,
@@ -888,7 +888,7 @@ impl ContextManager {
                         // token must all be reversed so that an
                         // unpaid-for invocation does not permanently
                         // charge any of the three. We cannot delegate
-                        // to `rollback_tool_economy_ticket` because
+                        // to `rollback_outlet_economy_ticket` because
                         // it would attempt to void the already-
                         // consumed escrow.
                         {
@@ -919,11 +919,11 @@ impl ContextManager {
 
         // ------------------------------------------------------------
         // Commit the ticket (no more rollback paths below this point)
-        // and assemble the ManagedToolInvocationOutput.
+        // and assemble the ManagedOutletInvocationOutput.
         // ------------------------------------------------------------
-        let cost = commit_tool_economy_ticket(ticket);
-        let event = build_tool_event(
-            tool_id,
+        let cost = commit_outlet_economy_ticket(ticket);
+        let event = build_outlet_event(
+            outlet_id,
             invoker_did,
             execution_time_ms,
             input_hash,
@@ -931,7 +931,8 @@ impl ContextManager {
             cost,
         );
 
-        Ok(ManagedToolInvocationOutput {
+        crate::metrics::record_outlet_invocation();
+        Ok(ManagedOutletInvocationOutput {
             output,
             event,
             consequences,
@@ -946,25 +947,25 @@ impl ContextManager {
 struct Phase1Snapshot {
     handle: crate::context::ContextHandle,
     role_state: scp_protocol::context::roles::ContextRoleState,
-    ticket: ToolEconomyTicket,
+    ticket: OutletEconomyTicket,
     ctx_gen: ContextGeneration,
 }
 
 /// Maps an [`InvocationError`] to a [`ContextError`] with SCP codes.
 ///
 /// Uses the canonical `SCP-TOOL` prefix (6000-6999 range) for
-/// tool-invocation failures, per the canonical error-code registry in
+/// outlet-invocation failures, per the canonical error-code registry in
 /// `.docs/standards/sdk-common.md`.
 fn invocation_error_to_context(err: InvocationError) -> ContextError {
     match err {
         InvocationError::ContextNotActive { current_state } => ContextError::PermissionDenied(
             format!("SCP-TOOL-6080: context not active: {current_state}"),
         ),
-        InvocationError::InvokerNotAuthorized { did, tool_id } => ContextError::PermissionDenied(
-            format!("SCP-TOOL-6081: invoker {did} lacks ToolInvoke({tool_id})"),
+        InvocationError::InvokerNotAuthorized { did, outlet_id } => ContextError::PermissionDenied(
+            format!("SCP-TOOL-6081: invoker {did} lacks OutletCall({outlet_id})"),
         ),
-        InvocationError::ToolNotFound { tool_id } => {
-            ContextError::PermissionDenied(format!("SCP-TOOL-6082: tool not found: {tool_id}"))
+        InvocationError::OutletNotFound { outlet_id } => {
+            ContextError::PermissionDenied(format!("SCP-TOOL-6082: outlet not found: {outlet_id}"))
         }
         InvocationError::InputValidationFailed { message } => ContextError::PermissionDenied(
             format!("SCP-TOOL-6083: input schema validation failed: {message}"),
@@ -973,13 +974,13 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
             format!("SCP-TOOL-6084: output schema validation failed: {message}"),
         ),
         InvocationError::ExecutionFailed { message } => ContextError::PermissionDenied(format!(
-            "SCP-TOOL-6085: tool execution failed: {message}"
+            "SCP-TOOL-6085: outlet execution failed: {message}"
         )),
         InvocationError::Timeout { timeout_ms } => ContextError::PermissionDenied(format!(
-            "SCP-TOOL-6086: tool execution timed out after {timeout_ms}ms"
+            "SCP-TOOL-6086: outlet execution timed out after {timeout_ms}ms"
         )),
         InvocationError::Cancelled => {
-            ContextError::PermissionDenied("SCP-TOOL-6087: tool invocation cancelled".to_owned())
+            ContextError::PermissionDenied("SCP-TOOL-6087: outlet invocation cancelled".to_owned())
         }
         InvocationError::BudgetExceeded {
             did,

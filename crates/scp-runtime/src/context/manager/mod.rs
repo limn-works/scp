@@ -45,12 +45,12 @@ use scp_protocol::context::governance::{
     unanimity::UnanimityEngine,
 };
 use scp_protocol::context::membership::{ContextEvent, KeyPackage, MembershipState, ReceiveBuffer};
+use scp_protocol::context::outlets::interface::OutletInterface;
 use scp_protocol::context::params::GovernanceModel;
-use scp_protocol::context::params::{ContextMode, TemplateId, ToolRegistration};
+use scp_protocol::context::params::{ContextMode, OutletRegistration, TemplateId};
 use scp_protocol::context::roles::{
     self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment,
 };
-use scp_protocol::context::tools::interface::ToolInterface;
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::crypto::sender_keys::BroadcastEnvelope;
 use scp_protocol::crypto::ucan::UcanToken;
@@ -70,9 +70,9 @@ mod economy;
 mod governance;
 mod lifecycle;
 mod messaging;
+mod outlets;
 mod queries;
 pub(crate) mod standing;
-mod tools;
 mod trust_recovery;
 mod ttl_close;
 
@@ -80,10 +80,10 @@ mod ttl_close;
 // Protocol-level collection size limits (§5.9)
 // ---------------------------------------------------------------------------
 
-/// Maximum number of registered tools per context.
-const MAX_REGISTERED_TOOLS: usize = 256;
+/// Maximum number of registered outlets per context.
+const MAX_REGISTERED_OUTLETS: usize = 256;
 
-/// Maximum number of cross-context tool interfaces per context.
+/// Maximum number of cross-context outlet interfaces per context.
 const MAX_TOOL_INTERFACES: usize = 256;
 
 /// Maximum number of governance threshold signers per context.
@@ -459,7 +459,7 @@ pub enum GovernanceActionResult {
     /// A member's role was changed.
     RoleChanged,
     /// A tool was registered in the context.
-    ToolRegistered,
+    OutletRegistered,
     /// A tool was removed from the context.
     ToolRemoved,
     /// The capability ceiling was modified.
@@ -480,8 +480,8 @@ pub enum GovernanceActionResult {
     ThresholdModified,
     /// A child context was created.
     ChildContextCreated,
-    /// A tool interface was established.
-    ToolInterfaceEstablished,
+    /// A outlet interface was established.
+    OutletInterfaceEstablished,
     /// A member was reset (ADR-029, Tier 3).
     MemberReset,
     /// A governance conflict was resolved (ADR-031 §7).
@@ -576,17 +576,17 @@ pub struct ContextSnapshot {
     /// Remaining TTL in seconds, if a TTL timer was active. `None` if no
     /// TTL was configured or the timer was not running.
     pub ttl_remaining_secs: Option<u64>,
-    /// Dynamically registered tools (beyond initial `ContextParams.tools`).
+    /// Dynamically registered outlets (beyond initial `ContextParams.tools`).
     #[serde(default)]
-    pub registered_tools: Vec<ToolRegistration>,
+    pub registered_outlets: Vec<OutletRegistration>,
     /// Members excluded from future CEK wrapping (`Revoke { access: AccessScope::Write }`).
     /// These members won't receive new content keys but retain access to
     /// historical content encrypted before the revocation (ADR-038, §9.17).
     #[serde(default)]
     pub read_exclusion_list: HashSet<DID>,
-    /// Established cross-context tool interfaces (§6.2).
+    /// Established cross-context outlet interfaces (§6.2).
     #[serde(default)]
-    pub tool_interfaces: Vec<ToolInterface>,
+    pub tool_interfaces: Vec<OutletInterface>,
     /// Governance threshold signers (for `ThresholdApproval` model).
     #[serde(default)]
     pub threshold_signers: Vec<DID>,
@@ -980,10 +980,10 @@ struct GovernanceState {
     pending_ceiling_modification: Option<PendingCeilingModification>,
     /// Pending economic policy change awaiting notification period (§19.3).
     pending_economic_policy_change: Option<PendingEconomicPolicyChange>,
-    /// Dynamically registered tools (beyond initial `ContextParams.tools`).
-    registered_tools: Vec<ToolRegistration>,
-    /// Established cross-context tool interfaces (§6.2).
-    tool_interfaces: Vec<ToolInterface>,
+    /// Dynamically registered outlets (beyond initial `ContextParams.tools`).
+    registered_outlets: Vec<OutletRegistration>,
+    /// Established cross-context outlet interfaces (§6.2).
+    tool_interfaces: Vec<OutletInterface>,
     /// Pruning policy override (ADR-030 §6).
     pruning_policy: Option<PruningPolicy>,
     /// Mutable economic policy (§19.3, ADR-033).
@@ -2400,7 +2400,7 @@ impl ContextManager {
             role_state,
             executed_proposals: std::collections::HashSet::new(),
             ttl_remaining_secs: None,
-            registered_tools: Vec::new(),
+            registered_outlets: Vec::new(),
             read_exclusion_list: std::collections::HashSet::new(),
             tool_interfaces: Vec::new(),
             threshold_signers: Vec::new(),
@@ -2799,7 +2799,7 @@ impl ContextManager {
             role_state: ctx.role_state.clone(),
             executed_proposals: ctx.governance.executed_proposals.keys().copied().collect(),
             ttl_remaining_secs,
-            registered_tools: ctx.governance.registered_tools.clone(),
+            registered_outlets: ctx.governance.registered_outlets.clone(),
             read_exclusion_list: ctx.access.read_exclusion_list.clone(),
             tool_interfaces: ctx.governance.tool_interfaces.clone(),
             threshold_signers: ctx.governance.threshold_signers.clone(),

@@ -16,8 +16,10 @@
 //! | `scp_persistence_failures_total`  | Counter   | Persistence write failures (best-effort saves) |
 //! | `scp_active_contexts`             | Gauge     | Number of registered (active) contexts         |
 //! | `scp_buffer_occupancy`            | Gauge     | Total events buffered across all contexts      |
+//! | `outlet_invocations_total`        | Counter   | Outlet invocations issued (ADR-049, §5.4)      |
+//! | `outlet_registrations_total`      | Counter   | Outlet registrations committed (ADR-049, §5.4) |
 //!
-//! See issue #1467.
+//! See issue #1467. Outlet counters land with SCP-OUT-004 (ADR-049).
 
 /// Records a message sent.
 pub fn record_message_sent() {
@@ -54,4 +56,17 @@ pub fn set_active_contexts(count: usize) {
 pub fn set_buffer_occupancy(count: usize) {
     #[allow(clippy::cast_precision_loss)]
     metrics::gauge!("scp_buffer_occupancy").set(count as f64);
+}
+
+/// Records an outlet invocation (ADR-049, spec §5.4). Incremented on every
+/// successful invocation dispatch from `ContextManager::invoke_outlet`.
+pub fn record_outlet_invocation() {
+    metrics::counter!("outlet_invocations_total").increment(1);
+}
+
+/// Records an outlet registration (ADR-049, spec §5.4). Incremented whenever a
+/// registration is committed to the outlet registry via
+/// `ContextManager::register_outlet`.
+pub fn record_outlet_registration() {
+    metrics::counter!("outlet_registrations_total").increment(1);
 }

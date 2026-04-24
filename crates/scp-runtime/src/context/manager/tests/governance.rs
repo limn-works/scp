@@ -225,7 +225,7 @@ async fn single_admin_propose_auto_executes() {
         ceiling: vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolRegister,
+            Capability::OutletRegister,
         ],
         ..ContextParams::default()
     };
@@ -242,9 +242,9 @@ async fn single_admin_propose_auto_executes() {
 
     assert_eq!(handle.state().await, ContextState::Active);
 
-    // Propose RegisterTool — should auto-execute in SingleAdmin.
-    let action = GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("test-tool")),
+    // Propose RegisterOutlet — should auto-execute in SingleAdmin.
+    let action = GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("test-tool")),
     };
 
     let (proposal, events, _) = manager
@@ -309,7 +309,7 @@ async fn threshold_context_proposal_lifecycle() {
         ceiling: vec![
             Capability::MessagesRead,
             Capability::MessagesWrite,
-            Capability::ToolRegister,
+            Capability::OutletRegister,
         ],
         ..ContextParams::default()
     };
@@ -320,9 +320,9 @@ async fn threshold_context_proposal_lifecycle() {
         .await
         .unwrap();
 
-    // Alice proposes RegisterTool (her proposer vote counts as first approval).
-    let action = GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("threshold-tool")),
+    // Alice proposes RegisterOutlet (her proposer vote counts as first approval).
+    let action = GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("threshold-tool")),
     };
 
     let (proposal, _events, _) = manager
@@ -348,7 +348,7 @@ async fn threshold_context_proposal_lifecycle() {
         "threshold proposal should be approved after 2nd vote, got {status:?}"
     );
 
-    // Verify the tool was registered (auto-execution).
+    // Verify the outlet was registered (auto-execution).
     let arc = manager
         .contexts
         .get("ctx-threshold")
@@ -359,7 +359,7 @@ async fn threshold_context_proposal_lifecycle() {
     let ctx = &*g;
     assert!(
         ctx.governance
-            .registered_tools
+            .registered_outlets
             .iter()
             .any(|t| t.name == "threshold-tool"),
         "tool should have been registered after proposal approval"
@@ -560,8 +560,8 @@ async fn non_eligible_voter_rejected() {
         .unwrap();
 
     // Alice proposes.
-    let action = GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("tool")),
+    let action = GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("tool")),
     };
 
     let (proposal, _, _) = manager
@@ -615,7 +615,7 @@ fn governance_snapshot_serde_roundtrip() {
         role_state,
         executed_proposals: HashSet::new(),
         ttl_remaining_secs: None,
-        registered_tools: Vec::new(),
+        registered_outlets: Vec::new(),
         read_exclusion_list: HashSet::new(),
         tool_interfaces: Vec::new(),
         threshold_signers: Vec::new(),
@@ -945,19 +945,19 @@ fn ceiling_test_proposal(context_id: &str, action: GovernanceAction) -> super::G
     }
 }
 
-/// #339: `RegisterTool` is rejected when `ToolRegister` is not in ceiling.
+/// #339: `RegisterOutlet` is rejected when `OutletRegister` is not in ceiling.
 #[tokio::test]
-async fn register_tool_rejected_without_ceiling_capability() {
-    use scp_protocol::context::tools::registry::ToolSchema;
+async fn register_outlet_rejected_without_ceiling_capability() {
+    use scp_protocol::context::outlets::registry::OutletSchema;
 
     let (manager, _handle, ctx_id) =
         setup_context_with_ceiling(vec![Capability::MessagesRead, Capability::MessagesWrite]).await;
 
-    let reg = scp_protocol::context::params::ToolRegistration {
-        tool_id: "test".to_owned(),
+    let reg = scp_protocol::context::params::OutletRegistration {
+        outlet_id: "test".to_owned(),
         name: "test".to_owned(),
         description: "test".to_owned(),
-        schema: ToolSchema {
+        schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
         },
@@ -971,7 +971,7 @@ async fn register_tool_rejected_without_ceiling_capability() {
 
     let proposal = ceiling_test_proposal(
         &ctx_id,
-        GovernanceAction::RegisterTool {
+        GovernanceAction::RegisterOutlet {
             registration: Box::new(reg),
         },
     );
@@ -980,28 +980,28 @@ async fn register_tool_rejected_without_ceiling_capability() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
-        matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("tool registration")),
-        "expected PermissionDenied about tool registration, got: {err}"
+        matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("outlet registration")),
+        "expected PermissionDenied about outlet registration, got: {err}"
     );
 }
 
-/// #339: `RegisterTool` succeeds when `ToolRegister` is in ceiling.
+/// #339: `RegisterOutlet` succeeds when `OutletRegister` is in ceiling.
 #[tokio::test]
-async fn register_tool_succeeds_with_ceiling_capability() {
-    use scp_protocol::context::tools::registry::ToolSchema;
+async fn register_outlet_succeeds_with_ceiling_capability() {
+    use scp_protocol::context::outlets::registry::OutletSchema;
 
     let (manager, _handle, ctx_id) = setup_context_with_ceiling(vec![
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolRegister,
+        Capability::OutletRegister,
     ])
     .await;
 
-    let reg = scp_protocol::context::params::ToolRegistration {
-        tool_id: "test".to_owned(),
+    let reg = scp_protocol::context::params::OutletRegistration {
+        outlet_id: "test".to_owned(),
         name: "test".to_owned(),
         description: "test".to_owned(),
-        schema: ToolSchema {
+        schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
         },
@@ -1015,16 +1015,16 @@ async fn register_tool_succeeds_with_ceiling_capability() {
 
     let proposal = ceiling_test_proposal(
         &ctx_id,
-        GovernanceAction::RegisterTool {
+        GovernanceAction::RegisterOutlet {
             registration: Box::new(reg),
         },
     );
 
     let result = manager.execute_governance_action(&ctx_id, &proposal).await;
-    assert!(result.is_ok(), "RegisterTool should succeed: {result:?}");
+    assert!(result.is_ok(), "RegisterOutlet should succeed: {result:?}");
 }
 
-/// #339: `EstablishToolInterface` is rejected when `ToolInterface` is not in ceiling.
+/// #339: `EstablishOutletInterface` is rejected when `OutletInterface` is not in ceiling.
 #[tokio::test]
 async fn establish_tool_interface_rejected_without_ceiling_capability() {
     let (manager, _handle, ctx_id) =
@@ -1032,11 +1032,11 @@ async fn establish_tool_interface_rejected_without_ceiling_capability() {
 
     let proposal = ceiling_test_proposal(
         &ctx_id,
-        GovernanceAction::EstablishToolInterface {
-            interface: ToolInterface {
+        GovernanceAction::EstablishOutletInterface {
+            interface: OutletInterface {
                 source_context: ctx_id.clone(),
                 target_context: "other-ctx".into(),
-                tool_id: "tool-a".into(),
+                outlet_id: "tool-a".into(),
                 rate_limit: None,
                 per_caller_rate_limit: None,
                 approved_by_source: true,
@@ -1051,8 +1051,8 @@ async fn establish_tool_interface_rejected_without_ceiling_capability() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(
-        matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("tool interface")),
-        "expected PermissionDenied about tool interface, got: {err}"
+        matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("outlet interface")),
+        "expected PermissionDenied about outlet interface, got: {err}"
     );
 }
 
@@ -3454,7 +3454,7 @@ async fn execute_modify_ceiling_sets_pending_with_72h_period() {
     let new_ceiling = vec![
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolRegister,
+        Capability::OutletRegister,
     ];
     let action = GovernanceAction::ModifyCeiling {
         new_ceiling: new_ceiling.clone(),
@@ -3481,8 +3481,8 @@ async fn execute_modify_ceiling_sets_pending_with_72h_period() {
     );
     // Ceiling should NOT yet be updated (still pending).
     assert!(
-        !ctx.role_state.ceiling.contains(&Capability::ToolRegister),
-        "ToolRegister should not be in ceiling yet (still in notification period)"
+        !ctx.role_state.ceiling.contains(&Capability::OutletRegister),
+        "OutletRegister should not be in ceiling yet (still in notification period)"
     );
 }
 
@@ -3515,7 +3515,7 @@ async fn apply_pending_ceiling_modification_respects_notification_period() {
     let new_ceiling = vec![
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolRegister,
+        Capability::OutletRegister,
     ];
     let action = GovernanceAction::ModifyCeiling {
         new_ceiling: new_ceiling.clone(),
@@ -3563,8 +3563,8 @@ async fn apply_pending_ceiling_modification_respects_notification_period() {
         "pending modification should be cleared after apply"
     );
     assert!(
-        ctx.role_state.ceiling.contains(&Capability::ToolRegister),
-        "ToolRegister should now be in the ceiling after apply"
+        ctx.role_state.ceiling.contains(&Capability::OutletRegister),
+        "OutletRegister should now be in the ceiling after apply"
     );
 }
 
@@ -3598,7 +3598,7 @@ async fn execute_modify_ceiling_emits_ceiling_change_notification() {
     let new_ceiling = vec![
         Capability::MessagesRead,
         Capability::MessagesWrite,
-        Capability::ToolRegister,
+        Capability::OutletRegister,
     ];
     let action = GovernanceAction::ModifyCeiling {
         new_ceiling: new_ceiling.clone(),
@@ -3646,7 +3646,7 @@ fn pending_economic_policy_change_effective_at_equals_notified_at_plus_86400() {
             cost_schedule: scp_protocol::economy::types::CostSchedule {
                 currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -3675,7 +3675,7 @@ fn pending_economic_policy_is_effective_false_before_period_expires() {
             cost_schedule: scp_protocol::economy::types::CostSchedule {
                 currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -3703,7 +3703,7 @@ fn pending_economic_policy_is_effective_true_after_period_expires() {
             cost_schedule: scp_protocol::economy::types::CostSchedule {
                 currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
                 per_message: None,
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: None,
                 per_period: None,
                 per_byte_stored: None,
@@ -3752,7 +3752,7 @@ async fn execute_set_economic_policy_stages_with_24h_delay() {
         cost_schedule: CostSchedule {
             currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -3825,7 +3825,7 @@ async fn apply_pending_economic_policy_change_respects_notification_period() {
         cost_schedule: CostSchedule {
             currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -3924,7 +3924,7 @@ async fn execute_set_economic_policy_emits_notification_event() {
         cost_schedule: CostSchedule {
             currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -3992,7 +3992,7 @@ async fn execute_set_economic_policy_rejects_when_already_pending() {
         cost_schedule: CostSchedule {
             currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -4334,7 +4334,7 @@ async fn approve_spend_grants_budget_to_member_tracker() {
             GovernanceAction::ApproveSpend {
                 spender: spender.clone(),
                 amount: scp_protocol::economy::types::Amount::new(5000),
-                purpose: "tool budget".to_owned(),
+                purpose: "outlet budget".to_owned(),
             },
             &sk,
         )
@@ -5451,7 +5451,7 @@ async fn test_economy_cost_deducted_on_send() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -5643,7 +5643,7 @@ async fn test_budget_exceeded_blocks_send() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(100)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -5905,7 +5905,7 @@ async fn test_participation_decay_clears_caches() {
                 context_id: "decay-ctx".to_owned(),
                 participation_count: 5,
                 participation_duration_seconds: 100,
-                tool_invocations: std::collections::HashMap::new(),
+                outlet_invocations: std::collections::HashMap::new(),
                 governance_actions_by: Vec::new(),
                 governance_actions_against: Vec::new(),
                 role_history: Vec::new(),
@@ -6110,7 +6110,7 @@ async fn test_auto_accept_blocked_for_paid_contexts() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: Some(Amount::new(50)),
             per_period: None,
             per_byte_stored: None,
@@ -6205,8 +6205,8 @@ async fn pending_removal_blocks_proposal() {
     }
 
     // Alice tries to propose — should be denied due to pending removal.
-    let action = GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("alice-tool")),
+    let action = GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("alice-tool")),
     };
     let result = manager
         .propose_governance_action("standing-ctx", &alice, action, &key_alice)
@@ -6238,8 +6238,8 @@ async fn participation_influences_governance_eligibility() {
         .unwrap();
 
     // Admin can propose (no pending removal, eligible participation).
-    let action = scp_protocol::context::governance::GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("admin-tool")),
+    let action = scp_protocol::context::governance::GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("admin-tool")),
     };
     let result = manager
         .propose_governance_action("standing-vote-ctx", &admin, action, &key_admin)
@@ -6278,7 +6278,7 @@ async fn decay_participation_clears_state() {
                 context_id: "decay-ctx".to_string(),
                 participation_count: 10,
                 participation_duration_seconds: 100,
-                tool_invocations: std::collections::HashMap::new(),
+                outlet_invocations: std::collections::HashMap::new(),
                 governance_actions_by: Vec::new(),
                 governance_actions_against: Vec::new(),
                 role_history: Vec::new(),
@@ -6375,8 +6375,8 @@ async fn sender_key_before_mls_removal_ordering() {
 
 /// Budget exceeded on tool invoke returns `BudgetExceeded` (#1537).
 #[tokio::test]
-async fn budget_exceeded_on_tool_invoke() {
-    use crate::context::tools::invoke::{InvocationError, ToolEconomyContext, invoke_tool};
+async fn budget_exceeded_on_outlet_call() {
+    use crate::context::outlets::invoke::{InvocationError, OutletEconomyContext, invoke_outlet};
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     let policy = EconomicPolicy {
@@ -6384,7 +6384,7 @@ async fn budget_exceeded_on_tool_invoke() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: Some(Amount::new(100)),
+            per_outlet_call: Some(Amount::new(100)),
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -6396,9 +6396,9 @@ async fn budget_exceeded_on_tool_invoke() {
     let invoker: DID = "did:key:invoker".into();
     let mut tracker = scp_protocol::economy::budget::MemberBudgetTracker::new();
     tracker.grant(&invoker, Amount::new(50)); // Less than cost=100.
-    let (handle, registry, role_state) = test_tool_invoke_setup(&invoker).await;
+    let (handle, registry, role_state) = test_outlet_call_setup(&invoker).await;
     let spending_ucan = dummy_spending_ucan();
-    let mut economy = ToolEconomyContext {
+    let mut economy = OutletEconomyContext {
         economic_policy: Some(&policy),
         budget_tracker: &mut tracker,
         spending_ucan: Some(&spending_ucan),
@@ -6412,7 +6412,7 @@ async fn budget_exceeded_on_tool_invoke() {
         velocity_tracker: None,
         message_pricing: None,
     };
-    let result = invoke_tool(
+    let result = invoke_outlet(
         &handle,
         &registry,
         &role_state,
@@ -6572,8 +6572,8 @@ async fn consequence_triggers_after_governance_action() {
 
     // Execute a governance action — finalize_governance_action calls
     // dispatch_consequences.
-    let action = scp_protocol::context::governance::GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("gov-conseq-tool")),
+    let action = scp_protocol::context::governance::GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("gov-conseq-tool")),
     };
     let result = manager
         .propose_governance_action("gov-conseq-ctx", &admin, action, &key_admin)
@@ -7079,7 +7079,7 @@ async fn full_send_consequence_enforcement_round_trip() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(5)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -7232,8 +7232,8 @@ async fn governance_participation_round_trip() {
     }
 
     // Execute governance action.
-    let action = scp_protocol::context::governance::GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("round-trip-tool")),
+    let action = scp_protocol::context::governance::GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("round-trip-tool")),
     };
     let result = manager
         .propose_governance_action("gov-stand-ctx", &admin, action, &key_admin)
@@ -7434,7 +7434,7 @@ async fn join_context_with_join_cost_no_budget_rejected() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: Some(Amount::new(50)),
             per_period: None,
             per_byte_stored: None,
@@ -7529,7 +7529,7 @@ async fn eligibility_blocks_low_participation() {
                 context_id: "low-stand-ctx".to_string(),
                 participation_count: 5,
                 participation_duration_seconds: 100,
-                tool_invocations: std::collections::HashMap::new(),
+                outlet_invocations: std::collections::HashMap::new(),
                 governance_actions_by: vec![],
                 governance_actions_against: vec![
                     GovernanceActionSummary {
@@ -7555,8 +7555,8 @@ async fn eligibility_blocks_low_participation() {
     }
 
     // Bob tries to propose — should fail due to low participation.
-    let action = GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("low-standing-tool")),
+    let action = GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("low-standing-tool")),
     };
     let result = manager
         .propose_governance_action("low-stand-ctx", &bob, action, &key_bob)
@@ -7626,7 +7626,7 @@ async fn eligibility_allows_good_participation() {
                 context_id: "good-stand-ctx".to_string(),
                 participation_count: 10,
                 participation_duration_seconds: 500,
-                tool_invocations: std::collections::HashMap::new(),
+                outlet_invocations: std::collections::HashMap::new(),
                 governance_actions_by: vec![
                     GovernanceActionSummary {
                         timestamp: 100,
@@ -7652,8 +7652,8 @@ async fn eligibility_allows_good_participation() {
     }
 
     // Alice proposes — should succeed (good participation).
-    let action = GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("good-standing-tool")),
+    let action = GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("good-standing-tool")),
     };
     let result = manager
         .propose_governance_action("good-stand-ctx", &alice, action, &key_alice)
@@ -7765,7 +7765,7 @@ async fn send_message_deducts_budget() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(5)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -7856,12 +7856,12 @@ async fn send_message_deducts_budget() {
     );
 }
 
-/// Tool invoke deducts budget by `per_tool_invoke` cost (#1537, positive case).
+/// Outlet invoke deducts budget by `per_outlet_call` cost (#1537, positive case).
 ///
-/// Tests budget deduction through `invoke_tool` with `ToolEconomyContext`.
+/// Tests budget deduction through `invoke_outlet` with `OutletEconomyContext`.
 #[tokio::test]
-async fn tool_invoke_deducts_budget() {
-    use crate::context::tools::invoke::{ToolEconomyContext, invoke_tool};
+async fn outlet_call_deducts_budget() {
+    use crate::context::outlets::invoke::{OutletEconomyContext, invoke_outlet};
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     let policy = EconomicPolicy {
@@ -7869,7 +7869,7 @@ async fn tool_invoke_deducts_budget() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: Some(Amount::new(20)),
+            per_outlet_call: Some(Amount::new(20)),
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -7881,13 +7881,13 @@ async fn tool_invoke_deducts_budget() {
     let invoker: DID = "did:key:invoker".into();
     let mut tracker = scp_protocol::economy::budget::MemberBudgetTracker::new();
     tracker.grant(&invoker, Amount::new(100));
-    let (handle, registry, role_state) = test_tool_invoke_setup(&invoker).await;
+    let (handle, registry, role_state) = test_outlet_call_setup(&invoker).await;
     let metrics = scp_protocol::economy::policy::ObservableMetrics::default();
     let spending_ucan = dummy_spending_ucan();
 
     // First invocation should deduct 20 from budget (100 -> 80).
     {
-        let mut economy = ToolEconomyContext {
+        let mut economy = OutletEconomyContext {
             economic_policy: Some(&policy),
             budget_tracker: &mut tracker,
             spending_ucan: Some(&spending_ucan),
@@ -7901,7 +7901,7 @@ async fn tool_invoke_deducts_budget() {
             velocity_tracker: None,
             message_pricing: None,
         };
-        let result = invoke_tool(
+        let result = invoke_outlet(
             &handle,
             &registry,
             &role_state,
@@ -7922,7 +7922,7 @@ async fn tool_invoke_deducts_budget() {
 
     // Second invocation: 80 -> 60.
     {
-        let mut economy = ToolEconomyContext {
+        let mut economy = OutletEconomyContext {
             economic_policy: Some(&policy),
             budget_tracker: &mut tracker,
             spending_ucan: Some(&spending_ucan),
@@ -7936,7 +7936,7 @@ async fn tool_invoke_deducts_budget() {
             velocity_tracker: None,
             message_pricing: None,
         };
-        let result2 = invoke_tool(
+        let result2 = invoke_outlet(
             &handle,
             &registry,
             &role_state,
@@ -7954,18 +7954,20 @@ async fn tool_invoke_deducts_budget() {
 }
 
 /// Creates common test fixtures for tool invoke economy tests.
-async fn test_tool_invoke_setup(
+async fn test_outlet_call_setup(
     invoker: &DID,
 ) -> (
     crate::context::ContextHandle,
-    scp_protocol::context::tools::registry::ToolRegistry,
+    scp_protocol::context::outlets::registry::OutletRegistry,
     scp_protocol::context::roles::ContextRoleState,
 ) {
     use scp_protocol::context::ContextParams;
+    use scp_protocol::context::outlets::registry::{
+        OutletRegistration, OutletSchema, register_outlet,
+    };
     use scp_protocol::context::roles::{Capability, CapabilityCeiling, ContextRoleState};
-    use scp_protocol::context::tools::registry::{ToolRegistration, ToolSchema, register_tool};
 
-    let ceiling = CapabilityCeiling::new([Capability::ToolInvokeAll, Capability::ToolRegister]);
+    let ceiling = CapabilityCeiling::new([Capability::OutletCallAll, Capability::OutletRegister]);
     let role_state = ContextRoleState::new(
         "ctx-test",
         invoker.as_ref(),
@@ -7974,12 +7976,12 @@ async fn test_tool_invoke_setup(
         &scp_primitives::SystemClock,
     )
     .unwrap();
-    let mut registry = scp_protocol::context::tools::registry::ToolRegistry::new();
-    let registration = ToolRegistration {
-        tool_id: "calculator".to_owned(),
+    let mut registry = scp_protocol::context::outlets::registry::OutletRegistry::new();
+    let registration = OutletRegistration {
+        outlet_id: "calculator".to_owned(),
         name: "Calculator".to_owned(),
         description: "A simple calculator".to_owned(),
-        schema: ToolSchema {
+        schema: OutletSchema {
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -8002,7 +8004,7 @@ async fn test_tool_invoke_setup(
         registered_at: 0,
         signature: Vec::new(),
     };
-    register_tool(&mut registry, &role_state, registration, invoker.as_ref()).unwrap();
+    register_outlet(&mut registry, &role_state, registration, invoker.as_ref()).unwrap();
     let handle =
         crate::context::ContextHandle::new("ctx-test".to_owned(), ContextParams::default());
     handle
@@ -8095,24 +8097,24 @@ async fn velocity_tracker_records_messages() {
 }
 
 /// UCAN spending composition checked on tool invoke (#1537).
-/// Per spec §19.5, paid tool invocations require a spending UCAN. The action
+/// Per spec §19.5, paid outlet invocations require a spending UCAN. The action
 /// capability side of AND-composition is verified UPSTREAM at the
-/// `ToolInvoke` / `ToolInvokeAll` `member_has_capability` gate (see
-/// `invoke_tool`), so this test only exercises the spending side.
+/// `OutletCall` / `OutletCallAll` `member_has_capability` gate (see
+/// `invoke_outlet`), so this test only exercises the spending side.
 #[test]
-fn ucan_spending_capability_checked_on_tool_invoke() {
-    use crate::context::tools::invoke::check_tool_spending_capability;
+fn ucan_spending_capability_checked_on_outlet_call() {
+    use crate::context::outlets::invoke::check_outlet_spending_capability;
     use scp_protocol::economy::types::Amount;
 
     // No spending UCAN, cost > 0 — must fail.
-    let result = check_tool_spending_capability(Amount::new(100), None);
+    let result = check_outlet_spending_capability(Amount::new(100), None);
     assert!(
         result.is_err(),
         "should fail when cost > 0 and no spending UCAN provided: {result:?}"
     );
 
     // No spending UCAN, cost = 0 — free actions bypass spending validation.
-    let result_zero = check_tool_spending_capability(Amount::new(0), None);
+    let result_zero = check_outlet_spending_capability(Amount::new(0), None);
     assert!(
         result_zero.is_ok(),
         "should succeed with cost=0 (free action, no spending UCAN needed): {result_zero:?}"
@@ -8198,7 +8200,7 @@ async fn paid_join_end_to_end_with_adapter() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: Some(Amount::new(25)),
             per_period: None,
             per_byte_stored: None,
@@ -8342,7 +8344,7 @@ async fn join_context_deducts_budget_when_granted() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: Some(Amount::new(10)),
             per_period: None,
             per_byte_stored: None,
@@ -8471,9 +8473,9 @@ async fn participation_record_updated_after_governance() {
             .unwrap();
     }
 
-    // Execute governance action (RegisterTool auto-approves in SingleAdmin).
-    let action = scp_protocol::context::governance::GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("part-gov2-tool")),
+    // Execute governance action (RegisterOutlet auto-approves in SingleAdmin).
+    let action = scp_protocol::context::governance::GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("part-gov2-tool")),
     };
     manager
         .propose_governance_action("part-gov2-ctx", &admin, action, &key_admin)
@@ -8523,7 +8525,7 @@ async fn test_send_rejected_insufficient_budget() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(5)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -8573,10 +8575,10 @@ async fn test_send_rejected_insufficient_budget() {
     );
 }
 
-/// Tool invoke rejected when budget insufficient (#1537).
+/// Outlet invoke rejected when budget insufficient (#1537).
 #[tokio::test]
-async fn test_tool_invoke_rejected_insufficient_budget() {
-    use crate::context::tools::invoke::{InvocationError, ToolEconomyContext, invoke_tool};
+async fn test_outlet_call_rejected_insufficient_budget() {
+    use crate::context::outlets::invoke::{InvocationError, OutletEconomyContext, invoke_outlet};
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     let policy = EconomicPolicy {
@@ -8584,7 +8586,7 @@ async fn test_tool_invoke_rejected_insufficient_budget() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: Some(Amount::new(50)),
+            per_outlet_call: Some(Amount::new(50)),
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -8595,10 +8597,10 @@ async fn test_tool_invoke_rejected_insufficient_budget() {
     };
     let invoker: DID = "did:key:invoker".into();
     let mut tracker = scp_protocol::economy::budget::MemberBudgetTracker::new();
-    tracker.grant(&invoker, Amount::new(30)); // Less than per_tool_invoke=50.
-    let (handle, registry, role_state) = test_tool_invoke_setup(&invoker).await;
+    tracker.grant(&invoker, Amount::new(30)); // Less than per_outlet_call=50.
+    let (handle, registry, role_state) = test_outlet_call_setup(&invoker).await;
     let spending_ucan = dummy_spending_ucan();
-    let mut economy = ToolEconomyContext {
+    let mut economy = OutletEconomyContext {
         economic_policy: Some(&policy),
         budget_tracker: &mut tracker,
         spending_ucan: Some(&spending_ucan),
@@ -8612,7 +8614,7 @@ async fn test_tool_invoke_rejected_insufficient_budget() {
         velocity_tracker: None,
         message_pricing: None,
     };
-    let result = invoke_tool(
+    let result = invoke_outlet(
         &handle,
         &registry,
         &role_state,
@@ -8648,7 +8650,7 @@ async fn test_join_rejected_insufficient_budget() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: Some(Amount::new(100)),
             per_period: None,
             per_byte_stored: None,
@@ -8703,7 +8705,7 @@ async fn test_execute_paid_action_skips_without_adapter() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -8757,7 +8759,7 @@ async fn test_execute_paid_action_full_flow_with_adapter() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -9048,7 +9050,7 @@ async fn test_send_consequence_economy_round_trip() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(5)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -9173,8 +9175,8 @@ async fn test_governance_eligibility_participation_round_trip() {
     }
 
     // Execute governance action.
-    let action = scp_protocol::context::governance::GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("stand-rt-tool")),
+    let action = scp_protocol::context::governance::GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("stand-rt-tool")),
     };
     manager
         .propose_governance_action("stand-rt-ctx", &admin, action, &key_admin)
@@ -9221,7 +9223,7 @@ async fn test_paid_join_with_consequence_evaluation() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: Some(Amount::new(25)),
             per_period: None,
             per_byte_stored: None,
@@ -9351,7 +9353,7 @@ async fn test_full_lifecycle_economy() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -9583,7 +9585,7 @@ async fn setup_velocity_escalation_context() -> (
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(1)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -9843,7 +9845,7 @@ async fn test_paid_send_rejected_without_spending_ucan() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -9955,7 +9957,7 @@ async fn test_paid_join_rejected_without_spending_ucan() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: Some(Amount::new(50)),
             per_period: None,
             per_byte_stored: None,
@@ -10234,7 +10236,7 @@ async fn paid_send_with_valid_spending_ucan_succeeds() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -10346,7 +10348,7 @@ async fn zero_cost_per_message_no_ucan_required() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(0)), // zero cost
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -10415,7 +10417,7 @@ async fn none_per_message_no_ucan_required() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None, // no per-message cost
-            per_tool_invoke: Some(Amount::new(100)),
+            per_outlet_call: Some(Amount::new(100)),
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -10480,7 +10482,7 @@ async fn multiple_sends_unique_spending_ucans_all_succeed() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(5)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -10573,7 +10575,7 @@ async fn paid_join_with_spending_ucan_still_blocked_by_auto_accept() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: Some(Amount::new(50)),
             per_period: None,
             per_byte_stored: None,
@@ -10932,7 +10934,7 @@ async fn no_auto_grant_requires_explicit_budget() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -11037,7 +11039,7 @@ async fn no_double_charge_on_paid_send() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(100)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -11503,7 +11505,7 @@ async fn execute_paid_action_skips_zero_cost() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(0)), // zero cost
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -11636,7 +11638,7 @@ async fn participation_cache_cleared_after_member_leaves() {
                 context_id: "part-cache-ctx".into(),
                 participation_count: 0,
                 participation_duration_seconds: 0,
-                tool_invocations: std::collections::HashMap::new(),
+                outlet_invocations: std::collections::HashMap::new(),
                 governance_actions_by: vec![],
                 governance_actions_against: vec![],
                 role_history: vec![],
@@ -11931,7 +11933,7 @@ async fn aggregate_velocity_via_manager_send() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(1)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -12447,7 +12449,7 @@ async fn budget_not_deducted_on_transport_failure() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(50)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -12592,7 +12594,7 @@ async fn observable_metrics_time_of_day_populated() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(1)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -12665,7 +12667,7 @@ async fn context_message_rate_from_aggregate_velocity() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(1)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -12816,7 +12818,7 @@ fn velocity_tracker_state_in_context_snapshot_roundtrip() {
         role_state,
         executed_proposals: HashSet::new(),
         ttl_remaining_secs: None,
-        registered_tools: Vec::new(),
+        registered_outlets: Vec::new(),
         read_exclusion_list: HashSet::new(),
         tool_interfaces: Vec::new(),
         threshold_signers: Vec::new(),
@@ -12907,7 +12909,7 @@ fn velocity_tracker_backward_compat_deserialization() {
         role_state,
         executed_proposals: HashSet::new(),
         ttl_remaining_secs: None,
-        registered_tools: Vec::new(),
+        registered_outlets: Vec::new(),
         read_exclusion_list: HashSet::new(),
         tool_interfaces: Vec::new(),
         threshold_signers: Vec::new(),
@@ -13331,7 +13333,7 @@ fn evaluate_cost_enforce_gate() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(25)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -13358,7 +13360,7 @@ fn evaluate_cost_enforce_gate() {
     );
 
     // No tool invoke cost configured — should return zero.
-    let tool_cost = evaluate_cost(&policy, &PaidActionType::ToolInvoke, &metrics);
+    let tool_cost = evaluate_cost(&policy, &PaidActionType::OutletCall, &metrics);
     assert_eq!(
         tool_cost,
         Some(Amount::new(0)),
@@ -13388,7 +13390,7 @@ async fn test_fabricated_spending_ucan_rejected() {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
             per_join: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_period: None,
             per_byte_stored: None,
         },
@@ -13495,7 +13497,7 @@ async fn c1_paid_context(name: &str, sender_did: &DID) -> (ContextManager, Conte
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
             per_join: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_period: None,
             per_byte_stored: None,
         },
@@ -13872,7 +13874,7 @@ async fn test_capability_failure_no_budget_leak() {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(50)),
             per_join: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_period: None,
             per_byte_stored: None,
         },
@@ -13970,7 +13972,7 @@ async fn test_capture_failure_budget_retained() {
             currency: scp_protocol::economy::types::CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(10)),
             per_join: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_period: None,
             per_byte_stored: None,
         },
@@ -14046,7 +14048,7 @@ async fn spending_ucan_nonce_replay_rejected() {
         cost_schedule: CostSchedule {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(5)),
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_join: None,
             per_period: None,
             per_byte_stored: None,
@@ -14299,7 +14301,7 @@ async fn test_cost_overflow_error() {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(u64::MAX)),
             per_join: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_period: None,
             per_byte_stored: None,
         },
@@ -14359,7 +14361,7 @@ async fn test_velocity_includes_current_message() {
             currency: CurrencyCode([85, 83, 68, 0]),
             per_message: Some(Amount::new(5)),
             per_join: None,
-            per_tool_invoke: None,
+            per_outlet_call: None,
             per_period: None,
             per_byte_stored: None,
         },
@@ -14552,7 +14554,7 @@ async fn test_governance_close_decays_participation() {
                 context_id: "test".to_owned(),
                 participation_count: 0,
                 participation_duration_seconds: 0,
-                tool_invocations: std::collections::HashMap::new(),
+                outlet_invocations: std::collections::HashMap::new(),
                 governance_actions_by: Vec::new(),
                 governance_actions_against: Vec::new(),
                 role_history: Vec::new(),
@@ -15446,7 +15448,7 @@ async fn test_evict_stale_entries_removes_non_members() {
                 context_id: "test".to_owned(),
                 participation_count: 0,
                 participation_duration_seconds: 0,
-                tool_invocations: std::collections::HashMap::new(),
+                outlet_invocations: std::collections::HashMap::new(),
                 governance_actions_by: Vec::new(),
                 governance_actions_against: Vec::new(),
                 role_history: Vec::new(),
@@ -15604,8 +15606,8 @@ async fn earned_capacity_limits_governance_proposals() {
     }
 
     // Now attempt a 6th proposal — should be rejected.
-    let action = scp_protocol::context::governance::GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("capacity-tool")),
+    let action = scp_protocol::context::governance::GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("capacity-tool")),
     };
     let result = manager
         .propose_governance_action("capacity-ctx", &admin, action, &key_admin)
@@ -15660,8 +15662,8 @@ async fn no_sybil_policy_allows_unlimited_proposals() {
             .insert(admin.to_string(), timestamps);
     }
 
-    let action = scp_protocol::context::governance::GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("unlimited-tool")),
+    let action = scp_protocol::context::governance::GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("unlimited-tool")),
     };
     let result = manager
         .propose_governance_action("no-sybil-ctx", &admin, action, &key_admin)
@@ -15712,8 +15714,8 @@ async fn earned_capacity_evicts_stale_timestamps() {
     }
 
     // Proposal should succeed because stale entries are evicted.
-    let action = scp_protocol::context::governance::GovernanceAction::RegisterTool {
-        registration: Box::new(test_tool_registration("evict-tool")),
+    let action = scp_protocol::context::governance::GovernanceAction::RegisterOutlet {
+        registration: Box::new(test_outlet_registration("evict-tool")),
     };
     let result = manager
         .propose_governance_action("evict-ctx", &admin, action, &key_admin)
@@ -16773,8 +16775,8 @@ async fn h10_approved_proposals_stores_monotonic_seq() {
             approved_proposal(
                 [100 + i; 32],
                 "h10-monotonic-ctx",
-                GovernanceAction::RegisterTool {
-                    registration: Box::new(test_tool_registration(&format!("tool-{i}"))),
+                GovernanceAction::RegisterOutlet {
+                    registration: Box::new(test_outlet_registration(&format!("tool-{i}"))),
                 },
                 &["did:key:admin"],
             )
@@ -16845,16 +16847,16 @@ async fn h10_next_proposal_seq_persists_across_snapshot() {
     let p_a = approved_proposal(
         [210u8; 32],
         "h10-persist-ctx",
-        GovernanceAction::RegisterTool {
-            registration: Box::new(test_tool_registration("persist-tool-a")),
+        GovernanceAction::RegisterOutlet {
+            registration: Box::new(test_outlet_registration("persist-tool-a")),
         },
         &["did:key:admin"],
     );
     let p_b = approved_proposal(
         [211u8; 32],
         "h10-persist-ctx",
-        GovernanceAction::RegisterTool {
-            registration: Box::new(test_tool_registration("persist-tool-b")),
+        GovernanceAction::RegisterOutlet {
+            registration: Box::new(test_outlet_registration("persist-tool-b")),
         },
         &["did:key:admin"],
     );
@@ -16932,16 +16934,16 @@ async fn h10_import_context_resets_next_proposal_seq() {
     let p_a = approved_proposal(
         [220u8; 32],
         "h10-source-ctx",
-        GovernanceAction::RegisterTool {
-            registration: Box::new(test_tool_registration("imp-tool-a")),
+        GovernanceAction::RegisterOutlet {
+            registration: Box::new(test_outlet_registration("imp-tool-a")),
         },
         &["did:key:admin"],
     );
     let p_b = approved_proposal(
         [221u8; 32],
         "h10-source-ctx",
-        GovernanceAction::RegisterTool {
-            registration: Box::new(test_tool_registration("imp-tool-b")),
+        GovernanceAction::RegisterOutlet {
+            registration: Box::new(test_outlet_registration("imp-tool-b")),
         },
         &["did:key:admin"],
     );
@@ -17221,7 +17223,7 @@ async fn suspend_all_consequence_preserves_mls_membership() {
 
     // Add Alice via the real `join_context` flow so `assign_role`
     // populates `member_capabilities` with the full `member` builtin role
-    // grant set (MessagesRead + MessagesWrite + ToolInvokeAll). Without
+    // grant set (MessagesRead + MessagesWrite + OutletCallAll). Without
     // this, `suspend_all` would have nothing to copy into the suspended
     // set and the assertions would be vacuous.
     let alice_kp = scp_protocol::context::membership::KeyPackage::mock(alice.clone());

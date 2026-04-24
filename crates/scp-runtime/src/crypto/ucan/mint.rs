@@ -166,7 +166,7 @@ pub struct MintParams<'a> {
     /// The context ID this token is scoped to.
     pub context_id: &'a str,
     /// Capabilities to grant, as `{resource}:{action}` strings (e.g.,
-    /// `"messages:write"`, `"tool_invoke:assistant"`).
+    /// `"messages:write"`, `"outlet_call:assistant"`).
     pub capabilities: &'a [String],
     /// Token lifetime in seconds from now. Must not exceed 24 hours (86400s).
     pub lifetime_secs: u64,
@@ -207,7 +207,7 @@ pub struct MintParams<'a> {
     /// rejected with [`UcanError::CapabilityOutsideCeiling`].
     ///
     /// The ceiling contains `{resource}:{action}` strings (e.g.,
-    /// `"messages:read"`, `"tool_invoke:assistant"`).
+    /// `"messages:read"`, `"outlet_call:assistant"`).
     ///
     /// `None` means no ceiling enforcement (backward-compatible default).
     pub ceiling: Option<HashSet<String>>,
@@ -254,8 +254,8 @@ pub async fn mint_ucan(
     }
 
     // Convert capability strings to UCAN resource/action pairs. This bridges
-    // the canonical user-facing colon format (e.g. "tool:invoke:*") to the
-    // UCAN underscore format (e.g. resource="tool_invoke", action="*") by
+    // the canonical user-facing colon format (e.g. "outlet:call:*") to the
+    // UCAN underscore format (e.g. resource="outlet_call", action="*") by
     // parsing through the Capability enum. See #1293.
     let parsed_caps: Vec<(String, String)> = params
         .capabilities
@@ -857,7 +857,7 @@ mod tests {
         let caps = vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ];
 
         let params = MintParams {
@@ -889,7 +889,7 @@ mod tests {
         assert_eq!(token.payload.att[1].can, "write");
         assert_eq!(
             token.payload.att[2].with,
-            "scp:ctx:ctx-multi/tool_invoke:assistant"
+            "scp:ctx:ctx-multi/outlet_call:assistant"
         );
         assert_eq!(token.payload.att[2].can, "assistant");
     }
@@ -1301,7 +1301,7 @@ mod tests {
         let caps = vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ];
         let root_token = mint_root_token(
             &alice_custody,
@@ -1343,7 +1343,7 @@ mod tests {
         let caps = vec![
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ];
         let root_token = mint_root_token(
             &alice_custody,
@@ -1679,14 +1679,14 @@ mod tests {
         )
         .await;
 
-        // Bob tries to delegate including tool_invoke:assistant (not in parent).
+        // Bob tries to delegate including outlet_call:assistant (not in parent).
         let attenuated = vec![
             Attenuation {
                 with: "scp:ctx:ctx-1/messages:read".to_owned(),
                 can: "read".to_owned(),
             },
             Attenuation {
-                with: "scp:ctx:ctx-1/tool_invoke:assistant".to_owned(),
+                with: "scp:ctx:ctx-1/outlet_call:assistant".to_owned(),
                 can: "assistant".to_owned(),
             },
         ];
@@ -2770,7 +2770,7 @@ mod tests {
     #[tokio::test]
     async fn mint_ucan_rejects_capability_outside_ceiling() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
-        let caps = vec!["tool_invoke:assistant".to_owned()];
+        let caps = vec!["outlet_call:assistant".to_owned()];
         let ceiling: HashSet<String> = ["messages:read".to_owned(), "messages:write".to_owned()]
             .into_iter()
             .collect();
@@ -2802,11 +2802,11 @@ mod tests {
     #[tokio::test]
     async fn mint_ucan_succeeds_within_ceiling() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
-        let caps = vec!["tool_invoke:assistant".to_owned()];
+        let caps = vec!["outlet_call:assistant".to_owned()];
         let ceiling: HashSet<String> = [
             "messages:read".to_owned(),
             "messages:write".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ]
         .into_iter()
         .collect();
@@ -2838,10 +2838,10 @@ mod tests {
     async fn mint_ucan_no_ceiling_applies_default_ceiling() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
         // These capabilities are within the default ceiling:
-        // tool_invoke:assistant is covered by ToolInvokeAll (tool_invoke:*),
+        // outlet_call:assistant is covered by OutletCallAll (outlet_call:*),
         // messages:write is exact match.
         let caps = vec![
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
             "messages:write".to_owned(),
         ];
 
@@ -2874,7 +2874,7 @@ mod tests {
     async fn mint_ucan_no_ceiling_rejects_capability_outside_default() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
         // "custom:exotic" is NOT in the default ceiling (which contains only
-        // standard SCP capabilities like messages:*, tool_invoke:*, etc.).
+        // standard SCP capabilities like messages:*, outlet_call:*, etc.).
         let caps = vec!["custom:exotic".to_owned()];
 
         let params = MintParams {
@@ -2910,10 +2910,10 @@ mod tests {
         let (alice_custody, alice_key, alice_did) = setup_custody().await;
         let (bob_custody, bob_key, bob_did) = setup_custody().await;
 
-        // Root token grants messages:read + tool_invoke:assistant.
+        // Root token grants messages:read + outlet_call:assistant.
         let caps = vec![
             "messages:read".to_owned(),
-            "tool_invoke:assistant".to_owned(),
+            "outlet_call:assistant".to_owned(),
         ];
         let root_token = mint_root_token(
             &alice_custody,
@@ -2925,11 +2925,11 @@ mod tests {
         )
         .await;
 
-        // Ceiling only allows messages:read — tool_invoke:assistant is outside.
+        // Ceiling only allows messages:read — outlet_call:assistant is outside.
         let ceiling: HashSet<String> = std::iter::once("messages:read".to_owned()).collect();
 
         let attenuated = vec![Attenuation {
-            with: "scp:ctx:ctx-1/tool_invoke:assistant".to_owned(),
+            with: "scp:ctx:ctx-1/outlet_call:assistant".to_owned(),
             can: "assistant".to_owned(),
         }];
 
@@ -3008,11 +3008,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn mint_ucan_tool_invoke_produces_underscore_resource() {
-        // Minting with the colon-format name "tool:invoke:*" must produce
-        // a UCAN URI with resource "tool_invoke", not "tool".
+    async fn mint_ucan_outlet_call_produces_underscore_resource() {
+        // Minting with the colon-format name "outlet:call:*" must produce
+        // a UCAN URI with resource "outlet_call", not "outlet".
         let (custody, key_handle, issuer_did) = setup_custody().await;
-        let caps = vec!["tool:invoke:*".to_owned()];
+        let caps = vec!["outlet:call:*".to_owned()];
 
         let params = MintParams {
             issuer_did: &issuer_did,
@@ -3035,16 +3035,16 @@ mod tests {
 
         // The attestation URI must use underscore format.
         assert_eq!(
-            token.payload.att[0].with, "scp:ctx:ctx-1293/tool_invoke:*",
-            "tool:invoke:* must produce tool_invoke:* in UCAN URI"
+            token.payload.att[0].with, "scp:ctx:ctx-1293/outlet_call:*",
+            "outlet:call:* must produce outlet_call:* in UCAN URI"
         );
         assert_eq!(token.payload.att[0].can, "*");
     }
 
     #[tokio::test]
-    async fn mint_ucan_tool_invoke_specific_produces_underscore_resource() {
+    async fn mint_ucan_outlet_call_specific_produces_underscore_resource() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
-        let caps = vec!["tool:invoke:calculator".to_owned()];
+        let caps = vec!["outlet:call:calculator".to_owned()];
 
         let params = MintParams {
             issuer_did: &issuer_did,
@@ -3066,8 +3066,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            token.payload.att[0].with, "scp:ctx:ctx-1293/tool_invoke:calculator",
-            "tool:invoke:calculator must produce tool_invoke:calculator in UCAN URI"
+            token.payload.att[0].with, "scp:ctx:ctx-1293/outlet_call:calculator",
+            "outlet:call:calculator must produce outlet_call:calculator in UCAN URI"
         );
         assert_eq!(token.payload.att[0].can, "calculator");
     }
@@ -3140,13 +3140,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mint_ucan_tool_invoke_passes_ceiling_check() {
-        // A ceiling with UCAN-format entries must accept tool:invoke:* capabilities.
+    async fn mint_ucan_outlet_call_passes_ceiling_check() {
+        // A ceiling with UCAN-format entries must accept outlet:call:* capabilities.
         let (custody, key_handle, issuer_did) = setup_custody().await;
-        let caps = vec!["tool:invoke:*".to_owned()];
+        let caps = vec!["outlet:call:*".to_owned()];
 
         let mut ceiling = HashSet::new();
-        ceiling.insert("tool_invoke:*".to_owned());
+        ceiling.insert("outlet_call:*".to_owned());
 
         let params = MintParams {
             issuer_did: &issuer_did,
@@ -3167,14 +3167,14 @@ mod tests {
             mint_ucan(&params, &custody, &scp_primitives::SystemClock)
                 .await
                 .is_ok(),
-            "tool:invoke:* must pass ceiling check with tool_invoke:* in ceiling"
+            "outlet:call:* must pass ceiling check with outlet_call:* in ceiling"
         );
     }
 
     #[tokio::test]
-    async fn mint_ucan_tool_invoke_rejected_when_not_in_ceiling() {
+    async fn mint_ucan_outlet_call_rejected_when_not_in_ceiling() {
         let (custody, key_handle, issuer_did) = setup_custody().await;
-        let caps = vec!["tool:invoke:*".to_owned()];
+        let caps = vec!["outlet:call:*".to_owned()];
 
         let mut ceiling = HashSet::new();
         ceiling.insert("messages:write".to_owned());
@@ -3199,7 +3199,7 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(err, UcanError::CapabilityOutsideCeiling(_)),
-            "tool:invoke:* must be rejected when not in ceiling: {err:?}"
+            "outlet:call:* must be rejected when not in ceiling: {err:?}"
         );
     }
 }

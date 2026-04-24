@@ -165,7 +165,7 @@ async fn test_agent_binding_full_flow() {
     // The issuer == audience (self-delegation) with key_scope = "#agent".
     let capabilities = vec![
         "messages:write".to_owned(),
-        "tool_invoke:assistant".to_owned(),
+        "outlet_call:assistant".to_owned(),
     ];
 
     let ucan_token = mint_ucan(
@@ -454,7 +454,7 @@ fn test_category_b_acceptance_both_keys() {
     let did = "did:dht:z6MkTestCategoryB";
     let category_b_resources = [
         "messages",
-        "tool_invoke",
+        "outlet_call",
         "member",
         "role",
         "context",

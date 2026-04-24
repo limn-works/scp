@@ -263,27 +263,27 @@ async fn handle_broadcast_key_request_rejects_non_local_did_before_context_looku
 // Collection bounds tests (#360, §5.9)
 // -----------------------------------------------------------------------
 
-/// Build a minimal valid [`ToolRegistration`] for bounds tests.
-/// #360: register exactly 256 tools (the limit), verify the 256th succeeds;
+/// Build a minimal valid [`OutletRegistration`] for bounds tests.
+/// #360: register exactly 256 outlets (the limit), verify the 256th succeeds;
 /// attempt to register a 257th, verify `LimitExceeded` is returned.
 #[tokio::test]
-async fn registered_tools_bounded_at_256() {
+async fn registered_outlets_bounded_at_256() {
     let (manager, _handle) = setup_active_context().await;
     let pid: ProposalId = [0u8; 32];
 
-    // Register exactly MAX_REGISTERED_TOOLS tools.
-    for i in 0..super::MAX_REGISTERED_TOOLS {
-        let reg = test_tool_registration(&format!("tool-{i}"));
+    // Register exactly MAX_REGISTERED_OUTLETS outlets.
+    for i in 0..super::MAX_REGISTERED_OUTLETS {
+        let reg = test_outlet_registration(&format!("tool-{i}"));
         manager
-            .execute_register_tool("test-ctx", &reg, pid, "")
+            .execute_register_outlet("test-ctx", &reg, pid, "")
             .await
             .unwrap();
     }
 
     // The 257th must fail with LimitExceeded.
-    let overflow = test_tool_registration("tool-overflow");
+    let overflow = test_outlet_registration("tool-overflow");
     let err = manager
-        .execute_register_tool("test-ctx", &overflow, pid, "")
+        .execute_register_outlet("test-ctx", &overflow, pid, "")
         .await
         .unwrap_err();
     assert!(
@@ -292,7 +292,7 @@ async fn registered_tools_bounded_at_256() {
     );
 }
 
-/// #360: establish exactly 256 tool interfaces (the limit), verify the 256th
+/// #360: establish exactly 256 outlet interfaces (the limit), verify the 256th
 /// succeeds; attempt to establish a 257th, verify `LimitExceeded` is returned.
 #[tokio::test]
 async fn tool_interfaces_bounded_at_256() {
@@ -301,10 +301,10 @@ async fn tool_interfaces_bounded_at_256() {
 
     // Establish exactly MAX_TOOL_INTERFACES interfaces.
     for i in 0..super::MAX_TOOL_INTERFACES {
-        let iface = ToolInterface {
+        let iface = OutletInterface {
             source_context: "test-ctx".to_owned(),
             target_context: format!("target-{i}"),
-            tool_id: format!("tool-{i}"),
+            outlet_id: format!("tool-{i}"),
             rate_limit: None,
             per_caller_rate_limit: None,
             approved_by_source: true,
@@ -319,10 +319,10 @@ async fn tool_interfaces_bounded_at_256() {
     }
 
     // The 257th must fail with LimitExceeded.
-    let overflow = ToolInterface {
+    let overflow = OutletInterface {
         source_context: "test-ctx".to_owned(),
         target_context: "target-overflow".to_owned(),
-        tool_id: "tool-overflow".to_owned(),
+        outlet_id: "tool-overflow".to_owned(),
         rate_limit: None,
         per_caller_rate_limit: None,
         approved_by_source: true,

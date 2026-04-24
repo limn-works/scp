@@ -7,11 +7,11 @@ use super::{
     ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS, EXECUTED_PROPOSALS_TTL_SECS, EconomicPolicy,
     GovernanceAction, GovernanceActionResult, GovernanceContext, GovernanceEvent, GovernanceModel,
     GovernanceProposal, GovernanceReconfiguredResult, HashSet, MAX_COMMIT_AGE_SECS,
-    MAX_COMMIT_RETRIES, MAX_PENDING_COMMITS, MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS,
-    MAX_TOOL_INTERFACES, MigrationProposedResult, MigrationState, MlsImpact,
-    PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange, PerContextState,
-    ProposalId, ProposalOutcome, ProposalStatus, PruningPolicy, RestoreAccessResult, RevokeResult,
-    SuspendMemberResult, ToolInterface, ToolRegistration, TriggeredConsequence, classify_action,
+    MAX_COMMIT_RETRIES, MAX_PENDING_COMMITS, MAX_REGISTERED_OUTLETS, MAX_THRESHOLD_SIGNERS,
+    MAX_TOOL_INTERFACES, MigrationProposedResult, MigrationState, MlsImpact, OutletInterface,
+    OutletRegistration, PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange,
+    PerContextState, ProposalId, ProposalOutcome, ProposalStatus, PruningPolicy,
+    RestoreAccessResult, RevokeResult, SuspendMemberResult, TriggeredConsequence, classify_action,
     collect_active_voters, commit_retry_backoff, context_id_to_bytes, evaluate_consequence_rules,
     generate_mls_operations, instrument, process_pending_proposals, push_welcome_event,
     require_active, require_migrating_out, roles, strip_event_payload, update_detection_state,
@@ -122,7 +122,7 @@ fn trigger_kind_str(trigger: &scp_protocol::trust::consequence::ConsequenceTrigg
     use scp_protocol::trust::consequence::ConsequenceTrigger;
     match trigger {
         ConsequenceTrigger::MessageVelocity => "MessageVelocity".to_owned(),
-        ConsequenceTrigger::ToolRateExceeded => "ToolRateExceeded".to_owned(),
+        ConsequenceTrigger::OutletRateExceeded => "ToolRateExceeded".to_owned(),
         ConsequenceTrigger::WarningCount => "WarningCount".to_owned(),
         ConsequenceTrigger::Custom(key) => format!("Custom:{key}"),
     }
@@ -195,7 +195,7 @@ fn append_consequence_event(
 /// providers, scope identifiers, and pre-evaluated rule data into one
 /// struct keeps the public function signature within the
 /// `clippy::too_many_arguments` budget while preserving the explicit
-/// names that callers (`messaging.rs`, `tools.rs`, `governance.rs`,
+/// names that callers (`messaging.rs`, `outlets.rs`, `governance.rs`,
 /// the periodic timer) need at construction time.
 pub(super) struct EnforceConsequencesCtx<'a> {
     pub context_id: &'a str,
@@ -700,8 +700,8 @@ pub(super) fn event_log_entries_for_consequences(
                 "MemberJoined" => scp_event_log::EventType::MemberJoined,
                 "MemberLeft" => scp_event_log::EventType::MemberLeft,
                 "RoleAssigned" => scp_event_log::EventType::RoleAssigned,
-                "ToolRegistered" | "ToolRemoved" | "ToolInvoked" => {
-                    scp_event_log::EventType::ToolInvoked
+                "OutletRegistered" | "OutletDeregistered" | "OutletInvoked" => {
+                    scp_event_log::EventType::OutletInvoked
                 }
                 // Governance actions and consequence enforcement records
                 // both feed the WarningCount trigger via the
@@ -877,7 +877,7 @@ fn check_proposer_eligibility(
     // Refresh participation record from recent events before checking the
     // participation threshold (#1530). Skip recomputation if a cached record
     // already exists — the cache is populated on first check and updated when
-    // participation events occur (messaging, governance, tools, lifecycle).
+    // participation events occur (messaging, governance, outlets, lifecycle).
     let context_id = ctx.handle.context_id().to_owned();
     if !ctx
         .governance
@@ -1446,8 +1446,8 @@ impl ContextManager {
             GovernanceAction::AddMember { .. }
             | GovernanceAction::RemoveMember { .. }
             | GovernanceAction::ChangeRole { .. }
-            | GovernanceAction::RegisterTool { .. }
-            | GovernanceAction::RemoveTool { .. }
+            | GovernanceAction::RegisterOutlet { .. }
+            | GovernanceAction::RemoveOutlet { .. }
             | GovernanceAction::ModifyCeiling { .. }
             | GovernanceAction::CloseContext { .. }
             | GovernanceAction::TransferAdmin { .. }
@@ -1456,7 +1456,7 @@ impl ContextManager {
             | GovernanceAction::AddSigner { .. }
             | GovernanceAction::RemoveSigner { .. }
             | GovernanceAction::ModifyThreshold { .. }
-            | GovernanceAction::EstablishToolInterface { .. }
+            | GovernanceAction::EstablishOutletInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
             | GovernanceAction::RotateContentKeys { .. }
@@ -1501,13 +1501,13 @@ impl ContextManager {
                     .await?;
                 Ok(GovernanceActionResult::RoleChanged)
             }
-            GovernanceAction::RegisterTool { registration } => {
-                self.execute_register_tool(context_id, registration, pid, actor_did)
+            GovernanceAction::RegisterOutlet { registration } => {
+                self.execute_register_outlet(context_id, registration, pid, actor_did)
                     .await?;
-                Ok(GovernanceActionResult::ToolRegistered)
+                Ok(GovernanceActionResult::OutletRegistered)
             }
-            GovernanceAction::RemoveTool { tool_id } => {
-                self.execute_remove_tool(context_id, tool_id, pid, actor_did)
+            GovernanceAction::RemoveOutlet { outlet_id } => {
+                self.execute_remove_outlet(context_id, outlet_id, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::ToolRemoved)
             }
@@ -1565,7 +1565,7 @@ impl ContextManager {
             GovernanceAction::AddSigner { .. }
             | GovernanceAction::RemoveSigner { .. }
             | GovernanceAction::ModifyThreshold { .. }
-            | GovernanceAction::EstablishToolInterface { .. }
+            | GovernanceAction::EstablishOutletInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
             | GovernanceAction::RotateContentKeys { .. }
@@ -1617,10 +1617,10 @@ impl ContextManager {
                     .await?;
                 Ok(GovernanceActionResult::ThresholdModified)
             }
-            GovernanceAction::EstablishToolInterface { interface } => {
+            GovernanceAction::EstablishOutletInterface { interface } => {
                 self.execute_establish_tool_interface(context_id, interface, pid, actor_did)
                     .await?;
-                Ok(GovernanceActionResult::ToolInterfaceEstablished)
+                Ok(GovernanceActionResult::OutletInterfaceEstablished)
             }
             GovernanceAction::ResetMember { did, reason } => {
                 self.execute_reset_member(context_id, did, reason, pid, actor_did)
@@ -1680,8 +1680,8 @@ impl ContextManager {
             | GovernanceAction::AddMember { .. }
             | GovernanceAction::RemoveMember { .. }
             | GovernanceAction::ChangeRole { .. }
-            | GovernanceAction::RegisterTool { .. }
-            | GovernanceAction::RemoveTool { .. }
+            | GovernanceAction::RegisterOutlet { .. }
+            | GovernanceAction::RemoveOutlet { .. }
             | GovernanceAction::ModifyCeiling { .. }
             | GovernanceAction::CloseContext { .. }
             | GovernanceAction::TransferAdmin { .. }
@@ -3061,13 +3061,13 @@ impl ContextManager {
         Ok(())
     }
 
-    /// Registers a tool in the context. Requires `ToolRegister` in the
+    /// Registers an outlet in the context. Requires `OutletRegister` in the
     /// context's ceiling (§5.3). Without this capability in the ceiling,
-    /// the context does not support tool registration.
-    pub(super) async fn execute_register_tool(
+    /// the context does not support outlet registration.
+    pub(super) async fn execute_register_outlet(
         &self,
         context_id: &str,
-        registration: &ToolRegistration,
+        registration: &OutletRegistration,
         _proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
@@ -3081,19 +3081,19 @@ impl ContextManager {
             let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
-            // Gate: ceiling must include ToolRegister (§5.3, #339).
-            if !ctx.role_state.ceiling.contains(&Capability::ToolRegister) {
+            // Gate: ceiling must include OutletRegister (§5.3, #339).
+            if !ctx.role_state.ceiling.contains(&Capability::OutletRegister) {
                 return Err(ContextError::PermissionDenied(
-                    "context ceiling does not include tool registration capability".into(),
+                    "context ceiling does not include outlet registration capability".into(),
                 ));
             }
 
-            if ctx.governance.registered_tools.len() >= MAX_REGISTERED_TOOLS {
+            if ctx.governance.registered_outlets.len() >= MAX_REGISTERED_OUTLETS {
                 return Err(ContextError::LimitExceeded(format!(
-                    "registered tool limit of {MAX_REGISTERED_TOOLS} exceeded"
+                    "registered tool limit of {MAX_REGISTERED_OUTLETS} exceeded"
                 )));
             }
-            ctx.governance.registered_tools.push(registration.clone());
+            ctx.governance.registered_outlets.push(registration.clone());
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
@@ -3105,7 +3105,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "ToolRegistered", actor_did)?;
+            .append_context_event(&context_id_bytes, "OutletRegistered", actor_did)?;
         {
             if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
@@ -3113,13 +3113,14 @@ impl ContextManager {
                 ctx.checkpoint_events_since += 1;
             }
         }
+        crate::metrics::record_outlet_registration();
         Ok(())
     }
 
-    async fn execute_remove_tool(
+    async fn execute_remove_outlet(
         &self,
         context_id: &str,
-        tool_id: &str,
+        outlet_id: &str,
         _proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
@@ -3134,8 +3135,8 @@ impl ContextManager {
             require_active(&ctx.handle)?;
 
             ctx.governance
-                .registered_tools
-                .retain(|t| t.tool_id != tool_id);
+                .registered_outlets
+                .retain(|t| t.outlet_id != outlet_id);
             if self.has_persistence() {
                 Some(Self::snapshot_context(ctx))
             } else {
@@ -3147,7 +3148,7 @@ impl ContextManager {
             self.persist_context_snapshot(context_id, snapshot);
         }
         self.event_log
-            .append_context_event(&context_id_bytes, "ToolRemoved", actor_did)?;
+            .append_context_event(&context_id_bytes, "OutletDeregistered", actor_did)?;
         {
             if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
@@ -3914,13 +3915,13 @@ impl ContextManager {
         Ok(())
     }
 
-    /// Establishes a cross-context tool interface. Requires `ToolInterface`
+    /// Establishes a cross-context outlet interface. Requires `OutletInterface`
     /// in the context's ceiling (§5.3, §6.2). Without this capability in the
-    /// ceiling, the context does not support tool interface exposure.
+    /// ceiling, the context does not support outlet interface exposure.
     pub(super) async fn execute_establish_tool_interface(
         &self,
         context_id: &str,
-        interface: &ToolInterface,
+        interface: &OutletInterface,
         _proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
@@ -3934,16 +3935,20 @@ impl ContextManager {
             let ctx = &mut *guard;
             require_active(&ctx.handle)?;
 
-            // Gate: ceiling must include ToolInterface (§5.3, §6.2, #339).
-            if !ctx.role_state.ceiling.contains(&Capability::ToolInterface) {
+            // Gate: ceiling must include OutletInterface (§5.3, §6.2, #339).
+            if !ctx
+                .role_state
+                .ceiling
+                .contains(&Capability::OutletInterface)
+            {
                 return Err(ContextError::PermissionDenied(
-                    "context ceiling does not include tool interface capability".into(),
+                    "context ceiling does not include outlet interface capability".into(),
                 ));
             }
 
             if ctx.governance.tool_interfaces.len() >= MAX_TOOL_INTERFACES {
                 return Err(ContextError::LimitExceeded(format!(
-                    "tool interface limit of {MAX_TOOL_INTERFACES} exceeded"
+                    "outlet interface limit of {MAX_TOOL_INTERFACES} exceeded"
                 )));
             }
             ctx.governance.tool_interfaces.push(interface.clone());
@@ -3959,7 +3964,7 @@ impl ContextManager {
         }
         self.event_log.append_context_event(
             &context_id_bytes,
-            "ToolInterfaceEstablished",
+            "OutletInterfaceEstablished",
             actor_did,
         )?;
         {
@@ -4694,7 +4699,7 @@ impl ContextManager {
     /// Grants the approved `amount` to the spender's cumulative budget via
     /// [`MemberBudgetTracker::grant`] and records the approval in the event
     /// log. Budget enforcement (checking remaining balance before tool
-    /// invocations) is handled at the tool invocation layer.
+    /// invocations) is handled at the outlet invocation layer.
     ///
     /// # Errors
     ///

@@ -94,8 +94,8 @@ mod wasm_registry_mirror {
             let ceiling_strings: HashSet<String> = [
                 "messages:read",
                 "messages:write",
-                "tool_register:*",
-                "tool_invoke:*",
+                "outlet_register:*",
+                "outlet_call:*",
                 "role_assign:*",
                 "member_invite:*",
                 "member_remove:*",
@@ -237,8 +237,8 @@ fn context_registry_default_ceiling_populated() {
 
     assert!(ceiling.contains("messages:read"));
     assert!(ceiling.contains("messages:write"));
-    assert!(ceiling.contains("tool_register:*"));
-    assert!(ceiling.contains("tool_invoke:*"));
+    assert!(ceiling.contains("outlet_register:*"));
+    assert!(ceiling.contains("outlet_call:*"));
     assert!(ceiling.contains("role_assign:*"));
     assert!(ceiling.contains("member_invite:*"));
     assert!(ceiling.contains("member_remove:*"));
@@ -897,7 +897,7 @@ mod wasm_role_broadcast_mirror {
                 "messages:read",
                 "messages:write",
                 "tool:register",
-                "tool_invoke:*",
+                "outlet_call:*",
                 "role:assign",
                 "member:invite",
                 "member:remove",
@@ -933,7 +933,7 @@ mod wasm_role_broadcast_mirror {
                         capability,
                         "messages:read"
                             | "messages:write"
-                            | "tool_invoke:*"
+                            | "outlet_call:*"
                             | "member:remove"
                             | "governance:propose"
                     );
@@ -942,14 +942,14 @@ mod wasm_role_broadcast_mirror {
                 "author" => {
                     let role_grants = matches!(
                         capability,
-                        "messages:write" | "messages:read" | "tool_invoke:*"
+                        "messages:write" | "messages:read" | "outlet_call:*"
                     );
                     role_grants && in_ceiling(capability)
                 }
                 "member" => {
                     let role_grants = matches!(
                         capability,
-                        "messages:read" | "messages:write" | "tool_invoke:*"
+                        "messages:read" | "messages:write" | "outlet_call:*"
                     );
                     role_grants && in_ceiling(capability)
                 }
@@ -1144,7 +1144,7 @@ fn moderator_has_governance_propose_capability() {
     );
     assert!(ctx.member_has_capability(did, "messages:read"));
     assert!(ctx.member_has_capability(did, "messages:write"));
-    assert!(ctx.member_has_capability(did, "tool_invoke:*"));
+    assert!(ctx.member_has_capability(did, "outlet_call:*"));
     assert!(
         !ctx.member_has_capability(did, "context:close"),
         "moderator should NOT have context:close"
@@ -1169,13 +1169,13 @@ fn subscriber_has_messages_read_only() {
         "subscriber should NOT have messages:write"
     );
     assert!(
-        !ctx.member_has_capability(did, "tool_invoke:*"),
-        "subscriber should NOT have tool_invoke:*"
+        !ctx.member_has_capability(did, "outlet_call:*"),
+        "subscriber should NOT have outlet_call:*"
     );
 }
 
 #[test]
-fn member_has_tool_invoke_all_capability() {
+fn member_has_outlet_call_all_capability() {
     use wasm_role_broadcast_mirror::PerContextState;
 
     let mut ctx = PerContextState::new_with_default_ceiling(None);
@@ -1186,8 +1186,8 @@ fn member_has_tool_invoke_all_capability() {
     assert!(ctx.member_has_capability(did, "messages:read"));
     assert!(ctx.member_has_capability(did, "messages:write"));
     assert!(
-        ctx.member_has_capability(did, "tool_invoke:*"),
-        "member should have tool_invoke:* capability"
+        ctx.member_has_capability(did, "outlet_call:*"),
+        "member should have outlet_call:* capability"
     );
     assert!(
         !ctx.member_has_capability(did, "governance:propose"),
@@ -1202,15 +1202,15 @@ fn member_capability_ceiling_intersection() {
     let mut ctx = PerContextState::new_with_default_ceiling(None);
     let did = "did:key:member-002";
 
-    ctx.ceiling_strings.remove("tool_invoke:*");
+    ctx.ceiling_strings.remove("outlet_call:*");
 
     ctx.add_member(did, "member");
 
     assert!(ctx.member_has_capability(did, "messages:read"));
     assert!(ctx.member_has_capability(did, "messages:write"));
     assert!(
-        !ctx.member_has_capability(did, "tool_invoke:*"),
-        "member should NOT have tool_invoke:* when tool_invoke:* is removed from ceiling"
+        !ctx.member_has_capability(did, "outlet_call:*"),
+        "member should NOT have outlet_call:* when outlet_call:* is removed from ceiling"
     );
 }
 
@@ -1469,11 +1469,8 @@ fn wasm_event_type_tag_exhaustiveness() {
             "RoleAssigned" => 6,
             "TokenRevoked" | "UcanRevoked" => 7,
             "MessageSent" => 8,
-            "ToolRegistered" => 9,
-            "ToolUpdated" => 10,
-            "ToolInvoked" => 11,
-            "ToolVerified" => 12,
-            "ToolInterfaceEstablished" => 13,
+            // Tags 9..=13 are the permanently retired pre-rename Tool* band
+            // (ADR-049, spec §5.14.10). The Outlet* variants live at 80..=88.
             "GovernanceAction" => 14,
             "ConsistencyCheckpoint" => 15,
             "AbsenceProofRequested" => 16,
@@ -1496,6 +1493,17 @@ fn wasm_event_type_tag_exhaustiveness() {
             "GovernanceActionExecuted" | "GovernanceExecuted" => 32,
             "ProvenanceAttached" => 34,
             "ProvenanceReceived" => 35,
+            // Outlet event types (ADR-049, spec §5.4 / §5.14.10). Tags 80..=88
+            // — bit 4 set, ≥ 0x10 offset from every retired Tool* tag.
+            "OutletRegistered" => 80,
+            "OutletUpdated" => 81,
+            "OutletDeregistered" => 82,
+            "OutletInvoked" => 83,
+            "OutletCancel" => 84,
+            "OutletVerified" => 85,
+            "OutletInterfaceOffered" => 86,
+            "OutletInterfaceAccepted" => 87,
+            "OutletInterfaceRevoked" => 88,
             _ => 0xFFFF,
         }
     }
@@ -1508,8 +1516,8 @@ fn wasm_event_type_tag_exhaustiveness() {
         "MemberJoined",
         "MemberLeft",
         "MessageSent",
-        "ToolRegistered",
-        "ToolInvoked",
+        "OutletRegistered",
+        "OutletInvoked",
         "UcanRevoked",
         "GovernanceExecuted",
         "GovernanceProposalCreated",
@@ -1519,9 +1527,13 @@ fn wasm_event_type_tag_exhaustiveness() {
         "ProvenanceReceived",
         "RoleAssigned",
         "TokenRevoked",
-        "ToolUpdated",
-        "ToolVerified",
-        "ToolInterfaceEstablished",
+        "OutletUpdated",
+        "OutletVerified",
+        "OutletDeregistered",
+        "OutletCancel",
+        "OutletInterfaceOffered",
+        "OutletInterfaceAccepted",
+        "OutletInterfaceRevoked",
         "GovernanceAction",
         "ConsistencyCheckpoint",
         "AbsenceProofRequested",
@@ -1560,14 +1572,18 @@ fn wasm_event_type_tag_exhaustiveness() {
         (EventType::RoleAssigned, "RoleAssigned"),
         (EventType::TokenRevoked, "TokenRevoked"),
         (EventType::MessageSent, "MessageSent"),
-        (EventType::ToolRegistered, "ToolRegistered"),
-        (EventType::ToolUpdated, "ToolUpdated"),
-        (EventType::ToolInvoked, "ToolInvoked"),
-        (EventType::ToolVerified, "ToolVerified"),
+        (EventType::OutletRegistered, "OutletRegistered"),
+        (EventType::OutletUpdated, "OutletUpdated"),
+        (EventType::OutletDeregistered, "OutletDeregistered"),
+        (EventType::OutletInvoked, "OutletInvoked"),
+        (EventType::OutletCancel, "OutletCancel"),
+        (EventType::OutletVerified, "OutletVerified"),
+        (EventType::OutletInterfaceOffered, "OutletInterfaceOffered"),
         (
-            EventType::ToolInterfaceEstablished,
-            "ToolInterfaceEstablished",
+            EventType::OutletInterfaceAccepted,
+            "OutletInterfaceAccepted",
         ),
+        (EventType::OutletInterfaceRevoked, "OutletInterfaceRevoked"),
         (EventType::GovernanceAction, "GovernanceAction"),
         (EventType::ConsistencyCheckpoint, "ConsistencyCheckpoint"),
         (EventType::AbsenceProofRequested, "AbsenceProofRequested"),

@@ -119,11 +119,8 @@ const fn event_type_tag(event_type: &EventType) -> u16 {
         EventType::RoleAssigned => 6,
         EventType::TokenRevoked => 7,
         EventType::MessageSent => 8,
-        EventType::ToolRegistered => 9,
-        EventType::ToolUpdated => 10,
-        EventType::ToolInvoked => 11,
-        EventType::ToolVerified => 12,
-        EventType::ToolInterfaceEstablished => 13,
+        // Tags 9..=13 are the permanently retired pre-rename Tool* band
+        // (ADR-049, spec §5.14.10). The Outlet* variants live at 80..=88.
         EventType::GovernanceAction => 14,
         EventType::ConsistencyCheckpoint => 15,
         EventType::AbsenceProofRequested => 16,
@@ -148,6 +145,17 @@ const fn event_type_tag(event_type: &EventType) -> u16 {
         // Provenance event types (issue #586)
         EventType::ProvenanceAttached => 34,
         EventType::ProvenanceReceived => 35,
+        // Outlet event types (ADR-049, spec §5.4 / §5.14.10). Tags 80..=88
+        // — bit 4 set, ≥ 0x10 offset from every retired Tool* tag.
+        EventType::OutletRegistered => 80,
+        EventType::OutletUpdated => 81,
+        EventType::OutletDeregistered => 82,
+        EventType::OutletInvoked => 83,
+        EventType::OutletCancel => 84,
+        EventType::OutletVerified => 85,
+        EventType::OutletInterfaceOffered => 86,
+        EventType::OutletInterfaceAccepted => 87,
+        EventType::OutletInterfaceRevoked => 88,
     }
 }
 

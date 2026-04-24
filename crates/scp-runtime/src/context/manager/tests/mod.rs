@@ -92,10 +92,10 @@ pub(super) async fn test_custody_from_seed(
 ///
 /// C1/C1b (PR #1606) follow-up: spending UCANs are now cryptographically
 /// validated end-to-end on the `send_message`, `join_context`, and
-/// `invoke_tool_with_economy` paths. This zero-arg helper produces an
+/// `invoke_outlet_with_economy` paths. This zero-arg helper produces an
 /// UNSIGNED token bound to the placeholder DID `did:key:test-spender` —
 /// sufficient ONLY for tests that (a) use the direct free-function
-/// `invoke_tool` helper (which does NOT run signature validation —
+/// `invoke_outlet` helper (which does NOT run signature validation —
 /// that's a caller-side escape hatch with no bridge exposure) or
 /// (b) only assert that a paid action is rejected (the rejection now
 /// happens at signature validation rather than at the previous
@@ -103,7 +103,7 @@ pub(super) async fn test_custody_from_seed(
 /// `Result::is_err()`).
 ///
 /// Tests that exercise the `send_message` / `join_context` /
-/// `ContextManager::invoke_tool_with_economy` HAPPY PATH with a paid
+/// `ContextManager::invoke_outlet_with_economy` HAPPY PATH with a paid
 /// policy MUST use [`dummy_spending_ucan_for`] (which signs the token
 /// with the deterministic test key matching `mock_key_resolver`).
 /// Pairing the unsigned helper with a paid happy-path call will fail
@@ -219,7 +219,7 @@ fn build_spending_ucan(
     if !signed {
         // Legacy unsigned shape — preserved so the zero-arg
         // `dummy_spending_ucan()` helper does not break tests that
-        // (a) only exercise the tool-invoke path or (b) only assert
+        // (a) only exercise the outlet-call path or (b) only assert
         // rejection. The token IS still rejected by the C1 signature
         // pipeline; that rejection is the test's expected outcome.
         return UcanToken {
@@ -1446,7 +1446,7 @@ pub(super) async fn setup_failing_capture_manager_with_context(
             cost_schedule: CostSchedule {
                 currency: CurrencyCode([85, 83, 68, 0]),
                 per_message: Some(Amount::new(1)),
-                per_tool_invoke: None,
+                per_outlet_call: None,
                 per_join: Some(Amount::new(1)),
                 per_period: None,
                 per_byte_stored: None,
@@ -1504,8 +1504,8 @@ pub(super) async fn setup_active_context() -> (ContextManager, ContextHandle) {
             scp_protocol::context::params::Capability::new("messages:read"),
             scp_protocol::context::params::Capability::new("messages:write"),
             scp_protocol::context::params::Capability::new("role:assign"),
-            Capability::ToolRegister,
-            Capability::ToolInterface,
+            Capability::OutletRegister,
+            Capability::OutletInterface,
             Capability::ChildContextCreate,
             Capability::MemberBan,
         ],
@@ -1536,8 +1536,8 @@ pub(super) async fn setup_active_context_with_key_resolver() -> (ContextManager,
             scp_protocol::context::params::Capability::new("messages:read"),
             scp_protocol::context::params::Capability::new("messages:write"),
             scp_protocol::context::params::Capability::new("role:assign"),
-            Capability::ToolRegister,
-            Capability::ToolInterface,
+            Capability::OutletRegister,
+            Capability::OutletInterface,
             Capability::ChildContextCreate,
             Capability::MemberBan,
         ],
@@ -1805,25 +1805,25 @@ pub(super) fn governance_params() -> ContextParams {
             scp_protocol::context::params::Capability::new("governance:vote"),
             scp_protocol::context::params::Capability::new("member:ban"),
             scp_protocol::context::params::Capability::new("context:close"),
-            Capability::ToolRegister,
+            Capability::OutletRegister,
         ],
         ..ContextParams::default()
     }
 }
 
-/// Helper: create a `ToolRegistration` fixture.
-pub(super) fn test_tool_registration(id: &str) -> ToolRegistration {
-    use scp_protocol::context::tools::registry::{TestVector, ToolSchema};
-    ToolRegistration {
-        tool_id: id.to_owned(),
+/// Helper: create a `OutletRegistration` fixture.
+pub(super) fn test_outlet_registration(id: &str) -> OutletRegistration {
+    use scp_protocol::context::outlets::registry::{OutletSchema, OutletTestVector};
+    OutletRegistration {
+        outlet_id: id.to_owned(),
         name: id.to_owned(),
         description: "test tool".to_owned(),
-        schema: ToolSchema {
+        schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
         },
         implementation_hash: [0u8; 32],
-        test_vectors: vec![TestVector {
+        test_vectors: vec![OutletTestVector {
             input: serde_json::json!({}),
             expected_output: serde_json::json!({}),
             description: "noop".to_owned(),

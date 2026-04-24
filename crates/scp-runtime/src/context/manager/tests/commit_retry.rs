@@ -360,7 +360,7 @@ fn test_pending_commits_persist_across_snapshot_roundtrip() {
         .unwrap(),
         executed_proposals: HashSet::new(),
         ttl_remaining_secs: None,
-        registered_tools: Vec::new(),
+        registered_outlets: Vec::new(),
         read_exclusion_list: HashSet::new(),
         tool_interfaces: Vec::new(),
         threshold_signers: Vec::new(),
