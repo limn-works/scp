@@ -1233,6 +1233,17 @@ impl CoreFields {
     /// that failed plus a redacted reason. Shutdown state short-circuits
     /// with [`LifecycleError::AlreadyShutDown`] rather than attempting
     /// reconnects against a torn-down instance.
+    ///
+    /// When reconnect was cancelled by a concurrent `suspend()` /
+    /// `shutdown()`, the `reason` field explicitly states "suspended
+    /// during reconnect" (empty `url`) so callers can distinguish a
+    /// suspend race from a dial / TLS / handshake failure. Non-cancel
+    /// failures carry the underlying connect error verbatim.
+    // Line-count waiver: dial spawn + cancel-aware collect + deterministic
+    // install phase form a single atomic operation. Splitting it across
+    // helpers (simplifier #1) lost the linear reading of the suspend/cancel
+    // invariants — keep it inline instead.
+    #[allow(clippy::too_many_lines)]
     pub async fn reconnect_transport_if_pending(&self) -> Result<(), LifecycleError> {
         if self.is_shutdown() {
             return Err(LifecycleError::AlreadyShutDown);
@@ -1303,9 +1314,9 @@ impl CoreFields {
         let mut results: Vec<(String, Result<_, _>)> = Vec::new();
         // Track the first panic so callers don't see a silent success when
         // every spawned dial task panicked (leaving `results` empty).
-        // Without this, `install_reconnected_adapters` would return
-        // `Ok(())` despite no adapters being installed — a split-brain
-        // where `resume()` reports success but transport is broken.
+        // Without this, the install phase below would return `Ok(())`
+        // despite no adapters being installed — a split-brain where
+        // `resume()` reports success but transport is broken.
         let mut first_panic_failure: Option<LifecycleError> = None;
         loop {
             tokio::select! {
@@ -1318,7 +1329,9 @@ impl CoreFields {
                     while join_set.join_next().await.is_some() {}
                     return Err(LifecycleError::ReconnectFailed {
                         url: String::new(),
-                        reason: "reconnect cancelled by suspend/shutdown".to_owned(),
+                        reason:
+                            "reconnect suspended during reconnect — caller invoked suspend()/shutdown() while dials were in flight"
+                                .to_owned(),
                     });
                 }
                 next = join_set.join_next() => {
@@ -1344,24 +1357,10 @@ impl CoreFields {
                 }
             }
         }
-        self.install_reconnected_adapters(results, &cancel, first_panic_failure)
-    }
-
-    /// Sorts the per-URL dial outcomes, registers the successful adapters
-    /// into a fresh `TransportManager`, and installs it on this instance
-    /// (unless cancellation fired before installation). Extracted from
-    /// [`reconnect_transport_if_pending`] to keep that function under the
-    /// clippy line-count limit while preserving determinism + cancel-aware
-    /// teardown semantics.
-    fn install_reconnected_adapters(
-        &self,
-        mut results: Vec<(
-            String,
-            Result<scp_transport::native::adapter::NativeRelayAdapter, String>,
-        )>,
-        cancel: &tokio_util::sync::CancellationToken,
-        first_panic_failure: Option<LifecycleError>,
-    ) -> Result<(), LifecycleError> {
+        // --- install phase (re-inlined from the previous
+        // `install_reconnected_adapters` helper so the suspend/cancel
+        // invariants read linearly alongside the dial phase) ---
+        //
         // Sort by URL before registering adapters so the adapter ordering
         // inside `TransportManager` is deterministic regardless of
         // network-timing jitter across the spawned tasks.
@@ -1415,7 +1414,9 @@ impl CoreFields {
             drop(manager);
             return Err(LifecycleError::ReconnectFailed {
                 url: String::new(),
-                reason: "reconnect cancelled by suspend/shutdown".to_owned(),
+                reason:
+                    "reconnect suspended during reconnect — caller invoked suspend()/shutdown() before install"
+                        .to_owned(),
             });
         }
         // Only install the manager if at least one adapter is registered —
