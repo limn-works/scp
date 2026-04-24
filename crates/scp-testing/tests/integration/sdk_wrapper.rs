@@ -23,7 +23,7 @@
 // Python SDK files
 const PY_IDENTITY: &str = include_str!("../../../../bindings/python/scp_sdk/identity.py");
 const PY_CONTEXT: &str = include_str!("../../../../bindings/python/scp_sdk/context.py");
-const PY_TOOLS: &str = include_str!("../../../../bindings/python/scp_sdk/tools.py");
+const PY_OUTLETS: &str = include_str!("../../../../bindings/python/scp_sdk/outlets.py");
 const PY_UCAN: &str = include_str!("../../../../bindings/python/scp_sdk/ucan.py");
 const PY_EVENT_LOG: &str = include_str!("../../../../bindings/python/scp_sdk/event_log.py");
 const PY_TRANSPORT: &str = include_str!("../../../../bindings/python/scp_sdk/transport.py");
@@ -37,7 +37,7 @@ const PY_GOVERNANCE: &str = include_str!("../../../../bindings/python/scp_sdk/go
 // TypeScript SDK files
 const TS_IDENTITY: &str = include_str!("../../../../bindings/typescript/src/identity.ts");
 const TS_CONTEXT: &str = include_str!("../../../../bindings/typescript/src/context.ts");
-const TS_TOOLS: &str = include_str!("../../../../bindings/typescript/src/tools.ts");
+const TS_OUTLETS: &str = include_str!("../../../../bindings/typescript/src/outlets.ts");
 const TS_UCAN: &str = include_str!("../../../../bindings/typescript/src/ucan.ts");
 const TS_EVENT_LOG: &str = include_str!("../../../../bindings/typescript/src/event-log.ts");
 const TS_TRANSPORT: &str = include_str!("../../../../bindings/typescript/src/transport.ts");
@@ -50,7 +50,7 @@ const TS_BRIDGE: &str = include_str!("../../../../bindings/typescript/src/bridge
 // Swift SDK files
 const SWIFT_IDENTITY: &str = include_str!("../../../../bindings/swift/Sources/SCP/Identity.swift");
 const SWIFT_CONTEXT: &str = include_str!("../../../../bindings/swift/Sources/SCP/Context.swift");
-const SWIFT_TOOLS: &str = include_str!("../../../../bindings/swift/Sources/SCP/Tools.swift");
+const SWIFT_OUTLETS: &str = include_str!("../../../../bindings/swift/Sources/SCP/Outlets.swift");
 const SWIFT_UCAN: &str = include_str!("../../../../bindings/swift/Sources/SCP/Ucan.swift");
 const SWIFT_EVENT_LOG: &str = include_str!("../../../../bindings/swift/Sources/SCP/EventLog.swift");
 const SWIFT_TRANSPORT: &str =
@@ -104,7 +104,7 @@ fn py_all() -> String {
     [
         PY_IDENTITY,
         PY_CONTEXT,
-        PY_TOOLS,
+        PY_OUTLETS,
         PY_UCAN,
         PY_EVENT_LOG,
         PY_TRANSPORT,
@@ -122,7 +122,7 @@ fn ts_all() -> String {
     [
         TS_IDENTITY,
         TS_CONTEXT,
-        TS_TOOLS,
+        TS_OUTLETS,
         TS_UCAN,
         TS_EVENT_LOG,
         TS_TRANSPORT,
@@ -139,7 +139,7 @@ fn swift_all() -> String {
     [
         SWIFT_IDENTITY,
         SWIFT_CONTEXT,
-        SWIFT_TOOLS,
+        SWIFT_OUTLETS,
         SWIFT_UCAN,
         SWIFT_EVENT_LOG,
         SWIFT_TRANSPORT,
@@ -1184,7 +1184,7 @@ fn all_sdk_source_files_are_non_empty() {
     let files: &[(&str, &str)] = &[
         ("Python identity.py", PY_IDENTITY),
         ("Python context.py", PY_CONTEXT),
-        ("Python tools.py", PY_TOOLS),
+        ("Python outlets.py", PY_OUTLETS),
         ("Python ucan.py", PY_UCAN),
         ("Python event_log.py", PY_EVENT_LOG),
         ("Python transport.py", PY_TRANSPORT),
@@ -1196,7 +1196,7 @@ fn all_sdk_source_files_are_non_empty() {
         ("Python governance.py", PY_GOVERNANCE),
         ("TypeScript identity.ts", TS_IDENTITY),
         ("TypeScript context.ts", TS_CONTEXT),
-        ("TypeScript tools.ts", TS_TOOLS),
+        ("TypeScript outlets.ts", TS_OUTLETS),
         ("TypeScript ucan.ts", TS_UCAN),
         ("TypeScript event-log.ts", TS_EVENT_LOG),
         ("TypeScript transport.ts", TS_TRANSPORT),
@@ -1207,7 +1207,7 @@ fn all_sdk_source_files_are_non_empty() {
         ("TypeScript bridge.ts", TS_BRIDGE),
         ("Swift Identity.swift", SWIFT_IDENTITY),
         ("Swift Context.swift", SWIFT_CONTEXT),
-        ("Swift Tools.swift", SWIFT_TOOLS),
+        ("Swift Outlets.swift", SWIFT_OUTLETS),
         ("Swift Ucan.swift", SWIFT_UCAN),
         ("Swift EventLog.swift", SWIFT_EVENT_LOG),
         ("Swift Transport.swift", SWIFT_TRANSPORT),
