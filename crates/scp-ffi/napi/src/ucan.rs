@@ -123,7 +123,7 @@ impl NapiUcanToken {
     /// Returns the token's unique ID.
     ///
     /// Exposed as both `id` (matching the SDK `UcanToken` interface) and
-    /// `tokenId` (legacy alias for backward compatibility).
+    /// `tokenId` (additional alias for older SDK consumers).
     #[napi(getter)]
     #[must_use]
     pub fn id(&self) -> String {

@@ -13113,18 +13113,19 @@ fn velocity_tracker_state_in_context_snapshot_roundtrip() {
     assert_eq!(deserialized.cooldown_until.get(&2), Some(&12345));
 }
 
-/// Verifies backward compatibility: old snapshots without `velocity_tracker_state`
-/// or `cooldown_until` deserialize cleanly using `#[serde(default)]`.
+/// Verifies `#[serde(default)]` on the velocity-tracker and cooldown fields:
+/// snapshots missing those keys deserialize with sensible defaults.
 #[test]
-fn velocity_tracker_backward_compat_deserialization() {
-    // Simulate a legacy snapshot JSON that has `velocity_tracker: 3600` but
-    // no `velocity_tracker_state` or `cooldown_until` keys.
+fn velocity_tracker_default_field_deserialization() {
+    // Construct a snapshot JSON that carries `velocity_tracker: 3600` but no
+    // `velocity_tracker_state` / `cooldown_until` keys — matches what a
+    // snapshot produced before those fields existed would look like.
     use scp_protocol::context::ContextParams;
     use scp_protocol::context::membership::MembershipState;
     use scp_protocol::context::roles::{ContextRoleState, default_ceiling};
 
     let role_state = ContextRoleState::new(
-        "legacy-ctx",
+        "default-field-ctx",
         "did:key:creator",
         default_ceiling(),
         vec![],
@@ -13133,9 +13134,9 @@ fn velocity_tracker_backward_compat_deserialization() {
     .unwrap();
 
     // Build a snapshot with the new fields, serialize, then strip the new keys
-    // from JSON to simulate a legacy format.
+    // to reproduce the older on-disk shape.
     let snapshot = super::ContextSnapshot {
-        context_id: "legacy-ctx".to_owned(),
+        context_id: "default-field-ctx".to_owned(),
         state: scp_protocol::context::ContextState::Active,
         context_params: ContextParams::default(),
         membership: MembershipState::new(),
@@ -13183,21 +13184,21 @@ fn velocity_tracker_backward_compat_deserialization() {
 
     let mut json_value: serde_json::Value =
         serde_json::to_value(&snapshot).expect("serialize to value");
-    // Remove the new fields to simulate a legacy snapshot.
+    // Remove the fields to reproduce the older on-disk shape.
     json_value
         .as_object_mut()
         .unwrap()
         .remove("velocity_tracker_state");
     json_value.as_object_mut().unwrap().remove("cooldown_until");
 
-    let legacy_json = serde_json::to_string(&json_value).expect("serialize");
+    let older_json = serde_json::to_string(&json_value).expect("serialize");
     let deserialized: super::ContextSnapshot =
-        serde_json::from_str(&legacy_json).expect("deserialize legacy");
+        serde_json::from_str(&older_json).expect("deserialize older-shape snapshot");
 
-    // New fields should default.
+    // Missing fields should default.
     assert!(deserialized.velocity_tracker_state.is_none());
     assert!(deserialized.cooldown_until.is_empty());
-    // Old field should survive.
+    // Present field should survive.
     assert_eq!(deserialized.velocity_tracker, Some(3600));
 }
 
@@ -15889,8 +15890,9 @@ async fn earned_capacity_limits_governance_proposals() {
     );
 }
 
-/// Without `sybil_policy`, `check_proposer_eligibility` does not enforce earned capacity
-/// limits (backward compatibility). Unlimited proposals should succeed.
+/// Without `sybil_policy`, `check_proposer_eligibility` does not enforce
+/// earned capacity limits — contexts that do not opt in accept unlimited
+/// proposals.
 #[tokio::test]
 async fn no_sybil_policy_allows_unlimited_proposals() {
     let manager = ContextManager::new(
@@ -17183,12 +17185,11 @@ async fn h10_next_proposal_seq_persists_across_snapshot() {
         "next_proposal_seq must round-trip through rmp_serde (production wire format)"
     );
 
-    // Backward-compat: a legacy snapshot missing the field MUST
-    // deserialize cleanly with `next_proposal_seq = 0` via
-    // `#[serde(default)]`. We construct the legacy bytes by
-    // re-encoding via `rmpv::Value`, removing the new key, and
-    // re-serializing.
-    let legacy_bytes = {
+    // A snapshot missing the field MUST deserialize cleanly with
+    // `next_proposal_seq = 0` via `#[serde(default)]`. Construct the
+    // without-field bytes by re-encoding via `rmpv::Value`, removing
+    // the key, and re-serializing.
+    let missing_field_bytes = {
         let mut value: rmpv::Value =
             rmpv::decode::read_value(&mut bytes.as_slice()).expect("rmpv decode");
         if let rmpv::Value::Map(ref mut entries) = value {
@@ -17200,11 +17201,11 @@ async fn h10_next_proposal_seq_persists_across_snapshot() {
         rmpv::encode::write_value(&mut out, &value).expect("rmpv encode");
         out
     };
-    let legacy: super::ContextSnapshot =
-        rmp_serde::from_slice(&legacy_bytes).expect("legacy deserialize");
+    let without_field: super::ContextSnapshot =
+        rmp_serde::from_slice(&missing_field_bytes).expect("deserialize without-field snapshot");
     assert_eq!(
-        legacy.next_proposal_seq, 0,
-        "legacy snapshot without the field must default to 0 via #[serde(default)]"
+        without_field.next_proposal_seq, 0,
+        "snapshot without the field must default to 0 via #[serde(default)]"
     );
 }
 

@@ -484,8 +484,8 @@ pub(crate) async fn context_create_on(
     let creator_did = identity.inner.did.clone();
 
     // Parse consequence_rules from params (ADR-017, #1531). Accepts either a
-    // JSON array (preferred) or a JSON-encoded string for legacy callers.
-    // Normalize to a JSON string for the common builder.
+    // JSON array (preferred) or a pre-encoded JSON string. Normalize to a
+    // JSON string for the common builder.
     let consequence_rules_json: Option<String> = match &params["consequenceRules"] {
         serde_json::Value::Null => None,
         serde_json::Value::String(s) => Some(s.clone()),
@@ -498,8 +498,8 @@ pub(crate) async fn context_create_on(
     };
 
     // Parse consequence_config from params (ADR-017, #1531). Accepts a JSON
-    // object (preferred) or a JSON-encoded string for legacy callers.
-    // Normalize to a JSON string for the common builder.
+    // object (preferred) or a pre-encoded JSON string. Normalize to a JSON
+    // string for the common builder.
     let consequence_config_json: Option<String> = match &params["consequenceConfig"] {
         serde_json::Value::Null => None,
         serde_json::Value::String(s) => Some(s.clone()),

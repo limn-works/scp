@@ -230,8 +230,9 @@ fn compute_entry_hash(
     hasher.update(actor_did.as_bytes());
     hasher.update(timestamp.to_be_bytes());
     hasher.update(prev_hash);
-    // Payload is included in the hash when present.
-    // Absent payloads contribute no bytes, preserving backward compat.
+    // Payload is included in the hash when present. Absent payloads
+    // contribute no bytes — entries without a payload hash identically
+    // regardless of whether the serializer knew about the field.
     if let Some(val) = payload {
         let json_bytes = serde_json::to_vec(val).unwrap_or_default();
         let payload_len = u32::try_from(json_bytes.len()).unwrap_or(u32::MAX);

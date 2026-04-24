@@ -194,7 +194,8 @@ fn validate_consequence_rules_for_import(
 /// Performs sybil resistance evaluation for a join candidate (#1530).
 ///
 /// Reads the `sybil_policy` from `ContextParams`. When `None`, passes
-/// unconditionally (backward compatible). When `Some`, constructs an
+/// unconditionally — contexts that do not opt into sybil resistance accept
+/// any join candidate. When `Some`, constructs an
 /// [`IdentityDepthAssessment`] from the member's available trust signals
 /// and delegates to [`scp_protocol::trust::sybil::evaluate_sybil_resistance`].
 ///

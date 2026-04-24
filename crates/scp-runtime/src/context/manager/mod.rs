@@ -599,8 +599,8 @@ pub struct ContextSnapshot {
     /// Governance model configuration for engine restoration (ADR-031).
     ///
     /// Persisted so the correct `GovernanceEngine` can be reconstructed on
-    /// restart. `None` for legacy snapshots (defaults to `SingleAdmin` with
-    /// the first admin DID from membership).
+    /// restart. `None` falls back to `SingleAdmin` with the first admin DID
+    /// from membership.
     #[serde(default)]
     pub governance_model_config: Option<GovernanceModelConfig>,
     /// Mutable economic policy (§19.3, ADR-033). Updated via
@@ -638,10 +638,10 @@ pub struct ContextSnapshot {
     /// against any defensive admin action and force a 48-hour governance
     /// freeze.
     ///
-    /// Backward compatible with legacy snapshots: missing field
-    /// deserializes as `0`. On `import_context` (untrusted exporter), the
-    /// counter is conservatively reset to `approved_proposals.len() as u64`
-    /// — see `lifecycle::import_context`.
+    /// Missing field deserializes as `0` via `#[serde(default)]`. On
+    /// `import_context` (untrusted exporter), the counter is conservatively
+    /// reset to `approved_proposals.len() as u64` — see
+    /// `lifecycle::import_context`.
     #[serde(default)]
     pub next_proposal_seq: u64,
     /// Governance freeze state due to simultaneous conflicts (ADR-031 §7).
@@ -751,18 +751,19 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub proposal_timestamps: HashMap<String, Vec<u64>>,
     /// Spec §19.7 per-DID escalating-cost message pricing configuration.
-    /// `None` for legacy snapshots; on restore, defaults to
-    /// `ContextMessagePricingConfig::spec_default()`.
+    /// `None` falls back to `ContextMessagePricingConfig::spec_default()`
+    /// on restore.
     #[serde(default)]
     pub message_pricing: Option<scp_protocol::economy::antispam::ContextMessagePricingConfig>,
     /// Hard rate limit (Matrix Synapse–style token bucket) configuration.
-    /// `None` for legacy snapshots; on restore, defaults to
-    /// `HardRateLimitConfig::matrix_defaults()`.
+    /// `None` falls back to `HardRateLimitConfig::matrix_defaults()` on
+    /// restore.
     #[serde(default)]
     pub hard_rate_limit_config: Option<scp_protocol::economy::antispam::HardRateLimitConfig>,
     /// Per-sender token bucket state for the hard rate limit, captured at
-    /// snapshot time. Empty for legacy snapshots; restored verbatim into the
-    /// new limiter via `TokenBucketLimiter::from_snapshot`.
+    /// snapshot time. Restored verbatim into the new limiter via
+    /// `TokenBucketLimiter::from_snapshot`; an empty map produces a fresh
+    /// limiter.
     #[serde(default)]
     pub hard_rate_limit_state: HashMap<String, (u64, u64)>,
     /// Per-context spending-UCAN nonce tracker state (ADR-016 §6, #1608
@@ -774,10 +775,8 @@ pub struct ContextSnapshot {
     /// replay valid spending tokens until the `max_total` budget was
     /// exhausted a second time.
     ///
-    /// MIGRATION: `#[serde(default)]` — legacy snapshots deserialize as
-    /// an empty map, producing a tracker with no prior entries. This
-    /// is the same behavior as the pre-persistence runtime, so upgrade
-    /// does not introduce any new risk.
+    /// `#[serde(default)]` produces a tracker with no prior entries when
+    /// the field is absent, matching the pre-persistence runtime.
     #[serde(default)]
     pub spending_nonce_tracker_state: HashMap<String, (u64, u64)>,
     /// Persistent MLS Commit broadcast retry queue (PR #1606 C6).
@@ -786,8 +785,7 @@ pub struct ContextSnapshot {
     /// after the local state mutation. Restored on process restart so that
     /// the governance timeout task continues retrying after a crash.
     ///
-    /// MIGRATION: `#[serde(default)]` — legacy snapshots deserialize as
-    /// an empty queue, matching pre-feature behavior.
+    /// `#[serde(default)]` deserializes missing fields as an empty queue.
     #[serde(default)]
     pub pending_commits: VecDeque<PendingCommit>,
     /// Fail-close marker for the persistent commit retry queue (PR #1606 C6).
@@ -797,8 +795,7 @@ pub struct ContextSnapshot {
     /// restart and an operator must explicitly acknowledge the fault before
     /// further mutations are accepted.
     ///
-    /// MIGRATION: `#[serde(default)]` — legacy snapshots deserialize as
-    /// `None`, matching pre-feature behavior.
+    /// `#[serde(default)]` deserializes missing fields as `None`.
     #[serde(default)]
     pub commit_fault: Option<CommitFaultMarker>,
     /// Number of event log appends since the last consistency checkpoint (§9.9.3).
@@ -2084,10 +2081,11 @@ pub struct ContextManager {
     task_set: Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>,
     /// Global monotonic counter for assigning generation IDs to contexts.
     ///
-    /// Starts at 1 so that generation 0 (the `#[serde(default)]` value for
-    /// legacy snapshots) is never actively assigned. Incremented with
-    /// `Relaxed` ordering — uniqueness is guaranteed by the `fetch_add`
-    /// atomicity, and no other memory accesses depend on the ordering.
+    /// Starts at 1 so generation 0 is never actively assigned — this keeps
+    /// it reserved as a reliably-invalid sentinel for confused-deputy
+    /// checks. Incremented with `Relaxed` ordering — uniqueness is
+    /// guaranteed by the `fetch_add` atomicity, and no other memory
+    /// accesses depend on the ordering.
     next_generation: std::sync::atomic::AtomicU64,
     /// Optional broadcast channel for notifying external consumers of context
     /// events (e.g., webhook dispatchers in scp-node). When `Some`, every event

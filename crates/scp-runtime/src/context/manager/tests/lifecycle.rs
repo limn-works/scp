@@ -1,7 +1,7 @@
 use super::*;
 
 // -----------------------------------------------------------------------
-// Context creation tests (backward compatibility)
+// Context creation tests — basic create_context coverage
 // -----------------------------------------------------------------------
 
 #[tokio::test]
