@@ -492,12 +492,14 @@ public extension SCP {
 
     /// Forwards to ``Scp/identityCreate`` on ``inner``.
     ///
-    /// `seed` is a testing-only parameter for the ADR-046 cross-bridge
-    /// parity harness; pass `nil` from production callers (the
-    /// `allow_in_memory_custody` in-memory path uses OS RNG when `seed`
-    /// is `nil`).
-    func identityCreate(custody: String, seed: Data? = nil) async throws -> Identity {
-        try await inner.identityCreate(custody: custody, seed: seed)
+    /// `testingSeed` is a testing-only parameter for the ADR-046
+    /// cross-bridge parity harness; pass `nil` from production callers
+    /// (the `allow_in_memory_custody` in-memory path uses OS RNG when
+    /// `testingSeed` is `nil`). A non-`nil` `testingSeed` is only valid
+    /// for `custody == "in_memory"`; other custody types reject it with
+    /// `SCP-VALID-7009`.
+    func identityCreate(custody: String, testingSeed: Data? = nil) async throws -> Identity {
+        try await inner.identityCreate(custody: custody, testingSeed: testingSeed)
     }
 
     /// Forwards to ``Scp/identityCreateLinkAttestation`` on ``inner``.
@@ -721,11 +723,10 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/scpidSign`` on ``inner``.
-    /// Forwards to ``Scp/scpidSign`` on ``inner``.
     ///
     /// `signedAtOverride` is a testing-only parameter for the ADR-046
     /// cross-bridge parity harness; pass `nil` from production callers.
-    /// Production builds reject non-`nil` values with `SCP-VALID-7007`.
+    /// Production builds reject non-`nil` values with `SCP-VALID-7008`.
     func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String, signedAtOverride: UInt64? = nil) throws -> String {
         try inner.scpidSign(identity: identity, signingKeyId: signingKeyId, challengeJson: challengeJson, signedAtOverride: signedAtOverride)
     }

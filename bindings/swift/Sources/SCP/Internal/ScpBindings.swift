@@ -2459,14 +2459,14 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * initialization, handle `instance_id` stamping) is scoped to this
      * `SCP`.
      *
-     * When `seed` is supplied (32 bytes), the in-memory custody is backed
-     * by a deterministic RNG so subsequent `generate_keypair` calls produce
-     * byte-identical Ed25519 keys across bridges — the basis of the
-     * cross-bridge parity test (ADR-046). `seed` is only valid for
-     * `"in_memory"` custody; other custody types reject it with
-     * `SCP-VALID-7007`.
+     * When `testing_seed` is supplied (32 bytes), the in-memory custody
+     * is backed by a deterministic RNG so subsequent `generate_keypair`
+     * calls produce byte-identical Ed25519 keys across bridges — the
+     * basis of the cross-bridge parity test (ADR-046). `testing_seed`
+     * is only valid for `"in_memory"` custody; other custody types
+     * reject it with `SCP-VALID-7009`.
      */
-    func identityCreate(custody: String, seed: Data?) async throws  -> Identity
+    func identityCreate(custody: String, testingSeed: Data?) async throws  -> Identity
     
     /**
      * Per-instance equivalent of the free-function
@@ -2833,7 +2833,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `signed_at_override` is a testing-only parameter for the ADR-046
      * cross-bridge parity harness. Only accepted when scp-core is built
      * with the `testing` feature; production builds reject any non-`None`
-     * value via `SCP-VALID-7007`.
+     * value via `SCP-VALID-7008`.
      */
     func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String, signedAtOverride: UInt64?) throws  -> String
     
@@ -4549,20 +4549,20 @@ open func identityAttestDevice(identity: Identity)async throws  -> String  {
      * initialization, handle `instance_id` stamping) is scoped to this
      * `SCP`.
      *
-     * When `seed` is supplied (32 bytes), the in-memory custody is backed
-     * by a deterministic RNG so subsequent `generate_keypair` calls produce
-     * byte-identical Ed25519 keys across bridges — the basis of the
-     * cross-bridge parity test (ADR-046). `seed` is only valid for
-     * `"in_memory"` custody; other custody types reject it with
-     * `SCP-VALID-7007`.
+     * When `testing_seed` is supplied (32 bytes), the in-memory custody
+     * is backed by a deterministic RNG so subsequent `generate_keypair`
+     * calls produce byte-identical Ed25519 keys across bridges — the
+     * basis of the cross-bridge parity test (ADR-046). `testing_seed`
+     * is only valid for `"in_memory"` custody; other custody types
+     * reject it with `SCP-VALID-7009`.
      */
-open func identityCreate(custody: String, seed: Data?)async throws  -> Identity  {
+open func identityCreate(custody: String, testingSeed: Data?)async throws  -> Identity  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_identity_create(
                     self.uniffiClonePointer(),
-                    FfiConverterString.lower(custody),FfiConverterOptionData.lower(seed)
+                    FfiConverterString.lower(custody),FfiConverterOptionData.lower(testingSeed)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
@@ -5459,7 +5459,7 @@ open func scopeRegister(scopeContextId: String, name: String, targetContextId: S
      * `signed_at_override` is a testing-only parameter for the ADR-046
      * cross-bridge parity harness. Only accepted when scp-core is built
      * with the `testing` feature; production builds reject any non-`None`
-     * value via `SCP-VALID-7007`.
+     * value via `SCP-VALID-7008`.
      */
 open func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String, signedAtOverride: UInt64?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
@@ -14641,7 +14641,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_attest_device() != 36607) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 47563) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 25630) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_link_attestation() != 29874) {
@@ -14782,7 +14782,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_scope_register() != 1713) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_scpid_sign() != 48262) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_scpid_sign() != 46660) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_scpid_verify() != 7728) {

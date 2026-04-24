@@ -862,12 +862,14 @@ class SCP internal constructor(
     /**
      * Forwards to [NativeScp.identityCreate] on [inner].
      *
-     * [seed] is a testing-only parameter for the ADR-046 cross-bridge
-     * parity harness; pass `null` from production callers (in-memory
-     * custody uses OS RNG when [seed] is `null`).
+     * [testingSeed] is a testing-only parameter for the ADR-046
+     * cross-bridge parity harness; pass `null` from production callers
+     * (in-memory custody uses OS RNG when [testingSeed] is `null`). A
+     * non-`null` [testingSeed] is only valid for `custody == "in_memory"`;
+     * other custody types reject it with `SCP-VALID-7009`.
      */
-    suspend fun identityCreate(custody: String, seed: ByteArray? = null): Identity =
-        inner.identityCreate(custody = custody, seed = seed)
+    suspend fun identityCreate(custody: String, testingSeed: ByteArray? = null): Identity =
+        inner.identityCreate(custody = custody, testingSeed = testingSeed)
 
     /** Forwards to [NativeScp.identityCreateLinkAttestation] on [inner]. */
     @Suppress("LongParameterList")
