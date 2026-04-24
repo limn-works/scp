@@ -103,11 +103,11 @@ pub const IDENT_1043: &str = "SCP-IDENT-1043";
 pub const IDENT_1044: &str = "SCP-IDENT-1044";
 /// Identity attestation list.
 pub const IDENT_1045: &str = "SCP-IDENT-1045";
-/// SCPID default closure unbound.
+/// SCPID unbound closure invoked directly.
 ///
 /// Construct an SCP-backed closure via `SCP.scpidSign` /
 /// `SCP.scpidChallenge` / `SCP.scpidVerify`. Only surfaced by the Swift
-/// SDK's `ScpId.defaultSign` / `defaultChallenge` / `defaultVerify`
+/// SDK's `ScpId.unboundSign` / `unboundChallenge` / `unboundVerify`
 /// stubs when a caller invokes them directly instead of passing an
 /// `SCP`-bound closure.
 pub const IDENT_1046: &str = "SCP-IDENT-1046";

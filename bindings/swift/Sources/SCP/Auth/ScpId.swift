@@ -171,39 +171,45 @@ public enum ScpId {
         _ challengeJson: String
     ) throws -> String
 
-    /// Default challenge function — delegates to an `SCP` instance's
-    /// `scpidChallenge(audience:ttlSeconds:)` method. The free
-    /// `scpidChallenge` UniFFI export was removed in Phase 4 PR 5 (ADR-048).
-    public static let defaultChallenge: ChallengeFn = { _, _ in
-        throw ScpError.Validation(
-            msg: "scpidChallenge default is not wired after façade deletion — pass an SCP-bound closure (see SCP.scpidChallenge)",
-            code: "SCP-IDENT-1046"
-        )
-    }
-
-    /// Default sign function — placeholder; callers must supply an
+    /// Unbound challenge function — placeholder; callers must supply an
     /// `SCP`-bound closure via the SDK wrapper because the free
-    /// `scpidSign` UniFFI export was removed in Phase 4 PR 5 (ADR-048).
-    public static let defaultSign: SignFn = { _, _, _ in
-        throw ScpError.Validation(
-            msg: "scpidSign default is not wired after façade deletion — pass an SCP-bound closure (see SCP.scpidSign)",
-            code: "SCP-IDENT-1046"
-        )
-    }
-
-    /// Default verify function — placeholder; callers must supply an
-    /// `SCP`-bound closure because the free `scpidVerify` UniFFI export
-    /// was removed in Phase 4 PR 5 (ADR-048) and replaced with
-    /// `Scp::scpid_verify` (per-instance) so the DID resolver used for
-    /// signature verification is routed through the caller's own `SCP`
+    /// `scpidChallenge` UniFFI export was removed in Phase 4 PR 5
+    /// (ADR-048) and replaced with `Scp::scpid_challenge` (per-instance)
+    /// so all SCPID operations route through the caller's own `SCP`
     /// rather than a process-global default.
-    public static let defaultVerify: VerifyFn = { _, _ in
+    public static let unboundChallenge: ChallengeFn = { _, _ in
         throw ScpError.Validation(
-            msg: "scpidVerify default is not wired after façade deletion — pass an SCP-bound closure (see SCP.scpidVerify)",
+            msg: "scpidChallenge is unbound — pass an SCP-bound closure (see SCP.scpidChallenge)",
             code: "SCP-IDENT-1046"
         )
     }
 
+    /// Unbound sign function — placeholder; callers must supply an
+    /// `SCP`-bound closure via the SDK wrapper because the free
+    /// `scpidSign` UniFFI export was removed in Phase 4 PR 5 (ADR-048)
+    /// and replaced with `Scp::scpid_sign` (per-instance) so signing
+    /// routes through the caller's own `SCP` identity registry rather
+    /// than a process-global default.
+    public static let unboundSign: SignFn = { _, _, _ in
+        throw ScpError.Validation(
+            msg: "scpidSign is unbound — pass an SCP-bound closure (see SCP.scpidSign)",
+            code: "SCP-IDENT-1046"
+        )
+    }
+
+    /// Unbound verify function — placeholder; callers must supply an
+    /// `SCP`-bound closure via the SDK wrapper because the free
+    /// `scpidVerify` UniFFI export was removed in Phase 4 PR 5
+    /// (ADR-048) and replaced with `Scp::scpid_verify` (per-instance)
+    /// so the DID resolver used for signature verification is routed
+    /// through the caller's own `SCP` rather than a process-global
+    /// default.
+    public static let unboundVerify: VerifyFn = { _, _ in
+        throw ScpError.Validation(
+            msg: "scpidVerify is unbound — pass an SCP-bound closure (see SCP.scpidVerify)",
+            code: "SCP-IDENT-1046"
+        )
+    }
 
     // MARK: - Public API
 
