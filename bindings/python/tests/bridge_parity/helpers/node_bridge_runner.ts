@@ -157,8 +157,27 @@ type AnyBridge = any;
 
 let wasmModule: AnyBridge | null = null;
 
+// The parity runner loads the Node/Bun-target wasm-pack build (pkg-node),
+// not the bundler-target package that ships to npm. The bundler output
+// uses `import * as wasm from "./scp_ffi_wasm_bg.wasm"` followed by
+// `wasm.__wbindgen_start()` at module load — a shape that depends on the
+// bundler (Webpack/Rollup) instantiating the wasm import synchronously
+// so that `__wbindgen_start` is reachable on the namespace. Bun's native
+// ESM wasm import does not expose start-function exports on the namespace
+// object, so loading the bundler package under Bun fails with
+// `wasm.__wbindgen_start is not a function` and leaves the instance
+// half-initialized (subsequent calls fail with `malloc is not a
+// function`). The Node-target build (`--target nodejs`) is a CommonJS
+// module that reads and instantiates the `.wasm` binary itself via
+// `fs.readFileSync` + `new WebAssembly.Instance(...)` and invokes
+// `__wbindgen_start()` directly — so it works in every Node-compatible
+// runtime (Bun included) without any bundler contract.
+//
+// Build once before running the parity suite:
+//   wasm-pack build crates/scp-ffi/wasm --target nodejs \
+//     --out-dir pkg-node --features testing
 const WASM_RAW_PATH =
-  "../../../../../bindings/typescript/node_modules/@limn-works/scp-ts-wasm/scp_ffi_wasm.js";
+  "../../../../../crates/scp-ffi/wasm/pkg-node/scp_ffi_wasm.js";
 
 // Lazy handle to the raw napi-rs native addon. The SDK `createNativeBridge`
 // requires a caller-supplied `SCP` (ADR-048 per-instance routing); the
