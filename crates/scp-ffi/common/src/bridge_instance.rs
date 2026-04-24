@@ -1318,6 +1318,12 @@ impl CoreFields {
         // despite no adapters being installed — a split-brain where
         // `resume()` reports success but transport is broken.
         let mut first_panic_failure: Option<LifecycleError> = None;
+        // Separate boolean so the partial-success log emission downstream
+        // can flag `panicked = true` without having to parse
+        // `first_failure`'s reason string. Used for log-based alerting
+        // (bug-catcher L1): a panic inside a `tokio::spawn` is a defect,
+        // not an expected dial failure, and should page.
+        let mut any_task_panicked = false;
         loop {
             tokio::select! {
                 biased;
@@ -1339,6 +1345,7 @@ impl CoreFields {
                         None => break,
                         Some(Ok(pair)) => results.push(pair),
                         Some(Err(join_err)) => {
+                            any_task_panicked = true;
                             tracing::warn!(
                                 error = %join_err,
                                 "reconnect_transport_if_pending: spawned task panicked — \
@@ -1447,20 +1454,36 @@ impl CoreFields {
         // If at least one adapter actually landed in the transport manager,
         // report success: the caller would otherwise see `Err` but observe
         // a working transport, and a retry would duplicate the already-open
-        // sockets. Panics and per-URL dial failures are demoted to
-        // `tracing::warn!` in this case (the per-site warnings were already
-        // emitted above). If `set_transport` itself failed, we keep the
-        // error so the caller can distinguish "nothing landed" from
-        // "transport live with some losses".
+        // sockets. A panic inside a spawned reconnect task is a real defect
+        // (uncaught `unwrap`, assertion failure, OOM) and is promoted to
+        // `tracing::error!` with a structured `panicked` field so log-based
+        // alerting can page on it. Plain per-URL dial failures (network
+        // refused, timeout) stay at `tracing::warn!` — those are routine
+        // and recoverable on the next reconnect cycle. If `set_transport`
+        // itself failed, we keep the error so the caller can distinguish
+        // "nothing landed" from "transport live with some losses".
         if connected_count > 0 && !install_failed {
             if let Some(err) = first_failure.as_ref() {
-                tracing::warn!(
-                    error = %err,
-                    connected_count,
-                    "reconnect_transport_if_pending: partial success — transport installed \
-                     with {connected_count} adapter(s); some dials failed or panicked but the \
-                     bridge is usable"
-                );
+                if any_task_panicked {
+                    tracing::error!(
+                        error = %err,
+                        connected_count,
+                        panicked = true,
+                        "reconnect_transport_if_pending: partial success — transport installed \
+                         with {connected_count} adapter(s); at least one reconnect task \
+                         PANICKED — investigate the backtrace, the bridge is usable but a \
+                         reconnect path is throwing"
+                    );
+                } else {
+                    tracing::warn!(
+                        error = %err,
+                        connected_count,
+                        panicked = false,
+                        "reconnect_transport_if_pending: partial success — transport installed \
+                         with {connected_count} adapter(s); some dials failed but the bridge \
+                         is usable"
+                    );
+                }
             }
             return Ok(());
         }
