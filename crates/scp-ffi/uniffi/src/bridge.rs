@@ -5805,10 +5805,11 @@ pub fn bridge_register(
 
     let parsed_platform_key = platform_key
         .map(|k| {
-            <[u8; 32]>::try_from(k.as_slice()).map_err(|_| ScpError::Validation {
-                msg: format!("platform_key must be exactly 32 bytes, got {}", k.len()),
-                code: codes::VALID_7052.to_owned(),
-            })
+            scp_ffi_common::validate::expect_fixed_bytes::<32>(k.as_slice(), "platform_key")
+                .map_err(|msg| ScpError::Validation {
+                    msg,
+                    code: codes::VALID_7052.to_owned(),
+                })
         })
         .transpose()?;
 
@@ -9636,11 +9637,12 @@ impl Scp {
 
                 let implementation_hash: [u8; 32] = match definition.implementation_hash.as_deref() {
                     None => [0u8; 32],
-                    Some(bytes) => <[u8; 32]>::try_from(bytes).map_err(|_| ScpError::Validation {
-                        msg: format!(
-                            "implementation_hash must be exactly 32 bytes, got {}",
-                            bytes.len()
-                        ),
+                    Some(bytes) => scp_ffi_common::validate::expect_fixed_bytes::<32>(
+                        bytes,
+                        "implementation_hash",
+                    )
+                    .map_err(|msg| ScpError::Validation {
+                        msg,
                         code: codes::VALID_7038.to_owned(),
                     })?,
                 };
@@ -10505,14 +10507,14 @@ impl Scp {
                         msg: format!("invalid interface_id_hex: not valid hex: {e}"),
                         code: codes::VALID_7042.to_owned(),
                     })?;
-                let interface_id: [u8; 32] = <[u8; 32]>::try_from(interface_id_bytes.as_slice())
-                    .map_err(|_| ScpError::Validation {
-                        msg: format!(
-                            "interface_id_hex must be exactly 32 bytes (64 hex chars), got {}",
-                            interface_id_bytes.len()
-                        ),
-                        code: codes::VALID_7042.to_owned(),
-                    })?;
+                let interface_id: [u8; 32] = scp_ffi_common::validate::expect_fixed_bytes::<32>(
+                    interface_id_bytes.as_slice(),
+                    "interface_id_hex",
+                )
+                .map_err(|msg| ScpError::Validation {
+                    msg,
+                    code: codes::VALID_7042.to_owned(),
+                })?;
 
                 let now_ms = scp_primitives::SystemClock.now_millis();
 
@@ -10767,31 +10769,24 @@ impl Scp {
                     if let Ok(Some(entries)) = manager.event_log_entries(&ctx_id_bytes)
                         && !entries.is_empty()
                     {
-                        #[allow(clippy::cast_possible_truncation)]
-                        let mut manager_events: Vec<Event> = Vec::new();
-                        for (idx, entry) in entries.iter().enumerate() {
-                            let seq = idx as u64;
-                            if let Some(after) = filter_after_seq
-                                && seq <= after
-                            {
-                                continue;
-                            }
-                            if let Some(before) = filter_before_seq
-                                && seq >= before
-                            {
-                                continue;
-                            }
-                            if let Some(ref et) = filter_event_type
-                                && entry.event != *et
-                            {
-                                continue;
-                            }
-                            if let Some(ref actor) = filter_actor_did
-                                && entry.actor_did != *actor
-                            {
-                                continue;
-                            }
-                            manager_events.push(Event {
+                        // Canonical filter — pinned across PyO3/NAPI/UniFFI by
+                        // `scp_ffi_common::event_log::filter_manager_entries`
+                        // so the three bridges cannot drift on
+                        // `after_sequence` / `before_sequence` / `event_type` /
+                        // `actor_did` / `limit`. Each bridge still owns its
+                        // native `Event` mapping below.
+                        let filter = scp_ffi_common::event_log::EventLogFilter {
+                            after_sequence: filter_after_seq,
+                            before_sequence: filter_before_seq,
+                            event_type: filter_event_type.as_deref(),
+                            actor_did: filter_actor_did.as_deref(),
+                            limit: filter_limit,
+                        };
+                        let filtered =
+                            scp_ffi_common::event_log::filter_manager_entries(&entries, &filter);
+                        let manager_events: Vec<Event> = filtered
+                            .into_iter()
+                            .map(|(seq, entry)| Event {
                                 event_type: entry.event.clone(),
                                 actor_did: entry.actor_did.clone(),
                                 timestamp: entry.timestamp,
@@ -10800,13 +10795,8 @@ impl Scp {
                                 })
                                 .to_string(),
                                 sequence: seq,
-                            });
-                            if let Some(lim) = filter_limit
-                                && manager_events.len() >= lim
-                            {
-                                break;
-                            }
-                        }
+                            })
+                            .collect();
                         // Once the outer `!entries.is_empty()` guard passes we
                         // return the (possibly filtered-empty) manager result
                         // instead of falling through to the UCAN-state event
@@ -11565,10 +11555,12 @@ impl Scp {
     /// handle-affinity check to perform.
     #[allow(clippy::unused_async)] // Must be async: UniFFI generates Swift async / Kotlin suspend.
     pub async fn transport_manager_status(&self) -> Result<TransportStatus, ScpError> {
+        let (connected, relay_url, latency_ms) =
+            scp_ffi_common::handleless_transport_status(self.inner.core.has_transport());
         Ok(TransportStatus {
-            connected: self.inner.core.has_transport(),
-            relay_url: None,
-            latency_ms: None,
+            connected,
+            relay_url,
+            latency_ms,
         })
     }
 

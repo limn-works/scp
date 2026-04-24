@@ -236,31 +236,21 @@ fn query_manager_entries(
         return Ok(None);
     }
 
-    let mut py_events = Vec::new();
-    for (idx, entry) in entries.iter().enumerate() {
-        let seq = idx as u64;
-        // Apply sequence range filters (exclusive on both ends to match
-        // UniFFI's `after_sequence` / `before_sequence` semantics).
-        if let Some(after) = query_filter.sequence_start
-            && seq <= after
-        {
-            continue;
-        }
-        if let Some(before) = query_filter.sequence_end
-            && seq >= before
-        {
-            continue;
-        }
-        if let Some(ref et) = query_filter.event_type
-            && entry.event != *et
-        {
-            continue;
-        }
-        if let Some(ref actor) = query_filter.actor_did
-            && entry.actor_did != *actor
-        {
-            continue;
-        }
+    // Canonical filter — pinned across PyO3/NAPI/UniFFI by
+    // `scp_ffi_common::event_log::filter_manager_entries` so the three
+    // bridges cannot drift. Each bridge still owns its payload/timestamp
+    // mapping below; the helper only encodes the filter contract.
+    let filter = scp_ffi_common::event_log::EventLogFilter {
+        after_sequence: query_filter.sequence_start,
+        before_sequence: query_filter.sequence_end,
+        event_type: query_filter.event_type.as_deref(),
+        actor_did: query_filter.actor_did.as_deref(),
+        limit: query_filter.limit,
+    };
+    let filtered = scp_ffi_common::event_log::filter_manager_entries(&entries, &filter);
+
+    let mut py_events = Vec::with_capacity(filtered.len());
+    for (seq, entry) in filtered {
         #[allow(clippy::cast_precision_loss)]
         let timestamp = entry.timestamp as f64;
         let payload_json = serde_json::json!({
@@ -274,11 +264,6 @@ fn query_manager_entries(
             payload,
             sequence: seq,
         });
-        if let Some(limit) = query_filter.limit
-            && py_events.len() >= limit
-        {
-            break;
-        }
     }
     Ok(Some(py_events))
 }

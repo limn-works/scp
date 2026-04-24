@@ -119,37 +119,26 @@ pub(crate) async fn event_log_query_on(
     if let Some(entries) = manager_entries
         && !entries.is_empty()
     {
-        // Build NapiEvent list from the ContextManager's Merkle entries.
-        // EventLogEntry carries `event`, `actor_did`, `timestamp`, `hash`; index
-        // within the entries slice becomes `sequence`. Filter semantics mirror
-        // UniFFI's `event_log_query`: `after_sequence` / `before_sequence` are
-        // exclusive on both ends.
+        // Canonical filter — pinned across PyO3/NAPI/UniFFI by
+        // `scp_ffi_common::event_log::filter_manager_entries` so the three
+        // bridges cannot drift on `after_sequence` / `before_sequence` /
+        // `event_type` / `actor_did` / `limit`. Each bridge still owns its
+        // `Event`/`NapiEvent`/`PyEvent` mapping; the helper only encodes the
+        // filter contract. Filter semantics: `after_sequence` /
+        // `before_sequence` exclusive on both ends (matches UniFFI reference).
+        let filter = scp_ffi_common::event_log::EventLogFilter {
+            after_sequence: after_sequence_filter,
+            before_sequence: before_sequence_filter,
+            event_type: event_type_filter.as_deref(),
+            actor_did: actor_did_filter.as_deref(),
+            limit,
+        };
+        let filtered = scp_ffi_common::event_log::filter_manager_entries(&entries, &filter);
+
         #[allow(clippy::cast_precision_loss)]
-        let mut events: Vec<NapiEvent> = Vec::new();
-        for (idx, entry) in entries.iter().enumerate() {
-            let seq = idx as u64;
-            if let Some(after) = after_sequence_filter
-                && seq <= after
-            {
-                continue;
-            }
-            if let Some(before) = before_sequence_filter
-                && seq >= before
-            {
-                continue;
-            }
-            if let Some(ref et) = event_type_filter
-                && entry.event != *et
-            {
-                continue;
-            }
-            if let Some(ref actor) = actor_did_filter
-                && entry.actor_did != *actor
-            {
-                continue;
-            }
-            #[allow(clippy::cast_precision_loss)]
-            events.push(NapiEvent {
+        let events: Vec<NapiEvent> = filtered
+            .into_iter()
+            .map(|(seq, entry)| NapiEvent {
                 event_type: entry.event.clone(),
                 actor_did: entry.actor_did.clone(),
                 timestamp: entry.timestamp as f64,
@@ -158,13 +147,8 @@ pub(crate) async fn event_log_query_on(
                 })
                 .to_string(),
                 sequence: seq as f64,
-            });
-            if let Some(lim) = limit
-                && events.len() >= lim
-            {
-                break;
-            }
-        }
+            })
+            .collect();
 
         return Ok(events);
     }
