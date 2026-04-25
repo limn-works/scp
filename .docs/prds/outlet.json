@@ -1156,7 +1156,7 @@
       "gate": "gate-classification",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/outlets.rs",
         "crates/scp-ffi/napi/src/outlets.rs",
