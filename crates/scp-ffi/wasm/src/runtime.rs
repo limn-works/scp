@@ -17,7 +17,7 @@ pub use scp_protocol::context::outlets::schema::{
     SchemaValidationError, validate_schema, validate_value_against_schema,
 };
 pub use scp_protocol::context::outlets::{
-    OutletTestVector, OutletCost, OutletRegistration, OutletRegistry, OutletSchema,
+    OutletCost, OutletRegistration, OutletRegistry, OutletSchema, OutletTestVector,
 };
 
 /// Inserts an outlet registration with duplicate checking.

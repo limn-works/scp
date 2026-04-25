@@ -33,12 +33,14 @@ describe("defineOutletDefinition", () => {
     const def = defineOutletDefinition({
       name: "calc",
       description: "A calculator",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: "did:dht:z6MkTest",
     });
     expect(def.name).toBe("calc");
     expect(def.operator).toBe("did:dht:z6MkTest");
+    expect(def.kind).toBe("action");
   });
 
   it("rejects empty name", () => {
@@ -46,6 +48,7 @@ describe("defineOutletDefinition", () => {
       defineOutletDefinition({
         name: "",
         description: "d",
+        kind: "action",
         inputSchema: {},
         outputSchema: {},
         operator: "did:dht:a",
@@ -58,11 +61,45 @@ describe("defineOutletDefinition", () => {
       defineOutletDefinition({
         name: "n",
         description: "d",
+        kind: "action",
         inputSchema: {},
         outputSchema: {},
         operator: "",
       }),
     ).toThrow(ValidationError);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SCP-OUT-017: OutletKind required + assertOutletKind + register helpers.
+// ---------------------------------------------------------------------------
+
+describe("SCP-OUT-017 OutletKind required", () => {
+  it("defineOutletDefinition rejects an invalid `kind` string at runtime", () => {
+    expect(() =>
+      defineOutletDefinition({
+        name: "n",
+        description: "d",
+        // @ts-expect-error: SCP-OUT-017 makes kind a string-literal union of 'query' | 'action'.
+        kind: "mutation",
+        inputSchema: {},
+        outputSchema: {},
+        operator: "did:dht:a",
+      }),
+    ).toThrow(ValidationError);
+  });
+
+  it("OUTLET_KINDS exposes the §5.4.2 wire vocabulary", async () => {
+    const { OUTLET_KINDS } = await import("../src/outlets");
+    expect(OUTLET_KINDS).toEqual(["query", "action"]);
+  });
+
+  it("assertOutletKind narrows the input type and rejects unknowns", async () => {
+    const { assertOutletKind } = await import("../src/outlets");
+    expect(() => assertOutletKind("query")).not.toThrow();
+    expect(() => assertOutletKind("action")).not.toThrow();
+    expect(() => assertOutletKind("mutation")).toThrow(ValidationError);
+    expect(() => assertOutletKind(123)).toThrow(ValidationError);
   });
 });
 

@@ -28,6 +28,7 @@ use scp_ffi_uniffi::{
     GovernanceModel,
     MemoryScope,
     OutletDefinition,
+    OutletKind,
     // Free functions — bridge trust
     bridge_evaluate_trust,
     // Free functions — broadcast
@@ -66,6 +67,9 @@ use scp_ffi_uniffi::{
     identity_migrate,
     // Free functions — local DID management
     is_local_did,
+    // Free functions — tools
+    outlet_register,
+    outlet_verify,
     provenance_attach,
     provenance_check_chain_depth,
     register_local_did,
@@ -74,9 +78,6 @@ use scp_ffi_uniffi::{
     // Free functions — sync
     sync_classify_offline,
     sync_classify_offline_custom,
-    // Free functions — tools
-    outlet_register,
-    outlet_verify,
     // Free functions — transport
     transport_connect,
     // Free functions — UCAN
@@ -621,6 +622,8 @@ async fn tool_register_and_verify() {
     let definition = OutletDefinition {
         name: "calculator".to_owned(),
         description: "A simple calculator tool".to_owned(),
+        // SCP-OUT-017: kind is required at the bridge.
+        kind: OutletKind::Action,
         input_schema_json:
             r#"{"type":"object","properties":{"a":{"type":"number"},"b":{"type":"number"}}}"#
                 .to_owned(),

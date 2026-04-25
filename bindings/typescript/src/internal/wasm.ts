@@ -1197,13 +1197,18 @@ export function createWasmBridge(): Bridge {
     // Tools -- delegates to WASM runtime registry
     async toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string> {
       const wasm = getWasm();
+      // SCP-OUT-017: kind is REQUIRED — the WASM bridge `extract_outlet_kind`
+      // helper enforces it at the JSON layer with a `ValidationError` on
+      // missing/null. The TypeScript surface enforces it at compile time.
+      // The bridge JSON shape uses `schema` (object with input/output)
+      // for `validate_schema_field` rather than the flat `outletSchema`
+      // shape NAPI uses; this mirrors the WASM `outletRegister` parser.
       const definitionJson = JSON.stringify({
         name: definition.name,
         description: definition.description,
-        schema: {
-          input: definition.inputSchema,
-          output: definition.outputSchema,
-        },
+        kind: definition.kind,
+        schema: definition.inputSchema,
+        outputSchema: definition.outputSchema,
         operatorDid: definition.operator,
         testVectors: definition.testVectors?.map((tv) => ({
           input: tv.input,

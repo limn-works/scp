@@ -79,13 +79,13 @@ def parse_capability(name: str):
         ("outlet_call:", "OutletCall"),
     ):
         if name.startswith(prefix):
-            suffix = name[len(prefix):]
+            suffix = name[len(prefix) :]
             if not _OUTLET_SUFFIX_RE.match(suffix):
                 return None
             return (kind, suffix)
 
     if name.startswith("custom:"):
-        return ("Custom", name[len("custom:"):])
+        return ("Custom", name[len("custom:") :])
     return ("Custom", name)
 
 
@@ -125,8 +125,7 @@ def test_negative_vectors(fixture):
     for v in fixture["negative"]:
         actual = parse_capability(v["input"])
         assert actual is None, (
-            f"negative vector must reject: {v['input']!r} ({v['reason']}) "
-            f"but parsed to {actual}"
+            f"negative vector must reject: {v['input']!r} ({v['reason']}) but parsed to {actual}"
         )
 
 

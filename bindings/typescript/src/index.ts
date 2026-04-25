@@ -79,15 +79,18 @@ export type {
   OutletCost,
   OutletDefinition,
   OutletId,
+  OutletKind,
   OutletStreamChunk,
   SessionId,
 } from "./outlets";
 export {
+  assertOutletKind,
   CaveatBuilder,
   caveats,
   defineOutletDefinition,
   InvocationHandle,
   newSessionId,
+  OUTLET_KINDS,
   OutletNamespace,
   OutletOffersNamespace,
   OutletSessionsNamespace,

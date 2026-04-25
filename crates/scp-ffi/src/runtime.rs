@@ -1395,7 +1395,10 @@ pub fn register_ffi_state(
             } else {
                 user_ceiling
                     .iter()
-                    .filter_map(|s| scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name()))
+                    .filter_map(|s| {
+                        scp_core::context::roles::Capability::new(s)
+                            .map(|c| c.ucan_capability_name())
+                    })
                     .collect::<HashSet<String>>()
             };
             let role_state =

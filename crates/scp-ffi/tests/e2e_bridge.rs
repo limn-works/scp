@@ -124,6 +124,8 @@ fn build_tool_reg<'py>(py: Python<'py>, name: &str, operator_did: &str) -> Bound
     reg.set_item("description", format!("Tool: {name}"))
         .unwrap();
     reg.set_item("operator_did", operator_did).unwrap();
+    // SCP-OUT-017: kind is required at the bridge boundary.
+    reg.set_item("kind", "action").unwrap();
     let schema = PyDict::new(py);
     let is = PyDict::new(py);
     is.set_item("type", "object").unwrap();
@@ -335,6 +337,8 @@ fn tool_register_and_verify() {
         reg.set_item("name", "test_tool").unwrap();
         reg.set_item("description", "A test tool").unwrap();
         reg.set_item("operator_did", &did).unwrap();
+        // SCP-OUT-017: kind is required at the bridge boundary.
+        reg.set_item("kind", "action").unwrap();
 
         let schema = PyDict::new(py);
         let input_schema = PyDict::new(py);
@@ -370,7 +374,8 @@ fn tool_register_and_verify() {
         let tv_list = PyList::new(py, &[tv]).unwrap();
         reg.set_item("test_vectors", tv_list).unwrap();
 
-        let outlet_id = _scp_core::outlets::py_outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
+        let outlet_id =
+            _scp_core::outlets::py_outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
         assert!(outlet_id.contains("test_tool"));
 
         let result = _scp_core::outlets::py_outlet_verify(&ctx_id, &outlet_id).unwrap();
@@ -440,9 +445,8 @@ fn outlet_register_rejects_query_with_positive_cost_via_pyo3_bridge() {
         reg.set_item("cost", cost).unwrap();
 
         let result = _scp_core::outlets::py_outlet_register(&ctx_id, &reg.as_borrowed());
-        let err = result.expect_err(
-            "Query+cost.amount=1 must be rejected end-to-end through the PyO3 bridge",
-        );
+        let err = result
+            .expect_err("Query+cost.amount=1 must be rejected end-to-end through the PyO3 bridge");
         let msg = err.to_string();
         // The bridge propagates the protocol's QueryCostViolation through
         // ScpPyError::context — the message must mention Query and the
@@ -1083,7 +1087,8 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
 
         // Register a tool using the helper.
         let reg = build_tool_reg(py, "cross_domain_tool", &did_a);
-        let outlet_id = _scp_core::outlets::py_outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
+        let outlet_id =
+            _scp_core::outlets::py_outlet_register(&ctx_id, &reg.as_borrowed()).unwrap();
         assert!(!outlet_id.is_empty());
 
         // Verify tool.

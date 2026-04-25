@@ -1874,12 +1874,11 @@ impl WasmContextManager {
         let ctx = self.require_active_context_mut(context_id)?;
 
         let outlet_id = registration.outlet_id.clone();
-        crate::runtime::outlet_registry_insert_unique(&mut ctx.outlet_registry, registration).map_err(
-            |e| ScpWasmError::Tool {
+        crate::runtime::outlet_registry_insert_unique(&mut ctx.outlet_registry, registration)
+            .map_err(|e| ScpWasmError::Tool {
                 message: e,
                 code: codes::TOOL_6001.to_owned(),
-            },
-        )?;
+            })?;
 
         let actor = ctx.creator_did.clone();
         ctx.append_log_event(EventType::OutletRegistered, &actor, outlet_id.as_bytes());
@@ -1969,13 +1968,13 @@ impl WasmContextManager {
     ) -> Result<serde_json::Value, ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        let registration = ctx
-            .outlet_registry
-            .get(outlet_id)
-            .ok_or_else(|| ScpWasmError::Tool {
-                message: format!("tool '{outlet_id}' not found in context '{context_id}'"),
-                code: codes::TOOL_6002.to_owned(),
-            })?;
+        let registration =
+            ctx.outlet_registry
+                .get(outlet_id)
+                .ok_or_else(|| ScpWasmError::Tool {
+                    message: format!("tool '{outlet_id}' not found in context '{context_id}'"),
+                    code: codes::TOOL_6002.to_owned(),
+                })?;
 
         // Validate input against the tool's input schema.
         validate_value_against_schema(input_json, &registration.schema.input_schema).map_err(
@@ -2027,13 +2026,13 @@ impl WasmContextManager {
     ) -> Result<(bool, Vec<String>), ScpWasmError> {
         let ctx = self.require_context(context_id)?;
 
-        let registration = ctx
-            .outlet_registry
-            .get(outlet_id)
-            .ok_or_else(|| ScpWasmError::Tool {
-                message: format!("tool '{outlet_id}' not found in context '{context_id}'"),
-                code: codes::TOOL_6003.to_owned(),
-            })?;
+        let registration =
+            ctx.outlet_registry
+                .get(outlet_id)
+                .ok_or_else(|| ScpWasmError::Tool {
+                    message: format!("tool '{outlet_id}' not found in context '{context_id}'"),
+                    code: codes::TOOL_6003.to_owned(),
+                })?;
 
         // Verify test vectors by validating inputs against the input schema.
         let mut failures = Vec::new();
@@ -2081,14 +2080,14 @@ impl WasmContextManager {
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        let existing =
-            ctx.outlet_registry
-                .get(outlet_id)
-                .ok_or_else(|| ScpWasmError::Tool {
-                    message: format!("outlet '{outlet_id}' not found in context '{context_id}'"),
-                    code: codes::TOOL_6002.to_owned(),
-                })?
-                .clone();
+        let existing = ctx
+            .outlet_registry
+            .get(outlet_id)
+            .ok_or_else(|| ScpWasmError::Tool {
+                message: format!("outlet '{outlet_id}' not found in context '{context_id}'"),
+                code: codes::TOOL_6002.to_owned(),
+            })?
+            .clone();
 
         let is_operator = existing.operator_did.as_ref() == updater_did;
         let is_admin = ctx.creator_did == updater_did;
@@ -2152,14 +2151,14 @@ impl WasmContextManager {
     ) -> Result<(), ScpWasmError> {
         let ctx = self.require_active_context_mut(context_id)?;
 
-        let existing =
-            ctx.outlet_registry
-                .get(outlet_id)
-                .ok_or_else(|| ScpWasmError::Tool {
-                    message: format!("outlet '{outlet_id}' not found in context '{context_id}'"),
-                    code: codes::TOOL_6002.to_owned(),
-                })?
-                .clone();
+        let existing = ctx
+            .outlet_registry
+            .get(outlet_id)
+            .ok_or_else(|| ScpWasmError::Tool {
+                message: format!("outlet '{outlet_id}' not found in context '{context_id}'"),
+                code: codes::TOOL_6002.to_owned(),
+            })?
+            .clone();
 
         let is_operator = existing.operator_did.as_ref() == actor_did;
         let is_admin = ctx.creator_did == actor_did;
@@ -2189,7 +2188,11 @@ impl WasmContextManager {
     /// Returns an error if the context is not found.
     pub fn list_outlets(&self, context_id: &str) -> Result<Vec<String>, ScpWasmError> {
         let ctx = self.require_context(context_id)?;
-        let mut ids: Vec<String> = ctx.outlet_registry.tool_ids().map(ToOwned::to_owned).collect();
+        let mut ids: Vec<String> = ctx
+            .outlet_registry
+            .tool_ids()
+            .map(ToOwned::to_owned)
+            .collect();
         ids.sort();
         Ok(ids)
     }
@@ -2258,15 +2261,16 @@ impl WasmContextManager {
         }
 
         // Validate tool exists in target and validate input.
-        let registration = target
-            .outlet_registry
-            .get(outlet_id)
-            .ok_or_else(|| ScpWasmError::Tool {
-                message: format!(
-                    "tool '{outlet_id}' not found in target context '{target_context_id}'"
-                ),
-                code: codes::TOOL_6003.to_owned(),
-            })?;
+        let registration =
+            target
+                .outlet_registry
+                .get(outlet_id)
+                .ok_or_else(|| ScpWasmError::Tool {
+                    message: format!(
+                        "tool '{outlet_id}' not found in target context '{target_context_id}'"
+                    ),
+                    code: codes::TOOL_6003.to_owned(),
+                })?;
 
         validate_value_against_schema(input, &registration.schema.input_schema).map_err(|e| {
             ScpWasmError::Tool {
@@ -3731,12 +3735,12 @@ impl WasmContextManager {
             registered_at,
             signature: Vec::new(),
         };
-        crate::runtime::outlet_registry_insert_unique(&mut ctx.outlet_registry, reg).map_err(|e| {
-            ScpWasmError::Tool {
+        crate::runtime::outlet_registry_insert_unique(&mut ctx.outlet_registry, reg).map_err(
+            |e| ScpWasmError::Tool {
                 message: e,
                 code: codes::TOOL_6001.to_owned(),
-            }
-        })?;
+            },
+        )?;
         Ok(serde_json::json!({"action": "RegisterTool", "toolId": outlet_id}))
     }
 

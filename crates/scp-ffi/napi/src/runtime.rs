@@ -35,7 +35,7 @@ use scp_core::context::builder::ContextEventLogProvider;
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
 use scp_core::context::providers::MerkleEventLogProvider;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
-use scp_core::context::tools::{SessionStore, OutletRegistry};
+use scp_core::context::tools::{OutletRegistry, SessionStore};
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
@@ -1418,7 +1418,9 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
     } else {
         handle_ceiling
             .into_iter()
-            .filter_map(|s| scp_core::context::roles::Capability::new(&s).map(|c| c.ucan_capability_name()))
+            .filter_map(|s| {
+                scp_core::context::roles::Capability::new(&s).map(|c| c.ucan_capability_name())
+            })
             .collect::<HashSet<String>>()
     };
 

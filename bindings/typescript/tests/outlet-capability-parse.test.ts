@@ -101,7 +101,10 @@ function parseCapability(name: string): ParseResult {
   }
 
   if (name in KNOWN_EXACT) {
-    return { kind: KNOWN_EXACT[name], payload: null };
+    const kind = KNOWN_EXACT[name];
+    if (kind !== undefined) {
+      return { kind, payload: null };
+    }
   }
 
   const prefixes: [string, string][] = [

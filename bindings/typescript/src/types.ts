@@ -571,6 +571,14 @@ export interface OutletDefinitionInternal {
   readonly name: string;
   /** Outlet description. */
   readonly description: string;
+  /**
+   * Outlet semantic class (§5.4.2). REQUIRED at the SDK surface across all
+   * 4 bindings (SCP-OUT-017). Crosses the wire as the lowercase string
+   * `'query'` or `'action'`. The `OutletKind` named alias lives in
+   * `outlets.ts`; this interface keeps the raw string-literal union to
+   * avoid a circular import.
+   */
+  readonly kind: "query" | "action";
   /** JSON Schema for outlet input. */
   readonly inputSchema: Readonly<Record<string, unknown>>;
   /** JSON Schema for outlet output. */

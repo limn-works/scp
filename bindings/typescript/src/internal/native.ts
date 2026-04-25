@@ -678,10 +678,15 @@ export function createNativeBridge(): Bridge {
 
     // Tools
     async toolRegister(handle: BridgeContextHandle, definition: ToolDefinition): Promise<string> {
-      // NapiToolDefinition has different field names from the Bridge ToolDefinition.
+      // SCP-OUT-017: NapiOutletDefinition requires `kind` as a non-optional
+      // field. The TypeScript surface enforces this at compile time on
+      // `OutletDefinition` (extends ToolDefinition with `kind: OutletKind`);
+      // here we forward it to the napi-rs `string_enum` binding which
+      // accepts the lowercase wire form.
       const napiDef = {
         name: definition.name,
         description: definition.description,
+        kind: definition.kind,
         inputSchemaJson: JSON.stringify(definition.inputSchema),
         outputSchemaJson: JSON.stringify(definition.outputSchema),
         operatorDid: definition.operator,

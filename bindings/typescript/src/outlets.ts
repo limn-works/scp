@@ -279,12 +279,54 @@ export const caveats = {
 };
 
 // ---------------------------------------------------------------------------
+// OutletKind — outlet semantic class (Query vs Action), SCP-OUT-017.
+// ---------------------------------------------------------------------------
+
+/**
+ * Outlet semantic class (§5.4.2).
+ *
+ * `'query'` outlets are read-only and idempotent (UCAN stem
+ * `outlet_query:{id}`); `'action'` outlets may mutate state (UCAN stem
+ * `outlet_call:{id}`).
+ *
+ * Required at the SDK surface across all 4 bindings (SCP-OUT-017). The
+ * lowercase string-literal union matches the §5.4.2 wire vocabulary
+ * directly so callers do not have to import an enum.
+ */
+export type OutletKind = "query" | "action";
+
+/** Allowed values for {@link OutletKind} — useful for `as const` consumers. */
+export const OUTLET_KINDS: readonly OutletKind[] = ["query", "action"] as const;
+
+/**
+ * Validate that a string is a valid {@link OutletKind} value. Throws
+ * {@link ValidationError} with code `SCP-VALID-7050` on mismatch.
+ */
+export function assertOutletKind(value: unknown): asserts value is OutletKind {
+  if (value !== "query" && value !== "action") {
+    throw new ValidationError(
+      `OutletKind must be 'query' or 'action' (§5.4.2 wire vocabulary), got ${JSON.stringify(value)}`,
+      "SCP-VALID-7050",
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Outlet type aliases (public surface — ToolDefinition/ToolCost kept at wire
 // level for internal bridge compat; re-exported under outlet names here).
 // ---------------------------------------------------------------------------
 
-/** Alias for the outlet registration dataclass. Wire equivalent of §5.4.1. */
-export type OutletDefinition = ToolDefinition;
+/**
+ * Outlet registration definition (§5.4.1) — public SDK surface.
+ *
+ * SCP-OUT-017 makes `kind` REQUIRED. Omitting `kind` is a TypeScript
+ * compile error; passing `undefined` is rejected at runtime via the
+ * type-narrowing at the bridge boundary.
+ */
+export interface OutletDefinition extends ToolDefinition {
+  /** Outlet semantic class (Query vs Action — §5.4.2). REQUIRED. */
+  readonly kind: OutletKind;
+}
 /** Alias for per-invocation cost metadata (§5.4.1). */
 export type OutletCost = ToolCost;
 
@@ -566,9 +608,42 @@ export class OutletNamespace {
     this.offers = new OutletOffersNamespace(handle);
   }
 
+  /**
+   * Register an outlet in the context.
+   *
+   * SCP-OUT-017 makes `kind` REQUIRED on `OutletDefinition`. Omitting
+   * `kind` is a TypeScript compile error; the bridge re-enforces the
+   * requirement as defense in depth.
+   */
   async register(definition: OutletDefinition): Promise<string> {
+    if (definition.kind !== "query" && definition.kind !== "action") {
+      throw new ValidationError(
+        `OutletDefinition.kind must be 'query' or 'action' (§5.4.2 wire vocabulary, ` +
+          `SCP-OUT-017), got ${JSON.stringify(definition.kind)}`,
+        "SCP-VALID-7050",
+      );
+    }
     const bridge = await getBridge();
     return bridge.toolRegister(this.handle, definition);
+  }
+
+  /**
+   * Convenience: register an outlet with `kind: 'query'`.
+   *
+   * Equivalent to {@link register} with `kind` overridden to `'query'`.
+   * Useful for the common path where the outlet is read-only.
+   */
+  async registerQuery(definition: Omit<OutletDefinition, "kind">): Promise<string> {
+    return this.register({ ...definition, kind: "query" });
+  }
+
+  /**
+   * Convenience: register an outlet with `kind: 'action'`.
+   *
+   * Equivalent to {@link register} with `kind` overridden to `'action'`.
+   */
+  async registerAction(definition: Omit<OutletDefinition, "kind">): Promise<string> {
+    return this.register({ ...definition, kind: "action" });
   }
 
   /**
@@ -778,10 +853,14 @@ export { OutletError, OutletExecutionError };
 /**
  * Constructor helper — matches the pre-rename `defineToolDefinition` API,
  * renamed for outlet vocabulary (AC2).
+ *
+ * SCP-OUT-017 makes `kind` REQUIRED. Omitting `kind` is a TypeScript
+ * compile error.
  */
 export function defineOutletDefinition(params: {
   readonly name: string;
   readonly description: string;
+  readonly kind: OutletKind;
   readonly inputSchema: Readonly<Record<string, unknown>>;
   readonly outputSchema: Readonly<Record<string, unknown>>;
   readonly operator: string;
@@ -798,9 +877,11 @@ export function defineOutletDefinition(params: {
   if (params.operator.length === 0) {
     throw new ValidationError("Outlet operator DID must not be empty", "SCP-VALID-7012");
   }
+  assertOutletKind(params.kind);
   const result: OutletDefinition = {
     name: params.name,
     description: params.description,
+    kind: params.kind,
     inputSchema: params.inputSchema,
     outputSchema: params.outputSchema,
     operator: params.operator,

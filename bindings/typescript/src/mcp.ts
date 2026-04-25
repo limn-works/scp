@@ -259,6 +259,8 @@ export async function connectMcp(config: McpClientConfig): Promise<McpClient> {
             >,
             outputSchema: {} as Readonly<Record<string, unknown>>,
             operator: "",
+            // SCP-OUT-017: MCP-imported tools default to §5.4.2 fail-safe (Action).
+            kind: "action" as const,
           }));
         },
         async invokeTool(
@@ -364,6 +366,10 @@ export async function connectMcpStdio(
           >,
           outputSchema: {} as Readonly<Record<string, unknown>>,
           operator: "",
+          // SCP-OUT-017: MCP-imported tools have no native kind signal —
+          // default to the §5.4.2 fail-safe (Action). Re-classification at
+          // the SCP context boundary is the operator's responsibility.
+          kind: "action" as const,
         }));
       },
       async invokeTool(

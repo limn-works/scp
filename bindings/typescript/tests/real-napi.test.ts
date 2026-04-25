@@ -460,6 +460,7 @@ if (bridge === null || serverAddon === null) {
       const toolId = await napi.toolRegister(ctx, {
         name: "echo",
         description: "Echoes input",
+        kind: "action",
         inputSchema: {
           type: "object",
           properties: { input: { type: "string" }, mode: { type: "string" } },
@@ -492,6 +493,7 @@ if (bridge === null || serverAddon === null) {
       const toolId = await napi.toolRegister(ctx, {
         name: "test-tool",
         description: "A test tool",
+        kind: "action",
         inputSchema: {
           type: "object",
           properties: { x: { type: "number" }, y: { type: "number" } },
@@ -524,6 +526,7 @@ if (bridge === null || serverAddon === null) {
       const toolId = await napi.toolRegister(ctx, {
         name: "verify-me",
         description: "Tool for verification",
+        kind: "action",
         inputSchema: {
           type: "object",
           properties: { query: { type: "string" }, limit: { type: "number" } },
@@ -1151,6 +1154,7 @@ if (bridge === null || serverAddon === null) {
       const toolId = await napi.toolRegister(ctx, {
         name: "e2e-tool",
         description: "End-to-end test tool",
+        kind: "action",
         inputSchema: {
           type: "object",
           properties: { value: { type: "number" }, mode: { type: "string" } },

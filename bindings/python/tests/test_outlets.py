@@ -19,6 +19,7 @@ Tests mock ``scp_sdk.outlets._scp_core``; no Rust extension required.
 from __future__ import annotations
 
 import time
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -43,6 +44,7 @@ from scp_sdk.outlets import (
     InvokeCrossContextOptions,
     OutletCost,  # noqa: F401 — re-export surface check
     OutletDefinition,
+    OutletKind,
     OutletNamespace,
     OutletOffersNamespace,
     OutletSessionsNamespace,
@@ -123,6 +125,7 @@ class TestBridgeGuard:
                     OutletDefinition(
                         name="n",
                         description="d",
+                        kind=OutletKind.Action,
                         input_schema={},
                         output_schema={},
                         operator=_DUMMY_DID,
@@ -145,6 +148,7 @@ class TestBridgeGuard:
                     OutletDefinition(
                         name="n",
                         description="d",
+                        kind=OutletKind.Action,
                         input_schema={},
                         output_schema={},
                         operator=_DUMMY_DID,
@@ -174,7 +178,7 @@ class TestBridgeGuard:
     async def test_invoke_cross_context_without_bridge(self) -> None:
         with patch("scp_sdk.outlets._scp_core", None):
             with pytest.raises(ContextError):
-                # SCP-DEFAULT-INSTANCE-OK: OutletNamespace.invoke_cross_context method, not deprecated free function
+                # SCP-DEFAULT-INSTANCE-OK: ns method, not deprecated free function
                 await _ns().invoke_cross_context(
                     target=_DUMMY_CTX_TGT,
                     outlet_id=_DUMMY_OUTLET,
@@ -215,7 +219,7 @@ class TestInvokeCrossContext:
         mock_bridge = MagicMock()
         mock_bridge.context_outlet_invoke_cross_context.return_value = {"ok": True}
         with patch("scp_sdk.outlets._scp_core", mock_bridge):
-            # SCP-DEFAULT-INSTANCE-OK: OutletNamespace.invoke_cross_context method, not deprecated free function
+            # SCP-DEFAULT-INSTANCE-OK: ns method, not deprecated free function
             result = await _ns().invoke_cross_context(
                 target=_DUMMY_CTX_TGT,
                 outlet_id=_DUMMY_OUTLET,
@@ -234,13 +238,13 @@ class TestInvokeCrossContext:
                 input={"x": 1},
                 ucan=_DUMMY_UCAN,
             )
-            # SCP-DEFAULT-INSTANCE-OK: OutletNamespace.invoke_cross_context method, not deprecated free function
+            # SCP-DEFAULT-INSTANCE-OK: ns method, not deprecated free function
             result = await _ns().invoke_cross_context(opts)
         assert result == {"ok": True}
 
     async def test_missing_required_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            # SCP-DEFAULT-INSTANCE-OK: OutletNamespace.invoke_cross_context method, not deprecated free function
+            # SCP-DEFAULT-INSTANCE-OK: ns method, not deprecated free function
             await _ns().invoke_cross_context(
                 target=_DUMMY_CTX_TGT,
                 input={},
@@ -255,7 +259,7 @@ class TestInvokeCrossContext:
             ucan=_DUMMY_UCAN,
         )
         with pytest.raises(ValidationError):
-            # SCP-DEFAULT-INSTANCE-OK: OutletNamespace.invoke_cross_context method, not deprecated free function
+            # SCP-DEFAULT-INSTANCE-OK: ns method, not deprecated free function
             await _ns().invoke_cross_context(opts, target=_DUMMY_CTX_TGT)
 
     @pytest.mark.parametrize("depth", [-1, 256, 1.5, True, False])
@@ -263,7 +267,7 @@ class TestInvokeCrossContext:
         mock_bridge = MagicMock()
         with patch("scp_sdk.outlets._scp_core", mock_bridge):
             with pytest.raises(ValidationError):
-                # SCP-DEFAULT-INSTANCE-OK: OutletNamespace.invoke_cross_context method, not deprecated free function
+                # SCP-DEFAULT-INSTANCE-OK: ns method, not deprecated free function
                 await _ns().invoke_cross_context(
                     target=_DUMMY_CTX_TGT,
                     outlet_id=_DUMMY_OUTLET,
@@ -485,6 +489,8 @@ class TestOutletNamespaceShape:
         ns = _ns()
         for name in (
             "register",
+            "register_query",
+            "register_action",
             "invoke",
             "update",
             "get",
@@ -494,6 +500,164 @@ class TestOutletNamespaceShape:
             "invoke_cross_context",
         ):
             assert callable(getattr(ns, name)), name
+
+
+# ---------------------------------------------------------------------------
+# SCP-OUT-017 — OutletKind required + register_query / register_action.
+# ---------------------------------------------------------------------------
+
+
+class TestOutletKindRequired:
+    """SCP-OUT-017 enforcement at the Python SDK surface."""
+
+    def test_outlet_definition_without_kind_raises_typeerror(self) -> None:
+        """The dataclass enforces `kind` at construction time."""
+        with pytest.raises(TypeError):
+            OutletDefinition(  # type: ignore[call-arg]
+                name="n",
+                description="d",
+                input_schema={},
+                output_schema={},
+                operator=_DUMMY_DID,
+            )
+
+    async def test_register_keyword_form_without_kind_raises_validation(self) -> None:
+        """Calling register() in keyword form without `kind` is rejected."""
+        with pytest.raises(ValidationError):
+            await _ns().register(  # type: ignore[call-arg]
+                name="n",
+                description="d",
+                input_schema={},
+                output_schema={},
+                operator=_DUMMY_DID,
+            )
+
+    def test_outlet_kind_parse_round_trips_strings(self) -> None:
+        assert OutletKind.parse("query") is OutletKind.Query
+        assert OutletKind.parse("action") is OutletKind.Action
+        assert OutletKind.parse(OutletKind.Query) is OutletKind.Query
+        with pytest.raises(ValidationError):
+            OutletKind.parse("mutation")
+        with pytest.raises(ValidationError):
+            OutletKind.parse(123)  # type: ignore[arg-type]
+
+    async def test_register_query_sets_kind_query_on_wire(self) -> None:
+        """register_query() sends `kind: "query"` to the bridge."""
+        captured = {}
+
+        def fake(_ctx_id: str, registration: dict[str, Any]) -> str:
+            captured["kind"] = registration["kind"]
+            return "tool-fake"
+
+        mock_bridge = MagicMock()
+        mock_bridge.context_outlet_register.side_effect = fake
+        with patch("scp_sdk.outlets._scp_core", mock_bridge):
+            outlet_id = await _ns().register_query(
+                name="weather",
+                description="lookup weather",
+                input_schema={"type": "object"},
+                output_schema={"type": "object"},
+                operator=_DUMMY_DID,
+            )
+        assert outlet_id == "tool-fake"
+        assert captured["kind"] == "query"
+
+    async def test_register_action_sets_kind_action_on_wire(self) -> None:
+        captured = {}
+
+        def fake(_ctx_id: str, registration: dict[str, Any]) -> str:
+            captured["kind"] = registration["kind"]
+            return "tool-fake"
+
+        mock_bridge = MagicMock()
+        mock_bridge.context_outlet_register.side_effect = fake
+        with patch("scp_sdk.outlets._scp_core", mock_bridge):
+            outlet_id = await _ns().register_action(
+                name="send-email",
+                description="send a message",
+                input_schema={"type": "object"},
+                output_schema={"type": "object"},
+                operator=_DUMMY_DID,
+            )
+        assert outlet_id == "tool-fake"
+        assert captured["kind"] == "action"
+
+    async def test_register_with_definition_threads_kind_to_bridge(self) -> None:
+        captured = {}
+
+        def fake(_ctx_id: str, registration: dict[str, Any]) -> str:
+            captured["kind"] = registration["kind"]
+            return "tool-fake"
+
+        mock_bridge = MagicMock()
+        mock_bridge.context_outlet_register.side_effect = fake
+        with patch("scp_sdk.outlets._scp_core", mock_bridge):
+            await _ns().register(
+                OutletDefinition(
+                    name="n",
+                    description="d",
+                    kind=OutletKind.Query,
+                    input_schema={},
+                    output_schema={},
+                    operator=_DUMMY_DID,
+                ),
+            )
+        assert captured["kind"] == "query"
+
+    async def test_register_keyword_form_threads_kind_to_bridge(self) -> None:
+        captured = {}
+
+        def fake(_ctx_id: str, registration: dict[str, Any]) -> str:
+            captured["kind"] = registration["kind"]
+            return "tool-fake"
+
+        mock_bridge = MagicMock()
+        mock_bridge.context_outlet_register.side_effect = fake
+        with patch("scp_sdk.outlets._scp_core", mock_bridge):
+            await _ns().register(
+                kind=OutletKind.Action,
+                name="n",
+                description="d",
+                input_schema={},
+                output_schema={},
+                operator=_DUMMY_DID,
+            )
+        assert captured["kind"] == "action"
+
+    async def test_register_kind_string_form_accepted(self) -> None:
+        """The wire-format string `"query"` / `"action"` is also accepted."""
+        captured = {}
+
+        def fake(_ctx_id: str, registration: dict[str, Any]) -> str:
+            captured["kind"] = registration["kind"]
+            return "tool-fake"
+
+        mock_bridge = MagicMock()
+        mock_bridge.context_outlet_register.side_effect = fake
+        with patch("scp_sdk.outlets._scp_core", mock_bridge):
+            await _ns().register(
+                kind="query",
+                name="n",
+                description="d",
+                input_schema={},
+                output_schema={},
+                operator=_DUMMY_DID,
+            )
+        assert captured["kind"] == "query"
+
+    async def test_register_definition_plus_kwargs_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            await _ns().register(
+                OutletDefinition(
+                    name="n",
+                    description="d",
+                    kind=OutletKind.Action,
+                    input_schema={},
+                    output_schema={},
+                    operator=_DUMMY_DID,
+                ),
+                name="other",
+            )
 
     def test_sub_namespaces_present(self) -> None:
         ns = _ns()

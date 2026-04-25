@@ -105,6 +105,35 @@ value class DID(val raw: String)
 @JvmInline
 value class OutletId(val raw: String)
 
+/**
+ * Outlet semantic class (§5.4.2).
+ *
+ * `QUERY` outlets are read-only and idempotent (UCAN stem
+ * `outlet_query:{id}`); `ACTION` outlets may mutate state (UCAN stem
+ * `outlet_call:{id}`).
+ *
+ * SCP-OUT-017 makes this REQUIRED at the SDK surface across all 4
+ * bindings. Crosses the wire as the lowercase string `"query"` /
+ * `"action"` matching the §5.4.2 wire vocabulary.
+ */
+enum class OutletKind(val wire: String) {
+    QUERY("query"),
+    ACTION("action"),
+    ;
+
+    companion object {
+        /** Parse the lowercase wire form ("query" / "action") into an [OutletKind]. */
+        @JvmStatic
+        fun parse(value: String): OutletKind = when (value) {
+            "query" -> QUERY
+            "action" -> ACTION
+            else -> throw IllegalArgumentException(
+                "OutletKind must be 'query' or 'action' (§5.4.2 wire vocabulary), got $value",
+            )
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Streaming + caveats (§5.4.5, §7.3.8)
 // ---------------------------------------------------------------------------
@@ -320,7 +349,26 @@ interface OutletNamespace {
     val sessions: OutletSessionsNamespace
     val offers: OutletOffersNamespace
 
-    suspend fun register(definitionJson: String): String
+    /**
+     * Register an outlet in the context.
+     *
+     * SCP-OUT-017 makes `kind` a REQUIRED parameter (no default). The
+     * caller MUST pass `kind = OutletKind.QUERY` or
+     * `OutletKind.ACTION`; omitting it is a Kotlin compile error.
+     *
+     * @param kind Outlet semantic class (§5.4.2). REQUIRED.
+     * @param definitionJson JSON definition body (without `kind`).
+     */
+    suspend fun register(kind: OutletKind, definitionJson: String): String
+
+    /** Convenience: register an outlet with `kind = OutletKind.QUERY`. */
+    suspend fun registerQuery(definitionJson: String): String =
+        register(OutletKind.QUERY, definitionJson)
+
+    /** Convenience: register an outlet with `kind = OutletKind.ACTION`. */
+    suspend fun registerAction(definitionJson: String): String =
+        register(OutletKind.ACTION, definitionJson)
+
     fun invoke(
         outletId: String,
         inputJson: String,
@@ -413,9 +461,14 @@ internal class InMemoryOutletNamespace(
 ) : OutletNamespace {
     private val registry = mutableMapOf<String, String>()
 
-    override suspend fun register(definitionJson: String): String {
+    override suspend fun register(kind: OutletKind, definitionJson: String): String {
+        // SCP-OUT-017: kind is required — embed the registered kind in the
+        // stored JSON so callers see it round-tripped on the read paths.
         val id = "outlet-${registry.size + 1}"
-        registry[id] = definitionJson
+        // Augment the JSON definition with a kind field, preserving the
+        // body untouched. The in-memory impl is a stub for tests; a
+        // production impl forwards (kind, definition) to UniFFI.
+        registry[id] = "{\"kind\":\"${kind.wire}\",\"definition\":$definitionJson}"
         return id
     }
 

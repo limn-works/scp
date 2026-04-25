@@ -11,7 +11,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use scp_ffi_common::validate::{
-    json_value_type_name, validate_did, validate_outlet_id, validate_outlet_name, validate_ucan_token,
+    json_value_type_name, validate_did, validate_outlet_id, validate_outlet_name,
+    validate_ucan_token,
 };
 
 use crate::context::WasmContextHandle;
@@ -336,6 +337,42 @@ fn parse_rate_limit_json(json: &str) -> Result<RateLimit, String> {
     parse_rate_limit_json_with_clock(json, &crate::time::WasmClock)
 }
 
+/// Extracts the REQUIRED `kind` field from the outlet definition JSON
+/// (SCP-OUT-017).
+///
+/// Accepts the lowercase strings `"query"` or `"action"` (matching the §5.4.2
+/// wire vocabulary). Missing or `null` `kind` returns a `ValidationError`.
+/// The TypeScript SDK enforces this at compile time as a non-optional field
+/// on `OutletDefinition`; the bridge re-enforces it for defense in depth.
+fn extract_outlet_kind(
+    def: &serde_json::Value,
+) -> Result<scp_protocol::context::outlets::OutletKind, ScpWasmError> {
+    use scp_protocol::context::outlets::OutletKind;
+    let val = def
+        .get("kind")
+        .filter(|v| !v.is_null())
+        .ok_or_else(|| ScpWasmError::Validation {
+            message: "missing required 'kind' field — must be 'query' or 'action' \
+                      (§5.4.2 wire vocabulary, SCP-OUT-017)"
+                .to_owned(),
+            code: codes::VALID_7000.to_owned(),
+        })?;
+    let s = val.as_str().ok_or_else(|| ScpWasmError::Validation {
+        message: format!("'kind' must be a string, got {}", json_value_type_name(val)),
+        code: codes::VALID_7000.to_owned(),
+    })?;
+    match s {
+        "query" => Ok(OutletKind::Query),
+        "action" => Ok(OutletKind::Action),
+        other => Err(ScpWasmError::Validation {
+            message: format!(
+                "'kind' must be 'query' or 'action' (§5.4.2 wire vocabulary), got {other:?}"
+            ),
+            code: codes::VALID_7000.to_owned(),
+        }),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
@@ -411,11 +448,14 @@ pub fn outlet_register(context: &WasmContextHandle, definition_json: String) -> 
 
         let (implementation_hash, signature, cost, registered_at) = parse_provenance_fields(&def)?;
 
+        // SCP-OUT-017: kind is REQUIRED in the WASM outlet definition JSON.
+        // The TypeScript SDK enforces this at compile time on
+        // `OutletDefinition`; the bridge re-enforces it as defense in depth.
+        let kind = extract_outlet_kind(&def).map_err(ScpWasmError::into_js)?;
+
         let registration = runtime::OutletRegistration {
             outlet_id: outlet_id.clone(),
-            // SCP-OUT-011: default to fail-safe Action (§5.4.2) until kind
-            // plumbing extends to WASM (downstream story).
-            kind: scp_protocol::context::outlets::OutletKind::default(),
+            kind,
             name,
             description,
             schema: runtime::OutletSchema {
@@ -522,7 +562,7 @@ pub fn outlet_invoke(
                     token,
                     &identity_did,
                 )
-                    .map_err(|e| {
+                .map_err(|e| {
                     ScpWasmError::Permission {
                         message: format!("UCAN authorization failed for tool '{outlet_id}': {e}"),
                         code: codes::PERM_3000.to_owned(),
@@ -637,15 +677,20 @@ fn build_outlet_registration_from_json(
     };
 
     let input_schema = validate_schema_field(def, "schema").map_err(ScpWasmError::into_js)?;
-    let output_schema = validate_schema_field(def, "outputSchema").map_err(ScpWasmError::into_js)?;
+    let output_schema =
+        validate_schema_field(def, "outputSchema").map_err(ScpWasmError::into_js)?;
     let operator_did = def["operatorDid"].as_str().unwrap_or("").to_owned();
     let test_vectors = validate_test_vectors(def).map_err(ScpWasmError::into_js)?;
     let (implementation_hash, signature, cost, registered_at) = parse_provenance_fields(def)?;
 
+    // SCP-OUT-017: kind is required on update too — the §5.4.2 cost-floor
+    // check rejects updates flipping to Query while retaining a positive
+    // cost.
+    let kind = extract_outlet_kind(def).map_err(ScpWasmError::into_js)?;
+
     Ok(runtime::OutletRegistration {
         outlet_id,
-        // SCP-OUT-011: default to fail-safe Action (§5.4.2).
-        kind: scp_protocol::context::outlets::OutletKind::default(),
+        kind,
         name,
         description,
         schema: runtime::OutletSchema {
@@ -692,8 +737,10 @@ pub fn outlet_update(
 
         let new_registration = build_outlet_registration_from_json(&def, outlet_id.clone())?;
 
-        with_manager(|mgr| mgr.update_outlet(&context_id, &outlet_id, new_registration, &updater_did))
-            .map_err(ScpWasmError::into_js)?;
+        with_manager(|mgr| {
+            mgr.update_outlet(&context_id, &outlet_id, new_registration, &updater_did)
+        })
+        .map_err(ScpWasmError::into_js)?;
 
         Ok(JsValue::from_str(&outlet_id))
     })
@@ -734,8 +781,8 @@ pub fn outlet_deregister(
 pub fn outlet_list(context: &WasmContextHandle) -> Promise {
     let context_id = context.context_id();
     future_to_promise(async move {
-        let ids = with_manager(|mgr| mgr.list_outlets(&context_id))
-            .map_err(ScpWasmError::into_js)?;
+        let ids =
+            with_manager(|mgr| mgr.list_outlets(&context_id)).map_err(ScpWasmError::into_js)?;
 
         let json_str = serde_json::to_string(&ids).map_err(|e| {
             ScpWasmError::Tool {
@@ -823,15 +870,15 @@ pub fn outlet_invoke_cross_context(
             &ucan_token,
             &invoker_did,
         )
-            .map_err(|e| {
-                ScpWasmError::Permission {
-                    message: format!(
-                        "UCAN authorization failed for cross-context tool '{outlet_id}': {e}"
-                    ),
-                    code: codes::PERM_3000.to_owned(),
-                }
-                .into_js()
-            })?;
+        .map_err(|e| {
+            ScpWasmError::Permission {
+                message: format!(
+                    "UCAN authorization failed for cross-context tool '{outlet_id}': {e}"
+                ),
+                code: codes::PERM_3000.to_owned(),
+            }
+            .into_js()
+        })?;
 
         let input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
             ScpWasmError::Validation {
@@ -927,8 +974,9 @@ pub fn outlet_session_invoke(
             .into());
         }
 
-        let outlet_id_for_ucan = with_manager(|mgr| mgr.session_outlet_id(&context_id, &session_id))
-            .map_err(ScpWasmError::into_js)?;
+        let outlet_id_for_ucan =
+            with_manager(|mgr| mgr.session_outlet_id(&context_id, &session_id))
+                .map_err(ScpWasmError::into_js)?;
 
         let outlet_kind_for_ucan =
             with_manager(|mgr| mgr.outlet_kind(&context_id, &outlet_id_for_ucan))

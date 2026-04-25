@@ -1154,7 +1154,9 @@ pub fn ensure_ucan_registered(context_id: &str, creator_did: &str, ceiling: &[St
     } else {
         ceiling
             .iter()
-            .filter_map(|s| scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name()))
+            .filter_map(|s| {
+                scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name())
+            })
             .collect::<HashSet<String>>()
     };
 

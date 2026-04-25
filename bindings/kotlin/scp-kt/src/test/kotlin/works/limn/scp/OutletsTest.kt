@@ -133,7 +133,7 @@ class OutletsTest {
     @Test
     fun `aggregate and asFlow are both reachable`() = runTest {
         val ns = InMemoryOutletNamespace()
-        val id = ns.register("{\"name\":\"calc\"}")
+        val id = ns.register(OutletKind.ACTION, "{\"name\":\"calc\"}")
         val handle = ns.invoke(id, "{\"x\":1}", ucanToken = "eyJ.dummy")
         val agg = handle.aggregate()
         assertTrue(agg.valueJson.contains("echo"))
@@ -154,7 +154,7 @@ class OutletsTest {
         val ns: OutletNamespace = InMemoryOutletNamespace()
         assertNotNull(ns.sessions)
         assertNotNull(ns.offers)
-        val id = ns.register("{\"name\":\"calc\"}")
+        val id = ns.register(OutletKind.ACTION, "{\"name\":\"calc\"}")
         assertEquals(listOf(id), ns.list())
         val got = ns.get(id)
         assertTrue(got.contains("calc"))
@@ -170,7 +170,7 @@ class OutletsTest {
     @Test
     fun `sessions exposes open, invoke, close`() = runTest {
         val ns = InMemoryOutletNamespace()
-        val id = ns.register("{\"name\":\"calc\"}")
+        val id = ns.register(OutletKind.ACTION, "{\"name\":\"calc\"}")
         val sid = ns.sessions.open(outletId = id, sourceContextId = "ctx-source")
         val result = ns.sessions.invoke(sid, "{\"x\":1}", "eyJ.dummy")
         assertTrue(result.contains("echo"))
@@ -221,6 +221,58 @@ class OutletsTest {
         // We assert runtime raw-string shape to anchor the doc.
         assertFalse(did.raw == outlet.raw)
         assertTrue(sid.raw.length == 36)
+    }
+
+    // --------------------------------------------------------------------
+    // SCP-OUT-017 — OutletKind required + register convenience methods.
+    // --------------------------------------------------------------------
+
+    @Test
+    fun `OutletKind enum has Query and Action with lowercase wire forms`() {
+        assertEquals("query", OutletKind.QUERY.wire)
+        assertEquals("action", OutletKind.ACTION.wire)
+        assertEquals(OutletKind.QUERY, OutletKind.parse("query"))
+        assertEquals(OutletKind.ACTION, OutletKind.parse("action"))
+    }
+
+    @Test
+    fun `OutletKind parse rejects unknown wire strings`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            OutletKind.parse("mutation")
+        }
+    }
+
+    @Test
+    fun `register requires kind and threads it through to the wire form`() = runTest {
+        val ns = InMemoryOutletNamespace()
+        val id = ns.register(OutletKind.QUERY, "{\"name\":\"weather\"}")
+        val stored = ns.get(id)
+        assertTrue(
+            stored.contains("\"kind\":\"query\""),
+            "InMemory impl should round-trip kind=query, got: $stored",
+        )
+    }
+
+    @Test
+    fun `registerQuery convenience sets kind=query`() = runTest {
+        val ns = InMemoryOutletNamespace()
+        val id = ns.registerQuery("{\"name\":\"weather\"}")
+        val stored = ns.get(id)
+        assertTrue(
+            stored.contains("\"kind\":\"query\""),
+            "registerQuery should set kind=query, got: $stored",
+        )
+    }
+
+    @Test
+    fun `registerAction convenience sets kind=action`() = runTest {
+        val ns = InMemoryOutletNamespace()
+        val id = ns.registerAction("{\"name\":\"send-email\"}")
+        val stored = ns.get(id)
+        assertTrue(
+            stored.contains("\"kind\":\"action\""),
+            "registerAction should set kind=action, got: $stored",
+        )
     }
 
     // Helper: wrap a suspend call so assertThrows can observe the OutletError

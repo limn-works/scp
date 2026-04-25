@@ -664,9 +664,7 @@ def context_outlet_update(
     """Update an outlet registration in-place."""
     ...
 
-def context_outlet_deregister(
-    context_id: str, outlet_id: str, actor_did: str
-) -> None:
+def context_outlet_deregister(context_id: str, outlet_id: str, actor_did: str) -> None:
     """Deregister an outlet from the context."""
     ...
 

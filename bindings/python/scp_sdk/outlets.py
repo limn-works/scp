@@ -31,6 +31,7 @@ Error codes remain ``SCP-TOOL-*`` per §9.18 (registered namespace).
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import re
 import secrets
@@ -121,6 +122,52 @@ def new_session_id() -> SessionId:
 
 
 # ---------------------------------------------------------------------------
+# OutletKind — outlet semantic class (Query vs Action), SCP-OUT-017.
+# ---------------------------------------------------------------------------
+
+
+class OutletKind(enum.Enum):
+    """Outlet semantic class (§5.4.2).
+
+    ``Query`` outlets are read-only and idempotent (UCAN stem
+    ``outlet_query:{id}``); ``Action`` outlets may mutate state (UCAN stem
+    ``outlet_call:{id}``).
+
+    Required at the SDK surface across all 4 bindings (SCP-OUT-017).
+    Crosses the bridge boundary as the lowercase string ``"query"`` /
+    ``"action"`` matching the §5.4.2 wire vocabulary.
+    """
+
+    Query = "query"
+    Action = "action"
+
+    @classmethod
+    def parse(cls, value: OutletKind | str) -> OutletKind:
+        """Coerce ``value`` to an :class:`OutletKind` instance.
+
+        Accepts an existing :class:`OutletKind` (returned unchanged) or
+        the lowercase string ``"query"`` / ``"action"`` matching the
+        §5.4.2 wire vocabulary. Other values raise
+        :class:`ValidationError`.
+        """
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            try:
+                return cls(value)
+            except ValueError as exc:
+                raise ValidationError(
+                    f"OutletKind must be 'query' or 'action' (§5.4.2 wire vocabulary), "
+                    f"got {value!r}",
+                    code="SCP-VALID-7050",
+                ) from exc
+        raise ValidationError(
+            f"OutletKind must be an OutletKind or str, got {type(value).__name__}",
+            code="SCP-VALID-7050",
+        )
+
+
+# ---------------------------------------------------------------------------
 # OutletDefinition / TestVector / OutletCost
 # ---------------------------------------------------------------------------
 
@@ -144,12 +191,19 @@ class OutletCost:
     cost_formula: str | None = None
 
 
-@dataclass
+@dataclass(kw_only=True)
 class OutletDefinition:
-    """Definition of an outlet registered in an SCP context (§5.4.1)."""
+    """Definition of an outlet registered in an SCP context (§5.4.1).
+
+    ``kind`` is REQUIRED — there is no default. Per SCP-OUT-017, all 4
+    SDKs surface :class:`OutletKind` as a required parameter; passing a
+    definition without ``kind`` raises :class:`TypeError` from the
+    dataclass machinery (the dataclass is keyword-only).
+    """
 
     name: str
     description: str
+    kind: OutletKind
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
     operator: Identity | str | None
@@ -503,12 +557,26 @@ class OutletNamespace:
             if hasattr(definition.operator, "did")
             else (definition.operator or self._creator_did)
         )
+        # SCP-OUT-017: kind is REQUIRED on the SDK surface and on the wire.
+        # `OutletKind.parse` accepts either an `OutletKind` instance or the
+        # lowercase string `"query"` / `"action"` so callers who supplied
+        # the wire form directly continue to work.
+        kind_obj = OutletKind.parse(definition.kind)
+        operator_did_str: str = (
+            operator_did if isinstance(operator_did, str) else self._creator_did  # type: ignore[unreachable]
+        )
         registration: dict[str, Any] = {
             "name": definition.name,
             "description": definition.description,
+            "kind": kind_obj.value,
             "input_schema": definition.input_schema,
             "output_schema": definition.output_schema,
-            "operator": operator_did,
+            "operator": operator_did_str,
+            # SCP-OUT-012/017: bridge expects `operator_did` for raw dict
+            # callers; SDK callers go through this builder so we set both
+            # the SDK-friendly `operator` and the bridge-required
+            # `operator_did` — the bridge reads `operator_did`.
+            "operator_did": operator_did_str,
         }
         if definition.test_vectors is not None:
             registration["test_vectors"] = [
@@ -532,10 +600,115 @@ class OutletNamespace:
 
     # -- register / invoke / update / get / list / verify / deregister ------
 
-    async def register(self, definition: OutletDefinition) -> str:
-        """Register an outlet in the context. Returns the assigned outlet id."""
+    async def register(
+        self,
+        definition: OutletDefinition | None = None,
+        *,
+        kind: OutletKind | str | None = None,
+        name: str | None = None,
+        description: str | None = None,
+        input_schema: dict[str, Any] | None = None,
+        output_schema: dict[str, Any] | None = None,
+        operator: Identity | str | None = None,
+        test_vectors: list[TestVector] | None = None,
+        implementation_hash: bytes | None = None,
+        cost: OutletCost | None = None,
+    ) -> str:
+        """Register an outlet in the context (SCP-OUT-017).
+
+        ``kind`` is REQUIRED. Two call styles are supported:
+
+        1. **Dataclass form** — pass an :class:`OutletDefinition` (which
+           already carries a required ``kind``) as the sole positional or
+           keyword argument. ``kind`` may optionally override the value
+           on the definition::
+
+               await ctx.outlets.register(
+                   OutletDefinition(
+                       name="weather",
+                       description="...",
+                       kind=OutletKind.Query,
+                       input_schema={...},
+                       output_schema={...},
+                       operator=alice,
+                   )
+               )
+
+        2. **Keyword form** — pass each field as a keyword argument
+           including the required ``kind=`` argument::
+
+               await ctx.outlets.register(
+                   kind=OutletKind.Action,
+                   name="send-email",
+                   description="...",
+                   input_schema={...},
+                   output_schema={...},
+                   operator=alice,
+               )
+
+        Calls without ``kind`` (and without a definition that supplies
+        it) raise :class:`TypeError` from the dataclass machinery, or
+        :class:`ValidationError` from the keyword-form path.
+
+        Returns the assigned outlet id.
+        """
+        if definition is not None:
+            if any(
+                v is not None
+                for v in (
+                    name,
+                    description,
+                    input_schema,
+                    output_schema,
+                    operator,
+                    test_vectors,
+                    implementation_hash,
+                    cost,
+                )
+            ):
+                raise ValidationError(
+                    "pass either an OutletDefinition or keyword args, not both",
+                    code="SCP-VALID-7002",
+                )
+            resolved_kind = OutletKind.parse(kind) if kind is not None else definition.kind
+            built = OutletDefinition(
+                name=definition.name,
+                description=definition.description,
+                kind=resolved_kind,
+                input_schema=definition.input_schema,
+                output_schema=definition.output_schema,
+                operator=definition.operator,
+                test_vectors=definition.test_vectors,
+                implementation_hash=definition.implementation_hash,
+                cost=definition.cost,
+            )
+        else:
+            if kind is None:
+                raise ValidationError(
+                    "register() requires `kind` (OutletKind.Query or "
+                    "OutletKind.Action) — SCP-OUT-017 makes kind REQUIRED on "
+                    "all 4 SDKs",
+                    code="SCP-VALID-7050",
+                )
+            if name is None or description is None or input_schema is None or output_schema is None:
+                raise ValidationError(
+                    "register() requires keyword args name, description, input_schema, "
+                    "output_schema, kind (or pass an OutletDefinition)",
+                    code="SCP-VALID-7002",
+                )
+            built = OutletDefinition(
+                name=name,
+                description=description,
+                kind=OutletKind.parse(kind),
+                input_schema=input_schema,
+                output_schema=output_schema,
+                operator=operator,
+                test_vectors=test_vectors,
+                implementation_hash=implementation_hash,
+                cost=cost,
+            )
         bridge = _require_bridge()
-        registration = self._build_registration(definition)
+        registration = self._build_registration(built)
         try:
             return await asyncio.to_thread(
                 bridge.context_outlet_register,
@@ -544,6 +717,67 @@ class OutletNamespace:
             )
         except Exception as exc:
             raise _translate_bridge_error(exc) from exc
+
+    async def register_query(
+        self,
+        definition: OutletDefinition | None = None,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        input_schema: dict[str, Any] | None = None,
+        output_schema: dict[str, Any] | None = None,
+        operator: Identity | str | None = None,
+        test_vectors: list[TestVector] | None = None,
+        implementation_hash: bytes | None = None,
+        cost: OutletCost | None = None,
+    ) -> str:
+        """Convenience: register an outlet with ``kind=OutletKind.Query``.
+
+        Equivalent to :meth:`register` with ``kind=OutletKind.Query``.
+        Useful for the common path where the outlet is read-only.
+        """
+        return await self.register(
+            definition,
+            kind=OutletKind.Query,
+            name=name,
+            description=description,
+            input_schema=input_schema,
+            output_schema=output_schema,
+            operator=operator,
+            test_vectors=test_vectors,
+            implementation_hash=implementation_hash,
+            cost=cost,
+        )
+
+    async def register_action(
+        self,
+        definition: OutletDefinition | None = None,
+        *,
+        name: str | None = None,
+        description: str | None = None,
+        input_schema: dict[str, Any] | None = None,
+        output_schema: dict[str, Any] | None = None,
+        operator: Identity | str | None = None,
+        test_vectors: list[TestVector] | None = None,
+        implementation_hash: bytes | None = None,
+        cost: OutletCost | None = None,
+    ) -> str:
+        """Convenience: register an outlet with ``kind=OutletKind.Action``.
+
+        Equivalent to :meth:`register` with ``kind=OutletKind.Action``.
+        """
+        return await self.register(
+            definition,
+            kind=OutletKind.Action,
+            name=name,
+            description=description,
+            input_schema=input_schema,
+            output_schema=output_schema,
+            operator=operator,
+            test_vectors=test_vectors,
+            implementation_hash=implementation_hash,
+            cost=cost,
+        )
 
     def invoke(
         self,
@@ -768,6 +1002,7 @@ __all__ = [
     "InvokeCrossContextOptions",
     "OutletCost",
     "OutletDefinition",
+    "OutletKind",
     "OutletNamespace",
     "OutletOffersNamespace",
     "OutletSessionsNamespace",

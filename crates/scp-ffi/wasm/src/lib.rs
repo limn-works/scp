@@ -99,6 +99,8 @@ pub mod event_log;
 pub mod identity;
 /// Centralized context state manager (`WasmContextManager`).
 pub mod manager;
+/// Tool registration, invocation, and verification.
+pub mod outlets;
 /// Provenance metadata operations.
 pub mod provenance;
 /// Reference attestation verification via browser Fetch API (§3.5.2).
@@ -113,8 +115,6 @@ pub mod storage;
 pub mod sync;
 /// Platform-agnostic time utilities for WASM.
 pub mod time;
-/// Tool registration, invocation, and verification.
-pub mod outlets;
 /// Transport connection and status operations.
 pub mod transport;
 /// Trust engine operations (attestation, challenge, verification).

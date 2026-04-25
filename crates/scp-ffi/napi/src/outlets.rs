@@ -33,16 +33,14 @@ fn validate_ucan_for_tool(
         // registered kind. `outlet_query:{id}` for Query outlets,
         // `outlet_call:{id}` for Action outlets — the legacy
         // `outlet_invoke:` stem is deleted with no transitional alias.
-        let outlet_kind_for_ucan =
-            rt.outlet_registry
-                .get(outlet_id)
-                .map(|r| r.kind)
-                .ok_or_else(|| ScpNapiError::Permission {
-                    message: format!(
-                        "tool '{outlet_id}' not registered in context '{context_id}'"
-                    ),
-                    code: codes::TOOL_6002.to_owned(),
-                })?;
+        let outlet_kind_for_ucan = rt
+            .outlet_registry
+            .get(outlet_id)
+            .map(|r| r.kind)
+            .ok_or_else(|| ScpNapiError::Permission {
+                message: format!("tool '{outlet_id}' not registered in context '{context_id}'"),
+                code: codes::TOOL_6002.to_owned(),
+            })?;
 
         let production_resolver = crate::runtime::did_resolver();
         let did_resolver = scp_ffi_common::DispatchDidResolver::new(
@@ -69,13 +67,46 @@ fn validate_ucan_for_tool(
         };
 
         scp_core::context::tools::validate_outlet_invocation_ucan(
-            ucan_token, context_id, outlet_id, outlet_kind_for_ucan, &mut ctx,
+            ucan_token,
+            context_id,
+            outlet_id,
+            outlet_kind_for_ucan,
+            &mut ctx,
         )
         .map_err(|e| ScpNapiError::Permission {
             message: format!("UCAN authorization failed for tool '{outlet_id}': {e}"),
             code: codes::PERM_3001.to_owned(),
         })
     })
+}
+
+// ---------------------------------------------------------------------------
+// NapiOutletKind — outlet semantic class (Query vs Action) for SCP-OUT-017.
+// ---------------------------------------------------------------------------
+
+/// Outlet semantic class (§5.4.2).
+///
+/// Crosses the NAPI boundary as the lowercase string `"query"` / `"action"`,
+/// matching the §5.4.2 wire vocabulary used by the spec, the canonical
+/// preimage, and every other bridge.
+///
+/// SCP-OUT-017 makes this REQUIRED at the SDK surface across all 4 bindings.
+#[napi(string_enum = "lowercase", js_name = "OutletKind")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NapiOutletKind {
+    /// Read-only, idempotent. UCAN stem `outlet_query:{id}`.
+    Query,
+    /// May mutate state. UCAN stem `outlet_call:{id}`. §5.4.2 fail-safe default.
+    Action,
+}
+
+impl From<NapiOutletKind> for scp_core::context::outlets::OutletKind {
+    fn from(k: NapiOutletKind) -> Self {
+        match k {
+            NapiOutletKind::Query => Self::Query,
+            NapiOutletKind::Action => Self::Action,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +122,9 @@ pub struct NapiOutletDefinition {
     pub name: String,
     /// Tool description.
     pub description: String,
+    /// Outlet semantic class (Query vs Action — §5.4.2). REQUIRED at the
+    /// bridge surface across all 4 bindings (SCP-OUT-017).
+    pub kind: NapiOutletKind,
     /// JSON Schema for tool input (as a JSON string).
     pub input_schema_json: String,
     /// JSON Schema for tool output (as a JSON string).
@@ -279,18 +313,21 @@ pub async fn outlet_register(
     let implementation_hash =
         validate_implementation_hash(definition.implementation_hash.as_deref())?;
 
-    let cost = definition.cost.map(|c| scp_core::context::tools::OutletCost {
-        amount: c.amount.max(0).cast_unsigned(),
-        currency: c.currency,
-        payee: c.payee.into(),
-        cost_formula: c.cost_formula,
-    });
+    let cost = definition
+        .cost
+        .map(|c| scp_core::context::tools::OutletCost {
+            amount: c.amount.max(0).cast_unsigned(),
+            currency: c.currency,
+            payee: c.payee.into(),
+            cost_formula: c.cost_formula,
+        });
 
     let core_registration = scp_core::context::tools::OutletRegistration {
         outlet_id,
-        // SCP-OUT-011: default to fail-safe Action (§5.4.2) until kind
-        // plumbing extends to NAPI (downstream story).
-        kind: scp_core::context::outlets::OutletKind::default(),
+        // SCP-OUT-017: kind is REQUIRED on the NAPI definition surface and
+        // forwarded to scp-core. The TypeScript SDK enforces this at compile
+        // time via the non-optional `kind` property on `OutletDefinition`.
+        kind: definition.kind.into(),
         name: definition.name,
         description: definition.description,
         schema: scp_core::context::tools::OutletSchema {
@@ -703,15 +740,15 @@ pub async fn outlet_invoke_cross_context(
     })?;
 
     let output = crate::runtime::with_context(&target_context_id, |rt| {
-        let registration = rt
-            .outlet_registry
-            .get(&outlet_id)
-            .ok_or_else(|| ScpNapiError::Tool {
-                message: format!(
-                    "tool '{outlet_id}' not found in target context '{target_context_id}'"
-                ),
-                code: codes::TOOL_6002.to_owned(),
-            })?;
+        let registration =
+            rt.outlet_registry
+                .get(&outlet_id)
+                .ok_or_else(|| ScpNapiError::Tool {
+                    message: format!(
+                        "tool '{outlet_id}' not found in target context '{target_context_id}'"
+                    ),
+                    code: codes::TOOL_6002.to_owned(),
+                })?;
 
         // Validate input against the tool's input schema.
         scp_core::context::tools::validate_value_against_schema(
@@ -1249,8 +1286,9 @@ fn build_outlet_registration_from_napi(
 
     Ok(scp_core::context::tools::OutletRegistration {
         outlet_id,
-        // SCP-OUT-011: default to fail-safe Action (§5.4.2).
-        kind: scp_core::context::outlets::OutletKind::default(),
+        // SCP-OUT-017: kind comes from the NAPI definition; the TypeScript
+        // SDK requires it as a non-optional field on `OutletDefinition`.
+        kind: definition.kind.into(),
         name: definition.name,
         description: definition.description,
         schema: scp_core::context::tools::OutletSchema {
@@ -1414,10 +1452,7 @@ pub async fn outlet_list(handle: &NapiContextHandle) -> napi::Result<Vec<String>
 #[napi(js_name = "contextOutletGet")]
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return.
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned values.
-pub async fn outlet_get(
-    handle: &NapiContextHandle,
-    outlet_id: String,
-) -> napi::Result<String> {
+pub async fn outlet_get(handle: &NapiContextHandle, outlet_id: String) -> napi::Result<String> {
     crate::napi_check_handle!(handle);
     validate_outlet_id(&outlet_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
@@ -1618,6 +1653,8 @@ mod tests {
         let definition = NapiOutletDefinition {
             name: "napi-timestamp-probe".to_owned(),
             description: "probes registered_at value".to_owned(),
+            // SCP-OUT-017: kind is required at the bridge.
+            kind: NapiOutletKind::Action,
             input_schema_json:
                 r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
                     .to_owned(),

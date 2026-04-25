@@ -351,10 +351,10 @@ pub fn py_outlet_register(context_id: &str, registration: &Bound<'_, PyDict>) ->
     // Extract cost metadata (optional, per spec §5.4.1).
     let cost = extract_cost(registration)?;
 
-    // SCP-OUT-012: extract optional `kind` so the §5.4.2 Query cost-floor
-    // check is exercisable end-to-end through the bridge. Defaults to
-    // Action (the §5.4.2 fail-safe). SCP-OUT-017 makes kind REQUIRED at
-    // the SDK surface across all 4 bindings.
+    // SCP-OUT-017: `kind` is REQUIRED at the bridge boundary across all 4
+    // bindings. The Python SDK enforces it as a keyword-only required
+    // parameter; the bridge re-enforces it for defense in depth and
+    // produces a `ValidationError` if missing.
     let kind = extract_kind(registration)?;
 
     // Generate a tool ID from the name (deterministic, human-readable).
@@ -457,7 +457,11 @@ fn validate_outlet_ucan(
         };
 
         scp_core::context::tools::validate_outlet_invocation_ucan(
-            ucan_token, context_id, outlet_id, outlet_kind_for_ucan, &mut ctx,
+            ucan_token,
+            context_id,
+            outlet_id,
+            outlet_kind_for_ucan,
+            &mut ctx,
         )
         .map_err(|e| {
             ScpPyError::ucan(format!(
@@ -785,23 +789,29 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
     Ok(hash)
 }
 
-/// Extracts the optional `kind` field from the registration dict.
+/// Extracts the REQUIRED `kind` field from the registration dict (SCP-OUT-017).
 ///
 /// Accepts the lowercase strings `"query"` or `"action"` (matching the
-/// §5.4.2 wire form). When the key is absent or `None`, returns
-/// [`OutletKind::default()`] — Action — which is the §5.4.2 fail-safe
-/// default. SCP-OUT-017 makes this field REQUIRED at the SDK surface
-/// across all 4 bindings; SCP-OUT-012 introduces optional plumbing so
-/// the §5.4.2 Query cost-floor check (this story) is exercisable
-/// end-to-end through the `PyO3` bridge.
+/// §5.4.2 wire form). The field is REQUIRED at the bridge boundary —
+/// missing or `None` returns a `ValidationError` carrying
+/// `SCP-VALID-7050`. The Python SDK (`scp_sdk.outlets`) enforces this
+/// at the SDK surface as a keyword-only required parameter; the bridge
+/// enforces it as a defense-in-depth check matching the SDK contract
+/// across all 4 bindings.
 fn extract_kind(
     registration: &Bound<'_, PyDict>,
 ) -> PyResult<scp_core::context::outlets::OutletKind> {
     use scp_core::context::outlets::OutletKind;
-    let val = match registration.get_item("kind")? {
-        Some(v) if !v.is_none() => v,
-        _ => return Ok(OutletKind::default()),
-    };
+    let val = registration
+        .get_item("kind")?
+        .filter(|v| !v.is_none())
+        .ok_or_else(|| {
+            ScpPyError::validation(
+                "missing required 'kind' field — must be 'query' or 'action' \
+                 (§5.4.2 wire vocabulary, SCP-OUT-017)"
+                    .to_owned(),
+            )
+        })?;
     let s: String = val
         .extract()
         .map_err(|_| ScpPyError::validation("'kind' must be a string".to_owned()))?;
@@ -1538,8 +1548,19 @@ fn outlet_registration_to_dict<'py>(
     dict.set_item("name", &reg.name)?;
     dict.set_item("description", &reg.description)?;
 
+    // SCP-OUT-017: surface the registered kind on read paths so SDK
+    // wrappers can round-trip the field.
+    let kind_str = match reg.kind {
+        scp_core::context::outlets::OutletKind::Query => "query",
+        scp_core::context::outlets::OutletKind::Action => "action",
+    };
+    dict.set_item("kind", kind_str)?;
+
     let schema = PyDict::new(py);
-    schema.set_item("input_schema", json_to_py_dict(py, &reg.schema.input_schema)?)?;
+    schema.set_item(
+        "input_schema",
+        json_to_py_dict(py, &reg.schema.input_schema)?,
+    )?;
     schema.set_item(
         "output_schema",
         json_to_py_dict(py, &reg.schema.output_schema)?,
@@ -1645,10 +1666,11 @@ fn build_outlet_registration_from_py(
     let test_vectors = extract_test_vectors(registration)?;
     let implementation_hash = extract_implementation_hash(registration)?;
     let cost = extract_cost(registration)?;
-    // SCP-OUT-012: optional `kind` (defaults to Action). The §5.4.2
-    // Query cost-floor check runs in `update_outlet` per registry.rs;
-    // accepting `kind` from Python here ensures an update flipping to
-    // Query while retaining a positive cost is rejected.
+    // SCP-OUT-017: `kind` is REQUIRED on update too — the §5.4.2 Query
+    // cost-floor check runs in `update_outlet` per registry.rs, and an
+    // update flipping to Query while retaining a positive cost is
+    // rejected. The SDK surface (`OutletNamespace.update`) requires
+    // `kind` on the new definition; the bridge re-enforces it.
     let kind = extract_kind(registration)?;
 
     Ok(scp_core::context::tools::OutletRegistration {
@@ -1734,11 +1756,7 @@ pub fn py_outlet_update(
 /// authorized.
 #[pyfunction]
 #[pyo3(name = "context_outlet_deregister")]
-pub fn py_outlet_deregister(
-    context_id: &str,
-    outlet_id: &str,
-    actor_did: &str,
-) -> PyResult<()> {
+pub fn py_outlet_deregister(context_id: &str, outlet_id: &str, actor_did: &str) -> PyResult<()> {
     validate::validate_context_id(context_id)?;
     validate::validate_outlet_id(outlet_id)?;
     validate::validate_did(actor_did)?;
@@ -2021,6 +2039,8 @@ mod tests {
         dict.set_item("description", "a test").unwrap();
         dict.set_item("operator_did", "did:dht:test123456789abcdefghij")
             .unwrap();
+        // SCP-OUT-017: `kind` is required at the bridge.
+        dict.set_item("kind", "action").unwrap();
         let schema = PyDict::new(py);
         let input = PyDict::new(py);
         input.set_item("type", "object").unwrap();
@@ -2270,6 +2290,8 @@ mod tests {
             dict.set_item("description", "probes registered_at value")
                 .unwrap();
             dict.set_item("operator_did", creator_did).unwrap();
+            // SCP-OUT-017: kind is required at the bridge.
+            dict.set_item("kind", "action").unwrap();
 
             // Schema must meet the specificity floor (>=2 properties on at
             // least one side).
@@ -2325,6 +2347,8 @@ mod tests {
             dict.set_item("name", name).unwrap();
             dict.set_item("description", "probe").unwrap();
             dict.set_item("operator_did", creator_did).unwrap();
+            // SCP-OUT-017: kind is required at the bridge.
+            dict.set_item("kind", "action").unwrap();
             let schema = PyDict::new(py);
             let input = PyDict::new(py);
             input.set_item("type", "object").unwrap();
@@ -2374,8 +2398,7 @@ mod tests {
 
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let dict_obj =
-                py_outlet_get(py, &ctx_id, &outlet_id).expect("get should succeed");
+            let dict_obj = py_outlet_get(py, &ctx_id, &outlet_id).expect("get should succeed");
             let dict: &Bound<'_, PyDict> = dict_obj.bind(py).downcast::<PyDict>().unwrap();
             let id: String = dict
                 .get_item("outlet_id")
@@ -2442,12 +2465,131 @@ mod tests {
 
         let outlet_id = register_probe_outlet(&ctx_id, creator_did, "epsilon");
 
-        let result = py_outlet_deregister(
-            &ctx_id,
-            &outlet_id,
-            "did:dht:z6MkStranger00000000000",
-        );
+        let result = py_outlet_deregister(&ctx_id, &outlet_id, "did:dht:z6MkStranger00000000000");
         assert!(result.is_err(), "stranger cannot deregister");
+
+        crate::runtime::remove_ffi_state(&ctx_id);
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-017 — extract_kind required-at-bridge enforcement.
+    // -----------------------------------------------------------------------
+
+    /// `extract_kind` rejects a registration dict missing the `kind` field
+    /// with a `ValidationError`. Defense-in-depth for the SDK contract that
+    /// makes `kind` REQUIRED across all 4 bindings (SCP-OUT-017).
+    #[test]
+    fn extract_kind_rejects_missing_kind() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            // No `kind` field at all.
+            let result = extract_kind(&dict.as_borrowed());
+            assert!(result.is_err(), "missing kind should be rejected");
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("kind"),
+                "error should mention 'kind', got: {err_str}"
+            );
+            assert!(
+                err_str.contains("SCP-OUT-017") || err_str.contains("required"),
+                "error should reference the requirement, got: {err_str}"
+            );
+        });
+    }
+
+    /// `extract_kind` rejects an explicit `None` value with a `ValidationError`.
+    #[test]
+    fn extract_kind_rejects_none_kind() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("kind", py.None()).unwrap();
+            let result = extract_kind(&dict.as_borrowed());
+            assert!(result.is_err(), "None kind should be rejected");
+        });
+    }
+
+    /// `extract_kind` accepts the canonical "query" / "action" lowercase strings.
+    #[test]
+    fn extract_kind_accepts_canonical_strings() {
+        use scp_core::context::outlets::OutletKind;
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("kind", "query").unwrap();
+            assert_eq!(
+                extract_kind(&dict.as_borrowed()).unwrap(),
+                OutletKind::Query
+            );
+            dict.set_item("kind", "action").unwrap();
+            assert_eq!(
+                extract_kind(&dict.as_borrowed()).unwrap(),
+                OutletKind::Action
+            );
+        });
+    }
+
+    /// `extract_kind` rejects unknown kind strings with a `ValidationError`.
+    #[test]
+    fn extract_kind_rejects_unknown_string() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let dict = PyDict::new(py);
+            dict.set_item("kind", "mutation").unwrap();
+            let result = extract_kind(&dict.as_borrowed());
+            assert!(result.is_err(), "unknown kind string should be rejected");
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("query") && err_str.contains("action"),
+                "error should hint accepted values, got: {err_str}"
+            );
+        });
+    }
+
+    /// `py_outlet_register` rejects a registration missing `kind` end-to-end.
+    #[test]
+    fn outlet_register_rejects_missing_kind() {
+        let ctx_id = format!("ctx-no-kind-{}", std::process::id());
+        let creator_did = "did:dht:z6MkNoKindTest";
+        crate::runtime::register_ffi_state(&ctx_id, creator_did, &[]).unwrap();
+
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            // valid_registration_dict adds kind by default; build manually here.
+            let dict = PyDict::new(py);
+            dict.set_item("name", "no-kind").unwrap();
+            dict.set_item("description", "no kind probe").unwrap();
+            dict.set_item("operator_did", creator_did).unwrap();
+            let schema = PyDict::new(py);
+            let input = PyDict::new(py);
+            input.set_item("type", "object").unwrap();
+            let props = PyDict::new(py);
+            let s = PyDict::new(py);
+            s.set_item("type", "string").unwrap();
+            props.set_item("a", s).unwrap();
+            let n = PyDict::new(py);
+            n.set_item("type", "number").unwrap();
+            props.set_item("b", n).unwrap();
+            input.set_item("properties", props).unwrap();
+            schema.set_item("input_schema", input).unwrap();
+            let output = PyDict::new(py);
+            output.set_item("type", "object").unwrap();
+            schema.set_item("output_schema", output).unwrap();
+            dict.set_item("schema", schema).unwrap();
+            // Intentionally no `kind` — must fail.
+
+            let result = py_outlet_register(&ctx_id, &dict.as_borrowed());
+            assert!(
+                result.is_err(),
+                "registration without `kind` must be rejected (SCP-OUT-017)"
+            );
+            let err_str = format!("{}", result.unwrap_err());
+            assert!(
+                err_str.contains("kind"),
+                "error should mention 'kind', got: {err_str}"
+            );
+        });
 
         crate::runtime::remove_ffi_state(&ctx_id);
     }
@@ -2467,6 +2609,8 @@ mod tests {
             dict.set_item("name", "omega").unwrap();
             dict.set_item("description", "updated description").unwrap();
             dict.set_item("operator_did", creator_did).unwrap();
+            // SCP-OUT-017: kind is required at the bridge on update too.
+            dict.set_item("kind", "action").unwrap();
             let schema = PyDict::new(py);
             let input = PyDict::new(py);
             input.set_item("type", "object").unwrap();

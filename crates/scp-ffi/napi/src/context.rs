@@ -590,7 +590,9 @@ pub async fn context_create(
         mode: mode_str,
         ceiling: ceiling
             .iter()
-            .filter_map(|s| scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name()))
+            .filter_map(|s| {
+                scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name())
+            })
             .collect(),
         ceiling_policy,
         ttl_seconds,
@@ -3293,8 +3295,14 @@ pub fn validate_capability_declaration(
     let decl: CapabilityDeclaration = serde_json::from_str(&declaration_json)
         .map_err(|e| NapiError::from_reason(format!("invalid declaration JSON: {e}")))?;
 
-    let ceiling: Vec<Capability> = ceiling_capabilities.iter().filter_map(Capability::new).collect();
-    let role_caps: Vec<Capability> = role_capabilities.iter().filter_map(Capability::new).collect();
+    let ceiling: Vec<Capability> = ceiling_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
+    let role_caps: Vec<Capability> = role_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
 
     let handle = ContextHandle::new("validation-context".to_owned(), ContextParams::default());
 

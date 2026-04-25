@@ -243,6 +243,7 @@ describe("Tool runtime (mock bridge)", () => {
     const def = defineOutletDefinition({
       name: "echo-tool",
       description: "Echoes input",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -267,6 +268,7 @@ describe("Tool runtime (mock bridge)", () => {
     const def = defineOutletDefinition({
       name: "add-tool",
       description: "Adds two numbers",
+      kind: "action",
       inputSchema: { type: "object", properties: { a: { type: "number" }, b: { type: "number" } } },
       outputSchema: { type: "object", properties: { sum: { type: "number" } } },
       operator: identity.did,
@@ -306,6 +308,7 @@ describe("Tool runtime (mock bridge)", () => {
     const def = defineOutletDefinition({
       name: "noop-tool",
       description: "Does nothing",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -332,6 +335,7 @@ describe("Tool runtime (mock bridge)", () => {
     const def = defineOutletDefinition({
       name: "noop-tool-2",
       description: "Does nothing",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -358,6 +362,7 @@ describe("Tool runtime (mock bridge)", () => {
     const def = defineOutletDefinition({
       name: "revoked-test-tool",
       description: "Test revocation",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -390,6 +395,7 @@ describe("Tool runtime (mock bridge)", () => {
     const def = defineOutletDefinition({
       name: "multiply",
       description: "Multiplies two numbers",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -424,6 +430,7 @@ describe("Tool runtime (mock bridge)", () => {
     const def = defineOutletDefinition({
       name: "broken",
       description: "A broken tool",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -477,6 +484,7 @@ describe("Tool runtime (mock bridge)", () => {
     const def = defineOutletDefinition({
       name: "paid-echo",
       description: "Paid echo tool for C4 wiring test",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -523,6 +531,7 @@ describe("Tool runtime (mock bridge)", () => {
     const def = defineOutletDefinition({
       name: "sdk-paid-echo",
       description: "SDK paid echo tool for C4 wiring test",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -562,6 +571,7 @@ describe("Tool runtime (mock bridge)", () => {
     const def = defineOutletDefinition({
       name: "sdk-free-echo",
       description: "SDK free echo tool",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,
@@ -852,6 +862,7 @@ describe("SDK class wiring (type-safe delegation)", () => {
     const def = defineOutletDefinition({
       name: "test",
       description: "desc",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: "did:dht:z6MkTest",
@@ -866,6 +877,7 @@ describe("SDK class wiring (type-safe delegation)", () => {
       defineOutletDefinition({
         name: "",
         description: "desc",
+        kind: "action",
         inputSchema: {},
         outputSchema: {},
         operator: "did:dht:z6MkTest",
@@ -906,6 +918,7 @@ describe("Trust evaluation runtime (mock bridge)", () => {
     const def = defineOutletDefinition({
       name: "calc",
       description: "Calculator",
+      kind: "action",
       inputSchema: { type: "object" },
       outputSchema: { type: "object" },
       operator: identity.did,

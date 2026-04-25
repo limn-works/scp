@@ -24,7 +24,7 @@ from scp_sdk.errors import (
     UcanPermissionError,
     ValidationError,
 )
-from scp_sdk.outlets import OutletDefinition, TestVector
+from scp_sdk.outlets import OutletDefinition, OutletKind, TestVector
 from scp_sdk.types import (
     Capability,
     CeilingPolicy,
@@ -318,12 +318,14 @@ class TestOutletDefinition:
         tool = OutletDefinition(
             name="recipe_search",
             description="Search recipes by ingredients",
+            kind=OutletKind.Query,
             input_schema={"type": "object"},
             output_schema={"type": "object"},
             operator="did:dht:z6MkOperator",
         )
         assert tool.name == "recipe_search"
         assert tool.description == "Search recipes by ingredients"
+        assert tool.kind is OutletKind.Query
         assert tool.input_schema == {"type": "object"}
         assert tool.output_schema == {"type": "object"}
         assert tool.operator == "did:dht:z6MkOperator"
@@ -338,6 +340,7 @@ class TestOutletDefinition:
         tool = OutletDefinition(
             name="recipe_search",
             description="Search recipes",
+            kind=OutletKind.Query,
             input_schema={},
             output_schema={},
             operator="did:dht:z6MkOp",
@@ -351,6 +354,7 @@ class TestOutletDefinition:
         tool = OutletDefinition(
             name="hasher",
             description="Hash tool",
+            kind=OutletKind.Action,
             input_schema={},
             output_schema={},
             operator="did:dht:z6MkOp",
@@ -362,6 +366,7 @@ class TestOutletDefinition:
         tool = OutletDefinition(
             name="t",
             description="d",
+            kind=OutletKind.Action,
             input_schema={},
             output_schema={},
             operator="did:dht:z6MkSomeone",

@@ -389,8 +389,99 @@ public actor OutletNamespace {
 
     // MARK: register / invoke / update / get / list / verify / deregister
 
+    /// Register an outlet in the context.
+    ///
+    /// SCP-OUT-017 makes `kind` REQUIRED on `OutletDefinition` — the
+    /// UniFFI-generated type carries a non-optional `kind: OutletKind`
+    /// field, so omitting it is a Swift compile error. Two call styles
+    /// are supported:
+    ///
+    /// 1. **Single-argument form** — pass an `OutletDefinition`
+    ///    constructed with the `kind:` labeled argument.
+    /// 2. **Labeled form** — pass `kind:` plus the rest of the fields as
+    ///    individual arguments. The labeled `kind:` argument is required
+    ///    in this form (no default).
     public func register(_ definition: OutletDefinition) async throws -> String {
         return try await outletRegister(handle: handle, definition: definition)
+    }
+
+    /// Register an outlet using labeled arguments. `kind` is REQUIRED
+    /// (no default) — Swift's labeled-argument style is the per-language
+    /// idiom for surfacing the requirement at compile time.
+    public func register(
+        kind: OutletKind,
+        name: String,
+        description: String,
+        inputSchemaJson: String,
+        outputSchemaJson: String,
+        operatorDid: String,
+        testVectorsJson: String? = nil,
+        implementationHash: Data? = nil,
+        cost: ToolCostDefinition? = nil
+    ) async throws -> String {
+        let definition = OutletDefinition(
+            name: name,
+            description: description,
+            kind: kind,
+            inputSchemaJson: inputSchemaJson,
+            outputSchemaJson: outputSchemaJson,
+            operatorDid: operatorDid,
+            testVectorsJson: testVectorsJson,
+            implementationHash: implementationHash,
+            cost: cost
+        )
+        return try await outletRegister(handle: handle, definition: definition)
+    }
+
+    /// Convenience: register an outlet with `kind: .query`.
+    ///
+    /// Equivalent to `register(kind: .query, ...)`. Use when the outlet
+    /// is read-only and idempotent (§5.4.2).
+    public func registerQuery(
+        name: String,
+        description: String,
+        inputSchemaJson: String,
+        outputSchemaJson: String,
+        operatorDid: String,
+        testVectorsJson: String? = nil,
+        implementationHash: Data? = nil,
+        cost: ToolCostDefinition? = nil
+    ) async throws -> String {
+        return try await register(
+            kind: .query,
+            name: name,
+            description: description,
+            inputSchemaJson: inputSchemaJson,
+            outputSchemaJson: outputSchemaJson,
+            operatorDid: operatorDid,
+            testVectorsJson: testVectorsJson,
+            implementationHash: implementationHash,
+            cost: cost
+        )
+    }
+
+    /// Convenience: register an outlet with `kind: .action`.
+    public func registerAction(
+        name: String,
+        description: String,
+        inputSchemaJson: String,
+        outputSchemaJson: String,
+        operatorDid: String,
+        testVectorsJson: String? = nil,
+        implementationHash: Data? = nil,
+        cost: ToolCostDefinition? = nil
+    ) async throws -> String {
+        return try await register(
+            kind: .action,
+            name: name,
+            description: description,
+            inputSchemaJson: inputSchemaJson,
+            outputSchemaJson: outputSchemaJson,
+            operatorDid: operatorDid,
+            testVectorsJson: testVectorsJson,
+            implementationHash: implementationHash,
+            cost: cost
+        )
     }
 
     /// Invoke an outlet — returns an `InvocationHandle` that exposes both

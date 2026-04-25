@@ -704,7 +704,11 @@ impl ContextProvider for FfiBridgeProvider {
                 };
 
                 scp_core::context::tools::validate_outlet_invocation_ucan(
-                    token, context_id, outlet_name, outlet_kind_for_ucan, &mut ctx,
+                    token,
+                    context_id,
+                    outlet_name,
+                    outlet_kind_for_ucan,
+                    &mut ctx,
                 )
                 .map_err(|e| {
                     tracing::warn!(

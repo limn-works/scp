@@ -88,7 +88,7 @@ use scp_core::context::membership::KeyPackage;
 
 use scp_ffi_common::validate::{
     json_value_type_name, validate_capability_uri, validate_context_id, validate_did,
-    validate_mcp_handle, validate_relay_url, validate_outlet_id, validate_outlet_name,
+    validate_mcp_handle, validate_outlet_id, validate_outlet_name, validate_relay_url,
     validate_transport_mode, validate_ucan_token,
 };
 
@@ -1188,6 +1188,32 @@ impl DataProvenance {
     }
 }
 
+/// Outlet semantic class (§5.4.2).
+///
+/// `Query` is read-only and idempotent (UCAN stem `outlet_query:{id}`);
+/// `Action` may mutate state (UCAN stem `outlet_call:{id}`).
+///
+/// SCP-OUT-017 makes this REQUIRED at the SDK surface across all 4
+/// bindings. Swift exposes it as `OutletKind` (a Swift enum with `.query`
+/// / `.action` cases); Kotlin exposes it as `OutletKind` (a Kotlin enum
+/// with `QUERY` / `ACTION`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum OutletKind {
+    /// Read-only, idempotent. UCAN stem `outlet_query:{id}`.
+    Query,
+    /// May mutate state. UCAN stem `outlet_call:{id}`. §5.4.2 fail-safe default.
+    Action,
+}
+
+impl From<OutletKind> for scp_core::context::outlets::OutletKind {
+    fn from(k: OutletKind) -> Self {
+        match k {
+            OutletKind::Query => Self::Query,
+            OutletKind::Action => Self::Action,
+        }
+    }
+}
+
 /// Tool definition for registration in a context.
 ///
 /// See ADR-010 (Tool Registry) and spec §5.4.1 (Tools).
@@ -1197,6 +1223,9 @@ pub struct OutletDefinition {
     pub name: String,
     /// Tool description.
     pub description: String,
+    /// Outlet semantic class (Query vs Action — §5.4.2). REQUIRED at the
+    /// bridge surface across all 4 bindings (SCP-OUT-017).
+    pub kind: OutletKind,
     /// JSON Schema for tool input (as a JSON string).
     pub input_schema_json: String,
     /// JSON Schema for tool output (as a JSON string).
@@ -3297,7 +3326,10 @@ pub async fn context_create(
                 ceiling_strings: params
                     .ceiling
                     .iter()
-                    .filter_map(|s| scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name()))
+                    .filter_map(|s| {
+                        scp_core::context::roles::Capability::new(s)
+                            .map(|c| c.ucan_capability_name())
+                    })
                     .collect(),
                 outlet_registry: tokio::sync::Mutex::new(
                     scp_core::context::tools::OutletRegistry::new(),
@@ -3979,18 +4011,23 @@ pub async fn outlet_register(
 
             let outlet_id = format!("tool-{}", definition.name.replace(' ', "-").to_lowercase());
 
-            let cost = definition.cost.map(|c| scp_core::context::tools::OutletCost {
-                amount: c.amount,
-                currency: c.currency,
-                payee: c.payee.into(),
-                cost_formula: c.cost_formula,
-            });
+            let cost = definition
+                .cost
+                .map(|c| scp_core::context::tools::OutletCost {
+                    amount: c.amount,
+                    currency: c.currency,
+                    payee: c.payee.into(),
+                    cost_formula: c.cost_formula,
+                });
 
             let core_registration = scp_core::context::tools::OutletRegistration {
                 outlet_id: outlet_id.clone(),
-                // SCP-OUT-011: default to fail-safe Action (§5.4.2) until
-                // kind plumbing extends to UniFFI (downstream story).
-                kind: scp_core::context::outlets::OutletKind::default(),
+                // SCP-OUT-017: kind is REQUIRED on the UniFFI definition
+                // surface — Swift requires the labeled `kind:` argument and
+                // Kotlin requires the `kind: OutletKind` parameter (no
+                // default). The `From<OutletKind>` impl above maps the
+                // bridge enum to the scp-core enum.
+                kind: definition.kind.into(),
                 name: definition.name,
                 description: definition.description,
                 schema: scp_core::context::tools::OutletSchema {
@@ -4316,12 +4353,11 @@ fn validate_outlet_ucan_uniffi(
             clock: &scp_primitives::SystemClock,
         };
 
-        validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, kind, &mut ctx).map_err(
-            |e| ScpError::Permission {
+        validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, kind, &mut ctx)
+            .map_err(|e| ScpError::Permission {
                 msg: format!("UCAN authorization failed for tool '{outlet_id}': {e}"),
                 code: codes::PERM_3002.to_owned(),
-            },
-        )
+            })
     })
     .ok_or_else(|| ScpError::Permission {
         msg: format!("context '{}' not found in UCAN registry", handle.context_id),
@@ -4378,10 +4414,8 @@ pub async fn outlet_verify(
             // verification happens once a live executor is wired.
             let registry = handle.outlet_registry.lock().await;
             let outlet_id_for_executor = outlet_id.clone();
-            let (verification_result, _event) = scp_core::context::tools::verify_outlet(
-                &registry,
-                &outlet_id,
-                |input| {
+            let (verification_result, _event) =
+                scp_core::context::tools::verify_outlet(&registry, &outlet_id, |input| {
                     if let Some(registration) = registry.get(&outlet_id_for_executor) {
                         for vector in &registration.test_vectors {
                             if vector.input == *input {
@@ -4390,12 +4424,11 @@ pub async fn outlet_verify(
                         }
                     }
                     serde_json::Value::Null
-                },
-            )
-            .map_err(|e| ScpError::Tool {
-                msg: format!("outlet verification failed: {e}"),
-                code: codes::TOOL_6001.to_owned(),
-            })?;
+                })
+                .map_err(|e| ScpError::Tool {
+                    msg: format!("outlet verification failed: {e}"),
+                    code: codes::TOOL_6001.to_owned(),
+                })?;
 
             let failures: Vec<String> = verification_result
                 .vector_results
@@ -5187,8 +5220,9 @@ fn build_outlet_registration_from_uniffi(
 
     Ok(scp_core::context::tools::OutletRegistration {
         outlet_id,
-        // SCP-OUT-011: default to fail-safe Action (§5.4.2).
-        kind: scp_core::context::outlets::OutletKind::default(),
+        // SCP-OUT-017: kind comes from the UniFFI definition; the Swift
+        // and Kotlin SDKs require it on `OutletDefinition` (no default).
+        kind: definition.kind.into(),
         name: definition.name,
         description: definition.description,
         schema: scp_core::context::tools::OutletSchema {
@@ -5387,27 +5421,23 @@ pub async fn outlet_list(handle: Arc<ContextHandle>) -> Result<Vec<String>, ScpE
 ///
 /// Returns `ScpError::Tool` (`SCP-TOOL-6002`) if the outlet is not found.
 #[uniffi::export]
-pub async fn outlet_get(
-    handle: Arc<ContextHandle>,
-    outlet_id: String,
-) -> Result<String, ScpError> {
+pub async fn outlet_get(handle: Arc<ContextHandle>, outlet_id: String) -> Result<String, ScpError> {
     crate::uniffi_check_handle!(handle);
     runtime()
         .spawn(async move {
             validate_outlet_id(&outlet_id)?;
 
             let registry = handle.outlet_registry.lock().await;
-            let registration =
-                registry
-                    .get(&outlet_id)
-                    .cloned()
-                    .ok_or_else(|| ScpError::Tool {
-                        msg: format!(
-                            "outlet '{}' not found in context '{}'",
-                            outlet_id, handle.context_id
-                        ),
-                        code: codes::TOOL_6002.to_owned(),
-                    })?;
+            let registration = registry
+                .get(&outlet_id)
+                .cloned()
+                .ok_or_else(|| ScpError::Tool {
+                    msg: format!(
+                        "outlet '{}' not found in context '{}'",
+                        outlet_id, handle.context_id
+                    ),
+                    code: codes::TOOL_6002.to_owned(),
+                })?;
             drop(registry);
 
             serde_json::to_string(&registration).map_err(|e| ScpError::Tool {
@@ -6161,9 +6191,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     .get(outlet_name)
                     .map(|r| r.kind)
                     .ok_or_else(|| {
-                        format!(
-                            "tool '{outlet_name}' not registered in context '{context_id}'"
-                        )
+                        format!("tool '{outlet_name}' not registered in context '{context_id}'")
                     })?
             };
 
@@ -6194,7 +6222,11 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 };
 
                 scp_core::context::tools::validate_outlet_invocation_ucan(
-                    token, context_id, outlet_name, outlet_kind_for_ucan, &mut ctx,
+                    token,
+                    context_id,
+                    outlet_name,
+                    outlet_kind_for_ucan,
+                    &mut ctx,
                 )
                 .map_err(|e| {
                     tracing::warn!(
@@ -6269,9 +6301,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 .ok_or_else(|| format!("context '{context_id}' not found in handle registry"))?;
 
             let outlet_registry = handle.outlet_registry.blocking_lock();
-            let registration = outlet_registry
-                .get(outlet_name)
-                .ok_or_else(|| format!("tool '{outlet_name}' not found in context '{context_id}'"))?;
+            let registration = outlet_registry.get(outlet_name).ok_or_else(|| {
+                format!("tool '{outlet_name}' not found in context '{context_id}'")
+            })?;
 
             // Validate input against the tool's input schema.
             scp_core::context::tools::schema::validate_value_against_schema(
@@ -6318,7 +6350,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     &output,
                     &output_schema,
                 )
-                .map_err(|msg| format!("output validation failed for tool '{outlet_name}': {msg}"))?;
+                .map_err(|msg| {
+                    format!("output validation failed for tool '{outlet_name}': {msg}")
+                })?;
 
                 output
             }
@@ -12931,8 +12965,14 @@ pub fn sandbox_validate_declaration(
             code: codes::VALID_7070.to_owned(),
         })?;
 
-    let ceiling: Vec<Capability> = ceiling_capabilities.iter().filter_map(Capability::new).collect();
-    let role_caps: Vec<Capability> = role_capabilities.iter().filter_map(Capability::new).collect();
+    let ceiling: Vec<Capability> = ceiling_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
+    let role_caps: Vec<Capability> = role_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
 
     let handle = CoreContextHandle::new("validation-context".to_owned(), ContextParams::default());
 
@@ -14068,7 +14108,9 @@ mod tests {
             callback_custody: None,
             signing_key: None,
             ceiling_strings: Vec::new(),
-            outlet_registry: tokio::sync::Mutex::new(scp_core::context::tools::OutletRegistry::new()),
+            outlet_registry: tokio::sync::Mutex::new(
+                scp_core::context::tools::OutletRegistry::new(),
+            ),
             outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             session_store: tokio::sync::Mutex::new(scp_core::context::tools::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
@@ -14405,6 +14447,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: "not valid json{{{".to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
             test_vectors_json: None,
@@ -14434,6 +14477,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: "{broken".to_owned(),
             test_vectors_json: None,
@@ -14465,6 +14509,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#""a string""#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
             test_vectors_json: None,
@@ -14498,6 +14543,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: "[1, 2, 3]".to_owned(),
             test_vectors_json: None,
@@ -14533,6 +14579,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
             test_vectors_json: Some(r#"{"not": "an array"}"#.to_owned()),
@@ -14563,6 +14610,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
             test_vectors_json: Some(r#"[{"bad": "entry"}]"#.to_owned()),
@@ -14590,6 +14638,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
             test_vectors_json: None,
@@ -14623,6 +14672,7 @@ mod tests {
         let def = OutletDefinition {
             name: "test-tool".to_owned(),
             description: "desc".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json: r#"{"type": "object"}"#.to_owned(),
             output_schema_json: r#"{"type": "object"}"#.to_owned(),
             test_vectors_json: None,
@@ -14757,6 +14807,7 @@ mod tests {
         let def = OutletDefinition {
             name: "timestamp-probe".to_owned(),
             description: "probes registered_at value".to_owned(),
+            kind: OutletKind::Action,
             input_schema_json:
                 r#"{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"number"}}}"#
                     .to_owned(),
