@@ -2478,7 +2478,7 @@
       "gate": "gate-round5-fixes",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-protocol/src/context/outlets/registration.rs",
         "crates/scp-protocol/src/context/outlets/message_catalog.rs",
