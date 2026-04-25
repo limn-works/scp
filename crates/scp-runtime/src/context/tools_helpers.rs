@@ -32,8 +32,10 @@
 //!
 //! Every hoisted free function is **behavior-preserving by construction**.
 //! Its body is a verbatim copy of the legacy inherent method's body with
-//! `self.X` replaced by `mgr.X(...)` for remaining inherent methods on
-//! [`ContextManager`](crate::context::manager::ContextManager).
+//! `self.X` replaced by `manager_methods::X(supervisor, ...)` for the
+//! cross-domain helpers hoisted from `ContextManager` in ADR-049 commit
+//! 12c.9g.1 (helper bodies migrated to direct calls in commit 12c.9g.2;
+//! no `mgr` derivation).
 //!
 //! The legacy inherent methods on
 //! [`ContextManager`](crate::context::manager::ContextManager) remain as
@@ -59,6 +61,7 @@
 
 use scp_identity::DID;
 
+use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
 
 // ---------------------------------------------------------------------------
@@ -82,12 +85,11 @@ pub async fn try_consume_hard_rate_limit(
     did: &DID,
     now_secs: u64,
 ) -> bool {
-    // ADR-049 commit 12c.9d — returns `bool` so an unpopulated attach
+    // ADR-049 commit 12c.9g.2 — returns `bool` so an unpopulated attach
     // slot degrades to the legacy unknown-context pass-through (`true`).
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        return true;
-    };
-    let Ok(arc) = mgr.get_context_arc(context_id) else {
+    // The contexts map accessor is reached directly through the supervisor;
+    // no `mgr` derivation needed.
+    let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
         return true;
     };
     let mut guard = arc.lock().await;
@@ -105,19 +107,27 @@ pub async fn try_consume_hard_rate_limit(
 /// [`ContextManager::refund_hard_rate_limit`](crate::context::manager::ContextManager::refund_hard_rate_limit)
 /// (ADR-049 commit 12c.4). Byte-identical behavior.
 pub async fn refund_hard_rate_limit(supervisor: &Supervisor, context_id: &str, did: &DID) {
-    // ADR-049 commit 12c.9d — returns `()` so an unpopulated attach
+    // ADR-049 commit 12c.9g.2 — returns `()` so an unpopulated attach
     // slot degrades to a no-op with a tracing error for observability.
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        tracing::error!(
-            context_id,
-            "refund_hard_rate_limit: Supervisor is not attached — skipping refund \
-             (contract violation; see ADR-049 commit 12c.9d)"
-        );
-        return;
-    };
-    if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
-        let guard = ctx_arc.lock().await;
-        let ctx = &*guard;
-        ctx.governance.hard_rate_limit.refund(did);
+    // The detached-supervisor case is distinguished from the
+    // unknown-context case via [`ContextError::NotInitialized`] vs
+    // [`ContextError::ContextNotRegistered`] so the tracing diagnostic
+    // remains specific.
+    match manager_methods::get_context_arc(supervisor, context_id) {
+        Ok(ctx_arc) => {
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+            ctx.governance.hard_rate_limit.refund(did);
+        }
+        Err(scp_protocol::context::ContextError::NotInitialized(_)) => {
+            tracing::error!(
+                context_id,
+                "refund_hard_rate_limit: Supervisor is not attached — skipping refund \
+                 (contract violation; see ADR-049 commit 12c.9d)"
+            );
+        }
+        Err(_) => {
+            // Unknown context: legacy behavior is silent no-op.
+        }
     }
 }

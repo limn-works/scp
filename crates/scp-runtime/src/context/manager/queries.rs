@@ -573,6 +573,7 @@ impl ContextManager {
     /// Legacy one-line forwarder to the hoisted
     /// [`crate::context::queries_helpers::create_checkpoint_if_due`] free
     /// function (ADR-049 commit 12c.5).
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) fn create_checkpoint_if_due(
         &self,
         context_id: &str,
@@ -596,6 +597,7 @@ impl ContextManager {
     /// Legacy one-line forwarder to the hoisted
     /// [`crate::context::queries_helpers::force_create_checkpoint`] free
     /// function (ADR-049 commit 12c.5).
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) fn force_create_checkpoint(
         &self,
         context_id: &str,

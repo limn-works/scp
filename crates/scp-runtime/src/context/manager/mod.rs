@@ -3379,6 +3379,7 @@ impl ContextManager {
     /// Legacy one-line forwarder to the hoisted
     /// [`crate::context::manager_methods::remove_context`] free function
     /// (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) fn remove_context(&self, context_id: &str) -> Option<Arc<Mutex<PerContextState>>> {
         let sup = self.supervisor()?;
         crate::context::manager_methods::remove_context(&sup, context_id)
@@ -3461,6 +3462,7 @@ impl ContextManager {
     /// Legacy one-line forwarder to the hoisted
     /// [`crate::context::manager_methods::update_context_gauges`] free
     /// function (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) fn update_context_gauges(&self) {
         let Some(sup) = self.supervisor() else {
             return;
@@ -3504,6 +3506,7 @@ impl ContextManager {
     /// Legacy one-line forwarder to the hoisted
     /// [`crate::context::manager_methods::init_broadcast_context`] free
     /// function (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) fn init_broadcast_context(
         &self,
         context_id: &str,
@@ -3625,6 +3628,7 @@ impl ContextManager {
     /// [`crate::context::manager_methods::record_payment_capture_failure`]
     /// free function (ADR-049 commit 12c.9g.1). Deleted in commit
     /// 12c.9g.4.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) async fn record_payment_capture_failure(
         &self,
         context_id: &str,

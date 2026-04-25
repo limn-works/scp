@@ -32,9 +32,13 @@
 //! Its body is a verbatim copy of the legacy inherent method's body with
 //! `self.X` replaced by either:
 //!
-//! - `mgr.X(...)` for remaining inherent methods on
-//!   [`ContextManager`](crate::context::manager::ContextManager), or
-//! - `mgr.X_ref()` / explicit collaborator parameters for fields.
+//! - `manager_methods::X(supervisor, ...)` /
+//!   `<domain>_helpers::X(supervisor, ...)` for the cross-domain and
+//!   per-domain free-function helpers hoisted from `ContextManager` in
+//!   ADR-049 commit 12c.9g.1 (helper bodies migrated to direct calls in
+//!   commit 12c.9g.2; no `mgr` derivation), or
+//! - `supervisor.X_ref().ok_or(NotInitialized)?` for provider slots
+//!   lifted to the supervisor in ADR-049 commit 12c.9a-9b.
 //!
 //! The legacy inherent methods on
 //! [`ContextManager`](crate::context::manager::ContextManager) remain as
@@ -135,6 +139,7 @@ use crate::context::manager::{
     context_id_to_bytes, push_welcome_event, require_active, require_migrating_out,
     strip_event_payload,
 };
+use crate::context::manager_methods;
 
 // The governance-domain free functions below are mechanically hoisted from the
 // legacy `impl ContextManager { ... }` block in `manager/governance.rs`. Each
@@ -168,9 +173,6 @@ pub async fn execute_governance_action(
     context_id: &str,
     proposal: &GovernanceProposal,
 ) -> Result<GovernanceActionResult, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // Gate: only approved proposals can be executed.
     if !matches!(proposal.status, ProposalStatus::Approved) {
         return Err(ContextError::PermissionDenied(format!(
@@ -192,7 +194,7 @@ pub async fn execute_governance_action(
     // lock_context to capture a generation token for later relock_context
     // calls (Phase B confused-deputy detection).
     let ctx_gen = {
-        let (mut guard, generation) = mgr.lock_context(context_id).await?;
+        let (mut guard, generation) = manager_methods::lock_context(supervisor, context_id).await?;
         let ctx = &mut *guard;
         ContextManager::check_commit_fault(ctx)?;
 
@@ -229,7 +231,7 @@ pub async fn execute_governance_action(
             // Roll back the executed marker on dispatch failure so the
             // proposal can be retried (e.g. after a transient crypto error).
             // Use relock_context for generation verification.
-            if let Ok(mut guard) = mgr.relock_context(&ctx_gen).await {
+            if let Ok(mut guard) = manager_methods::relock_context(supervisor, &ctx_gen).await {
                 let ctx = &mut *guard;
                 ctx.governance
                     .executed_proposals
@@ -271,9 +273,6 @@ pub async fn finalize_governance_action(
     proposal: &GovernanceProposal,
     ctx_gen: &ContextGeneration,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // For MLS-mutating actions (AddMember, RemoveMember, Revoke,
     // ResetMember), increment the epoch counter, place the old epoch into
     // the grace store (§23.11), record the coordination in the
@@ -285,7 +284,7 @@ pub async fn finalize_governance_action(
         let mls_op = generate_mls_operations(proposal)
             .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
 
-        if let Ok(mut guard) = mgr.relock_context(ctx_gen).await {
+        if let Ok(mut guard) = manager_methods::relock_context(supervisor, ctx_gen).await {
             let ctx = &mut *guard;
             let old_epoch = ctx.epoch.mls_epoch;
             ctx.epoch.mls_epoch = old_epoch.saturating_add(1);
@@ -363,7 +362,7 @@ pub async fn finalize_governance_action(
     {
         let action_summary = proposal.action.variant_name().to_owned();
         let target_did = proposal.action.target_did().cloned();
-        if let Ok(mut guard) = mgr.relock_context(ctx_gen).await {
+        if let Ok(mut guard) = manager_methods::relock_context(supervisor, ctx_gen).await {
             let ctx = &mut *guard;
             // Checkpoint tracking: count the GovernanceActionExecuted event.
             ctx.checkpoint_events_since += 1;
@@ -461,8 +460,9 @@ pub async fn finalize_governance_action(
                     .event_log_ref()
                     .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
             );
-            let gov_merkle = mgr
+            let gov_merkle = supervisor
                 .event_log_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
                 .event_log_merkle_root(&context_id_bytes)
                 .unwrap_or([0u8; 32]);
             if !gov_events.is_empty()
@@ -484,9 +484,9 @@ pub async fn finalize_governance_action(
             }
 
             // 4. Persist the updated context state (best-effort).
-            if mgr.has_persistence() {
+            if manager_methods::has_persistence(supervisor) {
                 let snapshot = ContextManager::snapshot_context(ctx);
-                mgr.persist_context_snapshot(context_id, snapshot);
+                manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
             }
         } else {
             tracing::warn!(
@@ -515,9 +515,6 @@ pub async fn dispatch_governance_action(
     context_id: &str,
     proposal: &GovernanceProposal,
 ) -> Result<GovernanceActionResult, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let pid = proposal.proposal_id;
     let actor = proposal.proposer_did.as_ref();
     match &proposal.action {
@@ -533,8 +530,7 @@ pub async fn dispatch_governance_action(
         GovernanceAction::SuspendAccess { did } => {
             // Suspend all capabilities for the member.
             let snapshot = {
-                let ctx_arc = mgr
-                    .get_context_arc(context_id)
+                let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
                     .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
@@ -560,7 +556,7 @@ pub async fn dispatch_governance_action(
                     supervisor.event_tx_ref(),
                 );
 
-                if mgr.has_persistence() {
+                if manager_methods::has_persistence(supervisor) {
                     Some(ContextManager::snapshot_context(ctx))
                 } else {
                     None
@@ -568,7 +564,7 @@ pub async fn dispatch_governance_action(
             };
 
             if let Some(snapshot) = snapshot {
-                mgr.persist_context_snapshot(context_id, snapshot);
+                manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
             }
             let context_id_bytes = context_id_to_bytes(context_id);
             supervisor
@@ -576,7 +572,7 @@ pub async fn dispatch_governance_action(
                 .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
                 .append_context_event(&context_id_bytes, "MemberSuspendedAll", actor)?;
             {
-                if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+                if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
                     let mut guard = ctx_arc.lock().await;
                     let ctx = &mut *guard;
                     ctx.checkpoint_events_since += 1;
@@ -1006,12 +1002,8 @@ pub async fn propose_governance_action_inner(
     ),
     ContextError,
 > {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let (proposal, events, should_execute, invalidated_by_conflict, in_freeze, conflict_events) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -1185,7 +1177,7 @@ pub async fn propose_governance_action_inner(
             }
         }
         if conflict_event_count > 0
-            && let Ok(ctx_arc) = mgr.get_context_arc(context_id)
+            && let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id)
         {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
@@ -1202,13 +1194,13 @@ pub async fn propose_governance_action_inner(
     };
 
     // Persist context state after proposal creation.
-    if mgr.has_persistence()
-        && let Ok(ctx_arc) = mgr.get_context_arc(context_id)
+    if manager_methods::has_persistence(supervisor)
+        && let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id)
     {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
         let snapshot = ContextManager::snapshot_context(ctx);
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
 
     Ok((proposal, events, execution_result))
@@ -1283,12 +1275,8 @@ pub async fn vote_on_proposal_inner(
     signing_key: &ed25519_dalek::SigningKey,
     check_vote_capability: bool,
 ) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let (status, events, proposal_for_execution, conflict_events) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -1401,7 +1389,7 @@ pub async fn vote_on_proposal_inner(
             }
         }
         if conflict_event_count > 0
-            && let Ok(ctx_arc) = mgr.get_context_arc(context_id)
+            && let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id)
         {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
@@ -1419,7 +1407,7 @@ pub async fn vote_on_proposal_inner(
     if let Some(proposal) = proposal_for_execution {
         // Check if we're in governance freeze before executing
         let in_freeze = {
-            if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+            if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
                 let guard = ctx_arc.lock().await;
                 let ctx = &*guard;
                 ctx.governance.freeze.is_some()
@@ -1434,13 +1422,13 @@ pub async fn vote_on_proposal_inner(
     }
 
     // Persist context state after vote.
-    if mgr.has_persistence()
-        && let Ok(ctx_arc) = mgr.get_context_arc(context_id)
+    if manager_methods::has_persistence(supervisor)
+        && let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id)
     {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
         let snapshot = ContextManager::snapshot_context(ctx);
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
 
     Ok((status, events))
@@ -1462,11 +1450,7 @@ pub async fn get_proposal(
     context_id: &str,
     proposal_id: &ProposalId,
 ) -> Result<GovernanceProposal, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let ctx_arc = mgr
-        .get_context_arc(context_id)
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let guard = ctx_arc.lock().await;
     let ctx = &*guard;
@@ -1501,11 +1485,7 @@ pub async fn list_proposals(
     supervisor: &Supervisor,
     context_id: &str,
 ) -> Result<Vec<GovernanceProposal>, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let ctx_arc = mgr
-        .get_context_arc(context_id)
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let guard = ctx_arc.lock().await;
     let ctx = &*guard;
@@ -1675,12 +1655,8 @@ pub async fn withdraw_governance_vote(
     proposal_id: &ProposalId,
     voter_did: &DID,
 ) -> Result<ProposalStatus, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let (status, events) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -1712,7 +1688,7 @@ pub async fn withdraw_governance_vote(
         event_count += 1;
     }
     if event_count > 0
-        && let Ok(ctx_arc) = mgr.get_context_arc(context_id)
+        && let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id)
     {
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -1720,13 +1696,13 @@ pub async fn withdraw_governance_vote(
     }
 
     // Persist context state after withdrawal.
-    if mgr.has_persistence()
-        && let Ok(ctx_arc) = mgr.get_context_arc(context_id)
+    if manager_methods::has_persistence(supervisor)
+        && let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id)
     {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
         let snapshot = ContextManager::snapshot_context(ctx);
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
 
     Ok(status)
@@ -1752,14 +1728,10 @@ pub async fn execute_suspend_member(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -1790,7 +1762,7 @@ pub async fn execute_suspend_member(
             supervisor.event_tx_ref(),
         );
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -1798,14 +1770,14 @@ pub async fn execute_suspend_member(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "MemberSuspended", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -1843,14 +1815,10 @@ pub async fn execute_revoke(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<usize, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (rotated_count, ctx_snapshot, bc_snapshot, needs_sender_key_rotation) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -1883,7 +1851,7 @@ pub async fn execute_revoke(
                     Ok(_) | Err(ContextError::MemberNotFound(_)) => {}
                     Err(e) => return Err(e),
                 }
-                if mgr.has_persistence() {
+                if manager_methods::has_persistence(supervisor) {
                     bc_snap = Some(bc.to_snapshot());
                 }
             }
@@ -1915,7 +1883,7 @@ pub async fn execute_revoke(
                     Err(ContextError::MemberNotFound(_)) => {}
                     Err(e) => return Err(e),
                 }
-                if mgr.has_persistence() {
+                if manager_methods::has_persistence(supervisor) {
                     bc_snap = Some(bc.to_snapshot());
                 }
             } else {
@@ -1945,7 +1913,7 @@ pub async fn execute_revoke(
         let rotate = matches!(access, AccessScope::Write | AccessScope::Both)
             && ctx.broadcast_context.is_none();
 
-        let snap = if mgr.has_persistence() {
+        let snap = if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -1954,10 +1922,10 @@ pub async fn execute_revoke(
     };
 
     if let Some(ctx_snapshot) = ctx_snapshot {
-        mgr.persist_context_snapshot(context_id, ctx_snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, ctx_snapshot);
     }
     if let Some(ref bc_snap) = bc_snapshot {
-        mgr.persist_broadcast_snapshot(context_id, bc_snap);
+        manager_methods::persist_broadcast_snapshot(supervisor, context_id, bc_snap);
     }
     supervisor
         .event_log_ref()
@@ -1969,7 +1937,7 @@ pub async fn execute_revoke(
             Some(&serde_json::json!({"target_did": did.as_ref()})),
         )?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -1993,7 +1961,11 @@ pub async fn execute_revoke(
                 "rotate_sender_key failed after access revocation"
             );
         }
-        if let Err(e) = mgr.drain_and_deliver_sender_keys(context_id, &context_id_bytes) {
+        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+            supervisor,
+            context_id,
+            &context_id_bytes,
+        ) {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -2025,14 +1997,10 @@ pub async fn execute_restore_access(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (ctx_snapshot, bc_snapshot) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -2072,7 +2040,7 @@ pub async fn execute_restore_access(
             // Broadcast mode: unban subscriber.
             let snap = ctx.broadcast_context.as_mut().and_then(|bc| {
                 bc.governance_unban_subscriber(&did.0);
-                if mgr.has_persistence() {
+                if manager_methods::has_persistence(supervisor) {
                     Some(bc.to_snapshot())
                 } else {
                     None
@@ -2109,7 +2077,7 @@ pub async fn execute_restore_access(
             ctx.emit_event(write_event, context_id, supervisor.event_tx_ref());
         }
 
-        let snap = if mgr.has_persistence() {
+        let snap = if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -2118,17 +2086,17 @@ pub async fn execute_restore_access(
     };
 
     if let Some(ctx_snapshot) = ctx_snapshot {
-        mgr.persist_context_snapshot(context_id, ctx_snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, ctx_snapshot);
     }
     if let Some(ref bc_snap) = bc_snapshot {
-        mgr.persist_broadcast_snapshot(context_id, bc_snap);
+        manager_methods::persist_broadcast_snapshot(supervisor, context_id, bc_snap);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "AccessRestored", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -2150,14 +2118,10 @@ pub async fn execute_add_member(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -2165,8 +2129,9 @@ pub async fn execute_add_member(
 
         // Crypto: add to MLS group under lock to prevent partial-failure
         // window (phantom MLS member if state mutation fails).
-        let add_output = mgr
+        let add_output = supervisor
             .crypto_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
             .add_member(&context_id_bytes, did, None)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
@@ -2219,7 +2184,7 @@ pub async fn execute_add_member(
             supervisor.event_tx_ref(),
         );
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -2227,14 +2192,14 @@ pub async fn execute_add_member(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "MemberJoined", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -2254,14 +2219,10 @@ pub async fn execute_remove_member(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (remove_output, snapshot) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -2275,8 +2236,9 @@ pub async fn execute_remove_member(
         // fails, we abort without touching sender keys. MLS removal is
         // the cryptographic enforcement that prevents the removed member
         // from decrypting future group messages.
-        let remove_output = mgr
+        let remove_output = supervisor
             .crypto_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
             .remove_member(&context_id_bytes, did)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
@@ -2284,8 +2246,9 @@ pub async fn execute_remove_member(
         // propagate. The MLS removal above is the hard boundary; sender
         // key removal is defense-in-depth for the independent sender key
         // confidentiality layer (§9.16).
-        if let Err(e) = mgr
+        if let Err(e) = supervisor
             .crypto_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
             .remove_member_sender_key(&context_id_bytes, did.as_ref())
         {
             tracing::warn!(
@@ -2337,7 +2300,7 @@ pub async fn execute_remove_member(
 
         (
             remove_output,
-            if mgr.has_persistence() {
+            if manager_methods::has_persistence(supervisor) {
                 Some(ContextManager::snapshot_context(ctx))
             } else {
                 None
@@ -2363,7 +2326,11 @@ pub async fn execute_remove_member(
 
     // Drain pending sender key distribution messages queued by
     // rotate_sender_key, MLS-encrypt, and deliver via transport (§9.16.2).
-    if let Err(e) = mgr.drain_and_deliver_sender_keys(context_id, &context_id_bytes) {
+    if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+        supervisor,
+        context_id,
+        &context_id_bytes,
+    ) {
         tracing::warn!(
             context_id = %context_id,
             error = %e,
@@ -2372,14 +2339,14 @@ pub async fn execute_remove_member(
     }
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "MemberLeft", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -2400,14 +2367,10 @@ pub async fn execute_change_role(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -2443,7 +2406,7 @@ pub async fn execute_change_role(
             info.tokens = tokens;
         }
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -2451,14 +2414,14 @@ pub async fn execute_change_role(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "RoleAssigned", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -2481,14 +2444,10 @@ pub async fn execute_register_tool(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -2507,7 +2466,7 @@ pub async fn execute_register_tool(
             )));
         }
         ctx.governance.registered_tools.push(registration.clone());
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -2515,14 +2474,14 @@ pub async fn execute_register_tool(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ToolRegistered", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -2542,14 +2501,10 @@ pub async fn execute_remove_tool(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -2558,7 +2513,7 @@ pub async fn execute_remove_tool(
         ctx.governance
             .registered_tools
             .retain(|t| t.tool_id != tool_id);
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -2566,14 +2521,14 @@ pub async fn execute_remove_tool(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ToolRemoved", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -2593,14 +2548,10 @@ pub async fn execute_modify_ceiling(
     proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -2649,7 +2600,7 @@ pub async fn execute_modify_ceiling(
             supervisor.event_tx_ref(),
         );
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -2657,14 +2608,14 @@ pub async fn execute_modify_ceiling(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "CeilingModificationPending", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -2694,14 +2645,10 @@ pub async fn apply_pending_ceiling_modification(
     context_id: &str,
     current_timestamp: u64,
 ) -> Result<bool, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (applied, snapshot) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -2716,7 +2663,7 @@ pub async fn apply_pending_ceiling_modification(
         ctx.role_state.ceiling = CapabilityCeiling::new(pending.new_capabilities.iter().cloned());
         ctx.governance.pending_ceiling_modification = None;
 
-        let snap = if mgr.has_persistence() {
+        let snap = if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -2726,14 +2673,14 @@ pub async fn apply_pending_ceiling_modification(
 
     if applied {
         if let Some(snapshot) = snapshot {
-            mgr.persist_context_snapshot(context_id, snapshot);
+            manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
         }
         supervisor
             .event_log_ref()
             .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
             .append_context_event(&context_id_bytes, "CeilingModified", "")?;
         {
-            if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+            if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -2756,16 +2703,13 @@ pub async fn execute_close_context(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Extract handle under lock, then drop lock before the async
     // transition to avoid holding the global contexts mutex across .await.
     // Capture generation for confused-deputy detection on reacquire.
     let (handle, ctx_gen) = {
-        let (guard, ctx_gen) = mgr.lock_context(context_id).await?;
+        let (guard, ctx_gen) = manager_methods::lock_context(supervisor, context_id).await?;
         let ctx = &*guard;
         require_active(&ctx.handle)?;
         (ctx.handle.clone(), ctx_gen)
@@ -2779,40 +2723,41 @@ pub async fn execute_close_context(
 
     // Re-acquire lock for cleanup and snapshot with generation check
     // to detect confused-deputy (context removed+recreated during transition).
-    let snapshot = if let Ok(mut guard) = mgr.relock_context(&ctx_gen).await {
-        let ctx = &mut *guard;
+    let snapshot =
+        if let Ok(mut guard) = manager_methods::relock_context(supervisor, &ctx_gen).await {
+            let ctx = &mut *guard;
 
-        // Cancel TTL timer and governance timeout task if active.
-        ctx.ttl.timer.cancel();
-        ctx.governance.timeout_task.cancel();
-        // Drop broadcast context state -- keys are zeroed by Zeroize.
-        ctx.broadcast_context = None;
+            // Cancel TTL timer and governance timeout task if active.
+            ctx.ttl.timer.cancel();
+            ctx.governance.timeout_task.cancel();
+            // Drop broadcast context state -- keys are zeroed by Zeroize.
+            ctx.broadcast_context = None;
 
-        // M7: Participation decay on governance-driven close (#1530).
-        ctx.governance.decay_participation();
+            // M7: Participation decay on governance-driven close (#1530).
+            ctx.governance.decay_participation();
 
-        if mgr.has_persistence() {
-            Some(ContextManager::snapshot_context(ctx))
+            if manager_methods::has_persistence(supervisor) {
+                Some(ContextManager::snapshot_context(ctx))
+            } else {
+                None
+            }
         } else {
+            tracing::warn!(
+                context_id,
+                "execute_close_context: generation mismatch on cleanup reacquire — skipping"
+            );
             None
-        }
-    } else {
-        tracing::warn!(
-            context_id,
-            "execute_close_context: generation mismatch on cleanup reacquire — skipping"
-        );
-        None
-    };
+        };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ContextClosing", actor_did)?;
     {
-        if let Ok(mut guard) = mgr.relock_context(&ctx_gen).await {
+        if let Ok(mut guard) = manager_methods::relock_context(supervisor, &ctx_gen).await {
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
         }
@@ -2835,14 +2780,10 @@ pub async fn execute_extend_ttl(
     proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (snapshot, new_remaining, handle, old_deadline, new_deadline, consenting_members) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -2914,7 +2855,7 @@ pub async fn execute_extend_ttl(
         ctx.ttl.timer.task = None;
 
         let h = ctx.handle.clone();
-        let snap = if mgr.has_persistence() {
+        let snap = if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -2924,12 +2865,17 @@ pub async fn execute_extend_ttl(
 
     // Respawn the TTL timer with the updated remaining duration.
     if let Some(secs) = new_remaining {
-        mgr.spawn_ttl_timer(context_id, std::time::Duration::from_secs(secs), handle)
-            .await;
+        crate::context::lifecycle_helpers::spawn_ttl_timer(
+            supervisor,
+            context_id,
+            std::time::Duration::from_secs(secs),
+            handle,
+        )
+        .await;
     }
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
 
     // §5.10.1 step 5: Record TTLExtended event with structured payload
@@ -2947,7 +2893,7 @@ pub async fn execute_extend_ttl(
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, &extended_payload.to_string(), actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -2967,14 +2913,10 @@ pub async fn execute_transfer_admin(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -3033,7 +2975,7 @@ pub async fn execute_transfer_admin(
             info.tokens = tokens;
         }
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -3041,14 +2983,14 @@ pub async fn execute_transfer_admin(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "AdminTransferred", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -3070,14 +3012,10 @@ pub async fn execute_create_child_context(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
     // Validate parent context is active and ceiling allows child creation.
     {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
@@ -3102,7 +3040,7 @@ pub async fn execute_create_child_context(
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ChildContextCreated", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -3122,9 +3060,6 @@ pub async fn execute_modify_pruning_policy(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Validate retention multipliers are non-zero.
@@ -3169,15 +3104,14 @@ pub async fn execute_modify_pruning_policy(
     }
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
         require_active(&ctx.handle)?;
 
         ctx.governance.pruning_policy = Some(new_policy.clone());
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -3185,14 +3119,14 @@ pub async fn execute_modify_pruning_policy(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "PruningPolicyModified", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -3214,14 +3148,10 @@ pub async fn execute_add_signer(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -3274,7 +3204,7 @@ pub async fn execute_add_signer(
             }
         }
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -3282,14 +3212,14 @@ pub async fn execute_add_signer(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "SignerAdded", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -3311,14 +3241,10 @@ pub async fn execute_remove_signer(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -3363,7 +3289,7 @@ pub async fn execute_remove_signer(
             });
         }
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -3371,14 +3297,14 @@ pub async fn execute_remove_signer(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "SignerRemoved", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -3398,14 +3324,10 @@ pub async fn execute_modify_threshold(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -3419,7 +3341,7 @@ pub async fn execute_modify_threshold(
             )));
         }
         ctx.governance.threshold_value = new_threshold;
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -3427,14 +3349,14 @@ pub async fn execute_modify_threshold(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ThresholdModified", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -3457,14 +3379,10 @@ pub async fn execute_establish_tool_interface(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -3483,7 +3401,7 @@ pub async fn execute_establish_tool_interface(
             )));
         }
         ctx.governance.tool_interfaces.push(interface.clone());
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -3491,14 +3409,14 @@ pub async fn execute_establish_tool_interface(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ToolInterfaceEstablished", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -3519,13 +3437,9 @@ pub async fn execute_reset_member(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
     {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
@@ -3537,13 +3451,15 @@ pub async fn execute_reset_member(
     }
     // Member reset = leave + immediately re-join (ADR-029 §Tier 3).
     // Step 1: Remove from MLS group (destroys stale leaf node).
-    let remove_output = mgr
+    let remove_output = supervisor
         .crypto_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .remove_member(&context_id_bytes, did)
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
     // Step 2: Re-add to MLS group with fresh key material.
-    let add_output = mgr
+    let add_output = supervisor
         .crypto_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .add_member(&context_id_bytes, did, None)
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
@@ -3578,8 +3494,9 @@ pub async fn execute_reset_member(
     // member's stale sender key, rotate our own key, and distribute
     // new key material to remaining members (§9.16.4). This ensures
     // the reset member cannot decrypt messages sent with the old key.
-    if let Err(e) = mgr
+    if let Err(e) = supervisor
         .crypto_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .remove_member_sender_key(&context_id_bytes, did.as_ref())
     {
         tracing::warn!(
@@ -3604,7 +3521,11 @@ pub async fn execute_reset_member(
 
     // Drain pending sender key distribution messages, MLS-encrypt,
     // and deliver via transport (same pattern as lifecycle leave).
-    if let Err(e) = mgr.drain_and_deliver_sender_keys(context_id, &context_id_bytes) {
+    if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+        supervisor,
+        context_id,
+        &context_id_bytes,
+    ) {
         tracing::warn!(
             context_id = %context_id,
             error = %e,
@@ -3620,7 +3541,7 @@ pub async fn execute_reset_member(
     // Track the epoch reset so the governance timeout task can invalidate
     // this member's votes on pending proposals (ADR-031 §5, ADR-029 Tier 3).
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -3649,14 +3570,10 @@ pub async fn execute_resolve_conflict(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -3755,7 +3672,7 @@ pub async fn execute_resolve_conflict(
         // Clear governance freeze now that the conflict is resolved.
         ctx.governance.freeze = None;
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -3763,14 +3680,14 @@ pub async fn execute_resolve_conflict(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "GovernanceConflictResolved", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -3800,14 +3717,10 @@ pub async fn execute_promote_context(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -3847,7 +3760,7 @@ pub async fn execute_promote_context(
         ctx.ttl.timer.deadline_unix_secs = None;
         ctx.handle.promote_memory_scope();
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -3855,14 +3768,14 @@ pub async fn execute_promote_context(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ContextPromoted", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -3901,14 +3814,10 @@ pub async fn execute_rotate_content_keys(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (epoch_output, snapshot, bc_snapshot) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -3917,7 +3826,7 @@ pub async fn execute_rotate_content_keys(
         let (epoch_out, bc_snap) = if let Some(ref mut bc) = ctx.broadcast_context {
             // Rotate every author's broadcast key (epoch advance + new key).
             bc.rotate_all_author_keys()?;
-            let snap = if mgr.has_persistence() {
+            let snap = if manager_methods::has_persistence(supervisor) {
                 Some(bc.to_snapshot())
             } else {
                 None
@@ -3964,7 +3873,7 @@ pub async fn execute_rotate_content_keys(
         };
         ctx.emit_event(rotated_event, context_id, supervisor.event_tx_ref());
 
-        let snap = if mgr.has_persistence() {
+        let snap = if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -3988,10 +3897,10 @@ pub async fn execute_rotate_content_keys(
     }
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     if let Some(ref snap) = bc_snapshot {
-        mgr.persist_broadcast_snapshot(context_id, snap);
+        manager_methods::persist_broadcast_snapshot(supervisor, context_id, snap);
     }
 
     supervisor
@@ -3999,7 +3908,7 @@ pub async fn execute_rotate_content_keys(
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ContentKeysRotated", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -4020,9 +3929,6 @@ pub async fn execute_reconfigure_governance(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     if changes.is_empty() {
         return Err(ContextError::PermissionDenied(
             "reconfigure_governance requires at least one change".to_owned(),
@@ -4038,8 +3944,7 @@ pub async fn execute_reconfigure_governance(
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -4098,7 +4003,7 @@ pub async fn execute_reconfigure_governance(
             return Err(e);
         }
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -4106,14 +4011,14 @@ pub async fn execute_reconfigure_governance(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "GovernanceReconfigured", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -4150,9 +4055,6 @@ pub async fn execute_set_economic_policy(
     proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // Validate that pricing formula only references available metrics.
     scp_protocol::economy::policy::validate_economic_policy_metrics(Some(policy))
         .map_err(|e| ContextError::PermissionDenied(format!("invalid economic policy: {e}")))?;
@@ -4160,8 +4062,7 @@ pub async fn execute_set_economic_policy(
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -4207,7 +4108,7 @@ pub async fn execute_set_economic_policy(
             supervisor.event_tx_ref(),
         );
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -4215,14 +4116,14 @@ pub async fn execute_set_economic_policy(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "EconomicPolicyChanged", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -4250,14 +4151,10 @@ pub async fn apply_pending_economic_policy_change(
     context_id: &str,
     current_timestamp: u64,
 ) -> Result<bool, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (applied, snapshot) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -4272,7 +4169,7 @@ pub async fn apply_pending_economic_policy_change(
         ctx.governance.economic_policy = Some(pending.new_policy);
         ctx.governance.pending_economic_policy_change = None;
 
-        let snap = if mgr.has_persistence() {
+        let snap = if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -4282,14 +4179,14 @@ pub async fn apply_pending_economic_policy_change(
 
     if applied {
         if let Some(snapshot) = snapshot {
-            mgr.persist_context_snapshot(context_id, snapshot);
+            manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
         }
         supervisor
             .event_log_ref()
             .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
             .append_context_event(&context_id_bytes, "EconomicPolicyApplied", "")?;
         {
-            if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+            if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
                 ctx.checkpoint_events_since += 1;
@@ -4325,14 +4222,10 @@ pub async fn execute_approve_spend(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -4346,7 +4239,7 @@ pub async fn execute_approve_spend(
         // Grant the approved budget to the member's cumulative tracker.
         ctx.governance.budget_tracker.grant(spender, amount);
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -4354,7 +4247,7 @@ pub async fn execute_approve_spend(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     let payload = serde_json::json!({
         "event": "SpendApproved",
@@ -4387,14 +4280,10 @@ pub async fn execute_lock_economic_policy(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -4416,7 +4305,7 @@ pub async fn execute_lock_economic_policy(
             }
         }
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -4424,14 +4313,14 @@ pub async fn execute_lock_economic_policy(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "EconomicPolicyLocked", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -4464,9 +4353,6 @@ pub async fn execute_modify_hard_rate_limit(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Validate BEFORE touching per-context state so a malformed
@@ -4478,8 +4364,7 @@ pub async fn execute_modify_hard_rate_limit(
     })?;
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -4514,7 +4399,7 @@ pub async fn execute_modify_hard_rate_limit(
                 preserved_state,
             );
 
-        if mgr.has_persistence() {
+        if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -4522,14 +4407,14 @@ pub async fn execute_modify_hard_rate_limit(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "HardRateLimitModified", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -4564,9 +4449,6 @@ pub async fn execute_propose_context_migration(
     proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<MigrationProposedResult, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Generate a deterministic destination context ID from the source
@@ -4600,8 +4482,7 @@ pub async fn execute_propose_context_migration(
     // race where another task observes the source as Active between
     // destination creation and the state transition (F4).
     let (creator_did, snapshot, buffer_len_before_migration, proposed_event, started_event) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -4666,7 +4547,7 @@ pub async fn execute_propose_context_migration(
         ctx.receive_buffer.push(proposed_event.clone());
         ctx.receive_buffer.push(started_event.clone());
 
-        let snap = if mgr.has_persistence() {
+        let snap = if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -4683,17 +4564,17 @@ pub async fn execute_propose_context_migration(
 
     // Create the destination context AFTER the source has been
     // transitioned to MigratingOut. If creation fails, roll back.
-    if let Err(e) = mgr
-        .create_context(
-            destination_context_id.clone(),
-            dest_params,
-            creator_did,
-            None,
-        )
-        .await
+    if let Err(e) = crate::context::lifecycle_helpers::create_context(
+        supervisor,
+        destination_context_id.clone(),
+        dest_params,
+        creator_did,
+        None,
+    )
+    .await
     {
         // Roll back: revert source to Active and clear migration state.
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             let _ = ctx.handle.transition_to(&ContextState::Active).await;
@@ -4715,14 +4596,14 @@ pub async fn execute_propose_context_migration(
     }
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "ContextMigrationStarted", actor_did)?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -4755,17 +4636,13 @@ pub async fn execute_cancel_context_migration(
     _proposal_id: ProposalId,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // Transition and state mutation happen under the same lock to prevent
     // a race where migration_state is cleared but the state transition
     // back to Active fails (F4).
     let (original_proposal_id, snapshot) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -4806,7 +4683,7 @@ pub async fn execute_cancel_context_migration(
             supervisor.event_tx_ref(),
         );
 
-        let snapshot = if mgr.has_persistence() {
+        let snapshot = if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -4815,7 +4692,7 @@ pub async fn execute_cancel_context_migration(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
@@ -4829,7 +4706,7 @@ pub async fn execute_cancel_context_migration(
             actor_did,
         )?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -4859,9 +4736,6 @@ pub async fn tombstone_migrated_context(
     supervisor: &Supervisor,
     context_id: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let now = supervisor
@@ -4873,8 +4747,7 @@ pub async fn tombstone_migrated_context(
     // a race where migration_state is cleared but the transition to
     // Tombstoned fails.
     let (destination_id, migration_pid, snapshot) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -4933,7 +4806,7 @@ pub async fn tombstone_migrated_context(
         // M7: Participation decay on tombstone (#1530).
         ctx.governance.decay_participation();
 
-        let snapshot = if mgr.has_persistence() {
+        let snapshot = if manager_methods::has_persistence(supervisor) {
             Some(ContextManager::snapshot_context(ctx))
         } else {
             None
@@ -4942,7 +4815,7 @@ pub async fn tombstone_migrated_context(
     };
 
     if let Some(snapshot) = snapshot {
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     supervisor
         .event_log_ref()
@@ -4957,7 +4830,7 @@ pub async fn tombstone_migrated_context(
             "",
         )?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -4975,8 +4848,7 @@ pub async fn tombstone_migrated_context(
 /// Returns `None` if the context is not registered or not migrating.
 #[instrument(skip_all, fields(context_id))]
 pub async fn migration_state(supervisor: &Supervisor, context_id: &str) -> Option<MigrationState> {
-    let mgr = supervisor.attached_context_manager()?;
-    let ctx_arc = mgr.get_context_arc(context_id).ok()?;
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
 
     let guard = ctx_arc.lock().await;
     let ctx = &*guard;
@@ -5247,9 +5119,6 @@ pub async fn try_broadcast_commit_or_enqueue(
     operation: CommitOperation,
     actor_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     if commit_bytes.is_empty() {
         // No-op: nothing to broadcast (e.g., broadcast-mode contexts).
         return Ok(());
@@ -5268,7 +5137,7 @@ pub async fn try_broadcast_commit_or_enqueue(
                 .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
                 .append_context_event(&context_id_bytes, "CommitBroadcasted", actor_did)?;
             {
-                if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+                if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
                     let mut guard = ctx_arc.lock().await;
                     let ctx = &mut *guard;
                     ctx.checkpoint_events_since += 1;
@@ -5295,8 +5164,7 @@ pub async fn try_broadcast_commit_or_enqueue(
             let label = operation.label();
             let context_id_bytes = context_id_to_bytes(context_id);
             {
-                let ctx_arc = mgr
-                    .get_context_arc(context_id)
+                let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
                     .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
                 let mut guard = ctx_arc.lock().await;
                 let ctx = &mut *guard;
@@ -5338,7 +5206,7 @@ pub async fn try_broadcast_commit_or_enqueue(
                 .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
                 .append_context_event(&context_id_bytes, "CommitBroadcastPending", actor_did)?;
             {
-                if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+                if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
                     let mut guard = ctx_arc.lock().await;
                     let ctx = &mut *guard;
                     ctx.checkpoint_events_since += 1;
@@ -5379,11 +5247,7 @@ pub async fn acknowledge_commit_fault(
     supervisor: &Supervisor,
     context_id: &str,
 ) -> Result<CommitFaultMarker, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let ctx_arc = mgr
-        .get_context_arc(context_id)
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let mut guard = ctx_arc.lock().await;
     let ctx = &mut *guard;
@@ -5426,14 +5290,11 @@ pub async fn start_governance_timeout_task(supervisor: &Supervisor, context_id: 
         collect_active_voters, process_pending_proposals, update_detection_state,
     };
 
-    let Some(mgr) = supervisor.attached_context_manager() else {
+    let Some(contexts_arc) = supervisor.contexts_ref().map(Arc::clone) else {
         tracing::error!(
             context_id,
             "start_governance_timeout_task: Supervisor is not attached — skipping"
         );
-        return;
-    };
-    let Some(contexts_arc) = supervisor.contexts_ref().map(Arc::clone) else {
         return;
     };
     let Some(clock_arc) = supervisor.clock_ref().map(Arc::clone) else {
@@ -5615,9 +5476,4 @@ pub async fn start_governance_timeout_task(supervisor: &Supervisor, context_id: 
             }
         }
     });
-
-    // Suppress "unused" warning for `mgr` — kept for symmetry with the
-    // other helpers and to re-establish the contract that the supervisor
-    // must be attached.
-    let _ = mgr;
 }

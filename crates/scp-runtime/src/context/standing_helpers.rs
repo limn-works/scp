@@ -31,9 +31,13 @@
 //! Its body is a verbatim copy of the legacy inherent method's body with
 //! `self.X` replaced by either:
 //!
-//! - `mgr.X(...)` for remaining inherent methods on
-//!   [`ContextManager`](crate::context::manager::ContextManager), or
-//! - `mgr.X_ref()` accessor calls for fields.
+//! - `manager_methods::X(supervisor, ...)` /
+//!   `<domain>_helpers::X(supervisor, ...)` for the cross-domain and
+//!   per-domain free-function helpers hoisted from `ContextManager` in
+//!   ADR-049 commit 12c.9g.1 (helper bodies migrated to direct calls in
+//!   commit 12c.9g.2; no `mgr` derivation), or
+//! - `supervisor.X_ref().ok_or(NotInitialized)?` for provider slots
+//!   lifted to the supervisor in ADR-049 commit 12c.9a-9b.
 //!
 //! The legacy inherent methods on
 //! [`ContextManager`](crate::context::manager::ContextManager) remain as
@@ -60,6 +64,7 @@ use sha2::{Digest, Sha256};
 
 use crate::context::ContextHandle;
 use crate::context::supervisor::Supervisor;
+use crate::context::{lifecycle_helpers, manager_methods};
 
 /// Shared expectation message for `Supervisor::attached_context_manager()`
 /// inside helpers (ADR-049 commit 12c.9d). The attach-time contract
@@ -125,9 +130,6 @@ pub async fn standing_context(
     local_did: &DID,
     peer_did: &DID,
 ) -> Result<String, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id = generate_standing_context_id(local_did, peer_did);
 
     // Step 1: Check if the context exists and is Active/Creating.
@@ -145,14 +147,18 @@ pub async fn standing_context(
     // to the create-new-context path; the TOCTOU re-check below will
     // resolve any race idempotently.
     {
-        if let Ok(arc) = mgr.get_context_arc(&context_id) {
+        if let Ok(arc) = manager_methods::get_context_arc(supervisor, &context_id) {
             let ctx = arc.lock().await;
             let state = ctx.handle.try_read_state();
             match state {
                 // Step 2: Active or still being set up -- return immediately.
                 Some(ContextState::Active | ContextState::Creating) => {
                     drop(ctx);
-                    let mut standing = mgr.standing_contexts_ref().lock().await;
+                    let mut standing = supervisor
+                        .standing_contexts_ref()
+                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+                        .lock()
+                        .await;
                     standing.insert(peer_did.to_string(), peer_did.clone());
                     return Ok(context_id);
                 }
@@ -175,11 +181,16 @@ pub async fn standing_context(
     }
 
     // Step 3/4: Create a new bilateral-persistent context via the full
-    // ContextManager::create_context flow (membership, roles, governance).
+    // create_context flow (membership, roles, governance).
     let params = template_params(&TemplateId::BilateralPersistent);
-    match mgr
-        .create_context(context_id.clone(), params, local_did.clone(), None)
-        .await
+    match lifecycle_helpers::create_context(
+        supervisor,
+        context_id.clone(),
+        params,
+        local_did.clone(),
+        None,
+    )
+    .await
     {
         Ok(_) => {}
         Err(e) => {
@@ -192,7 +203,7 @@ pub async fn standing_context(
             // handle's `RwLock` while holding `contexts.lock()`. A
             // contended state lock is treated as "not idempotent" and
             // surfaces the original create error rather than masking it.
-            if let Ok(arc) = mgr.get_context_arc(&context_id) {
+            if let Ok(arc) = manager_methods::get_context_arc(supervisor, &context_id) {
                 let ctx = arc.lock().await;
                 if matches!(
                     ctx.handle.try_read_state(),
@@ -210,7 +221,11 @@ pub async fn standing_context(
     }
 
     // Re-acquire lock to track the standing context.
-    let mut standing = mgr.standing_contexts_ref().lock().await;
+    let mut standing = supervisor
+        .standing_contexts_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .lock()
+        .await;
     standing.insert(peer_did.to_string(), peer_did.clone());
 
     Ok(context_id)
@@ -225,13 +240,13 @@ pub async fn standing_context(
 /// Hoisted body of the legacy
 /// [`ContextManager::standing_context_count`](crate::context::manager::ContextManager::standing_context_count).
 pub async fn standing_context_count(supervisor: &Supervisor) -> usize {
-    // ADR-049 commit 12c.9d — returns `usize` so an unpopulated attach
+    // ADR-049 commit 12c.9g.2 — returns `usize` so an unpopulated attach
     // slot degrades to a safe zero. Defense-in-depth against a contract
     // violation.
-    let Some(mgr) = supervisor.attached_context_manager() else {
+    let Some(standing) = supervisor.standing_contexts_ref() else {
         return 0;
     };
-    mgr.standing_contexts_ref().lock().await.len()
+    standing.lock().await.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -243,16 +258,13 @@ pub async fn standing_context_count(supervisor: &Supervisor) -> usize {
 /// Hoisted body of the legacy
 /// [`ContextManager::has_standing_context`](crate::context::manager::ContextManager::has_standing_context).
 pub async fn has_standing_context(supervisor: &Supervisor, peer_did: &DID) -> bool {
-    // ADR-049 commit 12c.9d — returns `bool` so an unpopulated attach
+    // ADR-049 commit 12c.9g.2 — returns `bool` so an unpopulated attach
     // slot degrades to `false`. Defense-in-depth against a contract
     // violation.
-    let Some(mgr) = supervisor.attached_context_manager() else {
+    let Some(standing) = supervisor.standing_contexts_ref() else {
         return false;
     };
-    mgr.standing_contexts_ref()
-        .lock()
-        .await
-        .contains_key(peer_did.as_ref())
+    standing.lock().await.contains_key(peer_did.as_ref())
 }
 
 // ---------------------------------------------------------------------------
@@ -268,9 +280,9 @@ pub async fn has_standing_context(supervisor: &Supervisor, peer_did: &DID) -> bo
 /// Hoisted body of the legacy
 /// [`ContextManager::register_standing_context`](crate::context::manager::ContextManager::register_standing_context).
 pub async fn register_standing_context(supervisor: &Supervisor, peer_did: DID) {
-    // ADR-049 commit 12c.9d — returns `()` so an unpopulated attach
+    // ADR-049 commit 12c.9g.2 — returns `()` so an unpopulated attach
     // slot degrades to a no-op with a tracing error for observability.
-    let Some(mgr) = supervisor.attached_context_manager() else {
+    let Some(standing) = supervisor.standing_contexts_ref() else {
         tracing::error!(
             peer_did = %peer_did,
             "register_standing_context: Supervisor is not attached — skipping registration \
@@ -278,10 +290,7 @@ pub async fn register_standing_context(supervisor: &Supervisor, peer_did: DID) {
         );
         return;
     };
-    mgr.standing_contexts_ref()
-        .lock()
-        .await
-        .insert(peer_did.to_string(), peer_did);
+    standing.lock().await.insert(peer_did.to_string(), peer_did);
 }
 
 // ---------------------------------------------------------------------------
@@ -309,9 +318,6 @@ pub async fn register_standing_context(supervisor: &Supervisor, peer_did: DID) {
 /// Partial reconnection results are still applied — contexts that
 /// succeeded remain connected.
 pub async fn reconnect_all_standing(supervisor: &Supervisor) -> Result<usize, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // Phase 1: Collect standing context info and local DIDs under their
     // respective locks, then release BOTH before acquiring per-context
     // Mutexes. This prevents the lock ordering inversion that would
@@ -319,7 +325,11 @@ pub async fn reconnect_all_standing(supervisor: &Supervisor) -> Result<usize, Co
     // then standing_contexts, so reconnect_all_standing must NOT hold
     // standing_contexts while acquiring per-context Mutexes.
     let standing_entries: Vec<(String, scp_identity::DID)> = {
-        let standing = mgr.standing_contexts_ref().lock().await;
+        let standing = supervisor
+            .standing_contexts_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .lock()
+            .await;
         standing
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -328,7 +338,11 @@ pub async fn reconnect_all_standing(supervisor: &Supervisor) -> Result<usize, Co
     // standing_contexts lock DROPPED.
 
     let local_did_list: Vec<scp_identity::DID> = {
-        let local_dids = mgr.local_dids_ref().read().await;
+        let local_dids = supervisor
+            .local_dids_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .read()
+            .await;
         local_dids.iter().cloned().collect()
     };
     // local_dids lock DROPPED.
@@ -339,7 +353,7 @@ pub async fn reconnect_all_standing(supervisor: &Supervisor) -> Result<usize, Co
     for (_key, peer_did) in &standing_entries {
         for local_did in &local_did_list {
             let context_id = generate_standing_context_id(local_did, peer_did);
-            if let Ok(arc) = mgr.get_context_arc(&context_id) {
+            if let Ok(arc) = manager_methods::get_context_arc(supervisor, &context_id) {
                 let ctx = arc.lock().await;
                 handles.push((context_id, ctx.handle.clone()));
                 break;
@@ -356,7 +370,9 @@ pub async fn reconnect_all_standing(supervisor: &Supervisor) -> Result<usize, Co
         match state {
             ContextState::Active => {
                 let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
-                mgr.transport_ref()
+                supervisor
+                    .transport_ref()
+                    .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
                     .publish_context(&context_id_bytes, handle.params())
                     .map_err(|e| {
                         ContextError::TransportFailed(format!(
@@ -382,9 +398,19 @@ pub async fn reconnect_all_standing(supervisor: &Supervisor) -> Result<usize, Co
     // Collecting into a HashSet avoids holding the RwLock across the
     // standing_contexts lock acquisition.
     if !terminal_context_ids.is_empty() {
-        let local_did_set: std::collections::HashSet<DID> =
-            mgr.local_dids_ref().read().await.iter().cloned().collect();
-        let mut standing = mgr.standing_contexts_ref().lock().await;
+        let local_did_set: std::collections::HashSet<DID> = supervisor
+            .local_dids_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect();
+        let mut standing = supervisor
+            .standing_contexts_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+            .lock()
+            .await;
         let to_remove: Vec<String> = standing
             .iter()
             .filter(|(_key, peer_did)| {

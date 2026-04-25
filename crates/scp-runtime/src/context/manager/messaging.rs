@@ -148,6 +148,7 @@ impl ContextManager {
     /// [`crate::context::messaging_helpers::encrypt_and_send`] free
     /// function (ADR-049 commit 12c.1b). Deleted in commit 12f.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) fn encrypt_and_send(
         &self,
         broadcast_envelope: Option<scp_protocol::crypto::sender_keys::broadcast::BroadcastEnvelope>,
@@ -190,6 +191,7 @@ impl ContextManager {
     /// budget when the caller subsequently drains the ticket (F4).
     /// Returns the authorization token (if payment is required) for later
     /// capture or void.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) async fn authorize_send_payment(
         &self,
         context_id: &str,
@@ -214,6 +216,7 @@ impl ContextManager {
     ///
     /// On failure a `PaymentCaptureFailed` entry is appended to the event log
     /// and pushed to the receive buffer to provide a durable audit trail (H19).
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) async fn capture_send_payment(
         &self,
         auth: Option<super::economy::PaidActionAuthorization>,
@@ -248,6 +251,7 @@ impl ContextManager {
     /// Extracted from `send_message` Phase 3 to keep the outer function
     /// within the clippy `too_many_lines` limit.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) async fn finalize_send(
         &self,
         context_id: &str,
@@ -281,6 +285,7 @@ impl ContextManager {
     /// Returns `Some(OpenedEnvelope)` for application messages that need further
     /// processing, or `None` for control/management messages that are handled
     /// internally.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) fn decrypt_and_dispatch(
         &self,
         context_id: &str,
@@ -349,6 +354,7 @@ impl ContextManager {
     ///
     /// Returns the `SequenceCheck` result for the caller to decide whether
     /// to deliver immediately or buffer.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) async fn validate_and_drain_timeouts(
         &self,
         context_id: &str,
@@ -371,6 +377,7 @@ impl ContextManager {
     ///
     /// If the buffer overflows, force-closes the oldest gap and delivers
     /// all its messages.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) async fn buffer_ahead_message(
         &self,
         context_id: &str,
@@ -398,6 +405,7 @@ impl ContextManager {
     /// (i.e. the same node that sent the message). In that case velocity is
     /// already recorded on the send path and must not be counted again here,
     /// otherwise a single message would be double-counted on single-node setups.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) async fn deliver_message_and_drain_buffered(
         &self,
         context_id: &str,

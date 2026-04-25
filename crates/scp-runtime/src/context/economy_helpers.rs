@@ -54,13 +54,16 @@
 //!
 //! [`authorize_paid_action`], [`complete_paid_action`], and
 //! [`void_paid_action`] are the three-phase escrow primitives reached
-//! from the hoisted messaging / lifecycle helpers via `mgr.X(...)`. The
-//! 12c.9g.1 hoist commit moves their bodies here as free functions on
-//! `&Supervisor`; the legacy methods on
-//! [`ContextManager`](crate::context::manager::ContextManager) become
-//! one-line forwarders. The companion `record_payment_capture_failure`
-//! lives in [`crate::context::manager_methods`] (cross-domain
-//! infrastructure used by both messaging and economy paths).
+//! from the hoisted messaging / lifecycle helpers as
+//! `economy_helpers::X(supervisor, ...)`. The 12c.9g.1 hoist commit
+//! moved their bodies here as free functions on `&Supervisor`; the
+//! 12c.9g.2 helper rewire migrated every callsite from the legacy
+//! manager-method form to the direct free-function call. The legacy
+//! methods on [`ContextManager`](crate::context::manager::ContextManager)
+//! remain as one-line forwarders for FFI use. The companion
+//! `record_payment_capture_failure` lives in
+//! [`crate::context::manager_methods`] (cross-domain infrastructure used
+//! by both messaging and economy paths).
 
 use std::sync::Arc;
 

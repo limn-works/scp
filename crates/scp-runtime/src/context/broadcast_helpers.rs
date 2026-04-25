@@ -33,13 +33,15 @@
 //! Its body is a verbatim copy of the legacy inherent method's body with
 //! `self.X` replaced by either:
 //!
-//! - `supervisor.X_ref().expect("attached")` for provider slots lifted
+//! - `supervisor.X_ref().ok_or(NotInitialized)?` for provider slots lifted
 //!   to the supervisor (crypto, transport, `event_log`, `event_tx`,
 //!   clock, `local_dids` — see ADR-049 commit 12c.9a/9b), or
-//! - `mgr.X(...)` for remaining inherent methods on
-//!   [`ContextManager`](crate::context::manager::ContextManager), where
-//!   `mgr` is derived inside each helper via
-//!   `supervisor.attached_context_manager().expect("attached")`.
+//! - `manager_methods::X(supervisor, ...)` /
+//!   `<domain>_helpers::X(supervisor, ...)` for the cross-domain and
+//!   per-domain free-function helpers hoisted from `ContextManager` in
+//!   ADR-049 commit 12c.9g.1. Helper bodies no longer derive a manager
+//!   binding — every legacy callsite migrated to a direct free-function
+//!   call in commit 12c.9g.2.
 //!
 //! The legacy inherent methods on
 //! [`ContextManager`](crate::context::manager::ContextManager) remain as
@@ -88,6 +90,7 @@ use scp_protocol::crypto::ucan::validate::{
 };
 
 use crate::context::manager::{ContextManager, context_id_to_bytes, require_active};
+use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
 
 /// Shared expectation message for `Supervisor::attached_context_manager()`
@@ -131,14 +134,10 @@ where
     P: ProofResolver + Send + Sync,
     S: BuildHasher + Send + Sync,
 {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (result, snapshot) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -161,7 +160,7 @@ where
 
         // Take snapshot for persistence before dropping lock (skip if
         // no persistence provider is configured).
-        let snapshot = if mgr.has_persistence() {
+        let snapshot = if manager_methods::has_persistence(supervisor) {
             Some(bc.to_snapshot())
         } else {
             None
@@ -180,17 +179,17 @@ where
 
     // Persist broadcast state for crash recovery.
     if let Some(ref snapshot) = snapshot {
-        mgr.persist_broadcast_snapshot(context_id, snapshot);
+        manager_methods::persist_broadcast_snapshot(supervisor, context_id, snapshot);
     }
 
     // Persist context state after subscribe (best-effort).
-    if mgr.has_persistence()
-        && let Ok(ctx_arc) = mgr.get_context_arc(context_id)
+    if manager_methods::has_persistence(supervisor)
+        && let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id)
     {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
         let ctx_snapshot = ContextManager::snapshot_context(ctx);
-        mgr.persist_context_snapshot(context_id, ctx_snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, ctx_snapshot);
     }
 
     // Append event to persistent event log.
@@ -199,7 +198,7 @@ where
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "MemberJoined", subscriber_did.as_ref())?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -230,14 +229,10 @@ pub async fn unsubscribe_broadcast(
     subscriber_did: &DID,
     rotate_keys: bool,
 ) -> Result<UnsubscribeResult, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (result, snapshot) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -253,7 +248,7 @@ pub async fn unsubscribe_broadcast(
 
         // Take snapshot for persistence before dropping lock (skip if
         // no persistence provider is configured).
-        let snapshot = if mgr.has_persistence() {
+        let snapshot = if manager_methods::has_persistence(supervisor) {
             Some(bc.to_snapshot())
         } else {
             None
@@ -274,17 +269,17 @@ pub async fn unsubscribe_broadcast(
 
     // Persist broadcast state for crash recovery.
     if let Some(ref snapshot) = snapshot {
-        mgr.persist_broadcast_snapshot(context_id, snapshot);
+        manager_methods::persist_broadcast_snapshot(supervisor, context_id, snapshot);
     }
 
     // Persist context state after unsubscribe (best-effort).
-    if mgr.has_persistence()
-        && let Ok(ctx_arc) = mgr.get_context_arc(context_id)
+    if manager_methods::has_persistence(supervisor)
+        && let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id)
     {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
         let ctx_snapshot = ContextManager::snapshot_context(ctx);
-        mgr.persist_context_snapshot(context_id, ctx_snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, ctx_snapshot);
     }
 
     supervisor
@@ -292,7 +287,7 @@ pub async fn unsubscribe_broadcast(
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "MemberLeft", subscriber_did.as_ref())?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -326,14 +321,10 @@ pub async fn publish_broadcast(
     custody: &impl scp_platform::KeyCustody,
     signing_key_handle: &scp_platform::KeyHandle,
 ) -> Result<BroadcastEnvelope, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let envelope = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -439,7 +430,7 @@ pub async fn publish_broadcast(
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "MessageSent", author_did.as_ref())?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -511,14 +502,10 @@ pub async fn block_broadcast_subscriber(
     author_did: &DID,
     subscriber_did: &DID,
 ) -> Result<BlockResult, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let (result, snapshot) = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -534,7 +521,7 @@ pub async fn block_broadcast_subscriber(
 
         // Take snapshot for persistence before dropping lock (skip if
         // no persistence provider is configured).
-        let snapshot = if mgr.has_persistence() {
+        let snapshot = if manager_methods::has_persistence(supervisor) {
             Some(bc.to_snapshot())
         } else {
             None
@@ -553,7 +540,7 @@ pub async fn block_broadcast_subscriber(
 
     // Persist broadcast state for crash recovery.
     if let Some(ref snapshot) = snapshot {
-        mgr.persist_broadcast_snapshot(context_id, snapshot);
+        manager_methods::persist_broadcast_snapshot(supervisor, context_id, snapshot);
     }
 
     supervisor
@@ -561,7 +548,7 @@ pub async fn block_broadcast_subscriber(
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "MemberBlocked", author_did.as_ref())?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -596,14 +583,10 @@ pub async fn unblock_broadcast_subscriber(
     author_did: &DID,
     subscriber_did: &DID,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     let snapshot = {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
@@ -618,7 +601,7 @@ pub async fn unblock_broadcast_subscriber(
         let _result = bc.unblock_subscriber(author_did, subscriber_did)?;
 
         // Take snapshot for persistence before dropping lock.
-        let snapshot = if mgr.has_persistence() {
+        let snapshot = if manager_methods::has_persistence(supervisor) {
             Some(bc.to_snapshot())
         } else {
             None
@@ -637,7 +620,7 @@ pub async fn unblock_broadcast_subscriber(
 
     // Persist broadcast state for crash recovery.
     if let Some(ref snapshot) = snapshot {
-        mgr.persist_broadcast_snapshot(context_id, snapshot);
+        manager_methods::persist_broadcast_snapshot(supervisor, context_id, snapshot);
     }
 
     supervisor
@@ -645,7 +628,7 @@ pub async fn unblock_broadcast_subscriber(
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event(&context_id_bytes, "MemberUnblocked", author_did.as_ref())?;
     {
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -681,9 +664,6 @@ pub async fn handle_broadcast_key_request(
     author_did: &DID,
     requester_did: &DID,
 ) -> Result<KeyRequestDecision, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // Defense-in-depth: verify the local SDK controls the author DID.
     // Transport-layer auth (section 9.16.6) is the primary gate; this prevents
     // misuse if the method is ever called from a different context.
@@ -699,8 +679,7 @@ pub async fn handle_broadcast_key_request(
         )));
     }
 
-    let ctx_arc = mgr
-        .get_context_arc(context_id)
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let guard = ctx_arc.lock().await;
     let ctx = &*guard;
@@ -728,8 +707,7 @@ pub async fn broadcast_subscriber_count(
     supervisor: &Supervisor,
     context_id: &str,
 ) -> Option<usize> {
-    let mgr = supervisor.attached_context_manager()?;
-    let arc = mgr.get_context_arc(context_id).ok()?;
+    let arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
     let ctx = arc.lock().await;
     ctx.broadcast_context
         .as_ref()
@@ -746,10 +724,7 @@ pub async fn broadcast_subscriber_count(
 /// [`ContextManager::is_broadcast_subscriber`](crate::context::manager::ContextManager::is_broadcast_subscriber)
 /// (ADR-049 commit 12c.4). Byte-identical behavior.
 pub async fn is_broadcast_subscriber(supervisor: &Supervisor, context_id: &str, did: &str) -> bool {
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        return false;
-    };
-    let Ok(arc) = mgr.get_context_arc(context_id) else {
+    let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
         return false;
     };
     let ctx = arc.lock().await;
@@ -773,8 +748,7 @@ pub async fn broadcast_admission(
     supervisor: &Supervisor,
     context_id: &str,
 ) -> Option<BroadcastAdmission> {
-    let mgr = supervisor.attached_context_manager()?;
-    let arc = mgr.get_context_arc(context_id).ok()?;
+    let arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
     let ctx = arc.lock().await;
     ctx.broadcast_context
         .as_ref()

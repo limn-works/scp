@@ -41,9 +41,11 @@
 //! Its body is a verbatim copy of the legacy inherent method's body with
 //! `self.X` replaced by either:
 //!
-//! - `mgr.X(...)` for remaining inherent methods on
-//!   [`ContextManager`](crate::context::manager::ContextManager), or
-//! - `mgr.X_ref()` accessor calls for fields.
+//! - `manager_methods::X(supervisor, ...)` for cross-domain helpers
+//!   (12c.9g.1 hoist; helper bodies migrated to direct calls in
+//!   commit 12c.9g.2), or
+//! - `supervisor.X_ref().ok_or(NotInitialized)?` for provider slots
+//!   lifted to the supervisor in ADR-049 commit 12c.9a-9b.
 //!
 //! The legacy inherent methods on
 //! [`ContextManager`](crate::context::manager::ContextManager) remain as
@@ -118,6 +120,7 @@ use crate::context::builder::ContextEventLogProvider;
 use crate::context::manager::{
     CommitFaultMarker, PendingCommit, PerContextState, context_id_to_bytes,
 };
+use crate::context::manager_methods;
 use crate::context::providers::event_log::EventLogEntry;
 use crate::context::supervisor::Supervisor;
 
@@ -146,14 +149,14 @@ const MAX_RETAINED_CHECKPOINTS: usize = 100;
 /// [`ContextManager::register_local_did`](crate::context::manager::ContextManager::register_local_did)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn register_local_did(supervisor: &Supervisor, did: DID) {
-    let Some(mgr) = supervisor.attached_context_manager() else {
+    let Some(local_dids) = supervisor.local_dids_ref() else {
         tracing::error!(
             did = %did,
             "register_local_did: Supervisor is not attached — skipping registration"
         );
         return;
     };
-    mgr.local_dids_ref().write().await.insert(did);
+    local_dids.write().await.insert(did);
 }
 
 /// Returns `true` if the given DID is registered as locally controlled.
@@ -162,10 +165,10 @@ pub async fn register_local_did(supervisor: &Supervisor, did: DID) {
 /// [`ContextManager::is_local_did`](crate::context::manager::ContextManager::is_local_did)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn is_local_did(supervisor: &Supervisor, did: &DID) -> bool {
-    let Some(mgr) = supervisor.attached_context_manager() else {
+    let Some(local_dids) = supervisor.local_dids_ref() else {
         return false;
     };
-    mgr.local_dids_ref().read().await.contains(did)
+    local_dids.read().await.contains(did)
 }
 
 // ===========================================================================
@@ -187,11 +190,7 @@ pub async fn local_pseudonym(
     supervisor: &Supervisor,
     context_id: &str,
 ) -> Result<Option<[u8; 32]>, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let ctx_arc = mgr
-        .get_context_arc(context_id)
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let guard = ctx_arc.lock().await;
     Ok(guard.local_pseudonym)
@@ -217,18 +216,17 @@ pub async fn get_broadcast_key_for_local_author(
     context_id: &str,
     author_did: &str,
 ) -> Result<(Zeroizing<[u8; 32]>, u64), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
+    let local_dids = supervisor
+        .local_dids_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // Verify the DID is locally controlled.
-    if !mgr.local_dids_ref().read().await.contains(author_did) {
+    if !local_dids.read().await.contains(author_did) {
         return Err(ContextError::PermissionDenied(format!(
             "author DID is not controlled by the local node: {author_did}"
         )));
     }
 
-    let ctx_arc = mgr
-        .get_context_arc(context_id)
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let guard = ctx_arc.lock().await;
     let ctx = &*guard;
@@ -252,8 +250,7 @@ pub async fn get_broadcast_key_for_local_author(
 /// [`ContextManager::member_count`](crate::context::manager::ContextManager::member_count)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn member_count(supervisor: &Supervisor, context_id: &str) -> Option<usize> {
-    let mgr = supervisor.attached_context_manager()?;
-    let arc = mgr.get_context_arc(context_id).ok()?;
+    let arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
     let ctx = arc.lock().await;
     Some(ctx.membership.count())
 }
@@ -264,10 +261,7 @@ pub async fn member_count(supervisor: &Supervisor, context_id: &str) -> Option<u
 /// [`ContextManager::is_member`](crate::context::manager::ContextManager::is_member)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn is_member(supervisor: &Supervisor, context_id: &str, did: &str) -> bool {
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        return false;
-    };
-    let Ok(arc) = mgr.get_context_arc(context_id) else {
+    let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
         return false;
     };
     let ctx = arc.lock().await;
@@ -280,10 +274,7 @@ pub async fn is_member(supervisor: &Supervisor, context_id: &str, did: &str) -> 
 /// [`ContextManager::member_dids`](crate::context::manager::ContextManager::member_dids)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn member_dids(supervisor: &Supervisor, context_id: &str) -> Vec<String> {
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        return Vec::new();
-    };
-    let Ok(arc) = mgr.get_context_arc(context_id) else {
+    let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
         return Vec::new();
     };
     let ctx = arc.lock().await;
@@ -303,8 +294,7 @@ pub async fn member_role(
     context_id: &str,
     did: &str,
 ) -> Option<RoleAssignment> {
-    let mgr = supervisor.attached_context_manager()?;
-    let arc = mgr.get_context_arc(context_id).ok()?;
+    let arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
     let ctx = arc.lock().await;
     ctx.role_state.assignments.get(did).cloned()
 }
@@ -316,8 +306,7 @@ pub async fn member_role(
 /// [`ContextManager::context_params`](crate::context::manager::ContextManager::context_params)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn context_params(supervisor: &Supervisor, context_id: &str) -> Option<ContextParams> {
-    let mgr = supervisor.attached_context_manager()?;
-    let arc = mgr.get_context_arc(context_id).ok()?;
+    let arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
     let ctx = arc.lock().await;
     Some(ctx.handle.params().clone())
 }
@@ -329,8 +318,7 @@ pub async fn context_params(supervisor: &Supervisor, context_id: &str) -> Option
 /// [`ContextManager::get_role_state`](crate::context::manager::ContextManager::get_role_state)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn get_role_state(supervisor: &Supervisor, context_id: &str) -> Option<ContextRoleState> {
-    let mgr = supervisor.attached_context_manager()?;
-    let arc = mgr.get_context_arc(context_id).ok()?;
+    let arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
     let ctx = arc.lock().await;
     Some(ctx.role_state.clone())
 }
@@ -342,10 +330,7 @@ pub async fn get_role_state(supervisor: &Supervisor, context_id: &str) -> Option
 /// [`ContextManager::pending_commits`](crate::context::manager::ContextManager::pending_commits)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn pending_commits(supervisor: &Supervisor, context_id: &str) -> Vec<PendingCommit> {
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        return Vec::new();
-    };
-    let Ok(arc) = mgr.get_context_arc(context_id) else {
+    let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
         return Vec::new();
     };
     let ctx = arc.lock().await;
@@ -359,8 +344,7 @@ pub async fn pending_commits(supervisor: &Supervisor, context_id: &str) -> Vec<P
 /// [`ContextManager::commit_fault`](crate::context::manager::ContextManager::commit_fault)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn commit_fault(supervisor: &Supervisor, context_id: &str) -> Option<CommitFaultMarker> {
-    let mgr = supervisor.attached_context_manager()?;
-    let arc = mgr.get_context_arc(context_id).ok()?;
+    let arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
     let ctx = arc.lock().await;
     ctx.commit_fault.clone()
 }
@@ -375,10 +359,7 @@ pub async fn commit_fault(supervisor: &Supervisor, context_id: &str) -> Option<C
 /// [`ContextManager::drain_events`](crate::context::manager::ContextManager::drain_events)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn drain_events(supervisor: &Supervisor, context_id: &str) -> Vec<ContextEvent> {
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        return Vec::new();
-    };
-    let Ok(arc) = mgr.get_context_arc(context_id) else {
+    let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
         return Vec::new();
     };
     let mut ctx = arc.lock().await;
@@ -397,13 +378,6 @@ pub async fn report_degraded_mode(
     compat: scp_protocol::envelope::VersionCompatibility,
     unsupported_features: Vec<String>,
 ) {
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        tracing::error!(
-            context_id,
-            "report_degraded_mode: Supervisor is not attached — skipping report"
-        );
-        return;
-    };
     if let scp_protocol::envelope::VersionCompatibility::DegradedMode {
         local_minor,
         remote_minor,
@@ -412,7 +386,7 @@ pub async fn report_degraded_mode(
         let local_major =
             scp_protocol::envelope::version_major(scp_protocol::envelope::SCP_PROTOCOL_VERSION);
         let remote_major = local_major; // same major guaranteed by VersionCompatibility
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             let event = ContextEvent::DegradedMode {
@@ -421,7 +395,7 @@ pub async fn report_degraded_mode(
                 remote_version: (remote_major, remote_minor),
                 unsupported_features,
             };
-            ctx.emit_event(event, context_id, mgr.event_tx_ref());
+            ctx.emit_event(event, context_id, supervisor.event_tx_ref());
         }
     }
 }
@@ -443,10 +417,10 @@ pub fn event_log_entries(
     supervisor: &Supervisor,
     context_id: &[u8; 32],
 ) -> Result<Option<Vec<EventLogEntry>>, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
+    let event_log = supervisor
+        .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    mgr.event_log_ref().event_log_entries(context_id)
+    event_log.event_log_entries(context_id)
 }
 
 // ===========================================================================
@@ -472,11 +446,7 @@ pub async fn generate_context_access_key(
     member_did: &str,
     caller_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let ctx_arc = mgr
-        .get_context_arc(context_id)
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let mut guard = ctx_arc.lock().await;
     let ctx = &mut *guard;
@@ -521,11 +491,7 @@ pub async fn revoke_context_access_key(
     member_did: &str,
     caller_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let ctx_arc = mgr
-        .get_context_arc(context_id)
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let mut guard = ctx_arc.lock().await;
     let ctx = &mut *guard;
@@ -567,11 +533,7 @@ pub async fn restore_context_access_key(
     member_did: &str,
     caller_did: &str,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let ctx_arc = mgr
-        .get_context_arc(context_id)
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let mut guard = ctx_arc.lock().await;
     let ctx = &mut *guard;
@@ -608,17 +570,15 @@ pub async fn set_access_key(
     member_did: &str,
     key: scp_protocol::crypto::access_keys::AccessKey,
 ) {
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        tracing::error!(
-            context_id,
-            "set_access_key: Supervisor is not attached — skipping"
-        );
-        return;
-    };
-    if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+    if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
         ctx.access.access_key_store.set(context_id, member_did, key);
+    } else {
+        tracing::error!(
+            context_id,
+            "set_access_key: context not registered or Supervisor not attached — skipping"
+        );
     }
 }
 
@@ -628,17 +588,15 @@ pub async fn set_access_key(
 /// [`ContextManager::remove_access_key`](crate::context::manager::ContextManager::remove_access_key)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn remove_access_key(supervisor: &Supervisor, context_id: &str, member_did: &str) {
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        tracing::error!(
-            context_id,
-            "remove_access_key: Supervisor is not attached — skipping"
-        );
-        return;
-    };
-    if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+    if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
         ctx.access.access_key_store.remove(context_id, member_did);
+    } else {
+        tracing::error!(
+            context_id,
+            "remove_access_key: context not registered or Supervisor not attached — skipping"
+        );
     }
 }
 
@@ -658,17 +616,15 @@ pub async fn inject_access_key(
     member_did: &str,
     key: scp_protocol::crypto::access_keys::AccessKey,
 ) {
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        tracing::error!(
-            context_id,
-            "inject_access_key: Supervisor is not attached — skipping"
-        );
-        return;
-    };
-    if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+    if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
         ctx.access.access_key_store.set(context_id, member_did, key);
+    } else {
+        tracing::error!(
+            context_id,
+            "inject_access_key: context not registered or Supervisor not attached — skipping"
+        );
     }
 }
 
@@ -684,8 +640,7 @@ pub async fn get_access_key(
     context_id: &str,
     member_did: &str,
 ) -> Option<scp_protocol::crypto::access_keys::AccessKey> {
-    let mgr = supervisor.attached_context_manager()?;
-    let arc = mgr.get_context_arc(context_id).ok()?;
+    let arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
     let ctx = arc.lock().await;
     ctx.access
         .access_key_store
@@ -703,10 +658,7 @@ pub async fn get_all_access_keys(
     supervisor: &Supervisor,
     context_id: &str,
 ) -> HashMap<String, scp_protocol::crypto::access_keys::AccessKey> {
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        return HashMap::new();
-    };
-    let Ok(arc) = mgr.get_context_arc(context_id) else {
+    let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
         return HashMap::new();
     };
     let ctx = arc.lock().await;
@@ -725,17 +677,15 @@ pub async fn grant_budget_for_test(
     member_did: &DID,
     amount: scp_protocol::economy::types::Amount,
 ) {
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        tracing::error!(
-            context_id,
-            "grant_budget_for_test: Supervisor is not attached — skipping"
-        );
-        return;
-    };
-    if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+    if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;
         ctx.governance.budget_tracker.grant(member_did, amount);
+    } else {
+        tracing::error!(
+            context_id,
+            "grant_budget_for_test: context not registered or Supervisor not attached — skipping"
+        );
     }
 }
 
@@ -750,10 +700,7 @@ pub async fn remaining_budget_for_test(
     context_id: &str,
     member_did: &DID,
 ) -> scp_protocol::economy::types::Amount {
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        return scp_protocol::economy::types::Amount::new(0);
-    };
-    let Ok(arc) = mgr.get_context_arc(context_id) else {
+    let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
         return scp_protocol::economy::types::Amount::new(0);
     };
     let ctx = arc.lock().await;
@@ -773,10 +720,7 @@ pub async fn velocity_for_test(
     member_did: &DID,
     now_secs: u64,
 ) -> u64 {
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        return 0;
-    };
-    let Ok(arc) = mgr.get_context_arc(context_id) else {
+    let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
         return 0;
     };
     let ctx = arc.lock().await;
@@ -809,8 +753,9 @@ pub fn create_checkpoint_if_due(
 ) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
     // Synchronous helper; on detached Supervisor degrades to `None`
     // (no checkpoint created).
-    let mgr = supervisor.attached_context_manager()?;
-    let now = mgr.clock_ref().now_secs();
+    let clock = supervisor.clock_ref()?;
+    let event_log = supervisor.event_log_ref()?;
+    let now = clock.now_secs();
     let events_due = ctx.checkpoint_events_since >= 50;
     // Time-based checkpoints require at least one event — creating a
     // checkpoint for zero events is wasteful and indistinguishable from
@@ -828,7 +773,7 @@ pub fn create_checkpoint_if_due(
         sender_did,
         signing_key,
         now,
-        mgr.event_log_ref().as_ref(),
+        event_log.as_ref(),
     );
 
     ctx.checkpoint_events_since = 0;
@@ -865,15 +810,16 @@ pub fn force_create_checkpoint(
     // ADR-049 commit 12c.9d — returns `Option` so a detached attach
     // slot degrades to `None`. Clippy's `expect_used` / `panic` lints
     // are denied crate-wide, so we cannot fall through with `expect`.
-    let mgr = supervisor.attached_context_manager()?;
-    let now = mgr.clock_ref().now_secs();
+    let clock = supervisor.clock_ref()?;
+    let event_log = supervisor.event_log_ref()?;
+    let now = clock.now_secs();
     let cp = build_checkpoint(
         context_id,
         ctx,
         sender_did,
         signing_key,
         now,
-        mgr.event_log_ref().as_ref(),
+        event_log.as_ref(),
     );
 
     ctx.checkpoint_events_since = 0;
@@ -898,9 +844,10 @@ pub fn force_create_checkpoint(
 ///
 /// Hoisted body of the legacy private
 /// `ContextManager::build_checkpoint` associated function (ADR-049
-/// commit 12c.5). Pure function — no `mgr` parameter; takes an explicit
-/// `&dyn ContextEventLogProvider` reference since the caller already
-/// dereferenced `mgr.event_log_ref()`. Byte-identical behavior.
+/// commit 12c.5). Pure function — no supervisor parameter; takes an
+/// explicit `&dyn ContextEventLogProvider` reference since the caller
+/// already dereferenced `supervisor.event_log_ref()`. Byte-identical
+/// behavior.
 fn build_checkpoint(
     context_id: &str,
     ctx: &PerContextState,
@@ -969,13 +916,15 @@ pub async fn compare_remote_checkpoint(
     context_id: &str,
     remote: &scp_event_log::checkpoint::ConsistencyCheckpoint,
 ) -> Result<scp_event_log::checkpoint::CheckpointComparison, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
+    let key_resolver = supervisor
+        .key_resolver_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
+    let event_log = supervisor
+        .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // Verify the sender is a member of this context.
     {
-        let ctx_arc = mgr
-            .get_context_arc(context_id)
+        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
@@ -988,7 +937,7 @@ pub async fn compare_remote_checkpoint(
     }
 
     // Verify checkpoint Ed25519 signature.
-    let sender_pk = (mgr.key_resolver_ref())(&remote.sender_did).ok_or_else(|| {
+    let sender_pk = (key_resolver)(&remote.sender_did).ok_or_else(|| {
         ContextError::CryptoFailed(format!(
             "cannot resolve public key for checkpoint sender {}",
             remote.sender_did
@@ -1003,12 +952,10 @@ pub async fn compare_remote_checkpoint(
     )?;
 
     let context_id_bytes = context_id_to_bytes(context_id);
-    let local_root = mgr
-        .event_log_ref()
+    let local_root = event_log
         .event_log_merkle_root(&context_id_bytes)
         .unwrap_or([0u8; 32]);
-    let local_count = mgr
-        .event_log_ref()
+    let local_count = event_log
         .event_log_entries(&context_id_bytes)
         .ok()
         .flatten()
@@ -1049,7 +996,7 @@ pub async fn compare_remote_checkpoint(
             event_count = remote.event_count,
             "relay equivocation detected — divergent Merkle roots at same event count (§9.9.3)"
         );
-        if let Err(e) = mgr.event_log_ref().append_context_event(
+        if let Err(e) = event_log.append_context_event(
             &context_id_bytes,
             "EquivocationDetected",
             remote.sender_did.as_ref(),
@@ -1059,7 +1006,7 @@ pub async fn compare_remote_checkpoint(
                 "failed to append EquivocationDetected to event log: {e}"
             );
         }
-        if let Ok(ctx_arc) = mgr.get_context_arc(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
@@ -1068,7 +1015,7 @@ pub async fn compare_remote_checkpoint(
                 remote_sender_did: remote.sender_did.clone(),
                 event_count: remote.event_count,
             };
-            ctx.emit_event(event, context_id, mgr.event_tx_ref());
+            ctx.emit_event(event, context_id, supervisor.event_tx_ref());
         }
     }
 
@@ -1084,8 +1031,8 @@ pub async fn compare_remote_checkpoint(
 /// Hoisted body of the legacy private
 /// `ContextManager::sync_merkle_tree` method (ADR-049 commit 12c.5).
 /// Takes an explicit `&dyn ContextEventLogProvider` reference since the
-/// caller already dereferenced `mgr.event_log_ref()`. Byte-identical
-/// behavior.
+/// caller already dereferenced `supervisor.event_log_ref()`. Byte-
+/// identical behavior.
 fn sync_merkle_tree(
     context_id: &str,
     ctx: &mut PerContextState,
@@ -1130,15 +1077,14 @@ pub async fn prove_event_inclusion(
     context_id: &str,
     leaf_index: u64,
 ) -> Result<scp_event_log::proof::InclusionProof, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
+    let event_log = supervisor
+        .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let ctx_arc = mgr
-        .get_context_arc(context_id)
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let mut guard = ctx_arc.lock().await;
     let ctx = &mut *guard;
-    sync_merkle_tree(context_id, ctx, mgr.event_log_ref().as_ref());
+    sync_merkle_tree(context_id, ctx, event_log.as_ref());
     scp_event_log::proof::prove_inclusion(&ctx.merkle_tree, leaf_index)
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))
 }
@@ -1160,15 +1106,14 @@ pub async fn prove_event_consistency(
     context_id: &str,
     old_size: u64,
 ) -> Result<scp_event_log::proof::ConsistencyProof, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
+    let event_log = supervisor
+        .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let ctx_arc = mgr
-        .get_context_arc(context_id)
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let mut guard = ctx_arc.lock().await;
     let ctx = &mut *guard;
-    sync_merkle_tree(context_id, ctx, mgr.event_log_ref().as_ref());
+    sync_merkle_tree(context_id, ctx, event_log.as_ref());
     let current_size = scp_event_log::tree::event_count(&ctx.merkle_tree);
     scp_event_log::proof::prove_consistency(&ctx.merkle_tree, old_size, current_size)
         .map_err(|e| ContextError::EventLogFailed(e.to_string()))

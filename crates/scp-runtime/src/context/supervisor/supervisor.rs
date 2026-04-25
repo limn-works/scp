@@ -764,6 +764,82 @@ impl Supervisor {
             .map(|mgr| mgr.local_dids_ref())
     }
 
+    /// Cheap reference to the attached manager's standing-context tracking
+    /// map (peer DID → DID). Returns `None` before
+    /// [`Self::attach_context_manager`] has been called.
+    ///
+    /// Mirrors the [`ContextManager::standing_contexts_ref`] accessor
+    /// added in ADR-049 commit 12c.4. Like
+    /// [`Self::local_dids_ref`], this delegates through the
+    /// `context_manager_bridge` `OnceLock` rather than mirroring the
+    /// underlying `Mutex` on the supervisor — the manager's
+    /// `standing_contexts` field is a direct
+    /// [`tokio::sync::Mutex`] (not `Arc`-wrapped), so duplicating it
+    /// on the supervisor would either diverge on writes or require a
+    /// ref-lifetime `OnceLock` cannot express.
+    ///
+    /// 12c.9g.2 callers rewrite
+    /// `mgr.standing_contexts_ref().lock().await` as
+    /// `supervisor.standing_contexts_ref().ok_or(ContextError::NotInitialized(_))?.lock().await`
+    /// — same semantics, routed through the supervisor.
+    ///
+    /// Note: not to be confused with the `standing_contexts:
+    /// ArcSwap<HashMap<...>>` field on [`Supervisor`] itself, which
+    /// holds the snapshot/restore copy used during attach. This
+    /// accessor returns the live, mutation-tracking `Mutex` owned by
+    /// the attached `ContextManager`.
+    #[must_use]
+    #[allow(dead_code)] // first caller lands in 12c.9g.2
+    pub(crate) fn standing_contexts_ref(
+        &self,
+    ) -> Option<&tokio::sync::Mutex<std::collections::HashMap<String, DID>>> {
+        self.context_manager_bridge
+            .get()
+            .map(|mgr| mgr.standing_contexts_ref())
+    }
+
+    /// Returns an owned clone of the attached manager's per-context
+    /// state-map `Arc<DashMap<...>>`. Returns `None` before
+    /// [`Self::attach_context_manager`] has been called.
+    ///
+    /// Convenience over [`Self::contexts_ref`] for callers that need to
+    /// move the `Arc` into a spawned task (the second use-case the
+    /// manager's [`ContextManager::contexts_arc`] exposes). Equivalent
+    /// to `self.contexts_ref().cloned()` — the cloned `Arc` shares the
+    /// same allocation as the manager's `contexts` field.
+    ///
+    /// 12c.9g.2 callers rewrite `mgr.contexts_arc()` as
+    /// `supervisor.contexts_arc().ok_or(ContextError::NotInitialized(_))?`
+    /// — same semantics, routed through the supervisor.
+    #[must_use]
+    #[allow(dead_code)] // first caller lands in 12c.9g.2
+    pub(crate) fn contexts_arc(&self) -> Option<Arc<ContextsMap>> {
+        self.contexts_ref().map(Arc::clone)
+    }
+
+    /// Cheap reference to the attached manager's `next_generation`
+    /// monotonic counter. Returns `None` before
+    /// [`Self::attach_context_manager`] has been called.
+    ///
+    /// The counter feeds [`crate::context::manager_methods::insert_context`]
+    /// via the helper-side `fetch_add` calls inside `import_context` /
+    /// `create_context`. Those pre-fetches are observably redundant with
+    /// `insert_context`'s own stamping (`insert_context` overwrites
+    /// `state.generation` with the fresh value it pulls), but the dual
+    /// increment is preserved here byte-identically with the legacy
+    /// inherent-method form so the post-import counter advances by the
+    /// same delta as before the hoist.
+    ///
+    /// The counter — and this accessor — disappear with [`ContextManager`]
+    /// in ADR-049 commit 12c.9g.4.
+    #[must_use]
+    #[allow(dead_code)] // first caller lands in 12c.9g.2
+    pub(crate) fn next_generation_ref(&self) -> Option<&std::sync::atomic::AtomicU64> {
+        self.context_manager_bridge
+            .get()
+            .map(|mgr| mgr.next_generation_ref())
+    }
+
     // -------------------------------------------------------------------
     // ADR-049 commit 12c.9f — per-identity wrapping-key accessors.
     //

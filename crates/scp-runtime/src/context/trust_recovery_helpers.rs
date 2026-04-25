@@ -28,9 +28,11 @@
 //! Its body is a verbatim copy of the legacy inherent method's body with
 //! `self.X` replaced by either:
 //!
-//! - `mgr.X(...)` for remaining inherent methods on
-//!   [`ContextManager`](crate::context::manager::ContextManager), or
-//! - `mgr.X_ref()` / explicit collaborator parameters for fields.
+//! - `manager_methods::X(supervisor, ...)` for cross-domain helpers
+//!   (12c.9g.1 hoist; helper bodies migrated to direct calls in
+//!   commit 12c.9g.2), or
+//! - `supervisor.X_ref().ok_or(NotInitialized)?` for provider slots
+//!   lifted to the supervisor in ADR-049 commit 12c.9a-9b.
 //!
 //! The legacy inherent methods on
 //! [`ContextManager`](crate::context::manager::ContextManager) remain as
@@ -63,6 +65,7 @@ use scp_protocol::context::governance::{
 use crate::context::manager::{
     ContextManager, PerContextState, context_id_to_bytes, require_active,
 };
+use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
 
 /// Shared expectation message for `Supervisor::attached_context_manager()`
@@ -92,11 +95,13 @@ pub async fn create_governance_checkpoint(
     creator_did: &DID,
     creator_signature: Vec<u8>,
 ) -> Result<ContextCheckpoint, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
+    let clock = supervisor
+        .clock_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let ctx_arc = mgr
-        .get_context_arc(context_id)
+    let event_log = supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let guard = ctx_arc.lock().await;
     let ctx = &*guard;
@@ -112,7 +117,7 @@ pub async fn create_governance_checkpoint(
     // Capture pruning policy before dropping the lock.
     let pruning_policy = ctx.governance.pruning_policy.clone();
 
-    let created_at = mgr.clock_ref().now_secs();
+    let created_at = clock.now_secs();
 
     let checkpoint = ContextCheckpoint {
         checkpoint_seq,
@@ -135,8 +140,7 @@ pub async fn create_governance_checkpoint(
     // creation if pruning encounters an error.
     if let Some(ref policy) = pruning_policy {
         let context_id_bytes = context_id_to_bytes(context_id);
-        if mgr
-            .event_log_ref()
+        if event_log
             .prune_before_checkpoint(&context_id_bytes, event_count, policy)
             .is_some_and(|pruned| pruned > 0)
         {
@@ -169,11 +173,7 @@ pub async fn add_checkpoint_cosignature(
 ) -> Result<CheckpointAttestationStatus, ContextError> {
     use sha2::Digest as _;
 
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let ctx_arc = mgr
-        .get_context_arc(context_id)
+    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let guard = ctx_arc.lock().await;
     let ctx = &*guard;
@@ -216,15 +216,21 @@ pub async fn recovery_advance_epoch(
     supervisor: &Supervisor,
     context_id: &str,
 ) -> Result<u64, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
+    let crypto = supervisor
+        .crypto_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
+    let transport = supervisor
+        .transport_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
+    let event_log = supervisor
+        .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
     // 1. Validate the context exists and is active (lock scoped).
     //    Capture generation for confused-deputy detection on reacquire.
     let ctx_gen = {
-        let (guard, generation) = mgr.lock_context(context_id).await?;
+        let (guard, generation) = manager_methods::lock_context(supervisor, context_id).await?;
         let ctx = &*guard;
         require_active(&ctx.handle)?;
         generation
@@ -232,16 +238,13 @@ pub async fn recovery_advance_epoch(
 
     // 2. Perform the MLS epoch advance (Update + self-Commit).
     //    If this fails the counter is NOT incremented.
-    let epoch_output = mgr.crypto_ref().advance_epoch(&context_id_bytes)?;
+    let epoch_output = crypto.advance_epoch(&context_id_bytes)?;
 
     // 2b. Broadcast the MLS Commit to all members so they can advance
     //     their group epoch and ratchet key material.
     if !epoch_output.commit_bytes.is_empty() {
         let routing_id = scp_protocol::context::context_routing_id(context_id);
-        if let Err(e) = mgr
-            .transport_ref()
-            .send_message(&routing_id, &epoch_output.commit_bytes)
-        {
+        if let Err(e) = transport.send_message(&routing_id, &epoch_output.commit_bytes) {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -254,7 +257,7 @@ pub async fn recovery_advance_epoch(
     //    Verify generation to detect confused-deputy (context removed
     //    and recreated while we awaited the MLS commit).
     let new_epoch = {
-        let mut guard = mgr.relock_context(&ctx_gen).await?;
+        let mut guard = manager_methods::relock_context(supervisor, &ctx_gen).await?;
         let ctx = &mut *guard;
         // Re-validate after the crypto op to close the TOCTOU window between
         // the active check in step 1 and the counter increment here. A
@@ -269,7 +272,7 @@ pub async fn recovery_advance_epoch(
 
     // 4. Emit epoch advancement event to event log. Event log failures
     //    are non-fatal — recovery must not be blocked by logging issues.
-    if let Err(e) = mgr.event_log_ref().append_context_event(
+    if let Err(e) = event_log.append_context_event(
         &context_id_bytes,
         "recovery/epoch_advanced",
         "system:recovery",
@@ -281,19 +284,19 @@ pub async fn recovery_advance_epoch(
         );
     }
     {
-        if let Ok(mut guard) = mgr.relock_context(&ctx_gen).await {
+        if let Ok(mut guard) = manager_methods::relock_context(supervisor, &ctx_gen).await {
             let ctx = &mut *guard;
             ctx.checkpoint_events_since += 1;
         }
     }
 
     // 5. Persist if configured (best-effort).
-    if mgr.has_persistence()
-        && let Ok(guard) = mgr.relock_context(&ctx_gen).await
+    if manager_methods::has_persistence(supervisor)
+        && let Ok(guard) = manager_methods::relock_context(supervisor, &ctx_gen).await
     {
         let ctx = &*guard;
         let snapshot = ContextManager::snapshot_context(ctx);
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
 
     Ok(new_epoch)
@@ -317,8 +320,14 @@ pub async fn recovery_send_notification(
     sequence: u64,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
+    let crypto = supervisor
+        .crypto_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
+    let transport = supervisor
+        .transport_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
+    let clock = supervisor
+        .clock_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = context_id_to_bytes(context_id);
 
@@ -326,7 +335,7 @@ pub async fn recovery_send_notification(
     // advance in step 2, the epoch is > 0 — using the real value ensures
     // receivers can validate the message against their local epoch state.
     let current_epoch = {
-        if let Ok(arc) = mgr.get_context_arc(context_id) {
+        if let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) {
             let ctx = arc.lock().await;
             ctx.epoch.mls_epoch
         } else {
@@ -337,7 +346,7 @@ pub async fn recovery_send_notification(
     // Construct a minimal inner envelope for the recovery notification.
     // Recovery notifications bypass the full send_message pipeline but
     // still go through the envelope crypto layer (seal).
-    let timestamp = mgr.clock_ref().now_millis();
+    let timestamp = clock.now_millis();
     let params = scp_protocol::envelope::inner::InnerEnvelopeParams {
         version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
         context_id,
@@ -358,7 +367,7 @@ pub async fn recovery_send_notification(
     // Use domain-separated routing ID for relay routing, distinct from
     // the raw context_id_bytes used for MLS crypto keying.
     let routing_id = scp_protocol::context::context_routing_id(context_id);
-    let encrypted = mgr.crypto_ref().seal(
+    let encrypted = crypto.seal(
         &context_id_bytes,
         &inner,
         &routing_id,
@@ -366,7 +375,7 @@ pub async fn recovery_send_notification(
     )?;
 
     // Send via transport using the domain-separated routing ID.
-    mgr.transport_ref().send_message(&routing_id, &encrypted)?;
+    transport.send_message(&routing_id, &encrypted)?;
 
     Ok(())
 }
@@ -388,8 +397,8 @@ pub async fn recovery_notify_contact(
     payload: &[u8],
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
+    let contexts = supervisor
+        .contexts_arc()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // Find a context where both the recovering DID and the contact DID
     // are members. The first matching context is used for delivery.
@@ -397,7 +406,6 @@ pub async fn recovery_notify_contact(
     // awaiting per-context Mutexes. Holding a DashMap Ref across .await
     // would deadlock any concurrent shard access.
     let shared_context_id = {
-        let contexts = mgr.contexts_arc();
         let entries: Vec<(String, Arc<tokio::sync::Mutex<PerContextState>>)> = contexts
             .iter()
             .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))

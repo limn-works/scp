@@ -1547,6 +1547,7 @@ impl ContextManager {
     /// [`crate::context::lifecycle_helpers::drain_and_deliver_sender_keys`]
     /// free function (ADR-049 commit 12c.2). Deleted in a later commit
     /// alongside every other `ContextManager` lifecycle surface.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) fn drain_and_deliver_sender_keys(
         &self,
         context_id: &str,

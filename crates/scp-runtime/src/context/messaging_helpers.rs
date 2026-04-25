@@ -104,6 +104,7 @@ use crate::context::builder::ContextEventLogProvider;
 use crate::context::manager::{
     self, ContextManager, PSEUDONYM_ANNOUNCEMENT_TAG, PerContextState, PseudonymAnnouncement,
 };
+use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
 
 /// Shared expectation message for `Supervisor::attached_context_manager()`
@@ -624,9 +625,6 @@ pub async fn send_message(
     source_provenance: Option<&SourceContextInfo>,
     spending_ucan: Option<&UcanToken>,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
     // Routing ID computation is deferred to Phase 1 (under lock) where
@@ -640,8 +638,7 @@ pub async fn send_message(
         ctx_gen,
         send_routing_ids,
     ) = {
-        let (mut guard, ctx_gen) = mgr
-            .lock_context(&context_id)
+        let (mut guard, ctx_gen) = manager_methods::lock_context(supervisor, &context_id)
             .await
             .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
         let ctx = &mut *guard;
@@ -798,15 +795,16 @@ pub async fn send_message(
     };
     // Payment flow (#1537): escrow pattern — authorize (hold) before the
     // action, complete (capture) after success, void + rollback on failure.
-    let auth = match mgr.authorize_send_payment(&context_id, sender_did).await {
+    let auth = match authorize_send_payment(supervisor, &context_id, sender_did).await {
         Ok(auth) => auth,
         Err(e) => {
             // Authorization failure — roll back the ticket. The sequence
             // number rollback is also needed because Phase 1 already
             // incremented it for non-broadcast.
-            manager::economy::rollback_economy_ticket(mgr, &context_id, ticket, &ctx_gen).await;
+            manager::economy::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen)
+                .await;
             if !is_broadcast {
-                if let Ok(mut guard) = mgr.relock_context(&ctx_gen).await {
+                if let Ok(mut guard) = manager_methods::relock_context(supervisor, &ctx_gen).await {
                     let ctx = &mut *guard;
                     ctx.membership.rollback_sequence_number(sender_did);
                 } else {
@@ -823,7 +821,8 @@ pub async fn send_message(
 
     // Phase 2: encrypt + send (no lock held).
     // §9.10.4: fan-out — send to all collected routing IDs.
-    let phase2_result = mgr.encrypt_and_send(
+    let phase2_result = encrypt_and_send(
+        supervisor,
         broadcast_envelope,
         signing_key,
         &context_id,
@@ -840,11 +839,11 @@ pub async fn send_message(
         // patch the outer rollback only touched the budget, silently
         // leaking the velocity entry and the hard-rate-limit token.
         if let Some(a) = auth {
-            mgr.void_paid_action(a, &context_id).await;
+            crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
         }
-        manager::economy::rollback_economy_ticket(mgr, &context_id, ticket, &ctx_gen).await;
+        manager::economy::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen).await;
         if !is_broadcast {
-            if let Ok(mut guard) = mgr.relock_context(&ctx_gen).await {
+            if let Ok(mut guard) = manager_methods::relock_context(supervisor, &ctx_gen).await {
                 let ctx = &mut *guard;
                 ctx.membership.rollback_sequence_number(sender_did);
             } else {
@@ -862,10 +861,10 @@ pub async fn send_message(
     // the ticket — commit returns the deducted cost for the capture step
     // and marks the ticket as committed so the Drop guard stays quiet.
     let deducted_cost = manager::economy::commit_economy_ticket(ticket);
-    mgr.capture_send_payment(auth, sender_did, &context_id, deducted_cost)
-        .await;
+    capture_send_payment(supervisor, auth, sender_did, &context_id, deducted_cost).await;
 
-    mgr.finalize_send(
+    finalize_send(
+        supervisor,
         &context_id,
         &context_id_bytes,
         sender_did,
@@ -932,9 +931,6 @@ pub async fn deliver_incoming(
     context_id: &str,
     encrypted_blob: &[u8],
 ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
     // Phase 1: state check + read local member DID + access key.
@@ -946,8 +942,7 @@ pub async fn deliver_incoming(
         .read()
         .await;
     let (local_member_did, access_key) = {
-        let ctx_arc = mgr
-            .get_context_arc_pub(context_id)
+        let ctx_arc = manager_methods::get_context_arc_pub(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
@@ -967,7 +962,7 @@ pub async fn deliver_incoming(
 
     // Phase 2: open envelope (MLS + sender key + deserialize + integrity).
     let Some(opened_envelope) =
-        mgr.decrypt_and_dispatch(context_id, &context_id_bytes, encrypted_blob)?
+        decrypt_and_dispatch(supervisor, context_id, &context_id_bytes, encrypted_blob)?
     else {
         return Ok(None);
     };
@@ -1005,7 +1000,7 @@ pub async fn deliver_incoming(
     // (admin). Only evaluated when message_type == Recovery to avoid an
     // extra lock acquisition on the normal path.
     let sender_is_admin = if inner.message_type == MessageType::Recovery {
-        if let Ok(ctx_arc) = mgr.get_context_arc_pub(context_id) {
+        if let Ok(ctx_arc) = manager_methods::get_context_arc_pub(supervisor, context_id) {
             let guard = ctx_arc.lock().await;
             let ctx = &*guard;
             ctx.role_state
@@ -1035,9 +1030,8 @@ pub async fn deliver_incoming(
     // Anti-replay + reorder buffer (§9.8.2, §9.8.5).
     // Now safe to inspect SequenceTracker — the envelope is authenticated.
     let now_ms = clock.now_millis();
-    let sequence_check = mgr
-        .validate_and_drain_timeouts(context_id, &inner, now_ms)
-        .await?;
+    let sequence_check =
+        validate_and_drain_timeouts(supervisor, context_id, &inner, now_ms).await?;
 
     // A locally-controlled sender was already counted on the send path;
     // skip velocity re-recording to prevent double-counting on single-node setups.
@@ -1050,16 +1044,16 @@ pub async fn deliver_incoming(
             // `true` when the message was consumed as a pseudonym announcement
             // (internal protocol message). Announcements must NOT be forwarded
             // to FFI callers as regular user messages.
-            let consumed_as_announcement = mgr
-                .deliver_message_and_drain_buffered(
-                    context_id,
-                    &context_id_bytes,
-                    &sender_did,
-                    &inner,
-                    &plaintext,
-                    is_local_sender,
-                )
-                .await?;
+            let consumed_as_announcement = deliver_message_and_drain_buffered(
+                supervisor,
+                context_id,
+                &context_id_bytes,
+                &sender_did,
+                &inner,
+                &plaintext,
+                is_local_sender,
+            )
+            .await?;
             if consumed_as_announcement {
                 Ok(None)
             } else {
@@ -1068,8 +1062,15 @@ pub async fn deliver_incoming(
         }
         SequenceCheck::Ahead { expected: _ } => {
             // Message is ahead of expected — buffer it (§9.8.5).
-            mgr.buffer_ahead_message(context_id, &inner, &sender_did, &plaintext, now_ms)
-                .await?;
+            buffer_ahead_message(
+                supervisor,
+                context_id,
+                &inner,
+                &sender_did,
+                &plaintext,
+                now_ms,
+            )
+            .await?;
             Ok(None)
         }
     }
@@ -1080,11 +1081,13 @@ pub async fn deliver_incoming(
 // ===========================================================================
 //
 // The free-function forms below mirror the legacy inherent-method bodies
-// byte-for-byte; only the `self.X` projections change to `mgr.X_ref()`
-// accessor calls or `mgr.X()` pub(crate) methods. The legacy methods
-// on `ContextManager` in `manager/messaging.rs` are now one-line
-// forwarders so existing callers (tests, hoisted top-level methods,
-// manager/tests integration) continue to compile unchanged.
+// byte-for-byte; only the `self.X` projections change to
+// `supervisor.X_ref().ok_or(NotInitialized)?` accessor calls or
+// `manager_methods::X(supervisor, ...)` / `<domain>_helpers::X(supervisor, ...)`
+// free-function calls. The legacy methods on `ContextManager` in
+// `manager/messaging.rs` are now one-line forwarders so existing callers
+// (tests, hoisted top-level methods, manager/tests integration)
+// continue to compile unchanged.
 //
 // The pipeline-wiring tests (`crates/scp-testing/tests/integration/
 // pipeline_wiring.rs`) extract function bodies by first occurrence of
@@ -1218,10 +1221,8 @@ pub async fn authorize_send_payment(
     context_id: &str,
     sender_did: &DID,
 ) -> Result<Option<manager::economy::PaidActionAuthorization>, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    mgr.authorize_paid_action(
+    crate::context::economy_helpers::authorize_paid_action(
+        supervisor,
         scp_protocol::economy::types::PaidActionType::MessageSend,
         sender_did,
         context_id,
@@ -1263,20 +1264,16 @@ pub async fn capture_send_payment(
     context_id: &str,
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
 ) {
-    // ADR-049 commit 12c.9c — `capture_send_payment` returns `()` so
-    // an unpopulated attach slot degrades to a no-op. The attach
-    // contract guarantees the slot is populated at call time; the
-    // early-return is defense-in-depth against a contract violation.
-    let Some(mgr) = supervisor.attached_context_manager() else {
-        tracing::error!(
-            context_id,
-            "capture_send_payment: Supervisor is not attached — \
-             skipping payment capture (contract violation; see ADR-049 commit 12c.9c)"
-        );
-        return;
-    };
+    // ADR-049 commit 12c.9g.2 — `capture_send_payment` returns `()` so
+    // an unpopulated attach slot degrades to a no-op. The free-function
+    // form of `complete_paid_action` propagates the same
+    // `NotInitialized` error the inherent forwarder did, so the
+    // observable contract is preserved.
     if let Some(a) = auth
-        && let Err(e) = mgr.complete_paid_action(a, sender_did, context_id).await
+        && let Err(e) = crate::context::economy_helpers::complete_paid_action(
+            supervisor, a, sender_did, context_id,
+        )
+        .await
     {
         // H8: do NOT rollback budget — service was delivered.
         tracing::warn!(
@@ -1284,7 +1281,8 @@ pub async fn capture_send_payment(
             "payment capture failed after successful send: {e}"
         );
         // H19: append durable audit record to event log + receive buffer.
-        mgr.record_payment_capture_failure(
+        manager_methods::record_payment_capture_failure(
+            supervisor,
             context_id,
             "send_message",
             sender_did,
@@ -1319,8 +1317,8 @@ pub async fn capture_send_payment(
 /// Byte-identical to the legacy method form. Pipeline-wiring assertion
 /// `extract_fn_body(MANAGER_SRC, "finalize_send")` must contain
 /// `create_checkpoint_if_due` — the call site here preserves that
-/// literal text (`mgr.create_checkpoint_if_due(...)`).
-#[allow(clippy::too_many_arguments)] // Retains legacy method signature plus explicit `mgr` param per ADR-049 §12c.1b.
+/// literal text (`queries_helpers::create_checkpoint_if_due(supervisor, ...)`).
+#[allow(clippy::too_many_arguments)] // Retains legacy method signature plus explicit `supervisor` param per ADR-049 §12c.9g.2.
 #[allow(clippy::significant_drop_tightening)] // Legacy body held `relock_context` guard across await points deliberately — narrowing changes lock-ordering semantics.
 pub async fn finalize_send(
     supervisor: &Supervisor,
@@ -1332,9 +1330,6 @@ pub async fn finalize_send(
     signing_key: Option<&ed25519_dalek::SigningKey>,
     ctx_gen: &manager::ContextGeneration,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     // M12: Append event log BEFORE consequence evaluation so that
     // event_log_entries_for_consequences sees the current event.
     // Periodic consequence timers only read from the event log (not
@@ -1350,7 +1345,7 @@ pub async fn finalize_send(
             .clock_ref()
             .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
             .now_secs();
-        if let Ok(mut guard) = mgr.relock_context(ctx_gen).await {
+        if let Ok(mut guard) = manager_methods::relock_context(supervisor, ctx_gen).await {
             let ctx = &mut *guard;
             if manager::require_active(&ctx.handle).is_err() {
                 // Context expired during Phase 2 — rollback the sequence
@@ -1412,8 +1407,9 @@ pub async fn finalize_send(
             // Participation record update (#1530) — refresh cache after send.
             // Reuses `send_events` from above to avoid a second
             // event_log_entries_for_consequences call.
-            let send_merkle = mgr
+            let send_merkle = supervisor
                 .event_log_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
                 .event_log_merkle_root(context_id_bytes)
                 .unwrap_or([0u8; 32]);
             if !send_events.is_empty()
@@ -1435,7 +1431,9 @@ pub async fn finalize_send(
             // create a checkpoint if the event or time threshold is met.
             ctx.checkpoint_events_since += 1;
             if let Some(sk) = signing_key {
-                mgr.create_checkpoint_if_due(context_id, ctx, sender_did, sk);
+                crate::context::queries_helpers::create_checkpoint_if_due(
+                    supervisor, context_id, ctx, sender_did, sk,
+                );
             }
         } else {
             tracing::warn!(
@@ -1445,12 +1443,12 @@ pub async fn finalize_send(
             );
         }
     }
-    if mgr.has_persistence()
-        && let Ok(guard) = mgr.relock_context(ctx_gen).await
+    if manager_methods::has_persistence(supervisor)
+        && let Ok(guard) = manager_methods::relock_context(supervisor, ctx_gen).await
     {
         let ctx = &*guard;
         let snapshot = ContextManager::snapshot_context(ctx);
-        mgr.persist_context_snapshot(context_id, snapshot);
+        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     Ok(())
 }
@@ -1538,11 +1536,7 @@ pub async fn validate_and_drain_timeouts(
     inner: &scp_protocol::envelope::inner::InnerEnvelope,
     now_ms: u64,
 ) -> Result<SequenceCheck, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let ctx_arc = mgr
-        .get_context_arc_pub(context_id)
+    let ctx_arc = manager_methods::get_context_arc_pub(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let mut guard = ctx_arc.lock().await;
     let ctx = &mut *guard;
@@ -1647,9 +1641,6 @@ pub async fn buffer_ahead_message(
     plaintext: &[u8],
     now_ms: u64,
 ) -> Result<(), ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let buffered_msg = scp_protocol::envelope::validation::BufferedMessage {
         inner: inner.clone(),
         sender_did: sender_did.to_owned(),
@@ -1657,8 +1648,7 @@ pub async fn buffer_ahead_message(
         received_at: now_ms,
     };
 
-    let ctx_arc = mgr
-        .get_context_arc_pub(context_id)
+    let ctx_arc = manager_methods::get_context_arc_pub(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let mut guard = ctx_arc.lock().await;
     let ctx = &mut *guard;
@@ -1759,13 +1749,9 @@ pub async fn deliver_message_and_drain_buffered(
     plaintext: &[u8],
     skip_velocity: bool,
 ) -> Result<bool, ContextError> {
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let sender_did_obj = DID(sender_did.to_owned());
 
-    let ctx_arc = mgr
-        .get_context_arc_pub(context_id)
+    let ctx_arc = manager_methods::get_context_arc_pub(supervisor, context_id)
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let mut guard = ctx_arc.lock().await;
     let ctx = &mut *guard;

@@ -576,13 +576,15 @@ pub fn rollback_economy_ticket_inline(ctx: &mut super::PerContextState, mut tick
 /// rollback (Phase B).
 #[allow(clippy::significant_drop_tightening)]
 pub async fn rollback_economy_ticket(
-    manager: &ContextManager,
+    supervisor: &crate::context::supervisor::Supervisor,
     context_id: &str,
     mut ticket: EconomyTicket,
     ctx_gen: &super::ContextGeneration,
 ) {
     ticket.consumed = true;
-    if let Ok(mut guard) = manager.relock_context(ctx_gen).await {
+    if let Ok(mut guard) =
+        crate::context::manager_methods::relock_context(supervisor, ctx_gen).await
+    {
         let ctx = &mut *guard;
         ctx.governance
             .velocity_tracker
@@ -616,6 +618,7 @@ impl ContextManager {
     /// Legacy one-line forwarder to the hoisted
     /// [`crate::context::economy_helpers::authorize_paid_action`] free
     /// function (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) async fn authorize_paid_action(
         &self,
         action_type: PaidActionType,
@@ -644,6 +647,7 @@ impl ContextManager {
     /// Legacy one-line forwarder to the hoisted
     /// [`crate::context::economy_helpers::complete_paid_action`] free
     /// function (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) async fn complete_paid_action(
         &self,
         auth: PaidActionAuthorization,
@@ -671,6 +675,7 @@ impl ContextManager {
     /// Legacy one-line forwarder to the hoisted
     /// [`crate::context::economy_helpers::void_paid_action`] free
     /// function (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
     pub(crate) async fn void_paid_action(&self, auth: PaidActionAuthorization, context_id: &str) {
         let Some(sup) = self.supervisor() else {
             tracing::error!(
