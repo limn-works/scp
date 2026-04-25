@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "_generated_from": "crates/scp-testing/tests/integration/ffi_conformance.rs \u2014 PARITY_OPERATIONS + per-bridge alias match arms",
+  "_generated_from": "crates/scp-testing/tests/integration/ffi_conformance.rs — PARITY_OPERATIONS + per-bridge alias match arms",
   "operations": [
     {
       "canonical": "identity_create",
@@ -2400,6 +2400,57 @@
       "wasm": [
         "context_tombstone_migrated"
       ]
+    },
+    {
+      "canonical": "access_key_generate",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "access_key_generate"
+      ],
+      "uniffi": [
+        "access_key_generate"
+      ],
+      "napi": [
+        "access_key_generate"
+      ],
+      "wasm": [
+        "access_key_generate"
+      ]
+    },
+    {
+      "canonical": "access_key_revoke",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "access_key_revoke"
+      ],
+      "uniffi": [
+        "access_key_revoke"
+      ],
+      "napi": [
+        "access_key_revoke"
+      ],
+      "wasm": [
+        "access_key_revoke"
+      ]
+    },
+    {
+      "canonical": "access_key_restore",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "access_key_restore"
+      ],
+      "uniffi": [
+        "access_key_restore"
+      ],
+      "napi": [
+        "access_key_restore"
+      ],
+      "wasm": [
+        "access_key_restore"
+      ]
     }
   ],
   "exemptions": {
@@ -2437,6 +2488,18 @@
       {
         "canonical": "context_tombstone_migrated",
         "reason": "Tombstone helper relies on scp-platform persistence; WASM defers persistence to host JS runtime per ADR-034"
+      },
+      {
+        "canonical": "access_key_generate",
+        "reason": "Per-context access keys involve MLS group membership state and persistence; WASM has no scp-platform / no openmls direct linkage per ADR-034. Generation in WASM is a follow-up if/when WASM gets first-class membership."
+      },
+      {
+        "canonical": "access_key_revoke",
+        "reason": "Revocation requires modifying persisted access key state and broadcasting to MLS group; WASM has no scp-platform per ADR-034."
+      },
+      {
+        "canonical": "access_key_restore",
+        "reason": "Restoration reads persisted access key state; WASM has no scp-platform per ADR-034."
       }
     ]
   }
