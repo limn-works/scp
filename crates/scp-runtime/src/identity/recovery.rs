@@ -738,8 +738,8 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32]) -> Option<Vec<u8>> 
 /// See spec §9.12 and the [`CompromiseRecoveryOrchestrator`] for step
 /// ordering and failure isolation semantics.
 pub struct ProductionRecoveryBackend {
-    /// The context manager that owns crypto, transport, and event log providers.
-    manager: Arc<ContextManager>,
+    /// The supervisor that owns crypto, transport, and event log providers.
+    manager: Arc<crate::context::supervisor::Supervisor>,
     /// The signing key for the recovering identity (post-rotation).
     ///
     /// Recovery notifications must be signed by the real key so receivers can
@@ -760,7 +760,10 @@ impl ProductionRecoveryBackend {
     ///   identity. Recovery notifications are signed with this key so
     ///   receivers can verify them against the sender's public key.
     #[must_use]
-    pub const fn new(manager: Arc<ContextManager>, signing_key: ed25519_dalek::SigningKey) -> Self {
+    pub const fn new(
+        manager: Arc<crate::context::supervisor::Supervisor>,
+        signing_key: ed25519_dalek::SigningKey,
+    ) -> Self {
         Self {
             manager,
             signing_key,
@@ -798,7 +801,10 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // Step 2: Advance the MLS epoch for post-compromise security.
         // The ContextManager increments the epoch counter, places the old
         // epoch into the grace window, and emits an event log entry.
-        let result = Self::block_on_async(self.manager.recovery_advance_epoch(context_id));
+        let result = Self::block_on_async(crate::context::trust_recovery_helpers::recovery_advance_epoch(
+            &self.manager,
+            context_id,
+        ));
         match result {
             Ok(_epoch) => {
                 // Send a scoped epoch-advance notification including the
@@ -813,7 +819,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
                 match serde_json::to_vec(&scoped_payload) {
                     Ok(payload_bytes) => {
                         let notify_result =
-                            Self::block_on_async(self.manager.recovery_send_notification(
+                            Self::block_on_async(crate::context::trust_recovery_helpers::recovery_send_notification(&self.manager, 
                                 context_id,
                                 key_rotation.did_after.as_ref(),
                                 &payload_bytes,
@@ -889,7 +895,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
 
         // Distribute the revocation via the context manager's recovery
         // notification channel so all members receive and merge it.
-        let result = Self::block_on_async(self.manager.recovery_send_notification(
+        let result = Self::block_on_async(crate::context::trust_recovery_helpers::recovery_send_notification(&self.manager, 
             context_id,
             key_rotation.did_after.as_ref(),
             &revocation_payload,
@@ -937,7 +943,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
 
         // Send the key-package-rotation notification via the recovery
         // notification channel. This records the event and alerts members.
-        let result = Self::block_on_async(self.manager.recovery_send_notification(
+        let result = Self::block_on_async(crate::context::trust_recovery_helpers::recovery_send_notification(&self.manager, 
             context_id,
             sender_did,
             payload.as_bytes(),
@@ -1012,9 +1018,14 @@ impl RecoveryBackend for ProductionRecoveryBackend {
             // `recovery_notify_contact` searches registered contexts to find
             // a suitable channel, then sends the notification through it.
             let send_result = Self::block_on_async(async {
-                self.manager
-                    .recovery_notify_contact(did_str, contact_did_str, &payload, &self.signing_key)
-                    .await
+                crate::context::trust_recovery_helpers::recovery_notify_contact(
+                    &self.manager,
+                    did_str,
+                    contact_did_str,
+                    &payload,
+                    &self.signing_key,
+                )
+                .await
             });
 
             if send_result.is_ok() {
@@ -1107,7 +1118,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // Send via recovery notification. We use a synthetic context ID
         // derived from "identity-private-state" since PSK rotation is
         // identity-scoped, not context-scoped.
-        let result = Self::block_on_async(self.manager.recovery_send_notification(
+        let result = Self::block_on_async(crate::context::trust_recovery_helpers::recovery_send_notification(&self.manager, 
             "identity-private-state",
             "system",
             &payload,
@@ -1842,7 +1853,7 @@ mod tests {
     /// [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider)
     /// — fail-injection and stub-seal overrides move to
     /// backend-injection in commit 12c.9f.
-    fn test_context_manager() -> Arc<ContextManager> {
+    fn test_context_manager() -> Arc<crate::context::supervisor::Supervisor> {
         use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
         use crate::context::providers::event_log::EventLogEntry;
         use scp_protocol::context::builder::ContextCreationError;
@@ -1895,27 +1906,30 @@ mod tests {
             }
         }
 
-        // ADR-049 commit 12c.9d: `create_context` / `join_context` now
-        // require an attached Supervisor. Wrap with `attach_test_supervisor`
-        // so the supervisor-dependent code paths resolve correctly.
-        crate::context::attach_test_supervisor(ContextManager::new(
+        // ADR-049 commit 12: `ContextManager` is gone. Build the
+        // `Supervisor` directly via `test_supervisor`.
+        crate::context::test_supervisor(
             Arc::new(crate::crypto::mls::provider::MlsCryptoProvider::new(
                 TEST_DID.to_owned(),
             )),
             Box::new(TestTransport),
             Box::new(TestEventLog),
             Arc::new(|_| None),
-        ))
+        )
     }
 
     /// Helper to create a context in the manager for testing.
-    async fn setup_context(manager: &ContextManager, context_id: &str, creator_did: &DID) {
+    async fn setup_context(
+        manager: &crate::context::supervisor::Supervisor,
+        context_id: &str,
+        creator_did: &DID,
+    ) {
         setup_context_with_members(manager, context_id, creator_did, &[]).await;
     }
 
     /// Helper to create a context with the creator and additional members.
     async fn setup_context_with_members(
-        manager: &ContextManager,
+        manager: &crate::context::supervisor::Supervisor,
         context_id: &str,
         creator_did: &DID,
         additional_members: &[&DID],

@@ -195,75 +195,46 @@ const fn _assert_send_sync() {
 }
 
 // ---------------------------------------------------------------------------
-// Test-only convenience: attach a fresh Supervisor to a ContextManager.
+// Test-only convenience: build a Supervisor with providers + no-op
+// persistence (ADR-049 commit 12).
 // ---------------------------------------------------------------------------
 
-/// Wraps a manager in an Arc + attaches a fresh test-only Supervisor
-/// (ADR-049 commit 12c.9c).
+/// Constructs a fresh test-only [`supervisor::Supervisor`] from the
+/// caller-supplied providers. Mirror of the legacy
+/// `attach_test_supervisor(ContextManager::new(...))` shorthand: the
+/// `ContextManager` type is gone in commit 12, so callers now build a
+/// supervisor directly via [`supervisor::Supervisor::with_providers`].
 ///
-/// After commit 12c.9c every `ContextManager` method that forwards to
-/// the hoisted messaging / broadcast / governance / economy helpers
-/// goes through `self.supervisor().ok_or_else(...)?`. Tests that
-/// invoke those methods directly on a fresh manager MUST first call
-/// this wrapper so the `Weak<Supervisor>` back-pointer is populated;
-/// otherwise the forwarder returns [`ContextError::NotInitialized`].
-///
-/// Returns [`Arc<manager::ContextManager>`] so tests can continue to
-/// access `manager.contexts`, `manager.create_context(...)`, etc. via
-/// [`std::sync::Arc`] auto-deref.
+/// Returns [`Arc<supervisor::Supervisor>`] — the supervisor is the
+/// authoritative owner of every per-context state, provider, and
+/// governance engine, and exposes the public API previously rooted on
+/// `ContextManager`.
 ///
 /// # Non-production
 ///
-/// The supervisor is created via
-/// [`supervisor::Supervisor::for_query_shim`] which installs no-op
-/// persistence and saga journals. Tests that exercise those specific
-/// subsystems must construct their own supervisor explicitly.
-///
-/// # Supervisor lifetime
-///
-/// The constructed [`std::sync::Arc<supervisor::Supervisor>`] is
-/// leaked via [`std::mem::forget`] so the supervisor outlives this
-/// stack frame. The manager holds only a
-/// [`std::sync::Weak<supervisor::Supervisor>`] back-pointer; without
-/// the leak, the supervisor's last strong reference would drop here
-/// and the `Weak` would become immediately stale, which would cause
-/// every forwarder call on `manager` to return `NotInitialized`.
-/// Leaking is acceptable in test-only code — the process exits
-/// shortly and the OS reclaims memory. Production callers (FFI
-/// bridges, `Node`, `scp-node`) construct the supervisor with a
-/// long-lived strong reference (e.g. `BridgeInstance::supervisor:
-/// Arc<Supervisor>`), so no leak is needed there.
-///
-/// # Panics
-///
-/// Panics if [`supervisor::Supervisor::attach_context_manager`]
-/// returns an error. That happens only on misuse (attaching a
-/// manager that has already been bound to a different supervisor) —
-/// a test-only contract violation.
-///
-/// ADR-049 commit 12 of 12c: Stub returning `Arc<ContextManager>`. The
-/// `manager` module is being deleted in this commit; the helper exists
-/// only so test fixtures still compile during the transition. Test
-/// fixtures (recovery.rs, e2e_context_manager.rs, fullstack/node.rs,
-/// governance_integration.rs) are rewired to call
-/// [`Supervisor::with_providers`] directly in agent 4's scope.
+/// `persistence`, `payment_adapter`, `event_tx`, and `clock` default to
+/// `None` (i.e. no-op persistence and a `SystemClock`). Tests that
+/// exercise any of those specific surfaces must construct their own
+/// supervisor explicitly via
+/// [`supervisor::Supervisor::with_providers`].
 #[cfg(any(test, feature = "testing"))]
-#[allow(
-    clippy::panic,
-    reason = "test-only helper: attach failure is a contract violation and should abort the test"
-)]
 #[must_use]
-pub fn attach_test_supervisor(mgr: manager::ContextManager) -> Arc<manager::ContextManager> {
-    // Stub during the manager-deletion transition (ADR-049 commit 12).
-    // The legacy body called `supervisor.attach_context_manager(...)` which
-    // was deleted alongside the bridge; test fixtures using this helper
-    // are migrated to direct `Supervisor::with_providers(...)` construction
-    // in agent 4's scope.
-    let _ = mgr;
-    panic!(
-        "attach_test_supervisor is deprecated during ADR-049 commit 12; \
-         migrate fixture to Supervisor::with_providers(...) directly"
-    );
+pub fn test_supervisor(
+    crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+    transport: Box<dyn builder::ContextTransportProvider>,
+    event_log: Box<dyn builder::ContextEventLogProvider>,
+    key_resolver: scp_protocol::context::governance::KeyResolver,
+) -> Arc<supervisor::Supervisor> {
+    supervisor::Supervisor::with_providers(
+        crypto,
+        transport,
+        event_log,
+        key_resolver,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 #[cfg(test)]

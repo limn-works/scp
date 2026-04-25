@@ -50,8 +50,8 @@ use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_protocol::context::{ContextError, ContextState};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::governance::timeout::{DeadlockCondition, DeadlockDetectionState};
-use scp_runtime::context::manager::ContextManager;
-use scp_runtime::context::manager::{GovernanceActionResult, ProposalOutcome};
+use scp_runtime::context::state::{GovernanceActionResult, ProposalOutcome};
+use scp_runtime::context::supervisor::Supervisor;
 use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
 
 // ---------------------------------------------------------------------------
@@ -159,17 +159,19 @@ fn eve() -> DID {
 // Manager factory
 // ---------------------------------------------------------------------------
 
-fn new_manager() -> std::sync::Arc<ContextManager> {
-    // ADR-049 commit 12c.9c — see
-    // `tests/content_access_governance_integration.rs::new_manager`.
-    scp_runtime::context::attach_test_supervisor(ContextManager::new(
+fn new_manager() -> std::sync::Arc<Supervisor> {
+    // ADR-049 commit 12 — `ContextManager` is gone; tests construct a
+    // `Supervisor` directly via `test_supervisor` and call the
+    // passthrough methods (`is_member`, `list_proposals`, etc.) that
+    // forward to the per-domain `*_helpers`.
+    scp_runtime::context::test_supervisor(
         Arc::new(MlsCryptoProvider::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
         )),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),
         mock_key_resolver(),
-    ))
+    )
 }
 
 /// Standard ceiling that includes all governance-relevant capabilities.

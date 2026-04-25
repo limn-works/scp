@@ -38,7 +38,7 @@ use scp_protocol::identity::SigningKeyId;
 use scp_protocol::identity::block_list::{BlockListEvent, BlockListState};
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::manager::ContextManager;
+use scp_runtime::context::supervisor::Supervisor;
 use scp_runtime::context::state::ProposalOutcome;
 use scp_runtime::crypto::access_keys::lifecycle::{
     handle_block_as_blocked_party, handle_block_as_blocker, restore_access_key, revoke_access_key,
@@ -175,17 +175,17 @@ fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
 // Manager factory
 // ---------------------------------------------------------------------------
 
-fn new_manager() -> std::sync::Arc<ContextManager> {
-    // ADR-049 commit 12c.9c — see
-    // `tests/content_access_governance_integration.rs::new_manager`.
-    scp_runtime::context::attach_test_supervisor(ContextManager::new(
+fn new_manager() -> std::sync::Arc<scp_runtime::context::supervisor::Supervisor> {
+    // ADR-049 commit 12 — `ContextManager` is gone; tests construct a
+    // `Supervisor` directly via `test_supervisor`.
+    scp_runtime::context::test_supervisor(
         Arc::new(MlsCryptoProvider::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
         )),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),
         mock_key_resolver(),
-    ))
+    )
 }
 
 fn governance_ceiling() -> Vec<Capability> {
@@ -208,7 +208,7 @@ fn governance_ceiling() -> Vec<Capability> {
 /// `vote_on_proposal` exceeds clippy's `large_futures` threshold
 /// (~16 KB) when inlined at many call sites.
 fn propose_and_approve_threshold<'a>(
-    manager: &'a ContextManager,
+    manager: &'a Supervisor,
     ctx_id: &'a str,
     action: GovernanceAction,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ProposalOutcome> + Send + 'a>> {

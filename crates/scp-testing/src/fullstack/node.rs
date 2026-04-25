@@ -35,7 +35,8 @@ use scp_core::context::builder::{ContextCreationError, ContextEventLogProvider};
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::membership::ContextEvent;
 use scp_core::context::providers::event_log::MerkleEventLogProvider;
-use scp_core::context::{ContextError, ContextHandle, ContextManager, ContextParams};
+use scp_core::context::supervisor::Supervisor;
+use scp_core::context::{ContextError, ContextHandle, ContextParams};
 use scp_identity::DID;
 
 use super::crypto::E2eCryptoProvider;
@@ -68,8 +69,8 @@ impl From<DeferredError> for ContextCreationError {
 pub struct FullStackNode {
     /// This node's DID.
     pub did: DID,
-    /// Real ContextManager, bound to a real MlsCryptoProvider.
-    pub manager: Arc<ContextManager>,
+    /// Real Supervisor, bound to a real MlsCryptoProvider.
+    pub manager: Arc<Supervisor>,
     /// Deferred E2E crypto provider (thin newtype around the real
     /// `MlsCryptoProvider`). Kept for public-API compatibility.
     pub crypto: Arc<E2eCryptoProvider>,
@@ -102,12 +103,12 @@ impl FullStackNode {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let signing_key = ed25519_dalek::SigningKey::from_bytes(&did_to_seed(&did));
 
-        let manager = scp_core::context::attach_test_supervisor(ContextManager::new(
+        let manager = scp_core::context::test_supervisor(
             Arc::clone(&crypto.provider),
             Box::new(scp_core::context::NotConfiguredTransportProvider),
             Box::new(MerkleEventLogProvider::new()),
             key_resolver,
-        ));
+        );
 
         Self {
             did,

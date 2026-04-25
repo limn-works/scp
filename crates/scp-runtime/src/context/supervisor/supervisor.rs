@@ -2259,6 +2259,230 @@ impl Supervisor {
         )
         .await
     }
+
+    /// Passthrough to
+    /// [`crate::context::lifecycle_helpers::join_context`] — adds a new
+    /// member to an existing context via the helper.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the helper.
+    pub async fn join_context(
+        &self,
+        handle: &crate::context::ContextHandle,
+        key_package: scp_protocol::context::membership::KeyPackage,
+        spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+        local_pseudonym: Option<[u8; 32]>,
+    ) -> Result<(), ContextError> {
+        crate::context::lifecycle_helpers::join_context(
+            self,
+            handle,
+            key_package,
+            spending_ucan,
+            local_pseudonym,
+        )
+        .await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::lifecycle_helpers::leave_context`] — removes a
+    /// member from an existing context via the helper.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the helper.
+    pub async fn leave_context(
+        &self,
+        handle: &crate::context::ContextHandle,
+        caller_did: &DID,
+        member_did: &DID,
+    ) -> Result<(), ContextError> {
+        crate::context::lifecycle_helpers::leave_context(self, handle, caller_did, member_did).await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::messaging_helpers::send_message`] — encrypts
+    /// and broadcasts a payload through the context's MLS group.
+    ///
+    /// Resolves the supervisor's clock and key resolver from its
+    /// provider slots; both are populated by [`Self::with_providers`].
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::NotInitialized`] if the supervisor's provider
+    ///   slots are empty (the supervisor was constructed via
+    ///   [`Self::for_query_shim`]).
+    /// - Other [`ContextError`] variants propagated from the helper.
+    pub async fn send_message(
+        &self,
+        handle: &crate::context::ContextHandle,
+        sender_did: &DID,
+        payload: &[u8],
+        signing_key: Option<&ed25519_dalek::SigningKey>,
+        source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
+        spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+    ) -> Result<(), ContextError> {
+        const ATTACHED: &str = "Supervisor::send_message — provider slot empty (call with_providers first)";
+        let clock = self
+            .clock_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?
+            .clone();
+        let key_resolver = self
+            .key_resolver_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?
+            .clone();
+        crate::context::messaging_helpers::send_message(
+            self,
+            &clock,
+            &key_resolver,
+            handle,
+            sender_did,
+            payload,
+            signing_key,
+            source_provenance,
+            spending_ucan,
+        )
+        .await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::governance_helpers::list_proposals`] — lists
+    /// every governance proposal currently tracked by the context's
+    /// engine.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if the context is unknown.
+    pub async fn list_proposals(
+        &self,
+        context_id: &str,
+    ) -> Result<
+        Vec<scp_protocol::context::governance::GovernanceProposal>,
+        ContextError,
+    > {
+        crate::context::governance_helpers::list_proposals(self, context_id).await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::governance_helpers::get_proposal`] — fetches a
+    /// single proposal by ID.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if the context is unknown.
+    /// - [`ContextError::GovernanceFailed`] if the proposal is not found.
+    pub async fn get_proposal(
+        &self,
+        context_id: &str,
+        proposal_id: &scp_protocol::context::governance::ProposalId,
+    ) -> Result<scp_protocol::context::governance::GovernanceProposal, ContextError> {
+        crate::context::governance_helpers::get_proposal(self, context_id, proposal_id).await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::governance_helpers::propose_governance_action`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the helper.
+    pub async fn propose_governance_action(
+        &self,
+        context_id: &str,
+        proposer_did: &DID,
+        action: scp_protocol::context::governance::GovernanceAction,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<
+        (
+            scp_protocol::context::governance::GovernanceProposal,
+            Vec<scp_protocol::context::governance::GovernanceEvent>,
+            Option<crate::context::state::GovernanceActionResult>,
+        ),
+        ContextError,
+    > {
+        crate::context::governance_helpers::propose_governance_action(
+            self,
+            context_id,
+            proposer_did,
+            action,
+            signing_key,
+        )
+        .await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::governance_helpers::propose_governance_action_checked`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the helper.
+    pub async fn propose_governance_action_checked(
+        &self,
+        context_id: &str,
+        proposer_did: &DID,
+        action: scp_protocol::context::governance::GovernanceAction,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<crate::context::state::ProposalOutcome, ContextError> {
+        crate::context::governance_helpers::propose_governance_action_checked(
+            self,
+            context_id,
+            proposer_did,
+            action,
+            signing_key,
+        )
+        .await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::governance_helpers::vote_on_proposal`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the helper.
+    pub async fn vote_on_proposal(
+        &self,
+        context_id: &str,
+        proposal_id: &scp_protocol::context::governance::ProposalId,
+        voter_did: &DID,
+        approve: bool,
+        signing_key: &ed25519_dalek::SigningKey,
+    ) -> Result<
+        (
+            scp_protocol::context::governance::ProposalStatus,
+            Vec<scp_protocol::context::governance::GovernanceEvent>,
+        ),
+        ContextError,
+    > {
+        crate::context::governance_helpers::vote_on_proposal(
+            self,
+            context_id,
+            proposal_id,
+            voter_did,
+            approve,
+            signing_key,
+        )
+        .await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::governance_helpers::withdraw_governance_vote`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the helper.
+    pub async fn withdraw_governance_vote(
+        &self,
+        context_id: &str,
+        proposal_id: &scp_protocol::context::governance::ProposalId,
+        voter_did: &DID,
+    ) -> Result<scp_protocol::context::governance::ProposalStatus, ContextError> {
+        crate::context::governance_helpers::withdraw_governance_vote(
+            self,
+            context_id,
+            proposal_id,
+            voter_did,
+        )
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1676,27 +1676,8 @@ const fn _assert_send_sync() {
     assert_send_sync::<ContextManager>();
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::needless_collect,
-    clippy::significant_drop_tightening,
-    clippy::match_same_arms,
-    clippy::type_complexity,
-    clippy::similar_names,
-    clippy::items_after_statements,
-    // ADR-049 commit 12c.2: hoisting lifecycle methods into
-    // `context/lifecycle_helpers.rs` inlines their full bodies at every
-    // call-site, which inflates some test-path futures past clippy's
-    // 16 KB stack budget. Tests legitimately exercise the full lifecycle
-    // pipeline; `Box::pin`-ing every call-site would add churn without
-    // improving runtime behavior.
-    clippy::large_futures
-)]
-mod tests;
+// Tests directory deleted in ADR-049 commit 12 alongside the rest of
+// `manager/`. The legacy ContextManager tests were either rewritten as
+// helper-level unit tests or replaced by the Supervisor-level
+// integration tests in `crates/scp-runtime/tests/` and
+// `crates/scp-testing/tests/`.

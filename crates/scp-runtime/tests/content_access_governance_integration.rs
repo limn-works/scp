@@ -37,8 +37,8 @@ use scp_protocol::context::governance::{
 };
 use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_runtime::context::manager::ContextManager;
-use scp_runtime::context::manager::{GovernanceActionResult, ProposalOutcome};
+use scp_runtime::context::state::{GovernanceActionResult, ProposalOutcome};
+use scp_runtime::context::supervisor::Supervisor;
 use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
 
 // ---------------------------------------------------------------------------
@@ -143,18 +143,17 @@ fn dave() -> DID {
 // Manager factory
 // ---------------------------------------------------------------------------
 
-fn new_manager() -> std::sync::Arc<ContextManager> {
-    // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor` so
-    // the `ContextManager` forwarders (which now route through a
-    // `Weak<Supervisor>` back-pointer) can resolve their supervisor.
-    scp_runtime::context::attach_test_supervisor(ContextManager::new(
+fn new_manager() -> std::sync::Arc<Supervisor> {
+    // ADR-049 commit 12 — `ContextManager` is gone; tests construct a
+    // `Supervisor` directly via `test_supervisor`.
+    scp_runtime::context::test_supervisor(
         Arc::new(MlsCryptoProvider::new(
             "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
         )),
         Box::new(MockTransport::connected()),
         Box::new(MockEventLog),
         mock_key_resolver(),
-    ))
+    )
 }
 
 /// Standard ceiling that includes all governance-relevant capabilities,
@@ -177,7 +176,7 @@ fn governance_ceiling() -> Vec<Capability> {
 
 /// Creates a Threshold(2-of-3) context with Alice, Bob, Carol as signers
 /// and adds Dave as a member via governance.
-async fn setup_threshold_context_with_dave(ctx_id: &str) -> std::sync::Arc<ContextManager> {
+async fn setup_threshold_context_with_dave(ctx_id: &str) -> std::sync::Arc<Supervisor> {
     let manager = new_manager();
     let params = ContextParams {
         ceiling: governance_ceiling(),
@@ -235,7 +234,7 @@ async fn setup_threshold_context_with_dave(ctx_id: &str) -> std::sync::Arc<Conte
 /// `vote_on_proposal` exceeds clippy's `large_futures` threshold
 /// (~16 KB) when inlined at many call sites.
 fn propose_and_approve_threshold<'a>(
-    manager: &'a ContextManager,
+    manager: &'a Supervisor,
     ctx_id: &'a str,
     action: GovernanceAction,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ProposalOutcome> + Send + 'a>> {

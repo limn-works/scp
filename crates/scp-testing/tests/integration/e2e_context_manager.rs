@@ -30,7 +30,9 @@ use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::governance::KeyResolver;
-use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
+use scp_core::context::persistence::ContextPersistence;
+use scp_core::context::state::ContextSnapshot;
+use scp_core::context::supervisor::Supervisor;
 use scp_core::context::membership::{ContextEvent, KeyPackage};
 use scp_core::context::{
     Capability, ContextError, ContextMode, ContextParams, ContextState, GovernanceAction,

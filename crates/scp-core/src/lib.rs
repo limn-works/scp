@@ -75,12 +75,11 @@ pub mod context {
     /// [`supervisor::Supervisor::dispatch_query`]. Part of the same
     /// commits-7-to-11 shim surface; deleted in commit 12.
     pub use scp_runtime::context::actor;
-    /// Test-only helper: wraps a `ContextManager` in `Arc` and attaches
-    /// a fresh [`supervisor::Supervisor`] so the manager's hoisted
-    /// forwarders (which look up `Weak<Supervisor>` via `self.supervisor()`
-    /// after ADR-049 commit 12c.9c) can resolve their supervisor.
+    /// Test-only helper: builds a fresh [`supervisor::Supervisor`] with
+    /// caller-supplied providers and no-op persistence (ADR-049
+    /// commit 12, replacing the legacy `attach_test_supervisor`).
     #[cfg(any(test, feature = "testing"))]
-    pub use scp_runtime::context::attach_test_supervisor;
+    pub use scp_runtime::context::test_supervisor;
     pub use scp_runtime::context::builder::{
         ContextEventLogProvider, ContextTransportProvider, LocalTransportProvider,
         NotConfiguredTransportProvider,
