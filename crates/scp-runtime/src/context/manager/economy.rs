@@ -123,7 +123,7 @@ impl RevocationChecker for ContextRevocationChecker<'_> {
 /// - Revocation lookup against the per-context revoked-CID set.
 /// - Nonce reservation against the per-context spending nonce tracker.
 /// - Spending-specific scope, lifetime, and parent attenuation checks.
-pub(super) fn validate_spending_ucan_or_error(
+pub(crate) fn validate_spending_ucan_or_error(
     spending: &scp_protocol::crypto::ucan::UcanToken,
     actor_did: &DID,
     context_id: &str,

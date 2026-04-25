@@ -215,7 +215,7 @@ pub struct Supervisor {
     /// Single-producer-multi-read write lock — plan §"Write path".
     #[allow(dead_code)]
     // read in commit 11 when handlers acquire it for standing/lifecycle writes
-    pub(in crate::context::supervisor) write_lock: tokio::sync::Mutex<()>,
+    pub(crate) write_lock: tokio::sync::Mutex<()>,
     /// Pending sagas keyed by saga ID; projection of the durable
     /// journal for fast lookup.
     #[allow(dead_code)] // real body lands with saga migration in commit 11
@@ -2213,7 +2213,7 @@ impl Supervisor {
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
         timeout_ms: Option<u32>,
         executor: F,
-    ) -> Result<crate::context::manager::tools::ManagedToolInvocationOutput, ContextError>
+    ) -> Result<crate::context::tools_helpers::ManagedToolInvocationOutput, ContextError>
     where
         F: FnOnce(serde_json::Value) -> Fut,
         Fut: std::future::Future<Output = Result<serde_json::Value, String>>,

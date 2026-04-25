@@ -1950,3 +1950,646 @@ pub async fn spawn_ttl_timer(
         ctx.ttl.timer.task = Some(abort_handle);
     }
 }
+
+// ---------------------------------------------------------------------------
+// load_persisted_context_state — hoisted from ContextManager (ADR-049 commit 12)
+// ---------------------------------------------------------------------------
+
+/// Loads a persisted context snapshot and optional broadcast state.
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::load_persisted_context_state`]
+/// (ADR-049 commit 12). Byte-identical behavior.
+///
+/// # Errors
+///
+/// Returns [`ContextError::PersistenceFailed`] if no persistence
+/// provider is configured, no snapshot exists, or the load operation
+/// fails.
+pub fn load_persisted_context_state(
+    supervisor: &Supervisor,
+    context_id: &str,
+) -> Result<
+    (
+        crate::context::manager::ContextSnapshot,
+        Option<scp_protocol::context::broadcast::BroadcastContext>,
+    ),
+    ContextError,
+> {
+    let Some(persistence) = supervisor.persistence_ref() else {
+        return Err(ContextError::PersistenceFailed(
+            "no persistence provider configured".into(),
+        ));
+    };
+
+    let ctx_snapshot = persistence
+        .load_context(context_id)
+        .map_err(|e| {
+            ContextError::PersistenceFailed(format!(
+                "failed to load context state for {context_id}: {e}"
+            ))
+        })?
+        .ok_or_else(|| {
+            ContextError::PersistenceFailed(format!(
+                "no persisted context state for {context_id}"
+            ))
+        })?;
+
+    let broadcast_ctx = persistence
+        .load_broadcast(context_id)
+        .map_err(|e| {
+            ContextError::PersistenceFailed(format!(
+                "failed to load broadcast state for {context_id}: {e}"
+            ))
+        })?
+        .map(scp_protocol::context::broadcast::BroadcastContext::from_snapshot);
+
+    Ok((ctx_snapshot, broadcast_ctx))
+}
+
+/// Best-effort event log restore from persistence (#636).
+///
+/// Hoisted from `ContextManager::restore_event_log_best_effort`
+/// (ADR-049 commit 12). Byte-identical behavior.
+fn restore_event_log_best_effort(supervisor: &Supervisor, context_id: &str) {
+    use crate::context::manager::context_id_to_bytes;
+    let ctx_id_bytes = context_id_to_bytes(context_id);
+    let Some(event_log) = supervisor.event_log_ref() else {
+        return;
+    };
+    if let Err(e) = event_log.restore_event_log(&ctx_id_bytes) {
+        tracing::warn!(
+            context_id = %context_id,
+            error = %e,
+            "failed to restore event log from persistence; \
+             context will start with an empty event log"
+        );
+        let _ = event_log.init_event_log(&ctx_id_bytes);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// restore_context — hoisted from ContextManager (ADR-049 commit 12)
+// ---------------------------------------------------------------------------
+
+/// Restores a context into the supervisor from persisted state.
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::restore_context`]
+/// (ADR-049 commit 12). Byte-identical behavior.
+///
+/// Loads the persisted `ContextSnapshot` and optional broadcast state,
+/// reconstructs `PerContextState`, and inserts it into the contexts
+/// map. Re-spawns the TTL timer if `ttl_remaining_secs` is `Some`.
+///
+/// # Arguments
+///
+/// * `supervisor` — supervisor providing crypto / event_log / clock /
+///   persistence accessors.
+/// * `context_id` — the context identifier to restore.
+/// * `handle` — a pre-created `ContextHandle` for the context.
+///
+/// # Errors
+///
+/// Returns [`ContextError::PersistenceFailed`] if no persisted state
+/// exists. Returns [`ContextError::MembershipFailed`] if the context
+/// cannot be inserted (already registered).
+#[tracing::instrument(skip_all, fields(context_id))]
+#[allow(clippy::too_many_lines)]
+pub async fn restore_context(
+    supervisor: &Supervisor,
+    context_id: &str,
+    handle: &crate::context::ContextHandle,
+) -> Result<(), ContextError> {
+    use crate::context::manager::{
+        context_id_to_bytes, restore_governance_engine_from_snapshot,
+        restore_grace_store_from_snapshot,
+    };
+    use crate::context::manager::lifecycle::{
+        sanitize_cooldown_until, validate_consequence_rules_for_import, derive_message_pricing,
+    };
+    use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
+    use scp_protocol::context::governance::mls_integration::EpochCoordinator;
+    use scp_protocol::context::membership::ReceiveBuffer;
+    use std::collections::HashSet;
+
+    const ATTACHED: &str = "lifecycle_helpers::restore_context: provider slot empty";
+
+    let crypto = Arc::clone(
+        supervisor
+            .crypto_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?,
+    );
+    let event_log = Arc::clone(
+        supervisor
+            .event_log_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?,
+    );
+    let clock = Arc::clone(
+        supervisor
+            .clock_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?,
+    );
+    let key_resolver = supervisor
+        .key_resolver_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?
+        .clone();
+
+    let (mut ctx_snapshot, broadcast_ctx) = load_persisted_context_state(supervisor, context_id)?;
+    restore_event_log_best_effort(supervisor, context_id);
+
+    validate_consequence_rules_for_import(
+        &ctx_snapshot.consequence_rules,
+        &ctx_snapshot.context_params.consequence_config,
+    )?;
+
+    let now_for_cooldown = clock.now_secs();
+    sanitize_cooldown_until(
+        &mut ctx_snapshot.cooldown_until,
+        &ctx_snapshot.consequence_rules,
+        now_for_cooldown,
+        "restore",
+    );
+    let ttl_remaining = ctx_snapshot.ttl_remaining_secs;
+
+    let governance_engine =
+        restore_governance_engine_from_snapshot(&ctx_snapshot, key_resolver.clone())?;
+    let (grace_store, needs_reconnect) =
+        restore_grace_store_from_snapshot(context_id, &ctx_snapshot);
+
+    if !ctx_snapshot.mls_crypto_state.is_empty() {
+        let ctx_id_bytes = context_id_to_bytes(context_id);
+        crypto.restore_crypto_state(&ctx_id_bytes, &ctx_snapshot.mls_crypto_state)?;
+    }
+
+    let last_members: HashSet<scp_identity::DID> = ctx_snapshot
+        .membership
+        .members()
+        .map(|m| m.did.clone())
+        .collect();
+
+    let now_for_validation = clock.now_secs();
+    let hrl_config = ctx_snapshot
+        .hard_rate_limit_config
+        .clone()
+        .unwrap_or_else(scp_protocol::economy::antispam::HardRateLimitConfig::matrix_defaults);
+    hrl_config.validate().map_err(|e| {
+        ContextError::PersistenceFailed(format!(
+            "restore: hard-rate-limit config validation failed: {e}"
+        ))
+    })?;
+    let mut hrl_state = ctx_snapshot.hard_rate_limit_state.clone();
+    scp_protocol::economy::antispam::TokenBucketLimiter::validate_and_sanitize_snapshot(
+        &mut hrl_state,
+        &hrl_config,
+        now_for_validation,
+        scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+    )
+    .map_err(|e| {
+        ContextError::PersistenceFailed(format!(
+            "restore: hard-rate-limit snapshot validation failed: {e}"
+        ))
+    })?;
+    let validated_velocity_tracker = match ctx_snapshot.velocity_tracker_state {
+        Some(vts) => {
+            let mut entries = vts.entries;
+            scp_protocol::economy::antispam::SenderVelocityTracker
+                ::validate_and_sanitize_snapshot(
+                    &mut entries,
+                    60,
+                    now_for_validation,
+                    scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+                )
+                .map_err(|e| {
+                    ContextError::PersistenceFailed(format!(
+                        "restore: velocity snapshot validation failed: {e}"
+                    ))
+                })?;
+            scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(60, entries)
+        }
+        None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
+    };
+    let validated_message_pricing = ctx_snapshot
+        .message_pricing
+        .clone()
+        .or_else(|| derive_message_pricing(ctx_snapshot.economic_policy.as_ref()));
+    if let Some(ref pricing) = validated_message_pricing {
+        pricing.validate().map_err(|e| {
+            ContextError::PersistenceFailed(format!(
+                "restore: message pricing config validation failed: {e}"
+            ))
+        })?;
+    }
+
+    let next_gen_ref = supervisor.next_generation_ref();
+    let per_context = PerContextState {
+        generation: if ctx_snapshot.generation == 0 {
+            next_gen_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        } else {
+            ctx_snapshot.generation
+        },
+        handle: handle.clone(),
+        membership: ctx_snapshot.membership,
+        governance: GovernanceState {
+            engine: governance_engine,
+            executed_proposals: {
+                let now = clock.now_secs();
+                ctx_snapshot
+                    .executed_proposals
+                    .into_iter()
+                    .map(|id| (id, now))
+                    .collect()
+            },
+            next_proposal_seq: ctx_snapshot
+                .next_proposal_seq
+                .max(ctx_snapshot.approved_proposals.len() as u64),
+            approved_proposals: ctx_snapshot.approved_proposals,
+            freeze: ctx_snapshot.governance_freeze,
+            timeout_task: GovernanceTimeoutTask::new(),
+            deadlock: DeadlockDetectionState::default(),
+            threshold_signers: ctx_snapshot.threshold_signers,
+            threshold_value: ctx_snapshot.threshold_value,
+            pending_ceiling_modification: ctx_snapshot.pending_ceiling_modification,
+            pending_economic_policy_change: ctx_snapshot.pending_economic_policy_change,
+            registered_tools: ctx_snapshot.registered_tools,
+            tool_interfaces: ctx_snapshot.tool_interfaces,
+            pruning_policy: ctx_snapshot.pruning_policy,
+            message_pricing: validated_message_pricing,
+            hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::from_snapshot(
+                hrl_config, hrl_state,
+            ),
+            economic_policy: ctx_snapshot.economic_policy,
+            budget_tracker: ctx_snapshot.budget_tracker,
+            last_known_members: last_members,
+            pending_epoch_resets: Vec::new(),
+            consequence_rules: ctx_snapshot.consequence_rules,
+            velocity_tracker: validated_velocity_tracker,
+            participation_cache: ctx_snapshot.participation_cache,
+            cooldown_until: ctx_snapshot.cooldown_until,
+            spending_nonce_tracker:
+                scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
+                    context_id.to_owned(),
+                    Arc::clone(&clock),
+                    ctx_snapshot.spending_nonce_tracker_state,
+                ),
+            revoked_spending_ucan_cids: HashSet::new(),
+            proposal_timestamps: ctx_snapshot.proposal_timestamps,
+        },
+        role_state: ctx_snapshot.role_state,
+        receive_buffer: ReceiveBuffer::new(),
+        broadcast_context: broadcast_ctx,
+        migration_state: ctx_snapshot.migration_state,
+        epoch: EpochState {
+            mls_epoch: ctx_snapshot.mls_epoch,
+            coordinator: EpochCoordinator::from_records(
+                ctx_snapshot.epoch_coordination_records,
+                context_id,
+            ),
+            grace_store,
+            needs_reconnect,
+        },
+        access: AccessControlState {
+            read_exclusion_list: ctx_snapshot.read_exclusion_list,
+            access_key_store: ctx_snapshot.access_key_store,
+        },
+        ttl: TtlState {
+            timer: crate::context::ttl::TtlTimer::with_clock(Arc::clone(&clock)),
+            extension: None,
+        },
+        sequence_tracker: scp_protocol::envelope::SequenceTracker::new(),
+        reorder_buffer: scp_protocol::envelope::ReorderBuffer::default(),
+        pending_commits: ctx_snapshot.pending_commits,
+        commit_fault: ctx_snapshot.commit_fault,
+        checkpoint_events_since: ctx_snapshot.checkpoint_events_since,
+        checkpoint_last_time_secs: ctx_snapshot.checkpoint_last_time_secs,
+        checkpoints: Vec::new(),
+        merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
+        local_pseudonym: ctx_snapshot.local_pseudonym,
+        pseudonym_registry: ctx_snapshot
+            .pseudonym_registry
+            .into_iter()
+            .map(|(did_str, p)| (scp_identity::DID(did_str), p))
+            .collect(),
+        send_tracker: crate::context::actor::SendSequenceTracker::new(),
+    };
+
+    manager_methods::insert_context(supervisor, context_id.to_owned(), per_context)
+        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+    // Start governance timeout task (ADR-031 §5).
+    crate::context::governance_helpers::start_governance_timeout_task(supervisor, context_id).await;
+
+    // Re-spawn TTL timer if there was remaining TTL.
+    if let Some(remaining_secs) = ttl_remaining {
+        let duration = std::time::Duration::from_secs(remaining_secs);
+        spawn_ttl_timer(supervisor, context_id, duration, handle.clone()).await;
+    }
+
+    let _ = event_log; // silence unused on this branch
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// restore_all_contexts — hoisted from ContextManager (ADR-049 commit 12)
+// ---------------------------------------------------------------------------
+
+/// Restore every persisted context that's in `Active` state.
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::restore_all_contexts`]
+/// (ADR-049 commit 12). Byte-identical behavior.
+///
+/// # Errors
+///
+/// Returns [`ContextError::PersistenceFailed`] if listing persisted
+/// contexts fails (no persistence provider configured, or list call
+/// fails).
+#[tracing::instrument(skip_all)]
+pub async fn restore_all_contexts(
+    supervisor: &Supervisor,
+) -> Result<Vec<String>, ContextError> {
+    let Some(persistence) = supervisor.persistence_ref() else {
+        return Err(ContextError::PersistenceFailed(
+            "no persistence provider configured".into(),
+        ));
+    };
+
+    let context_ids = persistence.list_persisted_contexts().map_err(|e| {
+        ContextError::PersistenceFailed(format!("failed to list persisted contexts: {e}"))
+    })?;
+
+    let mut restored = Vec::new();
+    for ctx_id in &context_ids {
+        let ctx_snapshot = match persistence.load_context(ctx_id) {
+            Ok(Some(snap)) => snap,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(context_id = %ctx_id, error = %e, "failed to load context snapshot during restore");
+                continue;
+            }
+        };
+
+        if ctx_snapshot.state != ContextState::Active {
+            continue;
+        }
+
+        let handle = crate::context::ContextHandle::new(
+            ctx_id.clone(),
+            ctx_snapshot.context_params.clone(),
+        );
+        if handle.transition_to(&ContextState::Active).await.is_err() {
+            continue;
+        }
+
+        match restore_context(supervisor, ctx_id, &handle).await {
+            Ok(()) => restored.push(ctx_id.clone()),
+            Err(e) => {
+                tracing::warn!(context_id = %ctx_id, error = %e, "failed to restore context");
+            }
+        }
+    }
+
+    Ok(restored)
+}
+
+// ---------------------------------------------------------------------------
+// flush_all_contexts / flush_all_contexts_sync / shutdown_all_contexts
+// (hoisted from ContextManager, ADR-049 commit 12)
+// ---------------------------------------------------------------------------
+
+/// Per-context lock-acquisition budget used by [`flush_all_contexts`].
+const FLUSH_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Persists all contexts as a best-effort snapshot flush. Async variant.
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::flush_all_contexts`]
+/// (ADR-049 commit 12). Byte-identical behavior.
+pub async fn flush_all_contexts(supervisor: &Supervisor) {
+    if !manager_methods::has_persistence(supervisor) {
+        return;
+    }
+    // Collect Arcs first to avoid holding DashMap shard locks.
+    let arcs: Vec<(String, Arc<tokio::sync::Mutex<PerContextState>>)> = supervisor
+        .contexts_ref()
+        .iter()
+        .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+        .collect();
+    let mut flushed = 0usize;
+    let mut degraded = 0usize;
+    for (context_id, arc) in arcs {
+        match tokio::time::timeout(FLUSH_LOCK_BUDGET, arc.lock()).await {
+            Ok(ctx) => {
+                let snapshot = manager_methods::snapshot_context(&ctx);
+                let bc_snapshot = ctx
+                    .broadcast_context
+                    .as_ref()
+                    .map(scp_protocol::context::broadcast::BroadcastContext::to_snapshot);
+                drop(ctx);
+                manager_methods::persist_context_snapshot(supervisor, &context_id, snapshot);
+                if let Some(ref bcs) = bc_snapshot {
+                    manager_methods::persist_broadcast_snapshot(supervisor, &context_id, bcs);
+                }
+                flushed += 1;
+            }
+            Err(_elapsed) => {
+                persist_degraded_snapshot(supervisor, &context_id);
+                degraded += 1;
+            }
+        }
+    }
+    tracing::debug!(
+        flushed,
+        degraded,
+        "flush_all_contexts: flushed {} context(s), {} degraded (lock timeout)",
+        flushed,
+        degraded,
+    );
+}
+
+/// Sync wrapper for [`flush_all_contexts`].
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::flush_all_contexts_sync`]
+/// (ADR-049 commit 12). Byte-identical behavior.
+pub fn flush_all_contexts_sync(supervisor: &Supervisor) {
+    if !manager_methods::has_persistence(supervisor) {
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| {
+                handle.block_on(flush_all_contexts(supervisor));
+            });
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "flush_all_contexts_sync called outside tokio runtime; \
+                 skipping flush — context state may not be persisted"
+            );
+        }
+    }
+}
+
+/// Persists a degraded `ContextSnapshot` for a context whose lock could
+/// not be acquired within the flush budget.
+fn persist_degraded_snapshot(supervisor: &Supervisor, context_id: &str) {
+    let Some(persistence) = supervisor.persistence_ref() else {
+        return;
+    };
+    let snapshot = build_degraded_snapshot(context_id);
+    if let Err(e) = persistence.persist_context(context_id, &snapshot) {
+        crate::metrics::record_persistence_failure();
+        tracing::warn!(
+            context_id = %context_id,
+            error = %e,
+            "failed to persist degraded context snapshot"
+        );
+    } else {
+        tracing::warn!(
+            context_id = %context_id,
+            "persisted degraded snapshot (needs_reconnect=true) — \
+             context lock could not be acquired within flush budget"
+        );
+    }
+}
+
+/// Builds a minimal `ContextSnapshot` marked for reconnection. Mirrors
+/// `ContextManager::build_degraded_snapshot`.
+fn build_degraded_snapshot(context_id: &str) -> crate::context::manager::ContextSnapshot {
+    use scp_protocol::context::ContextParams;
+    use scp_protocol::context::membership::MembershipState;
+
+    let role_state = scp_protocol::context::roles::ContextRoleState {
+        context_id: context_id.to_owned(),
+        creator_did: String::new(),
+        ceiling: scp_protocol::context::roles::CapabilityCeiling::new(
+            std::iter::empty::<scp_protocol::context::roles::Capability>(),
+        ),
+        role_definitions: HashMap::new(),
+        assignments: HashMap::new(),
+        members: HashSet::new(),
+        member_capabilities: HashMap::new(),
+        suspended_capabilities: HashMap::new(),
+    };
+    crate::context::manager::ContextSnapshot {
+        context_id: context_id.to_owned(),
+        state: ContextState::Active,
+        context_params: ContextParams::default(),
+        membership: MembershipState::new(),
+        role_state,
+        executed_proposals: HashSet::new(),
+        ttl_remaining_secs: None,
+        registered_tools: Vec::new(),
+        read_exclusion_list: HashSet::new(),
+        tool_interfaces: Vec::new(),
+        threshold_signers: Vec::new(),
+        threshold_value: 0,
+        pruning_policy: None,
+        governance_model_config: None,
+        economic_policy: None,
+        budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
+        approved_proposals: HashMap::new(),
+        next_proposal_seq: 0,
+        governance_freeze: None,
+        pending_ceiling_modification: None,
+        pending_economic_policy_change: None,
+        mls_epoch: 0,
+        epoch_coordination_records: Vec::new(),
+        grace_entries: Vec::new(),
+        needs_reconnect: true,
+        mls_crypto_state: Vec::new(),
+        migration_state: None,
+        access_key_store: scp_protocol::crypto::access_keys::AccessKeyStore::new(),
+        consequence_rules: Vec::new(),
+        participation_cache: HashMap::new(),
+        velocity_tracker: None,
+        velocity_tracker_state: None,
+        cooldown_until: HashMap::new(),
+        proposal_timestamps: HashMap::new(),
+        message_pricing: None,
+        hard_rate_limit_config: None,
+        hard_rate_limit_state: HashMap::new(),
+        spending_nonce_tracker_state: HashMap::new(),
+        pending_commits: VecDeque::new(),
+        commit_fault: None,
+        checkpoint_events_since: 0,
+        checkpoint_last_time_secs: 0,
+        generation: 0,
+        local_pseudonym: None,
+        pseudonym_registry: HashMap::new(),
+    }
+}
+
+/// Shut down every context the supervisor owns (best-effort, local
+/// cleanup only).
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::shutdown_all_contexts`]
+/// (ADR-049 commit 12). Byte-identical behavior.
+pub fn shutdown_all_contexts(supervisor: &Supervisor) {
+    use crate::context::manager::context_id_to_bytes;
+
+    let context_ids: Vec<String> = supervisor
+        .contexts_ref()
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+
+    let crypto_opt = supervisor.crypto_ref().cloned();
+    let event_log_opt = supervisor.event_log_ref().cloned();
+
+    for context_id in &context_ids {
+        let ctx_id_bytes = context_id_to_bytes(context_id);
+
+        if let Some(ref crypto) = crypto_opt {
+            if let Err(e) = crypto.destroy_sender_key(&ctx_id_bytes) {
+                tracing::debug!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to destroy sender key during shutdown — may already be gone"
+                );
+            }
+            if let Err(e) = crypto.destroy_mls_group(&ctx_id_bytes) {
+                tracing::debug!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to destroy MLS group during shutdown — may already be gone"
+                );
+            }
+        }
+        if let Some(ref event_log) = event_log_opt {
+            if let Err(e) = event_log.destroy_event_log(&ctx_id_bytes) {
+                tracing::debug!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to destroy event log during shutdown — may already be gone"
+                );
+            }
+        }
+
+        supervisor.contexts_ref().remove(context_id);
+    }
+
+    // Clear standing contexts tracking via write_lock + ArcSwap.
+    {
+        let standing_arc = supervisor.standing_contexts_ref();
+        // Best-effort: try to acquire the write lock; on contention,
+        // skip cleanup (callers can retry).
+        if let Ok(_guard) = supervisor.write_lock.try_lock() {
+            standing_arc.store(Arc::new(HashMap::new()));
+        }
+    }
+
+    if let Some(task_set) = supervisor.task_set_ref() {
+        if let Ok(mut tasks) = task_set.try_lock() {
+            tasks.abort_all();
+        }
+    }
+
+    tracing::info!(
+        removed_count = context_ids.len(),
+        "shutdown: removed all contexts and aborted background tasks"
+    );
+}

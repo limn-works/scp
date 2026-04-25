@@ -238,6 +238,13 @@ const fn _assert_send_sync() {
 /// returns an error. That happens only on misuse (attaching a
 /// manager that has already been bound to a different supervisor) —
 /// a test-only contract violation.
+///
+/// ADR-049 commit 12 of 12c: Stub returning `Arc<ContextManager>`. The
+/// `manager` module is being deleted in this commit; the helper exists
+/// only so test fixtures still compile during the transition. Test
+/// fixtures (recovery.rs, e2e_context_manager.rs, fullstack/node.rs,
+/// governance_integration.rs) are rewired to call
+/// [`Supervisor::with_providers`] directly in agent 4's scope.
 #[cfg(any(test, feature = "testing"))]
 #[allow(
     clippy::panic,
@@ -245,20 +252,16 @@ const fn _assert_send_sync() {
 )]
 #[must_use]
 pub fn attach_test_supervisor(mgr: manager::ContextManager) -> Arc<manager::ContextManager> {
-    let manager = Arc::new(mgr);
-    let supervisor = Arc::new(supervisor::Supervisor::for_query_shim());
-    // The Result is infallible in practice: a freshly-constructed
-    // Supervisor attaching a freshly-constructed manager cannot
-    // observe an already-populated OnceLock. A programmer misuse
-    // (attaching a manager that already has a different supervisor)
-    // would hit the identity mismatch branch below; we intentionally
-    // panic because tests should never attach twice.
-    if let Err(e) = supervisor.attach_context_manager(&manager) {
-        panic!("attach_test_supervisor: attach failed (contract violation): {e}");
-    }
-    // See doc comment "Supervisor lifetime" for the leak rationale.
-    std::mem::forget(supervisor);
-    manager
+    // Stub during the manager-deletion transition (ADR-049 commit 12).
+    // The legacy body called `supervisor.attach_context_manager(...)` which
+    // was deleted alongside the bridge; test fixtures using this helper
+    // are migrated to direct `Supervisor::with_providers(...)` construction
+    // in agent 4's scope.
+    let _ = mgr;
+    panic!(
+        "attach_test_supervisor is deprecated during ADR-049 commit 12; \
+         migrate fixture to Supervisor::with_providers(...) directly"
+    );
 }
 
 #[cfg(test)]
