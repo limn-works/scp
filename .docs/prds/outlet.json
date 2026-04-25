@@ -785,7 +785,7 @@
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         ".docs/prds/main.json"
       ],
