@@ -18,7 +18,7 @@
 //!
 //! 1. First call to a bridge free function initializes the default
 //!    [`UniffiBridgeInstance`] via [`ensure_bridge_instance`].
-//! 2. Bridge functions call [`context_manager()`] or [`bridge_instance()`]
+//! 2. Bridge functions call `context_manager()` or [`bridge_instance()`]
 //!    and delegate to the manager's async methods or the instance's typed
 //!    registries.
 //! 3. The `UniffiBridgeInstance` is dropped on process exit (static
@@ -243,7 +243,7 @@ impl UniffiBridgeInstance {
     /// Allocates a fresh `CoreFields` (new `instance_id`, new
     /// `CancellationToken`, empty `JoinSet`) and populates the protocol
     /// repository + typed registries. No `ContextManager` is attached —
-    /// callers attach one later via [`CoreFields::set_context_manager`].
+    /// callers attach one later via `CoreFields::set_context_manager`.
     #[must_use]
     pub fn new_uniffi() -> Self {
         let (_event_log, protocol_repository) =
@@ -595,8 +595,8 @@ pub fn default_bridge_instance() -> Result<Arc<UniffiBridgeInstance>, crate::Scp
 ///
 /// Called by `identity_create` before `DidDht::create()` runs, so that the
 /// DID resolver slot owned by `CoreFields` is available. The `ContextManager`
-/// is attached later via [`init_context_manager_with_did`] (or
-/// [`Supervisor::with_providers`]) once the identity is known. Per
+/// is attached later via `Self::init_context_manager_with_did` (or
+/// `Supervisor::with_providers`) once the identity is known. Per
 /// spec §12.2.3 the bridge instance container has no DID requirement — the
 /// authoritative local DID lives inside the `ContextManager`'s
 /// `MlsCryptoProvider`.
@@ -786,7 +786,7 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 // went through `ContextManager`.
 
 /// Adapter that lets a shared `Arc<dyn ContextPersistence + Send + Sync>` be
-/// consumed by [`ContextManager::with_persistence`] which requires a `Box`.
+/// consumed by `ContextManager::with_persistence` which requires a `Box`.
 ///
 /// `ContextManager::with_persistence` converts the `Box` back into an `Arc`
 /// internally, but the call-site signature is `Box`-only. Rather than
@@ -859,7 +859,7 @@ impl scp_core::context::persistence::ContextPersistence for ArcContextPersistenc
     }
 }
 
-/// Constructs a fresh per-instance [`Supervisor`] with the given
+/// Constructs a fresh per-instance `Supervisor` with the given
 /// providers.
 ///
 /// ADR-049 commit 12c.9g.3.6 — the FFI bridge no longer touches
@@ -997,7 +997,7 @@ pub fn supervisor_lenient()
         })
 }
 
-/// Initializes the per-instance [`Supervisor`] with [`MlsCryptoProvider`]
+/// Initializes the per-instance `Supervisor` with [`MlsCryptoProvider`]
 /// and [`scp_core::context::NotConfiguredTransportProvider`].
 ///
 /// Must be called before any context lifecycle operation — the bridge no
@@ -1040,8 +1040,8 @@ pub fn init_supervisor_with_did(local_did: &str) {
     bi.core.set_supervisor(supervisor_arc);
 }
 
-/// Initializes the per-instance [`Supervisor`] with
-/// [`RelayTransportProvider`].
+/// Initializes the per-instance `Supervisor` with
+/// `RelayTransportProvider`.
 ///
 /// Identical to [`init_supervisor_with_did`] except the transport
 /// provider is a `RelayTransportProvider` wrapping a real

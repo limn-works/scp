@@ -31,17 +31,17 @@
 //! `self.X` replaced by either:
 //!
 //! - `mgr.X_ref()` accessor calls for fields still owned by
-//!   [`ContextManager`](crate::context::manager::ContextManager), or
+//!   [`Supervisor`](crate::context::supervisor::Supervisor), or
 //! - `supervisor.X_ref()` accessor calls for the provider slots already
 //!   lifted to [`Supervisor`](crate::context::supervisor::Supervisor) in
 //!   ADR-049 commit 12c.9a/9b, or
 //! - `mgr.next_generation_ref()` for the `AtomicU64` generation counter
 //!   that has not yet been lifted to the supervisor (the
 //!   `next_generation` field disappears in 12c.9g.4 alongside
-//!   [`ContextManager`] itself).
+//!   `ContextManager` itself).
 //!
 //! The legacy inherent methods on
-//! [`ContextManager`](crate::context::manager::ContextManager) remain as
+//! [`Supervisor`](crate::context::supervisor::Supervisor) remain as
 //! one-line forwarders that thread `self.supervisor()` into each helper
 //! through the `Weak<Supervisor>` back-pointer installed by
 //! [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers)
@@ -102,7 +102,7 @@ use crate::context::supervisor::Supervisor;
 /// generation token for confused-deputy detection on later reacquire.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::lock_context`](crate::context::manager::ContextManager::lock_context)
+/// [`ContextManager::lock_context`](crate::context::supervisor::Supervisor::lock_context)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 ///
 /// # Errors
@@ -137,7 +137,7 @@ pub async fn lock_context(
 /// was removed and recreated between lock release and reacquire.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::relock_context`](crate::context::manager::ContextManager::relock_context)
+/// [`ContextManager::relock_context`](crate::context::supervisor::Supervisor::relock_context)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 ///
 /// # Errors
@@ -168,7 +168,7 @@ pub async fn relock_context(
 /// lock it later.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::get_context_arc`](crate::context::manager::ContextManager::get_context_arc)
+/// [`ContextManager::get_context_arc`](crate::context::supervisor::Supervisor::get_context_arc)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 ///
 /// # Errors
@@ -176,7 +176,7 @@ pub async fn relock_context(
 /// Returns [`ContextError::ContextNotRegistered`] if the context is not
 /// in the map, OR [`ContextError::NotInitialized`] if the supervisor's
 /// per-context map slot has not been populated by
-/// [`Supervisor::with_providers`].
+/// `Supervisor::with_providers`.
 pub fn get_context_arc(
     supervisor: &Supervisor,
     context_id: &str,
@@ -193,12 +193,12 @@ pub fn get_context_arc(
 // ---------------------------------------------------------------------------
 
 /// `pub(crate)` variant of [`get_context_arc`]. Used by the commit-7
-/// query shim on [`Supervisor::dispatch_query`] to resolve the
+/// query shim on `Supervisor::dispatch_query` to resolve the
 /// per-context Arc outside the `manager/` submodule without exposing the
 /// inner `Mutex` contents.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::get_context_arc_pub`](crate::context::manager::ContextManager::get_context_arc_pub)
+/// [`ContextManager::get_context_arc_pub`](crate::context::supervisor::Supervisor::get_context_arc_pub)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 ///
 /// # Errors
@@ -219,10 +219,10 @@ pub fn get_context_arc_pub(
 /// Insert a new context, stamping a fresh generation ID.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::insert_context`](crate::context::manager::ContextManager::insert_context)
+/// [`ContextManager::insert_context`](crate::context::supervisor::Supervisor::insert_context)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 ///
-/// The `next_generation` counter is still owned by [`ContextManager`]
+/// The `next_generation` counter is still owned by `ContextManager`
 /// (it disappears in 12c.9g.4 alongside the manager itself), so the
 /// hoisted body reaches it via `mgr.next_generation_ref()`.
 ///
@@ -260,7 +260,7 @@ pub fn insert_context(
 /// Remove a context from the map, returning its state `Arc` if it existed.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::remove_context`](crate::context::manager::ContextManager::remove_context)
+/// [`ContextManager::remove_context`](crate::context::supervisor::Supervisor::remove_context)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior. Returns `None` if
 /// the context is not registered OR the supervisor has not been attached
 /// — observationally identical for callers that already gate on a prior
@@ -279,10 +279,10 @@ pub fn remove_context(
 /// Returns `true` if a persistence provider is configured.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::has_persistence`](crate::context::manager::ContextManager::has_persistence)
+/// [`ContextManager::has_persistence`](crate::context::supervisor::Supervisor::has_persistence)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior — uses the
 /// supervisor's lifted persistence slot
-/// ([`Supervisor::persistence_ref`]) which already collapses the
+/// (`Supervisor::persistence_ref`) which already collapses the
 /// "not attached" + "attached but no persistence" cases to a single
 /// `None`.
 ///
@@ -302,7 +302,7 @@ pub fn has_persistence(supervisor: &Supervisor) -> bool {
 /// Updates operational gauge metrics (active contexts, buffer occupancy).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::update_context_gauges`](crate::context::manager::ContextManager::update_context_gauges)
+/// [`ContextManager::update_context_gauges`](crate::context::supervisor::Supervisor::update_context_gauges)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 ///
 /// Called after mutations that change context count or buffer state.
@@ -334,7 +334,7 @@ pub fn update_context_gauges(supervisor: &Supervisor) {
 /// Persists a context snapshot if a persistence provider is configured.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::persist_context_snapshot`](crate::context::manager::ContextManager::persist_context_snapshot)
+/// [`ContextManager::persist_context_snapshot`](crate::context::supervisor::Supervisor::persist_context_snapshot)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 ///
 /// Best-effort: logs errors but does not propagate them to callers. On a
@@ -398,7 +398,7 @@ pub fn persist_context_snapshot(
 /// configured. Best-effort: logs errors but does not propagate.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::persist_broadcast_snapshot`](crate::context::manager::ContextManager::persist_broadcast_snapshot)
+/// [`ContextManager::persist_broadcast_snapshot`](crate::context::supervisor::Supervisor::persist_broadcast_snapshot)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 pub fn persist_broadcast_snapshot(
     supervisor: &Supervisor,
@@ -426,7 +426,7 @@ pub fn persist_broadcast_snapshot(
 /// for crash recovery.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::init_broadcast_context`](crate::context::manager::ContextManager::init_broadcast_context)
+/// [`ContextManager::init_broadcast_context`](crate::context::supervisor::Supervisor::init_broadcast_context)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 pub fn init_broadcast_context(
     supervisor: &Supervisor,
@@ -470,7 +470,7 @@ pub fn init_broadcast_context(
 /// configured.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::persist_context_and_broadcast`](crate::context::manager::ContextManager::persist_context_and_broadcast)
+/// [`ContextManager::persist_context_and_broadcast`](crate::context::supervisor::Supervisor::persist_context_and_broadcast)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 pub async fn persist_context_and_broadcast(supervisor: &Supervisor, context_id: &str) {
     if has_persistence(supervisor)
@@ -498,7 +498,7 @@ pub async fn persist_context_and_broadcast(supervisor: &Supervisor, context_id: 
 /// matching [`ContextEvent::PaymentCaptureFailed`] to the receive buffer.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::record_payment_capture_failure`](crate::context::manager::ContextManager::record_payment_capture_failure)
+/// [`ContextManager::record_payment_capture_failure`](crate::context::supervisor::Supervisor::record_payment_capture_failure)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 ///
 /// Called by `capture_send_payment` and `capture_join_payment` when the
@@ -562,7 +562,7 @@ pub async fn record_payment_capture_failure(
 /// Takes a [`ContextSnapshot`] from the current [`PerContextState`].
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::snapshot_context`](crate::context::manager::ContextManager::snapshot_context)
+/// [`ContextManager::snapshot_context`](crate::context::supervisor::Supervisor::snapshot_context)
 /// (ADR-049 commit 12c.9g.3.5). Byte-identical behavior.
 ///
 /// Must be called while the contexts mutex is held (snapshot under lock).

@@ -5,7 +5,7 @@
 //! Unlike [`crate::context::supervisor::saga_journal::JournalEntry`] —
 //! which is the supervisor-side durable coordinator record — values of
 //! [`SagaPreparedState`] live in actor-local memory and are persisted only
-//! as part of the actor's coalesced [`ContextSnapshot`]. The split is
+//! as part of the actor's coalesced [`ContextSnapshot`](crate::context::state::ContextSnapshot). The split is
 //! deliberate:
 //!
 //! - **Journal (durable, supervisor-side):** records *which* saga is in

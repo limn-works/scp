@@ -92,7 +92,7 @@ pub const MAX_COMMIT_AGE_SECS: u64 = 3600; // 1 hour
 /// Maximum number of pending commits allowed in the retry queue per context.
 ///
 /// Prevents unbounded memory growth during sustained transport outages.
-/// When this cap is reached, [`try_broadcast_commit_or_enqueue`] sets the
+/// When this cap is reached, [`try_broadcast_commit_or_enqueue`](crate::context::governance_helpers::try_broadcast_commit_or_enqueue) sets the
 /// `commit_fault` marker immediately rather than enqueuing, fail-closing
 /// the context for operator attention.
 pub const MAX_PENDING_COMMITS: usize = 50;
@@ -211,7 +211,7 @@ pub struct PendingCommit {
 ///
 /// While `commit_fault` is set, all governance and lifecycle mutations on
 /// the context return [`ContextError::CommitBroadcastFault`]. Cleared by an
-/// operator via [`ContextManager::acknowledge_commit_fault`].
+/// operator via `ContextManager::acknowledge_commit_fault`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitFaultMarker {
     /// Logical operation whose commit failed permanently.
@@ -412,9 +412,9 @@ pub struct MigrationProposedResult {
 }
 
 /// Result of executing an approved governance action via
-/// [`ContextManager::execute_governance_action`].
+/// `ContextManager::execute_governance_action`.
 ///
-/// Each variant maps 1:1 to a [`GovernanceAction`] variant (ADR-031 §2).
+/// Each variant maps 1:1 to a [`GovernanceAction`](scp_protocol::context::governance::GovernanceAction) variant (ADR-031 §2).
 /// Variants that carry action-specific result data wrap a result struct;
 /// others are unit variants indicating successful execution.
 #[derive(Debug)]
@@ -493,7 +493,7 @@ pub enum GovernanceActionResult {
 // ---------------------------------------------------------------------------
 
 /// Result of submitting a governance proposal via
-/// [`ContextManager::propose_governance_action_checked`].
+/// `ContextManager::propose_governance_action_checked`.
 ///
 /// Contains the created proposal, its current status, and an optional
 /// execution result. When the proposal is auto-approved (`SingleAdmin`),
@@ -658,10 +658,10 @@ pub struct ContextSnapshot {
     #[serde(default)]
     pub needs_reconnect: bool,
     /// Opaque MLS crypto state blob exported by
-    /// [`ContextCryptoProvider::export_crypto_state`]. Contains MLS group
+    /// `ContextCryptoProvider::export_crypto_state`. Contains MLS group
     /// tree, epoch secrets, sender keys, and wrapping keys. Restored via
-    /// [`ContextCryptoProvider::restore_crypto_state`] during
-    /// [`ContextManager::restore_context`].
+    /// `ContextCryptoProvider::restore_crypto_state` during
+    /// `ContextManager::restore_context`.
     ///
     /// Empty if no crypto state was exported (e.g., broadcast-only contexts
     /// or mock providers). See issue #645.
@@ -1245,7 +1245,7 @@ pub(crate) struct PerContextState {
     /// Fail-close marker set when a `PendingCommit` exhausts its retry
     /// budget. While `Some`, all context-mutating operations return
     /// [`ContextError::CommitBroadcastFault`] until cleared via
-    /// [`ContextManager::acknowledge_commit_fault`].
+    /// `ContextManager::acknowledge_commit_fault`.
     pub(crate) commit_fault: Option<CommitFaultMarker>,
     /// Number of event log appends since the last consistency checkpoint (§9.9.3).
     pub(crate) checkpoint_events_since: u64,
@@ -1525,7 +1525,7 @@ pub(crate) fn strip_event_payload(event: &ContextEvent) -> ContextEvent {
 /// Helper type for generation tokens captured during Phase 1 lock acquisition.
 ///
 /// Captures the `context_id` and the `generation` counter at the time the
-/// per-context lock was first acquired. Passed to [`ContextManager::relock_context`]
+/// per-context lock was first acquired. Passed to `ContextManager::relock_context`
 /// to verify the context was not removed and recreated between lock release
 /// and reacquire (confused-deputy detection, Phase B).
 #[must_use]

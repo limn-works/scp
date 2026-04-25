@@ -1318,7 +1318,7 @@ pub fn identity_remove_if_present(did: String) -> bool {
 
 /// Generates a device attestation token for an identity.
 ///
-/// Uses [`InMemoryDeviceAttestation`] to produce a synthetic attestation token,
+/// Uses `InMemoryDeviceAttestation` to produce a synthetic attestation token,
 /// then attaches it to the identity's DID document.
 ///
 /// # Arguments
@@ -1363,7 +1363,7 @@ pub async fn identity_attest_device(did: String) -> napi::Result<String> {
 
 /// Verifies a device attestation token.
 ///
-/// Uses [`InMemoryDeviceAttestation`] to check the token format.
+/// Uses `InMemoryDeviceAttestation` to check the token format.
 ///
 /// # Arguments
 ///

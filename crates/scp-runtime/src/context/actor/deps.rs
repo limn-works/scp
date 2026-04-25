@@ -61,7 +61,7 @@
 //!
 //! Handler bodies that need raw byte-blob storage (saga evidence, KP
 //! store blobs) reach it through the specific bridge that already
-//! owns a concrete `Arc<S>` — e.g. [`Self::persistence`] (typed
+//! owns a concrete `Arc<S>` — e.g. [`ActorDeps::persistence`] (typed
 //! `ContextSnapshot` persistence), or the
 //! [`KeyPackageStoreHandle`](crate::context::supervisor::key_package_actor::KeyPackageStoreHandle)
 //! inside the bundle. No handler currently needs `dyn Storage`
@@ -174,7 +174,7 @@ pub struct ActorDeps {
     pub payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
     /// DIDs controlled by the local node/SDK. `ArcSwap` for lock-free
     /// reads on every `deliver_incoming` (resolve local member). Legacy:
-    /// [`crate::context::manager::ContextManager::local_dids`]
+    /// [`crate::context::supervisor::Supervisor::local_dids`]
     /// (`RwLock<HashSet<DID>>`). The actor model hoists this to the
     /// supervisor so every actor shares the same snapshot without each
     /// one carrying its own `RwLock` — the `Arc<ArcSwap<_>>` is

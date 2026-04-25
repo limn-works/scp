@@ -351,7 +351,7 @@ impl NativeRelayAdapter {
     ///
     /// After this call, [`suppression_events`](Self::suppression_events)
     /// returns `None`. This is used by the FFI bridge layer to extract the
-    /// receiver before moving the adapter into [`TransportManager`] — the
+    /// receiver before moving the adapter into [`TransportManager`](crate::manager::TransportManager) — the
     /// bridge spawns a background task that drains the receiver and feeds
     /// suppression events into the manager's reliability scoring (#1533 AC5).
     ///

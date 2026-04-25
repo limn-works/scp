@@ -139,7 +139,7 @@ pub enum ConsequenceTrigger {
 /// - `SuspendCapability`, `SuspendAccess` — always allowed. These are pure
 ///   application-level suspensions with no cryptographic side effects.
 /// - `RevokeAccess` — allowed **only** when the context's
-///   [`ConsequenceConfig::allow_automatic_access_revocation`] is `true`
+///   [`ConsequenceConfig::allow_automatic_access_revocation`](crate::context::params::ConsequenceConfig::allow_automatic_access_revocation) is `true`
 ///   ([`ContextParams.consequence_config`](crate::context::params::ContextParams::consequence_config)).
 ///   Defaults to `false`: cryptographic revocation is governance-only unless
 ///   the context explicitly opts in at creation time.
@@ -192,7 +192,7 @@ pub enum EnforcementSeverity {
     /// auditability.
     ///
     /// **Cannot be referenced by a consequence rule** unless the
-    /// context's [`ConsequenceConfig::allow_automatic_access_revocation`] is
+    /// context's [`ConsequenceConfig::allow_automatic_access_revocation`](crate::context::params::ConsequenceConfig::allow_automatic_access_revocation) is
     /// explicitly set to `true` at context creation time.
     RevokeAccess {
         /// DID of the member whose access is being cryptographically

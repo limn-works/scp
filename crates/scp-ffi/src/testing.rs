@@ -64,8 +64,8 @@ fn permissive_key_resolver() -> KeyResolver {
 
 /// Opaque handle to a full-stack test node with real MLS crypto.
 ///
-/// Each node has its own [`ContextManager`] backed by [`E2eCryptoProvider`]
-/// (real MLS + sender keys) with a shared [`KeyExchange`] for coordinating
+/// Each node has its own `ContextManager` backed by `E2eCryptoProvider`
+/// (real MLS + sender keys) with a shared `KeyExchange` for coordinating
 /// Welcome messages and sender keys between nodes.
 #[pyclass(name = "FullStackNode")]
 pub struct PyFullStackNode {

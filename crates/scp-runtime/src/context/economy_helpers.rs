@@ -32,7 +32,7 @@
 //! `supervisor.payment_adapter_ref()` (ADR-049 commit 12c.9c).
 //!
 //! The legacy inherent method on
-//! [`ContextManager`](crate::context::manager::ContextManager) remains as
+//! [`Supervisor`](crate::context::supervisor::Supervisor) remains as
 //! a one-line forwarder; it is deleted alongside the outer shim in a later
 //! ADR-049 commit when the actor handler body owns the economy path
 //! directly.
@@ -41,8 +41,8 @@
 //!
 //! [`verify_payment_receipts`] takes `supervisor: &Supervisor`. The
 //! payment adapter is lifted onto the supervisor by
-//! [`Supervisor::with_providers`] (commit 12c.9a). The legacy
-//! forwarder on [`ContextManager`] threads `self.supervisor()` into the
+//! `Supervisor::with_providers` (commit 12c.9a). The legacy
+//! forwarder on `ContextManager` threads `self.supervisor()` into the
 //! helper through the `Weak<Supervisor>` back-pointer installed at
 //! attach time.
 //!
@@ -59,7 +59,7 @@
 //! moved their bodies here as free functions on `&Supervisor`; the
 //! 12c.9g.2 helper rewire migrated every callsite from the legacy
 //! manager-method form to the direct free-function call. The legacy
-//! methods on [`ContextManager`](crate::context::manager::ContextManager)
+//! methods on [`Supervisor`](crate::context::supervisor::Supervisor)
 //! remain as one-line forwarders for FFI use. The companion
 //! `record_payment_capture_failure` lives in
 //! [`crate::context::manager_methods`] (cross-domain infrastructure used
@@ -89,7 +89,7 @@ const ATTACHED_EXPECT: &str = "economy_helpers: Supervisor must be fully attache
 
 /// Verifies payment receipts using the configured payment adapter
 /// (hoisted body of the legacy
-/// [`ContextManager::verify_payment_receipts`](crate::context::manager::ContextManager::verify_payment_receipts)).
+/// [`ContextManager::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts)).
 ///
 /// For each receipt whose `adapter_id` matches the configured adapter,
 /// calls `verify_dyn` directly. Receipts whose `adapter_id` does not
@@ -133,7 +133,7 @@ pub async fn verify_payment_receipts(
 /// Authorizes a paid action (escrow pattern, step 1).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::authorize_paid_action`](crate::context::manager::ContextManager::authorize_paid_action)
+/// [`ContextManager::authorize_paid_action`](crate::context::supervisor::Supervisor::authorize_paid_action)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 ///
 /// Evaluates cost, checks spending UCAN, checks budget, and calls
@@ -237,7 +237,7 @@ pub async fn authorize_paid_action(
 /// Completes a paid action after successful execution (escrow capture).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::complete_paid_action`](crate::context::manager::ContextManager::complete_paid_action)
+/// [`ContextManager::complete_paid_action`](crate::context::supervisor::Supervisor::complete_paid_action)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 ///
 /// Calls `adapter.capture`, verifies the receipt, stores it in the event
@@ -307,7 +307,7 @@ pub async fn complete_paid_action(
 /// Voids a paid action authorization on failure (escrow rollback).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::void_paid_action`](crate::context::manager::ContextManager::void_paid_action)
+/// [`ContextManager::void_paid_action`](crate::context::supervisor::Supervisor::void_paid_action)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 ///
 /// Calls `adapter.void` to release the escrow hold. Best-effort —

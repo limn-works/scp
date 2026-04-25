@@ -9,15 +9,15 @@
 //! `Outcome<()>`.
 //!
 //! The underlying byte-identical implementation still lives on
-//! [`ContextManager`](crate::context::manager::ContextManager): each
+//! [`Supervisor`](crate::context::supervisor::Supervisor): each
 //! handler delegates to
-//! [`ContextManager::create_context`](crate::context::manager::ContextManager::create_context),
-//! [`ContextManager::join_context`](crate::context::manager::ContextManager::join_context),
-//! [`ContextManager::leave_context`](crate::context::manager::ContextManager::leave_context),
-//! [`ContextManager::close_context`](crate::context::manager::ContextManager::close_context),
-//! [`ContextManager::export_context`](crate::context::manager::ContextManager::export_context),
+//! [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context),
+//! [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context),
+//! [`ContextManager::leave_context`](crate::context::supervisor::Supervisor::leave_context),
+//! [`ContextManager::close_context`](crate::context::lifecycle_helpers::close_context),
+//! [`ContextManager::export_context`](crate::context::lifecycle_helpers::export_context),
 //! or
-//! [`ContextManager::import_context`](crate::context::manager::ContextManager::import_context).
+//! [`ContextManager::import_context`](crate::context::lifecycle_helpers::import_context).
 //! The shim's job is:
 //!
 //! 1. Wrap every delegated call in [`tokio::time::timeout`] with a 30s
@@ -77,7 +77,7 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// `deps` is accepted for symmetry — the lifecycle handler does not yet
 /// touch deps during the shim period (the transport, event log, crypto
 /// providers, and persistence live on the legacy
-/// [`ContextManager`](crate::context::manager::ContextManager)). Commit
+/// [`Supervisor`](crate::context::supervisor::Supervisor)). Commit
 /// 12 rewires these paths to use `deps` directly once the manager
 /// surface is deleted.
 pub async fn dispatch(
@@ -102,7 +102,7 @@ pub async fn dispatch(
 ///
 /// Lifecycle commands do not yet touch [`ActorDeps`] during the shim
 /// period (every resource the legacy lifecycle methods need lives on
-/// the [`ContextManager`](crate::context::manager::ContextManager)). This
+/// the [`Supervisor`](crate::context::supervisor::Supervisor)). This
 /// entry point exists so callers can route lifecycle operations through
 /// the shim without synthesizing an [`ActorDeps`] — matching the pattern
 /// established for queries (commit 7) and messaging (commit 8).
@@ -220,7 +220,7 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: LifecycleCommand) -> Outco
 }
 
 /// Handle [`LifecycleCommand::CreateContext`]: delegate to
-/// [`ContextManager::create_context`](crate::context::manager::ContextManager::create_context)
+/// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context)
 /// under a 30s timeout.
 ///
 /// Saga-compatible: create-as-prepare support lands with
@@ -270,7 +270,7 @@ async fn handle_create_context(
 }
 
 /// Handle [`LifecycleCommand::JoinContext`]: delegate to
-/// [`ContextManager::join_context`](crate::context::manager::ContextManager::join_context)
+/// [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context)
 /// under a 30s timeout.
 #[allow(clippy::too_many_arguments)] // mirrors the legacy method's signature surface
 async fn handle_join_context(
@@ -321,7 +321,7 @@ async fn handle_join_context(
 }
 
 /// Handle [`LifecycleCommand::LeaveContext`]: delegate to
-/// [`ContextManager::leave_context`](crate::context::manager::ContextManager::leave_context)
+/// [`ContextManager::leave_context`](crate::context::supervisor::Supervisor::leave_context)
 /// under a 30s timeout.
 async fn handle_leave_context(
     supervisor: &Supervisor,
@@ -368,7 +368,7 @@ async fn handle_leave_context(
 }
 
 /// Handle [`LifecycleCommand::CloseContext`]: delegate to
-/// [`ContextManager::close_context`](crate::context::manager::ContextManager::close_context)
+/// [`ContextManager::close_context`](crate::context::lifecycle_helpers::close_context)
 /// under a 30s timeout. Only valid on `SingleAdmin` governance
 /// contexts; multi-admin contexts must use the governance path
 /// (`GovernanceAction::CloseContext`) — the legacy method enforces
@@ -413,7 +413,7 @@ async fn handle_close_context(
 }
 
 /// Handle [`LifecycleCommand::ExportContext`]: delegate to
-/// [`ContextManager::export_context`](crate::context::manager::ContextManager::export_context)
+/// [`ContextManager::export_context`](crate::context::lifecycle_helpers::export_context)
 /// under a 30s timeout.
 async fn handle_export_context(
     supervisor: &Supervisor,
@@ -444,7 +444,7 @@ async fn handle_export_context(
 }
 
 /// Handle [`LifecycleCommand::ImportContext`]: delegate to
-/// [`ContextManager::import_context`](crate::context::manager::ContextManager::import_context)
+/// [`ContextManager::import_context`](crate::context::lifecycle_helpers::import_context)
 /// under a 30s timeout. The C3 per-instance wipe policy is enforced
 /// by the legacy method; the handler passes the parsed export through
 /// verbatim.
@@ -485,7 +485,7 @@ async fn handle_import_context(
 
 /// Handle [`LifecycleCommand::RestoreContext`]: rebuild an ephemeral
 /// handle from the supplied params and delegate to
-/// [`ContextManager::restore_context`](crate::context::manager::ContextManager::restore_context)
+/// [`ContextManager::restore_context`](crate::context::supervisor::Supervisor::restore_context)
 /// under a 30s timeout.
 ///
 /// `restore_context` has no `lifecycle_helpers` peer at this point in

@@ -110,7 +110,7 @@ impl From<BroadcastKeyError> for ScpError {
     }
 }
 
-/// Auto-wires the global [`ContextManager`] with relay transport after
+/// Auto-wires the global `ContextManager` with relay transport after
 /// node startup.
 ///
 /// Connects to the node's local relay (with bearer token authentication)

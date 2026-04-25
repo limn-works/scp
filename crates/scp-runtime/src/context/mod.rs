@@ -17,7 +17,7 @@
 //!
 //! # State Machine
 //!
-//! The [`state_machine::transition`] function validates state transitions and
+//! The [`state_machine::transition`](scp_protocol::context::state_machine::transition) function validates state transitions and
 //! returns the new state or an error. It is pure -- no side effects. The
 //! Context Manager (SCP-019/020) is responsible for executing side effects.
 //!
@@ -155,7 +155,7 @@ impl ContextHandle {
     /// Attempts a non-blocking read of the context state.
     ///
     /// Returns `None` if the read lock cannot be acquired immediately (e.g.,
-    /// a state transition is in progress). Used by [`ContextManager`] to
+    /// a state transition is in progress). Used by `ContextManager` to
     /// check state synchronously inside a `Mutex` lock scope, avoiding
     /// TOCTOU races without holding the `MutexGuard` across `.await` points.
     #[must_use]
@@ -165,7 +165,7 @@ impl ContextHandle {
 
     /// Attempts to transition the context to a new state.
     ///
-    /// Validates the transition via [`state_machine::transition`] and applies
+    /// Validates the transition via [`state_machine::transition`](scp_protocol::context::state_machine::transition) and applies
     /// it atomically if valid. Returns the new state on success.
     ///
     /// # Errors

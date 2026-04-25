@@ -38,7 +38,7 @@
 //! no `mgr` derivation).
 //!
 //! The legacy inherent methods on
-//! [`ContextManager`](crate::context::manager::ContextManager) remain as
+//! [`Supervisor`](crate::context::supervisor::Supervisor) remain as
 //! one-line forwarders; they are deleted alongside the outer shim in a
 //! later ADR-049 commit when the actor handler body owns the tools
 //! path directly.
@@ -56,7 +56,7 @@
 //! `invoke_tool_with_economy` are reached only from FFI bridge layers
 //! (`PyO3` / NAPI / `UniFFI` / WASM), not from actor handlers. They remain
 //! as inherent methods on
-//! [`ContextManager`](crate::context::manager::ContextManager) and are
+//! [`Supervisor`](crate::context::supervisor::Supervisor) and are
 //! out of scope for the actor-handler-driven hoist.
 
 use std::collections::HashMap;
@@ -94,7 +94,7 @@ use crate::economy::integration::PreparedAction;
 /// context IS registered AND the sender is over budget.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::try_consume_hard_rate_limit`](crate::context::manager::ContextManager::try_consume_hard_rate_limit)
+/// [`ContextManager::try_consume_hard_rate_limit`](crate::context::tools_helpers::try_consume_hard_rate_limit)
 /// (ADR-049 commit 12c.4). Byte-identical behavior.
 #[must_use]
 pub async fn try_consume_hard_rate_limit(
@@ -122,7 +122,7 @@ pub async fn try_consume_hard_rate_limit(
 /// Async hard-rate-limit refund. No-op if the context is unknown.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::refund_hard_rate_limit`](crate::context::manager::ContextManager::refund_hard_rate_limit)
+/// [`ContextManager::refund_hard_rate_limit`](crate::context::tools_helpers::refund_hard_rate_limit)
 /// (ADR-049 commit 12c.4). Byte-identical behavior.
 pub async fn refund_hard_rate_limit(supervisor: &Supervisor, context_id: &str, did: &DID) {
     // ADR-049 commit 12c.9g.2 — returns `()` so an unpopulated attach
@@ -165,7 +165,7 @@ pub async fn refund_hard_rate_limit(supervisor: &Supervisor, context_id: &str, d
 /// task on the same tokio runtime — doing so will panic.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::try_consume_hard_rate_limit_blocking`]
+/// `ContextManager::try_consume_hard_rate_limit_blocking`
 /// (ADR-049 commit 12). Byte-identical behavior.
 #[allow(clippy::significant_drop_tightening)]
 #[must_use]
@@ -191,7 +191,7 @@ pub fn try_consume_hard_rate_limit_blocking(
 /// [`try_consume_hard_rate_limit_blocking`].
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::refund_hard_rate_limit_blocking`]
+/// `ContextManager::refund_hard_rate_limit_blocking`
 /// (ADR-049 commit 12). Byte-identical behavior.
 #[allow(clippy::significant_drop_tightening)]
 pub fn refund_hard_rate_limit_blocking(supervisor: &Supervisor, context_id: &str, did: &DID) {
@@ -220,7 +220,7 @@ pub fn refund_hard_rate_limit_blocking(supervisor: &Supervisor, context_id: &str
 ///    via an mpsc channel.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::try_consume_hard_rate_limit_from_any_context`]
+/// `ContextManager::try_consume_hard_rate_limit_from_any_context`
 /// (ADR-049 commit 12). Byte-identical behavior.
 #[must_use]
 #[allow(clippy::option_if_let_else)]
@@ -260,7 +260,7 @@ pub fn try_consume_hard_rate_limit_from_any_context(
 /// [`try_consume_hard_rate_limit_from_any_context`].
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::refund_hard_rate_limit_from_any_context`]
+/// `ContextManager::refund_hard_rate_limit_from_any_context`
 /// (ADR-049 commit 12). Byte-identical behavior.
 #[allow(clippy::option_if_let_else)]
 pub fn refund_hard_rate_limit_from_any_context(
@@ -343,7 +343,7 @@ fn run_blocking_on_dedicated_thread(
 
 /// Result of a successful managed tool invocation.
 ///
-/// Hoisted from `crate::context::manager::tools::ManagedToolInvocationOutput`
+/// Hoisted from `crate::context::tools_helpers::ManagedToolInvocationOutput`
 /// (ADR-049 commit 12). Byte-identical shape.
 #[derive(Debug)]
 pub struct ManagedToolInvocationOutput {
@@ -442,7 +442,7 @@ struct Phase1Snapshot {
 /// `contexts` mutex across the executor future (spec §19.7).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::invoke_tool_with_economy`]
+/// `ContextManager::invoke_tool_with_economy`
 /// (ADR-049 commit 12). Byte-identical behavior.
 #[allow(
     clippy::too_many_arguments,

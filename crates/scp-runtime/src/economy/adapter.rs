@@ -535,7 +535,7 @@ impl<T: PaymentAdapter> PaymentAdapterDyn for T {
 /// dummy receipts for non-zero actions.
 ///
 /// Used in tests and the governance dispatch path to wire the
-/// [`prepare_paid_action`] call without requiring real payment
+/// [`prepare_paid_action`](crate::economy::integration::prepare_paid_action) call without requiring real payment
 /// infrastructure. Free actions (cost=0) bypass the adapter entirely
 /// (handled by `prepare_paid_action`). Non-zero actions will be authorized
 /// with a dummy authorization that always succeeds.

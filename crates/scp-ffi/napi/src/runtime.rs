@@ -54,7 +54,7 @@ use crate::identity::OpaqueInMemoryKeyCustody;
 // NapiBridgeInstance — per-bridge concrete bridge instance (#1549 Phase 4 PR 1)
 // ---------------------------------------------------------------------------
 
-/// Storage configuration for [`NapiBridgeInstance`].
+/// Storage configuration for `NapiBridgeInstance`.
 ///
 /// Two variants are supported:
 /// - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
@@ -72,7 +72,7 @@ pub enum StorageConfig {
     ///
     /// Persists context snapshots, identity state, and the event log
     /// across process restarts. The `key` is raw encryption key material
-    /// wrapped in [`Zeroizing`] so the caller's copy is zeroed after the
+    /// wrapped in `Zeroizing` so the caller's copy is zeroed after the
     /// variant is consumed.
     Sqlite {
         /// Directory the database file is created in.
@@ -138,9 +138,9 @@ impl ProtocolRepoVariant {
 /// repository). The MCP registries continue to live in [`crate::mcp`] as
 /// their own `OnceLock`s during PR 1 — they move onto this struct in PR 2.
 ///
-/// Constructed via [`NapiBridgeInstance::new_napi`] /
-/// [`NapiBridgeInstance::with_persistence_napi`] /
-/// [`NapiBridgeInstance::with_storage_napi`]. The default global instance is
+/// Constructed via `NapiBridgeInstance::new_napi` /
+/// `NapiBridgeInstance::with_persistence_napi` /
+/// `NapiBridgeInstance::with_storage_napi`. The default global instance is
 /// lazily allocated into [`DEFAULT_BRIDGE_INSTANCE`]; user-owned instances
 /// (via `#[napi] Scp`) build their own instead.
 ///
@@ -216,7 +216,7 @@ impl NapiBridgeInstance {
     /// Allocates a fresh `CoreFields` (new `instance_id`, new
     /// `CancellationToken`, empty `JoinSet`) and populates the protocol
     /// repository + typed registries. No `ContextManager` is attached —
-    /// callers attach one later via [`CoreFields::set_context_manager`].
+    /// callers attach one later via `CoreFields::set_context_manager`.
     #[must_use]
     pub fn new_napi() -> Self {
         let (_event_log, protocol_repository) =
@@ -239,7 +239,7 @@ impl NapiBridgeInstance {
     ///
     /// Used by callers that already have a persistence strategy (typically
     /// unit tests; production persistence is wired through PR 3's
-    /// [`StorageConfig::InMemory`] path on [`NapiBridgeInstance::with_storage_napi`]).
+    /// [`StorageConfig::InMemory`] path on `NapiBridgeInstance::with_storage_napi`).
     #[must_use]
     pub fn with_persistence_napi(persistence: Box<dyn ContextPersistence + Send + Sync>) -> Self {
         let (_event_log, protocol_repository) =
@@ -260,7 +260,7 @@ impl NapiBridgeInstance {
     /// Constructs a new `NapiBridgeInstance` honoring a [`StorageConfig`].
     ///
     /// - [`StorageConfig::InMemory`] — equivalent to
-    ///   [`NapiBridgeInstance::new_napi`]; no persistence provider is
+    ///   `NapiBridgeInstance::new_napi`; no persistence provider is
     ///   attached to the embedded `CoreFields` (the legacy
     ///   `NapiBridgePersistence` `DashMap` is still wired into the
     ///   `ContextManager` by `init_context_manager*`).
@@ -437,7 +437,7 @@ pub type ToolHandler =
 /// # Why this remains a process-global after the #1549 Phase 4 singleton purge
 ///
 /// Every other bridge-level `OnceLock` was migrated onto
-/// [`NapiBridgeInstance`] so that an `SCP` instance can be constructed, used,
+/// `NapiBridgeInstance` so that an `SCP` instance can be constructed, used,
 /// and dropped without leaking state into a second instance. `SHARED_DHT_CLIENT`
 /// intentionally stays process-global because the cross-identity Alice+Bob
 /// integration flows published and read from a single in-memory DHT:
@@ -577,7 +577,7 @@ pub fn supervisor() -> napi::Result<&'static Arc<scp_core::context::supervisor::
 // 4 merges (see ADR + plan).
 // ---------------------------------------------------------------------------
 
-/// Default [`NapiBridgeInstance`] for the legacy free-function façade.
+/// Default `NapiBridgeInstance` for the legacy free-function façade.
 ///
 /// Lazily initialized on the first free-function call that touches bridge
 /// state (via [`ensure_bridge_instance`]). User-owned instances
@@ -585,11 +585,11 @@ pub fn supervisor() -> napi::Result<&'static Arc<scp_core::context::supervisor::
 /// paths have independent `ContextManager`s, registries, and transports.
 static DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<NapiBridgeInstance>> = OnceLock::new();
 
-/// Initializes the default [`NapiBridgeInstance`] without a `ContextManager`.
+/// Initializes the default `NapiBridgeInstance` without a `ContextManager`.
 ///
 /// Called by [`ensure_bridge_instance`] and (transitively) by the
 /// `init_context_manager*` family. The `ContextManager` is attached later
-/// via [`CoreFields::set_context_manager`] once `identity_create` has
+/// via `CoreFields::set_context_manager` once `identity_create` has
 /// produced the local DID and the `MlsCryptoProvider` has been constructed
 /// with it. Per spec §12.2.3 the bridge instance carries no DID of its own.
 ///
@@ -639,10 +639,10 @@ pub fn default_bridge_instance() -> napi::Result<Arc<NapiBridgeInstance>> {
 
 /// Ensures a `BridgeInstance` exists (without a `ContextManager`).
 ///
-/// Called by [`crate::identity::ensure_did_resolver_initialized`] before
+/// Called by `ensure_did_resolver_initialized` before
 /// `DidDht::create()` runs, so that the DID resolver slot owned by
 /// `BridgeInstance` is available. The `ContextManager` is attached later
-/// via [`init_context_manager`]
+/// via `Self::init_context_manager`
 /// once the identity is known. Per spec §12.2.3 the `BridgeInstance`
 /// container has no DID requirement.
 ///
@@ -658,7 +658,7 @@ pub fn ensure_bridge_instance() {
 // 12c.9g.3. The FFI bridge no longer surfaces an `Arc<ContextManager>`;
 // callers route through `init_supervisor*` and `Supervisor::*` methods.
 
-/// Returns a reference to the default [`NapiBridgeInstance`]'s core for
+/// Returns a reference to the default `NapiBridgeInstance`'s core for
 /// handle-affinity checks only.
 ///
 /// Unlike [`bridge_instance`], this helper does NOT return an error when
@@ -671,7 +671,7 @@ pub fn ensure_bridge_instance() {
 /// # Errors
 ///
 /// Returns `napi::Error` if the default bridge has not been initialized
-/// via [`init_context_manager`] (initializes it if needed — same
+/// via `Self::init_context_manager` (initializes it if needed — same
 /// semantics as the old `check_handle_affinity` path).
 #[must_use = "the returned CoreFields reference must be used for the affinity check"]
 pub fn bridge_instance_for_affinity() -> napi::Result<&'static CoreFields> {
@@ -687,7 +687,7 @@ pub fn bridge_instance_for_affinity() -> napi::Result<&'static CoreFields> {
         })
 }
 
-/// Returns a reference to the default [`NapiBridgeInstance`]'s core.
+/// Returns a reference to the default `NapiBridgeInstance`'s core.
 ///
 /// Existing callers interacting with core state (known contexts, transport,
 /// economy trackers) continue to use this helper. Handle-affinity checks
@@ -697,7 +697,7 @@ pub fn bridge_instance_for_affinity() -> napi::Result<&'static CoreFields> {
 /// # Errors
 ///
 /// Returns `napi::Error` if the default bridge has not been initialized
-/// via [`init_context_manager`], or if it is currently suspended.
+/// via `Self::init_context_manager`, or if it is currently suspended.
 pub fn bridge_instance() -> napi::Result<&'static CoreFields> {
     let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
         napi::Error::from(ScpNapiError::Context {
@@ -833,7 +833,7 @@ impl HandleInstance for crate::testing::NapiFullStackNode {
     }
 }
 
-/// Initializes the per-instance [`Supervisor`] with production
+/// Initializes the per-instance `Supervisor` with production
 /// providers.
 ///
 /// Uses `MlsCryptoProvider` (real MLS encryption, #1294),
@@ -919,8 +919,8 @@ fn persistence_box_for_init(bi: &NapiBridgeInstance) -> Box<dyn ContextPersisten
     }
 }
 
-/// Initializes the per-instance [`Supervisor`] with
-/// [`LocalTransportProvider`].
+/// Initializes the per-instance `Supervisor` with
+/// `LocalTransportProvider`.
 ///
 /// Identical to [`init_supervisor`] except the transport provider is
 /// `LocalTransportProvider` (silently succeeds on all send/publish calls)
@@ -964,8 +964,8 @@ pub fn init_supervisor_with_local_transport(local_did: &str) {
     bi.core.set_supervisor(supervisor_arc);
 }
 
-/// Initializes the per-instance [`Supervisor`] with
-/// [`RelayTransportProvider`].
+/// Initializes the per-instance `Supervisor` with
+/// `RelayTransportProvider`.
 ///
 /// Identical to [`init_supervisor`] except the transport provider is a
 /// `RelayTransportProvider` wrapping a real `NativeRelayAdapter` connected to
@@ -1141,7 +1141,7 @@ pub(crate) struct NapiIdentityEntry {
         Vec<scp_core::identity::attestation::IdentityLinkAttestation>,
 }
 
-/// The registry is a typed field on [`NapiBridgeInstance`].
+/// The registry is a typed field on `NapiBridgeInstance`.
 /// `ensure_bridge_instance()` initializes `DEFAULT_BRIDGE_INSTANCE` if it
 /// is not yet set, so the registry is always real — there is no fallback
 /// empty map that writers could land in before a reader sees the instance
@@ -1279,7 +1279,7 @@ pub struct UcanContextState {
 /// Returns a reference to the UCAN state registry.
 ///
 /// The registry is a typed `Arc<DashMap<String, UcanContextState>>` field
-/// on [`NapiBridgeInstance`]. `ensure_bridge_instance()` initializes
+/// on `NapiBridgeInstance`. `ensure_bridge_instance()` initializes
 /// `DEFAULT_BRIDGE_INSTANCE` if it is not yet set, so the registry is
 /// always real — there is no fallback empty map that writers could land in
 /// before a reader sees the instance registry (the H1 bug fixed in commit
@@ -1670,7 +1670,7 @@ impl ContextPersistence for NapiBridgePersistence {
 // ---------------------------------------------------------------------------
 
 /// Adapter that lets a shared `Arc<dyn ContextPersistence + Send + Sync>` be
-/// consumed by [`ContextManager::with_persistence`] which requires a `Box`.
+/// consumed by `ContextManager::with_persistence` which requires a `Box`.
 ///
 /// Mirrors the `UniFFI` and `PyO3` bridges' `ArcContextPersistence`.
 /// `ContextManager::with_persistence` converts the `Box` back into an

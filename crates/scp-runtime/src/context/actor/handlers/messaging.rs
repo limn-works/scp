@@ -10,9 +10,9 @@
 //! [`MessagingCommand`], returns `Outcome<()>`.
 //!
 //! The underlying byte-identical implementation still lives on
-//! [`ContextManager::send_message`](crate::context::manager::ContextManager::send_message)
+//! [`ContextManager::send_message`](crate::context::supervisor::Supervisor::send_message)
 //! and
-//! [`ContextManager::deliver_incoming`](crate::context::manager::ContextManager::deliver_incoming):
+//! [`ContextManager::deliver_incoming`](crate::context::messaging_helpers::deliver_incoming):
 //! the handler delegates to those methods for envelope construction,
 //! MLS encryption, transport fan-out, anti-replay, buffered delivery,
 //! consequence evaluation, etc. The shim's job is:
@@ -69,7 +69,7 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// Dispatch a [`MessagingCommand`] against the attached manager + the
 /// per-context send-sequence tracker + a deps bundle. Each real variant
 /// wraps the delegated
-/// [`ContextManager`](crate::context::manager::ContextManager) call in
+/// [`Supervisor`](crate::context::supervisor::Supervisor) call in
 /// [`tokio::time::timeout`] with the per-call [`HANDLER_TIMEOUT`]
 /// budget.
 ///
@@ -78,7 +78,7 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// (`handlers::messaging::dispatch(&mgr, &self.deps, &mut state.send_tracker, cmd).await`).
 /// `deps` is accepted for symmetry — the messaging handler does not yet
 /// touch deps during the shim period (the transport, event log, etc.
-/// live on the legacy [`ContextManager`](crate::context::manager::ContextManager)).
+/// live on the legacy [`Supervisor`](crate::context::supervisor::Supervisor)).
 /// Commit 12 rewires these paths to use `deps` directly once the
 /// manager surface is deleted.
 ///
@@ -103,7 +103,7 @@ pub async fn dispatch(
 ///
 /// Messaging commands do not yet touch [`ActorDeps`] during the shim
 /// period (the transport, MLS/HPKE backends, and key-package store
-/// live on the legacy [`ContextManager`](crate::context::manager::ContextManager)).
+/// live on the legacy [`Supervisor`](crate::context::supervisor::Supervisor)).
 /// Requiring callers to synthesize an `ActorDeps` instance just to route
 /// a send / deliver through the shim would force every bridge into a
 /// placeholder-deps dance before commits 9-11 land the real dep wiring.
@@ -179,7 +179,7 @@ async fn dispatch_inner(
 
 /// Handle [`MessagingCommand::SendMessage`]: reserve a sequence number
 /// via RAII, delegate to
-/// [`ContextManager::send_message`](crate::context::manager::ContextManager::send_message)
+/// [`ContextManager::send_message`](crate::context::supervisor::Supervisor::send_message)
 /// under a 30s timeout, commit the reservation on success or let it
 /// drop (RAII rollback) on any failure path.
 #[allow(clippy::too_many_arguments)] // unavoidable — matches ContextManager::send_message signature
@@ -336,7 +336,7 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 }
 
 /// Handle [`MessagingCommand::DeliverIncoming`]: delegate to
-/// [`ContextManager::deliver_incoming`](crate::context::manager::ContextManager::deliver_incoming)
+/// [`ContextManager::deliver_incoming`](crate::context::messaging_helpers::deliver_incoming)
 /// under the same 30s timeout contract.
 ///
 /// Takes the manager by shared reference — deliver does not reserve a
@@ -430,7 +430,7 @@ async fn handle_drain_events(
 }
 
 /// Handle [`MessagingCommand::SendPseudonymAnnouncement`]: delegate to
-/// [`ContextManager::send_pseudonym_announcement`](crate::context::manager::ContextManager::send_pseudonym_announcement)
+/// [`ContextManager::send_pseudonym_announcement`](crate::context::messaging_helpers::send_pseudonym_announcement)
 /// under a 30s timeout.
 ///
 /// Best-effort — the legacy method returns `()` and silently logs

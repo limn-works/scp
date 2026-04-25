@@ -52,7 +52,7 @@ fn node_err(e: NodeError) -> PyErr {
     pyo3::exceptions::PyRuntimeError::new_err("node operation failed")
 }
 
-/// Auto-wires the global [`ContextManager`] with relay transport after
+/// Auto-wires the global `ContextManager` with relay transport after
 /// node startup.
 ///
 /// Connects to the node's local relay (with bearer token authentication)

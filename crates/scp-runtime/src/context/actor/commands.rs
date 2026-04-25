@@ -61,7 +61,7 @@ pub type DeliverIncomingReply = oneshot::Sender<Result<Option<(Vec<u8>, String)>
 /// Reply-channel type alias for [`MessagingCommand::DrainEvents`]. The
 /// reply carries the drained `ContextEvent` vector — empty iff the
 /// context is unknown (matches the legacy
-/// [`ContextManager::drain_events`](crate::context::manager::ContextManager::drain_events)
+/// [`ContextManager::drain_events`](crate::context::supervisor::Supervisor::drain_events)
 /// "soft-default on unknown context" contract). Factored out to satisfy
 /// `clippy::type_complexity`.
 pub type DrainEventsReply =
@@ -76,7 +76,7 @@ pub type DrainEventsReply =
 ///
 /// Variants correspond one-to-one with handler files under
 /// [`crate::context::actor::handlers`]. The dispatch loop in
-/// [`crate::context::actor::ContextActor::dispatch`] matches on this enum.
+/// [`crate::context::actor::ContextActor::run`] matches on this enum.
 pub enum ContextCommand {
     /// Messaging — send, deliver, decrypt (spec §9.8).
     Messaging(MessagingCommand),
@@ -155,7 +155,7 @@ pub struct SendMessagePayload {
 /// the ADR-049 commit ladder (see `handlers/messaging.rs`). Variants
 /// cover the hot-path send + deliver operations; sender-key rotation,
 /// distribute/remove, sender-key request handling, and sender-key
-/// management messages all stay on the legacy [`ContextManager`] surface
+/// management messages all stay on the legacy `ContextManager` surface
 /// until commits 10-11 per the plan row-6 scope.
 pub enum MessagingCommand {
     /// Placeholder — retained so out-of-tree callers constructed during
@@ -171,7 +171,7 @@ pub enum MessagingCommand {
     /// Encrypts and transmits a message within an active context.
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::send_message`](crate::context::manager::ContextManager::send_message)
+    /// [`ContextManager::send_message`](crate::context::supervisor::Supervisor::send_message)
     /// signature exactly: the handler delegates to that method for
     /// byte-identical envelope construction, inner-signature signing,
     /// sender-key sealing, MLS encryption, and transport fan-out.
@@ -181,7 +181,7 @@ pub enum MessagingCommand {
     /// Every field is owned (`Vec<u8>`, `String`, `DID`,
     /// `ContextParams`) rather than borrowed so the command can cross
     /// the actor mailbox without lifetime juggling. The handler
-    /// reconstructs an ephemeral [`ContextHandle`] on the receive side
+    /// reconstructs an ephemeral [`ContextHandle`](crate::context::ContextHandle) on the receive side
     /// to match the legacy method's signature.
     ///
     /// # Reply
@@ -208,7 +208,7 @@ pub enum MessagingCommand {
     /// and returns `None`).
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::deliver_incoming`](crate::context::manager::ContextManager::deliver_incoming)
+    /// [`ContextManager::deliver_incoming`](crate::context::messaging_helpers::deliver_incoming)
     /// signature. Used by every FFI bridge's relay subscription loop;
     /// the return type matches the bridge's per-event dispatch pattern.
     ///
@@ -233,7 +233,7 @@ pub enum MessagingCommand {
     /// Drain the per-context receive buffer.
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::drain_events`](crate::context::manager::ContextManager::drain_events)
+    /// [`ContextManager::drain_events`](crate::context::supervisor::Supervisor::drain_events)
     /// signature: empties the receive buffer and returns the drained
     /// events. The legacy method returns an empty `Vec` on unknown
     /// context; the dispatch shim preserves that contract by surfacing
@@ -258,7 +258,7 @@ pub enum MessagingCommand {
     /// other members of a context.
     ///
     /// Mirrors the legacy
-    /// [`ContextManager::send_pseudonym_announcement`](crate::context::manager::ContextManager::send_pseudonym_announcement)
+    /// [`ContextManager::send_pseudonym_announcement`](crate::context::messaging_helpers::send_pseudonym_announcement)
     /// signature exactly: the handler delegates to that method which
     /// in turn wraps the announcement payload and routes it through
     /// `send_message`. Best-effort — the legacy method returns no
@@ -430,7 +430,7 @@ pub struct RestoreContextPayload {
 /// See [`ContextCommand::Lifecycle`]. Real variants land in commit 9 of
 /// the ADR-049 commit ladder (see `handlers/lifecycle.rs`). Variants
 /// mirror the legacy
-/// [`ContextManager`](crate::context::manager::ContextManager) lifecycle
+/// [`Supervisor`](crate::context::supervisor::Supervisor) lifecycle
 /// surface one-to-one: the handler shim delegates to the legacy method
 /// under the hood while the command shape fixes the post-refactor
 /// dispatch envelope. Commit 12 deletes the shim; the handler bodies
@@ -441,8 +441,8 @@ pub struct RestoreContextPayload {
 /// **Create-as-prepare.** `CreateContext` / `JoinContext` are legitimate
 /// saga entry points in later commits (standing-pair creation,
 /// migration). Commit 9 routes them through
-/// [`ContextManager::create_context`](crate::context::manager::ContextManager::create_context)
-/// / [`ContextManager::join_context`](crate::context::manager::ContextManager::join_context)
+/// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context)
+/// / [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context)
 /// directly; saga wiring moves into this enum in commit 11.
 pub enum LifecycleCommand {
     /// Placeholder — retained so out-of-tree callers constructed during
@@ -456,7 +456,7 @@ pub enum LifecycleCommand {
     },
 
     /// Creates a new MLS-backed (or broadcast-mode) context. Mirrors
-    /// [`ContextManager::create_context`](crate::context::manager::ContextManager::create_context).
+    /// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context).
     ///
     /// Saga-compatible: the same variant carries the
     /// `create_context`-for-standing-pair-prepare flow in commit 11; for
@@ -473,7 +473,7 @@ pub enum LifecycleCommand {
     },
 
     /// Joins an existing context. Mirrors
-    /// [`ContextManager::join_context`](crate::context::manager::ContextManager::join_context).
+    /// [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context).
     ///
     /// The caller is the MLS `KeyPackage` owner (`key_package.owner_did`).
     /// `spending_ucan` is the optional UCAN for the economy layer's
@@ -489,7 +489,7 @@ pub enum LifecycleCommand {
     },
 
     /// Removes a member from an active context. Mirrors
-    /// [`ContextManager::leave_context`](crate::context::manager::ContextManager::leave_context).
+    /// [`ContextManager::leave_context`](crate::context::supervisor::Supervisor::leave_context).
     ///
     /// Self-removal (`caller_did == member_did`) is always permitted;
     /// removing another member requires the `MemberRemove` capability
@@ -502,7 +502,7 @@ pub enum LifecycleCommand {
     },
 
     /// Initiates cooperative context closure. Mirrors
-    /// [`ContextManager::close_context`](crate::context::manager::ContextManager::close_context)
+    /// [`ContextManager::close_context`](crate::context::lifecycle_helpers::close_context)
     /// (not `close_context_with_key` — the latter is an internal
     /// optimization for checkpoint generation; commit 9 exposes the
     /// public surface through the command enum).
@@ -519,7 +519,7 @@ pub enum LifecycleCommand {
 
     /// Exports a snapshot of the context for cross-instance transfer.
     /// Mirrors
-    /// [`ContextManager::export_context`](crate::context::manager::ContextManager::export_context).
+    /// [`ContextManager::export_context`](crate::context::lifecycle_helpers::export_context).
     ExportContext {
         /// Context identifier string.
         context_id: String,
@@ -530,7 +530,7 @@ pub enum LifecycleCommand {
     },
 
     /// Imports a previously exported context. Mirrors
-    /// [`ContextManager::import_context`](crate::context::manager::ContextManager::import_context).
+    /// [`ContextManager::import_context`](crate::context::lifecycle_helpers::import_context).
     ///
     /// The per-instance authorization-state wipe policy (C3) is enforced
     /// by the legacy method; the command carries the raw export and
@@ -545,7 +545,7 @@ pub enum LifecycleCommand {
 
     /// Restore a single previously-persisted context from storage.
     /// Mirrors
-    /// [`ContextManager::restore_context`](crate::context::manager::ContextManager::restore_context).
+    /// [`ContextManager::restore_context`](crate::context::supervisor::Supervisor::restore_context).
     ///
     /// The legacy method loads a snapshot from the configured
     /// [`ContextPersistence`](crate::context::persistence::ContextPersistence)
@@ -562,7 +562,7 @@ pub enum LifecycleCommand {
 
     /// Generate and store a per-member access key for explicit
     /// lifecycle management (§9.17.2 step 1). Mirrors
-    /// [`ContextManager::generate_context_access_key`](crate::context::manager::ContextManager::generate_context_access_key).
+    /// [`ContextManager::generate_context_access_key`](crate::context::queries_helpers::generate_context_access_key).
     ///
     /// Requires `ContextClose` capability on the caller. Overwrites any
     /// existing key for the same `(context_id, member_did)` pair.
@@ -579,7 +579,7 @@ pub enum LifecycleCommand {
 
     /// Revoke (remove) a member's access key from the context's
     /// access key store (§9.17.2 step 3, ADR-038). Mirrors
-    /// [`ContextManager::revoke_context_access_key`](crate::context::manager::ContextManager::revoke_context_access_key).
+    /// [`ContextManager::revoke_context_access_key`](crate::context::queries_helpers::revoke_context_access_key).
     ///
     /// Requires `ContextClose` capability on the caller.
     RevokeContextAccessKey {
@@ -596,7 +596,7 @@ pub enum LifecycleCommand {
     /// Restore a member's access key by generating a fresh key at
     /// epoch 0 (§9.17.2 step 5, ADR-038 forward-only restoration).
     /// Mirrors
-    /// [`ContextManager::restore_context_access_key`](crate::context::manager::ContextManager::restore_context_access_key).
+    /// [`ContextManager::restore_context_access_key`](crate::context::queries_helpers::restore_context_access_key).
     ///
     /// Requires `ContextClose` capability on the caller. Historical
     /// content from the revocation period remains permanently
@@ -632,7 +632,7 @@ pub type ProposeGovernanceActionReply = oneshot::Sender<
 
 /// Reply-channel type alias for
 /// [`GovernanceCommand::ProposeGovernanceActionChecked`]. The reply
-/// carries a full [`ProposalOutcome`] — proposal, status, optional
+/// carries a full [`ProposalOutcome`](crate::context::state::ProposalOutcome) — proposal, status, optional
 /// execution result. Factored out for the same reason as
 /// [`ProposeGovernanceActionReply`].
 pub type ProposeGovernanceActionCheckedReply =
@@ -704,7 +704,7 @@ pub struct ExecuteGovernanceActionPayload {
 /// See [`ContextCommand::Governance`]. Real variants land in commit 10
 /// of the ADR-049 commit ladder (see `handlers/governance.rs`).
 /// Variants mirror the public surface of
-/// [`crate::context::manager::governance`] one-to-one: propose, vote,
+/// [`crate::context::governance_helpers`] one-to-one: propose, vote,
 /// approve/reject/withdraw, execute, read proposals, apply pending
 /// ceiling / economic-policy changes, tombstone migrations, acknowledge
 /// commit faults. ADR-031 defines 28 governance actions; those are the
@@ -723,7 +723,7 @@ pub enum GovernanceCommand {
     },
 
     /// Submits a governance proposal — unchecked variant. Mirrors
-    /// [`ContextManager::propose_governance_action`](crate::context::manager::ContextManager::propose_governance_action).
+    /// [`ContextManager::propose_governance_action`](crate::context::supervisor::Supervisor::propose_governance_action).
     /// Accepts the proposer DID + action + signing key without a
     /// capability pre-check (the governance engine enforces eligibility
     /// internally). For `SingleAdmin` contexts the proposal is auto-
@@ -738,7 +738,7 @@ pub enum GovernanceCommand {
     },
 
     /// Submits a governance proposal — checked variant. Mirrors
-    /// [`ContextManager::propose_governance_action_checked`](crate::context::manager::ContextManager::propose_governance_action_checked).
+    /// [`ContextManager::propose_governance_action_checked`](crate::context::supervisor::Supervisor::propose_governance_action_checked).
     /// Validates the proposer's `GovernancePropose` capability inside
     /// the same lock as the proposal submission (no TOCTOU).
     ProposeGovernanceActionChecked {
@@ -750,7 +750,7 @@ pub enum GovernanceCommand {
     },
 
     /// Casts a vote on a pending proposal. Mirrors
-    /// [`ContextManager::vote_on_proposal`](crate::context::manager::ContextManager::vote_on_proposal).
+    /// [`ContextManager::vote_on_proposal`](crate::context::supervisor::Supervisor::vote_on_proposal).
     /// `approve == true` is an approval vote; `false` is rejection.
     VoteOnProposal {
         /// Boxed owned payload.
@@ -764,7 +764,7 @@ pub enum GovernanceCommand {
     },
 
     /// Casts an approval vote with explicit capability pre-check.
-    /// Mirrors [`ContextManager::approve_governance_proposal`](crate::context::manager::ContextManager::approve_governance_proposal).
+    /// Mirrors [`ContextManager::approve_governance_proposal`](crate::context::governance_helpers::approve_governance_proposal).
     /// The reply carries only the resulting status (the legacy method
     /// discards the event list by convention — see its implementation).
     ApproveGovernanceProposal {
@@ -777,7 +777,7 @@ pub enum GovernanceCommand {
     },
 
     /// Casts a rejection vote with explicit capability pre-check.
-    /// Mirrors [`ContextManager::reject_governance_proposal`](crate::context::manager::ContextManager::reject_governance_proposal).
+    /// Mirrors [`ContextManager::reject_governance_proposal`](crate::context::governance_helpers::reject_governance_proposal).
     RejectGovernanceProposal {
         /// Boxed owned payload.
         payload: Box<VoteOnProposalPayload>,
@@ -788,7 +788,7 @@ pub enum GovernanceCommand {
     },
 
     /// Withdraws a previously cast vote. Mirrors
-    /// [`ContextManager::withdraw_governance_vote`](crate::context::manager::ContextManager::withdraw_governance_vote).
+    /// [`ContextManager::withdraw_governance_vote`](crate::context::supervisor::Supervisor::withdraw_governance_vote).
     /// No signing key — withdrawal is the voter's privileged operation
     /// on their own vote per the governance engine's trait contract.
     WithdrawGovernanceVote {
@@ -805,7 +805,7 @@ pub enum GovernanceCommand {
     },
 
     /// Executes an already-approved governance proposal. Mirrors
-    /// [`ContextManager::execute_governance_action`](crate::context::manager::ContextManager::execute_governance_action).
+    /// [`ContextManager::execute_governance_action`](crate::context::governance_helpers::execute_governance_action).
     /// Caller MUST pass a proposal whose status is
     /// [`ProposalStatus::Approved`](scp_protocol::context::governance::ProposalStatus);
     /// the legacy method enforces the gate.
@@ -818,7 +818,7 @@ pub enum GovernanceCommand {
     },
 
     /// Reads a single proposal by ID. Mirrors
-    /// [`ContextManager::get_proposal`](crate::context::manager::ContextManager::get_proposal).
+    /// [`ContextManager::get_proposal`](crate::context::supervisor::Supervisor::get_proposal).
     GetProposal {
         /// Context identifier string.
         context_id: String,
@@ -831,7 +831,7 @@ pub enum GovernanceCommand {
     },
 
     /// Lists all proposals for a context. Mirrors
-    /// [`ContextManager::list_proposals`](crate::context::manager::ContextManager::list_proposals).
+    /// [`ContextManager::list_proposals`](crate::context::supervisor::Supervisor::list_proposals).
     ListProposals {
         /// Context identifier string.
         context_id: String,
@@ -843,7 +843,7 @@ pub enum GovernanceCommand {
 
     /// Applies a pending ceiling modification whose notification period
     /// has expired. Mirrors
-    /// [`ContextManager::apply_pending_ceiling_modification`](crate::context::manager::ContextManager::apply_pending_ceiling_modification).
+    /// [`ContextManager::apply_pending_ceiling_modification`](crate::context::governance_helpers::apply_pending_ceiling_modification).
     /// Returns `true` iff a pending modification was applied.
     ApplyPendingCeilingModification {
         /// Context identifier string.
@@ -857,7 +857,7 @@ pub enum GovernanceCommand {
 
     /// Applies a pending economic-policy change whose notification
     /// period has expired. Mirrors
-    /// [`ContextManager::apply_pending_economic_policy_change`](crate::context::manager::ContextManager::apply_pending_economic_policy_change).
+    /// [`ContextManager::apply_pending_economic_policy_change`](crate::context::governance_helpers::apply_pending_economic_policy_change).
     /// Returns `true` iff a pending change was applied.
     ApplyPendingEconomicPolicyChange {
         /// Context identifier string.
@@ -870,7 +870,7 @@ pub enum GovernanceCommand {
 
     /// Tombstones a migrated context after the grace period expires.
     /// Mirrors
-    /// [`ContextManager::tombstone_migrated_context`](crate::context::manager::ContextManager::tombstone_migrated_context).
+    /// [`ContextManager::tombstone_migrated_context`](crate::context::governance_helpers::tombstone_migrated_context).
     TombstoneMigratedContext {
         /// Context identifier string.
         context_id: String,
@@ -879,7 +879,7 @@ pub enum GovernanceCommand {
     },
 
     /// Returns the migration state for a context if one exists. Mirrors
-    /// [`ContextManager::migration_state`](crate::context::manager::ContextManager::migration_state).
+    /// [`ContextManager::migration_state`](crate::context::governance_helpers::migration_state).
     ///
     /// This is read-only; the handler returns
     /// [`Outcome::ok`](crate::context::actor::Outcome::ok) and reports
@@ -894,7 +894,7 @@ pub enum GovernanceCommand {
 
     /// Acknowledges and clears a commit-fault marker for a context
     /// (PR #1606 C6). Mirrors
-    /// [`ContextManager::acknowledge_commit_fault`](crate::context::manager::ContextManager::acknowledge_commit_fault).
+    /// [`ContextManager::acknowledge_commit_fault`](crate::context::governance_helpers::acknowledge_commit_fault).
     AcknowledgeCommitFault {
         /// Context identifier string.
         context_id: String,
@@ -976,7 +976,7 @@ pub struct UnsubscribeBroadcastPayload {
 /// # KeyCustody plumbing
 ///
 /// The legacy
-/// [`ContextManager::publish_broadcast`](crate::context::manager::ContextManager::publish_broadcast)
+/// [`ContextManager::publish_broadcast`](crate::context::broadcast_helpers::publish_broadcast)
 /// takes a `custody: &impl KeyCustody + &KeyHandle` pair; the
 /// [`KeyCustody`](scp_platform::KeyCustody) trait uses RPITIT and is
 /// NOT `dyn`-safe, so it cannot cross the actor mailbox. Instead:
@@ -988,7 +988,7 @@ pub struct UnsubscribeBroadcastPayload {
 ///   [`Supervisor::dispatch_broadcast_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_broadcast_command)
 ///   is generic over the concrete custody type, and the shim extracts
 ///   the `KeyHandle` from the command and passes both to
-///   [`ContextManager::publish_broadcast`](crate::context::manager::ContextManager::publish_broadcast).
+///   [`ContextManager::publish_broadcast`](crate::context::broadcast_helpers::publish_broadcast).
 /// - For the post-refactor actor loop (commit 12+), the custody is
 ///   available via the actor's bridge-instance reference; the actor
 ///   body resolves the custody from the instance and signs inline.
@@ -1033,7 +1033,7 @@ pub struct BroadcastBlockPayload {
 }
 
 /// See [`ContextCommand::Broadcast`]. Real variants cover every public
-/// method on [`crate::context::manager::broadcast`] that is NOT the
+/// method on [`crate::context::broadcast_helpers`] that is NOT the
 /// saga-wired broadcast-hosting handshake. The handshake is spec-gapped
 /// — see `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
 ///
@@ -1044,7 +1044,7 @@ pub struct BroadcastBlockPayload {
 /// broadcast envelope — the custody trait uses RPITIT and cannot cross
 /// an actor mailbox. For commit 11 the non-saga variants store only the
 /// [`KeyHandle`](scp_platform::KeyHandle); the handler reaches back to
-/// the attached [`ContextManager`](crate::context::manager::ContextManager)
+/// the attached [`Supervisor`](crate::context::supervisor::Supervisor)
 /// for the custody reference, matching the bridge-level wiring the
 /// legacy method uses today.
 pub enum BroadcastCommand {
@@ -1057,7 +1057,7 @@ pub enum BroadcastCommand {
     },
 
     /// Subscribe a DID to a broadcast context. Mirrors
-    /// [`ContextManager::subscribe_broadcast`](crate::context::manager::ContextManager::subscribe_broadcast).
+    /// [`ContextManager::subscribe_broadcast`](crate::context::broadcast_helpers::subscribe_broadcast).
     ///
     /// The validation-context-generic variant on `ContextManager` carries
     /// a `ValidationContext<'_, D, N, R, P, S>` parameter; the actor
@@ -1072,7 +1072,7 @@ pub enum BroadcastCommand {
     },
 
     /// Unsubscribe a DID from a broadcast context. Mirrors
-    /// [`ContextManager::unsubscribe_broadcast`](crate::context::manager::ContextManager::unsubscribe_broadcast).
+    /// [`ContextManager::unsubscribe_broadcast`](crate::context::broadcast_helpers::unsubscribe_broadcast).
     UnsubscribeBroadcast {
         /// Boxed owned payload.
         payload: Box<UnsubscribeBroadcastPayload>,
@@ -1081,7 +1081,7 @@ pub enum BroadcastCommand {
     },
 
     /// Publish raw bytes to a broadcast context. Mirrors
-    /// [`ContextManager::publish_broadcast`](crate::context::manager::ContextManager::publish_broadcast).
+    /// [`ContextManager::publish_broadcast`](crate::context::broadcast_helpers::publish_broadcast).
     PublishBroadcast {
         /// Boxed owned payload.
         payload: Box<PublishBroadcastPayload>,
@@ -1089,9 +1089,9 @@ pub enum BroadcastCommand {
         reply: PublishBroadcastReply,
     },
 
-    /// Publish structured [`BroadcastContent`](scp_protocol::context::broadcast::BroadcastContent)
+    /// Publish structured [`BroadcastContent`](scp_protocol::context::broadcast_content::BroadcastContent)
     /// to a broadcast context. Mirrors
-    /// [`ContextManager::publish_broadcast_content`](crate::context::manager::ContextManager::publish_broadcast_content).
+    /// [`ContextManager::publish_broadcast_content`](crate::context::broadcast_helpers::publish_broadcast_content).
     PublishBroadcastContent {
         /// Boxed owned payload.
         payload: Box<PublishBroadcastContentPayload>,
@@ -1101,7 +1101,7 @@ pub enum BroadcastCommand {
 
     /// Block a subscriber from receiving future broadcasts from a
     /// specific author. Mirrors
-    /// [`ContextManager::block_broadcast_subscriber`](crate::context::manager::ContextManager::block_broadcast_subscriber).
+    /// [`ContextManager::block_broadcast_subscriber`](crate::context::broadcast_helpers::block_broadcast_subscriber).
     BlockBroadcastSubscriber {
         /// Boxed owned payload.
         payload: Box<BroadcastBlockPayload>,
@@ -1110,7 +1110,7 @@ pub enum BroadcastCommand {
     },
 
     /// Unblock a previously blocked subscriber. Mirrors
-    /// [`ContextManager::unblock_broadcast_subscriber`](crate::context::manager::ContextManager::unblock_broadcast_subscriber).
+    /// [`ContextManager::unblock_broadcast_subscriber`](crate::context::broadcast_helpers::unblock_broadcast_subscriber).
     UnblockBroadcastSubscriber {
         /// Boxed owned payload.
         payload: Box<BroadcastBlockPayload>,
@@ -1119,7 +1119,7 @@ pub enum BroadcastCommand {
     },
 
     /// Evaluate a subscriber's broadcast-key request. Mirrors
-    /// [`ContextManager::handle_broadcast_key_request`](crate::context::manager::ContextManager::handle_broadcast_key_request).
+    /// [`ContextManager::handle_broadcast_key_request`](crate::context::broadcast_helpers::handle_broadcast_key_request).
     ///
     /// Read-mostly (no per-context mutation) — handler reports
     /// `mutated: false`.
@@ -1136,7 +1136,7 @@ pub enum BroadcastCommand {
     },
 
     /// Return the subscriber count for a broadcast context. Mirrors
-    /// [`ContextManager::broadcast_subscriber_count`](crate::context::manager::ContextManager::broadcast_subscriber_count).
+    /// [`ContextManager::broadcast_subscriber_count`](crate::context::broadcast_helpers::broadcast_subscriber_count).
     /// Read-only. `Ok(None)` iff the context is unknown or not broadcast.
     BroadcastSubscriberCount {
         /// Context identifier string.
@@ -1146,7 +1146,7 @@ pub enum BroadcastCommand {
     },
 
     /// Membership predicate — `true` iff `did` is a subscriber. Mirrors
-    /// [`ContextManager::is_broadcast_subscriber`](crate::context::manager::ContextManager::is_broadcast_subscriber).
+    /// [`ContextManager::is_broadcast_subscriber`](crate::context::broadcast_helpers::is_broadcast_subscriber).
     /// Read-only.
     IsBroadcastSubscriber {
         /// Context identifier string.
@@ -1158,7 +1158,7 @@ pub enum BroadcastCommand {
     },
 
     /// Return the broadcast context's admission policy. Mirrors
-    /// [`ContextManager::broadcast_admission`](crate::context::manager::ContextManager::broadcast_admission).
+    /// [`ContextManager::broadcast_admission`](crate::context::broadcast_helpers::broadcast_admission).
     /// Read-only. `Ok(None)` iff the context is unknown or not broadcast.
     BroadcastAdmission {
         /// Context identifier string.
@@ -1201,8 +1201,8 @@ pub type VerifyPaymentReceiptsReply = oneshot::Sender<
 
 /// See [`ContextCommand::Economy`]. Real variants land in commit 10 of
 /// the ADR-049 commit ladder (see `handlers/economy.rs`). The public
-/// surface of [`crate::context::manager::economy`] currently consists
-/// of a single method, [`verify_payment_receipts`](crate::context::manager::ContextManager::verify_payment_receipts);
+/// surface of [`crate::context::economy_helpers`] currently consists
+/// of a single method, [`verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts);
 /// all other economy methods (`authorize_paid_action`,
 /// `complete_paid_action`, `void_paid_action`, `rollback_economy_ticket`)
 /// are `pub(super)` helpers invoked by the messaging path. Commit 12
@@ -1220,7 +1220,7 @@ pub enum EconomyCommand {
 
     /// Verifies a batch of payment receipts against the configured
     /// payment adapter. Mirrors
-    /// [`ContextManager::verify_payment_receipts`](crate::context::manager::ContextManager::verify_payment_receipts).
+    /// [`ContextManager::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts).
     ///
     /// Read-only — the handler returns
     /// [`Outcome::ok`](crate::context::actor::Outcome::ok) and reports
@@ -1298,7 +1298,7 @@ pub struct RecoveryNotifyContactPayload {
 /// See [`ContextCommand::TrustRecovery`]. Real variants land in commit
 /// 10 of the ADR-049 commit ladder (see `handlers/trust_recovery.rs`).
 /// Variants mirror the public surface of
-/// [`crate::context::manager::trust_recovery`] one-to-one: attestation
+/// [`crate::context::trust_recovery_helpers`] one-to-one: attestation
 /// verification, challenge issuance + verification, governance
 /// checkpoints + cosignatures, compromise-recovery epoch advance, and
 /// recovery notifications (spec §9.12).
@@ -1312,7 +1312,7 @@ pub enum TrustRecoveryCommand {
     },
 
     /// Creates a governance-aware checkpoint for a context. Mirrors
-    /// [`ContextManager::create_governance_checkpoint`](crate::context::manager::ContextManager::create_governance_checkpoint).
+    /// [`ContextManager::create_governance_checkpoint`](crate::context::trust_recovery_helpers::create_governance_checkpoint).
     CreateGovernanceCheckpoint {
         /// Boxed owned payload.
         payload: Box<CreateGovernanceCheckpointPayload>,
@@ -1324,7 +1324,7 @@ pub enum TrustRecoveryCommand {
 
     /// Adds a cosignature to an existing checkpoint and re-evaluates
     /// attestation status. Mirrors
-    /// [`ContextManager::add_checkpoint_cosignature`](crate::context::manager::ContextManager::add_checkpoint_cosignature).
+    /// [`ContextManager::add_checkpoint_cosignature`](crate::context::trust_recovery_helpers::add_checkpoint_cosignature).
     ///
     /// The caller supplies a mutable checkpoint (by owned value) and
     /// the cosignature; the handler applies the cosignature on success
@@ -1354,7 +1354,7 @@ pub enum TrustRecoveryCommand {
 
     /// Advances the MLS epoch for a context as part of compromise
     /// recovery (spec §9.12 step 2). Mirrors
-    /// [`ContextManager::recovery_advance_epoch`](crate::context::manager::ContextManager::recovery_advance_epoch).
+    /// [`ContextManager::recovery_advance_epoch`](crate::context::trust_recovery_helpers::recovery_advance_epoch).
     RecoveryAdvanceEpoch {
         /// Context identifier string.
         context_id: String,
@@ -1364,7 +1364,7 @@ pub enum TrustRecoveryCommand {
 
     /// Sends a recovery notification directly through a named context
     /// (spec §9.12 step 5 — context already known). Mirrors
-    /// [`ContextManager::recovery_send_notification`](crate::context::manager::ContextManager::recovery_send_notification).
+    /// [`ContextManager::recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification).
     RecoverySendNotification {
         /// Boxed owned payload (carries the signing key bytes).
         payload: Box<RecoverySendNotificationPayload>,
@@ -1374,7 +1374,7 @@ pub enum TrustRecoveryCommand {
 
     /// Sends a recovery notification to a contact DID by finding a
     /// shared context. Mirrors
-    /// [`ContextManager::recovery_notify_contact`](crate::context::manager::ContextManager::recovery_notify_contact).
+    /// [`ContextManager::recovery_notify_contact`](crate::context::trust_recovery_helpers::recovery_notify_contact).
     RecoveryNotifyContact {
         /// Boxed owned payload (carries the signing key bytes).
         payload: Box<RecoveryNotifyContactPayload>,
@@ -1384,7 +1384,7 @@ pub enum TrustRecoveryCommand {
 }
 
 /// See [`ContextCommand::Standing`]. Real variants cover every public
-/// method on [`crate::context::manager::standing`] that is NOT the
+/// method on [`crate::context::standing_helpers`] that is NOT the
 /// saga-wired standing-pair-create initiator path. The saga path is
 /// spec-gapped — see
 /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
@@ -1399,7 +1399,7 @@ pub enum StandingCommand {
 
     /// Get-or-create a standing bilateral context between two identities
     /// (spec §5.12.4 — contact graph). Mirrors
-    /// [`ContextManager::standing_context`](crate::context::manager::ContextManager::standing_context).
+    /// [`ContextManager::standing_context`](crate::context::standing_helpers::standing_context).
     ///
     /// Idempotent at the legacy-method level — a concurrent call
     /// returning `Active` or `Creating` surfaces the same context ID
@@ -1408,7 +1408,7 @@ pub enum StandingCommand {
     /// # Saga scope
     ///
     /// The legacy method internally calls
-    /// [`ContextManager::create_context`](crate::context::manager::ContextManager::create_context).
+    /// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context).
     /// Commit 11 routes through that legacy path directly — the
     /// standing-pair-create saga FSM (Prepare+Commit 2-phase) is
     /// deferred per
@@ -1426,7 +1426,7 @@ pub enum StandingCommand {
     },
 
     /// Returns the number of tracked standing contexts. Mirrors
-    /// [`ContextManager::standing_context_count`](crate::context::manager::ContextManager::standing_context_count).
+    /// [`ContextManager::standing_context_count`](crate::context::standing_helpers::standing_context_count).
     /// Read-only.
     StandingContextCount {
         /// Oneshot reply channel.
@@ -1435,7 +1435,7 @@ pub enum StandingCommand {
 
     /// Returns `true` iff a standing context exists for the given peer.
     /// Mirrors
-    /// [`ContextManager::has_standing_context`](crate::context::manager::ContextManager::has_standing_context).
+    /// [`ContextManager::has_standing_context`](crate::context::standing_helpers::has_standing_context).
     /// Read-only.
     HasStandingContext {
         /// Candidate peer DID.
@@ -1445,7 +1445,7 @@ pub enum StandingCommand {
     },
 
     /// Registers an existing context as a standing context. Mirrors
-    /// [`ContextManager::register_standing_context`](crate::context::manager::ContextManager::register_standing_context).
+    /// [`ContextManager::register_standing_context`](crate::context::standing_helpers::register_standing_context).
     /// Called during SDK init to restore the contact-graph index from a
     /// persisted snapshot.
     RegisterStandingContext {
@@ -1456,7 +1456,7 @@ pub enum StandingCommand {
     },
 
     /// Reconnects transport for every standing context. Mirrors
-    /// [`ContextManager::reconnect_all_standing`](crate::context::manager::ContextManager::reconnect_all_standing).
+    /// [`ContextManager::reconnect_all_standing`](crate::context::standing_helpers::reconnect_all_standing).
     /// Returns the number of contexts that were successfully
     /// reconnected.
     ReconnectAllStanding {
@@ -1516,7 +1516,7 @@ pub struct TtlTimerPayload {
 /// See [`ContextCommand::TtlClose`]. Real variants land in commit 9 of
 /// the ADR-049 commit ladder (see `handlers/ttl_close.rs`). Variants
 /// mirror the legacy
-/// [`ContextManager`](crate::context::manager::ContextManager) TTL
+/// [`Supervisor`](crate::context::supervisor::Supervisor) TTL
 /// surface one-to-one. The handler shim delegates to the legacy method
 /// under the hood.
 ///
@@ -1524,7 +1524,7 @@ pub struct TtlTimerPayload {
 /// architecture turns the TTL timer into a `select!` arm in
 /// [`ContextActor::run`](crate::context::actor::ContextActor). Commit 9
 /// keeps the timer spawned from the legacy
-/// [`ContextManager`](crate::context::manager::ContextManager) internals
+/// [`Supervisor`](crate::context::supervisor::Supervisor) internals
 /// (`spawn_ttl_timer`); the handler variants here respond to
 /// caller-initiated TTL commands (extend, finalize, explicit expiry)
 /// synchronously. Full timer-owning actor logic migrates with plan row
@@ -1541,8 +1541,8 @@ pub enum TtlCloseCommand {
     },
 
     /// Spawns (or respawns) the TTL timer for the given context with a
-    /// caller-supplied duration. Mirrors the legacy
-    /// [`ContextManager::spawn_ttl_timer`](crate::context::manager::ContextManager)
+    /// caller-supplied duration. Mirrors the legacy `ContextManager`'s
+    /// [`spawn_ttl_timer`](crate::context::lifecycle_helpers::spawn_ttl_timer)
     /// call path used at `create_context` / `restore_context` time.
     ///
     /// `Ok(())` once the timer has been successfully installed.
@@ -1554,7 +1554,7 @@ pub enum TtlCloseCommand {
     },
 
     /// Proposes a TTL extension on behalf of a specific member. Mirrors
-    /// [`ContextManager::propose_ttl_extension`](crate::context::manager::ContextManager::propose_ttl_extension).
+    /// [`ContextManager::propose_ttl_extension`](crate::context::lifecycle_helpers::propose_ttl_extension).
     ///
     /// Reply is `Ok(true)` iff the extension reaches unanimous consent
     /// on this call; the caller then invokes
@@ -1577,7 +1577,7 @@ pub enum TtlCloseCommand {
 
     /// Resets the TTL timer to a new duration after a successful
     /// unanimous extension. Mirrors
-    /// [`ContextManager::reset_ttl_timer`](crate::context::manager::ContextManager::reset_ttl_timer).
+    /// [`ContextManager::reset_ttl_timer`](crate::context::lifecycle_helpers::reset_ttl_timer).
     ResetTtlTimer {
         /// Boxed owned payload — see [`TtlTimerPayload`].
         payload: Box<TtlTimerPayload>,
@@ -1586,7 +1586,7 @@ pub enum TtlCloseCommand {
     },
 
     /// Executes a caller-initiated TTL expiry. Mirrors
-    /// [`ContextManager::handle_ttl_expiry`](crate::context::manager::ContextManager::handle_ttl_expiry).
+    /// [`ContextManager::handle_ttl_expiry`](crate::context::lifecycle_helpers::handle_ttl_expiry).
     ///
     /// In commit 9 this is the explicit-expiry entry point; the timer
     /// task spawned by `StartTtlTimer` still runs the automatic path
@@ -1601,7 +1601,7 @@ pub enum TtlCloseCommand {
 
     /// Completes context closure after all members have processed the
     /// `ContextClosing` notification. Mirrors
-    /// [`ContextManager::finalize_close`](crate::context::manager::ContextManager::finalize_close).
+    /// [`ContextManager::finalize_close`](crate::context::lifecycle_helpers::finalize_close).
     FinalizeClose {
         /// Boxed owned payload — see [`TtlContextPayload`].
         payload: Box<TtlContextPayload>,
@@ -1611,8 +1611,8 @@ pub enum TtlCloseCommand {
 }
 
 /// See [`ContextCommand::Tools`]. Real variants cover every public
-/// method on [`crate::context::manager::tools`] EXCEPT
-/// [`ContextManager::invoke_tool_with_economy`](crate::context::manager::ContextManager::invoke_tool_with_economy)
+/// method on [`crate::context::tools_helpers`] EXCEPT
+/// [`ContextManager::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
 /// — that method is the cross-context tool-invocation entry and carries
 /// a generic executor closure `F: FnOnce(Value) -> Fut` which cannot
 /// cross the actor mailbox. The cross-context saga path is spec-gapped
@@ -1622,7 +1622,7 @@ pub enum TtlCloseCommand {
 /// The migrated variants are the hard-rate-limit consume / refund
 /// helpers (async + sync + runtime-agnostic) that FFI bridges call from
 /// their own tool-dispatch paths. All 6 methods on
-/// [`crate::context::manager::tools`] migrate here because they are the
+/// [`crate::context::tools_helpers`] migrate here because they are the
 /// supervisor-observable tool surface.
 pub enum ToolsCommand {
     /// Placeholder — retained so out-of-tree callers constructed during
@@ -1635,7 +1635,7 @@ pub enum ToolsCommand {
 
     /// Try to consume one hard-rate-limit token for the given
     /// `(context_id, did)` pair (async variant). Mirrors
-    /// [`ContextManager::try_consume_hard_rate_limit`](crate::context::manager::ContextManager::try_consume_hard_rate_limit).
+    /// [`ContextManager::try_consume_hard_rate_limit`](crate::context::tools_helpers::try_consume_hard_rate_limit).
     ///
     /// Reply carries `Ok(true)` iff a token was consumed or the context
     /// is unknown (pass-through contract on unknown contexts — matches
@@ -1653,7 +1653,7 @@ pub enum ToolsCommand {
     },
 
     /// Refund one hard-rate-limit token (async variant). Mirrors
-    /// [`ContextManager::refund_hard_rate_limit`](crate::context::manager::ContextManager::refund_hard_rate_limit).
+    /// [`ContextManager::refund_hard_rate_limit`](crate::context::tools_helpers::refund_hard_rate_limit).
     /// No-op on unknown context.
     RefundHardRateLimit {
         /// Context identifier string.
@@ -1873,7 +1873,7 @@ pub enum SagaPhaseMessage {
 /// resume / shutdown path sends these; real variants land with the
 /// BridgeInstance integration in commit 11. Commit 6 only carries the
 /// two Pause / PersistSync variants that the
-/// [`BridgeInstanceCore`](scp_ffi_common::bridge_instance::BridgeInstanceCore)
+/// `BridgeInstanceCore` (in `scp_ffi_common::bridge_instance`)'s
 /// default `suspend()` body calls, plus the terminal `Shutdown`.
 pub enum LifecycleControlCommand {
     /// Supervisor asks the actor to quiesce: refuse new external

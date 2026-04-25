@@ -40,7 +40,7 @@
 //!   lifted to the supervisor in ADR-049 commit 12c.9a-9b.
 //!
 //! The legacy inherent methods on
-//! [`ContextManager`](crate::context::manager::ContextManager) remain as
+//! [`Supervisor`](crate::context::supervisor::Supervisor) remain as
 //! one-line forwarders; they are deleted alongside the outer shim in a
 //! later ADR-049 commit when the actor handler body owns the standing
 //! path directly.
@@ -87,7 +87,7 @@ const ATTACHED_EXPECT: &str = "standing_helpers: Supervisor must be fully attach
 /// the sorted DID pair for the unique portion.
 ///
 /// Hoisted body of the legacy
-/// [`crate::context::manager::standing::generate_standing_context_id`]
+/// [`crate::context::standing_helpers::generate_standing_context_id`]
 /// free function (ADR-049 commit 12c.4). The legacy free function remains
 /// as a thin re-export so test code importing the legacy path keeps
 /// working through the shim window.
@@ -118,7 +118,7 @@ pub fn generate_standing_context_id(local_did: &DID, peer_did: &DID) -> String {
 /// Returns an existing standing context or creates a new one (contact graph).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::standing_context`](crate::context::manager::ContextManager::standing_context).
+/// [`ContextManager::standing_context`](crate::context::standing_helpers::standing_context).
 /// See the legacy method's doc comment for the full semantics.
 /// Byte-identical behavior.
 ///
@@ -282,7 +282,7 @@ pub async fn has_standing_context(supervisor: &Supervisor, peer_did: &DID) -> bo
 /// in the manager's `contexts` map.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::register_standing_context`](crate::context::manager::ContextManager::register_standing_context).
+/// [`ContextManager::register_standing_context`](crate::context::standing_helpers::register_standing_context).
 pub async fn register_standing_context(supervisor: &Supervisor, peer_did: DID) {
     // ArcSwap+write_lock pattern (ADR-049 §Decision 12).
     let _guard = supervisor.write_lock.lock().await;
@@ -305,7 +305,7 @@ pub async fn register_standing_context(supervisor: &Supervisor, peer_did: DID) {
 /// terminal states (`Closed`, `Expired`) are skipped.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::reconnect_all_standing`](crate::context::manager::ContextManager::reconnect_all_standing).
+/// [`ContextManager::reconnect_all_standing`](crate::context::standing_helpers::reconnect_all_standing).
 /// See the legacy method's doc comment for the full semantics.
 /// Byte-identical behavior.
 ///

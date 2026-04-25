@@ -207,7 +207,7 @@ pub struct EnforceConsequencesCtx<'a> {
     pub clock: &'a dyn scp_primitives::Clock,
     pub event_log: &'a dyn crate::context::builder::ContextEventLogProvider,
     /// Optional broadcast channel for event propagation from free
-    /// functions that lack `&self` access to [`ContextManager`].
+    /// functions that lack `&self` access to `ContextManager`.
     pub event_tx: Option<
         &'a tokio::sync::broadcast::Sender<(
             String,

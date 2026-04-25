@@ -194,13 +194,13 @@ pub struct KnownContext {
 ///   instance if cloned elsewhere. Shutdown does NOT drop or invalidate
 ///   the `Supervisor` — it is a signal to the bridge layer only.
 pub struct CoreFields {
-    /// Shared per-instance [`Supervisor`] — actor registry, saga
+    /// Shared per-instance `Supervisor` — actor registry, saga
     /// coordinator, and query dispatcher.
     ///
     /// Stored in a `OnceLock` so that the per-bridge [`CoreFields`] (and
     /// thus the DID resolver slot it owns) can exist BEFORE the
     /// supervisor is constructed. The supervisor's underlying
-    /// [`ContextManager`] (during the ADR-049 transition window) needs
+    /// `ContextManager` (during the ADR-049 transition window) needs
     /// the real DID at construction time, but the DID is only known
     /// after `DidDht::create()` runs inside `identity_create`. Deferring
     /// the supervisor resolves this ordering.
@@ -276,7 +276,7 @@ pub struct CoreFields {
     /// Keyed by context ID. Created lazily on first access via
     /// [`with_economy_budget`] / [`with_economy_budget_mut`]. Budget trackers
     /// are NOT removed automatically when contexts are closed -- call
-    /// [`remove_economy_state`] for cleanup in long-running processes.
+    /// [`Self::remove_economy_state`] for cleanup in long-running processes.
     economy_budgets: DashMap<String, MemberBudgetTracker>,
 
     /// Per-context antispam velocity trackers for economic governance.
@@ -329,7 +329,7 @@ pub struct CoreFields {
     /// Optional persistence provider, forwarded from the `ContextManager`.
     ///
     /// When `Some`, `suspend()` and `shutdown()` call
-    /// [`ContextManager::flush_all_contexts_sync`] to persist context state
+    /// `ContextManager::flush_all_contexts_sync` to persist context state
     /// before tearing down transport or destroying MLS groups. The provider
     /// reference is retained here so the bridge layer can pass it through
     /// `with_persistence()` at construction time and expose it via the
@@ -361,9 +361,9 @@ pub struct CoreFields {
     /// URL individually, so the set is the source of truth for "which
     /// relays does this bridge intend to be connected to".
     ///
-    /// Populated via [`add_relay_url`]. Entries removed via
+    /// Populated via [`Self::add_relay_url`]. Entries removed via
     /// [`remove_relay_url`] (explicit disconnect). Retrieved as a
-    /// deduplicated snapshot via [`pending_relay_urls`]. Preserved across
+    /// deduplicated snapshot via [`Self::pending_relay_urls`]. Preserved across
     /// `suspend()` / `resume()` cycles so callers can reconnect.
     /// Cleared in full by [`shutdown()`] and [`clear_relay_urls`].
     relay_urls: Mutex<HashSet<String>>,
@@ -425,7 +425,7 @@ impl CoreFields {
     /// Initializes all shared state registries (transport, known contexts,
     /// rate limiters) as empty. Allocates a fresh [`CoreFields::instance_id`],
     /// a fresh [`CancellationToken`], and an empty [`JoinSet`]. The
-    /// per-instance [`Supervisor`] is **unbound** — call
+    /// per-instance `Supervisor` is **unbound** — call
     /// [`set_supervisor`](Self::set_supervisor) once the identity has
     /// been created and the supervisor constructed with its providers
     /// (whose `MlsCryptoProvider` carries the real local DID).
@@ -488,14 +488,14 @@ impl CoreFields {
     /// [`set_supervisor`](Self::set_supervisor).
     ///
     /// The persistence provider should be the same one configured on the
-    /// eventual [`ContextManager`] (typically constructed via
-    /// [`ContextManager::with_persistence`] or the builder `.storage()` method).
+    /// eventual `ContextManager` (typically constructed via
+    /// `ContextManager::with_persistence` or the builder `.storage()` method).
     ///
     /// # Arguments
     ///
     /// - `persistence` — the persistence provider for bridge-level flush on
     ///   suspend/shutdown. Accepts `Box` for ergonomic call-site parity
-    ///   with [`ContextManager::with_persistence`]; the box is upgraded to
+    ///   with `ContextManager::with_persistence`; the box is upgraded to
     ///   `Arc` internally so
     ///   [`persistence_arc_clone`](Self::persistence_arc_clone) can hand
     ///   the same provider to downstream consumers.
@@ -509,7 +509,7 @@ impl CoreFields {
     /// Variant of [`with_persistence`](Self::with_persistence) that accepts
     /// `Arc<dyn ContextPersistence + Send + Sync>` directly. Callers that
     /// need to hand the exact same provider to both this mirror and
-    /// [`ContextManager::with_persistence`] must use this constructor to
+    /// `ContextManager::with_persistence` must use this constructor to
     /// avoid opening two separate `SQLite` connections (one connection per
     /// `Box`) to the same database file.
     ///
@@ -603,7 +603,7 @@ impl CoreFields {
         }
     }
 
-    /// Stores the shared [`Supervisor`] for this instance.
+    /// Stores the shared `Supervisor` for this instance.
     ///
     /// Called by the FFI bridge's `init_supervisor*` family once the
     /// supervisor has been constructed (with the real DID passed
@@ -617,7 +617,7 @@ impl CoreFields {
         }
     }
 
-    /// Returns the shared per-instance [`Supervisor`], or `None` if not
+    /// Returns the shared per-instance `Supervisor`, or `None` if not
     /// yet set.
     ///
     /// FFI query call sites route through
@@ -645,7 +645,7 @@ impl CoreFields {
     ///
     /// Used by bridge constructors that want to hand the same provider
     /// instance to both this mirror and
-    /// [`ContextManager::with_persistence`] — critical when the underlying
+    /// `ContextManager::with_persistence` — critical when the underlying
     /// backend (e.g. `SqliteStorage`) cannot tolerate multiple concurrent
     /// connections to the same database file.
     ///
@@ -655,7 +655,7 @@ impl CoreFields {
         self.persistence.clone()
     }
 
-    /// Returns a reference to the shared [`Supervisor`], or `None` if
+    /// Returns a reference to the shared `Supervisor`, or `None` if
     /// not yet set.
     ///
     /// All callers must handle the `None` case explicitly — returning
@@ -673,7 +673,7 @@ impl CoreFields {
         self.supervisor.get()
     }
 
-    /// Returns whether a [`Supervisor`] has been set on this instance.
+    /// Returns whether a `Supervisor` has been set on this instance.
     #[must_use]
     pub fn has_supervisor(&self) -> bool {
         self.supervisor.get().is_some()
@@ -868,7 +868,7 @@ impl CoreFields {
     /// Clears the suspended flag so bridge operations can proceed.
     ///
     /// `resume` is `async` so per-bridge overrides (see
-    /// [`BridgeInstanceCore::resume`]) can chain async work — reconnecting
+    /// `BridgeInstanceCore::resume`) can chain async work — reconnecting
     /// transport from pending relay URLs, rehydrating persisted context
     /// state — after the core flag flip. The core-only body below is `.await`-
     /// free and remains cheap.
@@ -985,9 +985,9 @@ impl CoreFields {
     /// Clears the transport manager (called on disconnect or suspend).
     ///
     /// Does **not** clear the stored relay URL — the URL is preserved so
-    /// that callers can retrieve it after [`resume`] and reconnect to the
+    /// that callers can retrieve it after [`Self::resume`] and reconnect to the
     /// same relay. The relay URL is only cleared explicitly in
-    /// [`shutdown`] (after flush) or by the caller via an explicit
+    /// [`Self::shutdown`] (after flush) or by the caller via an explicit
     /// disconnect flow.
     ///
     /// After this, relay-based operations will fail until a new transport
@@ -1019,11 +1019,11 @@ impl CoreFields {
     /// connected to.
     ///
     /// Callers (bridge `transport_connect` functions) call this immediately
-    /// after [`set_transport`] so that [`pending_relay_urls`] returns the
-    /// URL in subsequent reconnect attempts after [`resume`]. Duplicate
+    /// after [`Self::set_transport`] so that [`Self::pending_relay_urls`] returns the
+    /// URL in subsequent reconnect attempts after [`Self::resume`]. Duplicate
     /// calls are idempotent because the underlying set deduplicates.
     ///
-    /// No-op after [`shutdown`] — [`pending_relay_urls`] is cleared on
+    /// No-op after [`Self::shutdown`] — [`Self::pending_relay_urls`] is cleared on
     /// shutdown and we must not resurrect it by admitting a late writer.
     /// Without this guard, a concurrent `add_relay_url` racing with a
     /// shutdown-triggered `relay_urls.clear()` could leave a stale URL in
@@ -1066,10 +1066,10 @@ impl CoreFields {
     }
 
     /// Returns a snapshot of every relay URL registered via
-    /// [`add_relay_url`] and not yet removed.
+    /// [`Self::add_relay_url`] and not yet removed.
     ///
-    /// After [`suspend`] the set is preserved so `resume()` overrides can
-    /// reconnect each relay. After [`shutdown`] the set is empty.
+    /// After [`Self::suspend`] the set is preserved so `resume()` overrides can
+    /// reconnect each relay. After [`Self::shutdown`] the set is empty.
     ///
     /// Returns an empty set if no URLs have been stored, if the instance
     /// has been shut down, or if the internal mutex is poisoned.
@@ -1091,13 +1091,13 @@ impl CoreFields {
             .is_some_and(|guard| !guard.is_empty())
     }
 
-    /// Reconnects every pending relay URL registered via [`add_relay_url`].
+    /// Reconnects every pending relay URL registered via [`Self::add_relay_url`].
     ///
-    /// Iterates the deduplicated snapshot from [`pending_relay_urls`], calls
+    /// Iterates the deduplicated snapshot from [`Self::pending_relay_urls`], calls
     /// `NativeRelayAdapter::connect_sourced` (source = `Explicit`) for each
     /// URL, wraps the adapter in a [`scp_transport::TransportManager`], and
-    /// stores it via [`set_transport`]. Called from per-bridge
-    /// [`BridgeInstanceCore::resume`] overrides after the core flag flip.
+    /// stores it via [`Self::set_transport`]. Called from per-bridge
+    /// `BridgeInstanceCore::resume` overrides after the core flag flip.
     ///
     /// Collects every failure and returns the first as
     /// [`LifecycleError::ReconnectFailed`] so the caller sees a real error.
@@ -1191,10 +1191,10 @@ impl CoreFields {
 
     /// Rehydrates every context that was persisted before the most recent
     /// `suspend()`/`shutdown()` cycle — see
-    /// [`ContextManager::restore_all_contexts`].
+    /// `ContextManager::restore_all_contexts`.
     ///
-    /// Called from per-bridge [`BridgeInstanceCore::resume`] overrides after
-    /// [`reconnect_transport_if_pending`]. No-ops silently when:
+    /// Called from per-bridge `BridgeInstanceCore::resume` overrides after
+    /// [`Self::reconnect_transport_if_pending`]. No-ops silently when:
     /// - No `ContextManager` is attached yet (the bridge hasn't seen its
     ///   first `identity_create` / `context_create`).
     /// - The attached `ContextManager` was built without persistence
@@ -1319,10 +1319,10 @@ impl CoreFields {
 
     /// Returns a reference to the known-contexts `DashMap`.
     ///
-    /// **Prefer the typed accessors** ([`register_known_context`],
-    /// [`remove_known_context`], [`all_known_contexts`],
-    /// [`known_contexts_for_member`], [`known_context_count`],
-    /// [`has_known_context`]) which enforce capacity limits. Direct
+    /// **Prefer the typed accessors** ([`Self::register_known_context`],
+    /// [`Self::remove_known_context`], [`Self::all_known_contexts`],
+    /// [`Self::known_contexts_for_member`], [`Self::known_context_count`],
+    /// [`Self::has_known_context`]) which enforce capacity limits. Direct
     /// mutation via this reference bypasses capacity enforcement.
     #[must_use]
     pub const fn known_contexts(&self) -> &DashMap<String, KnownContext> {
@@ -1403,7 +1403,7 @@ impl CoreFields {
 
     /// Returns a reference to the rate-limiters `DashMap`.
     ///
-    /// **Prefer [`with_rate_limit_tracker`]** which enforces capacity limits.
+    /// **Prefer [`Self::with_rate_limit_tracker`]** which enforces capacity limits.
     /// Direct mutation via this reference bypasses capacity enforcement.
     #[must_use]
     pub const fn rate_limiters(&self) -> &DashMap<String, RateLimitTracker> {
@@ -1474,7 +1474,7 @@ impl CoreFields {
     /// requested context ID does not already have a tracker, an ephemeral
     /// (non-persisted) default tracker is used and a warning is logged.
     /// Budget trackers are 1:1 with contexts, so the cap should never be
-    /// reached unless [`remove_economy_state`] is not called on context cleanup.
+    /// reached unless [`Self::remove_economy_state`] is not called on context cleanup.
     ///
     /// After shutdown, returns an ephemeral tracker to avoid re-populating
     /// the cleared `DashMap`.
@@ -1661,7 +1661,7 @@ impl CoreFields {
     ///    groups, clear registries, run shutdown hooks, clear transport)
     ///    regardless of graceful/timeout outcome — these side effects must
     ///    happen on *every* shutdown. The persistence flush
-    ///    ([`ContextManager::flush_all_contexts_sync`]) is executed
+    ///    (`ContextManager::flush_all_contexts_sync`) is executed
     ///    inside the remaining timeout budget so the caller's deadline is
     ///    honored end-to-end; if it exceeds the budget, flush is abandoned
     ///    and a warning is logged.
@@ -2255,7 +2255,7 @@ mod tests {
 
     /// Builds a per-instance Supervisor with test-friendly providers.
     /// Mirrors the FFI bridges' `init_supervisor*` path:
-    /// [`Supervisor::with_providers`] constructs the supervisor and
+    /// `Supervisor::with_providers` constructs the supervisor and
     /// populates the lifted-provider slots expected by every
     /// `Supervisor::*` passthrough method (ADR-049 commit 12c.9g.3.6 —
     /// the FFI layer no longer touches `ContextManager` directly).

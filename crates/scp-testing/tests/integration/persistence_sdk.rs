@@ -12,9 +12,11 @@
 //! - [`scp_core::store::context::ProtocolRepositoryContextBridge`] — the
 //!   `ContextPersistence` implementation the FFI layer attaches to
 //!   `CoreFields::persistence`.
-//! - [`scp_core::context::manager::ContextManager::builder`] — the exact
-//!   wiring point used by `UniffiBridgeInstance::with_storage_uniffi`
+//! - [`scp_core::context::supervisor::Supervisor::with_providers`] — the
+//!   exact wiring point used by `UniffiBridgeInstance::with_storage_uniffi`
 //!   and its `PyO3`/NAPI siblings (see `crates/scp-ffi/**/runtime.rs`).
+//!   ADR-049 commit 12 deleted the legacy `ContextManager` builder; tests
+//!   now compose providers directly through `Supervisor::with_providers`.
 //!
 //! Issues exercised:
 //! - #1491 (SQLite-backed persistence through the FFI).
@@ -39,13 +41,19 @@
 use std::sync::Arc;
 
 #[cfg(feature = "sqlite")]
+use scp_core::context::builder::NotConfiguredTransportProvider;
+#[cfg(feature = "sqlite")]
 use scp_core::context::governance::KeyResolver;
 #[cfg(feature = "sqlite")]
-use scp_core::context::manager::ContextManager;
+use scp_core::context::providers::MerkleEventLogProvider;
+#[cfg(feature = "sqlite")]
+use scp_core::context::supervisor::Supervisor;
 #[cfg(feature = "sqlite")]
 use scp_core::context::{
     Capability, ContextMode, ContextParams, ContextState, context_id_bytes, context_routing_id,
 };
+#[cfg(feature = "sqlite")]
+use scp_core::crypto::mls::provider::MlsCryptoProvider;
 #[cfg(feature = "sqlite")]
 use scp_core::store::ProtocolRepository;
 #[cfg(feature = "sqlite")]
@@ -153,54 +161,60 @@ async fn sqlite_storage_rejects_mismatched_key() {
 }
 
 // ---------------------------------------------------------------------------
-// AC2: ContextManager.builder().storage(SqliteStorage) persists state
+// AC2: Supervisor::with_providers + SqliteStorage persists state
 // ---------------------------------------------------------------------------
 
-/// Builds a `ContextManager` wired through a `SqliteStorage` on disk,
-/// then verifies that creating a context + registering the creator DID
-/// writes rows visible in the `ProtocolRepository` membership list.
+/// Builds a `Supervisor` wired through a `SqliteStorage` on disk, then
+/// verifies that creating a context + registering the creator DID writes
+/// rows visible in the `ProtocolRepository` membership list.
 ///
 /// This mirrors the exact wiring the FFI bridges use when
 /// `StorageConfig::Sqlite` is selected:
 /// `SqliteStorage::new(dir, key)` → `ProtocolRepository::new(Arc<SqliteStorage>)`
-/// → `ProtocolRepositoryContextBridge::new(repo)` → attached to
-/// `ContextManager` via `builder().storage(...)`.
+/// → `ProtocolRepositoryContextBridge::new(repo)` → attached to a
+/// `Supervisor` via `Supervisor::with_providers(.., persistence, ..)`.
+/// ADR-049 commit 12 deleted `ContextManager`; the bridges and tests now
+/// compose providers directly through this constructor.
 #[cfg(feature = "sqlite")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn context_create_persists_membership_to_sqlite() {
     let tmpdir = tempfile::tempdir().unwrap();
 
-    // Open ONE SqliteStorage and share it between the manager (via the
-    // builder's `.storage()` consumption) and the verification side by
-    // wrapping in Arc. The builder takes ownership, so we open the DB
-    // twice here — acceptable because both connections share SQLCipher
-    // state on the same file.
+    // Open ONE SqliteStorage and share it between the supervisor (via
+    // the persistence bridge) and the verification side by wrapping in
+    // Arc. The bridge owns its repo, so we open the DB twice here —
+    // acceptable because both connections share SQLCipher state on the
+    // same file.
     let alice = DID::from(ALICE_DID);
     let ctx_id = "ctx-persist-create";
 
     // Phase 1: create + flush.
     {
         let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
-        // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`.
-        let manager = scp_core::context::attach_test_supervisor(
-            ContextManager::builder()
-                .crypto(Box::new(
-                    scp_core::crypto::mls::provider::MlsCryptoProvider::new(ALICE_DID.to_owned()),
-                ))
-                .storage(storage)
-                .key_resolver(permissive_key_resolver())
-                .build()
-                .unwrap(),
+        let repo = Arc::new(ProtocolRepository::new(storage));
+        let persistence = Box::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo)));
+
+        // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
+        // deleted `ContextManager::builder().storage(..).build()` chain.
+        let manager = Supervisor::with_providers(
+            Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+            Box::new(NotConfiguredTransportProvider),
+            Box::new(MerkleEventLogProvider::new()),
+            permissive_key_resolver(),
+            Some(persistence),
+            None,
+            None,
+            None,
         );
 
-        manager.register_local_did(alice.clone()).await;
+        manager.register_local_did(alice.clone()).await.unwrap();
         let handle = manager
             .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
             .await
             .expect("context_create must succeed with sqlite-backed persistence");
         assert_eq!(handle.state().await, ContextState::Active);
         // Flush snapshots before drop.
-        manager.flush_all_contexts_sync();
+        manager.flush_all_contexts_sync().unwrap();
     }
 
     // Phase 2: reopen same path, inspect the persisted ContextSnapshot.
@@ -236,22 +250,22 @@ async fn context_create_persists_membership_to_sqlite() {
 // AC3: Full lifecycle roundtrip — create → send → drop manager → reopen → restore
 // ---------------------------------------------------------------------------
 
-/// Full suspend/kill/restore/resume semantics at the `ContextManager`
+/// Full suspend/kill/restore/resume semantics at the `Supervisor`
 /// layer — the machinery the FFI `suspend()` + `resume()` compose.
 ///
 /// Steps:
-/// 1. Open SqliteStorage#1 at tmpdir, build manager with persistence.
+/// 1. Open SqliteStorage#1 at tmpdir, build supervisor with persistence.
 /// 2. Register Alice's local DID, create context, send one message.
 /// 3. `flush_all_contexts_sync` — persists the snapshot.
-/// 4. Drop the manager (simulates process exit / `Scp::shutdown`).
+/// 4. Drop the supervisor (simulates process exit / `Scp::shutdown`).
 /// 5. Open SqliteStorage#2 at the SAME path with the SAME key.
-/// 6. Build a fresh manager with persistence pointing at the new
+/// 6. Build a fresh supervisor with persistence pointing at the new
 ///    storage. Call `restore_all_contexts` — this is what
 ///    `BridgeInstanceCore::resume` invokes through
 ///    `CoreFields::restore_all_persisted_contexts`.
 /// 7. Verify membership survived and the context handle is restored.
 ///
-/// The new manager uses a NEW `MlsCryptoProvider`, so the MLS group
+/// The new supervisor uses a NEW `MlsCryptoProvider`, so the MLS group
 /// itself does not survive (`OpenMLS` key material lives in the provider
 /// and is not persisted through this path — MLS state persistence is
 /// tracked separately under SCP-PERSIST-050). This test asserts what
@@ -268,19 +282,23 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
     // ---- Phase 1: First "process" creates state and flushes. ----
     {
         let storage = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
-        // ADR-049 commit 12c.9c — wrap with `attach_test_supervisor`.
-        let manager = scp_core::context::attach_test_supervisor(
-            ContextManager::builder()
-                .crypto(Box::new(
-                    scp_core::crypto::mls::provider::MlsCryptoProvider::new(ALICE_DID.to_owned()),
-                ))
-                .storage(storage)
-                .key_resolver(permissive_key_resolver())
-                .build()
-                .unwrap(),
+        let repo = Arc::new(ProtocolRepository::new(storage));
+        let persistence = Box::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo)));
+
+        // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
+        // deleted `ContextManager::builder().storage(..).build()` chain.
+        let manager = Supervisor::with_providers(
+            Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+            Box::new(NotConfiguredTransportProvider),
+            Box::new(MerkleEventLogProvider::new()),
+            permissive_key_resolver(),
+            Some(persistence),
+            None,
+            None,
+            None,
         );
 
-        manager.register_local_did(alice.clone()).await;
+        manager.register_local_did(alice.clone()).await.unwrap();
         let _handle = manager
             .create_context(ctx_id.to_owned(), encrypted_params(), alice.clone(), None)
             .await
@@ -294,7 +312,7 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         // Flush to SQLite before dropping — mirrors
         // `CoreFields::shutdown_core_async` and `suspend()`'s
         // `flush_all_contexts_sync` call.
-        manager.flush_all_contexts_sync();
+        manager.flush_all_contexts_sync().unwrap();
     }
 
     // ---- Phase 2: Reopen the same database in a second "process". ----
@@ -320,22 +338,25 @@ async fn full_lifecycle_suspend_restore_roundtrip() {
         );
     }
 
-    // ---- Phase 3: Build a fresh manager + persistence + call restore. ----
+    // ---- Phase 3: Build a fresh supervisor + persistence + call restore. ----
     let storage2 = SqliteStorage::new(tmpdir.path(), &SQLITE_KEY).unwrap();
     let repo2 = Arc::new(ProtocolRepository::new(storage2));
     let persistence = Box::new(ProtocolRepositoryContextBridge::new(Arc::clone(&repo2)));
 
-    let manager2 = ContextManager::with_persistence(
-        Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
-            ALICE_DID.to_owned(),
-        )),
-        Box::new(scp_core::context::NotConfiguredTransportProvider),
-        Box::new(scp_core::context::providers::event_log::MerkleEventLogProvider::new()),
-        persistence,
+    // ADR-049 commit 12 — `Supervisor::with_providers` replaces the
+    // deleted `ContextManager::with_persistence(..)` constructor.
+    let manager2 = Supervisor::with_providers(
+        Arc::new(MlsCryptoProvider::new(ALICE_DID.to_owned())),
+        Box::new(NotConfiguredTransportProvider),
+        Box::new(MerkleEventLogProvider::new()),
         permissive_key_resolver(),
+        Some(persistence),
+        None,
+        None,
+        None,
     );
 
-    manager2.register_local_did(alice.clone()).await;
+    manager2.register_local_did(alice.clone()).await.unwrap();
     let restored = manager2
         .restore_all_contexts()
         .await

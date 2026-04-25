@@ -70,7 +70,7 @@ use zeroize::Zeroizing;
 /// the supervisor (ADR-049 commit 12c.9b), and spawned background
 /// tasks all hold equivalent clones of the same `DashMap`. The
 /// per-entry `Arc<Mutex<PerContextState>>` is the contract the manager
-/// exposes via [`ContextManager::contexts_arc`]; the alias is
+/// exposes via `ContextManager::contexts_arc`; the alias is
 /// introduced here so the supervisor-side accessor can return a
 /// readable type (avoids `clippy::type_complexity` on the nested
 /// generics).
@@ -88,7 +88,7 @@ pub const ACTOR_MAILBOX_CAPACITY: usize = 256;
 // SagaInput / SagaOutput — plan §"Cross-context saga protocol"
 // ---------------------------------------------------------------------------
 
-/// Input to [`Supervisor::start_saga`]. The variant enumerates the 4
+/// Input to `Supervisor::start_saga`. The variant enumerates the 4
 /// saga types defined in plan §"Cross-context saga protocol"
 /// (standing-pair create, migration, cross-context tool invoke,
 /// broadcast hosting handshake). Commit 6 lands the enum shape;
@@ -133,7 +133,7 @@ pub enum SagaInput {
     },
 }
 
-/// Output from [`Supervisor::start_saga`] on success. The saga's durable
+/// Output from `Supervisor::start_saga` on success. The saga's durable
 /// outcome; commit 6 carries only the saga ID so the type is stable for
 /// callers.
 #[derive(Debug)]
@@ -290,7 +290,7 @@ pub struct Supervisor {
     // -----------------------------------------------------------------
     // ADR-049 commit 12 — supervisor-authoritative direct fields.
     //
-    // These were previously mirrored from [`ContextManager`]. The
+    // These were previously mirrored from `ContextManager`. The
     // supervisor now owns them directly; eagerly initialized in
     // [`Self::new`].
     // -----------------------------------------------------------------
@@ -323,7 +323,7 @@ impl Supervisor {
     ///
     /// `persistence` and `saga_journal` are injected at construction so
     /// the supervisor is never a singleton — bridge instances in
-    /// [`scp_ffi_common::bridge_instance`] construct one per SCP
+    /// `scp_ffi_common::bridge_instance` construct one per SCP
     /// instance and drop it on `shutdown`.
     #[must_use]
     pub fn new(
@@ -367,7 +367,7 @@ impl Supervisor {
     /// ([`Self::dispatch_query`]) does not touch either field; saga and
     /// actor-spawn wiring arrive in commits 9-11.
     ///
-    /// Every FFI bridge embeds one [`Supervisor`] per bridge instance.
+    /// Every FFI bridge embeds one `Supervisor` per bridge instance.
     /// When the migration completes (commit 12) this helper is deleted
     /// along with the shim and callers switch to [`Self::new`] with
     /// real production impls.
@@ -379,7 +379,7 @@ impl Supervisor {
     }
 
     /// Construct a supervisor with the providers that previously lived on
-    /// [`crate::context::manager::ContextManager`] (ADR-049 commit 12).
+    /// the deleted `ContextManager` (ADR-049 commit 12).
     ///
     /// The supervisor is now the authoritative owner of every provider —
     /// there is no `ContextManager` to attach. FFI bridges call this
@@ -398,9 +398,9 @@ impl Supervisor {
     /// * `crypto` — production
     ///   [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider).
     /// * `transport` — production transport (typically
-    ///   [`scp_core::context::NotConfiguredTransportProvider`],
-    ///   [`scp_core::context::LocalTransportProvider`], or a real
-    ///   [`scp_transport::RelayTransportProvider`]).
+    ///   [`NotConfiguredTransportProvider`](crate::context::builder::NotConfiguredTransportProvider),
+    ///   [`LocalTransportProvider`](crate::context::builder::LocalTransportProvider), or a real
+    ///   `scp_transport::RelayTransportProvider`).
     /// * `event_log` — event log provider, usually backed by
     ///   `MerkleEventLogProvider::with_persistence(...)` so entries
     ///   survive restart.
@@ -780,7 +780,8 @@ impl Supervisor {
     /// wraps a cloned `Arc` of the same supervisor instance — not a
     /// fresh `Supervisor::for_query_shim()`. Without this the handle
     /// would point at a dangling second supervisor and
-    /// [`SupervisorHandle::local_dids`] / [`SupervisorHandle::standing_peer`]
+    /// [`SupervisorHandle::local_dids`](crate::context::supervisor::SupervisorHandle::local_dids)
+    /// / [`SupervisorHandle::standing_peer`](crate::context::supervisor::SupervisorHandle::standing_peer)
     /// would read empty state.
     #[allow(clippy::unused_async)]
     // Test fixtures call `build_actor_deps(...).await` on this method;
@@ -859,7 +860,7 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::NotInitialized`] if no [`ContextManager`] has
+    /// - [`ContextError::NotInitialized`] if no `ContextManager` has
     ///   been attached yet — the caller must call
     ///   [`Self::with_providers`] first.
     pub async fn dispatch_query(&self, cmd: QueriesCommand) -> Result<Outcome<()>, ContextError> {
@@ -921,8 +922,8 @@ impl Supervisor {
     /// shim (ADR-049 commit 8 / plan row 8).
     ///
     /// Contract (byte-identical to the legacy
-    /// [`ContextManager::send_message`](crate::context::manager::ContextManager::send_message)
-    /// / [`ContextManager::deliver_incoming`](crate::context::manager::ContextManager::deliver_incoming)
+    /// [`ContextManager::send_message`](crate::context::supervisor::Supervisor::send_message)
+    /// / [`ContextManager::deliver_incoming`](crate::context::messaging_helpers::deliver_incoming)
     /// it replaces):
     ///
     /// 1. Takes the tracker out of the per-context state under a brief
@@ -930,7 +931,7 @@ impl Supervisor {
     ///    [`SendSequenceTracker`](crate::context::actor::SendSequenceTracker)
     ///    whose high-water mark matches the previous one).
     /// 2. Drops the lock so the delegated
-    ///    [`ContextManager`](crate::context::manager::ContextManager)
+    ///    [`Supervisor`](crate::context::supervisor::Supervisor)
     ///    call can re-acquire it internally without deadlock.
     /// 3. Invokes
     ///    [`handlers::messaging::dispatch_from_shim`](crate::context::actor::handlers::messaging::dispatch_from_shim)
@@ -938,8 +939,8 @@ impl Supervisor {
     ///    taken tracker. The handler exercises
     ///    [`SequenceReservation`](crate::context::actor::SequenceReservation)
     ///    on that tracker, wraps the delegated
-    ///    [`ContextManager::send_message`](crate::context::manager::ContextManager::send_message)
-    ///    / [`ContextManager::deliver_incoming`](crate::context::manager::ContextManager::deliver_incoming)
+    ///    [`ContextManager::send_message`](crate::context::supervisor::Supervisor::send_message)
+    ///    / [`ContextManager::deliver_incoming`](crate::context::messaging_helpers::deliver_incoming)
     ///    call in `tokio::time::timeout` with a 30s budget, and maps
     ///    a timeout to
     ///    [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout).
@@ -970,19 +971,19 @@ impl Supervisor {
     /// — all of which wire up in commits 9-11. For the shim's messaging
     /// path those fields are unused: the handler delegates every
     /// transport/MLS call to the attached
-    /// [`ContextManager`](crate::context::manager::ContextManager)'s
+    /// [`Supervisor`](crate::context::supervisor::Supervisor)'s
     /// pre-existing providers. Rather than construct placeholder deps
     /// on every call, the shim forwards `None` for the deps argument
     /// via the overload
     /// [`handlers::messaging::dispatch_from_shim`](crate::context::actor::handlers::messaging::dispatch_from_shim),
     /// which shares the same match arms as the post-refactor
     /// [`handlers::messaging::dispatch`](crate::context::actor::handlers::messaging::dispatch)
-    /// but takes no [`ActorDeps`].
+    /// but takes no [`ActorDeps`](crate::context::actor::ActorDeps).
     ///
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet — the caller must call
     ///   [`Self::with_providers`] first.
     /// - [`ContextError::ContextNotRegistered`] if the command targets a
@@ -1063,7 +1064,7 @@ impl Supervisor {
     /// shim (ADR-049 commit 9 / plan row 9).
     ///
     /// Contract (byte-identical to the legacy
-    /// [`ContextManager`](crate::context::manager::ContextManager)
+    /// [`Supervisor`](crate::context::supervisor::Supervisor)
     /// lifecycle methods it replaces):
     ///
     /// Step 1 invokes
@@ -1074,7 +1075,7 @@ impl Supervisor {
     /// is required.
     ///
     /// Each variant wraps the delegated
-    /// [`ContextManager`](crate::context::manager::ContextManager) method
+    /// [`Supervisor`](crate::context::supervisor::Supervisor) method
     /// in `tokio::time::timeout` with a 30s budget, maps a timeout to
     /// [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout),
     /// and relays the typed reply on the variant's oneshot.
@@ -1092,7 +1093,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet — the caller must call
     ///   [`Self::with_providers`] first.
     /// - Any typed error returned by the delegated
@@ -1117,7 +1118,7 @@ impl Supervisor {
     ///
     /// Same shape as [`Self::dispatch_lifecycle_command`] — handlers
     /// take the attached manager directly, wrap delegated
-    /// [`ContextManager`](crate::context::manager::ContextManager) calls
+    /// [`Supervisor`](crate::context::supervisor::Supervisor) calls
     /// in [`tokio::time::timeout`] with a 30s budget, and relay the
     /// typed result through the variant's oneshot.
     ///
@@ -1133,7 +1134,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
     pub async fn dispatch_ttl_close_command(
         &self,
@@ -1147,7 +1148,7 @@ impl Supervisor {
     /// (ADR-049 commit 10 / plan row 10).
     ///
     /// Contract (byte-identical to the legacy
-    /// [`ContextManager`](crate::context::manager::ContextManager)
+    /// [`Supervisor`](crate::context::supervisor::Supervisor)
     /// governance methods it replaces):
     ///
     /// Step 1 invokes
@@ -1158,7 +1159,7 @@ impl Supervisor {
     /// is required — same shape as the lifecycle shim.
     ///
     /// Each variant wraps the delegated
-    /// [`ContextManager`](crate::context::manager::ContextManager) method
+    /// [`Supervisor`](crate::context::supervisor::Supervisor) method
     /// in `tokio::time::timeout` with a 30s budget, maps a timeout to
     /// [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout),
     /// and relays the typed reply on the variant's oneshot.
@@ -1166,7 +1167,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
     /// - Any typed error from the delegated manager method is surfaced
     ///   through the variant's oneshot reply; the method-level result
@@ -1189,8 +1190,8 @@ impl Supervisor {
     ///
     /// Same shape as [`Self::dispatch_governance_command`]. The
     /// economy handler only exposes the single public-surface method
-    /// on [`ContextManager`](crate::context::manager::ContextManager),
-    /// [`verify_payment_receipts`](crate::context::manager::ContextManager::verify_payment_receipts);
+    /// on [`Supervisor`](crate::context::supervisor::Supervisor),
+    /// [`verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts);
     /// internal helpers (`authorize_paid_action`, `complete_paid_action`,
     /// `void_paid_action`) remain on the manager's private surface
     /// and are exercised through the messaging path.
@@ -1198,7 +1199,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
     pub async fn dispatch_economy_command(
         &self,
@@ -1219,7 +1220,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
     pub async fn dispatch_trust_recovery_command(
         &self,
@@ -1358,7 +1359,7 @@ impl Supervisor {
     /// This is the post-refactor spawn path: the supervisor's caller
     /// drains state from the legacy `ContextManager` and
     /// `MlsCryptoProvider` via
-    /// [`crate::context::manager::ContextManager::take_context_state`]
+    /// [`crate::context::supervisor::Supervisor::take_context_state`]
     /// +
     /// [`crate::crypto::mls::provider::MlsCryptoProvider::take_crypto_state`],
     /// assembles the actor-side `PerContextState` using the drained
@@ -1445,7 +1446,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
     pub async fn dispatch_standing_command(
         &self,
@@ -1463,14 +1464,14 @@ impl Supervisor {
     /// saga-initiator variant returns [`ContextError::NotImplemented`]
     /// during the commit-11 window — see
     /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`. Note that
-    /// [`ContextManager::invoke_tool_with_economy`](crate::context::manager::ContextManager::invoke_tool_with_economy)
+    /// [`ContextManager::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
     /// is not migrated here because its generic executor closure cannot
     /// cross the actor mailbox.
     ///
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
     pub async fn dispatch_tools_command(
         &self,
@@ -1495,7 +1496,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
     pub async fn dispatch_broadcast_command(
         &self,
@@ -1514,7 +1515,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
+    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
     pub async fn dispatch_broadcast_command_with_custody<C: scp_platform::KeyCustody>(
         &self,
@@ -1622,8 +1623,8 @@ impl Supervisor {
     /// - `NeedsRepair` — emit a metric; operator intervention is
     ///   required to repair the saga.
     ///
-    /// This method is called by [`Self::new`]-through-
-    /// [`Self::spawn_replay_task`] on construction so a crash-restart
+    /// This method is called by [`Self::new`] through an internal replay-task
+    /// spawn on construction so a crash-restart
     /// supervisor reconciles state before the first `start_saga` call.
     /// It is safe to call multiple times; each call loads the current
     /// unresolved set from the journal.
@@ -1955,7 +1956,7 @@ impl Supervisor {
     // Supervisor-scope direct methods (no per-context command dispatch)
     //
     // The methods in this block route to the attached
-    // [`ContextManager`](crate::context::manager::ContextManager)
+    // [`Supervisor`](crate::context::supervisor::Supervisor)
     // surface directly because the underlying operation has no
     // per-context lock-and-handler shape: it operates on the
     // supervisor-wide identity registry (`local_dids`), or it iterates
@@ -2061,7 +2062,7 @@ impl Supervisor {
     /// standing-context tracking, and aborts background tasks (TTL
     /// timers, governance timeouts). Does NOT send leave messages or
     /// notify remote peers — used by
-    /// [`scp_ffi_common::BridgeInstance::shutdown`] for process exit /
+    /// `scp_ffi_common::BridgeInstance::shutdown` for process exit /
     /// test teardown.
     ///
     /// # Errors
@@ -2284,7 +2285,7 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// Returns [`scp_protocol::context::ContextCreationError`] if the
+    /// Returns [`ContextCreationError`](scp_protocol::context::builder::ContextCreationError) if the
     /// supervisor's providers are not wired or context creation fails.
     pub async fn create_context(
         &self,
@@ -2663,14 +2664,14 @@ fn current_timestamp_ms() -> u64 {
 
 // ---------------------------------------------------------------------------
 // No-op ContextPersistence + SagaJournal — plumbed into the FFI query
-// shim's [`Supervisor::for_query_shim`] constructor. Neither surface is
+// shim's `Supervisor::for_query_shim` constructor. Neither surface is
 // touched by the query path; the saga + lifecycle handlers that DO touch
 // them land in commits 9-11 and replace these stubs with the real
 // production wiring.
 // ---------------------------------------------------------------------------
 
 /// No-op persistence — every operation is a no-op success. Used by
-/// [`Supervisor::for_query_shim`]; deleted in commit 12 with the shim.
+/// `Supervisor::for_query_shim`; deleted in commit 12 with the shim.
 struct NoopContextPersistence;
 
 impl ContextPersistence for NoopContextPersistence {
@@ -2725,7 +2726,7 @@ impl ContextPersistence for NoopContextPersistence {
 }
 
 /// No-op saga journal — every operation is a no-op success. Used by
-/// [`Supervisor::for_query_shim`]; deleted in commit 12 with the shim.
+/// `Supervisor::for_query_shim`; deleted in commit 12 with the shim.
 struct NoopSagaJournal;
 
 #[async_trait::async_trait]

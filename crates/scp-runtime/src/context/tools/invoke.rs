@@ -5,7 +5,7 @@
 //! UCAN capability checking, input/output schema validation, timeout
 //! enforcement, cancellation, error propagation, and event log recording.
 //!
-//! Tool execution errors are returned in [`ToolResponse::error`](super::lifecycle::ToolResponse),
+//! Tool execution errors are returned in [`ToolResponse::error`](scp_protocol::context::tools::lifecycle::ToolResponse),
 //! not as protocol-level errors. Schema validation failures are caught by
 //! the SDK (this module), not by the tool itself.
 //!
@@ -41,7 +41,7 @@ use scp_protocol::trust::consequence::evaluate_consequence_rules;
 ///
 /// These are protocol-level errors that prevent the invocation from being
 /// dispatched. Tool execution errors are returned inside
-/// [`ToolResponse::error`](super::lifecycle::ToolResponse) instead.
+/// [`ToolResponse::error`](scp_protocol::context::tools::lifecycle::ToolResponse) instead.
 #[derive(Debug, thiserror::Error)]
 pub enum InvocationError {
     /// The context is not in the Active state.
@@ -200,7 +200,7 @@ pub struct ToolEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
 ///
 /// # Cancellation
 ///
-/// Cancellation is handled externally via [`ToolCancel`](super::lifecycle::ToolCancel)
+/// Cancellation is handled externally via [`ToolCancel`](scp_protocol::context::tools::lifecycle::ToolCancel)
 /// messages. This function supports cancellation through a
 /// `cancellation_token` future that resolves when cancellation is requested.
 ///

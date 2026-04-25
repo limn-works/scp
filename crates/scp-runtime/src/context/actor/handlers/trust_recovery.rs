@@ -9,14 +9,14 @@
 //! returns `Outcome<()>`.
 //!
 //! The underlying byte-identical implementation still lives on
-//! [`ContextManager`](crate::context::manager::ContextManager): each
+//! [`Supervisor`](crate::context::supervisor::Supervisor): each
 //! handler delegates to
-//! [`ContextManager::create_governance_checkpoint`](crate::context::manager::ContextManager::create_governance_checkpoint),
-//! [`ContextManager::add_checkpoint_cosignature`](crate::context::manager::ContextManager::add_checkpoint_cosignature),
-//! [`ContextManager::recovery_advance_epoch`](crate::context::manager::ContextManager::recovery_advance_epoch),
-//! [`ContextManager::recovery_send_notification`](crate::context::manager::ContextManager::recovery_send_notification),
+//! [`ContextManager::create_governance_checkpoint`](crate::context::trust_recovery_helpers::create_governance_checkpoint),
+//! [`ContextManager::add_checkpoint_cosignature`](crate::context::trust_recovery_helpers::add_checkpoint_cosignature),
+//! [`ContextManager::recovery_advance_epoch`](crate::context::trust_recovery_helpers::recovery_advance_epoch),
+//! [`ContextManager::recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification),
 //! or
-//! [`ContextManager::recovery_notify_contact`](crate::context::manager::ContextManager::recovery_notify_contact).
+//! [`ContextManager::recovery_notify_contact`](crate::context::trust_recovery_helpers::recovery_notify_contact).
 //! The shim wraps each delegated call in [`tokio::time::timeout`] with
 //! a 30s budget per ADR-049 §7.
 //!
@@ -119,7 +119,7 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: TrustRecoveryCommand) -> O
 
 /// Handle [`TrustRecoveryCommand::CreateGovernanceCheckpoint`] —
 /// delegates to
-/// [`ContextManager::create_governance_checkpoint`](crate::context::manager::ContextManager::create_governance_checkpoint)
+/// [`ContextManager::create_governance_checkpoint`](crate::context::trust_recovery_helpers::create_governance_checkpoint)
 /// under a 30s timeout. The legacy method prunes the event log as a
 /// side effect when a pruning policy is configured — that is a
 /// mutation, so the handler reports `mutated: true` on success.
@@ -168,7 +168,7 @@ async fn handle_create_governance_checkpoint(
 
 /// Handle [`TrustRecoveryCommand::AddCheckpointCosignature`] —
 /// delegates to
-/// [`ContextManager::add_checkpoint_cosignature`](crate::context::manager::ContextManager::add_checkpoint_cosignature)
+/// [`ContextManager::add_checkpoint_cosignature`](crate::context::trust_recovery_helpers::add_checkpoint_cosignature)
 /// under a 30s timeout. The legacy method takes `&mut ContextCheckpoint`;
 /// the handler owns the checkpoint by value and returns the mutated
 /// copy alongside the attestation status.
@@ -220,7 +220,7 @@ async fn handle_add_checkpoint_cosignature(
 
 /// Handle [`TrustRecoveryCommand::RecoveryAdvanceEpoch`] — delegates
 /// to
-/// [`ContextManager::recovery_advance_epoch`](crate::context::manager::ContextManager::recovery_advance_epoch)
+/// [`ContextManager::recovery_advance_epoch`](crate::context::trust_recovery_helpers::recovery_advance_epoch)
 /// under a 30s timeout.
 async fn handle_recovery_advance_epoch(
     supervisor: &Supervisor,
@@ -255,7 +255,7 @@ async fn handle_recovery_advance_epoch(
 
 /// Handle [`TrustRecoveryCommand::RecoverySendNotification`] —
 /// delegates to
-/// [`ContextManager::recovery_send_notification`](crate::context::manager::ContextManager::recovery_send_notification)
+/// [`ContextManager::recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification)
 /// under a 30s timeout. The legacy method transmits a bypass-encrypted
 /// recovery envelope but does not persist per-context state
 /// modifications — `Outcome::ok(())` on the success path.
@@ -300,7 +300,7 @@ async fn handle_recovery_send_notification(
 
 /// Handle [`TrustRecoveryCommand::RecoveryNotifyContact`] — delegates
 /// to
-/// [`ContextManager::recovery_notify_contact`](crate::context::manager::ContextManager::recovery_notify_contact)
+/// [`ContextManager::recovery_notify_contact`](crate::context::trust_recovery_helpers::recovery_notify_contact)
 /// under a 30s timeout. Read-only with respect to per-context state;
 /// the legacy method only transmits an envelope through the first
 /// shared context it finds.

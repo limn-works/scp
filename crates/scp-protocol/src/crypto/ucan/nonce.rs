@@ -386,7 +386,7 @@ impl<C: Clock> NonceTracker<C> {
     /// (first_seen_secs, token_expiry_secs)>` for embedding in a
     /// `ContextSnapshot`.
     ///
-    /// Unlike [`to_bytes`], this returns strongly-typed data that can
+    /// Unlike [`Self::to_bytes`], this returns strongly-typed data that can
     /// be serialized directly as a struct field, avoiding a JSON blob
     /// round-trip inside the snapshot.
     #[must_use]
@@ -405,7 +405,7 @@ impl<C: Clock> NonceTracker<C> {
     /// beyond the prune grace period is dropped on restore so the
     /// tracker starts in a normalized state. The restored tracker
     /// uses the supplied capacity limit (defaulting to
-    /// `DEFAULT_MAX_CAPACITY` via [`from_snapshot`]).
+    /// `DEFAULT_MAX_CAPACITY` via [`Self::from_snapshot`]).
     #[must_use]
     pub fn from_snapshot(
         context_id: String,
@@ -415,7 +415,7 @@ impl<C: Clock> NonceTracker<C> {
         Self::from_snapshot_with_capacity(context_id, clock, entries, DEFAULT_MAX_CAPACITY)
     }
 
-    /// Like [`from_snapshot`] but with an explicit capacity limit.
+    /// Like [`Self::from_snapshot`] but with an explicit capacity limit.
     ///
     /// If the snapshot contains more entries than `max_capacity`, the
     /// excess is truncated after the post-restore prune pass — this

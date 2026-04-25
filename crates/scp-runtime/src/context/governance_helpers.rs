@@ -41,7 +41,7 @@
 //!   lifted to the supervisor in ADR-049 commit 12c.9a-9b.
 //!
 //! The legacy inherent methods on
-//! [`ContextManager`](crate::context::manager::ContextManager) remain as
+//! [`Supervisor`](crate::context::supervisor::Supervisor) remain as
 //! one-line forwarders; they are deleted alongside the outer shim in a
 //! later ADR-049 commit when the actor handler bodies own the
 //! governance path directly.
@@ -100,7 +100,7 @@
 //!   in the free-function form.
 //!
 //! Forwarders remain on
-//! [`ContextManager`](crate::context::manager::ContextManager) under
+//! [`Supervisor`](crate::context::supervisor::Supervisor) under
 //! `#[allow(dead_code)]` until the outer shim is deleted in commit
 //! 12c.9g.4.
 
@@ -5273,7 +5273,7 @@ pub async fn acknowledge_commit_fault(
 /// Starts the governance timeout background task for a context (ADR-031 §5).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::start_governance_timeout_task`](crate::context::manager::ContextManager::start_governance_timeout_task)
+/// [`ContextManager::start_governance_timeout_task`](crate::context::supervisor::Supervisor::start_governance_timeout_task)
 /// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
 ///
 /// The task runs a 60-second interval loop that:
@@ -5486,7 +5486,7 @@ pub async fn start_governance_timeout_task(supervisor: &Supervisor, context_id: 
 /// Returns the event-log label string for a [`GovernanceEvent`] variant.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::governance_event_label`](crate::context::manager::ContextManager::governance_event_label)
+/// [`ContextManager::governance_event_label`](crate::context::supervisor::Supervisor::governance_event_label)
 /// (ADR-049 commit 12c.9g.3.5). Byte-identical behavior.
 ///
 /// Used when appending governance events to the Merkle event log. Each
@@ -5513,7 +5513,7 @@ pub const fn governance_event_label(event: &GovernanceEvent) -> &'static str {
 /// commit fault marker (PR #1606 C6), otherwise `Ok(())`.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::check_commit_fault`](crate::context::manager::ContextManager::check_commit_fault)
+/// [`ContextManager::check_commit_fault`](crate::context::supervisor::Supervisor::check_commit_fault)
 /// (ADR-049 commit 12c.9g.3.5). Byte-identical behavior.
 ///
 /// Called by every governance executor that mutates context state. While
@@ -5544,7 +5544,7 @@ pub fn check_commit_fault(ctx: &PerContextState) -> Result<(), ContextError> {
 /// receive buffer.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::translate_timeout_events`](crate::context::manager::ContextManager::translate_timeout_events)
+/// [`ContextManager::translate_timeout_events`](crate::context::supervisor::Supervisor::translate_timeout_events)
 /// (ADR-049 commit 12c.9g.3.5). Byte-identical behavior.
 pub fn translate_timeout_events(
     result_events: &[GovernanceEvent],
@@ -5624,7 +5624,7 @@ pub fn translate_timeout_events(
 /// all members (#1531).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::evaluate_periodic_consequences`](crate::context::manager::ContextManager::evaluate_periodic_consequences)
+/// [`ContextManager::evaluate_periodic_consequences`](crate::context::supervisor::Supervisor::evaluate_periodic_consequences)
 /// (ADR-049 commit 12c.9g.3.5). Byte-identical behavior.
 ///
 /// Time-based rules (e.g., "if no messages in 1 hour, downgrade role") must
@@ -5729,7 +5729,7 @@ enum CommitRetryOutcomeKind {
 /// Processes the per-context MLS Commit retry queue (PR #1606 C6).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::process_pending_commits_static`](crate::context::manager::ContextManager::process_pending_commits_static)
+/// [`ContextManager::process_pending_commits_static`](crate::context::supervisor::Supervisor::process_pending_commits_static)
 /// (ADR-049 commit 12c.9g.3.5). The legacy `_static` suffix is dropped
 /// because the free function form has no `&self` ambiguity.
 /// Byte-identical behavior.

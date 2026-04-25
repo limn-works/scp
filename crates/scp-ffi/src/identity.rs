@@ -1134,7 +1134,7 @@ fn py_identity_migrate(py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIden
 
 /// Generates a device attestation token for an identity.
 ///
-/// Uses [`InMemoryDeviceAttestation`] (available only with
+/// Uses `InMemoryDeviceAttestation` (available only with
 /// `allow_in_memory_custody` feature) to produce a synthetic attestation
 /// token, then attaches it to the identity's DID document via
 /// [`DidDht::attach_device_attestation`].
@@ -1200,7 +1200,7 @@ fn py_identity_attest_device(py: Python<'_>, identity_did: &str) -> PyResult<Str
 
 /// Verifies a device attestation token.
 ///
-/// Uses [`InMemoryDeviceAttestation`] to check the token format.
+/// Uses `InMemoryDeviceAttestation` to check the token format.
 ///
 /// # Arguments
 ///

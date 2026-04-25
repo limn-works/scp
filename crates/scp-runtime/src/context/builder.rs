@@ -248,7 +248,7 @@ pub trait ContextEventLogProvider: Send + Sync {
 
     /// Restores the event log for a context from persistent storage.
     ///
-    /// Called during [`crate::context::manager::ContextManager::restore_context`] to reload event log
+    /// Called during [`crate::context::supervisor::Supervisor::restore_context`] to reload event log
     /// entries that were persisted before the process restarted.
     ///
     /// The default implementation initializes an empty event log (no-op for
@@ -385,7 +385,7 @@ impl ContextTransportProvider for NotConfiguredTransportProvider {
 ///
 /// Exists solely to carry type-level evidence that an MLS group was created
 /// and needs rollback. The actual MLS group state lives inside the
-/// [`ContextCryptoProvider`]; this handle tracks that the provider holds
+/// `ContextCryptoProvider`; this handle tracks that the provider holds
 /// state on behalf of this creation flow.
 #[derive(Debug)]
 pub struct MlsGroupHandle {
@@ -402,7 +402,7 @@ impl MlsGroupHandle {
 /// Opaque handle representing ownership of a created sender key (or broadcast key).
 ///
 /// Like [`MlsGroupHandle`], the actual key material lives inside the
-/// [`ContextCryptoProvider`]; this handle tracks that the provider holds
+/// `ContextCryptoProvider`; this handle tracks that the provider holds
 /// sender key state for this context.
 #[derive(Debug)]
 pub struct SenderKeyHandle {
@@ -450,7 +450,7 @@ impl EventLogHandle {
 /// The ADR-008 spec shows `Option<MlsGroup>`, `Option<SenderKey>`,
 /// `Option<EventLog>`. In this implementation, the actual resource state
 /// (MLS groups, sender keys, event logs) lives inside the provider traits
-/// ([`ContextCryptoProvider`], [`ContextEventLogProvider`]) which own and
+/// (`ContextCryptoProvider`, [`ContextEventLogProvider`]) which own and
 /// manage the state. The receipt holds opaque handle types
 /// ([`MlsGroupHandle`], [`SenderKeyHandle`], [`EventLogHandle`]) that
 /// carry type-level evidence of resource creation without duplicating

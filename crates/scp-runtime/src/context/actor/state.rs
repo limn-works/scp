@@ -14,8 +14,8 @@
 //! # Split from `manager/mod.rs`
 //!
 //! The legacy `ContextManager` carries its own `pub(crate)
-//! PerContextState` in
-//! [`crate::context::manager::mod`] — that type is consumed through
+//! PerContextState` in the deleted `crate::context::manager` module —
+//! that type was consumed through
 //! the `Mutex<PerContextState>` lock-based model that ADR-049 deletes.
 //! The actor's state type here is a SUPERSET-COMPATIBLE shape: every field
 //! the legacy struct owns is represented here (so commit 12b+ handler-body
@@ -508,7 +508,7 @@ impl ContextModeState {
 // PerContextState — the actor's owned state payload
 // ---------------------------------------------------------------------------
 
-/// Per-context actor state. Owned by exactly one [`ContextActor`] for its
+/// Per-context actor state. Owned by exactly one [`ContextActor`](crate::context::actor::ContextActor) for its
 /// entire lifetime; no interior mutability, no locks, no `Arc`.
 ///
 /// Field set is the contract the plan's handler signatures rely on

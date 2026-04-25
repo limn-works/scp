@@ -9,7 +9,7 @@
 //! `Outcome<()>`.
 //!
 //! The underlying byte-identical implementation still lives on
-//! [`ContextManager::verify_payment_receipts`](crate::context::manager::ContextManager::verify_payment_receipts).
+//! [`ContextManager::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts).
 //! The shim wraps the delegated call in [`tokio::time::timeout`] with a
 //! 30s budget per ADR-049 §7. The method never returns an error (the
 //! vector of per-receipt results already embeds

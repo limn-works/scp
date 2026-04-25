@@ -6,19 +6,19 @@
 //!
 //! Migrates the dispatch shape for the non-saga broadcast surface.
 //! Underlying byte-identical implementation still lives on
-//! [`ContextManager`](crate::context::manager::ContextManager): each
+//! [`Supervisor`](crate::context::supervisor::Supervisor): each
 //! handler delegates to
-//! [`ContextManager::subscribe_broadcast`](crate::context::manager::ContextManager::subscribe_broadcast),
-//! [`ContextManager::unsubscribe_broadcast`](crate::context::manager::ContextManager::unsubscribe_broadcast),
-//! [`ContextManager::publish_broadcast`](crate::context::manager::ContextManager::publish_broadcast),
-//! [`ContextManager::publish_broadcast_content`](crate::context::manager::ContextManager::publish_broadcast_content),
-//! [`ContextManager::block_broadcast_subscriber`](crate::context::manager::ContextManager::block_broadcast_subscriber),
-//! [`ContextManager::unblock_broadcast_subscriber`](crate::context::manager::ContextManager::unblock_broadcast_subscriber),
-//! [`ContextManager::handle_broadcast_key_request`](crate::context::manager::ContextManager::handle_broadcast_key_request),
-//! [`ContextManager::broadcast_subscriber_count`](crate::context::manager::ContextManager::broadcast_subscriber_count),
-//! [`ContextManager::is_broadcast_subscriber`](crate::context::manager::ContextManager::is_broadcast_subscriber),
+//! [`ContextManager::subscribe_broadcast`](crate::context::broadcast_helpers::subscribe_broadcast),
+//! [`ContextManager::unsubscribe_broadcast`](crate::context::broadcast_helpers::unsubscribe_broadcast),
+//! [`ContextManager::publish_broadcast`](crate::context::broadcast_helpers::publish_broadcast),
+//! [`ContextManager::publish_broadcast_content`](crate::context::broadcast_helpers::publish_broadcast_content),
+//! [`ContextManager::block_broadcast_subscriber`](crate::context::broadcast_helpers::block_broadcast_subscriber),
+//! [`ContextManager::unblock_broadcast_subscriber`](crate::context::broadcast_helpers::unblock_broadcast_subscriber),
+//! [`ContextManager::handle_broadcast_key_request`](crate::context::broadcast_helpers::handle_broadcast_key_request),
+//! [`ContextManager::broadcast_subscriber_count`](crate::context::broadcast_helpers::broadcast_subscriber_count),
+//! [`ContextManager::is_broadcast_subscriber`](crate::context::broadcast_helpers::is_broadcast_subscriber),
 //! or
-//! [`ContextManager::broadcast_admission`](crate::context::manager::ContextManager::broadcast_admission).
+//! [`ContextManager::broadcast_admission`](crate::context::broadcast_helpers::broadcast_admission).
 //! The shim wraps each delegated call in [`tokio::time::timeout`] with
 //! a 30s budget per ADR-049 §7.
 //!
@@ -520,7 +520,7 @@ async fn handle_broadcast_admission(
 
 // ---------------------------------------------------------------------------
 // No-op UCAN validation trait impls — satisfy the generic bounds on
-// [`ContextManager::subscribe_broadcast`](crate::context::manager::ContextManager::subscribe_broadcast)
+// [`ContextManager::subscribe_broadcast`](crate::context::broadcast_helpers::subscribe_broadcast)
 // when the caller passes `None` for `validation_ctx`. No method is
 // actually invoked; the types exist only as compile-time witnesses so
 // the turbofish has something to bind to. Mirrors the

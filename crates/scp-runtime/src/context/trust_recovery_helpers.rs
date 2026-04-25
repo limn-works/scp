@@ -35,7 +35,7 @@
 //!   lifted to the supervisor in ADR-049 commit 12c.9a-9b.
 //!
 //! The legacy inherent methods on
-//! [`ContextManager`](crate::context::manager::ContextManager) remain as
+//! [`Supervisor`](crate::context::supervisor::Supervisor) remain as
 //! one-line forwarders; they are deleted alongside the outer shim in a
 //! later ADR-049 commit when the actor handler bodies own the trust-
 //! recovery path directly.
@@ -49,7 +49,7 @@
 //! # Not hoisted
 //!
 //! `verify_attestation`, `create_challenge`, `verify_challenge_response`
-//! remain as inherent methods on [`ContextManager`]. They are pure-CPU
+//! remain as inherent methods on `ContextManager`. They are pure-CPU
 //! operations with no state mutation and are not migrated as actor
 //! commands; the post-refactor architecture moves them off
 //! `ContextManager` entirely (they only need a DID resolver + clock).
@@ -77,7 +77,7 @@ const ATTACHED_EXPECT: &str = "trust_recovery_helpers: Supervisor must be fully 
 
 /// Creates a governance-aware checkpoint for a context (hoisted body of
 /// the legacy
-/// [`ContextManager::create_governance_checkpoint`](crate::context::manager::ContextManager::create_governance_checkpoint)).
+/// [`ContextManager::create_governance_checkpoint`](crate::context::trust_recovery_helpers::create_governance_checkpoint)).
 ///
 /// See the legacy method's doc comment for the full semantics.
 /// Byte-identical behavior.
@@ -159,7 +159,7 @@ pub async fn create_governance_checkpoint(
 
 /// Adds a cosignature to an existing checkpoint and re-evaluates
 /// attestation status (hoisted body of
-/// [`ContextManager::add_checkpoint_cosignature`](crate::context::manager::ContextManager::add_checkpoint_cosignature)).
+/// [`ContextManager::add_checkpoint_cosignature`](crate::context::trust_recovery_helpers::add_checkpoint_cosignature)).
 ///
 /// See the legacy method's doc comment for the full semantics.
 /// Byte-identical behavior.
@@ -206,7 +206,7 @@ pub async fn add_checkpoint_cosignature(
 
 /// Advances the MLS epoch for a context as part of compromise recovery
 /// (hoisted body of
-/// [`ContextManager::recovery_advance_epoch`](crate::context::manager::ContextManager::recovery_advance_epoch)).
+/// [`ContextManager::recovery_advance_epoch`](crate::context::trust_recovery_helpers::recovery_advance_epoch)).
 ///
 /// See the legacy method's doc comment for the full semantics.
 /// Byte-identical behavior.
@@ -306,7 +306,7 @@ pub async fn recovery_advance_epoch(
 
 /// Sends an encrypted message to a context for recovery notification
 /// purposes (hoisted body of
-/// [`ContextManager::recovery_send_notification`](crate::context::manager::ContextManager::recovery_send_notification)).
+/// [`ContextManager::recovery_send_notification`](crate::context::trust_recovery_helpers::recovery_send_notification)).
 ///
 /// See the legacy method's doc comment for the full semantics.
 /// Byte-identical behavior.
@@ -384,7 +384,7 @@ pub async fn recovery_send_notification(
 
 /// Sends a recovery notification to a contact DID by finding shared
 /// contexts (hoisted body of
-/// [`ContextManager::recovery_notify_contact`](crate::context::manager::ContextManager::recovery_notify_contact)).
+/// [`ContextManager::recovery_notify_contact`](crate::context::trust_recovery_helpers::recovery_notify_contact)).
 ///
 /// See the legacy method's doc comment for the full semantics.
 /// Byte-identical behavior.

@@ -6,11 +6,11 @@
 //!
 //! Migrates the dispatch shape for the non-saga tool surface.
 //! Underlying byte-identical implementation still lives on
-//! [`ContextManager`](crate::context::manager::ContextManager): each
+//! [`Supervisor`](crate::context::supervisor::Supervisor): each
 //! handler delegates to
-//! [`ContextManager::try_consume_hard_rate_limit`](crate::context::manager::ContextManager::try_consume_hard_rate_limit)
+//! [`ContextManager::try_consume_hard_rate_limit`](crate::context::tools_helpers::try_consume_hard_rate_limit)
 //! or
-//! [`ContextManager::refund_hard_rate_limit`](crate::context::manager::ContextManager::refund_hard_rate_limit).
+//! [`ContextManager::refund_hard_rate_limit`](crate::context::tools_helpers::refund_hard_rate_limit).
 //! The shim wraps the delegated call in [`tokio::time::timeout`] with a
 //! 30s budget per ADR-049 §7.
 //!
@@ -41,7 +41,7 @@
 //! Until those land, the saga-initiator path returns
 //! `ContextError::NotImplemented`. Non-saga commands are fully migrated
 //! in this commit (ADR-049 commit 11). Note:
-//! [`ContextManager::invoke_tool_with_economy`](crate::context::manager::ContextManager::invoke_tool_with_economy)
+//! [`ContextManager::invoke_tool_with_economy`](crate::context::supervisor::Supervisor::invoke_tool_with_economy)
 //! takes a generic executor closure that cannot cross the actor
 //! mailbox; it is not migrated to a command variant and continues to
 //! run on the direct manager surface (FFI bridges invoke it inline).
@@ -101,7 +101,7 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: ToolsCommand) -> Outcome<(
 }
 
 /// Handle [`ToolsCommand::TryConsumeHardRateLimit`] — delegates to
-/// [`ContextManager::try_consume_hard_rate_limit`](crate::context::manager::ContextManager::try_consume_hard_rate_limit)
+/// [`ContextManager::try_consume_hard_rate_limit`](crate::context::tools_helpers::try_consume_hard_rate_limit)
 /// under a 30s timeout.
 ///
 /// The legacy method is infallible and returns `bool`. Under timeout we
@@ -148,7 +148,7 @@ async fn handle_try_consume_hard_rate_limit(
 }
 
 /// Handle [`ToolsCommand::RefundHardRateLimit`] — delegates to
-/// [`ContextManager::refund_hard_rate_limit`](crate::context::manager::ContextManager::refund_hard_rate_limit)
+/// [`ContextManager::refund_hard_rate_limit`](crate::context::tools_helpers::refund_hard_rate_limit)
 /// under a 30s timeout.
 async fn handle_refund_hard_rate_limit(
     supervisor: &Supervisor,

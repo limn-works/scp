@@ -145,7 +145,7 @@ pub const SENDER_HEADER_SIZE: usize = 16;
 /// Prepends epoch + sequence header to sender-key ciphertext.
 ///
 /// Wire format: `epoch (8 bytes BE) || sequence (8 bytes BE) || ciphertext`.
-/// Used by [`ContextCryptoProvider::seal`] to construct the MLS plaintext.
+/// Used by the runtime crypto provider's `seal` operation to construct the MLS plaintext.
 #[must_use]
 pub fn build_sender_header(epoch: u64, sequence: u64, ciphertext: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(SENDER_HEADER_SIZE + ciphertext.len());

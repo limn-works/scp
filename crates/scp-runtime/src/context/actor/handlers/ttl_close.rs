@@ -9,21 +9,21 @@
 //! `Outcome<()>`.
 //!
 //! The underlying byte-identical implementation still lives on
-//! [`ContextManager`](crate::context::manager::ContextManager): each
+//! [`Supervisor`](crate::context::supervisor::Supervisor): each
 //! handler delegates to
-//! [`ContextManager::spawn_ttl_timer`](crate::context::manager::ContextManager)
+//! [`spawn_ttl_timer`](crate::context::lifecycle_helpers::spawn_ttl_timer)
 //! (via an internal helper),
-//! [`ContextManager::propose_ttl_extension`](crate::context::manager::ContextManager::propose_ttl_extension),
-//! [`ContextManager::reset_ttl_timer`](crate::context::manager::ContextManager::reset_ttl_timer),
-//! [`ContextManager::handle_ttl_expiry`](crate::context::manager::ContextManager::handle_ttl_expiry),
+//! [`ContextManager::propose_ttl_extension`](crate::context::lifecycle_helpers::propose_ttl_extension),
+//! [`ContextManager::reset_ttl_timer`](crate::context::lifecycle_helpers::reset_ttl_timer),
+//! [`ContextManager::handle_ttl_expiry`](crate::context::lifecycle_helpers::handle_ttl_expiry),
 //! or
-//! [`ContextManager::finalize_close`](crate::context::manager::ContextManager::finalize_close).
+//! [`ContextManager::finalize_close`](crate::context::lifecycle_helpers::finalize_close).
 //!
 //! **TTL timer specifics (commit 9 scope).** The post-refactor
 //! architecture turns the TTL timer into a `select!` arm in
 //! [`ContextActor::run`](crate::context::actor::ContextActor). Commit 9
 //! keeps the timer spawned from the legacy
-//! [`ContextManager`](crate::context::manager::ContextManager) internals;
+//! [`Supervisor`](crate::context::supervisor::Supervisor) internals;
 //! the handler variants here respond to caller-initiated TTL commands
 //! (extend, finalize, explicit expiry, timer start / reset)
 //! synchronously. Full timer-owning actor logic migrates with plan row
@@ -120,9 +120,9 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: TtlCloseCommand) -> Outcom
 }
 
 /// Handle [`TtlCloseCommand::StartTtlTimer`]: delegate to
-/// [`ContextManager::spawn_ttl_timer`](crate::context::manager::ContextManager)
+/// [`spawn_ttl_timer`](crate::context::lifecycle_helpers::spawn_ttl_timer)
 /// via the public
-/// [`ContextManager::start_ttl_timer`](crate::context::manager::ContextManager::start_ttl_timer)
+/// [`Supervisor::start_ttl_timer`](crate::context::supervisor::Supervisor::start_ttl_timer)
 /// shim accessor added by this commit.
 ///
 /// `spawn_ttl_timer` itself has no inherent timeout (it returns once
@@ -168,7 +168,7 @@ async fn handle_start_ttl_timer(
 }
 
 /// Handle [`TtlCloseCommand::ExtendTtl`]: delegate to
-/// [`ContextManager::propose_ttl_extension`](crate::context::manager::ContextManager::propose_ttl_extension)
+/// [`ContextManager::propose_ttl_extension`](crate::context::lifecycle_helpers::propose_ttl_extension)
 /// under a 30s timeout.
 async fn handle_extend_ttl(
     supervisor: &Supervisor,
@@ -204,7 +204,7 @@ async fn handle_extend_ttl(
 }
 
 /// Handle [`TtlCloseCommand::ResetTtlTimer`]: delegate to
-/// [`ContextManager::reset_ttl_timer`](crate::context::manager::ContextManager::reset_ttl_timer)
+/// [`ContextManager::reset_ttl_timer`](crate::context::lifecycle_helpers::reset_ttl_timer)
 /// under a 30s timeout.
 async fn handle_reset_ttl_timer(
     supervisor: &Supervisor,
@@ -246,7 +246,7 @@ async fn handle_reset_ttl_timer(
 }
 
 /// Handle [`TtlCloseCommand::ExecuteTtlClose`]: delegate to
-/// [`ContextManager::handle_ttl_expiry`](crate::context::manager::ContextManager::handle_ttl_expiry)
+/// [`ContextManager::handle_ttl_expiry`](crate::context::lifecycle_helpers::handle_ttl_expiry)
 /// under a 30s timeout.
 async fn handle_execute_ttl_close(
     supervisor: &Supervisor,
@@ -286,7 +286,7 @@ async fn handle_execute_ttl_close(
 }
 
 /// Handle [`TtlCloseCommand::FinalizeClose`]: delegate to
-/// [`ContextManager::finalize_close`](crate::context::manager::ContextManager::finalize_close)
+/// [`ContextManager::finalize_close`](crate::context::lifecycle_helpers::finalize_close)
 /// under a 30s timeout.
 async fn handle_finalize_close(
     supervisor: &Supervisor,

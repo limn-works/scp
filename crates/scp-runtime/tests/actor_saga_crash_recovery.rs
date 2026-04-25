@@ -1,7 +1,7 @@
 //! Integration test for the ADR-049 commit-11 saga crash-recovery
 //! path.
 //!
-//! On supervisor startup, [`Supervisor::replay_unresolved_sagas`]
+//! On supervisor startup, `Supervisor::replay_unresolved_sagas`
 //! reads the journal's latest unresolved entries and dispatches
 //! per-state recovery:
 //!   - `Initiated` / `PreparingA` — discard (no remote side-effects

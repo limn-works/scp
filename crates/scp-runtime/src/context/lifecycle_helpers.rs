@@ -42,7 +42,7 @@
 //!   12c.9a-9b).
 //!
 //! The legacy inherent methods on
-//! [`ContextManager`](crate::context::manager::ContextManager) remain as
+//! [`Supervisor`](crate::context::supervisor::Supervisor) remain as
 //! one-line forwarders; they are deleted alongside the outer shim in a
 //! later ADR-049 commit when the actor handler bodies own the lifecycle
 //! / `ttl_close` path directly.
@@ -119,7 +119,7 @@ const ATTACHED_EXPECT: &str = "lifecycle_helpers: Supervisor must be fully attac
 
 /// Exports a context's full state as a transferable `ContextExport`
 /// (hoisted body of the legacy
-/// [`ContextManager::export_context`](crate::context::manager::ContextManager::export_context)).
+/// [`ContextManager::export_context`](crate::context::lifecycle_helpers::export_context)).
 ///
 /// Captures a `ContextSnapshot`, event log data, and MLS state (empty
 /// until #333 lands), then produces a signed export that can be imported
@@ -181,7 +181,7 @@ pub async fn export_context(
 
 /// Imports a previously exported context into the manager (hoisted body of
 /// the legacy
-/// [`ContextManager::import_context`](crate::context::manager::ContextManager::import_context)).
+/// [`ContextManager::import_context`](crate::context::lifecycle_helpers::import_context)).
 ///
 /// See the legacy method's doc comment for the full C3 per-instance wipe
 /// policy, consequence-rule validation, and crypto-state restore
@@ -593,7 +593,7 @@ pub async fn import_context(
 
 /// Creates a new SCP context with the two-phase commit pattern (hoisted
 /// body of the legacy
-/// [`ContextManager::create_context`](crate::context::manager::ContextManager::create_context)).
+/// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context)).
 ///
 /// See the legacy method's doc comment for the full semantics. Byte-
 /// identical behavior.
@@ -793,7 +793,7 @@ fn generate_initial_access_key_store(
 // ---------------------------------------------------------------------------
 
 /// Joins a member to a context (hoisted body of the legacy
-/// [`ContextManager::join_context`](crate::context::manager::ContextManager::join_context)).
+/// [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context)).
 ///
 /// Validates the joiner's key package, performs the F4 escrow dance
 /// (economy + sybil + hard-rate-limit under lock, then authorize,
@@ -1227,7 +1227,7 @@ pub async fn capture_join_payment(
 // ---------------------------------------------------------------------------
 
 /// Removes a member from a context (hoisted body of the legacy
-/// [`ContextManager::leave_context`](crate::context::manager::ContextManager::leave_context)).
+/// [`ContextManager::leave_context`](crate::context::supervisor::Supervisor::leave_context)).
 ///
 /// Self-removal is always permitted; otherwise requires `MemberRemove`
 /// capability. Performs MLS `remove_member` (hard security boundary)
@@ -1456,7 +1456,7 @@ pub fn drain_and_deliver_sender_keys(
 // ---------------------------------------------------------------------------
 
 /// Initiates cooperative context closure (hoisted body of the legacy
-/// [`ContextManager::close_context`](crate::context::manager::ContextManager::close_context)).
+/// [`ContextManager::close_context`](crate::context::lifecycle_helpers::close_context)).
 ///
 /// For `SingleAdmin` governance: delegates to [`close_context_with_key`]
 /// with no signing key. Multi-admin contexts are rejected — they must
@@ -1475,7 +1475,7 @@ pub async fn close_context(
 
 /// Closes a context with an optional signing key for final checkpoint
 /// generation (§9.9.3) — hoisted body of the legacy
-/// [`ContextManager::close_context_with_key`](crate::context::manager::ContextManager::close_context_with_key).
+/// [`ContextManager::close_context_with_key`](crate::context::supervisor::Supervisor::close_context_with_key).
 ///
 /// See the legacy method's doc comment for the full `SingleAdmin` gate,
 /// TTL / governance-timeout cancellation, and final-checkpoint policy.
@@ -1607,7 +1607,7 @@ pub async fn close_context_with_key(
 // ---------------------------------------------------------------------------
 
 /// Completes context closure (hoisted body of the legacy
-/// [`ContextManager::finalize_close`](crate::context::manager::ContextManager::finalize_close)).
+/// [`ContextManager::finalize_close`](crate::context::lifecycle_helpers::finalize_close)).
 ///
 /// Destroys MLS group state and sender keys, issues relay deletion
 /// requests for ephemeral/summary scopes, transitions from `Closing`
@@ -1648,7 +1648,7 @@ pub async fn finalize_close(
 // ---------------------------------------------------------------------------
 
 /// Handles automatic TTL expiry (hoisted body of the legacy
-/// [`ContextManager::handle_ttl_expiry`](crate::context::manager::ContextManager::handle_ttl_expiry)).
+/// [`ContextManager::handle_ttl_expiry`](crate::context::lifecycle_helpers::handle_ttl_expiry)).
 ///
 /// Transitions from `Active` to `Expired`, destroys keys per memory
 /// scope, issues relay deletion requests for ephemeral/summary scopes,
@@ -1747,7 +1747,7 @@ pub async fn handle_ttl_expiry(
 // ---------------------------------------------------------------------------
 
 /// Proposes a TTL extension (hoisted body of the legacy
-/// [`ContextManager::propose_ttl_extension`](crate::context::manager::ContextManager::propose_ttl_extension)).
+/// [`ContextManager::propose_ttl_extension`](crate::context::lifecycle_helpers::propose_ttl_extension)).
 ///
 /// Records consent from the given member. Returns `true` iff every
 /// member has now consented (unanimous); the caller should then call
@@ -1794,7 +1794,7 @@ pub async fn propose_ttl_extension(
 
 /// Resets the TTL timer after a successful unanimous extension (hoisted
 /// body of the legacy
-/// [`ContextManager::reset_ttl_timer`](crate::context::manager::ContextManager::reset_ttl_timer)).
+/// [`ContextManager::reset_ttl_timer`](crate::context::lifecycle_helpers::reset_ttl_timer)).
 ///
 /// Cancels the old timer and spawns a new one with the given duration.
 /// Clears the extension proposal state.
@@ -1833,7 +1833,7 @@ pub async fn reset_ttl_timer(
 
 /// Installs a TTL timer for the given context (hoisted body of the
 /// legacy
-/// [`ContextManager::start_ttl_timer`](crate::context::manager::ContextManager::start_ttl_timer)).
+/// [`ContextManager::start_ttl_timer`](crate::context::supervisor::Supervisor::start_ttl_timer)).
 ///
 /// Thin shim that delegates to [`spawn_ttl_timer`] — the actor-shape
 /// [`TtlCloseCommand::StartTtlTimer`](crate::context::actor::commands::TtlCloseCommand::StartTtlTimer)
@@ -1990,7 +1990,7 @@ pub async fn spawn_ttl_timer(
 /// Loads a persisted context snapshot and optional broadcast state.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::load_persisted_context_state`]
+/// `ContextManager::load_persisted_context_state`
 /// (ADR-049 commit 12). Byte-identical behavior.
 ///
 /// # Errors
@@ -2065,7 +2065,7 @@ fn restore_event_log_best_effort(supervisor: &Supervisor, context_id: &str) {
 /// Restores a context into the supervisor from persisted state.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::restore_context`]
+/// `ContextManager::restore_context`
 /// (ADR-049 commit 12). Byte-identical behavior.
 ///
 /// Loads the persisted `ContextSnapshot` and optional broadcast state,
@@ -2324,7 +2324,7 @@ pub async fn restore_context(
 /// Restore every persisted context that's in `Active` state.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::restore_all_contexts`]
+/// `ContextManager::restore_all_contexts`
 /// (ADR-049 commit 12). Byte-identical behavior.
 ///
 /// # Errors
@@ -2387,7 +2387,7 @@ const FLUSH_LOCK_BUDGET: std::time::Duration = std::time::Duration::from_millis(
 /// Persists all contexts as a best-effort snapshot flush. Async variant.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::flush_all_contexts`]
+/// `ContextManager::flush_all_contexts`
 /// (ADR-049 commit 12). Byte-identical behavior.
 pub async fn flush_all_contexts(supervisor: &Supervisor) {
     if !manager_methods::has_persistence(supervisor) {
@@ -2434,7 +2434,7 @@ pub async fn flush_all_contexts(supervisor: &Supervisor) {
 /// Sync wrapper for [`flush_all_contexts`].
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::flush_all_contexts_sync`]
+/// `ContextManager::flush_all_contexts_sync`
 /// (ADR-049 commit 12). Byte-identical behavior.
 pub fn flush_all_contexts_sync(supervisor: &Supervisor) {
     if !manager_methods::has_persistence(supervisor) {
@@ -2550,7 +2550,7 @@ fn build_degraded_snapshot(context_id: &str) -> crate::context::state::ContextSn
 /// cleanup only).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::shutdown_all_contexts`]
+/// `ContextManager::shutdown_all_contexts`
 /// (ADR-049 commit 12). Byte-identical behavior.
 pub fn shutdown_all_contexts(supervisor: &Supervisor) {
     use crate::context::state::context_id_to_bytes;

@@ -4,7 +4,7 @@
 //!
 //! This module hoists the messaging-domain helpers and top-level send /
 //! receive methods that previously lived inside
-//! `crate::context::manager::messaging`. Commit 12b.1 hoisted six pure
+//! `crate::context::messaging_helpers`. Commit 12b.1 hoisted six pure
 //! [`PerContextState`]-scoped helpers. Commit 12c.1 extends the hoist to
 //! the two top-level messaging methods [`send_message`] and
 //! [`deliver_incoming`]. The hoist is a **pre-work** commit for the actor
@@ -28,15 +28,15 @@
 //!
 //! Commit 12c.1 hoists only the two top-level methods. The
 //! messaging-internal private helpers
-//! [`ContextManager::encrypt_and_send`](crate::context::manager::ContextManager::encrypt_and_send),
-//! [`ContextManager::authorize_send_payment`](crate::context::manager::ContextManager::authorize_send_payment),
-//! [`ContextManager::capture_send_payment`](crate::context::manager::ContextManager::capture_send_payment),
-//! [`ContextManager::finalize_send`](crate::context::manager::ContextManager::finalize_send),
-//! [`ContextManager::decrypt_and_dispatch`](crate::context::manager::ContextManager::decrypt_and_dispatch),
-//! [`ContextManager::validate_and_drain_timeouts`](crate::context::manager::ContextManager::validate_and_drain_timeouts),
-//! [`ContextManager::buffer_ahead_message`](crate::context::manager::ContextManager::buffer_ahead_message),
+//! [`ContextManager::encrypt_and_send`](crate::context::supervisor::Supervisor::encrypt_and_send),
+//! [`ContextManager::authorize_send_payment`](crate::context::supervisor::Supervisor::authorize_send_payment),
+//! [`ContextManager::capture_send_payment`](crate::context::supervisor::Supervisor::capture_send_payment),
+//! [`ContextManager::finalize_send`](crate::context::supervisor::Supervisor::finalize_send),
+//! [`ContextManager::decrypt_and_dispatch`](crate::context::supervisor::Supervisor::decrypt_and_dispatch),
+//! [`ContextManager::validate_and_drain_timeouts`](crate::context::supervisor::Supervisor::validate_and_drain_timeouts),
+//! [`ContextManager::buffer_ahead_message`](crate::context::supervisor::Supervisor::buffer_ahead_message),
 //! and
-//! [`ContextManager::deliver_message_and_drain_buffered`](crate::context::manager::ContextManager::deliver_message_and_drain_buffered)
+//! [`ContextManager::deliver_message_and_drain_buffered`](crate::context::supervisor::Supervisor::deliver_message_and_drain_buffered)
 //! remain as inherent methods on `ContextManager` for this commit — the
 //! hoisted [`send_message`] / [`deliver_incoming`] call them via the
 //! `mgr` parameter. They are themselves hoisted in a follow-up step of
@@ -582,7 +582,7 @@ pub fn run_buffered_post_delivery(
 // ---------------------------------------------------------------------------
 
 /// Sends a message within a context (hoisted body of the legacy
-/// [`ContextManager::send_message`]). Orchestrates the full 3-phase send
+/// `ContextManager::send_message`). Orchestrates the full 3-phase send
 /// pipeline:
 ///
 /// 1. **Under-lock Phase 1**: state check, commit-fault gate, capability
@@ -904,7 +904,7 @@ pub async fn send_message(
 // ---------------------------------------------------------------------------
 
 /// Delivers an incoming encrypted message from the relay to a context
-/// (hoisted body of the legacy [`ContextManager::deliver_incoming`]).
+/// (hoisted body of the legacy `ContextManager::deliver_incoming`).
 ///
 /// Opens the received envelope through the full receive pipeline,
 /// verifies the inner signature, validates anti-replay sequence numbers,
@@ -1137,7 +1137,7 @@ pub async fn deliver_incoming(
 /// # Behavior preservation
 ///
 /// Byte-identical to the legacy
-/// [`ContextManager::encrypt_and_send`](crate::context::manager::ContextManager::encrypt_and_send)
+/// [`ContextManager::encrypt_and_send`](crate::context::supervisor::Supervisor::encrypt_and_send)
 /// method form. The `self.transport.send_message(rid, &encrypted)`
 /// call becomes `supervisor.transport_ref().ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?.send_message(rid, &encrypted)` —
 /// the literal `.send_message(` call-text is preserved so pipeline
@@ -1227,7 +1227,7 @@ pub fn encrypt_and_send(
 /// # Collaborators
 ///
 /// - `mgr` — delegates to
-///   [`ContextManager::authorize_paid_action`](crate::context::manager::ContextManager::authorize_paid_action)
+///   [`ContextManager::authorize_paid_action`](crate::context::supervisor::Supervisor::authorize_paid_action)
 ///   (pub(crate)), which owns the economy-policy lookup and escrow
 ///   reservation.
 ///
@@ -1267,9 +1267,9 @@ pub async fn authorize_send_payment(
 /// # Collaborators
 ///
 /// - `mgr` — delegates to
-///   [`ContextManager::complete_paid_action`](crate::context::manager::ContextManager::complete_paid_action)
+///   [`ContextManager::complete_paid_action`](crate::context::supervisor::Supervisor::complete_paid_action)
 ///   and
-///   [`ContextManager::record_payment_capture_failure`](crate::context::manager::ContextManager::record_payment_capture_failure)
+///   [`ContextManager::record_payment_capture_failure`](crate::context::supervisor::Supervisor::record_payment_capture_failure)
 ///   (both pub(crate)).
 ///
 /// # Behavior preservation
@@ -2110,7 +2110,7 @@ pub async fn deliver_message_and_drain_buffered(
 /// announcing member's DID to their per-context pseudonym routing ID.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::send_pseudonym_announcement`](crate::context::manager::ContextManager::send_pseudonym_announcement)
+/// [`ContextManager::send_pseudonym_announcement`](crate::context::messaging_helpers::send_pseudonym_announcement)
 /// (ADR-049 commit 12). Byte-identical behavior — best-effort delivery
 /// with internal logging on transport / serialization failures.
 pub async fn send_pseudonym_announcement(

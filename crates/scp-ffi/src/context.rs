@@ -1615,7 +1615,7 @@ fn py_context_send(
     Ok(())
 }
 
-/// Drains events from the [`ContextManager`]'s receive buffer and delivers
+/// Drains events from the `ContextManager`'s receive buffer and delivers
 /// them to the FFI bridge's receive channel via [`deliver_message`].
 ///
 /// This is the bridge between the `ContextManager`'s internal event buffer
@@ -2370,7 +2370,7 @@ fn resolve_signing_key(identity_did: &str) -> PyResult<ed25519_dalek::SigningKey
 
 /// Proposes a governance action for voting.
 ///
-/// Delegates to [`ContextManager::propose_governance_action_checked`],
+/// Delegates to `ContextManager::propose_governance_action_checked`,
 /// which validates the proposer's `GovernancePropose` capability before
 /// submitting the proposal to the governance engine.
 ///
@@ -2487,7 +2487,7 @@ fn validate_governance_action_strings(
 
 /// Casts an approval vote on a pending governance proposal.
 ///
-/// Delegates to [`ContextManager::approve_governance_proposal`], which
+/// Delegates to `ContextManager::approve_governance_proposal`, which
 /// validates the voter's `GovernanceVote` capability before casting the
 /// vote. If the vote pushes the proposal past quorum, the action is
 /// auto-executed.
@@ -2573,7 +2573,7 @@ fn py_governance_approve(
 
 /// Casts a rejection vote on a pending governance proposal.
 ///
-/// Delegates to [`ContextManager::reject_governance_proposal`], which
+/// Delegates to `ContextManager::reject_governance_proposal`, which
 /// validates the voter's `GovernanceVote` capability before casting the
 /// vote.
 ///
@@ -2651,7 +2651,7 @@ fn py_governance_reject(
 
 /// Withdraws a previously cast vote on a pending governance proposal.
 ///
-/// Delegates to [`ContextManager::withdraw_governance_vote`]. No signing
+/// Delegates to `ContextManager::withdraw_governance_vote`. No signing
 /// key is required -- withdrawal is the voter's privileged operation on
 /// their own vote.
 ///
@@ -2840,7 +2840,7 @@ fn py_governance_list_proposals(handle: &PyContextHandle) -> PyResult<String> {
 
 /// Applies a pending ceiling modification if the notification period has elapsed.
 ///
-/// Delegates to [`ContextManager::apply_pending_ceiling_modification`].
+/// Delegates to `ContextManager::apply_pending_ceiling_modification`.
 /// Returns `true` if the modification was applied, `false` if no pending
 /// modification exists or the notification period has not elapsed.
 ///
@@ -2898,7 +2898,7 @@ fn py_apply_pending_ceiling_modification(
 
 /// Finalizes the cooperative close flow for a context in `Closing` state.
 ///
-/// Delegates to [`ContextManager::finalize_close`], which transitions
+/// Delegates to `ContextManager::finalize_close`, which transitions
 /// the context from `Closing` to `Closed`, destroys keys per memory scope,
 /// and records a `ContextClosed` event.
 ///
@@ -2959,7 +2959,7 @@ fn py_finalize_close(handle: &PyContextHandle) -> PyResult<()> {
 
 /// Creates a governance checkpoint for a context (ADR-031 §9).
 ///
-/// Delegates to [`ContextManager::create_governance_checkpoint`].
+/// Delegates to `ContextManager::create_governance_checkpoint`.
 ///
 /// # Arguments
 ///
@@ -3053,7 +3053,7 @@ fn py_create_governance_checkpoint(
 
 /// Adds a cosignature to an existing governance checkpoint (ADR-031 §9).
 ///
-/// Delegates to [`ContextManager::add_checkpoint_cosignature`].
+/// Delegates to `ContextManager::add_checkpoint_cosignature`.
 ///
 /// # Arguments
 ///
@@ -3136,7 +3136,7 @@ fn py_add_checkpoint_cosignature(
 
 /// Restores a single persisted context from storage.
 ///
-/// Delegates to [`ContextManager::restore_context`]. The context must
+/// Delegates to `ContextManager::restore_context`. The context must
 /// have been previously persisted and must not already be registered.
 ///
 /// # Arguments
@@ -3190,7 +3190,7 @@ fn py_restore_context(context_id: &str) -> PyResult<()> {
 
 /// Restores all persisted contexts from storage.
 ///
-/// Delegates to [`ContextManager::restore_all_contexts`]. Only contexts
+/// Delegates to `ContextManager::restore_all_contexts`. Only contexts
 /// in `Active` state are restored; contexts in `Closing`/`Closed`/`Expired`
 /// states are skipped.
 ///
@@ -3398,7 +3398,7 @@ fn py_broadcast_publish(
 ///
 /// Constructs a [`BroadcastContent`] from the asset entry fields, computes an
 /// `ETag` from the body, serializes with the magic prefix, and publishes via
-/// [`ContextManager::publish_broadcast_content`].
+/// `ContextManager::publish_broadcast_content`.
 ///
 /// Returns a dict with `blob_id` (hex-encoded SHA-256 of the serialized
 /// envelope) and `etag` (hex-encoded SHA-256 of the body).
@@ -4733,7 +4733,7 @@ fn parse_template_id(
 /// Generates and stores a per-member access key for explicit lifecycle
 /// management.
 ///
-/// Delegates to [`ContextManager::generate_context_access_key`].
+/// Delegates to `ContextManager::generate_context_access_key`.
 ///
 /// # Errors
 ///
@@ -4780,7 +4780,7 @@ fn py_access_key_generate(context_id: &str, member_did: &str, caller_did: &str) 
 /// Revokes (removes) a member's access key from the context's access key
 /// store.
 ///
-/// Delegates to [`ContextManager::revoke_context_access_key`].
+/// Delegates to `ContextManager::revoke_context_access_key`.
 ///
 /// # Errors
 ///
@@ -4826,7 +4826,7 @@ fn py_access_key_revoke(context_id: &str, member_did: &str, caller_did: &str) ->
 /// Restores a member's access key by generating a new key at the next
 /// epoch.
 ///
-/// Delegates to [`ContextManager::restore_context_access_key`].
+/// Delegates to `ContextManager::restore_context_access_key`.
 ///
 /// # Errors
 ///

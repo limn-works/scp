@@ -12,7 +12,7 @@
 //!
 //! # Transport model
 //!
-//! Transport state is delegated to the default [`NapiBridgeInstance`]'s transport
+//! Transport state is delegated to the default `NapiBridgeInstance`'s transport
 //! field (#1549). The `BridgeInstance` stores an `Arc<TransportManager>` behind
 //! a `RwLock` — the `Arc` allows NAPI subscription tasks to hold a reference
 //! across `.await` points without keeping the lock guard alive.
@@ -445,7 +445,7 @@ pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Resul
     Ok(())
 }
 
-/// Pre-configures the [`ContextManager`] with [`LocalTransportProvider`].
+/// Pre-configures the `ContextManager` with `LocalTransportProvider`.
 ///
 /// **Must be called before any `identityCreate` → `contextCreate` sequence.**
 /// Once the `ContextManager` is initialized (by whichever call arrives first),
@@ -471,7 +471,7 @@ pub fn configure_local_transport(local_did: String) -> napi::Result<()> {
     Ok(())
 }
 
-/// Pre-configures the [`ContextManager`] with [`RelayTransportProvider`].
+/// Pre-configures the `ContextManager` with `RelayTransportProvider`.
 ///
 /// **Must be called before any `identityCreate` → `contextCreate` sequence.**
 /// Once the `ContextManager` is initialized (by whichever call arrives first),
@@ -613,7 +613,7 @@ pub async fn transport_add_relay(relay_url: String) -> napi::Result<u32> {
 
 /// Assigns a relay set for the given context.
 ///
-/// Delegates to [`TransportManager::assign_relay_set`] which selects at
+/// Delegates to `TransportManager::assign_relay_set` which selects at
 /// least `min_relays` adapters per context using round-robin spread to
 /// minimize overlap.
 ///

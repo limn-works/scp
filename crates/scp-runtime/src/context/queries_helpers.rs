@@ -31,7 +31,7 @@
 //! take `&ActorDeps` and `&mut PerContextState` — so the methods they
 //! call must accept explicit collaborators rather than reaching through
 //! `self`. After this commit, every actor-handler-reachable method body
-//! on [`ContextManager`](crate::context::manager::ContextManager) lives
+//! on [`Supervisor`](crate::context::supervisor::Supervisor) lives
 //! in a sibling `*_helpers.rs` module; the legacy inherent methods are
 //! one-line forwarders that are deleted alongside the outer shim in a
 //! later ADR-049 commit.
@@ -59,7 +59,7 @@
 //!   lifted to the supervisor in ADR-049 commit 12c.9a-9b.
 //!
 //! The legacy inherent methods on
-//! [`ContextManager`](crate::context::manager::ContextManager) remain as
+//! [`Supervisor`](crate::context::supervisor::Supervisor) remain as
 //! one-line forwarders; they are deleted alongside the outer shim in a
 //! later ADR-049 commit when the actor handler bodies own the queries
 //! path directly.
@@ -111,11 +111,11 @@
 //! the builder and integration-test wiring. It is not reached from
 //! actor handlers and has a structural shape (`&mut self`) that does
 //! not fit the free-function pattern; it remains on
-//! [`ContextManager`](crate::context::manager::ContextManager).
+//! [`Supervisor`](crate::context::supervisor::Supervisor).
 //!
 //! `event_log_provider` is a pure accessor that returns
 //! `&dyn ContextEventLogProvider`; the modern accessor is
-//! [`ContextManager::event_log_ref`](crate::context::manager::ContextManager::event_log_ref).
+//! [`ContextManager::event_log_ref`](crate::context::supervisor::Supervisor::event_log_ref).
 //! The legacy method remains as inherent for FFI-bridge backwards
 //! compatibility.
 
@@ -144,7 +144,7 @@ const ATTACHED_EXPECT: &str = "queries_helpers: Supervisor must be fully attache
 /// are drained when this limit is exceeded to prevent unbounded growth.
 ///
 /// Hoisted from the legacy
-/// `crate::context::manager::queries::MAX_RETAINED_CHECKPOINTS` private
+/// `crate::context::queries_helpers::MAX_RETAINED_CHECKPOINTS` private
 /// constant (ADR-049 commit 12c.5). The legacy constant is removed
 /// because its sole readers (`create_checkpoint_if_due` /
 /// `force_create_checkpoint`) now live in this module.
@@ -157,7 +157,7 @@ const MAX_RETAINED_CHECKPOINTS: usize = 100;
 /// Registers a DID as controlled by the local node/SDK.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::register_local_did`](crate::context::manager::ContextManager::register_local_did)
+/// [`ContextManager::register_local_did`](crate::context::supervisor::Supervisor::register_local_did)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn register_local_did(supervisor: &Supervisor, did: DID) {
     // ArcSwap+write_lock pattern (ADR-049 §Decision 12). Reads are
@@ -195,7 +195,7 @@ pub async fn is_local_did(supervisor: &Supervisor, did: &DID) -> bool {
 /// (§9.10.4).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::local_pseudonym`](crate::context::manager::ContextManager::local_pseudonym)
+/// [`ContextManager::local_pseudonym`](crate::context::supervisor::Supervisor::local_pseudonym)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 ///
 /// # Errors
@@ -216,7 +216,7 @@ pub async fn local_pseudonym(
 /// in a broadcast context.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::get_broadcast_key_for_local_author`](crate::context::manager::ContextManager::get_broadcast_key_for_local_author)
+/// [`ContextManager::get_broadcast_key_for_local_author`](crate::context::supervisor::Supervisor::get_broadcast_key_for_local_author)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 ///
 /// # Errors
@@ -261,7 +261,7 @@ pub async fn get_broadcast_key_for_local_author(
 /// Returns the current member count for a context.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::member_count`](crate::context::manager::ContextManager::member_count)
+/// [`ContextManager::member_count`](crate::context::supervisor::Supervisor::member_count)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn member_count(supervisor: &Supervisor, context_id: &str) -> Option<usize> {
     let arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
@@ -272,7 +272,7 @@ pub async fn member_count(supervisor: &Supervisor, context_id: &str) -> Option<u
 /// Returns `true` if the given DID is a member of the specified context.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::is_member`](crate::context::manager::ContextManager::is_member)
+/// [`ContextManager::is_member`](crate::context::supervisor::Supervisor::is_member)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn is_member(supervisor: &Supervisor, context_id: &str, did: &str) -> bool {
     let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
@@ -285,7 +285,7 @@ pub async fn is_member(supervisor: &Supervisor, context_id: &str, did: &str) -> 
 /// Returns all member DIDs for a context.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::member_dids`](crate::context::manager::ContextManager::member_dids)
+/// [`ContextManager::member_dids`](crate::context::supervisor::Supervisor::member_dids)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn member_dids(supervisor: &Supervisor, context_id: &str) -> Vec<String> {
     let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
@@ -301,7 +301,7 @@ pub async fn member_dids(supervisor: &Supervisor, context_id: &str) -> Vec<Strin
 /// Returns the role assignment for a specific member in a context.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::member_role`](crate::context::manager::ContextManager::member_role)
+/// [`ContextManager::member_role`](crate::context::supervisor::Supervisor::member_role)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn member_role(
     supervisor: &Supervisor,
@@ -317,7 +317,7 @@ pub async fn member_role(
 /// context is not registered with this manager.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::context_params`](crate::context::manager::ContextManager::context_params)
+/// [`ContextManager::context_params`](crate::context::supervisor::Supervisor::context_params)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn context_params(supervisor: &Supervisor, context_id: &str) -> Option<ContextParams> {
     let arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
@@ -329,7 +329,7 @@ pub async fn context_params(supervisor: &Supervisor, context_id: &str) -> Option
 /// context is not registered.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::get_role_state`](crate::context::manager::ContextManager::get_role_state)
+/// [`ContextManager::get_role_state`](crate::context::supervisor::Supervisor::get_role_state)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn get_role_state(supervisor: &Supervisor, context_id: &str) -> Option<ContextRoleState> {
     let arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
@@ -341,7 +341,7 @@ pub async fn get_role_state(supervisor: &Supervisor, context_id: &str) -> Option
 /// (PR #1606 C6).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::pending_commits`](crate::context::manager::ContextManager::pending_commits)
+/// [`ContextManager::pending_commits`](crate::context::supervisor::Supervisor::pending_commits)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn pending_commits(supervisor: &Supervisor, context_id: &str) -> Vec<PendingCommit> {
     let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
@@ -355,7 +355,7 @@ pub async fn pending_commits(supervisor: &Supervisor, context_id: &str) -> Vec<P
 /// (PR #1606 C6).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::commit_fault`](crate::context::manager::ContextManager::commit_fault)
+/// [`ContextManager::commit_fault`](crate::context::supervisor::Supervisor::commit_fault)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn commit_fault(supervisor: &Supervisor, context_id: &str) -> Option<CommitFaultMarker> {
     let arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
@@ -370,7 +370,7 @@ pub async fn commit_fault(supervisor: &Supervisor, context_id: &str) -> Option<C
 /// Drains all events from the receive buffer for a context.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::drain_events`](crate::context::manager::ContextManager::drain_events)
+/// [`ContextManager::drain_events`](crate::context::supervisor::Supervisor::drain_events)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn drain_events(supervisor: &Supervisor, context_id: &str) -> Vec<ContextEvent> {
     let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
@@ -384,7 +384,7 @@ pub async fn drain_events(supervisor: &Supervisor, context_id: &str) -> Vec<Cont
 /// context.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::report_degraded_mode`](crate::context::manager::ContextManager::report_degraded_mode)
+/// [`ContextManager::report_degraded_mode`](crate::context::supervisor::Supervisor::report_degraded_mode)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn report_degraded_mode(
     supervisor: &Supervisor,
@@ -421,7 +421,7 @@ pub async fn report_degraded_mode(
 /// Returns the Merkle event log entries for a context.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::event_log_entries`](crate::context::manager::ContextManager::event_log_entries)
+/// [`ContextManager::event_log_entries`](crate::context::supervisor::Supervisor::event_log_entries)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 ///
 /// # Errors
@@ -445,7 +445,7 @@ pub fn event_log_entries(
 /// management.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::generate_context_access_key`](crate::context::manager::ContextManager::generate_context_access_key)
+/// [`ContextManager::generate_context_access_key`](crate::context::queries_helpers::generate_context_access_key)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 ///
 /// # Errors
@@ -490,7 +490,7 @@ pub async fn generate_context_access_key(
 /// key store.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::revoke_context_access_key`](crate::context::manager::ContextManager::revoke_context_access_key)
+/// [`ContextManager::revoke_context_access_key`](crate::context::queries_helpers::revoke_context_access_key)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 ///
 /// # Errors
@@ -532,7 +532,7 @@ pub async fn revoke_context_access_key(
 /// Restores a member's access key by generating a new key at epoch 0.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::restore_context_access_key`](crate::context::manager::ContextManager::restore_context_access_key)
+/// [`ContextManager::restore_context_access_key`](crate::context::queries_helpers::restore_context_access_key)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 ///
 /// # Errors
@@ -576,7 +576,7 @@ pub async fn restore_context_access_key(
 /// Stores an access key in a context's access key store.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::set_access_key`](crate::context::manager::ContextManager::set_access_key)
+/// [`ContextManager::set_access_key`](crate::context::supervisor::Supervisor::set_access_key)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn set_access_key(
     supervisor: &Supervisor,
@@ -599,7 +599,7 @@ pub async fn set_access_key(
 /// Removes a member's access key from a context's access key store.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::remove_access_key`](crate::context::manager::ContextManager::remove_access_key)
+/// [`ContextManager::remove_access_key`](crate::context::supervisor::Supervisor::remove_access_key)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn remove_access_key(supervisor: &Supervisor, context_id: &str, member_did: &str) {
     if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
@@ -751,7 +751,7 @@ pub async fn velocity_for_test(
 /// or time interval thresholds.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::create_checkpoint_if_due`](crate::context::manager::ContextManager::create_checkpoint_if_due)
+/// [`ContextManager::create_checkpoint_if_due`](crate::context::supervisor::Supervisor::create_checkpoint_if_due)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 ///
 /// A checkpoint is due when either:
@@ -812,7 +812,7 @@ pub fn create_checkpoint_if_due(
 /// the event/time thresholds have been reached.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::force_create_checkpoint`](crate::context::manager::ContextManager::force_create_checkpoint)
+/// [`ContextManager::force_create_checkpoint`](crate::context::supervisor::Supervisor::force_create_checkpoint)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub fn force_create_checkpoint(
     supervisor: &Supervisor,
@@ -914,7 +914,7 @@ fn build_checkpoint(
 /// equivocation detection (§9.9.3, ADR-011 AC-8).
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::compare_remote_checkpoint`](crate::context::manager::ContextManager::compare_remote_checkpoint)
+/// [`ContextManager::compare_remote_checkpoint`](crate::context::supervisor::Supervisor::compare_remote_checkpoint)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 ///
 /// # Errors
@@ -1078,7 +1078,7 @@ fn sync_merkle_tree(
 /// in the per-context RFC 6962 event log.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::prove_event_inclusion`](crate::context::manager::ContextManager::prove_event_inclusion)
+/// [`ContextManager::prove_event_inclusion`](crate::context::supervisor::Supervisor::prove_event_inclusion)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 ///
 /// # Errors
@@ -1107,7 +1107,7 @@ pub async fn prove_event_inclusion(
 /// the current tree size.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::prove_event_consistency`](crate::context::manager::ContextManager::prove_event_consistency)
+/// [`ContextManager::prove_event_consistency`](crate::context::supervisor::Supervisor::prove_event_consistency)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 ///
 /// # Errors
@@ -1136,7 +1136,7 @@ pub async fn prove_event_consistency(
 /// Verifies a Merkle inclusion proof. Pure function — no state needed.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::verify_event_inclusion`](crate::context::manager::ContextManager::verify_event_inclusion)
+/// [`ContextManager::verify_event_inclusion`](crate::context::supervisor::Supervisor::verify_event_inclusion)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 #[must_use]
 pub fn verify_event_inclusion(proof: &scp_event_log::proof::InclusionProof) -> bool {
@@ -1146,7 +1146,7 @@ pub fn verify_event_inclusion(proof: &scp_event_log::proof::InclusionProof) -> b
 /// Verifies a Merkle consistency proof. Pure function — no state needed.
 ///
 /// Hoisted body of the legacy
-/// [`ContextManager::verify_event_consistency`](crate::context::manager::ContextManager::verify_event_consistency)
+/// [`ContextManager::verify_event_consistency`](crate::context::supervisor::Supervisor::verify_event_consistency)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 #[must_use]
 pub fn verify_event_consistency(proof: &scp_event_log::proof::ConsistencyProof) -> bool {

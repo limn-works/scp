@@ -5369,7 +5369,7 @@ pub async fn transport_disconnect(manager: Arc<TransportManager>) -> Result<(), 
         })?
 }
 
-/// Pre-configures the [`ContextManager`] with [`RelayTransportProvider`].
+/// Pre-configures the `ContextManager` with `RelayTransportProvider`.
 ///
 /// **Must be called before any `identityCreate` → `contextCreate` sequence.**
 /// Once the `ContextManager` is initialized (by whichever call arrives first),

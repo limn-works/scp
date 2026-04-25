@@ -709,11 +709,11 @@ fn wrap_psk_for_device(psk: &[u8; 32], device_pk: &[u8; 32]) -> Option<Vec<u8>> 
 // ---------------------------------------------------------------------------
 
 /// Production implementation of [`RecoveryBackend`] that delegates to the
-/// [`ContextManager`] for MLS, UCAN, `KeyPackage`, notification, and PSK
+/// `ContextManager` for MLS, UCAN, `KeyPackage`, notification, and PSK
 /// operations.
 ///
 /// This struct bridges the synchronous [`RecoveryBackend`] trait to the async
-/// [`ContextManager`] API using `tokio::task::block_in_place` +
+/// `ContextManager` API using `tokio::task::block_in_place` +
 /// `Handle::current().block_on()` — the same pattern used by
 /// `ContextPersistenceBridge` in `store/context.rs`.
 ///

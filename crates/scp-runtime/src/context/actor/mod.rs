@@ -324,7 +324,7 @@ impl ContextActor {
             ContextCommand::Messaging(MessagingCommand::SendMessage { reply, .. }) => {
                 // Skeleton dispatch does NOT own a ContextManager to
                 // delegate to — the shim routes messaging through
-                // [`Supervisor::dispatch_command`] (commit 8). Any
+                // `Supervisor::dispatch_command` (commit 8). Any
                 // caller that mistakenly routes a SendMessage through
                 // the actor mailbox during the migration window gets a
                 // typed error rather than a hang.

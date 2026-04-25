@@ -1,13 +1,13 @@
 //! Global runtime registry mapping context IDs to live `scp-core` objects.
 //!
 //! The FFI bridge functions accept `context_id: &str` parameters but need
-//! access to both the shared [`ContextManager`] (for lifecycle, membership,
+//! access to both the shared `ContextManager` (for lifecycle, membership,
 //! governance, and messaging operations) and per-context FFI-specific state
 //! (tool registries, event logs, UCAN state, message channels).
 //!
 //! # Architecture (post-#386 rewrite)
 //!
-//! Context lifecycle is delegated to a shared [`ContextManager`] which holds
+//! Context lifecycle is delegated to a shared `ContextManager` which holds
 //! the canonical membership, role, governance, broadcast, and TTL state.
 //! Per-context FFI-specific state (tool registries, event logs, UCAN
 //! revocation/nonce tracking, tool handlers, message channels) lives in
@@ -37,7 +37,7 @@
 //! 1. `py_context_create` delegates to `ContextManager::create_context`, then
 //!    registers FFI-specific state via [`register_ffi_state`].
 //! 2. Bridge functions call [`with_ffi_state`] for FFI-specific state and
-//!    [`context_manager`] for the shared `ContextManager`.
+//!    `Self::context_manager` for the shared `ContextManager`.
 //! 3. `py_context_close` delegates to `ContextManager::close_context`, then
 //!    removes FFI state via [`remove_ffi_state`].
 //!
@@ -203,7 +203,7 @@ pub fn supervisor() -> Result<&'static Arc<scp_core::context::supervisor::Superv
 /// - [`StorageConfig::InMemory`] — encrypted in-memory storage (ephemeral).
 /// - [`StorageConfig::Sqlite`] — persistent SQLCipher-encrypted storage on
 ///   disk. The `key` is the raw encryption key material held in
-///   [`Zeroizing`] so it is wiped from memory as soon as the config is
+///   `Zeroizing` so it is wiped from memory as soon as the config is
 ///   consumed.
 ///
 /// Keeping this as an enum (instead of a string parameter) means adding future
@@ -216,7 +216,7 @@ pub enum StorageConfig {
     ///
     /// Wraps [`scp_platform::sqlite::SqliteStorage`]. Persists across
     /// process restarts. The `key` is raw encryption key material wrapped in
-    /// [`Zeroizing`] so the caller's copy is wiped after construction.
+    /// `Zeroizing` so the caller's copy is wiped after construction.
     Sqlite {
         /// Directory the database file is created in.
         path: PathBuf,
@@ -705,8 +705,8 @@ pub(crate) static DEFAULT_BRIDGE_INSTANCE: OnceLock<Arc<PyBridgeInstance>> = Onc
 /// Initializes the default [`PyBridgeInstance`] without a `ContextManager`.
 ///
 /// Called by [`ensure_bridge_instance`] and (transitively) by
-/// [`init_context_manager`]. The `ContextManager` is attached later via
-/// [`CoreFields::set_context_manager`] once `identity_create` has produced
+/// `Self::init_context_manager`. The `ContextManager` is attached later via
+/// `CoreFields::set_context_manager` once `identity_create` has produced
 /// the local DID and the `MlsCryptoProvider` has been constructed with it.
 ///
 /// `PyBridgeInstance` itself carries no DID (spec §12.2.3) — the
@@ -738,7 +738,7 @@ pub fn bridge_instance_raw() -> Option<&'static Arc<PyBridgeInstance>> {
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the bridge has not been initialized
-/// via [`init_context_manager`] (which also creates the default instance),
+/// via `Self::init_context_manager` (which also creates the default instance),
 /// or if the bridge is currently suspended. Shutdown is a warning (not an
 /// error) because shutdown is terminal and operations fail naturally at the
 /// MLS/transport layer.
@@ -817,7 +817,7 @@ pub fn bridge_instance_for_affinity() -> Result<&'static CoreFields, ScpPyError>
 // ContextManager initialization
 // ---------------------------------------------------------------------------
 
-/// Initializes the per-bridge [`Supervisor`] with production providers.
+/// Initializes the per-bridge `Supervisor` with production providers.
 ///
 /// Uses `MlsCryptoProvider` (real OpenMLS-backed encryption, sender keys, and
 /// group management — ported from NAPI bridge #1305, closes #1324),
@@ -880,7 +880,7 @@ pub fn init_supervisor(local_did: &str) {
 
 /// Ensures the default [`PyBridgeInstance`] exists (without a `Supervisor`).
 ///
-/// Called by [`crate::identity::ensure_did_resolver_initialized`] before
+/// Called by `ensure_did_resolver_initialized` before
 /// `DidDht::create()` runs, so that the DID resolver slot owned by
 /// `BridgeInstance` is available. The `Supervisor` is attached later
 /// via [`init_supervisor`] once the identity is known and the
@@ -892,7 +892,7 @@ pub fn ensure_bridge_instance() {
     init_bridge_instance_empty();
 }
 
-/// Initializes the per-bridge [`Supervisor`] with custom providers.
+/// Initializes the per-bridge `Supervisor` with custom providers.
 ///
 /// Allows injecting real or custom provider implementations. If the
 /// supervisor is already initialized, this is a no-op (first call wins).
@@ -1064,11 +1064,11 @@ impl ContextPersistence for ArcContextPersistence {
     }
 }
 
-/// Constructs a fresh per-instance [`Supervisor`] with the given
+/// Constructs a fresh per-instance `Supervisor` with the given
 /// providers.
 ///
 /// ADR-049 commit 12c.9g.3.6 — the FFI bridge no longer touches
-/// [`ContextManager`] at all. [`Supervisor::with_providers`] is the
+/// `ContextManager` at all. `Supervisor::with_providers` is the
 /// single entry point that constructs the supervisor + populates the
 /// lifted-provider slots. The supervisor is the only handle returned
 /// to the bridge layer.
@@ -1196,7 +1196,7 @@ static EMPTY_FFI_BRIDGE_STATE: OnceLock<DashMap<String, FfiBridgeState>> = OnceL
 /// the removed standalone `OnceLock<DashMap<...>>` (callers previously saw
 /// an empty registry on first touch; they still do).
 ///
-/// Stores state that is NOT managed by [`ContextManager`]: tool registries,
+/// Stores state that is NOT managed by `ContextManager`: tool registries,
 /// event logs, UCAN revocation/nonce tracking, tool handlers, and message
 /// channels. Context lifecycle state (membership, roles, governance,
 /// broadcast, TTL) lives in the `ContextManager`.
@@ -1212,7 +1212,7 @@ fn ffi_state_registry() -> &'static DashMap<String, FfiBridgeState> {
     )
 }
 
-/// Per-context FFI-specific state that does NOT duplicate [`ContextManager`].
+/// Per-context FFI-specific state that does NOT duplicate `ContextManager`.
 ///
 /// Contains subsystem state used by `tools.rs`, `ucan.rs`, `event_log.rs`,
 /// and `mcp.rs`, plus FFI-specific message channel and tool handler state.
@@ -1598,7 +1598,7 @@ pub fn deliver_message(context_id: &str, message: PyMessage) -> Result<(), ScpPy
 ///
 /// # Panics
 ///
-/// Panics if the bridge has not been initialized via [`init_context_manager`].
+/// Panics if the bridge has not been initialized via `Self::init_context_manager`.
 pub fn register_known_context(context_id: &str, known: KnownContext) {
     if let Ok(bi) = bridge_instance() {
         bi.core.register_known_context(context_id, known);

@@ -289,7 +289,7 @@ impl SenderKeyStore {
 
     /// Sets a sender key WITHOUT enforcing epoch monotonicity.
     ///
-    /// Use [`set_checked`] when accepting keys from other members to prevent
+    /// Use [`Self::set_checked`] when accepting keys from other members to prevent
     /// epoch rollback attacks. This method is intended only for the local
     /// member's own key rotation.
     pub fn set_unchecked(&mut self, context_id: &str, sender_did: &str, key: SenderKey) {
@@ -374,12 +374,12 @@ impl SenderKeyStore {
     /// Used exclusively by the crypto-provider snapshot restore path to
     /// repopulate the epoch map from a persisted snapshot — the restored
     /// values ARE the authoritative high-water marks, so `set_checked`
-    /// must not reject them. After restore, subsequent [`set_checked`]
+    /// must not reject them. After restore, subsequent [`Self::set_checked`]
     /// calls continue to enforce monotonicity against the restored
     /// values.
     ///
     /// This method does NOT touch the `keys` map — the matching
-    /// [`set_unchecked`] or [`set_checked`] call is still required to
+    /// [`Self::set_unchecked`] or [`Self::set_checked`] call is still required to
     /// install the key material itself.
     pub fn restore_epoch_high_water(&mut self, context_id: &str, sender_did: &str, epoch: u64) {
         self.epochs

@@ -107,7 +107,7 @@ impl NapiFullStackNode {
 /// Creates a full-stack test node with real MLS crypto.
 ///
 /// All nodes created via this function share a single `FullStackNetwork`
-/// (and therefore a single [`KeyExchange`]), enabling Welcome message and
+/// (and therefore a single `KeyExchange`), enabling Welcome message and
 /// sender key exchange between them.
 #[napi]
 pub fn fullstack_create_node(did: String) -> napi::Result<NapiFullStackNode> {

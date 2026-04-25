@@ -9,14 +9,14 @@
 //! `Outcome<()>`.
 //!
 //! The underlying byte-identical implementation still lives on
-//! [`ContextManager`](crate::context::manager::ContextManager): each
+//! [`Supervisor`](crate::context::supervisor::Supervisor): each
 //! handler delegates to
-//! [`ContextManager::standing_context`](crate::context::manager::ContextManager::standing_context),
-//! [`ContextManager::standing_context_count`](crate::context::manager::ContextManager::standing_context_count),
-//! [`ContextManager::has_standing_context`](crate::context::manager::ContextManager::has_standing_context),
-//! [`ContextManager::register_standing_context`](crate::context::manager::ContextManager::register_standing_context),
+//! [`ContextManager::standing_context`](crate::context::standing_helpers::standing_context),
+//! [`ContextManager::standing_context_count`](crate::context::standing_helpers::standing_context_count),
+//! [`ContextManager::has_standing_context`](crate::context::standing_helpers::has_standing_context),
+//! [`ContextManager::register_standing_context`](crate::context::standing_helpers::register_standing_context),
 //! or
-//! [`ContextManager::reconnect_all_standing`](crate::context::manager::ContextManager::reconnect_all_standing).
+//! [`ContextManager::reconnect_all_standing`](crate::context::standing_helpers::reconnect_all_standing).
 //! The shim wraps the delegated call in [`tokio::time::timeout`] with a
 //! 30s budget per ADR-049 §7.
 //!
@@ -35,7 +35,7 @@
 //! The `InitiateStandingPairCreate` saga-initiator variant returns
 //! [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
 //! because the 2-phase Prepare+Commit decomposition of
-//! [`ContextManager::standing_context`](crate::context::manager::ContextManager::standing_context)
+//! [`ContextManager::standing_context`](crate::context::standing_helpers::standing_context)
 //! is spec-gapped — the spec does not yet define:
 //!   - which fields of the `CreationReceipt` are covered by the
 //!     Prepare-side commitment (public fields vs. committed-to-bytes),
@@ -115,7 +115,7 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: StandingCommand) -> Outcom
 }
 
 /// Handle [`StandingCommand::StandingContext`] — delegates to
-/// [`ContextManager::standing_context`](crate::context::manager::ContextManager::standing_context)
+/// [`ContextManager::standing_context`](crate::context::standing_helpers::standing_context)
 /// under a 30s timeout.
 async fn handle_standing_context(
     supervisor: &Supervisor,
@@ -194,7 +194,7 @@ async fn handle_has_standing_context(
 }
 
 /// Handle [`StandingCommand::RegisterStandingContext`] — delegates to
-/// [`ContextManager::register_standing_context`](crate::context::manager::ContextManager::register_standing_context)
+/// [`ContextManager::register_standing_context`](crate::context::standing_helpers::register_standing_context)
 /// under a 30s timeout. Always mutating.
 async fn handle_register_standing_context(
     supervisor: &Supervisor,
@@ -221,7 +221,7 @@ async fn handle_register_standing_context(
 }
 
 /// Handle [`StandingCommand::ReconnectAllStanding`] — delegates to
-/// [`ContextManager::reconnect_all_standing`](crate::context::manager::ContextManager::reconnect_all_standing)
+/// [`ContextManager::reconnect_all_standing`](crate::context::standing_helpers::reconnect_all_standing)
 /// under a 30s timeout. Always mutating.
 async fn handle_reconnect_all_standing(
     supervisor: &Supervisor,

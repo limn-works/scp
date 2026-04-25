@@ -264,7 +264,7 @@ struct ContextCryptoState {
 /// Commit 12b.2a does NOT move any production state into actor ownership.
 /// `take_crypto_state` is callable but no production site calls it yet;
 /// the legacy `create_mls_group` still populates `contexts` via the
-/// [`ContextCryptoProvider`] trait impl, and the legacy `seal` / `open`
+/// `ContextCryptoProvider` trait impl, and the legacy `seal` / `open`
 /// path continues to operate on `contexts[ctx_id]`. Commit 12b.2b is the
 /// first site that invokes `take_crypto_state` to atomically migrate every
 /// messaging handler's state into actor ownership at spawn time — see
@@ -351,7 +351,7 @@ struct PendingJoinState {
     provider: super::storage::InMemoryMlsProvider,
 }
 
-/// Production [`ContextCryptoProvider`] backed by `OpenMLS`.
+/// Production `ContextCryptoProvider` backed by `OpenMLS`.
 ///
 /// Manages per-context MLS groups and sender keys. Thread-safe via internal
 /// `Mutex`-protected maps.
@@ -540,8 +540,8 @@ impl MlsCryptoProvider {
     /// - `self.contexts[context_id]` is absent (`HashMap::remove`d).
     /// - `context_id` is recorded in [`Self::taken_context_ids`].
     /// - Every subsequent [`Self::with_context`] /
-    ///   [`ContextCryptoProvider::seal`] /
-    ///   [`ContextCryptoProvider::open`] on `context_id` returns
+    ///   `ContextCryptoProvider::seal` /
+    ///   `ContextCryptoProvider::open` on `context_id` returns
     ///   [`ContextError::CryptoFailed`] with the
     ///   `context state owned by actor` message.
     ///
@@ -884,7 +884,7 @@ impl MlsCryptoProvider {
 
     /// Adds a member to the MLS group (ADR-001 `add_member()`).
     ///
-    /// Returns an [`AddMemberOutput`] containing the TLS-serialized MLS
+    /// Returns an [`AddMemberOutput`](scp_protocol::context::builder::AddMemberOutput) containing the TLS-serialized MLS
     /// Welcome (for the joiner) and Commit (for existing members). Non-MLS
     /// providers return `AddMemberOutput::default()` (empty bytes).
     ///
@@ -977,7 +977,7 @@ impl MlsCryptoProvider {
 
     /// Removes a member from the MLS group (ADR-001 `remove_member()`).
     ///
-    /// Returns a [`RemoveMemberOutput`] containing the TLS-serialized MLS
+    /// Returns a [`RemoveMemberOutput`](scp_protocol::context::builder::RemoveMemberOutput) containing the TLS-serialized MLS
     /// Commit (for remaining members to process). Non-MLS providers return
     /// `RemoveMemberOutput::default()` (empty bytes).
     ///
@@ -1588,10 +1588,10 @@ impl MlsCryptoProvider {
     /// Opens a received envelope: MLS decrypts, sender-key decrypts,
     /// deserializes, verifies membership + padding + integrity check.
     ///
-    /// Returns [`OpenResult::Application`] for application messages,
-    /// [`OpenResult::Control`] for MLS Commit/Proposal messages, or
-    /// [`OpenResult::Management`] for MLS-wrapped management messages
-    /// (identified by the [`MANAGEMENT_MSG_MAGIC`] prefix).
+    /// Returns [`OpenResult::Application`](scp_protocol::context::builder::OpenResult::Application) for application messages,
+    /// [`OpenResult::Control`](scp_protocol::context::builder::OpenResult::Control) for MLS Commit/Proposal messages, or
+    /// [`OpenResult::Management`](scp_protocol::context::builder::OpenResult::Management) for MLS-wrapped management messages
+    /// (identified by the [`MANAGEMENT_MSG_MAGIC`](scp_protocol::context::builder::MANAGEMENT_MSG_MAGIC) prefix).
     ///
     /// Signature verification is NOT performed here — the caller
     /// (`ContextManager`) handles it via `key_resolver` after `open` returns.
@@ -1743,7 +1743,7 @@ impl MlsCryptoProvider {
 
     /// MLS-encrypts a management payload for group-authenticated delivery.
     ///
-    /// Prepends the [`MANAGEMENT_MSG_MAGIC`] prefix, MLS-encrypts the result,
+    /// Prepends the [`MANAGEMENT_MSG_MAGIC`](scp_protocol::context::builder::MANAGEMENT_MSG_MAGIC) prefix, MLS-encrypts the result,
     /// and wraps in an outer envelope. Used to send sender key distributions
     /// that are authenticated by MLS membership.
     ///
@@ -1798,7 +1798,7 @@ impl MlsCryptoProvider {
     /// a new epoch with fresh key material. After this call, the compromised
     /// old epoch key is useless for future messages.
     ///
-    /// Returns an [`AdvanceEpochOutput`] containing the TLS-serialized MLS
+    /// Returns an [`AdvanceEpochOutput`](scp_protocol::context::builder::AdvanceEpochOutput) containing the TLS-serialized MLS
     /// Commit message that must be distributed to all group members.
     ///
     /// The default implementation is a no-op returning empty output so that
@@ -2172,7 +2172,7 @@ impl MlsCryptoProvider {
     /// Returns the per-sender epoch high-water marks for a given context.
     ///
     /// Each `(sender_did, epoch)` pair represents the highest sender key epoch
-    /// seen from that participant.  Used by [`ContextManager::import_context`]
+    /// seen from that participant.  Used by `ContextManager::import_context`
     /// to capture the local floors **before** destroying existing crypto state
     /// so the incoming snapshot can be validated against them.
     ///

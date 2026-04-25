@@ -289,7 +289,7 @@ pub async fn start_relay_local(data_dir: &Path) -> Result<RunningRelay, ServerEr
 /// portability — the same DID persists across node restarts.
 ///
 /// The relay is started during construction. The HTTP server is **not** started;
-/// call [`ApplicationNode::serve`] if HTTP endpoints are needed.
+/// call `ApplicationNode::serve` if HTTP endpoints are needed.
 ///
 /// # Errors
 ///
@@ -337,7 +337,7 @@ pub async fn start_node_in_memory(
 /// - Relay bound to `127.0.0.1:0` (OS-assigned port)
 ///
 /// The relay is started during construction. The HTTP server is **not** started;
-/// call [`ApplicationNode::serve`] if HTTP endpoints are needed.
+/// call `ApplicationNode::serve` if HTTP endpoints are needed.
 ///
 /// # Identity modes
 ///
@@ -753,9 +753,9 @@ pub async fn resolve_broadcast_key(
     }
 }
 
-/// Convenience: builds a [`BroadcastKey`] from a [`ResolvedBroadcastKey`].
+/// Convenience: builds a `BroadcastKey` from a [`ResolvedBroadcastKey`].
 impl ResolvedBroadcastKey {
-    /// Converts the resolved key into a [`BroadcastKey`] suitable for
+    /// Converts the resolved key into a `BroadcastKey` suitable for
     /// passing to `enable_broadcast_projection_with_site`.
     #[must_use]
     pub fn into_broadcast_key(self) -> scp_core::crypto::sender_keys::BroadcastKey {

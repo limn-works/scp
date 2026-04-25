@@ -259,7 +259,7 @@ pub fn py_transport_status() -> PyResult<PyTransportStatus> {
     })
 }
 
-/// Pre-configures the [`ContextManager`] with [`RelayTransportProvider`].
+/// Pre-configures the `ContextManager` with `RelayTransportProvider`.
 ///
 /// **Must be called before any `py_identity_create` → `py_context_create` sequence.**
 /// Once the `ContextManager` is initialized (by whichever call arrives first),
@@ -318,7 +318,7 @@ pub fn py_configure_relay_transport(relay_url: &str, local_did: &str) -> PyResul
 /// Registers an additional relay adapter with the transport manager.
 ///
 /// Connects to the specified relay URL and adds the resulting adapter to
-/// the global [`TransportManager`]. The `transport_connect` function must
+/// the global `TransportManager`. The `transport_connect` function must
 /// have been called first to initialize the manager.
 ///
 /// # Arguments
@@ -387,7 +387,7 @@ pub fn py_transport_add_relay(relay_url: &str, source: &str) -> PyResult<usize> 
 
 /// Assigns a relay set for the given context.
 ///
-/// Delegates to [`TransportManager::assign_relay_set`] which selects at
+/// Delegates to `TransportManager::assign_relay_set` which selects at
 /// least `min_relays` adapters per context using round-robin spread to
 /// minimize overlap.
 ///

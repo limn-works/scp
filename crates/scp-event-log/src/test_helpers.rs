@@ -80,7 +80,7 @@ pub fn leaf_hash_from_event(event: &Event) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// A test-only [`EventLogSigner`] that wraps an Ed25519 signing key directly.
+/// A test-only [`EventLogSigner`](crate::EventLogSigner) that wraps an Ed25519 signing key directly.
 ///
 /// Replaces `InMemoryKeyCustody` for tests within scp-event-log, which cannot
 /// depend on scp-platform.

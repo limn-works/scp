@@ -10,23 +10,23 @@
 //! `&Arc<ContextManager>` directly).
 //!
 //! The underlying byte-identical implementation still lives on
-//! [`ContextManager`](crate::context::manager::ContextManager): each
+//! [`Supervisor`](crate::context::supervisor::Supervisor): each
 //! handler delegates to
-//! [`ContextManager::propose_governance_action`](crate::context::manager::ContextManager::propose_governance_action),
-//! [`ContextManager::propose_governance_action_checked`](crate::context::manager::ContextManager::propose_governance_action_checked),
-//! [`ContextManager::vote_on_proposal`](crate::context::manager::ContextManager::vote_on_proposal),
-//! [`ContextManager::approve_governance_proposal`](crate::context::manager::ContextManager::approve_governance_proposal),
-//! [`ContextManager::reject_governance_proposal`](crate::context::manager::ContextManager::reject_governance_proposal),
-//! [`ContextManager::withdraw_governance_vote`](crate::context::manager::ContextManager::withdraw_governance_vote),
-//! [`ContextManager::execute_governance_action`](crate::context::manager::ContextManager::execute_governance_action),
-//! [`ContextManager::get_proposal`](crate::context::manager::ContextManager::get_proposal),
-//! [`ContextManager::list_proposals`](crate::context::manager::ContextManager::list_proposals),
-//! [`ContextManager::apply_pending_ceiling_modification`](crate::context::manager::ContextManager::apply_pending_ceiling_modification),
-//! [`ContextManager::apply_pending_economic_policy_change`](crate::context::manager::ContextManager::apply_pending_economic_policy_change),
-//! [`ContextManager::tombstone_migrated_context`](crate::context::manager::ContextManager::tombstone_migrated_context),
-//! [`ContextManager::migration_state`](crate::context::manager::ContextManager::migration_state),
+//! [`ContextManager::propose_governance_action`](crate::context::supervisor::Supervisor::propose_governance_action),
+//! [`ContextManager::propose_governance_action_checked`](crate::context::supervisor::Supervisor::propose_governance_action_checked),
+//! [`ContextManager::vote_on_proposal`](crate::context::supervisor::Supervisor::vote_on_proposal),
+//! [`ContextManager::approve_governance_proposal`](crate::context::governance_helpers::approve_governance_proposal),
+//! [`ContextManager::reject_governance_proposal`](crate::context::governance_helpers::reject_governance_proposal),
+//! [`ContextManager::withdraw_governance_vote`](crate::context::supervisor::Supervisor::withdraw_governance_vote),
+//! [`ContextManager::execute_governance_action`](crate::context::governance_helpers::execute_governance_action),
+//! [`ContextManager::get_proposal`](crate::context::supervisor::Supervisor::get_proposal),
+//! [`ContextManager::list_proposals`](crate::context::supervisor::Supervisor::list_proposals),
+//! [`ContextManager::apply_pending_ceiling_modification`](crate::context::governance_helpers::apply_pending_ceiling_modification),
+//! [`ContextManager::apply_pending_economic_policy_change`](crate::context::governance_helpers::apply_pending_economic_policy_change),
+//! [`ContextManager::tombstone_migrated_context`](crate::context::governance_helpers::tombstone_migrated_context),
+//! [`ContextManager::migration_state`](crate::context::governance_helpers::migration_state),
 //! or
-//! [`ContextManager::acknowledge_commit_fault`](crate::context::manager::ContextManager::acknowledge_commit_fault).
+//! [`ContextManager::acknowledge_commit_fault`](crate::context::governance_helpers::acknowledge_commit_fault).
 //! The shim's job is:
 //!
 //! 1. Wrap the delegated call in [`tokio::time::timeout`] with a 30s
@@ -225,7 +225,7 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: GovernanceCommand) -> Outc
 }
 
 /// Handle [`GovernanceCommand::ProposeGovernanceAction`] — delegates to
-/// [`ContextManager::propose_governance_action`](crate::context::manager::ContextManager::propose_governance_action)
+/// [`ContextManager::propose_governance_action`](crate::context::supervisor::Supervisor::propose_governance_action)
 /// under a 30s timeout. `_checked` is a sibling flag the dispatch
 /// function uses to pick between the two manager entry points; this
 /// helper handles only the unchecked variant (checked has its own
@@ -280,7 +280,7 @@ async fn handle_propose_governance_action(
 
 /// Handle [`GovernanceCommand::ProposeGovernanceActionChecked`] —
 /// delegates to
-/// [`ContextManager::propose_governance_action_checked`](crate::context::manager::ContextManager::propose_governance_action_checked)
+/// [`ContextManager::propose_governance_action_checked`](crate::context::supervisor::Supervisor::propose_governance_action_checked)
 /// under a 30s timeout.
 async fn handle_propose_governance_action_checked(
     supervisor: &Supervisor,
@@ -327,7 +327,7 @@ async fn handle_propose_governance_action_checked(
 }
 
 /// Handle [`GovernanceCommand::VoteOnProposal`] — delegates to
-/// [`ContextManager::vote_on_proposal`](crate::context::manager::ContextManager::vote_on_proposal)
+/// [`ContextManager::vote_on_proposal`](crate::context::supervisor::Supervisor::vote_on_proposal)
 /// under a 30s timeout.
 async fn handle_vote_on_proposal(
     supervisor: &Supervisor,
@@ -378,7 +378,7 @@ async fn handle_vote_on_proposal(
 
 /// Handle [`GovernanceCommand::ApproveGovernanceProposal`] — delegates
 /// to
-/// [`ContextManager::approve_governance_proposal`](crate::context::manager::ContextManager::approve_governance_proposal)
+/// [`ContextManager::approve_governance_proposal`](crate::context::governance_helpers::approve_governance_proposal)
 /// under a 30s timeout.
 async fn handle_approve_governance_proposal(
     supervisor: &Supervisor,
@@ -426,7 +426,7 @@ async fn handle_approve_governance_proposal(
 
 /// Handle [`GovernanceCommand::RejectGovernanceProposal`] — delegates
 /// to
-/// [`ContextManager::reject_governance_proposal`](crate::context::manager::ContextManager::reject_governance_proposal)
+/// [`ContextManager::reject_governance_proposal`](crate::context::governance_helpers::reject_governance_proposal)
 /// under a 30s timeout.
 async fn handle_reject_governance_proposal(
     supervisor: &Supervisor,
@@ -473,7 +473,7 @@ async fn handle_reject_governance_proposal(
 }
 
 /// Handle [`GovernanceCommand::WithdrawGovernanceVote`] — delegates to
-/// [`ContextManager::withdraw_governance_vote`](crate::context::manager::ContextManager::withdraw_governance_vote)
+/// [`ContextManager::withdraw_governance_vote`](crate::context::supervisor::Supervisor::withdraw_governance_vote)
 /// under a 30s timeout.
 async fn handle_withdraw_governance_vote(
     supervisor: &Supervisor,
@@ -509,7 +509,7 @@ async fn handle_withdraw_governance_vote(
 }
 
 /// Handle [`GovernanceCommand::ExecuteGovernanceAction`] — delegates to
-/// [`ContextManager::execute_governance_action`](crate::context::manager::ContextManager::execute_governance_action)
+/// [`ContextManager::execute_governance_action`](crate::context::governance_helpers::execute_governance_action)
 /// under a 30s timeout.
 async fn handle_execute_governance_action(
     supervisor: &Supervisor,
@@ -548,7 +548,7 @@ async fn handle_execute_governance_action(
 }
 
 /// Handle [`GovernanceCommand::GetProposal`] — read-only, delegates to
-/// [`ContextManager::get_proposal`](crate::context::manager::ContextManager::get_proposal)
+/// [`ContextManager::get_proposal`](crate::context::supervisor::Supervisor::get_proposal)
 /// under a 30s timeout.
 async fn handle_get_proposal(
     supervisor: &Supervisor,
@@ -582,7 +582,7 @@ async fn handle_get_proposal(
 
 /// Handle [`GovernanceCommand::ListProposals`] — read-only, delegates
 /// to
-/// [`ContextManager::list_proposals`](crate::context::manager::ContextManager::list_proposals)
+/// [`ContextManager::list_proposals`](crate::context::supervisor::Supervisor::list_proposals)
 /// under a 30s timeout.
 async fn handle_list_proposals(
     supervisor: &Supervisor,
@@ -614,7 +614,7 @@ async fn handle_list_proposals(
 
 /// Handle [`GovernanceCommand::ApplyPendingCeilingModification`] —
 /// delegates to
-/// [`ContextManager::apply_pending_ceiling_modification`](crate::context::manager::ContextManager::apply_pending_ceiling_modification)
+/// [`ContextManager::apply_pending_ceiling_modification`](crate::context::governance_helpers::apply_pending_ceiling_modification)
 /// under a 30s timeout.
 async fn handle_apply_pending_ceiling_modification(
     supervisor: &Supervisor,
@@ -657,7 +657,7 @@ async fn handle_apply_pending_ceiling_modification(
 
 /// Handle [`GovernanceCommand::ApplyPendingEconomicPolicyChange`] —
 /// delegates to
-/// [`ContextManager::apply_pending_economic_policy_change`](crate::context::manager::ContextManager::apply_pending_economic_policy_change)
+/// [`ContextManager::apply_pending_economic_policy_change`](crate::context::governance_helpers::apply_pending_economic_policy_change)
 /// under a 30s timeout.
 async fn handle_apply_pending_economic_policy_change(
     supervisor: &Supervisor,
@@ -699,7 +699,7 @@ async fn handle_apply_pending_economic_policy_change(
 
 /// Handle [`GovernanceCommand::TombstoneMigratedContext`] — delegates
 /// to
-/// [`ContextManager::tombstone_migrated_context`](crate::context::manager::ContextManager::tombstone_migrated_context)
+/// [`ContextManager::tombstone_migrated_context`](crate::context::governance_helpers::tombstone_migrated_context)
 /// under a 30s timeout.
 async fn handle_tombstone_migrated_context(
     supervisor: &Supervisor,
@@ -730,7 +730,7 @@ async fn handle_tombstone_migrated_context(
 
 /// Handle [`GovernanceCommand::MigrationState`] — read-only, delegates
 /// to
-/// [`ContextManager::migration_state`](crate::context::manager::ContextManager::migration_state)
+/// [`ContextManager::migration_state`](crate::context::governance_helpers::migration_state)
 /// under a 30s timeout. The legacy method returns an `Option`
 /// (no error) — timeout is mapped to `TransportTimeout` on the reply
 /// side, consistent with other read handlers.
@@ -757,7 +757,7 @@ async fn handle_migration_state(
 }
 
 /// Handle [`GovernanceCommand::AcknowledgeCommitFault`] — delegates to
-/// [`ContextManager::acknowledge_commit_fault`](crate::context::manager::ContextManager::acknowledge_commit_fault)
+/// [`ContextManager::acknowledge_commit_fault`](crate::context::governance_helpers::acknowledge_commit_fault)
 /// under a 30s timeout.
 async fn handle_acknowledge_commit_fault(
     supervisor: &Supervisor,

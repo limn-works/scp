@@ -1,7 +1,7 @@
 //! `#[napi] Scp` class — the caller-owned SCP instance exposed to TypeScript.
 //!
 //! `SCP` (exposed to TS as `SCP`) is the top-level SDK-facing handle that
-//! owns a [`NapiBridgeInstance`] — which in turn owns the `ContextManager`,
+//! owns a `NapiBridgeInstance` — which in turn owns the `ContextManager`,
 //! transport, and bridge-specific registries.
 //!
 //! PR 1 introduces the type and its constructors plus the lifecycle
@@ -22,7 +22,7 @@ use crate::error::ScpNapiError;
 use crate::runtime::{NapiBridgeInstance, StorageConfig, default_bridge_instance};
 
 /// The SCP instance — a caller-owned handle that wraps a
-/// [`NapiBridgeInstance`].
+/// `NapiBridgeInstance`.
 ///
 /// # JS usage
 ///
@@ -58,7 +58,7 @@ pub struct Scp {
 impl Scp {
     /// Constructs a fresh `SCP` instance with default in-memory state.
     ///
-    /// Equivalent to [`NapiBridgeInstance::new_napi`]. No state is shared
+    /// Equivalent to `NapiBridgeInstance::new_napi`. No state is shared
     /// with the process-wide default instance.
     #[napi(constructor)]
     #[allow(clippy::new_without_default)] // napi constructor cannot take Default
@@ -204,7 +204,7 @@ impl Scp {
     /// Resumes a suspended bridge instance.
     ///
     /// Clears the suspended flag, then runs any per-bridge async work chained
-    /// by the [`BridgeInstanceCore::resume`] override (transport reconnect
+    /// by the `BridgeInstanceCore::resume` override (transport reconnect
     /// from pending relay URLs, persisted-context restoration).
     #[napi]
     pub async fn resume(&self) -> napi::Result<()> {

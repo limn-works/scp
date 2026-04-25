@@ -11,7 +11,7 @@
 //! must **not** expose any method that returns a
 //! [`ContextActorHandle`](crate::context::actor::handle::ContextActorHandle).
 //! Actors cannot reach sibling actors; cross-context work goes through
-//! [`Self::start_saga`]. This is the capability-reduction mechanism:
+//! [`SupervisorHandle::start_saga`]. This is the capability-reduction mechanism:
 //! the inner `Arc<Supervisor>` is private and no accessor exposes it.
 //!
 //! # `&OwnedIdentityDid` parameters
@@ -38,7 +38,7 @@ use crate::context::supervisor::supervisor::{SagaInput, SagaOutput, Supervisor};
 // Handle
 // ---------------------------------------------------------------------------
 
-/// Capability-reduced view of [`Supervisor`] held by actors. Cloned into
+/// Capability-reduced view of `Supervisor` held by actors. Cloned into
 /// each actor's `ActorDeps` and never exposed outside `crate::context::`.
 ///
 /// **No `ContextActorHandle` accessor.** This is the mechanical contract
@@ -71,7 +71,7 @@ impl SupervisorHandle {
     ///
     /// # Errors
     ///
-    /// See [`Supervisor::start_saga`]. Commit 6: always
+    /// See `Supervisor::start_saga`. Commit 6: always
     /// [`ContextError::NotImplemented`].
     pub async fn start_saga(&self, input: SagaInput) -> Result<SagaOutput, ContextError> {
         self.supervisor.start_saga(input).await
