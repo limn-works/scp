@@ -142,7 +142,7 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
     .await
     {
         Ok(adapter) => {
-            crate::runtime::init_context_manager_with_relay_transport(did, adapter);
+            crate::runtime::init_supervisor_with_relay_transport(did, adapter);
         }
         Err(e) => {
             tracing::warn!(
@@ -152,16 +152,21 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
                  context operations may fail until transport is configured manually"
             );
             // Fall back to initializing with MLS crypto so that the
-            // ContextManager exists with real crypto bound to the identity's
+            // Supervisor exists with real crypto bound to the identity's
             // DID, matching PyO3/NAPI behavior. (The bridge no longer has a
             // DID-less stub crypto path — see commit 4 of the phase 4
             // persistence refactor.)
-            crate::runtime::init_context_manager_with_did(did);
+            crate::runtime::init_supervisor_with_did(did);
         }
     }
     // Always register the node's DID as a local DID for defense-in-depth.
-    if let Ok(mgr) = crate::runtime::context_manager() {
-        mgr.register_local_did(did.to_owned().into()).await;
+    if let Ok(supervisor) = crate::runtime::supervisor_lenient()
+        && let Err(e) = supervisor.register_local_did(did.to_owned().into()).await
+    {
+        tracing::debug!(
+            error = %e,
+            "auto_wire_context_manager: register_local_did skipped (supervisor not ready)"
+        );
     }
 }
 
@@ -326,12 +331,12 @@ impl NodeHandle {
 
         // Resolve broadcast key: explicit, auto-lookup, or auto with explicit author.
         // Delegates to the shared resolver in scp-ffi-common (same logic as PyO3/NAPI).
-        let mgr = crate::runtime::context_manager()?;
+        let supervisor = crate::runtime::supervisor_expect()?;
         let resolved = server::resolve_broadcast_key(
             broadcast_key_hex,
             author_did,
             self.inner.did(),
-            mgr,
+            supervisor,
             &context_id,
         )
         .await?;

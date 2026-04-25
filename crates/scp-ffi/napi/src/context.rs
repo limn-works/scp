@@ -549,9 +549,9 @@ pub async fn context_create(
             })
         })?;
 
-    // Initialize the ContextManager if not already done (first context_create call).
+    // Initialize the Supervisor if not already done (first context_create call).
     // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1294).
-    crate::runtime::init_context_manager(&creator_did);
+    crate::runtime::init_supervisor(&creator_did);
 
     // Derive the context-scoped pseudonym routing ID (§9.10.4, SCP-214 criterion 5).
     // Derived BEFORE create_context so it can be passed to the ContextManager.
@@ -717,11 +717,11 @@ pub async fn context_join(
         })
         .transpose()?;
 
-    // Ensure the ContextManager is initialized — context_join is a valid
+    // Ensure the Supervisor is initialized — context_join is a valid
     // first operation (e.g. a device joining a context without creating one).
-    // init_context_manager is idempotent (OnceLock — first call wins). #1073
+    // init_supervisor is idempotent (OnceLock — first call wins). #1073
     // Passes the joiner DID to MlsCryptoProvider for real MLS encryption (#1294).
-    crate::runtime::init_context_manager(&identity_did);
+    crate::runtime::init_supervisor(&identity_did);
 
     let core_handle = handle.require_core_handle().map_err(NapiError::from)?;
 
@@ -3964,14 +3964,14 @@ pub async fn context_import(data: Vec<u8>) -> napi::Result<String> {
     })?;
     let context_id = export.snapshot.context_id.clone();
 
-    // Validate the exporter DID before passing to init_context_manager (#1324).
+    // Validate the exporter DID before passing to init_supervisor (#1324).
     validate_did(&export.exporter_did.0).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
-    // Ensure the ContextManager is initialized — context_import is a valid
+    // Ensure the Supervisor is initialized — context_import is a valid
     // first operation (e.g. a device receiving exported context data).
-    // init_context_manager is idempotent (OnceLock — first call wins). #1073
+    // init_supervisor is idempotent (OnceLock — first call wins). #1073
     // Passes the exporter DID to MlsCryptoProvider for real MLS encryption (#1294).
-    crate::runtime::init_context_manager(&export.exporter_did.0);
+    crate::runtime::init_supervisor(&export.exporter_did.0);
 
     let sup = crate::runtime::supervisor()?;
     let (tx, rx) = tokio::sync::oneshot::channel();
@@ -4615,7 +4615,7 @@ mod tests {
     /// creator); after a join it becomes 2.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn member_count_reflects_actual_membership() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         let ctx_id = format!("test-member-count-{}", uuid::Uuid::new_v4());
         let creator = DID("did:key:z6MkCreator".to_owned());
 
@@ -4698,7 +4698,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_change_role() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         let ctx_id = format!("napi-sync-role-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator1";
         let params = ContextParams {
@@ -4749,7 +4749,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_add_member() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         let ctx_id = format!("napi-sync-add-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator2";
         let params = ContextParams {
@@ -4794,7 +4794,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn role_state_syncs_after_remove_member() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         let ctx_id = format!("napi-sync-rm-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator3";
         let target = "did:key:z6MkNapiRemTarget";
@@ -5008,7 +5008,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_create_threads_consequence_rules_and_config() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
 
         let identity = crate::identity::identity_create("in_memory".to_owned())
             .await
@@ -5058,7 +5058,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_create_rejects_revoke_access_when_config_disallows() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
 
         let identity = crate::identity::identity_create("in_memory".to_owned())
             .await
@@ -5095,7 +5095,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_rejects_malformed_spending_ucan_jwt() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
 
         let identity = crate::identity::identity_create("in_memory".to_owned())
             .await
@@ -5134,7 +5134,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn context_join_accepts_none_spending_ucan_jwt() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
 
         let identity = crate::identity::identity_create("in_memory".to_owned())
             .await
@@ -5287,7 +5287,7 @@ mod tests {
     async fn subscription_flag_resets_on_suspend() {
         use std::sync::atomic::Ordering;
 
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
 
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 

@@ -407,14 +407,14 @@ mod tests {
 
     #[test]
     fn budget_remaining_empty_context_returns_zero() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         let result = economy_budget_remaining("test-ctx".to_owned(), "did:key:test".to_owned());
         assert_eq!(result.unwrap(), 0);
     }
 
     #[test]
     fn budget_grant_and_spend() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         economy_budget_grant("napi-econ-ctx".to_owned(), "did:key:alice".to_owned(), 1000).unwrap();
         let r = economy_budget_remaining("napi-econ-ctx".to_owned(), "did:key:alice".to_owned())
             .unwrap();
@@ -429,7 +429,7 @@ mod tests {
 
     #[test]
     fn antispam_velocity_starts_at_zero() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         let v =
             economy_antispam_velocity("napi-spam-ctx".to_owned(), "did:key:bob".to_owned(), 1000);
         assert_eq!(v.unwrap(), 0);
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn budget_grant_rejects_negative_amount() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         let err =
             economy_budget_grant("ctx".to_owned(), "did:key:alice".to_owned(), -1).unwrap_err();
         assert!(
@@ -454,7 +454,7 @@ mod tests {
 
     #[test]
     fn budget_record_spend_rejects_negative_amount() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         let err = economy_budget_record_spend("ctx".to_owned(), "did:key:alice".to_owned(), -100)
             .unwrap_err();
         assert!(
@@ -465,7 +465,7 @@ mod tests {
 
     #[test]
     fn antispam_record_rejects_negative_timestamp() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         let err =
             economy_antispam_record("ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();
         assert!(
@@ -476,7 +476,7 @@ mod tests {
 
     #[test]
     fn antispam_velocity_rejects_negative_now() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         let err =
             economy_antispam_velocity("ctx".to_owned(), "did:key:bob".to_owned(), -1).unwrap_err();
         assert!(

@@ -30,9 +30,9 @@ use _scp_core::runtime::{self, IdentityEntry};
 
 static INIT: Once = Once::new();
 
-/// Ensures the Python interpreter, tokio runtime, and `ContextManager` are initialized.
+/// Ensures the Python interpreter, tokio runtime, and `Supervisor` are initialized.
 ///
-/// Uses `init_context_manager_for_test()` which wires `LocalTransportProvider`
+/// Uses `init_supervisor_for_test()` which wires `LocalTransportProvider`
 /// so that `publish_context` succeeds without warning noise
 /// (`NotConfiguredTransportProvider` would log warnings on best-effort publish).
 fn setup() {
@@ -44,7 +44,7 @@ fn setup() {
     });
     // Uses LocalTransportProvider so publish_context succeeds without warning
     // noise (NotConfiguredTransportProvider logs warnings on best-effort publish).
-    runtime::init_context_manager_for_test();
+    runtime::init_supervisor_for_test();
 }
 
 /// Creates a tokio runtime for async operations in tests.
@@ -94,24 +94,25 @@ fn create_test_identity() -> String {
     did
 }
 
-/// Creates a context via `ContextManager` and registers FFI state.
-/// Returns the `context_id`.
+/// Creates a context via the per-instance `Supervisor` and registers FFI
+/// state. Returns the `context_id`.
 fn create_test_context(creator_did: &str) -> String {
     setup();
     let context_id = random_context_id();
     runtime::register_context(&context_id, creator_did, &[]).unwrap();
 
     let rt = test_runtime();
-    let mgr = runtime::context_manager().unwrap().clone();
+    let supervisor = runtime::supervisor().unwrap().clone();
     let creator = scp_identity::DID(creator_did.to_owned());
     let ctx_id = context_id.clone();
 
     rt.block_on(async move {
         let params = scp_core::context::ContextParams::default();
-        mgr.create_context(ctx_id.clone(), params, creator.clone(), None)
+        supervisor
+            .create_context(ctx_id.clone(), params, creator.clone(), None)
             .await
             .unwrap();
-        mgr.register_local_did(creator).await;
+        supervisor.register_local_did(creator).await.unwrap();
     });
 
     context_id
@@ -211,12 +212,12 @@ fn context_membership_creator_is_member() {
     let ctx_id = create_test_context(&did);
 
     let rt = test_runtime();
-    let mgr = runtime::context_manager().unwrap().clone();
+    let supervisor = runtime::supervisor().unwrap().clone();
 
-    assert!(rt.block_on(mgr.is_member(&ctx_id, &did)));
-    assert_eq!(rt.block_on(mgr.member_count(&ctx_id)), Some(1));
+    assert!(rt.block_on(supervisor.is_member(&ctx_id, &did)));
+    assert_eq!(rt.block_on(supervisor.member_count(&ctx_id)), Some(1));
 
-    let dids = rt.block_on(mgr.member_dids(&ctx_id));
+    let dids = rt.block_on(supervisor.member_dids(&ctx_id));
     assert!(dids.contains(&did));
 }
 
@@ -226,9 +227,9 @@ fn context_member_role_creator_is_admin() {
     let ctx_id = create_test_context(&did);
 
     let rt = test_runtime();
-    let mgr = runtime::context_manager().unwrap().clone();
+    let supervisor = runtime::supervisor().unwrap().clone();
 
-    let role = rt.block_on(mgr.member_role(&ctx_id, &did));
+    let role = rt.block_on(supervisor.member_role(&ctx_id, &did));
     assert!(role.is_some());
     let role_str = format!("{:?}", role.unwrap());
     // Role name is lowercase "admin" in the ContextManager.
@@ -244,14 +245,14 @@ fn context_drain_events_is_idempotent() {
     let ctx_id = create_test_context(&did);
 
     let rt = test_runtime();
-    let mgr = runtime::context_manager().unwrap().clone();
+    let supervisor = runtime::supervisor().unwrap().clone();
 
     // First drain: may or may not have events depending on ContextManager internals.
-    let events = rt.block_on(mgr.drain_events(&ctx_id));
+    let events = rt.block_on(supervisor.drain_events(&ctx_id));
     let first_count = events.len();
 
     // Second drain: must be empty (events are consumed).
-    let events2 = rt.block_on(mgr.drain_events(&ctx_id));
+    let events2 = rt.block_on(supervisor.drain_events(&ctx_id));
     assert!(
         events2.is_empty(),
         "Second drain should return empty, first had {first_count}"
@@ -285,13 +286,13 @@ fn context_create_establishes_mls_group() {
     let ctx_id = create_test_context(&did);
 
     let rt = test_runtime();
-    let mgr = runtime::context_manager().unwrap().clone();
+    let supervisor = runtime::supervisor().unwrap().clone();
 
     // The ContextManager should have the context with the creator as a member.
     // This confirms that the full creation flow ran (including the crypto
     // provider's create_mls_group call which must succeed for create_context
     // to return Ok).
-    let member_count = rt.block_on(mgr.member_count(&ctx_id));
+    let member_count = rt.block_on(supervisor.member_count(&ctx_id));
     assert_eq!(
         member_count,
         Some(1),
@@ -300,19 +301,19 @@ fn context_create_establishes_mls_group() {
 
     // Verify the creator is registered as a member.
     assert!(
-        rt.block_on(mgr.is_member(&ctx_id, &did)),
+        rt.block_on(supervisor.is_member(&ctx_id, &did)),
         "Creator DID should be a member of the context"
     );
 
     // Verify role state exists (populated during creation).
-    let role_state = rt.block_on(mgr.get_role_state(&ctx_id));
+    let role_state = rt.block_on(supervisor.get_role_state(&ctx_id));
     assert!(
         role_state.is_some(),
         "Context should have role state after creation"
     );
 
     // Verify the creator has admin role (context creator gets admin).
-    let role = rt.block_on(mgr.member_role(&ctx_id, &did));
+    let role = rt.block_on(supervisor.member_role(&ctx_id, &did));
     assert!(role.is_some(), "Creator should have a role assignment");
     let role_str = format!("{:?}", role.unwrap());
     assert!(

@@ -306,7 +306,7 @@ pub fn py_configure_relay_transport(relay_url: &str, local_did: &str) -> PyResul
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
     let event_log: Box<dyn scp_core::context::builder::ContextEventLogProvider> =
         Box::new(crate::runtime::NoOpEventLogProvider);
-    crate::runtime::init_context_manager_with(local_did, crypto, transport, event_log, None);
+    crate::runtime::init_supervisor_with(local_did, crypto, transport, event_log, None);
 
     Ok(())
 }
@@ -550,7 +550,7 @@ mod tests {
     #[test]
     fn transport_disconnect_is_idempotent() {
         // BridgeInstance must exist for transport operations.
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         // Disconnecting when not connected should not error.
         let result = py_transport_disconnect();
         assert!(result.is_ok());

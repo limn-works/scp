@@ -62,23 +62,23 @@ fn map_transport_lock_error(e: TransportLockError) -> ScpNapiError {
 ///
 /// Wraps in `Arc` and delegates to [`CoreFields::set_transport`].
 /// If the `BridgeInstance` doesn't exist yet, lazily creates it from
-/// the existing `ContextManager`.
+/// the bridge's lazy-instantiation path.
 ///
 /// # Errors
 ///
 /// Returns `ScpNapiError::Transport` if the lock is poisoned or the bridge
 /// is not initialized.
 fn set_transport_manager(manager: scp_transport::TransportManager) -> napi::Result<()> {
-    // Try existing bridge instance first; fall back to lazy creation
-    // from the existing ContextManager.
+    // Try the existing bridge instance first; fall back to the empty
+    // bootstrap (`ensure_bridge_instance`) when no instance has been
+    // created yet. After ADR-049 commit 12c.9g.3 the bridge layer no
+    // longer holds an `Arc<ContextManager>` directly — every per-instance
+    // supervisor either is already present (created by an earlier
+    // `init_supervisor*` call) or will be wired on the next `init`.
     let bi = if let Ok(bi) = crate::runtime::bridge_instance() {
         bi
     } else {
-        if let Ok(cm) = crate::runtime::context_manager() {
-            crate::runtime::attach_context_manager_to_bridge(cm.clone());
-        } else {
-            crate::runtime::ensure_bridge_instance();
-        }
+        crate::runtime::ensure_bridge_instance();
         crate::runtime::bridge_instance()?
     };
     bi.set_transport(Arc::new(manager))
@@ -467,7 +467,7 @@ pub async fn transport_disconnect(manager: &NapiTransportManager) -> napi::Resul
 pub fn configure_local_transport(local_did: String) -> napi::Result<()> {
     scp_ffi_common::validate::validate_did(&local_did)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    crate::runtime::init_context_manager_with_local_transport(&local_did);
+    crate::runtime::init_supervisor_with_local_transport(&local_did);
     Ok(())
 }
 
@@ -519,7 +519,7 @@ pub async fn configure_relay_transport(relay_url: String, local_did: String) -> 
                 code: codes::TRANS_5001.to_owned(),
             })?;
 
-    crate::runtime::init_context_manager_with_relay_transport(&local_did, adapter);
+    crate::runtime::init_supervisor_with_relay_transport(&local_did, adapter);
     Ok(())
 }
 

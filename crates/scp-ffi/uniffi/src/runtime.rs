@@ -610,22 +610,9 @@ pub fn ensure_bridge_instance() {
     init_default_bridge_instance();
 }
 
-/// Attaches an externally-constructed `ContextManager` to the default
-/// `UniffiBridgeInstance`.
-///
-/// Used by `transport_connect` and similar code paths that need to install
-/// a `ContextManager` not created by `init_context_manager*`. Creates the
-/// default bridge if one does not yet exist.
-///
-/// No-op if the default bridge already has a `ContextManager` attached.
-pub fn attach_context_manager_to_bridge(cm: Arc<ContextManager>) {
-    ensure_bridge_instance();
-    if let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get()
-        && !bi.core.has_context_manager()
-    {
-        bi.core.set_context_manager(cm);
-    }
-}
+// `attach_context_manager_to_bridge` deleted in ADR-049 commit
+// 12c.9g.3. The FFI bridge no longer surfaces an `Arc<ContextManager>`;
+// callers route through `init_supervisor*` and `Supervisor::*` methods.
 
 /// Returns a reference to the default [`UniffiBridgeInstance`]'s core for
 /// handle-affinity checks only.
@@ -790,43 +777,14 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 }
 
 // ---------------------------------------------------------------------------
-// ContextManager accessors
+// Supervisor accessors
 // ---------------------------------------------------------------------------
-
-/// Returns a reference to the shared `ContextManager` on the default bridge
-/// instance.
-///
-/// # Errors
-///
-/// Returns `ScpError::Context` if the manager has not been initialized or if
-/// the bridge is currently suspended.
-pub fn context_manager() -> Result<&'static Arc<ContextManager>, crate::ScpError> {
-    let bi = DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .ok_or_else(|| crate::ScpError::Context {
-            msg: "ContextManager not initialized — call context_create, \
-                  context_join, context_import, or init_context_manager first"
-                .to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })?;
-    if bi.core.is_suspended() {
-        return Err(crate::ScpError::Context {
-            msg: "bridge is suspended — call resume() before performing operations".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        });
-    }
-    if bi.core.is_shutdown() {
-        tracing::warn!("context_manager() called after shutdown — operations may fail");
-    }
-    bi.core
-        .try_context_manager()
-        .ok_or_else(|| crate::ScpError::Context {
-            msg: "ContextManager not yet attached — call context_create, \
-                  context_join, context_import, or init_context_manager first"
-                .to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })
-}
+//
+// `context_manager()` / `context_manager_expect()` were deleted in
+// ADR-049 commit 12c.9g.3. Bridge code routes through
+// [`supervisor_expect`] / [`supervisor_lenient`] (already present below)
+// and uses `Supervisor::*` methods for every operation that previously
+// went through `ContextManager`.
 
 /// Adapter that lets a shared `Arc<dyn ContextPersistence + Send + Sync>` be
 /// consumed by [`ContextManager::with_persistence`] which requires a `Box`.
@@ -900,24 +858,33 @@ impl scp_core::context::manager::ContextPersistence for ArcContextPersistence {
     }
 }
 
-/// Constructs a [`ContextManager`] with or without persistence.
+/// Constructs a fresh per-instance [`Supervisor`] wrapping a
+/// `ContextManager` (with or without persistence).
 ///
-/// Mirrors the `PyO3` bridge's `build_context_manager` (`crates/scp-ffi/src/runtime.rs`).
-/// When `persistence` is `Some`, wraps the shared `Arc` in
-/// [`ArcContextPersistence`] and hands it to
-/// [`ContextManager::with_persistence`]; otherwise calls
-/// [`ContextManager::new`]. Callers pull the shared persistence from the
-/// embedded `CoreFields` via
+/// ADR-049 commit 12c.9g.3 — the FFI bridge no longer hands out a raw
+/// `Arc<ContextManager>`. The manager is built here, attached to the
+/// supervisor (so the supervisor's lifted-provider slots populate),
+/// and the supervisor is the only handle returned to the bridge layer.
+/// Commit 12c.9g.4 deletes the manager-construction step and lets the
+/// supervisor own its providers directly.
+///
+/// Mirrors the `PyO3` bridge's `build_supervisor`. When `persistence`
+/// is `Some`, the shared `Arc` is wrapped in [`ArcContextPersistence`]
+/// and handed to [`ContextManager::with_persistence`]; otherwise we
+/// call [`ContextManager::new`]. Callers pull the shared persistence
+/// from the embedded `CoreFields` via
 /// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`]
 /// so the manager and the bridge mirror share the same backend — a
 /// single `SQLite` connection, not two.
-fn build_context_manager(
+fn build_supervisor(
     crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>>,
-) -> Arc<ContextManager> {
-    match persistence {
+) -> Arc<scp_core::context::supervisor::Supervisor> {
+    use scp_core::context::supervisor::Supervisor;
+
+    let cm = match persistence {
         Some(shared) => Arc::new(ContextManager::with_persistence(
             crypto,
             transport,
@@ -931,7 +898,16 @@ fn build_context_manager(
             event_log,
             not_configured_key_resolver(),
         )),
+    };
+    let supervisor = Arc::new(Supervisor::for_query_shim());
+    if let Err(err) = supervisor.attach_context_manager(&cm) {
+        tracing::warn!(
+            error = %err,
+            "build_supervisor: attach_context_manager failed — supervisor still constructed but \
+             without lifted providers"
+        );
     }
+    supervisor
 }
 
 /// Builds an event log provider that reuses the already-registered
@@ -947,60 +923,20 @@ fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProv
     Some(bi.protocol_repository.event_log_provider())
 }
 
-/// Returns a reference to the shared `ContextManager` on the default bridge
-/// instance.
-///
-/// Unlike [`context_manager`], this variant does not initialize the bridge
-/// instance lazily — callers must have already registered a local DID via
-/// [`init_context_manager_with_did`] (typically indirectly through
-/// `context_create`, `context_join`, `context_import`, `register_local_did`,
-/// or `identity_create`). This matches the `PyO3` / `NAPI` `context_manager()`
-/// semantics where no DID-less construction path exists.
-///
-/// # Errors
-///
-/// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the bridge has not
-/// been initialized, when no local DID has been registered yet, when the
-/// bridge is currently suspended, or when the bridge has been permanently
-/// shut down. The shutdown branch is a hard error (not a warning) so
-/// stateful exports never run against a zombie bridge (ADR-048 §PR 2, #1646).
-pub fn context_manager_expect() -> Result<&'static Arc<ContextManager>, crate::ScpError> {
-    let bi = DEFAULT_BRIDGE_INSTANCE
-        .get()
-        .ok_or_else(|| crate::ScpError::Context {
-            msg: "bridge not ready: no local DID registered".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })?;
-    if bi.core.is_suspended() {
-        return Err(crate::ScpError::Context {
-            msg: "bridge not ready: suspended".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        });
-    }
-    if bi.core.is_shutdown() {
-        return Err(crate::ScpError::Context {
-            msg: "bridge not ready: shut down".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        });
-    }
-    bi.core
-        .try_context_manager()
-        .ok_or_else(|| crate::ScpError::Context {
-            msg: "bridge not ready: no local DID registered".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })
-}
-
 /// Returns the per-instance
-/// [`Supervisor`](scp_core::context::supervisor::Supervisor) used by the
-/// commits-7-to-11 FFI query shim. Deleted in commit 12.
+/// [`Supervisor`](scp_core::context::supervisor::Supervisor) for the
+/// default bridge instance.
+///
+/// Per ADR-049 commit 12c.9g.3 the FFI bridge no longer surfaces an
+/// `Arc<ContextManager>`. Every bridge function that previously routed
+/// through `context_manager_expect()` now goes through this accessor
+/// and uses `Supervisor::*` methods.
 ///
 /// # Errors
 ///
 /// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the bridge
-/// instance has not been initialized, or when the bridge is suspended
-/// or shut down. Does not require the `ContextManager` itself to be
-/// attached.
+/// instance has not been initialized, when no supervisor has been
+/// wired yet, or when the bridge is suspended or shut down.
 pub fn supervisor_expect()
 -> Result<&'static Arc<scp_core::context::supervisor::Supervisor>, crate::ScpError> {
     let bi = DEFAULT_BRIDGE_INSTANCE
@@ -1021,28 +957,30 @@ pub fn supervisor_expect()
             code: codes::CTX_2000.to_owned(),
         });
     }
-    Ok(bi.core.supervisor())
+    bi.core
+        .try_supervisor()
+        .ok_or_else(|| crate::ScpError::Context {
+            msg: "bridge not ready: no local DID registered".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })
 }
 
 /// Lenient sibling of [`supervisor_expect`].
 ///
 /// Returns the supervisor even when [`CoreFields::is_shutdown`] is
-/// `true`, matching the shutdown-tolerance contract of
-/// [`context_manager()`] (`context_manager` only logs a warning on
-/// shutdown; it does not error). Used by the ADR-049 commit-9
-/// lifecycle shim paths (`context_create`, `context_close`) so the
-/// shim's behaviour reaches parity with the pre-shim
-/// `ContextManager::...` call sites those paths delegate to. Still
-/// errors on `is_suspended` (the resume-required contract) and on
-/// missing-bridge.
-///
-/// Deleted in commit 12 with the shim.
+/// `true`, matching the legacy shutdown-tolerance contract that the
+/// removed `context_manager()` provided (which only logged a warning
+/// on shutdown rather than erroring). Used by the lifecycle shim paths
+/// (`context_create`, `context_close`) so the shim behaviour reaches
+/// parity with the pre-shim `ContextManager::...` call sites those
+/// paths delegate to. Still errors on `is_suspended` (the
+/// resume-required contract) and on missing-bridge / missing-supervisor.
 ///
 /// # Errors
 ///
 /// Returns `ScpError::Context` (code `SCP-CTX-2000`) when the bridge
-/// instance has not been initialized, or when the bridge is
-/// explicitly suspended.
+/// instance has not been initialized, when no supervisor is wired
+/// yet, or when the bridge is explicitly suspended.
 pub fn supervisor_lenient()
 -> Result<&'static Arc<scp_core::context::supervisor::Supervisor>, crate::ScpError> {
     let bi = DEFAULT_BRIDGE_INSTANCE
@@ -1063,11 +1001,16 @@ pub fn supervisor_lenient()
              operations may fail (ADR-049 commit 9 shim path)"
         );
     }
-    Ok(bi.core.supervisor())
+    bi.core
+        .try_supervisor()
+        .ok_or_else(|| crate::ScpError::Context {
+            msg: "bridge not ready: no local DID registered".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })
 }
 
-/// Initializes the global [`ContextManager`] with [`MlsCryptoProvider`] and
-/// [`scp_core::context::NotConfiguredTransportProvider`].
+/// Initializes the per-instance [`Supervisor`] with [`MlsCryptoProvider`]
+/// and [`scp_core::context::NotConfiguredTransportProvider`].
 ///
 /// Must be called before any context lifecycle operation — the bridge no
 /// longer supports a DID-less stub crypto path. Callers that have a local
@@ -1076,16 +1019,16 @@ pub fn supervisor_lenient()
 /// `MlsCryptoProvider::new(local_did)` to the default bridge instance.
 ///
 /// Subsequent calls are no-ops (`OnceLock`).
-pub fn init_context_manager_with_did(local_did: &str) {
+pub fn init_supervisor_with_did(local_did: &str) {
     ensure_bridge_instance();
     let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!("init_context_manager_with_did: default instance unexpectedly None");
+        tracing::error!("init_supervisor_with_did: default instance unexpectedly None");
         return;
     };
-    if bi.core.has_context_manager() {
+    if bi.core.has_supervisor() {
         tracing::debug!(
             requested_did = %local_did,
-            "init_context_manager_with_did: ContextManager already attached — using existing instance"
+            "init_supervisor_with_did: Supervisor already attached — using existing instance"
         );
         return;
     }
@@ -1093,44 +1036,43 @@ pub fn init_context_manager_with_did(local_did: &str) {
     let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
         tracing::error!(
-            "init_context_manager_with_did: missing ProtocolRepository after \
+            "init_supervisor_with_did: missing ProtocolRepository after \
              ensure_bridge_instance — falling back to a fresh event log provider"
         );
         build_event_log_provider().0
     });
     let persistence = bi.core.persistence_arc_clone();
-    let cm_arc = build_context_manager(
+    let supervisor_arc = build_supervisor(
         crypto,
         Box::new(scp_core::context::NotConfiguredTransportProvider),
         event_log,
         persistence,
     );
 
-    bi.core.set_context_manager(cm_arc);
+    bi.core.set_supervisor(supervisor_arc);
 }
 
-/// Initializes the global [`ContextManager`] with [`RelayTransportProvider`].
+/// Initializes the per-instance [`Supervisor`] with
+/// [`RelayTransportProvider`].
 ///
-/// Identical to [`init_context_manager`] except the transport provider is a
-/// `RelayTransportProvider` wrapping a real `NativeRelayAdapter` connected to
-/// the given relay URL.
+/// Identical to [`init_supervisor_with_did`] except the transport
+/// provider is a `RelayTransportProvider` wrapping a real
+/// `NativeRelayAdapter` connected to the given relay URL.
 ///
 /// Subsequent calls are no-ops (`OnceLock`).
-pub fn init_context_manager_with_relay_transport(
+pub fn init_supervisor_with_relay_transport(
     local_did: &str,
     adapter: scp_transport::native::adapter::NativeRelayAdapter,
 ) {
     ensure_bridge_instance();
     let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!(
-            "init_context_manager_with_relay_transport: default instance unexpectedly None"
-        );
+        tracing::error!("init_supervisor_with_relay_transport: default instance unexpectedly None");
         return;
     };
-    if bi.core.has_context_manager() {
+    if bi.core.has_supervisor() {
         tracing::warn!(
             requested_did = %local_did,
-            "init_context_manager_with_relay_transport: ContextManager already attached — ignoring"
+            "init_supervisor_with_relay_transport: Supervisor already attached — ignoring"
         );
         return;
     }
@@ -1139,15 +1081,15 @@ pub fn init_context_manager_with_relay_transport(
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
     let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
         tracing::error!(
-            "init_context_manager_with_relay_transport: missing ProtocolRepository after \
+            "init_supervisor_with_relay_transport: missing ProtocolRepository after \
              ensure_bridge_instance — falling back to a fresh event log provider"
         );
         build_event_log_provider().0
     });
     let persistence = bi.core.persistence_arc_clone();
-    let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
+    let supervisor_arc = build_supervisor(crypto, transport, event_log, persistence);
 
-    bi.core.set_context_manager(cm_arc);
+    bi.core.set_supervisor(supervisor_arc);
 }
 
 /// Returns the default instance's `ProtocolRepoVariant`, if initialized.
@@ -1255,23 +1197,24 @@ pub fn remove_ucan_state(context_id: &str) {
     }
 }
 
-/// Syncs role state from the `ContextManager` after governance operations.
+/// Syncs role state from the per-instance `Supervisor` after governance
+/// operations.
 ///
-/// Validates the `ContextManager` state is consistent and logs the sync for
+/// Validates the supervisor state is consistent and logs the sync for
 /// traceability.
 ///
 /// # Errors
 ///
-/// Returns `ScpError` if the context is not registered in the manager.
+/// Returns `ScpError` if the context is not registered in the supervisor.
 pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), crate::ScpError> {
-    let manager = context_manager()?;
+    let supervisor = supervisor_expect()?;
     let _role_state =
-        manager
+        supervisor
             .get_role_state(context_id)
             .await
             .ok_or_else(|| crate::ScpError::Context {
                 msg: format!(
-                    "context '{context_id}' not found in ContextManager during role state sync"
+                    "context '{context_id}' not found in Supervisor during role state sync"
                 ),
                 code: codes::CTX_2040.to_owned(),
             })?;
@@ -1435,20 +1378,20 @@ mod tests {
     }
 
     #[test]
-    fn bridge_instance_populated_by_init_context_manager() -> Result<(), crate::ScpError> {
-        init_context_manager_with_did("did:dht:ztest");
-        let cm = context_manager()?;
+    fn bridge_instance_populated_by_init_supervisor() -> Result<(), crate::ScpError> {
+        init_supervisor_with_did("did:dht:ztest");
+        let sup = supervisor_expect()?;
         let bi = bridge_instance()?;
         assert!(
-            Arc::ptr_eq(cm, bi.core.try_context_manager().unwrap()),
-            "bridge_instance().context_manager() must be the same Arc as context_manager()"
+            Arc::ptr_eq(sup, bi.core.try_supervisor().unwrap()),
+            "bridge_instance().try_supervisor() must be the same Arc as supervisor_expect()"
         );
         Ok(())
     }
 
     #[test]
     fn bridge_instance_not_shutdown_initially() -> Result<(), crate::ScpError> {
-        init_context_manager_with_did("did:dht:ztest");
+        init_supervisor_with_did("did:dht:ztest");
         let bi = bridge_instance()?;
         assert!(
             !bi.core.is_shutdown(),

@@ -2425,6 +2425,248 @@ impl Supervisor {
             "Supervisor::persist_state — migrates in commit 11 of ADR-049".to_owned(),
         ))
     }
+
+    // -------------------------------------------------------------------
+    // ADR-049 commit 12c.9g.3 — FFI passthrough surface.
+    //
+    // The 4 FFI bridges (PyO3, NAPI, UniFFI, common) used to dereference
+    // an `Arc<ContextManager>` and invoke methods directly. After commit
+    // 12c.9g.3 they hold an `Arc<Supervisor>` only. The methods below
+    // mirror the small subset of `ContextManager` methods that the
+    // bridge functions actually call (membership queries, event-log
+    // probes, hard-rate-limit consumption, broadcast key resolution,
+    // tool invocation, lifecycle creation in tests).
+    //
+    // Each method is intentionally a thin one-liner over the equivalent
+    // `*_helpers::X(&self, ...)` free function or the legacy
+    // `ContextManager::X` method (resolved via
+    // `attached_context_manager()`). The thin layer keeps the FFI rewire
+    // mechanical: bridge call sites change exactly one identifier
+    // (`mgr.X` → `supervisor.X`). When `manager/` is deleted in commit
+    // 12c.9g.4, the manager-fallback methods below become direct helper
+    // calls.
+    // -------------------------------------------------------------------
+
+    /// Passthrough to
+    /// [`crate::context::queries_helpers::member_count`] — returns the
+    /// current member count for `context_id`, or `None` if the context
+    /// is not registered.
+    #[must_use]
+    pub async fn member_count(&self, context_id: &str) -> Option<usize> {
+        crate::context::queries_helpers::member_count(self, context_id).await
+    }
+
+    /// Passthrough to [`crate::context::queries_helpers::is_member`] —
+    /// returns `true` iff `did` is a member of `context_id`.
+    #[must_use]
+    pub async fn is_member(&self, context_id: &str, did: &str) -> bool {
+        crate::context::queries_helpers::is_member(self, context_id, did).await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::queries_helpers::member_dids`] — returns every
+    /// member DID currently associated with `context_id` (empty if the
+    /// context is unknown).
+    #[must_use]
+    pub async fn member_dids(&self, context_id: &str) -> Vec<String> {
+        crate::context::queries_helpers::member_dids(self, context_id).await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::queries_helpers::member_role`] — returns the
+    /// role assignment for `did` in `context_id`, or `None` if the
+    /// member has no role.
+    #[must_use]
+    pub async fn member_role(
+        &self,
+        context_id: &str,
+        did: &str,
+    ) -> Option<scp_protocol::context::roles::RoleAssignment> {
+        crate::context::queries_helpers::member_role(self, context_id, did).await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::queries_helpers::context_params`] — returns a
+    /// clone of the context's creation parameters, or `None` if the
+    /// context is unknown.
+    #[must_use]
+    pub async fn context_params(
+        &self,
+        context_id: &str,
+    ) -> Option<scp_protocol::context::ContextParams> {
+        crate::context::queries_helpers::context_params(self, context_id).await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::queries_helpers::get_role_state`] — returns a
+    /// clone of the context's role state, or `None` if the context is
+    /// unknown.
+    #[must_use]
+    pub async fn get_role_state(
+        &self,
+        context_id: &str,
+    ) -> Option<scp_protocol::context::roles::ContextRoleState> {
+        crate::context::queries_helpers::get_role_state(self, context_id).await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::queries_helpers::drain_events`] — drains and
+    /// returns every event currently buffered for `context_id`.
+    #[must_use]
+    pub async fn drain_events(&self, context_id: &str) -> Vec<ContextEvent> {
+        crate::context::queries_helpers::drain_events(self, context_id).await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::queries_helpers::event_log_entries`] —
+    /// returns the Merkle-log entries for the routing-id-hashed
+    /// `context_id_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] if the event-log provider fails or no
+    /// providers are wired.
+    pub fn event_log_entries(
+        &self,
+        context_id_bytes: &[u8; 32],
+    ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
+    {
+        crate::context::queries_helpers::event_log_entries(self, context_id_bytes)
+    }
+
+    /// Passthrough to
+    /// [`crate::context::queries_helpers::get_broadcast_key_for_local_author`]
+    /// — returns the broadcast sender key + epoch for `author_did` in
+    /// `context_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] when the caller is not authorized as
+    /// the broadcast author or when the context is unknown.
+    pub async fn get_broadcast_key_for_local_author(
+        &self,
+        context_id: &str,
+        author_did: &str,
+    ) -> Result<(Zeroizing<[u8; 32]>, u64), ContextError> {
+        crate::context::queries_helpers::get_broadcast_key_for_local_author(
+            self, context_id, author_did,
+        )
+        .await
+    }
+
+    /// Passthrough to the legacy
+    /// [`ContextManager::try_consume_hard_rate_limit_from_any_context`]
+    /// — runtime-agnostic hard-rate-limit consumption used by FFI
+    /// callers that may run inside or outside a tokio runtime.
+    ///
+    /// Returns `false` if the bucket is empty or no manager is
+    /// attached. Folded into a real Supervisor handler in commit
+    /// 12c.9g.4.
+    #[must_use]
+    pub fn try_consume_hard_rate_limit_from_any_context(
+        self: &Arc<Self>,
+        context_id: &str,
+        did: &DID,
+        now_secs: u64,
+    ) -> bool {
+        let Some(cm) = self.attached_context_manager() else {
+            tracing::error!(
+                context_id,
+                "Supervisor::try_consume_hard_rate_limit_from_any_context — no ContextManager \
+                 attached; failing closed"
+            );
+            return false;
+        };
+        let cm = Arc::clone(cm);
+        cm.try_consume_hard_rate_limit_from_any_context(context_id, did, now_secs)
+    }
+
+    /// Passthrough to the legacy
+    /// [`ContextManager::refund_hard_rate_limit_from_any_context`].
+    /// No-op if no manager is attached.
+    pub fn refund_hard_rate_limit_from_any_context(self: &Arc<Self>, context_id: &str, did: &DID) {
+        let Some(cm) = self.attached_context_manager() else {
+            tracing::error!(
+                context_id,
+                "Supervisor::refund_hard_rate_limit_from_any_context — no ContextManager \
+                 attached; skipping refund"
+            );
+            return;
+        };
+        let cm = Arc::clone(cm);
+        cm.refund_hard_rate_limit_from_any_context(context_id, did);
+    }
+
+    /// Passthrough to the legacy
+    /// [`ContextManager::invoke_tool_with_economy`] — invokes a tool
+    /// under the full economy pipeline.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::NotInitialized`] if no manager is
+    /// attached. Otherwise propagates every error variant the legacy
+    /// method emits (`ContextNotRegistered`, `PermissionDenied`,
+    /// `RateLimited`, schema/economy/UCAN failures).
+    #[allow(clippy::too_many_arguments)] // matches legacy signature 1:1
+    pub async fn invoke_tool_with_economy<F, Fut>(
+        &self,
+        context_id: &str,
+        registry: &scp_protocol::context::tools::registry::ToolRegistry,
+        tool_id: &scp_protocol::context::tools::ToolId,
+        input: serde_json::Value,
+        invoker_did: &DID,
+        spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+        timeout_ms: Option<u32>,
+        executor: F,
+    ) -> Result<crate::context::manager::tools::ManagedToolInvocationOutput, ContextError>
+    where
+        F: FnOnce(serde_json::Value) -> Fut,
+        Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
+    {
+        let cm = self.attached_context_manager().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::invoke_tool_with_economy — no ContextManager attached".to_owned(),
+            )
+        })?;
+        cm.invoke_tool_with_economy(
+            context_id,
+            registry,
+            tool_id,
+            input,
+            invoker_did,
+            spending_ucan,
+            timeout_ms,
+            executor,
+        )
+        .await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::lifecycle_helpers::create_context`] — used by
+    /// FFI integration tests that need to bypass the full bridge
+    /// lifecycle entry points.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`scp_protocol::context::ContextCreationError`] if the
+    /// supervisor's providers are not wired or context creation fails.
+    pub async fn create_context(
+        &self,
+        context_id: String,
+        params: scp_protocol::context::ContextParams,
+        creator_did: DID,
+        local_pseudonym: Option<[u8; 32]>,
+    ) -> Result<crate::context::ContextHandle, scp_protocol::context::builder::ContextCreationError>
+    {
+        crate::context::lifecycle_helpers::create_context(
+            self,
+            context_id,
+            params,
+            creator_did,
+            local_pseudonym,
+        )
+        .await
+    }
 }
 
 // ---------------------------------------------------------------------------

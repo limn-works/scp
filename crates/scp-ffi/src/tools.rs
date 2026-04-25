@@ -485,13 +485,13 @@ pub fn py_tool_invoke(
     // are sync; the Python SDK wrapper invokes us via `asyncio.to_thread`
     // so we are NOT inside a tokio runtime context — `block_on` on the
     // multi-thread global runtime is safe (matches `py_context_send`).
-    let manager = crate::runtime::context_manager()?;
+    let supervisor = crate::runtime::supervisor()?;
     let invoker_did_typed: scp_primitives::DID = identity_did_owned.into();
     let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id_owned.as_str());
     let rt = crate::runtime()?;
     let outcome = rt
         .block_on(async {
-            manager
+            supervisor
                 .invoke_tool_with_economy(
                     &ctx_id_owned,
                     &registry,
@@ -824,10 +824,10 @@ pub fn py_tool_invoke_cross_context(
 
     // Validate chain depth (context-configurable, default 8 per ADR-043).
     let max_chain_depth = {
-        let mgr = crate::runtime::context_manager()?;
+        let supervisor = crate::runtime::supervisor()?;
         let tokio_rt = crate::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
         let source_max = tokio_rt
-            .block_on(mgr.context_params(source_context_id))
+            .block_on(supervisor.context_params(source_context_id))
             .and_then(|p| p.max_chain_depth);
         scp_core::provenance::attach::effective_max_chain_depth(source_max)
     };
@@ -945,10 +945,10 @@ pub fn py_tool_session_create(
 
         // Enforce per-caller session cap (context-configured, default 1000, ADR-043).
         let cap = {
-            let mgr = crate::runtime::context_manager()?;
+            let supervisor = crate::runtime::supervisor()?;
             let tokio_rt = crate::runtime().map_err(|e| ScpPyError::context(e.to_string()))?;
             tokio_rt
-                .block_on(mgr.context_params(context_id))
+                .block_on(supervisor.context_params(context_id))
                 .and_then(|p| p.session_cap)
                 .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER)
                 as usize

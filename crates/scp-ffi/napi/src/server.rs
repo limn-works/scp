@@ -79,7 +79,7 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
     .await
     {
         Ok(adapter) => {
-            crate::runtime::init_context_manager_with_relay_transport(did, adapter);
+            crate::runtime::init_supervisor_with_relay_transport(did, adapter);
 
             // Also populate the BridgeInstance transport manager so that
             // broadcast publish, context subscribe, and discovery probing
@@ -117,13 +117,18 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
                  context operations may fail until transport is configured manually"
             );
             // Fall back to initializing without transport so that at least
-            // the ContextManager exists (with NotConfiguredTransportProvider).
-            crate::runtime::init_context_manager(did);
+            // the Supervisor exists (with NotConfiguredTransportProvider).
+            crate::runtime::init_supervisor(did);
         }
     }
     // Always register the node's DID as a local DID for defense-in-depth.
-    if let Ok(mgr) = crate::runtime::context_manager() {
-        mgr.register_local_did(did.to_owned().into()).await;
+    if let Ok(supervisor) = crate::runtime::supervisor()
+        && let Err(e) = supervisor.register_local_did(did.to_owned().into()).await
+    {
+        tracing::debug!(
+            error = %e,
+            "auto_wire_context_manager: register_local_did skipped (supervisor not ready)"
+        );
     }
 }
 
@@ -286,13 +291,13 @@ impl NapiNodeHandle {
             validate_did(did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
         }
 
-        // Resolve broadcast key: explicit or auto-lookup from ContextManager.
-        let mgr = crate::runtime::context_manager()?;
+        // Resolve broadcast key: explicit or auto-lookup via Supervisor.
+        let supervisor = crate::runtime::supervisor()?;
         let resolved = server::resolve_broadcast_key(
             broadcast_key_hex,
             author_did,
             self.inner.did(),
-            mgr,
+            supervisor,
             &context_id,
         )
         .await

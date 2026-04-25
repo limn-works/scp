@@ -67,7 +67,7 @@ pub(crate) mod lifecycle;
 pub(crate) mod messaging;
 mod queries;
 pub(crate) mod standing;
-mod tools;
+pub(crate) mod tools;
 mod trust_recovery;
 pub(crate) mod ttl_close;
 

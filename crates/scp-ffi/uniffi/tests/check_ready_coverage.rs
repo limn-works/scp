@@ -39,34 +39,27 @@ use std::path::PathBuf;
 /// invokes the same lifecycle check inside `bridge_instance()` itself.
 ///
 /// The `supervisor_expect()` / `supervisor_lenient()` entries correspond
-/// to the ADR-049 commit-9/10/11 shim paths — both resolve
-/// `DEFAULT_BRIDGE_INSTANCE` and invoke the same suspended/shutdown
-/// checks as `context_manager()`, so they're real lifecycle gates.
+/// to the ADR-049 commit-9/10/11 shim paths and the post-12c.9g.3 final
+/// surface — both resolve `DEFAULT_BRIDGE_INSTANCE` and invoke the same
+/// suspended/shutdown checks the removed `context_manager()` did, so
+/// they're real lifecycle gates.
 const GATE_PATTERNS: &[&str] = &[
     "default_bridge_instance()",
     "bridge_instance()",
-    "context_manager()?",
-    "context_manager().ok_or_else",
-    "context_manager_expect()?",
-    "= crate::runtime::context_manager_expect()",
     "supervisor_expect()",
     "supervisor_lenient()",
     "check_ready",
     "ensure_bridge_instance",
 ];
 
-/// Patterns that indicate a function body touches `ContextManager` state
-/// (Category A). The presence of any of these marks the function as
-/// stateful and therefore requires a gate. `supervisor_expect()` /
-/// `supervisor_lenient()` are the ADR-049 shim-path equivalents — an
-/// export that resolves the supervisor is touching the same per-context
-/// state the manager-path exports do.
-const CM_PATTERNS: &[&str] = &[
-    "context_manager()",
-    "context_manager_expect()",
-    "supervisor_expect()",
-    "supervisor_lenient()",
-];
+/// Patterns that indicate a function body touches per-instance
+/// supervisor / context state (Category A). The presence of any of
+/// these marks the function as stateful and therefore requires a gate.
+/// After ADR-049 commit 12c.9g.3 the bridge no longer holds an
+/// `Arc<ContextManager>` directly — `supervisor_expect()` /
+/// `supervisor_lenient()` are the only entry points that resolve the
+/// per-context state.
+const CM_PATTERNS: &[&str] = &["supervisor_expect()", "supervisor_lenient()"];
 
 /// Patterns that indicate a function body touches `CoreFields` state
 /// (Category B). Category A takes precedence over B when both patterns
@@ -289,10 +282,10 @@ fn uniffi_check_ready_coverage() {
 
     if !missing.is_empty() {
         let mut msg = format!(
-            "{} UniFFI export(s) touching CoreFields/ContextManager state are missing a \
+            "{} UniFFI export(s) touching CoreFields/Supervisor state are missing a \
              lifecycle gate (#1646). Every Category A/B export must invoke one of: \
-             `default_bridge_instance()?`, `bridge_instance()`, `context_manager()?`, \
-             `context_manager_expect()?`, or `check_ready()`.\n\n",
+             `default_bridge_instance()?`, `bridge_instance()`, `supervisor_expect()?`, \
+             `supervisor_lenient()?`, or `check_ready()`.\n\n",
             missing.len()
         );
         for e in &missing {
@@ -303,8 +296,8 @@ fn uniffi_check_ready_coverage() {
         }
         msg.push_str(
             "\nFix: add `let _bi = crate::runtime::default_bridge_instance()?;` at the \
-             top of each offender's body, or resolve the manager via \
-             `context_manager()?` / `context_manager_expect()?`.\n\
+             top of each offender's body, or resolve the supervisor via \
+             `supervisor_expect()?` / `supervisor_lenient()?`.\n\
              See .docs/audits/uniffi-check-ready-audit-1646.md for the full audit table.",
         );
         panic!("{msg}");

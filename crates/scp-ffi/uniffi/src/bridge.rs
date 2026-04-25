@@ -3177,7 +3177,7 @@ pub async fn context_create(
             // (`OnceLock` — first call wins). The bridge no longer supports
             // a DID-less stub crypto path; the creator DID becomes the
             // process-wide MLS credential identity.
-            crate::runtime::init_context_manager_with_did(&identity.did);
+            crate::runtime::init_supervisor_with_did(&identity.did);
 
             // Extract key custody and signing key from the identity.
             #[cfg(feature = "allow_in_memory_custody")]
@@ -3421,7 +3421,7 @@ pub async fn context_join(
             // identity's DID — context_join is a valid first operation
             // (e.g. a device joining a context without creating one).
             // `init_context_manager_with_did` is idempotent (`OnceLock`). #1073
-            crate::runtime::init_context_manager_with_did(&identity.did);
+            crate::runtime::init_supervisor_with_did(&identity.did);
 
             // Build a core ContextHandle to pass the context_id through the
             // lifecycle shim. This ephemeral ContextHandle carries default
@@ -4332,10 +4332,10 @@ pub async fn tool_invoke(
                 }
             };
 
-            let manager = crate::runtime::context_manager_expect()?;
+            let supervisor = crate::runtime::supervisor_expect()?;
             let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
             let tool_id_typed = scp_core::context::tools::ToolId::from(tool_id.as_str());
-            let outcome = manager
+            let outcome = supervisor
                 .invoke_tool_with_economy(
                     &context_id,
                     &registry,
@@ -5248,16 +5248,14 @@ pub async fn transport_connect(relay_url: String) -> Result<Arc<TransportManager
             // Store the transport manager in BridgeInstance so that
             // suspend()/shutdown() lifecycle events automatically clear it.
             // The BridgeInstance container has no DID requirement (spec
-            // §12.2.3) — ensure it exists, and attach the ContextManager if
-            // one is already available.
+            // §12.2.3) — ensure it exists, and let the supervisor wire
+            // itself on the next init call. After ADR-049 commit
+            // 12c.9g.3 the bridge layer never holds an
+            // `Arc<ContextManager>` directly.
             let bi = if let Ok(bi) = crate::runtime::bridge_instance() {
                 bi
             } else {
-                if let Ok(cm) = crate::runtime::context_manager() {
-                    crate::runtime::attach_context_manager_to_bridge(cm.clone());
-                } else {
-                    crate::runtime::ensure_bridge_instance();
-                }
+                crate::runtime::ensure_bridge_instance();
                 crate::runtime::bridge_instance().map_err(|_| ScpError::Context {
                     msg: "bridge not initialized — call identity_create before transport_connect"
                         .to_owned(),
@@ -5420,7 +5418,7 @@ pub async fn configure_relay_transport(
                 code: codes::TRANS_5001.to_owned(),
             })?;
 
-    crate::runtime::init_context_manager_with_relay_transport(&local_did, adapter);
+    crate::runtime::init_supervisor_with_relay_transport(&local_did, adapter);
     Ok(())
 }
 
@@ -10232,7 +10230,7 @@ pub async fn context_reset_ttl_timer(handle: Arc<ContextHandle>, new_seconds: u6
 #[uniffi::export]
 pub async fn register_local_did(did: String) -> Result<(), ScpError> {
     validate_did(&did)?;
-    crate::runtime::init_context_manager_with_did(&did);
+    crate::runtime::init_supervisor_with_did(&did);
     let sup = crate::runtime::supervisor_expect()?;
     sup.register_local_did(did.into())
         .await
@@ -10252,7 +10250,7 @@ pub async fn is_local_did(did: String) -> bool {
     // `is_local_did` to be a valid first operation — matching the old
     // DID-less `init_context_manager` path's permissiveness but now with a
     // real MLS credential identity.
-    crate::runtime::init_context_manager_with_did(&did);
+    crate::runtime::init_supervisor_with_did(&did);
     let Ok(sup) = crate::runtime::supervisor_expect() else {
         return false;
     };
@@ -10984,7 +10982,7 @@ pub async fn context_import(data: Vec<u8>) -> Result<String, ScpError> {
             // data). `init_context_manager_with_did` is idempotent
             // (`OnceLock`). #1073
             validate_did(&export.exporter_did.0)?;
-            crate::runtime::init_context_manager_with_did(&export.exporter_did.0);
+            crate::runtime::init_supervisor_with_did(&export.exporter_did.0);
 
             // Route through the ADR-049 commit-9 lifecycle shim.
             let sup = crate::runtime::supervisor_expect()?;

@@ -30,7 +30,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
-use scp_core::context::builder::ContextEventLogProvider;
+use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
 use scp_core::context::providers::MerkleEventLogProvider;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
@@ -522,58 +522,27 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
     scp_ffi_common::bridge_runtime::not_configured_key_resolver()
 }
 
-/// Returns a reference to the shared `ContextManager` on the default
-/// bridge instance.
-///
-/// # Errors
-///
-/// Returns `napi::Error` if the default bridge has not been initialized
-/// via [`init_context_manager`], or if it is currently suspended.
-pub fn context_manager() -> napi::Result<&'static Arc<ContextManager>> {
-    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Context {
-            message: "ContextManager not initialized — call context_create, \
-                      context_join, context_import, or init_context_manager first"
-                .to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })
-    })?;
-    // Suspended: return error (recoverable — caller should resume()).
-    // AlreadyShutDown: warn only — shutdown already destroyed state,
-    // operations will fail naturally at MLS/transport layer.
-    if bi.core.is_suspended() {
-        return Err(napi::Error::from(ScpNapiError::Context {
-            message: "bridge is suspended — call resume() before performing operations".to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        }));
-    }
-    if bi.core.is_shutdown() {
-        tracing::warn!("context_manager() called after shutdown — operations may fail");
-    }
-    bi.core.try_context_manager().ok_or_else(|| {
-        napi::Error::from(ScpNapiError::Context {
-            message: "ContextManager not yet attached — call context_create, \
-                      context_join, context_import, or init_context_manager first"
-                .to_owned(),
-            code: codes::CTX_2000.to_owned(),
-        })
-    })
-}
-
 /// Returns the per-instance
-/// [`Supervisor`](scp_core::context::supervisor::Supervisor) used by the
-/// commits-7-to-11 FFI query shim. Deleted in commit 12.
+/// [`Supervisor`](scp_core::context::supervisor::Supervisor) for the
+/// default bridge instance.
+///
+/// Per ADR-049 commit 12c.9g.3 the FFI bridge no longer hands out an
+/// `Arc<ContextManager>`. Every bridge function that previously routed
+/// through `context_manager()` now goes through this accessor and uses
+/// the supervisor's
+/// [`dispatch_*`](scp_core::context::supervisor::Supervisor) family or
+/// the per-method passthrough surface added on the supervisor.
 ///
 /// # Errors
 ///
-/// Returns `napi::Error` if the default bridge instance has not been
-/// initialized, or if the bridge is currently suspended. Does not
-/// require `ContextManager` to be attached.
+/// Returns `napi::Error` if the default bridge has not been
+/// initialized via [`init_supervisor`], no supervisor is wired yet, or
+/// the bridge is currently suspended.
 pub fn supervisor() -> napi::Result<&'static Arc<scp_core::context::supervisor::Supervisor>> {
     let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
         napi::Error::from(ScpNapiError::Context {
-            message: "Supervisor not initialized — call context_create or \
-                      init_context_manager first"
+            message: "Supervisor not initialized — call context_create, \
+                      context_join, context_import, or init_supervisor first"
                 .to_owned(),
             code: codes::CTX_2000.to_owned(),
         })
@@ -587,7 +556,14 @@ pub fn supervisor() -> napi::Result<&'static Arc<scp_core::context::supervisor::
     if bi.core.is_shutdown() {
         tracing::warn!("supervisor() called after shutdown — operations may fail");
     }
-    Ok(bi.core.supervisor())
+    bi.core.try_supervisor().ok_or_else(|| {
+        napi::Error::from(ScpNapiError::Context {
+            message: "Supervisor not yet attached — call context_create, \
+                      context_join, context_import, or init_supervisor first"
+                .to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -677,22 +653,9 @@ pub fn ensure_bridge_instance() {
     init_default_bridge_instance();
 }
 
-/// Attaches an externally-constructed `ContextManager` to the default
-/// `NapiBridgeInstance`.
-///
-/// Used by `set_transport_manager` and similar code paths that need to install
-/// a `ContextManager` that was not created by `init_context_manager*`. Creates
-/// the default bridge if one does not yet exist.
-///
-/// No-op if the default bridge already has a `ContextManager` attached.
-pub fn attach_context_manager_to_bridge(cm: Arc<ContextManager>) {
-    ensure_bridge_instance();
-    if let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get()
-        && !bi.core.has_context_manager()
-    {
-        bi.core.set_context_manager(cm);
-    }
-}
+// `attach_context_manager_to_bridge` deleted in ADR-049 commit
+// 12c.9g.3. The FFI bridge no longer surfaces an `Arc<ContextManager>`;
+// callers route through `init_supervisor*` and `Supervisor::*` methods.
 
 /// Returns a reference to the default [`NapiBridgeInstance`]'s core for
 /// handle-affinity checks only.
@@ -869,7 +832,8 @@ impl HandleInstance for crate::testing::NapiFullStackNode {
     }
 }
 
-/// Initializes the global [`ContextManager`] with production providers.
+/// Initializes the per-instance [`Supervisor`] with production
+/// providers.
 ///
 /// Uses `MlsCryptoProvider` (real MLS encryption, #1294),
 /// `NotConfiguredTransportProvider`, `MerkleEventLogProvider` (persistent,
@@ -887,16 +851,16 @@ impl HandleInstance for crate::testing::NapiFullStackNode {
 /// `BridgeInstance` container carries no DID of its own (spec §12.2.3).
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-pub fn init_context_manager(local_did: &str) {
+pub fn init_supervisor(local_did: &str) {
     ensure_bridge_instance();
     let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!("init_context_manager: BridgeInstance unexpectedly None");
+        tracing::error!("init_supervisor: BridgeInstance unexpectedly None");
         return;
     };
-    if bi.core.has_context_manager() {
+    if bi.core.has_supervisor() {
         tracing::debug!(
             requested_did = %local_did,
-            "init_context_manager: ContextManager already attached — using existing instance"
+            "init_supervisor: Supervisor already attached — using existing instance"
         );
         return;
     }
@@ -905,21 +869,44 @@ pub fn init_context_manager(local_did: &str) {
     let transport = Box::new(scp_core::context::NotConfiguredTransportProvider);
     let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
         tracing::error!(
-            "init_context_manager: missing ProtocolRepository after ensure_bridge_instance — \
+            "init_supervisor: missing ProtocolRepository after ensure_bridge_instance — \
              falling back to a fresh event log provider (persistence will be lost)"
         );
         build_event_log_provider().0
     });
     let persistence = persistence_box_for_init(bi);
-    let cm_arc = Arc::new(ContextManager::with_persistence(
+    let supervisor_arc = build_supervisor_arc(crypto, transport, event_log, persistence);
+
+    bi.core.set_supervisor(supervisor_arc);
+}
+
+/// Constructs an `Arc<Supervisor>` wrapping a freshly-built
+/// `ContextManager` (ADR-049 commit 12c.9g.3 — bridge layer no longer
+/// surfaces the manager directly).
+fn build_supervisor_arc(
+    crypto: Arc<scp_core::crypto::mls::provider::MlsCryptoProvider>,
+    transport: Box<dyn ContextTransportProvider>,
+    event_log: Box<dyn ContextEventLogProvider>,
+    persistence: Box<dyn ContextPersistence>,
+) -> Arc<scp_core::context::supervisor::Supervisor> {
+    use scp_core::context::supervisor::Supervisor;
+
+    let cm = Arc::new(ContextManager::with_persistence(
         crypto,
         transport,
         event_log,
         persistence,
         not_configured_key_resolver(),
     ));
-
-    bi.core.set_context_manager(cm_arc);
+    let supervisor = Arc::new(Supervisor::for_query_shim());
+    if let Err(err) = supervisor.attach_context_manager(&cm) {
+        tracing::warn!(
+            error = %err,
+            "build_supervisor_arc: attach_context_manager failed — supervisor still constructed \
+             but without lifted providers"
+        );
+    }
+    supervisor
 }
 
 /// Returns a `Box<dyn ContextPersistence>` for `ContextManager::with_persistence`.
@@ -937,14 +924,15 @@ fn persistence_box_for_init(bi: &NapiBridgeInstance) -> Box<dyn ContextPersisten
     }
 }
 
-/// Initializes the global [`ContextManager`] with [`LocalTransportProvider`].
+/// Initializes the per-instance [`Supervisor`] with
+/// [`LocalTransportProvider`].
 ///
-/// Identical to [`init_context_manager`] except the transport provider is
+/// Identical to [`init_supervisor`] except the transport provider is
 /// `LocalTransportProvider` (silently succeeds on all send/publish calls)
 /// instead of `NotConfiguredTransportProvider` (rejects everything).
 ///
 /// **Must be called before any `context_create` / `context_join` /
-/// `context_import`** — those functions call `init_context_manager` which
+/// `context_import`** — those functions call `init_supervisor` which
 /// will win the `OnceLock` race if called first.
 ///
 /// Exposed to JS/TS via [`crate::transport::configure_local_transport`] so
@@ -952,18 +940,16 @@ fn persistence_box_for_init(bi: &NapiBridgeInstance) -> Box<dyn ContextPersisten
 /// a real relay server.
 ///
 /// Subsequent calls are no-ops (`OnceLock`).
-pub fn init_context_manager_with_local_transport(local_did: &str) {
+pub fn init_supervisor_with_local_transport(local_did: &str) {
     ensure_bridge_instance();
     let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!(
-            "init_context_manager_with_local_transport: BridgeInstance unexpectedly None"
-        );
+        tracing::error!("init_supervisor_with_local_transport: BridgeInstance unexpectedly None");
         return;
     };
-    if bi.core.has_context_manager() {
+    if bi.core.has_supervisor() {
         tracing::warn!(
             requested_did = %local_did,
-            "init_context_manager_with_local_transport: ContextManager already attached — ignoring"
+            "init_supervisor_with_local_transport: Supervisor already attached — ignoring"
         );
         return;
     }
@@ -972,32 +958,27 @@ pub fn init_context_manager_with_local_transport(local_did: &str) {
     let transport = Box::new(scp_core::context::LocalTransportProvider);
     let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
         tracing::error!(
-            "init_context_manager_with_local_transport: missing ProtocolRepository after \
+            "init_supervisor_with_local_transport: missing ProtocolRepository after \
              ensure_bridge_instance — falling back to a fresh event log provider"
         );
         build_event_log_provider().0
     });
     let persistence = persistence_box_for_init(bi);
-    let cm_arc = Arc::new(ContextManager::with_persistence(
-        crypto,
-        transport,
-        event_log,
-        persistence,
-        not_configured_key_resolver(),
-    ));
+    let supervisor_arc = build_supervisor_arc(crypto, transport, event_log, persistence);
 
-    bi.core.set_context_manager(cm_arc);
+    bi.core.set_supervisor(supervisor_arc);
 }
 
-/// Initializes the global [`ContextManager`] with [`RelayTransportProvider`].
+/// Initializes the per-instance [`Supervisor`] with
+/// [`RelayTransportProvider`].
 ///
-/// Identical to [`init_context_manager`] except the transport provider is a
+/// Identical to [`init_supervisor`] except the transport provider is a
 /// `RelayTransportProvider` wrapping a real `NativeRelayAdapter` connected to
-/// the given relay URL. This allows `ContextManager::send_message` (and thus
-/// `contextSend`) to publish encrypted payloads through the relay.
+/// the given relay URL. This allows the supervisor's send pipeline (and
+/// thus `contextSend`) to publish encrypted payloads through the relay.
 ///
 /// **Must be called before any `context_create` / `context_join` /
-/// `context_import`** — those functions call `init_context_manager` which
+/// `context_import`** — those functions call `init_supervisor` which
 /// will win the `OnceLock` race if called first.
 ///
 /// Exposed to JS/TS via [`crate::transport::configure_relay_transport`] so
@@ -1011,21 +992,19 @@ pub fn init_context_manager_with_local_transport(local_did: &str) {
 ///   `RelayTransportProvider`.
 ///
 /// Subsequent calls are no-ops (`OnceLock`).
-pub fn init_context_manager_with_relay_transport(
+pub fn init_supervisor_with_relay_transport(
     local_did: &str,
     adapter: scp_transport::native::adapter::NativeRelayAdapter,
 ) {
     ensure_bridge_instance();
     let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!(
-            "init_context_manager_with_relay_transport: BridgeInstance unexpectedly None"
-        );
+        tracing::error!("init_supervisor_with_relay_transport: BridgeInstance unexpectedly None");
         return;
     };
-    if bi.core.has_context_manager() {
+    if bi.core.has_supervisor() {
         tracing::warn!(
             requested_did = %local_did,
-            "init_context_manager_with_relay_transport: ContextManager already attached — ignoring"
+            "init_supervisor_with_relay_transport: Supervisor already attached — ignoring"
         );
         return;
     }
@@ -1034,21 +1013,15 @@ pub fn init_context_manager_with_relay_transport(
     let transport = Box::new(scp_transport::RelayTransportProvider::new(adapter));
     let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
         tracing::error!(
-            "init_context_manager_with_relay_transport: missing ProtocolRepository after \
+            "init_supervisor_with_relay_transport: missing ProtocolRepository after \
              ensure_bridge_instance — falling back to a fresh event log provider"
         );
         build_event_log_provider().0
     });
     let persistence = persistence_box_for_init(bi);
-    let cm_arc = Arc::new(ContextManager::with_persistence(
-        crypto,
-        transport,
-        event_log,
-        persistence,
-        not_configured_key_resolver(),
-    ));
+    let supervisor_arc = build_supervisor_arc(crypto, transport, event_log, persistence);
 
-    bi.core.set_context_manager(cm_arc);
+    bi.core.set_supervisor(supervisor_arc);
 }
 
 /// Returns the default-instance `ProtocolRepoVariant` if initialized.
@@ -1102,43 +1075,42 @@ fn event_log_provider_from_existing_repo() -> Option<Box<dyn ContextEventLogProv
 // longer required. Other tests that previously acquired the guard now
 // simply run without it.
 
-/// Test variant of [`context_manager`] initialization that uses
+/// Test variant of [`init_supervisor`] that uses
 /// [`LocalTransportProvider`](scp_core::context::LocalTransportProvider)
 /// instead of
 /// [`NotConfiguredTransportProvider`](scp_core::context::NotConfiguredTransportProvider)
 /// and a no-op crypto provider for Rust unit tests that pass `None` key
 /// package bytes with `did:key:` test DIDs.
 ///
-/// Must be called before the first `context_manager()` call in tests.
+/// Must be called before the first `supervisor()` call in tests.
 /// `OnceLock::get_or_init` ensures only the first initialization wins.
 #[cfg(test)]
-pub(crate) fn init_context_manager_for_test() {
+pub(crate) fn init_supervisor_for_test() {
     ensure_bridge_instance();
     let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!("init_context_manager_for_test: BridgeInstance unexpectedly None");
+        tracing::error!("init_supervisor_for_test: BridgeInstance unexpectedly None");
         return;
     };
-    if bi.core.has_context_manager() {
+    if bi.core.has_supervisor() {
         return;
     }
     let event_log = event_log_provider_from_existing_repo().unwrap_or_else(|| {
         tracing::error!(
-            "init_context_manager_for_test: missing ProtocolRepository after \
+            "init_supervisor_for_test: missing ProtocolRepository after \
              ensure_bridge_instance — falling back to a fresh event log provider"
         );
         build_event_log_provider().0
     });
-    let cm_arc = Arc::new(ContextManager::with_persistence(
+    let supervisor_arc = build_supervisor_arc(
         Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
             "did:test:napi-bridge-test".to_owned(),
         )),
         Box::new(scp_core::context::LocalTransportProvider),
         event_log,
         Box::new(NapiBridgePersistence::new()),
-        not_configured_key_resolver(),
-    ));
+    );
 
-    bi.core.set_context_manager(cm_arc);
+    bi.core.set_supervisor(supervisor_arc);
 }
 
 // ---------------------------------------------------------------------------
@@ -1792,26 +1764,27 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn bridge_instance_populated_by_init_context_manager() {
-        // init_context_manager_for_test populates DEFAULT_BRIDGE_INSTANCE which
-        // owns the ContextManager. Since OnceLock is process-global, the first
-        // call in any test wins — subsequent calls are no-ops. We rely on this
-        // being called (possibly by other tests) before asserting.
-        init_context_manager_for_test();
+    fn bridge_instance_populated_by_init_supervisor() {
+        // init_supervisor_for_test populates DEFAULT_BRIDGE_INSTANCE which
+        // owns the per-instance Supervisor. Since OnceLock is process-global,
+        // the first call in any test wins — subsequent calls are no-ops. We
+        // rely on this being called (possibly by other tests) before
+        // asserting.
+        init_supervisor_for_test();
 
-        let cm = context_manager().expect("context_manager should be initialized");
+        let sup = supervisor().expect("supervisor should be initialized");
         let core = bridge_instance().expect("bridge_instance should be initialized");
 
-        // Both should point to the same ContextManager allocation.
+        // Both should point to the same Supervisor allocation.
         assert!(
-            Arc::ptr_eq(cm, core.try_context_manager().unwrap()),
-            "bridge_instance().try_context_manager() must be the same Arc as context_manager()"
+            Arc::ptr_eq(sup, core.try_supervisor().unwrap()),
+            "bridge_instance().try_supervisor() must be the same Arc as supervisor()"
         );
     }
 
     #[test]
     fn bridge_instance_not_shutdown_initially() {
-        init_context_manager_for_test();
+        init_supervisor_for_test();
 
         let core = bridge_instance().expect("bridge_instance should be initialized");
         assert!(

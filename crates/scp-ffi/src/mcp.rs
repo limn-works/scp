@@ -817,8 +817,8 @@ impl ContextProvider for FfiBridgeProvider {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let manager = crate::runtime::context_manager().map_err(|e| format!("{e}"))?;
-        if !manager.try_consume_hard_rate_limit_from_any_context(
+        let supervisor = crate::runtime::supervisor().map_err(|e| format!("{e}"))?;
+        if !supervisor.try_consume_hard_rate_limit_from_any_context(
             context_id,
             &invoker_did_typed,
             now_secs,
@@ -832,7 +832,8 @@ impl ContextProvider for FfiBridgeProvider {
         // as the consume call above.
         let ctx_id_for_refund = context_id.to_owned();
         let refund = |e: String| -> String {
-            manager.refund_hard_rate_limit_from_any_context(&ctx_id_for_refund, &invoker_did_typed);
+            supervisor
+                .refund_hard_rate_limit_from_any_context(&ctx_id_for_refund, &invoker_did_typed);
             e
         };
 
@@ -2786,7 +2787,7 @@ mod tests {
     #[test]
     fn known_context_registration_and_lookup() {
         // BridgeInstance must exist for known-context registration.
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
 
         let creator = "did:dht:z6MkCreatorKnownCtx";
         let ctx_id = crate::types::generate_random_id("known-ctx");
@@ -3137,7 +3138,7 @@ mod tests {
 
     #[test]
     fn mcp_registry_stats_returns_consistent_counts() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         let stats = mcp_registry_stats();
         // Cannot assert exact values due to parallel tests, but structural
         // invariants must hold: stopped_servers can never exceed total servers.
@@ -3245,7 +3246,7 @@ mod tests {
 
     #[test]
     fn core_registry_stats_includes_all_fields() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         let stats = crate::runtime::registry_stats();
         // Just verify the struct has the expected fields and doesn't panic.
         let _ = stats.contexts;

@@ -148,74 +148,31 @@ pub type ToolHandler =
     Arc<dyn Fn(serde_json::Value) -> Result<serde_json::Value, String> + Send + Sync>;
 
 // ---------------------------------------------------------------------------
-// ContextManager (shared, process-global)
+// Supervisor (per-bridge, process-global default)
 // ---------------------------------------------------------------------------
-
-/// Returns a reference to the shared [`ContextManager`] from the default
-/// bridge instance.
-///
-/// Delegates to [`PyBridgeInstance::core`] → [`CoreFields::try_context_manager`].
-///
-/// # Errors
-///
-/// Returns `ScpPyError::ContextError` if the bridge has not been
-/// initialized via [`init_context_manager`], if the `ContextManager` has
-/// not been attached to the instance yet (i.e.,
-/// `ensure_bridge_instance` ran but `init_context_manager` has not), or if
-/// the bridge is currently suspended.
-pub fn context_manager() -> Result<&'static Arc<ContextManager>, ScpPyError> {
-    let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
-        ScpPyError::context(
-            "ContextManager not initialized — call py_context_create, \
-             py_context_join, py_context_import, or init_context_manager first"
-                .to_owned(),
-        )
-    })?;
-    // Suspended: return error (recoverable — caller should call resume()).
-    // AlreadyShutDown: warn only. Shutdown already destroyed MLS groups,
-    // cleared registries, and disconnected transport — operations will fail
-    // naturally. Returning an error breaks test suites that call shutdown
-    // before exit, since OnceLock cannot be re-initialized.
-    if bi.core.is_suspended() {
-        return Err(ScpPyError::context(
-            "bridge is suspended — call resume() before performing operations".to_owned(),
-        ));
-    }
-    if bi.core.is_shutdown() {
-        tracing::warn!("context_manager() called after shutdown — operations may fail");
-    }
-    bi.core.try_context_manager().ok_or_else(|| {
-        ScpPyError::context(
-            "ContextManager not yet attached — call py_context_create, \
-             py_context_join, py_context_import, or init_context_manager first"
-                .to_owned(),
-        )
-    })
-}
 
 /// Returns a reference to the shared
 /// [`Supervisor`](scp_core::context::supervisor::Supervisor) from the
 /// default bridge instance.
 ///
-/// Used by the commits-7-to-11 FFI query shim — query bridge functions
-/// route through
-/// [`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query)
-/// instead of calling `ContextManager::member_count` etc. directly.
-/// Deleted in commit 12 with the shim.
+/// Per ADR-049 commit 12c.9g.3 the FFI bridge no longer hands out an
+/// `Arc<ContextManager>`. Every bridge function that previously routed
+/// through `context_manager()` now goes through this accessor and uses
+/// the supervisor's
+/// [`dispatch_*`](scp_core::context::supervisor::Supervisor) family or
+/// the per-method passthrough surface added on the supervisor.
 ///
 /// # Errors
 ///
 /// Returns `ScpPyError::ContextError` if the bridge instance has not
-/// been initialized yet or if the bridge is currently suspended. Does
-/// NOT require the `ContextManager` itself to be attached — a future
-/// caller that constructs the supervisor before the manager is ready
-/// would observe `ContextError::NotInitialized` on dispatch, which maps
-/// to a descriptive Python error at the bridge boundary.
+/// been initialized yet, if no supervisor has been wired (i.e.
+/// `ensure_bridge_instance` ran but `init_supervisor` has not), or if
+/// the bridge is currently suspended.
 pub fn supervisor() -> Result<&'static Arc<scp_core::context::supervisor::Supervisor>, ScpPyError> {
     let bi = DEFAULT_BRIDGE_INSTANCE.get().ok_or_else(|| {
         ScpPyError::context(
-            "Supervisor not initialized — call py_context_create or \
-             init_context_manager first"
+            "Supervisor not initialized — call py_context_create, \
+             py_context_join, py_context_import, or init_supervisor first"
                 .to_owned(),
         )
     })?;
@@ -227,7 +184,13 @@ pub fn supervisor() -> Result<&'static Arc<scp_core::context::supervisor::Superv
     if bi.core.is_shutdown() {
         tracing::warn!("supervisor() called after shutdown — operations may fail");
     }
-    Ok(bi.core.supervisor())
+    bi.core.try_supervisor().ok_or_else(|| {
+        ScpPyError::context(
+            "Supervisor not yet attached — call py_context_create, \
+             py_context_join, py_context_import, or init_supervisor first"
+                .to_owned(),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -854,7 +817,7 @@ pub fn bridge_instance_for_affinity() -> Result<&'static CoreFields, ScpPyError>
 // ContextManager initialization
 // ---------------------------------------------------------------------------
 
-/// Initializes the global [`ContextManager`] with production providers.
+/// Initializes the per-bridge [`Supervisor`] with production providers.
 ///
 /// Uses `MlsCryptoProvider` (real OpenMLS-backed encryption, sender keys, and
 /// group management — ported from NAPI bridge #1305, closes #1324),
@@ -871,32 +834,33 @@ pub fn bridge_instance_for_affinity() -> Result<&'static CoreFields, ScpPyError>
 ///
 /// When the `BridgeInstance` storage provider has been initialized via
 /// [`init_storage`], a [`ProtocolRepositoryContextBridge`] is constructed
-/// from it and injected into the `ContextManager`. This enables context state
-/// persistence across process restarts without requiring callers to manually
-/// wire persistence. See issue #329.
+/// from it and injected into the `ContextManager` that the supervisor wraps.
+/// This enables context state persistence across process restarts without
+/// requiring callers to manually wire persistence. See issue #329.
 ///
 /// The `local_did` is consumed only by `MlsCryptoProvider::new` — the
 /// `BridgeInstance` itself carries no DID (spec §12.2.3).
 ///
 /// Subsequent calls are no-ops (`OnceLock` guarantees single initialization).
-/// If the manager is already initialized with a different DID, a warning is logged.
-pub fn init_context_manager(local_did: &str) {
+/// If the supervisor is already initialized with a different DID, a warning is
+/// logged.
+pub fn init_supervisor(local_did: &str) {
     // Always ensure the BridgeInstance exists first so that identity-time
     // state (DID resolver, identity registry) is wired up before we attempt
-    // to attach a ContextManager.
+    // to attach a Supervisor.
     ensure_bridge_instance();
 
     let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
         tracing::error!(
-            "init_context_manager: PyBridgeInstance unexpectedly None after ensure_bridge_instance"
+            "init_supervisor: PyBridgeInstance unexpectedly None after ensure_bridge_instance"
         );
         return;
     };
 
-    if bi.core.has_context_manager() {
+    if bi.core.has_supervisor() {
         tracing::debug!(
             requested_did = %local_did,
-            "init_context_manager: ContextManager already attached — using existing instance"
+            "init_supervisor: Supervisor already attached — using existing instance"
         );
         return;
     }
@@ -904,22 +868,22 @@ pub fn init_context_manager(local_did: &str) {
     let did = local_did.to_owned();
     let crypto = Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let persistence = build_persistence_provider();
-    let cm_arc = build_context_manager(
+    let supervisor_arc = build_supervisor(
         crypto,
         Box::new(NotConfiguredTransportProvider),
         Box::new(NoOpEventLogProvider),
         persistence,
     );
 
-    bi.core.set_context_manager(cm_arc);
+    bi.core.set_supervisor(supervisor_arc);
 }
 
-/// Ensures the default [`PyBridgeInstance`] exists (without a `ContextManager`).
+/// Ensures the default [`PyBridgeInstance`] exists (without a `Supervisor`).
 ///
 /// Called by [`crate::identity::ensure_did_resolver_initialized`] before
 /// `DidDht::create()` runs, so that the DID resolver slot owned by
-/// `BridgeInstance` is available. The `ContextManager` is attached later
-/// via [`init_context_manager`] once the identity is known and the
+/// `BridgeInstance` is available. The `Supervisor` is attached later
+/// via [`init_supervisor`] once the identity is known and the
 /// `MlsCryptoProvider` has been constructed with it. Per spec §12.2.3
 /// the `BridgeInstance` container has no DID requirement.
 ///
@@ -928,15 +892,16 @@ pub fn ensure_bridge_instance() {
     init_bridge_instance_empty();
 }
 
-/// Initializes the global [`ContextManager`] with custom providers.
+/// Initializes the per-bridge [`Supervisor`] with custom providers.
 ///
-/// Allows injecting real or custom provider implementations. If the manager
-/// is already initialized, this is a no-op (first call wins).
+/// Allows injecting real or custom provider implementations. If the
+/// supervisor is already initialized, this is a no-op (first call wins).
 ///
 /// When `persistence` is `None` but the global storage provider has been
-/// initialized, a [`ProtocolRepositoryContextBridge`] is automatically constructed
-/// from it. Pass `Some(...)` to override with a custom implementation.
-pub fn init_context_manager_with(
+/// initialized, a [`ProtocolRepositoryContextBridge`] is automatically
+/// constructed from it. Pass `Some(...)` to override with a custom
+/// implementation.
+pub fn init_supervisor_with(
     _local_did: &str,
     crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
@@ -948,18 +913,18 @@ pub fn init_context_manager_with(
     // (it is the `MlsCryptoProvider` that carries the DID; see spec §12.2.3).
     ensure_bridge_instance();
     let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!("init_context_manager_with: PyBridgeInstance unexpectedly None");
+        tracing::error!("init_supervisor_with: PyBridgeInstance unexpectedly None");
         return;
     };
-    if bi.core.has_context_manager() {
+    if bi.core.has_supervisor() {
         return;
     }
     let persistence = persistence.or_else(build_persistence_provider);
-    let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
-    bi.core.set_context_manager(cm_arc);
+    let supervisor_arc = build_supervisor(crypto, transport, event_log, persistence);
+    bi.core.set_supervisor(supervisor_arc);
 }
 
-/// Test variant of [`init_context_manager`] that uses `LocalTransportProvider`
+/// Test variant of [`init_supervisor`] that uses `LocalTransportProvider`
 /// instead of `NotConfiguredTransportProvider`.
 ///
 /// Production code uses `NotConfiguredTransportProvider` to surface descriptive
@@ -969,17 +934,17 @@ pub fn init_context_manager_with(
 ///
 /// Not behind `#[cfg(test)]` because integration tests (`tests/e2e_bridge.rs`)
 /// compile as separate crates and need access to this function.
-pub fn init_context_manager_for_test() {
+pub fn init_supervisor_for_test() {
     ensure_bridge_instance();
     let Some(bi) = DEFAULT_BRIDGE_INSTANCE.get() else {
-        tracing::error!("init_context_manager_for_test: PyBridgeInstance unexpectedly None");
+        tracing::error!("init_supervisor_for_test: PyBridgeInstance unexpectedly None");
         return;
     };
-    if bi.core.has_context_manager() {
+    if bi.core.has_supervisor() {
         return;
     }
     let persistence = build_persistence_provider();
-    let cm_arc = build_context_manager(
+    let supervisor_arc = build_supervisor(
         Arc::new(MlsCryptoProvider::new(
             "did:test:pyo3-bridge-test".to_owned(),
         )),
@@ -988,7 +953,7 @@ pub fn init_context_manager_for_test() {
         persistence,
     );
 
-    bi.core.set_context_manager(cm_arc);
+    bi.core.set_supervisor(supervisor_arc);
 }
 
 /// Constructs a [`ProtocolRepositoryContextBridge`] from the global storage provider,
@@ -1099,14 +1064,24 @@ impl ContextPersistence for ArcContextPersistence {
     }
 }
 
-/// Constructs a `ContextManager` with or without persistence.
-fn build_context_manager(
+/// Constructs a fresh per-instance [`Supervisor`] wrapping a
+/// `ContextManager` (with or without persistence).
+///
+/// ADR-049 commit 12c.9g.3 — the FFI bridge no longer hands out a raw
+/// `Arc<ContextManager>`. The manager is built here, attached to the
+/// supervisor (so the supervisor's lifted-provider slots populate),
+/// and the supervisor is the only handle returned to the bridge layer.
+/// Commit 12c.9g.4 deletes the manager-construction step and lets the
+/// supervisor own its providers directly.
+fn build_supervisor(
     crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
-) -> Arc<ContextManager> {
-    match persistence {
+) -> Arc<scp_core::context::supervisor::Supervisor> {
+    use scp_core::context::supervisor::Supervisor;
+
+    let cm = match persistence {
         Some(p) => Arc::new(ContextManager::with_persistence(
             crypto,
             transport,
@@ -1120,7 +1095,16 @@ fn build_context_manager(
             event_log,
             not_configured_key_resolver(),
         )),
+    };
+    let supervisor = Arc::new(Supervisor::for_query_shim());
+    if let Err(err) = supervisor.attach_context_manager(&cm) {
+        tracing::warn!(
+            error = %err,
+            "build_supervisor: attach_context_manager failed — supervisor still constructed but \
+             without lifted providers"
+        );
     }
+    supervisor
 }
 
 // ---------------------------------------------------------------------------
@@ -2023,9 +2007,9 @@ pub fn register_context(
     // context is valid locally even without relay publication, #501).
     // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1324).
     #[cfg(test)]
-    init_context_manager_for_test();
+    init_supervisor_for_test();
     #[cfg(not(test))]
-    init_context_manager(creator_did);
+    init_supervisor(creator_did);
 
     // Register FFI-specific state.
     register_ffi_state(context_id, creator_did, user_ceiling)
@@ -2170,7 +2154,7 @@ mod tests {
 
     #[test]
     fn registry_stats_reflects_context_registration() {
-        init_context_manager_for_test();
+        init_supervisor_for_test();
         let ctx_id = unique_ctx_id("stats-ctx");
         let creator = "did:dht:z6MkStatsTest";
 
@@ -2201,7 +2185,7 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn registry_stats_reflects_identity_registration() {
-        init_context_manager_for_test();
+        init_supervisor_for_test();
         let did = "did:dht:z6MkStatsIdentityUnique9988";
 
         let entry = IdentityEntry {
@@ -2241,7 +2225,7 @@ mod tests {
     #[test]
     fn registry_stats_reflects_known_context_registration() {
         // Ensure bridge is initialized so known_contexts DashMap exists.
-        init_context_manager_for_test();
+        init_supervisor_for_test();
         let bi = bridge_instance().unwrap();
 
         let ctx_id = unique_ctx_id("stats-known");
@@ -2278,7 +2262,7 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn remove_identity_if_present_returns_true_when_found() {
-        init_context_manager_for_test();
+        init_supervisor_for_test();
         let did = "did:dht:z6MkRemoveIfPresent";
         let entry = IdentityEntry {
             identity: ScpIdentity {
@@ -2300,13 +2284,13 @@ mod tests {
 
     #[test]
     fn remove_identity_if_present_returns_false_when_not_found() {
-        init_context_manager_for_test();
+        init_supervisor_for_test();
         assert!(!remove_identity_if_present("did:dht:z6MkNotPresent9999"));
     }
 
     #[test]
     fn registry_stats_returns_all_fields() {
-        init_context_manager_for_test();
+        init_supervisor_for_test();
         // Verifies the struct shape and that registry_stats() doesn't panic.
         let stats = registry_stats();
         // Destructure to catch struct changes at compile time. If a field is
@@ -2325,13 +2309,13 @@ mod tests {
     }
 
     #[test]
-    fn context_manager_initializes_once() {
-        init_context_manager_for_test();
-        let mgr1 = context_manager().unwrap();
-        init_context_manager_for_test();
-        let mgr2 = context_manager().unwrap();
+    fn supervisor_initializes_once() {
+        init_supervisor_for_test();
+        let sup1 = supervisor().unwrap();
+        init_supervisor_for_test();
+        let sup2 = supervisor().unwrap();
         // Same Arc (same pointer).
-        assert!(Arc::ptr_eq(mgr1, mgr2));
+        assert!(Arc::ptr_eq(sup1, sup2));
     }
 
     #[test]
@@ -2434,26 +2418,27 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn bridge_instance_populated_by_init_context_manager() {
-        // init_context_manager_for_test populates BRIDGE_INSTANCE which owns
-        // the ContextManager. Since OnceLock is process-global, the first call
-        // in any test wins — subsequent calls are no-ops. We rely on this
-        // being called (possibly by other tests) before asserting.
-        init_context_manager_for_test();
+    fn bridge_instance_populated_by_init_supervisor() {
+        // init_supervisor_for_test populates DEFAULT_BRIDGE_INSTANCE which
+        // owns the per-instance Supervisor. Since OnceLock is process-global,
+        // the first call in any test wins — subsequent calls are no-ops. We
+        // rely on this being called (possibly by other tests) before
+        // asserting.
+        init_supervisor_for_test();
 
-        let cm = context_manager().expect("context_manager should be initialized");
+        let sup = supervisor().expect("supervisor should be initialized");
         let bi = bridge_instance().expect("bridge_instance should be initialized");
 
-        // Both should point to the same ContextManager allocation.
+        // Both should point to the same Supervisor allocation.
         assert!(
-            Arc::ptr_eq(cm, bi.core.try_context_manager().unwrap()),
-            "bridge_instance().context_manager() must be the same Arc as context_manager()"
+            Arc::ptr_eq(sup, bi.core.try_supervisor().unwrap()),
+            "bridge_instance().try_supervisor() must be the same Arc as supervisor()"
         );
     }
 
     #[test]
     fn bridge_instance_not_shutdown_initially() {
-        init_context_manager_for_test();
+        init_supervisor_for_test();
 
         let bi = bridge_instance().expect("bridge_instance should be initialized");
         assert!(
@@ -2472,7 +2457,7 @@ mod tests {
         // tests. `CoreFields` is imported at module top via `use
         // scp_ffi_common::bridge_instance::CoreFields`.
         let persistence = build_persistence_provider();
-        let cm = build_context_manager(
+        let supervisor_arc = build_supervisor(
             Arc::new(MlsCryptoProvider::new(
                 "did:test:pyo3-bridge-test".to_owned(),
             )),
@@ -2480,7 +2465,7 @@ mod tests {
             Box::new(NoOpEventLogProvider),
             persistence,
         );
-        let bi = CoreFields::with_context_manager(cm);
+        let bi = CoreFields::with_supervisor(supervisor_arc);
 
         let ran = Arc::new(AtomicBool::new(false));
         let ran2 = Arc::clone(&ran);

@@ -113,20 +113,21 @@ pub async fn event_log_query(
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned);
 
-    // Query the ContextManager's event log provider for real Merkle entries.
-    // The UCAN state event log is a separate per-context instance; the
-    // ContextManager's MerkleEventLogProvider is the authoritative source.
+    // Query the per-instance Supervisor's event log provider for real
+    // Merkle entries. The UCAN state event log is a separate per-context
+    // instance; the supervisor-owned `MerkleEventLogProvider` is the
+    // authoritative source.
     let context_id_str = handle.context_id();
     let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id_str);
 
-    let manager_entries = crate::runtime::context_manager()
+    let manager_entries = crate::runtime::supervisor()
         .ok()
-        .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten());
+        .and_then(|supervisor| supervisor.event_log_entries(&ctx_id_bytes).ok().flatten());
 
     if let Some(entries) = manager_entries
         && !entries.is_empty()
     {
-        // Build NapiEvent list from the ContextManager's Merkle entries.
+        // Build NapiEvent list from the supervisor's Merkle entries.
         // EventLogEntry has: event (name), timestamp, prev_hash, hash.
         // Map event → event_type, no actor_did (unknown), index → sequence.
         #[allow(clippy::cast_precision_loss)]
@@ -244,14 +245,14 @@ pub async fn event_log_verify(
 
     let context_id = handle.context_id();
 
-    // Sync ContextManager's Merkle event log entries into the UCAN-state
+    // Sync the supervisor's Merkle event log entries into the UCAN-state
     // EventLog so that prove_inclusion / prove_absence operate on the same
     // tree that tracks lifecycle events. The UCAN-state EventLog starts
     // empty; this populates it from the authoritative MerkleEventLogProvider.
     let ctx_id_bytes = scp_core::context::context_id_bytes(&context_id);
-    if let Some(entries) = crate::runtime::context_manager()
+    if let Some(entries) = crate::runtime::supervisor()
         .ok()
-        .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten())
+        .and_then(|supervisor| supervisor.event_log_entries(&ctx_id_bytes).ok().flatten())
     {
         crate::runtime::with_context(&context_id, |rt| {
             let existing_leaves = rt.core.event_log.leaves();

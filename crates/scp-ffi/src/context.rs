@@ -1289,14 +1289,14 @@ fn py_context_join(
         })
         .transpose()?;
 
-    // Ensure the ContextManager is initialized — context_join is a valid
+    // Ensure the Supervisor is initialized — context_join is a valid
     // first operation (e.g. a device joining a context without creating one).
-    // init_context_manager is idempotent (OnceLock — first call wins). #1073
+    // init_supervisor is idempotent (OnceLock — first call wins). #1073
     // Passes the joiner DID to MlsCryptoProvider for real MLS encryption (#1324).
     #[cfg(test)]
-    crate::runtime::init_context_manager_for_test();
+    crate::runtime::init_supervisor_for_test();
     #[cfg(not(test))]
-    crate::runtime::init_context_manager(identity_did);
+    crate::runtime::init_supervisor(identity_did);
 
     // Delegate join to the shared ContextManager via the ADR-049 commit-9
     // lifecycle shim and pseudonym-announcement messaging shim.
@@ -2016,17 +2016,17 @@ fn py_context_import(data: &[u8]) -> PyResult<String> {
 
     let context_id = export.snapshot.context_id.clone();
 
-    // Validate the exporter DID before passing to init_context_manager (#1324).
+    // Validate the exporter DID before passing to init_supervisor (#1324).
     validate::validate_did(&export.exporter_did.0)?;
 
-    // Ensure the ContextManager is initialized — context_import is a valid
+    // Ensure the Supervisor is initialized — context_import is a valid
     // first operation (e.g. a device receiving exported context data).
-    // init_context_manager is idempotent (OnceLock — first call wins). #1073
+    // init_supervisor is idempotent (OnceLock — first call wins). #1073
     // Passes the exporter DID to MlsCryptoProvider for real MLS encryption (#1324).
     #[cfg(test)]
-    crate::runtime::init_context_manager_for_test();
+    crate::runtime::init_supervisor_for_test();
     #[cfg(not(test))]
-    crate::runtime::init_context_manager(&export.exporter_did.0);
+    crate::runtime::init_supervisor(&export.exporter_did.0);
 
     let rt = crate::runtime()?;
     // Route through the ADR-049 commit-9 lifecycle shim.

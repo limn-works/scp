@@ -425,7 +425,7 @@ mod tests {
 
     #[test]
     fn create_shadow_returns_observer_role() {
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_supervisor_for_test();
         let result = bridge_create_shadow(
             "bridge-1".to_owned(),
             "@user".to_owned(),
