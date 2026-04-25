@@ -3074,19 +3074,19 @@
       },
       {
         "canonical": "node_start_in_memory",
-        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no openmls direct linkage / no transport per ADR-034."
+        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no transport per ADR-034."
       },
       {
         "canonical": "node_start_local",
-        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no openmls direct linkage / no transport per ADR-034."
+        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no transport per ADR-034."
       },
       {
         "canonical": "relay_start_in_memory",
-        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no openmls direct linkage / no transport per ADR-034."
+        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no transport per ADR-034."
       },
       {
         "canonical": "relay_start_local",
-        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no openmls direct linkage / no transport per ADR-034."
+        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no transport per ADR-034."
       }
     ]
   }
