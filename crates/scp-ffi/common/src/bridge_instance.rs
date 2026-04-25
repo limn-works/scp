@@ -2222,7 +2222,6 @@ pub enum ShutdownError {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use scp_core::context::ContextManager;
     use scp_core::context::LocalTransportProvider;
     use scp_core::context::builder::{ContextCreationError, ContextEventLogProvider};
     use scp_core::crypto::mls::provider::MlsCryptoProvider;
@@ -2254,31 +2253,24 @@ mod tests {
         }
     }
 
-    fn test_context_manager() -> Arc<ContextManager> {
+    /// Builds a per-instance Supervisor with test-friendly providers.
+    /// Mirrors the FFI bridges' `init_supervisor*` path:
+    /// [`Supervisor::with_providers`] constructs the supervisor and
+    /// populates the lifted-provider slots expected by every
+    /// `Supervisor::*` passthrough method (ADR-049 commit 12c.9g.3.6 —
+    /// the FFI layer no longer touches `ContextManager` directly).
+    fn test_supervisor() -> Arc<Supervisor> {
         // Use LocalTransportProvider (silently succeeds) for tests.
         // Key resolver returns None — no signature verification in tests.
         let key_resolver: scp_core::context::governance::KeyResolver = Arc::new(|_| None);
         let test_did = "did:test:bridge-instance-test".to_owned();
-        Arc::new(ContextManager::new(
+        Supervisor::with_providers(
             Arc::new(MlsCryptoProvider::new(test_did)),
             Box::new(LocalTransportProvider),
             Box::new(NoOpEventLog),
             key_resolver,
-        ))
-    }
-
-    /// Builds a per-instance Supervisor wired to a fresh test
-    /// `ContextManager`. Mirrors the FFI bridges' `init_supervisor*`
-    /// path: the supervisor exists before the manager attaches, and
-    /// `attach_context_manager` populates the lifted-provider slots
-    /// expected by every `Supervisor::*` passthrough method.
-    fn test_supervisor() -> Arc<Supervisor> {
-        let supervisor = Arc::new(Supervisor::for_query_shim());
-        let cm = test_context_manager();
-        supervisor
-            .attach_context_manager(&cm)
-            .expect("test supervisor attach must succeed");
-        supervisor
+            None,
+        )
     }
 
     /// Minimal no-op transport adapter for lifecycle tests.
@@ -3447,25 +3439,23 @@ mod tests {
         use std::sync::Arc;
 
         let persistence = Arc::new(InMemoryPersistence::new());
-        let persistence_for_cm = Box::new(InMemoryPersistence::new());
+        let persistence_for_supervisor: Box<dyn ContextPersistence> =
+            Box::new(InMemoryPersistence::new());
         let persistence_for_instance: Box<dyn ContextPersistence + Send + Sync> =
             Box::new(InMemoryPersistence::new());
 
-        // Build a ContextManager with persistence and wrap it in a
-        // Supervisor (the bridge-side handle that replaces the legacy
-        // direct manager reference — ADR-049 commit 12c.9g.3).
+        // Build the Supervisor directly through `with_providers` (ADR-049
+        // commit 12c.9g.3.6 — the FFI layer no longer touches
+        // `ContextManager`). The supervisor populates its lifted-
+        // provider slots and the manager attachment internally.
         let key_resolver: scp_core::context::governance::KeyResolver = Arc::new(|_| None);
-        let cm = Arc::new(ContextManager::with_persistence(
+        let supervisor = Supervisor::with_providers(
             Arc::new(MlsCryptoProvider::new("did:test:suspend-flush".to_owned())),
             Box::new(scp_core::context::LocalTransportProvider),
             Box::new(NoOpEventLog),
-            persistence_for_cm,
             key_resolver,
-        ));
-        let supervisor = Arc::new(Supervisor::for_query_shim());
-        supervisor
-            .attach_context_manager(&cm)
-            .expect("attach must succeed for fresh supervisor");
+            Some(persistence_for_supervisor),
+        );
 
         let instance = CoreFields::with_persistence(persistence_for_instance);
         instance.set_supervisor(supervisor);
@@ -3489,7 +3479,7 @@ mod tests {
 
         // Suppress the unused `persistence` warning — it was only used to
         // verify the Arc::new pattern compiles; the real persistence is
-        // inside the ContextManager.
+        // owned by the Supervisor through the manager it holds internally.
         let _ = persistence;
     }
 

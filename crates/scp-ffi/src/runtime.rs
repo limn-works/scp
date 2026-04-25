@@ -61,7 +61,7 @@ use dashmap::DashMap;
 use scp_core::context::builder::{
     ContextCreationError, ContextEventLogProvider, ContextTransportProvider,
 };
-use scp_core::context::manager::{ContextManager, ContextPersistence};
+use scp_core::context::manager::ContextPersistence;
 use scp_core::context::providers::ProtocolRepositoryContextBridge;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
@@ -1064,47 +1064,27 @@ impl ContextPersistence for ArcContextPersistence {
     }
 }
 
-/// Constructs a fresh per-instance [`Supervisor`] wrapping a
-/// `ContextManager` (with or without persistence).
+/// Constructs a fresh per-instance [`Supervisor`] with the given
+/// providers.
 ///
-/// ADR-049 commit 12c.9g.3 — the FFI bridge no longer hands out a raw
-/// `Arc<ContextManager>`. The manager is built here, attached to the
-/// supervisor (so the supervisor's lifted-provider slots populate),
-/// and the supervisor is the only handle returned to the bridge layer.
-/// Commit 12c.9g.4 deletes the manager-construction step and lets the
-/// supervisor own its providers directly.
+/// ADR-049 commit 12c.9g.3.6 — the FFI bridge no longer touches
+/// [`ContextManager`] at all. [`Supervisor::with_providers`] is the
+/// single entry point that constructs the supervisor + populates the
+/// lifted-provider slots. The supervisor is the only handle returned
+/// to the bridge layer.
 fn build_supervisor(
     crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
-    use scp_core::context::supervisor::Supervisor;
-
-    let cm = match persistence {
-        Some(p) => Arc::new(ContextManager::with_persistence(
-            crypto,
-            transport,
-            event_log,
-            p,
-            not_configured_key_resolver(),
-        )),
-        None => Arc::new(ContextManager::new(
-            crypto,
-            transport,
-            event_log,
-            not_configured_key_resolver(),
-        )),
-    };
-    let supervisor = Arc::new(Supervisor::for_query_shim());
-    if let Err(err) = supervisor.attach_context_manager(&cm) {
-        tracing::warn!(
-            error = %err,
-            "build_supervisor: attach_context_manager failed — supervisor still constructed but \
-             without lifted providers"
-        );
-    }
-    supervisor
+    scp_core::context::supervisor::Supervisor::with_providers(
+        crypto,
+        transport,
+        event_log,
+        not_configured_key_resolver(),
+        persistence,
+    )
 }
 
 // ---------------------------------------------------------------------------

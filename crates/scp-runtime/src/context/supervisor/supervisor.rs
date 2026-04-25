@@ -433,6 +433,97 @@ impl Supervisor {
         Self::new(persistence, saga_journal, SupervisorConfig::default())
     }
 
+    /// Construct a supervisor with the providers that previously lived on
+    /// [`ContextManager`] (ADR-049 commit 12c.9g.3.6).
+    ///
+    /// FFI bridges previously called [`ContextManager::new`] (or
+    /// [`ContextManager::with_persistence`]) and then
+    /// [`Self::attach_context_manager`] to wire the manager into the
+    /// supervisor. This factory collapses both steps into one call so the
+    /// FFI layer never has to construct or even reference a
+    /// [`ContextManager`]. Internally it still builds a manager and
+    /// invokes [`Self::attach_context_manager`] — the actor handlers and
+    /// hoisted helpers that landed in commits 12c.9c-g still fish
+    /// `attached_context_manager()` for the `clock` / `key_resolver` /
+    /// `local_dids` / `standing_contexts` / `next_generation` /
+    /// per-context state-map accessors that have not yet been lifted to
+    /// the supervisor's own fields. Commit 12c.9g.3.7 deletes the
+    /// internal `ContextManager` construction once those last accessors
+    /// migrate.
+    ///
+    /// Saga journal + supervisor-level persistence are wired with the
+    /// same no-op stubs [`Self::for_query_shim`] uses — saga
+    /// orchestration is not yet active in the FFI bridges (it lands with
+    /// the watchdog migration in commit 12c.10), and the supervisor's own
+    /// persistence slot is distinct from the manager's `cm_persistence`
+    /// (the latter is what helper paths actually read; see the
+    /// `cm_persistence` field doc).
+    ///
+    /// # Arguments
+    ///
+    /// * `crypto` — production [`MlsCryptoProvider`].
+    /// * `transport` — production transport (typically
+    ///   [`scp_core::context::NotConfiguredTransportProvider`],
+    ///   [`scp_core::context::LocalTransportProvider`], or a real
+    ///   [`scp_transport::RelayTransportProvider`]).
+    /// * `event_log` — event log provider, usually backed by
+    ///   `MerkleEventLogProvider::with_persistence(...)` so entries
+    ///   survive restart.
+    /// * `key_resolver` — DID-to-Ed25519-key resolver for governance
+    ///   signature verification.
+    /// * `persistence` — optional context persistence; `None` keeps the
+    ///   manager in-memory.
+    ///
+    /// # Returns
+    ///
+    /// `Arc<Supervisor>` — already wrapped because
+    /// [`Self::attach_context_manager`] requires `self: &Arc<Self>` (the
+    /// downgrade step that installs the back-pointer on the manager). FFI
+    /// bridges keep their per-instance supervisor in an `Arc` slot
+    /// anyway.
+    #[must_use]
+    pub fn with_providers(
+        crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
+        transport: Box<dyn ContextTransportProvider>,
+        event_log: Box<dyn ContextEventLogProvider>,
+        key_resolver: KeyResolver,
+        persistence: Option<Box<dyn ContextPersistence>>,
+    ) -> Arc<Self> {
+        let cm = match persistence {
+            Some(p) => Arc::new(ContextManager::with_persistence(
+                crypto,
+                transport,
+                event_log,
+                p,
+                key_resolver,
+            )),
+            None => Arc::new(ContextManager::new(
+                crypto,
+                transport,
+                event_log,
+                key_resolver,
+            )),
+        };
+        let supervisor = Arc::new(Self::for_query_shim());
+        // `attach_context_manager` only fails on a re-attach attempt with a
+        // different pointer; we just constructed the supervisor + manager
+        // pair so a divergent prior attach is unreachable. Use `let _ =`
+        // rather than `.expect(...)` because clippy::expect_used is denied
+        // workspace-wide and the path is genuinely infallible — any failure
+        // would represent a memory-ordering bug detectable by the
+        // [`Self::attach_context_manager`] internal `OnceLock` checks
+        // (which return a typed error rather than panicking).
+        if let Err(err) = supervisor.attach_context_manager(&cm) {
+            tracing::error!(
+                error = %err,
+                "Supervisor::with_providers — attach_context_manager failed for a freshly \
+                 constructed supervisor + manager pair; this should be unreachable and indicates \
+                 an impl bug"
+            );
+        }
+        supervisor
+    }
+
     /// Attach the legacy [`ContextManager`] used by the commits-7-to-11
     /// migration shim. The bridge instance constructs both the
     /// supervisor and the context manager, then calls this method once

@@ -31,7 +31,7 @@ use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_core::context::manager::{ContextManager, ContextPersistence, ContextSnapshot};
+use scp_core::context::manager::{ContextPersistence, ContextSnapshot};
 use scp_core::context::providers::MerkleEventLogProvider;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::{SessionStore, ToolRegistry};
@@ -880,33 +880,24 @@ pub fn init_supervisor(local_did: &str) {
     bi.core.set_supervisor(supervisor_arc);
 }
 
-/// Constructs an `Arc<Supervisor>` wrapping a freshly-built
-/// `ContextManager` (ADR-049 commit 12c.9g.3 — bridge layer no longer
-/// surfaces the manager directly).
+/// Constructs an `Arc<Supervisor>` with the given providers (ADR-049
+/// commit 12c.9g.3.6 — bridge layer no longer touches
+/// `ContextManager`). [`scp_core::context::supervisor::Supervisor::with_providers`]
+/// is the single entry point that constructs the supervisor +
+/// populates the lifted-provider slots.
 fn build_supervisor_arc(
     crypto: Arc<scp_core::crypto::mls::provider::MlsCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Box<dyn ContextPersistence>,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
-    use scp_core::context::supervisor::Supervisor;
-
-    let cm = Arc::new(ContextManager::with_persistence(
+    scp_core::context::supervisor::Supervisor::with_providers(
         crypto,
         transport,
         event_log,
-        persistence,
         not_configured_key_resolver(),
-    ));
-    let supervisor = Arc::new(Supervisor::for_query_shim());
-    if let Err(err) = supervisor.attach_context_manager(&cm) {
-        tracing::warn!(
-            error = %err,
-            "build_supervisor_arc: attach_context_manager failed — supervisor still constructed \
-             but without lifted providers"
-        );
-    }
-    supervisor
+        Some(persistence),
+    )
 }
 
 /// Returns a `Box<dyn ContextPersistence>` for `ContextManager::with_persistence`.

@@ -42,7 +42,6 @@ use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use scp_core::context::builder::ContextEventLogProvider;
-use scp_core::context::manager::ContextManager;
 use scp_core::context::providers::MerkleEventLogProvider;
 use scp_core::crypto::mls::provider::MlsCryptoProvider;
 use scp_core::crypto::ucan::nonce::NonceTracker;
@@ -858,56 +857,40 @@ impl scp_core::context::manager::ContextPersistence for ArcContextPersistence {
     }
 }
 
-/// Constructs a fresh per-instance [`Supervisor`] wrapping a
-/// `ContextManager` (with or without persistence).
+/// Constructs a fresh per-instance [`Supervisor`] with the given
+/// providers.
 ///
-/// ADR-049 commit 12c.9g.3 — the FFI bridge no longer hands out a raw
-/// `Arc<ContextManager>`. The manager is built here, attached to the
-/// supervisor (so the supervisor's lifted-provider slots populate),
-/// and the supervisor is the only handle returned to the bridge layer.
-/// Commit 12c.9g.4 deletes the manager-construction step and lets the
-/// supervisor own its providers directly.
+/// ADR-049 commit 12c.9g.3.6 — the FFI bridge no longer touches
+/// [`scp_core::context::manager::ContextManager`] at all.
+/// [`scp_core::context::supervisor::Supervisor::with_providers`] is
+/// the single entry point that constructs the supervisor + populates
+/// the lifted-provider slots. The supervisor is the only handle
+/// returned to the bridge layer.
 ///
-/// Mirrors the `PyO3` bridge's `build_supervisor`. When `persistence`
-/// is `Some`, the shared `Arc` is wrapped in [`ArcContextPersistence`]
-/// and handed to [`ContextManager::with_persistence`]; otherwise we
-/// call [`ContextManager::new`]. Callers pull the shared persistence
-/// from the embedded `CoreFields` via
-/// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`]
-/// so the manager and the bridge mirror share the same backend — a
-/// single `SQLite` connection, not two.
+/// When `persistence` is `Some`, the shared `Arc` is wrapped in
+/// [`ArcContextPersistence`] so the manager's internal `Arc` and the
+/// `CoreFields::persistence` mirror end up pointing at the same
+/// provider — a single `SQLite` connection, not two. Callers pull
+/// the shared persistence from the embedded `CoreFields` via
+/// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`].
 fn build_supervisor(
     crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>>,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
-    use scp_core::context::supervisor::Supervisor;
-
-    let cm = match persistence {
-        Some(shared) => Arc::new(ContextManager::with_persistence(
-            crypto,
-            transport,
-            event_log,
-            Box::new(ArcContextPersistence::new(shared)),
-            not_configured_key_resolver(),
-        )),
-        None => Arc::new(ContextManager::new(
-            crypto,
-            transport,
-            event_log,
-            not_configured_key_resolver(),
-        )),
-    };
-    let supervisor = Arc::new(Supervisor::for_query_shim());
-    if let Err(err) = supervisor.attach_context_manager(&cm) {
-        tracing::warn!(
-            error = %err,
-            "build_supervisor: attach_context_manager failed — supervisor still constructed but \
-             without lifted providers"
-        );
-    }
-    supervisor
+    let persistence_box: Option<Box<dyn scp_core::context::manager::ContextPersistence>> =
+        persistence.map(|shared| {
+            Box::new(ArcContextPersistence::new(shared))
+                as Box<dyn scp_core::context::manager::ContextPersistence>
+        });
+    scp_core::context::supervisor::Supervisor::with_providers(
+        crypto,
+        transport,
+        event_log,
+        not_configured_key_resolver(),
+        persistence_box,
+    )
 }
 
 /// Builds an event log provider that reuses the already-registered
