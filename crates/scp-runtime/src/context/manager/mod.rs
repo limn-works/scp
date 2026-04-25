@@ -77,10 +77,17 @@ mod queries;
 // from other crates (FFI bridges, future SCP-OUT-036/038 typed-error wiring,
 // integration tests) and keep `pub` items in `manager::outlets` from being
 // flagged as unreachable-and-dead.
+//
+// SCP-OUT-016 adds the per-kind cross-context rate-tier defaults
+// (`OutletInterfaceDefaults`, `cross_context_rate_tier_default`) so the
+// classification-aware rate-tier picks (Query 600/100, Action 60/10) are
+// reachable from FFI bridges and integration tests through the same
+// `manager::*` path as the chain-depth helpers.
 pub use outlets::{
-    CrossContextHopAccepted, OutletAmplificationError, action_chain_budget,
-    amplification_error_to_context, cross_context_invoke, origin_kind_from_ucan_stem,
-    query_chain_budget, record_amplification_rejection,
+    CrossContextHopAccepted, OutletAmplificationError, OutletInterfaceDefaults,
+    action_chain_budget, amplification_error_to_context, cross_context_invoke,
+    cross_context_rate_tier_default, origin_kind_from_ucan_stem, query_chain_budget,
+    record_amplification_rejection,
 };
 pub(crate) mod standing;
 mod trust_recovery;

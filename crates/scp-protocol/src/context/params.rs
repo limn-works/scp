@@ -55,6 +55,26 @@ pub use super::roles::RoleDefinition;
 pub use super::outlets::OutletRegistration;
 
 // ---------------------------------------------------------------------------
+// OutletInterfaceDefaults (re-export — spec §6.2.0.2 classification-aware
+// rate tiers, SCP-OUT-016)
+// ---------------------------------------------------------------------------
+
+/// Re-export of [`super::outlets::interface::OutletInterfaceDefaults`] —
+/// the §6.2.0.2 classification-aware cross-context rate-tier defaults.
+///
+/// `OutletInterfaceDefaults::for_kind(OutletKind::Query)` returns
+/// `(per_interface = 600, per_caller = 100)`;
+/// `OutletInterfaceDefaults::for_kind(OutletKind::Action)` returns
+/// `(60, 10)` — the pre-classification baseline preserved for the Action
+/// tier per §6.2.0.2. Callers MUST use this helper rather than hardcoding
+/// `60` or `600` so a future spec revision that adjusts the tiers updates
+/// one helper and every call site follows.
+///
+/// See [`super::outlets::interface::OutletInterfaceDefaults`] and
+/// SCP-OUT-016 for full rationale.
+pub use super::outlets::interface::OutletInterfaceDefaults;
+
+// ---------------------------------------------------------------------------
 // ContextMode
 // ---------------------------------------------------------------------------
 

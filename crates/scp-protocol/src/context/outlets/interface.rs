@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 
 use super::lifecycle::{OutletStatus, sha256_json};
 use super::registry::{OutletRegistration, OutletRegistry};
-use super::{DID, OutletError, OutletId, has_admin_role};
+use super::{DID, OutletError, OutletId, OutletKind, has_admin_role};
 use crate::context::roles::ContextRoleState;
 use crate::provenance::DataProvenance;
 use crate::provenance::attach::{SourceContextInfo, attach_provenance, effective_max_chain_depth};
@@ -45,11 +45,37 @@ pub type ContextId = String;
 // Rate limit defaults (§6.2.0.2)
 // ---------------------------------------------------------------------------
 
-/// Default per-interface rate limit: 60 calls per minute (spec §6.2.0.2).
+/// Default per-interface rate limit for [`OutletKind::Action`] outlets:
+/// 60 calls per minute (spec §6.2.0.2 Action tier — identical to the
+/// pre-classification baseline).
+///
+/// Query outlets use the higher [`DEFAULT_QUERY_PER_INTERFACE_CALLS_PER_MINUTE`]
+/// default. Use [`OutletInterfaceDefaults::for_kind`] to derive the correct
+/// default at the call site rather than referencing this constant directly.
 pub const DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE: u32 = 60;
 
-/// Default per-caller rate limit: 10 calls per minute (spec §6.2.0.2).
+/// Default per-caller rate limit for [`OutletKind::Action`] outlets:
+/// 10 calls per minute (spec §6.2.0.2 Action tier).
+///
+/// Query outlets use the higher [`DEFAULT_QUERY_PER_CALLER_CALLS_PER_MINUTE`]
+/// default. Use [`OutletInterfaceDefaults::for_kind`] to derive the correct
+/// default at the call site rather than referencing this constant directly.
 pub const DEFAULT_PER_CALLER_CALLS_PER_MINUTE: u32 = 10;
+
+/// Default per-interface rate limit for [`OutletKind::Query`] outlets:
+/// 600 calls per minute (spec §6.2.0.2 Query tier).
+///
+/// An order of magnitude higher than the Action default
+/// ([`DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE`]), reflecting the idempotent
+/// read-only contract that Query outlets carry under §5.4.2.
+pub const DEFAULT_QUERY_PER_INTERFACE_CALLS_PER_MINUTE: u32 = 600;
+
+/// Default per-caller rate limit for [`OutletKind::Query`] outlets:
+/// 100 calls per minute (spec §6.2.0.2 Query tier).
+///
+/// An order of magnitude higher than the Action per-caller default
+/// ([`DEFAULT_PER_CALLER_CALLS_PER_MINUTE`]).
+pub const DEFAULT_QUERY_PER_CALLER_CALLS_PER_MINUTE: u32 = 100;
 
 /// Default sliding window duration: 60 seconds (spec §6.2.0.2).
 pub const DEFAULT_WINDOW_SECONDS: u64 = 60;
@@ -66,6 +92,112 @@ pub const MAX_BURST_ALLOWANCE: u32 = 50;
 
 /// Interface offer expiry duration: 7 days (spec §6.2.0.1).
 pub const OFFER_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// OutletInterfaceDefaults (§6.2.0.2 classification-aware rate tiers)
+// ---------------------------------------------------------------------------
+
+/// Per-kind cross-context rate-tier defaults (spec §6.2.0.2).
+///
+/// Spec §6.2.0.2 partitions the cross-context outlet-interface rate-limit
+/// defaults by [`OutletKind`]: Query outlets get an order-of-magnitude
+/// higher tier (`600/100`) reflecting the idempotent read-only contract,
+/// while Action outlets retain the pre-classification baseline (`60/10`).
+/// Both tiers are independently configurable within the §6.2.0.2 ranges
+/// (1–6000 per-interface, 1–1000 per-caller); the helper here only supplies
+/// the *default* when no caller-supplied value is present.
+///
+/// **Single source of truth.** Callers that need to derive the kind-aware
+/// default MUST use [`OutletInterfaceDefaults::for_kind`] — never hardcode
+/// `60` or `600` at the call site, and never branch on
+/// `OutletKind::{Query,Action}` to pick a constant manually. Centralising
+/// the derivation here keeps the spec invariant
+/// "Query > Action by 10x" mechanically enforced: a future spec revision
+/// that tweaks the tiers updates one helper and every caller follows.
+///
+/// **Explicit values preserved.** This helper is *only* consulted when the
+/// caller omitted a `max_calls_per_minute`. Builder functions
+/// ([`expose_tool`], [`accept_tool_interface`], [`create_interface_offer`])
+/// pass any caller-supplied `OutboundPolicy` / `InboundPolicy` through
+/// untouched — only when the policy is `None` or carries a defaulted-by-kind
+/// value do these defaults apply (spec §6.2.0.2 "Both tiers are
+/// independently configurable").
+///
+/// **§5.4.2 cross-reference.** `OutletKind::Query` is the read-only,
+/// idempotent, cacheable tier; `OutletKind::Action` is the mutating tier.
+/// The §6.2.0.2 tier split mirrors the §5.4.2 classification — Query gets
+/// the higher tier because reads are amortisable, Action gets the lower
+/// tier because writes have economic and side-effect cost.
+///
+/// See spec §6.2.0.2 "Classification-aware rate tiers" and §5.4.2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutletInterfaceDefaults {
+    /// The [`OutletKind`] this default tuple is keyed to. Stored so the
+    /// helper round-trips through [`OutletInterfaceDefaults::for_kind`]
+    /// and so callers that need the kind alongside the limits do not
+    /// have to thread it separately.
+    pub kind: OutletKind,
+    /// Default per-interface calls per minute for this `kind`.
+    /// `60` for Action, `600` for Query (spec §6.2.0.2).
+    pub per_interface_calls_per_minute: u32,
+    /// Default per-caller calls per minute for this `kind`.
+    /// `10` for Action, `100` for Query (spec §6.2.0.2).
+    pub per_caller_calls_per_minute: u32,
+}
+
+impl OutletInterfaceDefaults {
+    /// Returns the §6.2.0.2 default rate-tier tuple
+    /// `(per_interface, per_caller)` for the given [`OutletKind`].
+    ///
+    /// - [`OutletKind::Query`] → `(600, 100)` — read-only, idempotent,
+    ///   amortisable (§6.2.0.2 Query tier; §5.4.2 cache property).
+    /// - [`OutletKind::Action`] → `(60, 10)` — pre-classification baseline,
+    ///   matches the §6.2.0.2 "default" row of the rate-limit table.
+    ///
+    /// **Stability invariant.** The returned tuple is stable across the
+    /// `OutletKind` variants documented in this version of the protocol.
+    /// If a future spec revision adds a new `OutletKind` variant, this
+    /// helper MUST be updated in lockstep — every caller relies on
+    /// `for_kind` returning a real default, never panicking and never
+    /// returning a sentinel.
+    ///
+    /// See [`OutletInterfaceDefaults::tuple_for_kind`] for the direct
+    /// `(u32, u32)` tuple shape used by `expose_tool` /
+    /// `accept_tool_interface` / `create_interface_offer` when filling in
+    /// a missing `max_calls_per_minute`.
+    #[must_use]
+    pub const fn for_kind(kind: OutletKind) -> Self {
+        match kind {
+            OutletKind::Query => Self {
+                kind,
+                per_interface_calls_per_minute: DEFAULT_QUERY_PER_INTERFACE_CALLS_PER_MINUTE,
+                per_caller_calls_per_minute: DEFAULT_QUERY_PER_CALLER_CALLS_PER_MINUTE,
+            },
+            OutletKind::Action => Self {
+                kind,
+                per_interface_calls_per_minute: DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE,
+                per_caller_calls_per_minute: DEFAULT_PER_CALLER_CALLS_PER_MINUTE,
+            },
+        }
+    }
+
+    /// Returns the `(per_interface, per_caller)` default tuple for the
+    /// given [`OutletKind`] — the shape AC1/AC2 of SCP-OUT-016 assert
+    /// against, and the shape that builder functions consume when filling
+    /// in a missing `max_calls_per_minute`.
+    ///
+    /// Equivalent to
+    /// `(Self::for_kind(kind).per_interface_calls_per_minute,
+    ///   Self::for_kind(kind).per_caller_calls_per_minute)`.
+    #[must_use]
+    pub const fn tuple_for_kind(kind: OutletKind) -> (u32, u32) {
+        let d = Self::for_kind(kind);
+        (
+            d.per_interface_calls_per_minute,
+            d.per_caller_calls_per_minute,
+        )
+    }
+}
 
 // ---------------------------------------------------------------------------
 // OutboundPolicy (§6.2.0.1)
@@ -102,10 +234,33 @@ pub struct OutboundPolicy {
 }
 
 impl Default for OutboundPolicy {
+    /// Returns an [`OutletKind::Action`]-tier default policy
+    /// (`max_calls_per_minute = 60`, spec §6.2.0.2 Action tier).
+    ///
+    /// The [`Default`] impl is fail-safe: it picks the stricter Action tier
+    /// because `OutletKind::Action` is the §5.4.2 fail-safe default. Use
+    /// [`OutboundPolicy::for_kind`] when you have an [`OutletKind`] in hand
+    /// to pick the matching tier.
     fn default() -> Self {
+        Self::for_kind(OutletKind::Action)
+    }
+}
+
+impl OutboundPolicy {
+    /// Returns the §6.2.0.2 default [`OutboundPolicy`] for the given
+    /// [`OutletKind`].
+    ///
+    /// `max_calls_per_minute` is filled from
+    /// [`OutletInterfaceDefaults::for_kind`] — `600` for Query, `60` for
+    /// Action. All other fields take the protocol-wide defaults
+    /// (empty `allowed_callers`, 64 KiB payload cap, `require_provenance =
+    /// true`).
+    #[must_use]
+    pub const fn for_kind(kind: OutletKind) -> Self {
+        let defaults = OutletInterfaceDefaults::for_kind(kind);
         Self {
             allowed_callers: Vec::new(),
-            max_calls_per_minute: DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE,
+            max_calls_per_minute: defaults.per_interface_calls_per_minute,
             max_payload_bytes: 65_536,
             require_provenance: true,
         }
@@ -148,10 +303,33 @@ pub struct InboundPolicy {
 }
 
 impl Default for InboundPolicy {
+    /// Returns an [`OutletKind::Action`]-tier default policy
+    /// (`max_calls_per_minute = 60`, spec §6.2.0.2 Action tier).
+    ///
+    /// The [`Default`] impl is fail-safe: it picks the stricter Action tier
+    /// because `OutletKind::Action` is the §5.4.2 fail-safe default. Use
+    /// [`InboundPolicy::for_kind`] when you have an [`OutletKind`] in hand
+    /// to pick the matching tier.
     fn default() -> Self {
+        Self::for_kind(OutletKind::Action)
+    }
+}
+
+impl InboundPolicy {
+    /// Returns the §6.2.0.2 default [`InboundPolicy`] for the given
+    /// [`OutletKind`].
+    ///
+    /// `max_calls_per_minute` is filled from
+    /// [`OutletInterfaceDefaults::for_kind`] — `600` for Query, `60` for
+    /// Action. All other fields take the protocol-wide defaults
+    /// (empty `allowed_source_roles`, 64 KiB response cap,
+    /// `require_spending_ucan = false`).
+    #[must_use]
+    pub const fn for_kind(kind: OutletKind) -> Self {
+        let defaults = OutletInterfaceDefaults::for_kind(kind);
         Self {
             allowed_source_roles: Vec::new(),
-            max_calls_per_minute: DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE,
+            max_calls_per_minute: defaults.per_interface_calls_per_minute,
             max_response_bytes: 65_536,
             require_spending_ucan: false,
         }
@@ -179,6 +357,18 @@ pub struct ProposeOutletInterface {
 ///
 /// The offer carries the full tool schema and outbound policy. It expires after
 /// 7 days if not accepted.
+///
+/// **Kind-aware default rate tier (§6.2.0.2).** The
+/// [`outbound_policy.max_calls_per_minute`](OutboundPolicy::max_calls_per_minute)
+/// field on this offer carries the §6.2.0.2 default keyed to
+/// [`outlet_schema.kind`](OutletRegistration::kind) when the source
+/// context's `expose_tool` call did not pass an explicit
+/// [`OutboundPolicy`]: 600 calls/min for [`OutletKind::Query`] and 60
+/// calls/min for [`OutletKind::Action`]. When the source context provided
+/// an explicit policy, that policy's `max_calls_per_minute` is preserved
+/// verbatim regardless of `kind` (AC5). See
+/// [`OutletInterfaceDefaults::for_kind`] for the helper that derives the
+/// default tuple.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceOffer {
     /// `SHA-256("SCP-OFFER-ID-V1:" || len(source_context_id) || source_context_id || len(outlet_id) || outlet_id || len(target_context_id) || target_context_id || timestamp)`.
@@ -188,9 +378,20 @@ pub struct InterfaceOffer {
     pub source_context: ContextId,
     /// The context the tool is offered to.
     pub target_context: ContextId,
-    /// Full tool registration (schema, metadata).
+    /// Full tool registration (schema, metadata). The
+    /// [`OutletRegistration::kind`] field on this schema selects the
+    /// §6.2.0.2 default rate tier carried in
+    /// [`outbound_policy`](Self::outbound_policy) when no caller-supplied
+    /// policy was provided to [`expose_tool`] / [`create_interface_offer`].
     pub outlet_schema: OutletRegistration,
-    /// Outbound policy set by the source context.
+    /// Outbound policy set by the source context (§6.2.0.1, §6.2.0.2).
+    ///
+    /// When the source context's `expose_tool` call omitted an explicit
+    /// [`OutboundPolicy`], this field holds the §6.2.0.2 kind-aware default
+    /// derived via [`OutboundPolicy::for_kind`]
+    /// (`outlet_schema.kind` → tier): 600 calls/min for `Query`, 60
+    /// calls/min for `Action`. Explicit caller-supplied policies are
+    /// preserved verbatim (AC5).
     pub outbound_policy: OutboundPolicy,
     /// Unix timestamp (ms) when the offer expires (7 days from creation).
     pub expires_at: u64,
@@ -696,7 +897,12 @@ pub struct CrossContextToolEvent {
 /// context must call [`accept_tool_interface`] to complete the handshake.
 ///
 /// Creates the interface with an [`OutboundPolicy`] (set by source context) and
-/// a default per-caller rate limit of 10 calls/min (spec §6.2.0.2).
+/// a per-caller rate limit derived from the registered outlet's
+/// [`OutletKind`] via [`OutletInterfaceDefaults::for_kind`]. Per spec
+/// §6.2.0.2 the defaults are `600 / 100` (per-interface / per-caller) for
+/// [`OutletKind::Query`] and `60 / 10` for [`OutletKind::Action`]. When the
+/// caller passes an explicit `outbound_policy`, its `max_calls_per_minute`
+/// is preserved verbatim regardless of kind.
 ///
 /// # Arguments
 ///
@@ -706,8 +912,14 @@ pub struct CrossContextToolEvent {
 /// * `role_state` - The source context's role state for capability checking.
 /// * `admin_did` - The DID of the admin proposing the interface.
 /// * `registry` - The source context's tool registry.
-/// * `rate_limit` - Optional per-interface rate limit.
-/// * `outbound_policy` - Optional outbound policy (defaults to [`OutboundPolicy::default()`]).
+/// * `rate_limit` - Optional per-interface rate limit. When `None`, no
+///   per-interface counter is installed (the per-caller counter still
+///   applies; spec §6.2.0.2 leaves the per-interface counter optional —
+///   callers wire it explicitly when they want a context-wide cap).
+/// * `outbound_policy` - Optional outbound policy. When `None`, defaults
+///   to [`OutboundPolicy::for_kind`] using the registered outlet's
+///   [`OutletKind`] — Query → 600 calls/min, Action → 60 calls/min
+///   (spec §6.2.0.2 classification-aware tiers).
 ///
 /// # Errors
 ///
@@ -731,26 +943,40 @@ pub fn expose_tool(
         });
     }
 
-    // Verify the tool exists in the source context's registry.
-    if !registry.contains(outlet_id) {
-        return Err(OutletError::OutletNotFound {
-            outlet_id: outlet_id.to_owned(),
-        });
-    }
+    // Verify the tool exists in the source context's registry and recover
+    // its declared OutletKind. The kind drives the §6.2.0.2 default rate
+    // tier — Query gets 600/100, Action gets 60/10 — when the caller did
+    // not supply an explicit `outbound_policy` or `rate_limit`. Reading
+    // the kind from the *registered* outlet (not a parameter) means the
+    // tier always matches the declaration the source context committed
+    // to at registration time.
+    let registration =
+        registry
+            .get(outlet_id)
+            .ok_or_else(|| OutletError::OutletNotFound {
+                outlet_id: outlet_id.to_owned(),
+            })?;
+    let kind = registration.kind;
 
+    let defaults = OutletInterfaceDefaults::for_kind(kind);
     let default_window = Duration::from_secs(DEFAULT_WINDOW_SECONDS);
     Ok(OutletInterface {
         source_context: context_id.to_owned(),
         target_context: to_context.to_owned(),
         outlet_id: outlet_id.to_owned(),
         rate_limit,
+        // §6.2.0.2 per-caller default keyed to the registered kind:
+        // 100/min for Query, 10/min for Action.
         per_caller_rate_limit: Some(PerCallerRateLimit::new(
-            u64::from(DEFAULT_PER_CALLER_CALLS_PER_MINUTE),
+            u64::from(defaults.per_caller_calls_per_minute),
             default_window,
         )),
         approved_by_source: true,
         approved_by_target: false,
-        outbound_policy: Some(outbound_policy.unwrap_or_default()),
+        // §6.2.0.2 per-interface default keyed to the registered kind
+        // when no caller-supplied policy is present (AC3/AC4). Caller's
+        // explicit policy is passed through untouched (AC5).
+        outbound_policy: Some(outbound_policy.unwrap_or_else(|| OutboundPolicy::for_kind(kind))),
         inbound_policy: None,
     })
 }
@@ -760,10 +986,20 @@ pub fn expose_tool(
 /// Called after the source context's governance has approved the proposal.
 /// The offer includes the full tool schema and expires after 7 days.
 ///
+/// **Kind-aware default (§6.2.0.2).** When the source `interface` has no
+/// `outbound_policy` set, the helper fills one in from
+/// [`OutboundPolicy::for_kind`] keyed to `tool_registration.kind` so the
+/// published offer's `max_calls_per_minute` matches the §6.2.0.2 tier
+/// (Query → 600/min, Action → 60/min). When the interface already carries
+/// an `outbound_policy`, that policy is passed through unchanged — explicit
+/// caller values are preserved regardless of kind (AC5).
+///
 /// # Arguments
 ///
 /// * `interface` - The approved tool interface.
-/// * `tool_registration` - Full tool registration from the registry.
+/// * `tool_registration` - Full tool registration from the registry. Its
+///   `kind` field selects the §6.2.0.2 default rate tier when the
+///   interface omits an `outbound_policy`.
 /// * `timestamp_ms` - Current timestamp in milliseconds.
 ///
 /// # Returns
@@ -782,7 +1018,15 @@ pub fn create_interface_offer(
         timestamp_ms,
     );
 
-    let outbound_policy = interface.outbound_policy.clone().unwrap_or_default();
+    // §6.2.0.2 default is keyed to the registered kind. When the
+    // source interface already carries an explicit `outbound_policy`, it
+    // is preserved verbatim (AC5). When omitted, fall back to the
+    // kind-aware §6.2.0.2 default — Query → 600/min, Action → 60/min
+    // (AC3/AC4).
+    let outbound_policy = interface
+        .outbound_policy
+        .clone()
+        .unwrap_or_else(|| OutboundPolicy::for_kind(tool_registration.kind));
 
     InterfaceOffer {
         offer_id,
@@ -830,6 +1074,15 @@ pub fn revoke_tool_interface(
 /// The effective rate limit for calls is `min(outbound.max_calls_per_minute,
 /// inbound.max_calls_per_minute)` (spec §6.2.0.1).
 ///
+/// **Default rate tier.** When `inbound_policy` is `None` this helper falls
+/// back to [`InboundPolicy::default()`] — the §5.4.2 fail-safe Action tier
+/// (60 calls/min). Callers that already know the accepted outlet's
+/// [`OutletKind`] (typically from the matched [`InterfaceOffer::outlet_schema`])
+/// SHOULD use [`accept_tool_interface_with_kind`] instead so the §6.2.0.2
+/// default lines up with the kind (Query → 600/min, Action → 60/min). When
+/// `inbound_policy` is `Some`, that policy is preserved verbatim regardless
+/// of kind (AC5).
+///
 /// # Arguments
 ///
 /// * `context` - The target context handle.
@@ -850,6 +1103,48 @@ pub fn accept_tool_interface(
     admin_did: &str,
     inbound_policy: Option<InboundPolicy>,
 ) -> Result<(), OutletError> {
+    accept_tool_interface_with_kind(
+        context_id,
+        interface,
+        role_state,
+        admin_did,
+        inbound_policy,
+        None,
+    )
+}
+
+/// Kind-aware variant of [`accept_tool_interface`] (spec §6.2.0.2).
+///
+/// Identical to [`accept_tool_interface`] except that when `inbound_policy`
+/// is `None` and `kind` is `Some`, the helper fills in
+/// [`InboundPolicy::for_kind`] keyed to that [`OutletKind`] so the accept
+/// side's default `max_calls_per_minute` matches the §6.2.0.2 tier (Query
+/// → 600/min, Action → 60/min). When `kind` is `None`, falls back to
+/// [`InboundPolicy::default()`] (Action tier — §5.4.2 fail-safe).
+///
+/// Callers that hold the matched [`InterfaceOffer`] should pass
+/// `Some(offer.outlet_schema.kind)` so the inbound default matches the
+/// outbound default the offer carries — this preserves the
+/// `min(outbound.max_calls_per_minute, inbound.max_calls_per_minute)`
+/// effective-limit semantics from §6.2.0.1 across the kind tiers.
+///
+/// **Explicit values preserved.** When `inbound_policy` is `Some`, that
+/// policy is preserved verbatim regardless of `kind` (AC5).
+///
+/// # Errors
+///
+/// Same as [`accept_tool_interface`]:
+/// [`OutletError::InterfaceAdminRequired`] when the caller is not an admin
+/// and [`OutletError::InterfaceContextMismatch`] when the interface's
+/// target context does not match the provided context handle.
+pub fn accept_tool_interface_with_kind(
+    context_id: &str,
+    interface: &mut OutletInterface,
+    role_state: &ContextRoleState,
+    admin_did: &str,
+    inbound_policy: Option<InboundPolicy>,
+    kind: Option<OutletKind>,
+) -> Result<(), OutletError> {
     // Require admin capability.
     if !has_admin_role(role_state, admin_did) {
         return Err(OutletError::InterfaceAdminRequired {
@@ -866,7 +1161,14 @@ pub fn accept_tool_interface(
     }
 
     interface.approved_by_target = true;
-    interface.inbound_policy = Some(inbound_policy.unwrap_or_default());
+    // §6.2.0.2 kind-aware default for the inbound policy. Caller-supplied
+    // policy is preserved verbatim (AC5); when `inbound_policy` is `None`
+    // and `kind` is supplied, defaults are derived from the kind via
+    // `InboundPolicy::for_kind` — Query → 600/min, Action → 60/min. When
+    // both are `None`, falls back to the §5.4.2 fail-safe Action default.
+    interface.inbound_policy = Some(inbound_policy.unwrap_or_else(|| {
+        kind.map_or_else(InboundPolicy::default, InboundPolicy::for_kind)
+    }));
     Ok(())
 }
 
@@ -2977,5 +3279,562 @@ mod tests {
             crate::provenance::ProvenanceQuality::PersistentVerifiable,
             "persistent + active source should evaluate to PersistentVerifiable"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-016 — Per-kind cross-context rate tier defaults (§6.2.0.2)
+    // -----------------------------------------------------------------------
+    //
+    // AC1: OutletInterfaceDefaults::for_kind(OutletKind::Query) returns (600, 100)
+    // AC2: OutletInterfaceDefaults::for_kind(OutletKind::Action) returns (60, 10)
+    // AC3: When an InterfaceOffer is built for a Query outlet and the caller
+    //      omits max_calls_per_minute, the runtime writes 600
+    // AC4: When an InterfaceOffer is built for an Action outlet and the caller
+    //      omits max_calls_per_minute, the runtime writes 60
+    // AC5: Explicit max_calls_per_minute values are preserved regardless of kind
+    // AC6: A rate-limit unit test for both tiers
+    // AC7: cargo test --workspace succeeds (covered by these tests + workspace)
+
+    /// Helper: construct an [`OutletRegistration`] with the given kind for
+    /// SCP-OUT-016 tests. Mirrors `setup_registry_with_tool` but parameterised
+    /// on `kind` so the AC3/AC4 tests can register Query *and* Action tools.
+    fn registration_for_kind(outlet_id: &str, kind: OutletKind) -> OutletRegistration {
+        OutletRegistration {
+            outlet_id: outlet_id.to_owned(),
+            kind,
+            name: format!("Test {kind:?}"),
+            description: "SCP-OUT-016 fixture".to_owned(),
+            schema: OutletSchema {
+                input_schema: serde_json::json!({"type": "object"}),
+                output_schema: serde_json::json!({"type": "object"}),
+            },
+            implementation_hash: [0xBB; 32],
+            test_vectors: vec![],
+            operator_did: "did:dht:z6MkOperator".into(),
+            cost: None,
+            registered_at: 0,
+            signature: Vec::new(),
+        }
+    }
+
+    /// Helper: registry pre-populated with a single outlet of the given
+    /// kind. Bypasses the registration validation path because SCP-OUT-016
+    /// only cares about the kind being readable from the registry.
+    fn registry_with_kind(outlet_id: &str, kind: OutletKind) -> OutletRegistry {
+        let mut registry = OutletRegistry::new();
+        registry.insert(registration_for_kind(outlet_id, kind));
+        registry
+    }
+
+    /// AC1: `OutletInterfaceDefaults::for_kind(Query)` returns `(600, 100)`.
+    #[test]
+    fn ac1_outlet_interface_defaults_for_query_returns_600_100() {
+        let defaults = OutletInterfaceDefaults::for_kind(OutletKind::Query);
+        assert_eq!(defaults.kind, OutletKind::Query);
+        assert_eq!(
+            defaults.per_interface_calls_per_minute, 600,
+            "§6.2.0.2 Query per-interface tier"
+        );
+        assert_eq!(
+            defaults.per_caller_calls_per_minute, 100,
+            "§6.2.0.2 Query per-caller tier"
+        );
+
+        // Tuple form (the shape the AC asserts against directly).
+        let tuple = OutletInterfaceDefaults::tuple_for_kind(OutletKind::Query);
+        assert_eq!(tuple, (600, 100));
+    }
+
+    /// AC2: `OutletInterfaceDefaults::for_kind(Action)` returns `(60, 10)`.
+    #[test]
+    fn ac2_outlet_interface_defaults_for_action_returns_60_10() {
+        let defaults = OutletInterfaceDefaults::for_kind(OutletKind::Action);
+        assert_eq!(defaults.kind, OutletKind::Action);
+        assert_eq!(
+            defaults.per_interface_calls_per_minute, 60,
+            "§6.2.0.2 Action per-interface tier"
+        );
+        assert_eq!(
+            defaults.per_caller_calls_per_minute, 10,
+            "§6.2.0.2 Action per-caller tier"
+        );
+
+        // Tuple form.
+        let tuple = OutletInterfaceDefaults::tuple_for_kind(OutletKind::Action);
+        assert_eq!(tuple, (60, 10));
+    }
+
+    /// AC3: When an [`InterfaceOffer`] is built for a Query outlet and the
+    /// caller omits `max_calls_per_minute`, the runtime writes 600.
+    ///
+    /// Verifies the full path: `expose_tool` (no `outbound_policy`) →
+    /// `create_interface_offer` → `offer.outbound_policy.max_calls_per_minute`.
+    #[test]
+    fn ac3_interface_offer_for_query_writes_600_when_caller_omits_value() {
+        let admin_did = "did:dht:z6MkAdmin";
+        let role_state = test_role_state("ctx-source", admin_did);
+        let registry = registry_with_kind("query-outlet", OutletKind::Query);
+
+        // Caller omits both rate_limit AND outbound_policy — the runtime
+        // must derive the kind-aware default.
+        let interface = expose_tool(
+            "ctx-source",
+            &"query-outlet".to_owned(),
+            &"ctx-target".to_owned(),
+            &role_state,
+            admin_did,
+            &registry,
+            None, // rate_limit omitted
+            None, // outbound_policy omitted — triggers §6.2.0.2 default-derivation
+        )
+        .unwrap();
+
+        // §6.2.0.2 Query per-interface tier on the interface itself.
+        let interface_outbound = interface
+            .outbound_policy
+            .as_ref()
+            .expect("outbound_policy must be populated by expose_tool");
+        assert_eq!(
+            interface_outbound.max_calls_per_minute, 600,
+            "Query interface omitted-policy default must be 600 (§6.2.0.2)"
+        );
+
+        // §6.2.0.2 Query per-caller tier on the per-caller rate limiter.
+        let per_caller = interface
+            .per_caller_rate_limit
+            .as_ref()
+            .expect("per_caller_rate_limit must be populated for Query");
+        assert_eq!(
+            per_caller.max_calls_per_caller, 100,
+            "Query per-caller default must be 100 (§6.2.0.2)"
+        );
+
+        // Now build the offer — it carries the same defaulted policy.
+        let registration = registry.get("query-outlet").unwrap();
+        let offer = create_interface_offer(&interface, registration, 1_000);
+        assert_eq!(
+            offer.outbound_policy.max_calls_per_minute, 600,
+            "InterfaceOffer for Query outlet must carry 600 calls/min default (AC3)"
+        );
+
+        // The offer also carries the kind through outlet_schema.
+        assert_eq!(offer.outlet_schema.kind, OutletKind::Query);
+    }
+
+    /// AC4: When an [`InterfaceOffer`] is built for an Action outlet and the
+    /// caller omits `max_calls_per_minute`, the runtime writes 60.
+    #[test]
+    fn ac4_interface_offer_for_action_writes_60_when_caller_omits_value() {
+        let admin_did = "did:dht:z6MkAdmin";
+        let role_state = test_role_state("ctx-source", admin_did);
+        let registry = registry_with_kind("action-outlet", OutletKind::Action);
+
+        let interface = expose_tool(
+            "ctx-source",
+            &"action-outlet".to_owned(),
+            &"ctx-target".to_owned(),
+            &role_state,
+            admin_did,
+            &registry,
+            None,
+            None, // outbound_policy omitted — Action tier default applies
+        )
+        .unwrap();
+
+        // §6.2.0.2 Action per-interface tier (the pre-classification baseline).
+        let interface_outbound = interface
+            .outbound_policy
+            .as_ref()
+            .expect("outbound_policy must be populated by expose_tool");
+        assert_eq!(
+            interface_outbound.max_calls_per_minute, 60,
+            "Action interface omitted-policy default must be 60 (§6.2.0.2)"
+        );
+
+        // §6.2.0.2 Action per-caller tier (10/min).
+        let per_caller = interface
+            .per_caller_rate_limit
+            .as_ref()
+            .expect("per_caller_rate_limit must be populated for Action");
+        assert_eq!(
+            per_caller.max_calls_per_caller, 10,
+            "Action per-caller default must be 10 (§6.2.0.2)"
+        );
+
+        // Build the offer.
+        let registration = registry.get("action-outlet").unwrap();
+        let offer = create_interface_offer(&interface, registration, 1_000);
+        assert_eq!(
+            offer.outbound_policy.max_calls_per_minute, 60,
+            "InterfaceOffer for Action outlet must carry 60 calls/min default (AC4)"
+        );
+
+        assert_eq!(offer.outlet_schema.kind, OutletKind::Action);
+    }
+
+    /// AC5: Explicit `max_calls_per_minute` values are preserved regardless
+    /// of kind.
+    ///
+    /// Drives both Query and Action paths with caller-supplied
+    /// `OutboundPolicy` values that diverge from the §6.2.0.2 defaults
+    /// (a Query outlet with the Action default, and an Action outlet with
+    /// a one-off custom value). After `expose_tool` and
+    /// `create_interface_offer` the explicit value MUST round-trip
+    /// untouched.
+    #[test]
+    fn ac5_explicit_max_calls_preserved_regardless_of_kind() {
+        let admin_did = "did:dht:z6MkAdmin";
+        let role_state = test_role_state("ctx-source", admin_did);
+
+        // Query outlet with an explicit Action-tier (60) policy. The
+        // builder MUST preserve the caller's 60 even though Query default
+        // would be 600.
+        let query_registry = registry_with_kind("query-outlet", OutletKind::Query);
+        let explicit_for_query = OutboundPolicy {
+            allowed_callers: Vec::new(),
+            max_calls_per_minute: 60, // Caller picked the Action tier deliberately
+            max_payload_bytes: 65_536,
+            require_provenance: true,
+        };
+        let interface = expose_tool(
+            "ctx-source",
+            &"query-outlet".to_owned(),
+            &"ctx-target".to_owned(),
+            &role_state,
+            admin_did,
+            &query_registry,
+            None,
+            Some(explicit_for_query),
+        )
+        .unwrap();
+        assert_eq!(
+            interface
+                .outbound_policy
+                .as_ref()
+                .unwrap()
+                .max_calls_per_minute,
+            60,
+            "explicit value must be preserved for Query outlet (AC5)"
+        );
+        let registration = query_registry.get("query-outlet").unwrap();
+        let offer = create_interface_offer(&interface, registration, 1_000);
+        assert_eq!(
+            offer.outbound_policy.max_calls_per_minute, 60,
+            "explicit value must round-trip into the offer for Query outlet (AC5)"
+        );
+
+        // Action outlet with an explicit non-default value (1234) — also
+        // preserved.
+        let action_registry = registry_with_kind("action-outlet", OutletKind::Action);
+        let explicit_for_action = OutboundPolicy {
+            allowed_callers: Vec::new(),
+            max_calls_per_minute: 1234, // Custom value — neither §6.2.0.2 default
+            max_payload_bytes: 65_536,
+            require_provenance: true,
+        };
+        let interface2 = expose_tool(
+            "ctx-source",
+            &"action-outlet".to_owned(),
+            &"ctx-target".to_owned(),
+            &role_state,
+            admin_did,
+            &action_registry,
+            None,
+            Some(explicit_for_action),
+        )
+        .unwrap();
+        assert_eq!(
+            interface2
+                .outbound_policy
+                .as_ref()
+                .unwrap()
+                .max_calls_per_minute,
+            1234,
+            "explicit value must be preserved for Action outlet (AC5)"
+        );
+        let registration2 = action_registry.get("action-outlet").unwrap();
+        let offer2 = create_interface_offer(&interface2, registration2, 1_000);
+        assert_eq!(
+            offer2.outbound_policy.max_calls_per_minute, 1234,
+            "explicit value must round-trip into the offer for Action outlet (AC5)"
+        );
+    }
+
+    /// AC6: A rate-limit unit test for both tiers.
+    ///
+    /// Drives a [`RateLimit`] at the Query tier (600/min) and at the Action
+    /// tier (60/min) and verifies the `check_and_increment` boundary
+    /// behaviour at each tier — the 600th Query call passes, the 601st is
+    /// rejected; the 60th Action call passes, the 61st is rejected.
+    /// Burst allowance is set to 0 so the test isolates base-tier behaviour.
+    #[test]
+    fn ac6_rate_limit_unit_test_for_both_tiers() {
+        // Action tier: 60 calls/min.
+        let mut action_rl = RateLimit::with_burst(
+            u64::from(DEFAULT_PER_INTERFACE_CALLS_PER_MINUTE),
+            Duration::from_secs(DEFAULT_WINDOW_SECONDS),
+            0,
+            Duration::from_secs(DEFAULT_BURST_WINDOW_SECS),
+            &scp_primitives::SystemClock,
+        );
+        assert_eq!(
+            action_rl.max_calls, 60,
+            "Action tier max_calls must equal §6.2.0.2 default (60)"
+        );
+        for i in 0..60 {
+            assert!(
+                action_rl.check_and_increment(&scp_primitives::SystemClock),
+                "Action call {i} (1-indexed: {}) must succeed under tier limit",
+                i + 1
+            );
+        }
+        assert!(
+            !action_rl.check_and_increment(&scp_primitives::SystemClock),
+            "Action call 61 must be rejected — tier limit exhausted"
+        );
+
+        // Query tier: 600 calls/min.
+        let mut query_rl = RateLimit::with_burst(
+            u64::from(DEFAULT_QUERY_PER_INTERFACE_CALLS_PER_MINUTE),
+            Duration::from_secs(DEFAULT_WINDOW_SECONDS),
+            0,
+            Duration::from_secs(DEFAULT_BURST_WINDOW_SECS),
+            &scp_primitives::SystemClock,
+        );
+        assert_eq!(
+            query_rl.max_calls, 600,
+            "Query tier max_calls must equal §6.2.0.2 default (600)"
+        );
+        for i in 0..600 {
+            assert!(
+                query_rl.check_and_increment(&scp_primitives::SystemClock),
+                "Query call {i} must succeed under tier limit",
+            );
+        }
+        assert!(
+            !query_rl.check_and_increment(&scp_primitives::SystemClock),
+            "Query call 601 must be rejected — tier limit exhausted"
+        );
+
+        // Per-caller tiers also exercise the boundary at the §6.2.0.2
+        // per-caller defaults (Query 100/min, Action 10/min). Burst zero
+        // so we isolate base-tier behaviour.
+        let alice: DID = "did:dht:z6MkAlice".into();
+        let mut action_per_caller = PerCallerRateLimit::with_burst(
+            u64::from(DEFAULT_PER_CALLER_CALLS_PER_MINUTE),
+            Duration::from_secs(DEFAULT_WINDOW_SECONDS),
+            0,
+            Duration::from_secs(DEFAULT_BURST_WINDOW_SECS),
+        );
+        for i in 0..10 {
+            assert!(
+                action_per_caller.check_and_increment(&alice, &scp_primitives::SystemClock),
+                "Action per-caller call {i} must succeed under tier (10)",
+            );
+        }
+        assert!(
+            !action_per_caller.check_and_increment(&alice, &scp_primitives::SystemClock),
+            "Action per-caller call 11 must be rejected"
+        );
+
+        let mut query_per_caller = PerCallerRateLimit::with_burst(
+            u64::from(DEFAULT_QUERY_PER_CALLER_CALLS_PER_MINUTE),
+            Duration::from_secs(DEFAULT_WINDOW_SECONDS),
+            0,
+            Duration::from_secs(DEFAULT_BURST_WINDOW_SECS),
+        );
+        for i in 0..100 {
+            assert!(
+                query_per_caller.check_and_increment(&alice, &scp_primitives::SystemClock),
+                "Query per-caller call {i} must succeed under tier (100)",
+            );
+        }
+        assert!(
+            !query_per_caller.check_and_increment(&alice, &scp_primitives::SystemClock),
+            "Query per-caller call 101 must be rejected"
+        );
+    }
+
+    /// `OutboundPolicy::for_kind(Query)` returns the Query tier (600).
+    #[test]
+    fn outbound_policy_for_kind_query_uses_600() {
+        let policy = OutboundPolicy::for_kind(OutletKind::Query);
+        assert_eq!(policy.max_calls_per_minute, 600);
+        assert!(policy.allowed_callers.is_empty());
+        assert_eq!(policy.max_payload_bytes, 65_536);
+        assert!(policy.require_provenance);
+    }
+
+    /// `OutboundPolicy::for_kind(Action)` returns the Action tier (60) —
+    /// matches the Default impl which is fail-safe Action.
+    #[test]
+    fn outbound_policy_for_kind_action_matches_default() {
+        let policy = OutboundPolicy::for_kind(OutletKind::Action);
+        assert_eq!(policy.max_calls_per_minute, 60);
+        assert_eq!(policy, OutboundPolicy::default());
+    }
+
+    /// `InboundPolicy::for_kind(Query)` returns the Query tier (600).
+    #[test]
+    fn inbound_policy_for_kind_query_uses_600() {
+        let policy = InboundPolicy::for_kind(OutletKind::Query);
+        assert_eq!(policy.max_calls_per_minute, 600);
+        assert!(policy.allowed_source_roles.is_empty());
+        assert_eq!(policy.max_response_bytes, 65_536);
+        assert!(!policy.require_spending_ucan);
+    }
+
+    /// `InboundPolicy::for_kind(Action)` returns the Action tier (60) —
+    /// matches the Default impl which is fail-safe Action.
+    #[test]
+    fn inbound_policy_for_kind_action_matches_default() {
+        let policy = InboundPolicy::for_kind(OutletKind::Action);
+        assert_eq!(policy.max_calls_per_minute, 60);
+        assert_eq!(policy, InboundPolicy::default());
+    }
+
+    /// `accept_tool_interface_with_kind(Some(Query))` writes 600 inbound when
+    /// the caller omits an inbound policy. This is the symmetric AC3 on the
+    /// accept side: `min(outbound, inbound) = 600` when both sides default
+    /// to the Query tier.
+    #[test]
+    fn accept_tool_interface_with_kind_uses_kind_default_for_query() {
+        let admin_did = "did:dht:z6MkAdmin";
+        let role_state = test_role_state("ctx-target", admin_did);
+
+        let mut interface = OutletInterface {
+            source_context: "ctx-source".to_owned(),
+            target_context: "ctx-target".to_owned(),
+            outlet_id: "query-outlet".to_owned(),
+            rate_limit: None,
+            per_caller_rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: false,
+            outbound_policy: None,
+            inbound_policy: None,
+        };
+
+        accept_tool_interface_with_kind(
+            "ctx-target",
+            &mut interface,
+            &role_state,
+            admin_did,
+            None,
+            Some(OutletKind::Query),
+        )
+        .unwrap();
+
+        let inbound = interface.inbound_policy.unwrap();
+        assert_eq!(
+            inbound.max_calls_per_minute, 600,
+            "accept must use Query tier when kind=Query and inbound_policy=None"
+        );
+    }
+
+    /// `accept_tool_interface_with_kind(Some(Action))` writes 60 inbound,
+    /// matching the §5.4.2 fail-safe default.
+    #[test]
+    fn accept_tool_interface_with_kind_uses_kind_default_for_action() {
+        let admin_did = "did:dht:z6MkAdmin";
+        let role_state = test_role_state("ctx-target", admin_did);
+
+        let mut interface = OutletInterface {
+            source_context: "ctx-source".to_owned(),
+            target_context: "ctx-target".to_owned(),
+            outlet_id: "action-outlet".to_owned(),
+            rate_limit: None,
+            per_caller_rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: false,
+            outbound_policy: None,
+            inbound_policy: None,
+        };
+
+        accept_tool_interface_with_kind(
+            "ctx-target",
+            &mut interface,
+            &role_state,
+            admin_did,
+            None,
+            Some(OutletKind::Action),
+        )
+        .unwrap();
+
+        let inbound = interface.inbound_policy.unwrap();
+        assert_eq!(inbound.max_calls_per_minute, 60);
+    }
+
+    /// `accept_tool_interface_with_kind(None, None)` falls back to the
+    /// §5.4.2 fail-safe Action default — backwards-compatible with the
+    /// kind-blind `accept_tool_interface` wrapper.
+    #[test]
+    fn accept_tool_interface_with_kind_none_falls_back_to_action_default() {
+        let admin_did = "did:dht:z6MkAdmin";
+        let role_state = test_role_state("ctx-target", admin_did);
+
+        let mut interface = OutletInterface {
+            source_context: "ctx-source".to_owned(),
+            target_context: "ctx-target".to_owned(),
+            outlet_id: "outlet".to_owned(),
+            rate_limit: None,
+            per_caller_rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: false,
+            outbound_policy: None,
+            inbound_policy: None,
+        };
+
+        accept_tool_interface_with_kind(
+            "ctx-target",
+            &mut interface,
+            &role_state,
+            admin_did,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let inbound = interface.inbound_policy.unwrap();
+        assert_eq!(
+            inbound.max_calls_per_minute, 60,
+            "kind=None must fall back to §5.4.2 fail-safe Action default"
+        );
+    }
+
+    /// Per-kind defaults should round-trip through serde — the tier is part
+    /// of the on-wire `outbound_policy.max_calls_per_minute`, so it must
+    /// serialize to the explicit integer value (NOT the kind), and
+    /// re-parse to the same numeric tier.
+    #[test]
+    fn outlet_interface_defaults_serialize_into_offer_explicitly() {
+        let admin_did = "did:dht:z6MkAdmin";
+        let role_state = test_role_state("ctx-source", admin_did);
+        let registry = registry_with_kind("query-outlet", OutletKind::Query);
+
+        let interface = expose_tool(
+            "ctx-source",
+            &"query-outlet".to_owned(),
+            &"ctx-target".to_owned(),
+            &role_state,
+            admin_did,
+            &registry,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let registration = registry.get("query-outlet").unwrap();
+        let offer = create_interface_offer(&interface, registration, 1_000);
+
+        let json = serde_json::to_string(&offer).unwrap();
+        // The integer tier must appear verbatim in the JSON encoding.
+        assert!(
+            json.contains("\"max_calls_per_minute\":600"),
+            "offer JSON must serialize Query tier as 600: {json}"
+        );
+
+        let decoded: InterfaceOffer = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.outbound_policy.max_calls_per_minute, 600);
+        assert_eq!(decoded.outlet_schema.kind, OutletKind::Query);
     }
 }

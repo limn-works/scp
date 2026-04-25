@@ -1438,6 +1438,59 @@ pub const fn action_chain_budget(max_chain_depth: Option<u8>) -> u8 {
     if half == 0 { 1 } else { half }
 }
 
+// ===========================================================================
+// SCP-OUT-016 — Per-kind cross-context rate tier defaults (§6.2.0.2)
+// ===========================================================================
+//
+// Spec §6.2.0.2 partitions the cross-context outlet-interface rate-limit
+// defaults by [`OutletKind`]: Query outlets get an order-of-magnitude
+// higher tier (`(600, 100)` per-interface/per-caller) reflecting the
+// idempotent read-only contract; Action outlets retain the
+// pre-classification baseline (`(60, 10)`). The tier flips on the
+// `OutletKind` field set by SCP-OUT-011 — when the runtime fills in a
+// missing `max_calls_per_minute` on the cross-context invocation path,
+// it consults the kind from the registered outlet (or the offer's
+// `outlet_schema.kind` on the receive side).
+//
+// **Single source of truth.** The kind → `(per_interface, per_caller)`
+// mapping lives in [`scp_protocol::context::outlets::interface::OutletInterfaceDefaults`].
+// The runtime helpers below thinly re-export that mapping so the
+// cross-context invocation path here in `scp-runtime` does not duplicate
+// the constants — they are derived through the protocol-layer helper at
+// every call site. A future spec revision that tweaks the tiers updates
+// the protocol helper and the runtime path follows automatically.
+//
+// **Explicit values preserved (AC5).** These helpers are *only* consulted
+// when the caller-supplied policy omitted `max_calls_per_minute`. The
+// runtime cross-context invocation path passes any caller-supplied value
+// through to the per-interface and per-caller rate-limit checks
+// (`invoke_cross_context` in the protocol layer) untouched.
+
+/// Re-export of [`scp_protocol::context::outlets::interface::OutletInterfaceDefaults`]
+/// — the §6.2.0.2 classification-aware cross-context rate-tier defaults.
+///
+/// Exposed here so the runtime cross-context invocation path can derive
+/// the kind-aware default rate tier without taking a transitive dependency
+/// on the deep `scp_protocol::context::outlets::interface` path. See
+/// SCP-OUT-016.
+pub use scp_protocol::context::outlets::interface::OutletInterfaceDefaults;
+
+/// Returns the §6.2.0.2 default per-interface / per-caller calls-per-minute
+/// tuple for the given hop's [`OutletKind`].
+///
+/// `Query → (600, 100)`, `Action → (60, 10)`. Use this on the
+/// cross-context invocation path when the caller-supplied policy omitted
+/// `max_calls_per_minute` so the runtime fills in the right tier.
+///
+/// Equivalent to
+/// [`OutletInterfaceDefaults::tuple_for_kind`](OutletInterfaceDefaults::tuple_for_kind);
+/// re-exposed at the runtime layer for symmetry with
+/// [`query_chain_budget`] / [`action_chain_budget`]. See SCP-OUT-016.
+#[must_use]
+pub const fn cross_context_rate_tier_default(kind: OutletKind) -> (u32, u32) {
+    OutletInterfaceDefaults::tuple_for_kind(kind)
+}
+
 /// Recovers the [`OutletKind`] implied by a UCAN token's outermost capability
 /// stem (§6.2.0.3 "`origin_kind` is bound to the UCAN delegation chain").
 ///
@@ -2441,5 +2494,52 @@ mod amplification_tests {
             }
             other => panic!("unexpected ContextError: {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-016 — Per-kind cross-context rate-tier defaults (§6.2.0.2)
+    // -----------------------------------------------------------------------
+    //
+    // The runtime re-exposes the protocol-layer
+    // `OutletInterfaceDefaults::for_kind` helper plus a thin
+    // `cross_context_rate_tier_default` wrapper so the cross-context
+    // invocation path here in `scp-runtime` (alongside
+    // `cross_context_invoke` / `query_chain_budget` / `action_chain_budget`)
+    // can pick the §6.2.0.2 default `(per_interface, per_caller)` tuple
+    // without duplicating the constants. These tests verify the runtime
+    // surface; the protocol-layer surface is covered by the SCP-OUT-016
+    // tests in `scp_protocol::context::outlets::interface`.
+
+    #[test]
+    fn cross_context_rate_tier_default_query_returns_600_100() {
+        assert_eq!(
+            cross_context_rate_tier_default(OutletKind::Query),
+            (600, 100),
+            "§6.2.0.2 Query tier default tuple"
+        );
+    }
+
+    #[test]
+    fn cross_context_rate_tier_default_action_returns_60_10() {
+        assert_eq!(
+            cross_context_rate_tier_default(OutletKind::Action),
+            (60, 10),
+            "§6.2.0.2 Action tier default tuple"
+        );
+    }
+
+    #[test]
+    fn outlet_interface_defaults_runtime_reexport_matches_protocol() {
+        // Sanity: the runtime re-export resolves to the same struct as the
+        // protocol-layer original.
+        let q = OutletInterfaceDefaults::for_kind(OutletKind::Query);
+        assert_eq!(q.kind, OutletKind::Query);
+        assert_eq!(q.per_interface_calls_per_minute, 600);
+        assert_eq!(q.per_caller_calls_per_minute, 100);
+
+        let a = OutletInterfaceDefaults::for_kind(OutletKind::Action);
+        assert_eq!(a.kind, OutletKind::Action);
+        assert_eq!(a.per_interface_calls_per_minute, 60);
+        assert_eq!(a.per_caller_calls_per_minute, 10);
     }
 }
