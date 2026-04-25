@@ -117,7 +117,7 @@ use scp_protocol::context::{ContextError, ContextParams};
 use zeroize::Zeroizing;
 
 use crate::context::builder::ContextEventLogProvider;
-use crate::context::manager::{
+use crate::context::state::{
     CommitFaultMarker, PendingCommit, PerContextState, context_id_to_bytes,
 };
 use crate::context::manager_methods;

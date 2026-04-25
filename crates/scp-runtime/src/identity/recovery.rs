@@ -29,7 +29,8 @@ use serde::{Deserialize, Serialize};
 
 use scp_identity::DID;
 
-use crate::context::manager::ContextManager;
+// ContextManager type deleted in ADR-049 commit 12; recovery binds to
+// the supervisor directly.
 use scp_primitives::Clock;
 
 // ---------------------------------------------------------------------------

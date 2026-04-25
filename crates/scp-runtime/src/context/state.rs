@@ -1316,7 +1316,7 @@ impl PerContextState {
     // calls these accessors. They return shared references only;
     // every mutating path continues to touch fields directly inside
     // the manager module. The set is deleted in commit 12 together
-    // with `manager::PerContextState`.
+    // with `state::PerContextState`.
     // -------------------------------------------------------------------
 
     /// Membership state — the live `MembershipState` the manager uses to

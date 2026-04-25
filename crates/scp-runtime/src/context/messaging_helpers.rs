@@ -70,7 +70,7 @@
 //!
 //! # State parameter
 //!
-//! Leaf helpers take `&mut manager::PerContextState` (the legacy
+//! Leaf helpers take `&mut state::PerContextState` (the legacy
 //! struct). Commit 12b.2 retargets the state parameter to
 //! `&mut actor::PerContextState` as handler bodies migrate. The
 //! explicit-collaborator shape here is identical either way; only the
@@ -102,7 +102,7 @@ use scp_protocol::trust::consequence::{ConsequenceRule, evaluate_consequence_rul
 use crate::context::ContextHandle;
 use crate::context::builder::ContextEventLogProvider;
 use crate::context::governance_helpers;
-use crate::context::manager::{
+use crate::context::state::{
     self, PSEUDONYM_ANNOUNCEMENT_TAG, PerContextState, PseudonymAnnouncement,
 };
 use crate::context::manager_methods;
@@ -652,7 +652,7 @@ pub async fn send_message(
             .await
             .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
         let ctx = &mut *guard;
-        manager::require_active(&ctx.handle)?;
+        state::require_active(&ctx.handle)?;
         // N3: Fail-close on commit fault — if a prior governance
         // mutation's MLS Commit failed to broadcast and exhausted
         // retries, messages encrypted under the divergent epoch may
@@ -951,7 +951,7 @@ pub async fn deliver_incoming(
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
-        manager::require_active(&ctx.handle)?;
+        state::require_active(&ctx.handle)?;
         let did = ctx
             .membership
             .member_dids()
@@ -1333,7 +1333,7 @@ pub async fn finalize_send(
     sequence: u64,
     payload: &[u8],
     signing_key: Option<&ed25519_dalek::SigningKey>,
-    ctx_gen: &manager::ContextGeneration,
+    ctx_gen: &state::ContextGeneration,
 ) -> Result<(), ContextError> {
     // M12: Append event log BEFORE consequence evaluation so that
     // event_log_entries_for_consequences sees the current event.
@@ -1352,7 +1352,7 @@ pub async fn finalize_send(
             .now_secs();
         if let Ok(mut guard) = manager_methods::relock_context(supervisor, ctx_gen).await {
             let ctx = &mut *guard;
-            if manager::require_active(&ctx.handle).is_err() {
+            if state::require_active(&ctx.handle).is_err() {
                 // Context expired during Phase 2 — rollback the sequence
                 // number to prevent a permanent gap (Fix 6).
                 ctx.membership.rollback_sequence_number(sender_did);
@@ -1760,7 +1760,7 @@ pub async fn deliver_message_and_drain_buffered(
         .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
     let mut guard = ctx_arc.lock().await;
     let ctx = &mut *guard;
-    manager::require_active(&ctx.handle)?;
+    state::require_active(&ctx.handle)?;
 
     // Membership + capability check.
     if !ctx.membership.contains(sender_did) {
@@ -2117,8 +2117,8 @@ pub async fn send_pseudonym_announcement(
     let Some(pseudonym) = pseudonym else {
         return;
     };
-    let announcement = manager::PseudonymAnnouncement {
-        tag: manager::PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+    let announcement = state::PseudonymAnnouncement {
+        tag: state::PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
         member_did: sender_did.as_ref().to_owned(),
         pseudonym,
     };

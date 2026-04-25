@@ -89,7 +89,7 @@ use scp_protocol::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext,
 };
 
-use crate::context::manager::{context_id_to_bytes, require_active};
+use crate::context::state::{context_id_to_bytes, require_active};
 use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
 

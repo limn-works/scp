@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use super::manager::ContextSnapshot;
+use super::state::ContextSnapshot;
 use crate::store::StoredValue;
 use scp_identity::DID;
 use scp_protocol::context::ContextError;

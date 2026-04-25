@@ -56,7 +56,6 @@ pub mod context {
     pub use scp_runtime::context::builder;
     pub use scp_runtime::context::export_import;
     pub use scp_runtime::context::key_destruction;
-    pub use scp_runtime::context::manager;
     pub use scp_runtime::context::policy;
     pub use scp_runtime::context::providers;
     pub use scp_runtime::context::ttl;
@@ -84,7 +83,9 @@ pub mod context {
         ContextEventLogProvider, ContextTransportProvider, LocalTransportProvider,
         NotConfiguredTransportProvider,
     };
-    pub use scp_runtime::context::manager::ContextManager;
+    // ContextManager type deleted in ADR-049 commit 12; consumers
+    // build a `Supervisor` directly via `Supervisor::with_providers`
+    // (re-exported through `scp_core::context::supervisor`).
     pub use scp_runtime::context::persistence;
     pub use scp_runtime::context::persistence::ContextPersistence;
     pub use scp_runtime::context::state;

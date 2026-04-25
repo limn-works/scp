@@ -18,7 +18,8 @@ use std::collections::HashMap;
 )]
 use std::sync::Mutex;
 
-use crate::context::manager::{ContextPersistence, ContextSnapshot};
+use crate::context::persistence::ContextPersistence;
+use crate::context::state::ContextSnapshot;
 use scp_protocol::context::broadcast::BroadcastContextSnapshot;
 
 // Re-export the canonical implementation.

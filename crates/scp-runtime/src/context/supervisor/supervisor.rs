@@ -53,7 +53,8 @@ use crate::context::actor::outcome::Outcome;
 use crate::context::actor::sequence::SendSequenceTracker;
 use crate::context::actor::state::WrappingKeyPair;
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use crate::context::manager::{ContextPersistence, PerContextState};
+use crate::context::persistence::ContextPersistence;
+use crate::context::state::PerContextState;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::saga_journal::{
     JournalEntry, SagaId, SagaJournal, SagaState, SagaTerminalState,

@@ -25,7 +25,7 @@
 //! state) that the legacy struct did not own.
 //!
 //! The two types coexist during the commit ladder (commit 6 through
-//! commit 12). The legacy `manager::PerContextState` remains
+//! commit 12). The legacy `state::PerContextState` remains
 //! byte-identical — no changes to it apart from the `pub(crate)` field
 //! elevations commit 12a adds so the actor can name the sub-struct types.
 //! Commits 12b-12c migrate handler bodies to take `&mut
@@ -55,7 +55,7 @@
 //!
 //! This commit does NOT wire production construction — the production
 //! construction path still lives on `ContextManager` and hands the shim
-//! a legacy `manager::PerContextState`. Commit 12b (messaging handler
+//! a legacy `state::PerContextState`. Commit 12b (messaging handler
 //! migration) is the first production call site that constructs an
 //! [`actor::PerContextState`](PerContextState). Until then the test
 //! constructors [`PerContextState::new_for_test_encrypted`] and
@@ -80,7 +80,7 @@ use zeroize::Zeroizing;
 
 use crate::context::ContextHandle;
 use crate::context::actor::sequence::SendSequenceTracker;
-use crate::context::manager::{
+use crate::context::state::{
     AccessControlState, CommitFaultMarker, EpochState, GovernanceState, MigrationState,
     PendingCommit, TtlState,
 };
@@ -566,14 +566,14 @@ pub struct PerContextState {
     pub generation: u64,
 
     /// Full-fat context handle (creation params, lifecycle FSM). Mirrors
-    /// legacy `manager::PerContextState::handle`.
+    /// legacy `state::PerContextState::handle`.
     pub handle: ContextHandle,
 
     // -----------------------------------------------------------------
     // Membership + role fields
     // -----------------------------------------------------------------
     /// Legacy membership record (per-DID role / tokens / sequence).
-    /// Mirrors legacy `manager::PerContextState::membership`. Coexists
+    /// Mirrors legacy `state::PerContextState::membership`. Coexists
     /// with [`Self::members`] during the 12a→12d window: the shim still
     /// delegates to legacy and reads the rich `MembershipState`; the
     /// 12b+ handler-body migrations decide per-handler which of the two
@@ -587,7 +587,7 @@ pub struct PerContextState {
     pub members: HashSet<DID>,
 
     /// Roles, ceiling, and assignments. Mirrors legacy
-    /// `manager::PerContextState::role_state`.
+    /// `state::PerContextState::role_state`.
     pub role_state: ContextRoleState,
 
     // -----------------------------------------------------------------
@@ -604,13 +604,13 @@ pub struct PerContextState {
     /// In-memory RFC-6962 Merkle tree (ADR-011) parallel to the
     /// persisted event log. Used by `manager/messaging.rs` for O(log n)
     /// inclusion / consistency proofs. Mirrors legacy
-    /// `manager::PerContextState::merkle_tree`. Not persisted — rebuilt
+    /// `state::PerContextState::merkle_tree`. Not persisted — rebuilt
     /// from `MerkleEventLogProvider` on `restore_context` /
     /// `import_context` per legacy comment.
     pub merkle_tree: MerkleEventLog,
 
     /// Receive event buffer (bounded 1000-entry deque). Mirrors legacy
-    /// `manager::PerContextState::receive_buffer`.
+    /// `state::PerContextState::receive_buffer`.
     pub receive_buffer: ReceiveBuffer,
 
     // -----------------------------------------------------------------
@@ -623,19 +623,19 @@ pub struct PerContextState {
     /// carries the subscriber roster, admission policy, and author
     /// state the `BroadcastContext` type owns at the spec layer (spec
     /// §5.14). Mirrors legacy
-    /// `manager::PerContextState::broadcast_context`.
+    /// `state::PerContextState::broadcast_context`.
     pub broadcast_context: Option<ProtocolBroadcastContext>,
 
     /// Active migration state (§5.11A). `Some` when the context is in
     /// `MigratingOut` state. Mirrors legacy
-    /// `manager::PerContextState::migration_state`.
+    /// `state::PerContextState::migration_state`.
     pub migration_state: Option<MigrationState>,
 
     // -----------------------------------------------------------------
     // Governance + economy
     // -----------------------------------------------------------------
     /// Governance engine + proposals + tooling per-context state
-    /// (ADR-031). Mirrors legacy `manager::PerContextState::governance`.
+    /// (ADR-031). Mirrors legacy `state::PerContextState::governance`.
     /// Type is elevated from private to `pub(crate)` by commit 12a so
     /// the actor can carry it; field visibility matches the type
     /// (`pub(crate)`) because the `GovernanceState` struct itself cannot
@@ -647,12 +647,12 @@ pub struct PerContextState {
     // MLS + access control + TTL
     // -----------------------------------------------------------------
     /// MLS epoch + reconnection state (§5.9, §23.11). Mirrors legacy
-    /// `manager::PerContextState::epoch`. Type is elevated from private
+    /// `state::PerContextState::epoch`. Type is elevated from private
     /// to `pub(crate)` by commit 12a; field visibility matches.
     pub(crate) epoch: EpochState,
 
     /// Access-control / CEK-wrapping exclusion list (ADR-038, §9.17).
-    /// Mirrors legacy `manager::PerContextState::access`. Type is
+    /// Mirrors legacy `state::PerContextState::access`. Type is
     /// elevated from private to `pub(crate)` by commit 12a; field
     /// visibility matches.
     ///
@@ -664,7 +664,7 @@ pub struct PerContextState {
     pub(crate) access: AccessControlState,
 
     /// TTL timer + extension state (SCP-021). Mirrors legacy
-    /// `manager::PerContextState::ttl`. Type is elevated from private
+    /// `state::PerContextState::ttl`. Type is elevated from private
     /// to `pub(crate)` by commit 12a; field visibility matches.
     pub(crate) ttl: TtlState,
 
@@ -673,24 +673,24 @@ pub struct PerContextState {
     // -----------------------------------------------------------------
     /// This member's pseudonym-derived routing ID for this context
     /// (§9.10.4). `None` if the bridge did not supply a pseudonym.
-    /// Mirrors legacy `manager::PerContextState::local_pseudonym`.
+    /// Mirrors legacy `state::PerContextState::local_pseudonym`.
     pub local_pseudonym: Option<[u8; 32]>,
 
     /// Known members' pseudonym routing IDs, learned via
     /// `PseudonymAnnouncement` MLS application messages. Mirrors legacy
-    /// `manager::PerContextState::pseudonym_registry`.
+    /// `state::PerContextState::pseudonym_registry`.
     pub pseudonym_registry: HashMap<DID, [u8; 32]>,
 
     // -----------------------------------------------------------------
     // Anti-replay + reorder buffers (§9.8.2, §9.8.5)
     // -----------------------------------------------------------------
     /// Per-sender sequence tracker for anti-replay protection (§9.8.2).
-    /// Mirrors legacy `manager::PerContextState::sequence_tracker`.
+    /// Mirrors legacy `state::PerContextState::sequence_tracker`.
     pub sequence_tracker: SequenceTracker,
 
     /// Per-sender reorder buffer for out-of-order message delivery
     /// (§9.8.5). Mirrors legacy
-    /// `manager::PerContextState::reorder_buffer`.
+    /// `state::PerContextState::reorder_buffer`.
     pub reorder_buffer: ReorderBuffer,
 
     // -----------------------------------------------------------------
@@ -699,28 +699,28 @@ pub struct PerContextState {
     /// Persistent retry queue for MLS Commit broadcasts that failed at
     /// the transport layer after local state already mutated (PR
     /// #1606 C6). Mirrors legacy
-    /// `manager::PerContextState::pending_commits`.
+    /// `state::PerContextState::pending_commits`.
     pub pending_commits: VecDeque<PendingCommit>,
 
     /// Fail-close marker set when a `PendingCommit` exhausts its retry
     /// budget. While `Some`, all context-mutating operations return
     /// `ContextError::CommitBroadcastFault` until cleared. Mirrors
-    /// legacy `manager::PerContextState::commit_fault`.
+    /// legacy `state::PerContextState::commit_fault`.
     pub commit_fault: Option<CommitFaultMarker>,
 
     /// Number of event-log appends since the last consistency
     /// checkpoint (§9.9.3). Mirrors legacy
-    /// `manager::PerContextState::checkpoint_events_since`.
+    /// `state::PerContextState::checkpoint_events_since`.
     pub checkpoint_events_since: u64,
 
     /// Unix timestamp (seconds) of the last consistency checkpoint
     /// (§9.9.3). Mirrors legacy
-    /// `manager::PerContextState::checkpoint_last_time_secs`.
+    /// `state::PerContextState::checkpoint_last_time_secs`.
     pub checkpoint_last_time_secs: u64,
 
     /// Locally generated consistency checkpoints for equivocation
     /// detection (§9.9.3). Mirrors legacy
-    /// `manager::PerContextState::checkpoints`.
+    /// `state::PerContextState::checkpoints`.
     pub checkpoints: Vec<ConsistencyCheckpoint>,
 
     // -----------------------------------------------------------------

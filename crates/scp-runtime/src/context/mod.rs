@@ -40,7 +40,6 @@ pub(crate) mod lifecycle_helpers;
 pub(crate) mod lifecycle_logic;
 pub(crate) mod economy_logic;
 pub(crate) mod governance_logic;
-pub mod manager;
 pub(crate) mod manager_methods;
 pub(crate) mod messaging_helpers;
 pub mod persistence;

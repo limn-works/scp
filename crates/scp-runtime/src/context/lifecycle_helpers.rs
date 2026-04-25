@@ -100,7 +100,7 @@ use scp_protocol::economy::budget::MemberBudgetTracker;
 use crate::context::ContextHandle;
 use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
 use crate::context::governance_helpers;
-use crate::context::manager::{
+use crate::context::state::{
     self, AccessControlState, CommitOperation, EpochState, GovernanceState, PerContextState,
     TtlState,
 };
@@ -315,7 +315,7 @@ pub async fn import_context(
     }
 
     // 5. Reconstruct governance engine from snapshot.
-    let governance_engine = manager::restore_governance_engine_from_snapshot(
+    let governance_engine = state::restore_governance_engine_from_snapshot(
         &export.snapshot,
         Arc::clone(key_resolver),
     )?;
@@ -623,7 +623,7 @@ pub async fn create_context(
     let next_generation = supervisor.next_generation_ref();
     // Defense-in-depth: verify creator's SDK version satisfies min_protocol_version.
     params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
-    manager::validate_governance_model(&params.governance)?;
+    state::validate_governance_model(&params.governance)?;
     crate::context::lifecycle_logic::validate_consequence_rules(
         &params.consequence_rules,
         &params.consequence_config,
@@ -632,7 +632,7 @@ pub async fn create_context(
         params.economic_policy.as_ref(),
     )
     .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-    let governance_engine = manager::create_governance_engine(
+    let governance_engine = state::create_governance_engine(
         &params.governance,
         &creator_did,
         Arc::clone(key_resolver),
@@ -821,7 +821,7 @@ pub async fn join_context(
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id = handle.context_id().to_owned();
-    let context_id_bytes = manager::context_id_to_bytes(&context_id);
+    let context_id_bytes = state::context_id_to_bytes(&context_id);
     let member_did = key_package.owner_did.clone();
 
     // Fast-fail: reject obviously incompatible versions before expensive
@@ -854,7 +854,7 @@ pub async fn join_context(
         let ctx = &mut *guard;
 
         // State check inside lock -- eliminates TOCTOU race.
-        manager::require_active(&ctx.handle)?;
+        state::require_active(&ctx.handle)?;
 
         // Defense-in-depth: re-check version compatibility under the
         // mutation lock. The early check above uses a separate lock
@@ -1090,7 +1090,7 @@ pub async fn join_context_membership(
     let mut guard = ctx_arc.lock().await;
     let ctx = &mut *guard;
 
-    manager::require_active(&ctx.handle)?;
+    state::require_active(&ctx.handle)?;
 
     crate::context::lifecycle_logic::post_join_bookkeeping(
         ctx,
@@ -1140,7 +1140,7 @@ pub async fn join_context_membership(
     ctx.emit_event(join_event, context_id, supervisor.event_tx_ref());
 
     // Emit WelcomeGenerated event if the add produced a Welcome message.
-    manager::push_welcome_event(
+    state::push_welcome_event(
         ctx,
         context_id,
         &DID(creator_did),
@@ -1216,7 +1216,7 @@ pub async fn leave_context(
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id = handle.context_id().to_owned();
-    let context_id_bytes = manager::context_id_to_bytes(&context_id);
+    let context_id_bytes = state::context_id_to_bytes(&context_id);
 
     // Determine broadcast mode + authorization in a single lock acquire.
     // PR #1606 C6: also check the commit fault marker so a fail-closed
@@ -1299,7 +1299,7 @@ pub async fn leave_context(
         let ctx = &mut *guard;
 
         // State check inside lock -- eliminates TOCTOU race.
-        manager::require_active(&ctx.handle)?;
+        state::require_active(&ctx.handle)?;
 
         // For broadcast contexts, unsubscribe from the BroadcastContext.
         // rotate_keys=true for forward secrecy after departure.
@@ -1470,7 +1470,7 @@ pub async fn close_context_with_key(
         let ctx = &*guard;
 
         // State check inside lock -- eliminates TOCTOU race.
-        manager::require_active(&ctx.handle)?;
+        state::require_active(&ctx.handle)?;
 
         // Gate: multi-admin models must use governance path.
         if !matches!(
@@ -2061,7 +2061,7 @@ pub async fn restore_context(
     context_id: &str,
     handle: &crate::context::ContextHandle,
 ) -> Result<(), ContextError> {
-    use crate::context::manager::{
+    use crate::context::state::{
         context_id_to_bytes, restore_governance_engine_from_snapshot,
         restore_grace_store_from_snapshot,
     };

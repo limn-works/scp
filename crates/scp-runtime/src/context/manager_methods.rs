@@ -88,7 +88,7 @@ use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::params::{ContextMode, TemplateId};
 use tokio::sync::Mutex;
 
-use crate::context::manager::{
+use crate::context::state::{
     ContextGeneration, ContextSnapshot, PerContextState, VelocityTrackerSnapshot,
     context_id_to_bytes,
 };

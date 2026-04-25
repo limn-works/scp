@@ -62,7 +62,7 @@ use scp_protocol::context::governance::{
     CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint,
 };
 
-use crate::context::manager::{PerContextState, context_id_to_bytes, require_active};
+use crate::context::state::{PerContextState, context_id_to_bytes, require_active};
 use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
 

@@ -31,7 +31,8 @@ use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use scp_core::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use scp_core::context::manager::{ContextPersistence, ContextSnapshot};
+use scp_core::context::persistence::ContextPersistence;
+use scp_core::context::state::ContextSnapshot;
 use scp_core::context::providers::MerkleEventLogProvider;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::{SessionStore, ToolRegistry};

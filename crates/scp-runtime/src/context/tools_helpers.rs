@@ -359,7 +359,7 @@ pub struct ManagedToolInvocationOutput {
 
 /// Phase-1 bookkeeping bundle for a tool invocation in flight.
 ///
-/// Mirrors the legacy `manager::tools::ToolEconomyTicket`. The
+/// Mirrors the legacy `state::tools::ToolEconomyTicket`. The
 /// `#[must_use]` + `Drop` debug-assert invariant catches any future
 /// refactor that leaks an unbalanced budget deduction or velocity entry.
 #[must_use = "ToolEconomyTicket must be committed or rolled back — dropping leaks budget, velocity, and escrow state"]

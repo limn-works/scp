@@ -21,103 +21,16 @@
 // Source files embedded at compile time
 // ---------------------------------------------------------------------------
 
-// Production submodules first so extract_fn_body finds real implementations
-// before test mocks in mod.rs (the parser returns the first match).
+// Production helper modules + domain logic modules. The legacy
+// `manager/<domain>.rs` submodules and `manager/mod.rs` were deleted
+// in ADR-049 commit 12 — every method body that the pipeline-wiring
+// assertions probe now lives in `<domain>_helpers.rs` (forwarder-free)
+// or in `<domain>_logic.rs` (the free-function logic that used to
+// share a file with `impl ContextManager` blocks).
 const MANAGER_SRC: &str = concat!(
-    include_str!("../../../../crates/scp-runtime/src/context/manager/economy.rs"),
-    // Commit 12b.1 of ADR-049 hoisted six private helpers out of
-    // `manager/messaging.rs` into `context/messaging_helpers.rs`. The
-    // pipeline-wiring assertions below still need to see those helper
-    // bodies (they assert spec-required calls inside e.g.
-    // `build_encrypted_envelope`, `enforce_send_economy`), so the new
-    // free-function module is concatenated into MANAGER_SRC here.
-    //
-    // Commit 12c.1 of ADR-049 additionally hoisted the top-level
-    // `send_message` and `deliver_incoming` method bodies into the same
-    // helper module; the outer methods in `manager/messaging.rs` are now
-    // one-line forwarders. The helpers file is concatenated BEFORE
-    // `manager/messaging.rs` so that `extract_fn_body` — which returns the
-    // FIRST occurrence — picks up the real hoisted bodies rather than
-    // the forwarders. When the forwarders are deleted in commit 12f this
-    // ordering becomes a no-op; it remains correct.
-    //
-    // Commit 12c.2 of ADR-049 extends the same hoist pattern to the
-    // lifecycle / ttl_close domain: `create_context`, `join_context`,
-    // `leave_context`, `close_context`, `export_context`,
-    // `import_context`, `start_ttl_timer`, `propose_ttl_extension`,
-    // `reset_ttl_timer`, `handle_ttl_expiry`, `finalize_close`, and
-    // their domain-internal transitives (`close_context_with_key`,
-    // `finalize_create`, `join_context_membership`,
-    // `capture_join_payment`, `spawn_ttl_timer`,
-    // `drain_and_deliver_sender_keys`). `lifecycle_helpers.rs` is
-    // concatenated BEFORE `manager/lifecycle.rs` and
-    // `manager/ttl_close.rs` for the same first-match reason — any
-    // pipeline-wiring assertion that names one of these methods must
-    // witness the hoisted body, not the forwarder.
-    //
-    // Commit 12c.3b of ADR-049 extends the hoist pattern to the
-    // governance domain: `propose_governance_action`,
-    // `propose_governance_action_checked`, `vote_on_proposal`,
-    // `approve_governance_proposal`, `reject_governance_proposal`,
-    // `withdraw_governance_vote`, `execute_governance_action`,
-    // `get_proposal`, `list_proposals`,
-    // `apply_pending_ceiling_modification`,
-    // `apply_pending_economic_policy_change`,
-    // `tombstone_migrated_context`, `migration_state`,
-    // `acknowledge_commit_fault`, and their 25+ domain-internal
-    // transitives (the `execute_*` bodies, `finalize_governance_action`,
-    // `dispatch_governance_action`, `dispatch_context_governance_action`,
-    // `dispatch_content_governance_action`, `propose_governance_action_inner`,
-    // `vote_on_proposal_inner`, `detect_and_handle_conflicts`,
-    // `check_and_resolve_expired_freezes`, `try_broadcast_commit_or_enqueue`,
-    // `build_governance_context`). `governance_helpers.rs` is concatenated
-    // BEFORE `manager/governance.rs` for the same first-match reason.
-    //
-    // Commit 12c.4 of ADR-049 extends the hoist pattern to the
-    // standing-pair, tools, and broadcast domains: standing
-    // (`standing_context`, `standing_context_count`,
-    // `has_standing_context`, `register_standing_context`,
-    // `reconnect_all_standing`); tools (`try_consume_hard_rate_limit`,
-    // `refund_hard_rate_limit`); broadcast (`subscribe_broadcast`,
-    // `unsubscribe_broadcast`, `publish_broadcast`,
-    // `publish_broadcast_content`, `block_broadcast_subscriber`,
-    // `unblock_broadcast_subscriber`, `handle_broadcast_key_request`,
-    // `broadcast_subscriber_count`, `is_broadcast_subscriber`,
-    // `broadcast_admission`). The three new helper modules
-    // (`standing_helpers.rs`, `tools_helpers.rs`, `broadcast_helpers.rs`)
-    // are concatenated BEFORE their `manager/{standing,tools,broadcast}.rs`
-    // counterparts for the same first-match reason — any pipeline-wiring
-    // assertion that names one of these methods must witness the
-    // hoisted body, not the forwarder.
-    //
-    // Commit 12c.5 of ADR-049 completes the hoist pattern on the queries
-    // domain — the last hoist before shim deletion + legacy deletion.
-    // `queries_helpers.rs` hoists: local DID management
-    // (`register_local_did`, `is_local_did`); per-context read queries
-    // (`local_pseudonym`, `get_broadcast_key_for_local_author`,
-    // `member_count`, `is_member`, `member_dids`, `member_role`,
-    // `context_params`, `get_role_state`, `pending_commits`,
-    // `commit_fault`); receive buffer + degraded mode
-    // (`drain_events`, `report_degraded_mode`); event log passthrough
-    // (`event_log_entries`); access-key management
-    // (`generate_context_access_key`, `revoke_context_access_key`,
-    // `restore_context_access_key`, `set_access_key`,
-    // `remove_access_key`); test-only accessors (`inject_access_key`,
-    // `get_access_key`, `get_all_access_keys`,
-    // `grant_budget_for_test`, `remaining_budget_for_test`,
-    // `velocity_for_test`); checkpoint operations
-    // (`create_checkpoint_if_due`, `force_create_checkpoint`,
-    // `compare_remote_checkpoint`, and the private `build_checkpoint`
-    // helper); Merkle proof operations (`prove_event_inclusion`,
-    // `prove_event_consistency`, `verify_event_inclusion`,
-    // `verify_event_consistency`, and the private `sync_merkle_tree`
-    // helper). `queries_helpers.rs` is concatenated BEFORE
-    // `manager/queries.rs` for the same first-match reason as the
-    // earlier `*_helpers.rs` additions. `set_payment_adapter` and
-    // `event_log_provider` remain as inherent methods on
-    // `ContextManager` (the former is a `&mut self` one-time setter;
-    // the latter is a pure accessor returning a `&dyn` trait
-    // reference).
+    include_str!("../../../../crates/scp-runtime/src/context/economy_logic.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/lifecycle_logic.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/governance_logic.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/messaging_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/lifecycle_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs"),
@@ -125,16 +38,8 @@ const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/tools_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/broadcast_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/queries_helpers.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/messaging.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/broadcast.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/governance.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/lifecycle.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/queries.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/standing.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/tools.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/trust_recovery.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/ttl_close.rs"),
-    include_str!("../../../../crates/scp-runtime/src/context/manager/mod.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/economy_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/trust_recovery_helpers.rs"),
 );
 const PROVIDER_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/crypto/mls/provider.rs");
