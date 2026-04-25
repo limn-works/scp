@@ -72,6 +72,16 @@ mod lifecycle;
 mod messaging;
 mod outlets;
 mod queries;
+
+// SCP-OUT-015: re-export the chain amplification surface so it is reachable
+// from other crates (FFI bridges, future SCP-OUT-036/038 typed-error wiring,
+// integration tests) and keep `pub` items in `manager::outlets` from being
+// flagged as unreachable-and-dead.
+pub use outlets::{
+    CrossContextHopAccepted, OutletAmplificationError, action_chain_budget,
+    amplification_error_to_context, cross_context_invoke, origin_kind_from_ucan_stem,
+    query_chain_budget, record_amplification_rejection,
+};
 pub(crate) mod standing;
 mod trust_recovery;
 mod ttl_close;
