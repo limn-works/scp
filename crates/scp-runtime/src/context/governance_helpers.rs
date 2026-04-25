@@ -123,7 +123,7 @@ use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::types::EconomicPolicy;
 use tracing::instrument;
 
-use crate::context::manager::governance::{
+use crate::context::governance_logic::{
     EnforceConsequencesCtx, check_proposer_eligibility, dispatch_consequences,
     enforce_triggered_consequences, event_log_entries_for_consequences,
 };

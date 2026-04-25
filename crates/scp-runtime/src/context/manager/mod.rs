@@ -60,16 +60,10 @@ use scp_protocol::trust::consequence::{
 use tracing::instrument;
 use zeroize::Zeroizing;
 
-mod broadcast;
-pub(crate) mod economy;
-pub(crate) mod governance;
-pub(crate) mod lifecycle;
-pub(crate) mod messaging;
-mod queries;
-pub(crate) mod standing;
-pub(crate) mod tools;
-mod trust_recovery;
-pub(crate) mod ttl_close;
+// All `manager/<domain>.rs` submodules deleted in ADR-049 commit 12.
+// Their free functions migrated to `crate::context::{lifecycle_logic,
+// economy_logic, governance_logic}`; the `impl ContextManager {}`
+// forwarders went away with the type itself.
 
 
 // ---------------------------------------------------------------------------

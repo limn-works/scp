@@ -529,7 +529,7 @@ where
         let consequence_rules = ctx.governance.consequence_rules.clone();
         let message_pricing = ctx.governance.message_pricing.clone();
 
-        let events_snapshot = crate::context::manager::governance::event_log_entries_for_consequences(
+        let events_snapshot = crate::context::governance_logic::event_log_entries_for_consequences(
             ctx,
             context_id,
             now_secs,
@@ -579,7 +579,7 @@ where
                     "SCP-ECON-12060: paid action requires spending UCAN".to_owned(),
                 ));
             };
-            if let Err(err) = crate::context::manager::economy::validate_spending_ucan_or_error(
+            if let Err(err) = crate::context::economy_logic::validate_spending_ucan_or_error(
                 spending,
                 invoker_did,
                 context_id,
@@ -730,7 +730,7 @@ where
         let ctx = &mut *guard;
 
         let now = clock.now_secs();
-        let events_for_consequences = crate::context::manager::governance::event_log_entries_for_consequences(
+        let events_for_consequences = crate::context::governance_logic::event_log_entries_for_consequences(
             ctx,
             context_id,
             now,
@@ -747,9 +747,9 @@ where
             &consequence_rules,
         );
 
-        crate::context::manager::governance::enforce_triggered_consequences(
+        crate::context::governance_logic::enforce_triggered_consequences(
             ctx,
-            &crate::context::manager::governance::EnforceConsequencesCtx {
+            &crate::context::governance_logic::EnforceConsequencesCtx {
                 context_id,
                 member_did: invoker_did,
                 now,

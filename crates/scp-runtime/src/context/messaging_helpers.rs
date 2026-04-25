@@ -231,9 +231,18 @@ pub fn build_encrypted_envelope(
         &context_id_bytes,
         &inner,
         &routing_id,
-        manager::messaging::DEFAULT_BLOB_TTL_SECS,
+        DEFAULT_BLOB_TTL_SECS,
     )
 }
+
+/// Default TTL (in seconds) for sealed message blobs sent through the
+/// transport. 300s = 5 minutes — short enough to limit replay surface,
+/// long enough to absorb transient relay outages.
+///
+/// Hoisted out of the deleted `manager/messaging.rs` in ADR-049 commit
+/// 12. Public so the lifecycle path can re-use the same value when
+/// sealing welcome envelopes.
+pub const DEFAULT_BLOB_TTL_SECS: u32 = 300;
 
 // ---------------------------------------------------------------------------
 // 2. enforce_send_economy
@@ -253,7 +262,7 @@ pub fn build_encrypted_envelope(
 /// # Collaborators
 ///
 /// - `clock` — used for UCAN expiry validation inside
-///   [`manager::economy::enforce_economy`]. Passed as `&dyn Clock` to match
+///   [`crate::context::economy_logic::enforce_economy`]. Passed as `&dyn Clock` to match
 ///   the trait-object shape the downstream call expects.
 /// - `key_resolver` — resolves the actor's UCAN signing key; same shape
 ///   as the resolver used for governance vote verification.
@@ -280,7 +289,7 @@ pub fn enforce_send_economy(
         .message_pricing
         .as_ref()
         .unwrap_or(&pricing_default);
-    manager::economy::enforce_economy(manager::economy::EnforceEconomyRequest {
+    crate::context::economy_logic::enforce_economy(crate::context::economy_logic::EnforceEconomyRequest {
         economic_policy: governance.economic_policy.as_ref(),
         budget_tracker: &mut governance.budget_tracker,
         velocity_tracker: &governance.velocity_tracker,
@@ -542,14 +551,14 @@ pub fn run_buffered_post_delivery(
     // Consequence evaluation — same rules as the direct path.
     let consequence_rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
     if !consequence_rules.is_empty() {
-        let events = manager::governance::event_log_entries_for_consequences(
+        let events = crate::context::governance_logic::event_log_entries_for_consequences(
             ctx, context_id, now, event_log,
         );
         let triggered = evaluate_consequence_rules(&consequence_rules, &events, sender_did, now);
         let member_did = DID(sender_did.to_owned());
-        manager::governance::enforce_triggered_consequences(
+        crate::context::governance_logic::enforce_triggered_consequences(
             ctx,
-            &manager::governance::EnforceConsequencesCtx {
+            &crate::context::governance_logic::EnforceConsequencesCtx {
                 context_id,
                 member_did: &member_did,
                 now,
@@ -578,7 +587,7 @@ pub fn run_buffered_post_delivery(
 ///    check, hard-rate-limit consume, velocity record, economy
 ///    enforcement, broadcast-envelope build (broadcast mode) OR sequence
 ///    assignment + routing-ID fan-out list (encrypted mode), producing
-///    an [`EconomyTicket`](crate::context::manager::economy::EconomyTicket)
+///    an [`EconomyTicket`](crate::context::economy_logic::EconomyTicket)
 ///    carrying all refundable state.
 /// 2. **Off-lock Phase 2**: payment authorization (escrow hold), then
 ///    encrypt and transport fan-out. On any failure, voids the escrow
@@ -722,7 +731,7 @@ pub async fn send_message(
         // every downstream error branch is forced to consume it.
         // Dropping without commit/rollback is a compile-time warning
         // (`#[must_use]`) + debug-assert at runtime.
-        let ticket = manager::economy::EconomyTicket {
+        let ticket = crate::context::economy_logic::EconomyTicket {
             actor_did: sender_did.clone(),
             deducted_cost,
             velocity_token,
@@ -733,7 +742,7 @@ pub async fn send_message(
             let Some(sk) = signing_key else {
                 // Phase 1 failed after ticket creation — drain it.
                 // Use inline variant: we already hold the per-context lock.
-                manager::economy::rollback_economy_ticket_inline(ctx, ticket);
+                crate::context::economy_logic::rollback_economy_ticket_inline(ctx, ticket);
                 return Err(ContextError::CryptoFailed(
                     "signing key required for broadcast publish".into(),
                 ));
@@ -742,7 +751,7 @@ pub async fn send_message(
                 Ok(env) => env,
                 Err(e) => {
                     // Use inline variant: we already hold the per-context lock.
-                    manager::economy::rollback_economy_ticket_inline(ctx, ticket);
+                    crate::context::economy_logic::rollback_economy_ticket_inline(ctx, ticket);
                     return Err(e);
                 }
             };
@@ -762,7 +771,7 @@ pub async fn send_message(
             // Assign sequence under lock — SequenceTracker rejects duplicates.
             let Some(seq) = ctx.membership.next_sequence_number(sender_did) else {
                 // Use inline variant: we already hold the per-context lock.
-                manager::economy::rollback_economy_ticket_inline(ctx, ticket);
+                crate::context::economy_logic::rollback_economy_ticket_inline(ctx, ticket);
                 return Err(ContextError::MemberNotFound(format!(
                     "cannot assign sequence: {sender_did} is not a member"
                 )));
@@ -802,7 +811,7 @@ pub async fn send_message(
             // Authorization failure — roll back the ticket. The sequence
             // number rollback is also needed because Phase 1 already
             // incremented it for non-broadcast.
-            manager::economy::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen)
+            crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen)
                 .await;
             if !is_broadcast {
                 if let Ok(mut guard) = manager_methods::relock_context(supervisor, &ctx_gen).await {
@@ -842,7 +851,7 @@ pub async fn send_message(
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
         }
-        manager::economy::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen).await;
+        crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen).await;
         if !is_broadcast {
             if let Ok(mut guard) = manager_methods::relock_context(supervisor, &ctx_gen).await {
                 let ctx = &mut *guard;
@@ -861,7 +870,7 @@ pub async fn send_message(
     // Phase 3: capture the escrow hold after successful send. Consume
     // the ticket — commit returns the deducted cost for the capture step
     // and marks the ticket as committed so the Drop guard stays quiet.
-    let deducted_cost = manager::economy::commit_economy_ticket(ticket);
+    let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
     capture_send_payment(supervisor, auth, sender_did, &context_id, deducted_cost).await;
 
     finalize_send(
@@ -1216,7 +1225,7 @@ pub async fn authorize_send_payment(
     supervisor: &Supervisor,
     context_id: &str,
     sender_did: &DID,
-) -> Result<Option<manager::economy::PaidActionAuthorization>, ContextError> {
+) -> Result<Option<crate::context::economy_logic::PaidActionAuthorization>, ContextError> {
     crate::context::economy_helpers::authorize_paid_action(
         supervisor,
         scp_protocol::economy::types::PaidActionType::MessageSend,
@@ -1255,7 +1264,7 @@ pub async fn authorize_send_payment(
 /// Byte-identical to the legacy method form.
 pub async fn capture_send_payment(
     supervisor: &Supervisor,
-    auth: Option<manager::economy::PaidActionAuthorization>,
+    auth: Option<crate::context::economy_logic::PaidActionAuthorization>,
     sender_did: &DID,
     context_id: &str,
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
@@ -1365,7 +1374,7 @@ pub async fn finalize_send(
             //
             // The same event snapshot is reused for both consequence evaluation
             // and participation record computation (finding #46 dedup).
-            let send_events = manager::governance::event_log_entries_for_consequences(
+            let send_events = crate::context::governance_logic::event_log_entries_for_consequences(
                 ctx,
                 context_id,
                 now,
@@ -1382,9 +1391,9 @@ pub async fn finalize_send(
                 sender_did.as_ref(),
                 now,
             );
-            manager::governance::enforce_triggered_consequences(
+            crate::context::governance_logic::enforce_triggered_consequences(
                 ctx,
-                &manager::governance::EnforceConsequencesCtx {
+                &crate::context::governance_logic::EnforceConsequencesCtx {
                     context_id,
                     member_did: sender_did,
                     now,
@@ -1892,7 +1901,7 @@ pub async fn deliver_message_and_drain_buffered(
         }
         let consequence_rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
         if !consequence_rules.is_empty() {
-            let recv_events = manager::governance::event_log_entries_for_consequences(
+            let recv_events = crate::context::governance_logic::event_log_entries_for_consequences(
                 ctx,
                 context_id,
                 now,
@@ -1903,9 +1912,9 @@ pub async fn deliver_message_and_drain_buffered(
             let recv_triggered =
                 evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
             let recv_member_did = DID(sender_did.to_owned());
-            manager::governance::enforce_triggered_consequences(
+            crate::context::governance_logic::enforce_triggered_consequences(
                 ctx,
-                &manager::governance::EnforceConsequencesCtx {
+                &crate::context::governance_logic::EnforceConsequencesCtx {
                     context_id,
                     member_did: &recv_member_did,
                     now,
@@ -2039,7 +2048,7 @@ pub async fn deliver_message_and_drain_buffered(
     }
     let consequence_rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
     if !consequence_rules.is_empty() {
-        let recv_events = manager::governance::event_log_entries_for_consequences(
+        let recv_events = crate::context::governance_logic::event_log_entries_for_consequences(
             ctx,
             context_id,
             now,
@@ -2050,9 +2059,9 @@ pub async fn deliver_message_and_drain_buffered(
         let recv_triggered =
             evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
         let recv_member_did = DID(sender_did.to_owned());
-        manager::governance::enforce_triggered_consequences(
+        crate::context::governance_logic::enforce_triggered_consequences(
             ctx,
-            &manager::governance::EnforceConsequencesCtx {
+            &crate::context::governance_logic::EnforceConsequencesCtx {
                 context_id,
                 member_did: &recv_member_did,
                 now,

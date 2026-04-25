@@ -1993,6 +1993,21 @@ impl Supervisor {
         crate::context::lifecycle_helpers::restore_all_contexts(self).await
     }
 
+    /// Passthrough to
+    /// [`crate::context::lifecycle_helpers::restore_context`] — used by
+    /// FFI integration tests that restore individual contexts.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the helper.
+    pub async fn restore_context(
+        &self,
+        context_id: &str,
+        handle: &crate::context::ContextHandle,
+    ) -> Result<(), ContextError> {
+        crate::context::lifecycle_helpers::restore_context(self, context_id, handle).await
+    }
+
     /// Best-effort flush of every context's snapshot to the configured
     /// persistence provider.
     ///

@@ -72,7 +72,7 @@ use scp_protocol::context::ContextError;
 use scp_protocol::economy::policy::ObservableMetrics;
 use scp_protocol::economy::types::PaidActionType;
 
-use crate::context::manager::economy::PaidActionAuthorization;
+use crate::context::economy_logic::PaidActionAuthorization;
 use crate::context::supervisor::Supervisor;
 use crate::economy::adapter::{PaymentMetadata, PaymentReceipt};
 use crate::economy::integration;
@@ -206,7 +206,7 @@ pub async fn authorize_paid_action(
     let metadata = PaymentMetadata {
         action_type: action_type.clone(),
         context_id: Some(context_id.to_owned()),
-        idempotency_key: crate::context::manager::economy::rand_idempotency_key(),
+        idempotency_key: crate::context::economy_logic::rand_idempotency_key(),
     };
 
     let prepared = integration::prepare_paid_action(
@@ -220,7 +220,7 @@ pub async fn authorize_paid_action(
         Vec::new(),
     )
     .await
-    .map_err(crate::context::manager::economy::integration_error_to_context)?;
+    .map_err(crate::context::economy_logic::integration_error_to_context)?;
 
     Ok(Some(PaidActionAuthorization {
         prepared,
@@ -265,14 +265,14 @@ pub async fn complete_paid_action(
         |payload| async move { Ok(payload) },
     )
     .await
-    .map_err(crate::context::manager::economy::integration_error_to_context)?;
+    .map_err(crate::context::economy_logic::integration_error_to_context)?;
 
     let Some(receipt) = processed.receipt else {
         return Ok(None);
     };
 
     // Verify the receipt.
-    crate::context::manager::economy::verify_and_check_receipt(auth.adapter.as_ref(), &receipt)
+    crate::context::economy_logic::verify_and_check_receipt(auth.adapter.as_ref(), &receipt)
         .await?;
 
     // Store receipt in event log.

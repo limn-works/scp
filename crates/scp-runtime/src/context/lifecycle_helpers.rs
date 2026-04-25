@@ -211,7 +211,7 @@ pub async fn import_context(
     // RevokeAccess even on imported snapshots and rejects with the
     // canonical SCP-CTX-2092 envelope so SDK callers can detect
     // structural rejection by `.code` rather than message body.
-    manager::lifecycle::validate_consequence_rules_for_import(
+    crate::context::lifecycle_logic::validate_consequence_rules_for_import(
         &export.snapshot.consequence_rules,
         &export.snapshot.context_params.consequence_config,
     )?;
@@ -375,7 +375,7 @@ pub async fn import_context(
         None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
     };
     let validated_message_pricing = export.snapshot.message_pricing.clone().or_else(|| {
-        manager::lifecycle::derive_message_pricing(export.snapshot.economic_policy.as_ref())
+        crate::context::lifecycle_logic::derive_message_pricing(export.snapshot.economic_policy.as_ref())
     });
     if let Some(ref pricing) = validated_message_pricing {
         pricing.validate().map_err(|e| {
@@ -391,7 +391,7 @@ pub async fn import_context(
     // this, an attacker can ship `cooldown_until[i] = u64::MAX` and
     // permanently disable a consequence rule.
     let mut sanitized_cooldown_until = export.snapshot.cooldown_until.clone();
-    manager::lifecycle::sanitize_cooldown_until(
+    crate::context::lifecycle_logic::sanitize_cooldown_until(
         &mut sanitized_cooldown_until,
         &export.snapshot.consequence_rules,
         now_for_validation,
@@ -624,7 +624,7 @@ pub async fn create_context(
     // Defense-in-depth: verify creator's SDK version satisfies min_protocol_version.
     params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
     manager::validate_governance_model(&params.governance)?;
-    manager::lifecycle::validate_consequence_rules(
+    crate::context::lifecycle_logic::validate_consequence_rules(
         &params.consequence_rules,
         &params.consequence_config,
     )?;
@@ -684,7 +684,7 @@ pub async fn create_context(
             registered_tools: Vec::new(),
             tool_interfaces: Vec::new(),
             pruning_policy: None,
-            message_pricing: manager::lifecycle::derive_message_pricing(
+            message_pricing: crate::context::lifecycle_logic::derive_message_pricing(
                 params.economic_policy.as_ref(),
             ),
             hard_rate_limit: scp_protocol::economy::antispam::TokenBucketLimiter::new(
@@ -871,7 +871,7 @@ pub async fn join_context(
         // rollback restores the deducted amount AND the velocity+hard-rate state.
         // M13: Sybil resistance check BEFORE economy enforcement so that
         // a rejected sybil attacker doesn't consume budget. Fail-closed.
-        manager::lifecycle::evaluate_sybil_resistance(ctx, &member_did, clock.now_secs())?;
+        crate::context::lifecycle_logic::evaluate_sybil_resistance(ctx, &member_did, clock.now_secs())?;
 
         // Defense-in-depth hard rate limit on joins (Matrix-style token
         // bucket). On any subsequent failure we refund the token.
@@ -895,7 +895,7 @@ pub async fn join_context(
             .velocity_tracker
             .record_message(&member_did, now_secs);
 
-        let deducted_cost = match manager::lifecycle::enforce_join_economy(
+        let deducted_cost = match crate::context::lifecycle_logic::enforce_join_economy(
             ctx,
             &member_did,
             now_secs,
@@ -919,7 +919,7 @@ pub async fn join_context(
         // to roll back velocity + hard_rate_limit + budget, not just
         // the budget.
         (
-            manager::economy::EconomyTicket {
+            crate::context::economy_logic::EconomyTicket {
                 actor_did: member_did.clone(),
                 deducted_cost,
                 velocity_token,
@@ -942,7 +942,7 @@ pub async fn join_context(
     {
         Ok(auth) => auth,
         Err(payment_err) => {
-            manager::economy::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen)
+            crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen)
                 .await;
             return Err(payment_err);
         }
@@ -957,7 +957,7 @@ pub async fn join_context(
             if let Some(a) = auth {
                 crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
             }
-            manager::economy::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen)
+            crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen)
                 .await;
             return Err(e);
         }
@@ -970,7 +970,7 @@ pub async fn join_context(
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
         }
-        manager::economy::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen).await;
+        crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen).await;
         return Err(e);
     }
 
@@ -1010,7 +1010,7 @@ pub async fn join_context(
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
         }
-        manager::economy::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen).await;
+        crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen).await;
         return Err(e);
     }
 
@@ -1023,7 +1023,7 @@ pub async fn join_context(
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
         }
-        manager::economy::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen).await;
+        crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen).await;
         return Err(e);
     }
 
@@ -1042,7 +1042,7 @@ pub async fn join_context(
     // Consume the ticket — commit returns the deducted cost for the
     // capture step and marks the ticket as committed so the Drop
     // guard stays quiet.
-    let deducted_cost = manager::economy::commit_economy_ticket(ticket);
+    let deducted_cost = crate::context::economy_logic::commit_economy_ticket(ticket);
     capture_join_payment(supervisor, auth, &member_did, &context_id, deducted_cost).await;
 
     // Append MemberJoined event to event log.
@@ -1092,7 +1092,7 @@ pub async fn join_context_membership(
 
     manager::require_active(&ctx.handle)?;
 
-    manager::lifecycle::post_join_bookkeeping(
+    crate::context::lifecycle_logic::post_join_bookkeeping(
         ctx,
         context_id,
         member_did,
@@ -1161,7 +1161,7 @@ pub async fn join_context_membership(
 /// `ContextManager::capture_join_payment`.
 pub async fn capture_join_payment(
     supervisor: &Supervisor,
-    auth: Option<manager::economy::PaidActionAuthorization>,
+    auth: Option<crate::context::economy_logic::PaidActionAuthorization>,
     member_did: &DID,
     context_id: &str,
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
@@ -1403,7 +1403,7 @@ pub fn drain_and_deliver_sender_keys(
                 context_id_bytes,
                 &message,
                 &routing_id,
-                manager::messaging::DEFAULT_BLOB_TTL_SECS,
+                crate::context::messaging_helpers::DEFAULT_BLOB_TTL_SECS,
             ) {
                 Ok(sealed) => {
                     if let Err(e) = transport.send_message(&routing_id, &sealed) {
@@ -2065,7 +2065,7 @@ pub async fn restore_context(
         context_id_to_bytes, restore_governance_engine_from_snapshot,
         restore_grace_store_from_snapshot,
     };
-    use crate::context::manager::lifecycle::{
+    use crate::context::lifecycle_logic::{
         sanitize_cooldown_until, validate_consequence_rules_for_import, derive_message_pricing,
     };
     use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};

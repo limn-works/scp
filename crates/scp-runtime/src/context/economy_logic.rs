@@ -33,7 +33,7 @@ use crate::economy::adapter::{PaymentAdapterDyn, PaymentReceipt};
 use crate::economy::integration::{self, IntegrationError};
 use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
 
-use super::ContextManager;
+use super::state::{ContextGeneration, PerContextState};
 
 // ---------------------------------------------------------------------------
 // Spending UCAN signature validation wiring (C1, PR #1606)
@@ -545,7 +545,7 @@ pub fn commit_economy_ticket(
 /// holds the per-context Mutex (Phase 1 error paths under lock).
 ///
 /// Consumes the ticket so the `Drop` guard does not fire.
-pub fn rollback_economy_ticket_inline(ctx: &mut super::PerContextState, mut ticket: EconomyTicket) {
+pub fn rollback_economy_ticket_inline(ctx: &mut super::state::PerContextState, mut ticket: EconomyTicket) {
     ticket.consumed = true;
     ctx.governance
         .velocity_tracker
@@ -579,7 +579,7 @@ pub async fn rollback_economy_ticket(
     supervisor: &crate::context::supervisor::Supervisor,
     context_id: &str,
     mut ticket: EconomyTicket,
-    ctx_gen: &super::ContextGeneration,
+    ctx_gen: &super::state::ContextGeneration,
 ) {
     ticket.consumed = true;
     if let Ok(mut guard) =
@@ -604,136 +604,6 @@ pub async fn rollback_economy_ticket(
         );
     }
 }
-
-#[allow(clippy::significant_drop_tightening)]
-impl ContextManager {
-    /// Authorizes a paid action (escrow pattern, step 1).
-    ///
-    /// Evaluates cost, checks spending UCAN, checks budget, and calls
-    /// `adapter.authorize` to create an escrow hold. The caller performs the
-    /// action, then calls `complete_paid_action` or `void_paid_action`.
-    ///
-    /// Returns `Ok(None)` when no payment adapter is configured or cost is zero.
-    ///
-    /// Legacy one-line forwarder to the hoisted
-    /// [`crate::context::economy_helpers::authorize_paid_action`] free
-    /// function (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
-    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
-    pub(crate) async fn authorize_paid_action(
-        &self,
-        action_type: PaidActionType,
-        payer_did: &DID,
-        context_id: &str,
-    ) -> Result<Option<PaidActionAuthorization>, ContextError> {
-        let sup = self.supervisor().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "ContextManager::authorize_paid_action — Supervisor must be attached".to_owned(),
-            )
-        })?;
-        crate::context::economy_helpers::authorize_paid_action(
-            &sup,
-            action_type,
-            payer_did,
-            context_id,
-        )
-        .await
-    }
-
-    /// Completes a paid action after successful execution (escrow capture).
-    ///
-    /// Calls `adapter.capture`, verifies the receipt, stores it in the event
-    /// log, and records budget spend.
-    ///
-    /// Legacy one-line forwarder to the hoisted
-    /// [`crate::context::economy_helpers::complete_paid_action`] free
-    /// function (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
-    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
-    pub(crate) async fn complete_paid_action(
-        &self,
-        auth: PaidActionAuthorization,
-        payer_did: &DID,
-        context_id: &str,
-    ) -> Result<Option<PaymentReceipt>, ContextError> {
-        let sup = self.supervisor().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "ContextManager::complete_paid_action — Supervisor must be attached".to_owned(),
-            )
-        })?;
-        crate::context::economy_helpers::complete_paid_action(&sup, auth, payer_did, context_id)
-            .await
-    }
-
-    /// Voids a paid action authorization on failure (escrow rollback).
-    ///
-    /// Calls `adapter.void` to release the escrow hold. Best-effort —
-    /// logs but does not propagate void failures.
-    ///
-    /// Used by `send_message` when `encrypt_and_send` fails after
-    /// `authorize_paid_action` succeeded (escrow pattern: authorize →
-    /// action → complete on success / void on failure).
-    ///
-    /// Legacy one-line forwarder to the hoisted
-    /// [`crate::context::economy_helpers::void_paid_action`] free
-    /// function (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
-    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.2 helper rewire; deleted in 12c.9g.4.
-    pub(crate) async fn void_paid_action(&self, auth: PaidActionAuthorization, context_id: &str) {
-        let Some(sup) = self.supervisor() else {
-            tracing::error!(
-                context_id,
-                "ContextManager::void_paid_action — Supervisor is not attached; \
-                 skipping void (contract violation; see ADR-049 commit 12c.9g.1)"
-            );
-            return;
-        };
-        crate::context::economy_helpers::void_paid_action(&sup, auth, context_id).await;
-    }
-
-    /// Verifies payment receipts using the configured payment adapter.
-    ///
-    /// For each receipt whose `adapter_id` matches the configured adapter,
-    /// calls `verify_dyn` directly. Receipts whose `adapter_id` does not
-    /// match the configured adapter return
-    /// [`ReceiptVerificationError::NoVerifierForAdapter`].
-    ///
-    /// If no payment adapter is configured, all receipts return
-    /// [`ReceiptVerificationError::NoVerifierForAdapter`].
-    ///
-    /// Legacy one-line forwarder to the hoisted
-    /// [`crate::context::economy_helpers::verify_payment_receipts`] free
-    /// function (ADR-049 commit 12c.3). Deleted in a later commit
-    /// alongside every other `ContextManager` economy surface.
-    pub async fn verify_payment_receipts(
-        &self,
-        receipts: &[PaymentReceipt],
-    ) -> Vec<Result<ReceiptVerification, ReceiptVerificationError>> {
-        // ADR-049 commit 12c.9c — helper now takes `&Supervisor`;
-        // reach it through the `Weak<Supervisor>` back-pointer
-        // installed by `Supervisor::attach_context_manager`. On a
-        // detach-contract violation (unreachable in practice), map
-        // every receipt to `NoVerifierForAdapter` — matching the
-        // "no adapter configured" branch inside the helper.
-        let Some(sup) = self.supervisor() else {
-            return receipts
-                .iter()
-                .map(|r| {
-                    Err(ReceiptVerificationError::NoVerifierForAdapter {
-                        receipt_id: r.receipt_id,
-                        adapter_id: r.adapter_id.clone(),
-                    })
-                })
-                .collect();
-        };
-        crate::context::economy_helpers::verify_payment_receipts(&sup, receipts).await
-    }
-}
-
-/// Generates a random 16-byte idempotency key for payment metadata.
-///
-/// Visibility widened in ADR-049 commit 12c.9g.1 so the hoisted
-/// [`crate::context::economy_helpers::authorize_paid_action`] free
-/// function can mint the same idempotency keys the legacy method did.
-/// The enclosing `economy` module is `pub(crate)` so the effective
-/// visibility is unchanged.
 pub fn rand_idempotency_key() -> [u8; 16] {
     *uuid::Uuid::new_v4().as_bytes()
 }
