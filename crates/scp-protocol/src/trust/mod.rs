@@ -8,12 +8,14 @@ pub mod aggregate;
 pub mod attestation;
 pub mod capability_registry;
 pub mod capability_uri;
+pub mod caveats;
 pub mod challenge;
 pub mod consequence;
 pub mod custody_violation;
 pub mod participation;
 pub mod renewal;
 pub mod sybil;
+pub mod ucan;
 
 // Re-exports for backward compatibility.
 pub use attestation::{
@@ -21,6 +23,12 @@ pub use attestation::{
     RevocationStatus, verify_attestation, verify_attestation_with_revocation,
 };
 pub use capability_uri::{CapabilityUri, CapabilityUriError};
+pub use caveats::{
+    AttenuationViolation, CAVEAT_MINT_LIMIT_EXCEEDED_CODE, CaveatMintError, CaveatSerError,
+    DaysOfWeekMask, HoursOfDayMask, InvocationCaveats, MAX_INPUT_SCHEMA_BYTES,
+    MAX_INPUT_SCHEMA_DEPTH, MAX_LIST_ENTRIES, MAX_POPULATED_CAVEATS, MAX_RATE_WINDOW_SECS,
+    MaskWidthError, RateWindow, assert_mask_widths,
+};
 pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,
     issue_challenge, verify_challenge_response,
@@ -38,6 +46,7 @@ pub use sybil::{
     EarnedCapacityLevel, FreshnessWeight, IdentityDepthAssessment, TrustSignal,
     TrustSignalCategory, evaluate_earned_capacity,
 };
+pub use ucan::outlet_kind_for_stem;
 
 use std::collections::HashMap;
 
