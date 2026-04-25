@@ -66,7 +66,7 @@ use crate::context::manager_methods;
 use crate::context::state::{PerContextState, context_id_to_bytes, require_active};
 use crate::context::supervisor::Supervisor;
 
-/// Shared expectation message for `Supervisor::attached_context_manager()`
+/// Shared expectation message for `Supervisor::with_providers()`
 /// inside helpers (ADR-049 commit 12c.9d).
 const ATTACHED_EXPECT: &str = "trust_recovery_helpers: Supervisor must be fully attached before helper invocation \
      (set by Supervisor::with_providers during bridge construction)";

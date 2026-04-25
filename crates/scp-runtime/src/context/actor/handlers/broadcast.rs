@@ -82,7 +82,7 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// event_log, event_tx, clock, local_dids) directly off the supervisor.
 /// Each helper derives `&ContextManager` internally for the remaining
 /// manager-only surface (`get_context_arc`, `has_persistence`, etc.)
-/// via `supervisor.attached_context_manager().expect(...)`.
+/// via `supervisor.crypto_ref().expect(...)` etc..
 pub async fn dispatch(
     supervisor: &Supervisor,
     _deps: &ActorDeps,

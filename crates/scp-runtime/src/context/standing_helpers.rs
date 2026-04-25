@@ -66,7 +66,7 @@ use crate::context::ContextHandle;
 use crate::context::supervisor::Supervisor;
 use crate::context::{lifecycle_helpers, manager_methods};
 
-/// Shared expectation message for `Supervisor::attached_context_manager()`
+/// Shared expectation message for `Supervisor::with_providers()`
 /// inside helpers (ADR-049 commit 12c.9d). The attach-time contract
 /// (see
 /// [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers))

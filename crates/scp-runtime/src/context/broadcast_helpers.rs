@@ -60,7 +60,7 @@
 //! The remaining `ContextManager`-only surface (`get_context_arc`,
 //! `has_persistence`, `persist_context_snapshot`,
 //! `persist_broadcast_snapshot`, `snapshot_context`) is reached through
-//! `supervisor.attached_context_manager().expect("attached")` — the
+//! `supervisor.crypto_ref().expect("attached")` etc. — the
 //! attach-time contract guarantees the `OnceLock` is populated before any
 //! FFI caller or test can invoke a helper.
 //!
@@ -93,12 +93,12 @@ use crate::context::manager_methods;
 use crate::context::state::{context_id_to_bytes, require_active};
 use crate::context::supervisor::Supervisor;
 
-/// Shared expectation message for `Supervisor::attached_context_manager()`
+/// Shared expectation message for `Supervisor::with_providers()`
 /// inside helpers. The attach-time contract (see
 /// [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers))
 /// installs the manager before any FFI caller or test can invoke a
 /// helper, so unwrap is panic-only under a contract violation.
-const ATTACHED_EXPECT: &str = "broadcast_helpers: Supervisor::attached_context_manager must be populated before helper \
+const ATTACHED_EXPECT: &str = "broadcast_helpers: Supervisor must be initialized via `with_providers` before helper \
      invocation (set by Supervisor::with_providers during bridge construction)";
 
 // ---------------------------------------------------------------------------

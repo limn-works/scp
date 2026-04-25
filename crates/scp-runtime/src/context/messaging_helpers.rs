@@ -108,7 +108,7 @@ use crate::context::state::{
 };
 use crate::context::supervisor::Supervisor;
 
-/// Shared expectation message for `Supervisor::attached_context_manager()`
+/// Shared expectation message for `Supervisor::with_providers()`
 /// and `Supervisor::*_ref()` accessors inside helpers. The attach-time
 /// contract (see
 /// [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers))

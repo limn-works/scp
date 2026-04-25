@@ -78,7 +78,7 @@ use crate::economy::adapter::{PaymentMetadata, PaymentReceipt};
 use crate::economy::integration;
 use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
 
-/// Shared expectation message for `Supervisor::attached_context_manager()`
+/// Shared expectation message for `Supervisor::with_providers()`
 /// inside economy helpers (ADR-049 commit 12c.9g.1).
 const ATTACHED_EXPECT: &str = "economy_helpers: Supervisor must be fully attached before helper invocation \
      (set by Supervisor::with_providers during bridge construction)";

@@ -108,7 +108,7 @@ use crate::context::state::{
 use crate::context::supervisor::Supervisor;
 use crate::context::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 
-/// Shared expectation message for `Supervisor::attached_context_manager()`
+/// Shared expectation message for `Supervisor::with_providers()`
 /// inside helpers (ADR-049 commit 12c.9d).
 const ATTACHED_EXPECT: &str = "lifecycle_helpers: Supervisor must be fully attached before helper invocation \
      (set by Supervisor::with_providers during bridge construction)";
@@ -1859,7 +1859,7 @@ pub async fn start_ttl_timer(
 /// cancelled select-arm semantics, generation-check handling, and
 /// `ContextEvent::Expired` / `ContextEvent::ExpiryFailed` emission
 /// policy. Byte-identical to the legacy method.
-#[allow(clippy::too_many_lines)] // 12c.9g.2 widens the prelude (5 supervisor accessor probes vs 1 attached_context_manager check) by 14 lines so the spawn_blocking closure body fits within the previous 90-line budget — see commit message.
+#[allow(clippy::too_many_lines)] // 12c.9g.2 widens the prelude (5 supervisor accessor probes vs 1 provider readiness check) by 14 lines so the spawn_blocking closure body fits within the previous 90-line budget — see commit message.
 pub async fn spawn_ttl_timer(
     supervisor: &Supervisor,
     context_id: &str,

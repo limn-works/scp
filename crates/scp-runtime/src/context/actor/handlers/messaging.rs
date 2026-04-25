@@ -117,7 +117,7 @@ pub async fn dispatch(
 /// functions can read the lifted provider slots directly. Each
 /// delegated call either reads `supervisor.X_ref()` for lifted
 /// providers or derives `&ContextManager` via
-/// `supervisor.attached_context_manager().expect(...)` for the
+/// `supervisor.crypto_ref().expect(...)` etc. for the
 /// remaining manager-only surface.
 pub(crate) async fn dispatch_from_shim(
     supervisor: &Supervisor,

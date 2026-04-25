@@ -135,7 +135,7 @@ use crate::context::state::{
 };
 use crate::context::supervisor::Supervisor;
 
-/// Shared expectation message for `Supervisor::attached_context_manager()`
+/// Shared expectation message for `Supervisor::with_providers()`
 /// inside helpers (ADR-049 commit 12c.9d).
 const ATTACHED_EXPECT: &str = "queries_helpers: Supervisor must be fully attached before helper invocation \
      (set by Supervisor::with_providers during bridge construction)";

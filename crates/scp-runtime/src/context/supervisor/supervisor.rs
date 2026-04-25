@@ -1032,7 +1032,7 @@ impl Supervisor {
         // same mutex without contention.
         // ADR-049 commit 12c.9c — messaging handler takes `&Supervisor`
         // so it can read lifted provider slots directly; `cm` is
-        // resolved from `self.attached_context_manager()` inside the
+        // resolved from `self.crypto_ref()/etc.` inside the
         // handler's `handle_send_message` helper.
         let outcome = handlers::messaging::dispatch_from_shim(self, &mut taken_tracker, cmd).await;
 
@@ -2102,7 +2102,7 @@ impl Supervisor {
     // Each method is intentionally a thin one-liner over the equivalent
     // `*_helpers::X(&self, ...)` free function or the legacy
     // `ContextManager::X` method (resolved via
-    // `attached_context_manager()`). The thin layer keeps the FFI rewire
+    // `with_providers()`). The thin layer keeps the FFI rewire
     // mechanical: bridge call sites change exactly one identifier
     // (`mgr.X` → `supervisor.X`). When `manager/` is deleted in commit
     // 12c.9g.4, the manager-fallback methods below become direct helper
