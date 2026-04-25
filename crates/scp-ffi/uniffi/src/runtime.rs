@@ -596,7 +596,7 @@ pub fn default_bridge_instance() -> Result<Arc<UniffiBridgeInstance>, crate::Scp
 /// Called by `identity_create` before `DidDht::create()` runs, so that the
 /// DID resolver slot owned by `CoreFields` is available. The `ContextManager`
 /// is attached later via [`init_context_manager_with_did`] (or
-/// [`attach_context_manager_to_bridge`]) once the identity is known. Per
+/// [`Supervisor::with_providers`]) once the identity is known. Per
 /// spec §12.2.3 the bridge instance container has no DID requirement — the
 /// authoritative local DID lives inside the `ContextManager`'s
 /// `MlsCryptoProvider`.
@@ -609,7 +609,7 @@ pub fn ensure_bridge_instance() {
     init_default_bridge_instance();
 }
 
-// `attach_context_manager_to_bridge` deleted in ADR-049 commit
+// the legacy `*_to_bridge` shim was deleted in ADR-049 commit
 // 12c.9g.3. The FFI bridge no longer surfaces an `Arc<ContextManager>`;
 // callers route through `init_supervisor*` and `Supervisor::*` methods.
 

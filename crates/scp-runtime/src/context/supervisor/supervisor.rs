@@ -861,7 +861,7 @@ impl Supervisor {
     ///
     /// - [`ContextError::NotInitialized`] if no [`ContextManager`] has
     ///   been attached yet — the caller must call
-    ///   [`Self::attach_context_manager`] first.
+    ///   [`Self::with_providers`] first.
     pub async fn dispatch_query(&self, cmd: QueriesCommand) -> Result<Outcome<()>, ContextError> {
         // Pre-lookup: variants that require a per-context lock all carry
         // a `context_id` field. We route by command variant to preserve
@@ -984,7 +984,7 @@ impl Supervisor {
     /// - [`ContextError::NotInitialized`] if no
     ///   [`ContextManager`](crate::context::manager::ContextManager) has
     ///   been attached yet — the caller must call
-    ///   [`Self::attach_context_manager`] first.
+    ///   [`Self::with_providers`] first.
     /// - [`ContextError::ContextNotRegistered`] if the command targets a
     ///   context that has not been created / joined / imported on the
     ///   attached manager.
@@ -1094,7 +1094,7 @@ impl Supervisor {
     /// - [`ContextError::NotInitialized`] if no
     ///   [`ContextManager`](crate::context::manager::ContextManager) has
     ///   been attached yet — the caller must call
-    ///   [`Self::attach_context_manager`] first.
+    ///   [`Self::with_providers`] first.
     /// - Any typed error returned by the delegated
     ///   `ContextManager::{create,join,leave,close,export,import}_context`
     ///   call is surfaced through the variant's oneshot reply; the

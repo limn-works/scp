@@ -117,7 +117,7 @@ fn auto_wire_context_manager(
                     tracing::warn!(
                         error = %e,
                         relay_url = %relay_url,
-                        "auto_wire_context_manager: ContextManager wired but failed to \
+                        "auto_wire_supervisor: Supervisor wired but failed to \
                          populate BridgeInstance transport manager — broadcast publish and \
                          discovery may require a manual transport_connect call"
                     );

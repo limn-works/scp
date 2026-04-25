@@ -41,7 +41,7 @@
 //!
 //! [`verify_payment_receipts`] takes `supervisor: &Supervisor`. The
 //! payment adapter is lifted onto the supervisor by
-//! [`Supervisor::attach_context_manager`] (commit 12c.9a). The legacy
+//! [`Supervisor::with_providers`] (commit 12c.9a). The legacy
 //! forwarder on [`ContextManager`] threads `self.supervisor()` into the
 //! helper through the `Weak<Supervisor>` back-pointer installed at
 //! attach time.
@@ -81,7 +81,7 @@ use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
 /// Shared expectation message for `Supervisor::attached_context_manager()`
 /// inside economy helpers (ADR-049 commit 12c.9g.1).
 const ATTACHED_EXPECT: &str = "economy_helpers: Supervisor must be fully attached before helper invocation \
-     (set by Supervisor::attach_context_manager during bridge construction)";
+     (set by Supervisor::with_providers during bridge construction)";
 
 // ---------------------------------------------------------------------------
 // verify_payment_receipts (top-level, actor-handler entry point)

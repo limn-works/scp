@@ -102,7 +102,7 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
                     tracing::warn!(
                         error = %e,
                         relay_url = %relay_url,
-                        "auto_wire_context_manager: ContextManager wired but failed to \
+                        "auto_wire_supervisor: Supervisor wired but failed to \
                          populate BridgeInstance transport manager — broadcast publish and \
                          discovery may require a manual transportConnect call"
                     );

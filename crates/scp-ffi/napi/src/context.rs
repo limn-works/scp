@@ -304,7 +304,7 @@ impl NapiContextHandle {
             .as_ref()
             .ok_or_else(|| ScpNapiError::Context {
                 message: "context does not have a core handle — context was not created via \
-                      ContextManager"
+                      Supervisor"
                     .to_owned(),
                 code: codes::CTX_2024.to_owned(),
             })

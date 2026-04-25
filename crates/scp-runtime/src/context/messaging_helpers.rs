@@ -111,12 +111,12 @@ use crate::context::supervisor::Supervisor;
 /// Shared expectation message for `Supervisor::attached_context_manager()`
 /// and `Supervisor::*_ref()` accessors inside helpers. The attach-time
 /// contract (see
-/// [`Supervisor::attach_context_manager`](crate::context::supervisor::Supervisor::attach_context_manager))
+/// [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers))
 /// installs the manager (and lifts every provider slot) before any FFI
 /// caller or test can invoke a helper, so unwrap is panic-only under a
 /// contract violation.
 const ATTACHED_EXPECT: &str = "messaging_helpers: Supervisor must be fully attached before helper invocation \
-     (set by Supervisor::attach_context_manager during bridge construction)";
+     (set by Supervisor::with_providers during bridge construction)";
 
 /// Alias for the broadcast channel used to fan out [`ContextEvent`]s to
 /// external subscribers (webhook dispatcher, SDK event streams).

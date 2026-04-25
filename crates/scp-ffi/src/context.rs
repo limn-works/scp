@@ -969,7 +969,7 @@ fn bridge_dispatch_create_context(
     outcome.map_err(|e| {
         // Clean up FFI state on ContextManager failure.
         crate::runtime::remove_context(context_id);
-        PyRuntimeError::new_err(format!("ContextManager create_context failed: {e}"))
+        PyRuntimeError::new_err(format!("Supervisor create_context failed: {e}"))
     })
 }
 
@@ -1207,9 +1207,7 @@ fn bridge_dispatch_join_context(
             })?;
         rx.await
             .map_err(|e| PyRuntimeError::new_err(format!("join shim reply dropped: {e}")))?
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}"))
-            })
+            .map_err(|e| PyRuntimeError::new_err(format!("Supervisor join_context failed: {e}")))
     })?;
 
     // §9.10.4: Send pseudonym announcement to inform existing members.
@@ -1365,7 +1363,7 @@ fn py_context_leave(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
             rx.await
                 .map_err(|e| PyRuntimeError::new_err(format!("leave shim reply dropped: {e}")))?
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!("ContextManager leave_context failed: {e}"))
+                    PyRuntimeError::new_err(format!("Supervisor leave_context failed: {e}"))
                 })
         })?;
 
@@ -1478,7 +1476,7 @@ fn py_context_close(handle: &PyContextHandle, identity_did: &str) -> PyResult<()
                 // members left).
                 if !matches!(e, scp_core::context::ContextError::ContextNotRegistered(_)) {
                     return Err(PyRuntimeError::new_err(format!(
-                        "ContextManager close_context failed: {e}"
+                        "Supervisor close_context failed: {e}"
                     )));
                 }
             }
@@ -2198,7 +2196,7 @@ fn py_governance_execute(handle: &PyContextHandle, proposal_json: &str) -> PyRes
                     context_id = %context_id,
                     action = action_name,
                     "failed to sync role state after governance action — \
-                     context not found in ContextManager"
+                     context not registered with Supervisor"
                 );
             }
         }

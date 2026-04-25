@@ -642,7 +642,7 @@ pub fn default_bridge_instance() -> napi::Result<Arc<NapiBridgeInstance>> {
 /// Called by [`crate::identity::ensure_did_resolver_initialized`] before
 /// `DidDht::create()` runs, so that the DID resolver slot owned by
 /// `BridgeInstance` is available. The `ContextManager` is attached later
-/// via [`init_context_manager`] (or [`attach_context_manager_to_bridge`])
+/// via [`init_context_manager`]
 /// once the identity is known. Per spec §12.2.3 the `BridgeInstance`
 /// container has no DID requirement.
 ///
@@ -654,7 +654,7 @@ pub fn ensure_bridge_instance() {
     init_default_bridge_instance();
 }
 
-// `attach_context_manager_to_bridge` deleted in ADR-049 commit
+// the legacy `*_to_bridge` shim was deleted in ADR-049 commit
 // 12c.9g.3. The FFI bridge no longer surfaces an `Arc<ContextManager>`;
 // callers route through `init_supervisor*` and `Supervisor::*` methods.
 
@@ -1441,7 +1441,7 @@ pub async fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpNap
             code: codes::CTX_2000.to_owned(),
         })?
         .ok_or_else(|| ScpNapiError::Context {
-            message: format!("context '{context_id}' not found in ContextManager"),
+            message: format!("context '{context_id}' not registered with Supervisor"),
             code: codes::CTX_2023.to_owned(),
         })?;
 

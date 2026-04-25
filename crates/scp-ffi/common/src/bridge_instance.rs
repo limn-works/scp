@@ -1229,7 +1229,7 @@ impl CoreFields {
                 // hasn't seen its first identity_create / context_create.
                 tracing::debug!(
                     error = %e,
-                    "restore_all_persisted_contexts: skipped (no-op is expected when persistence is not configured or no ContextManager is attached)"
+                    "restore_all_persisted_contexts: skipped (no-op is expected when persistence is not configured or no supervisor is attached)"
                 );
             }
         }
@@ -1747,7 +1747,7 @@ impl CoreFields {
                         tracing::warn!(
                             error = %e,
                             "flush_all_contexts returned an error during shutdown \
-                             (likely ContextManager detached mid-flight) — \
+                             (likely supervisor providers detached mid-flight) — \
                              context state may not be persisted"
                         );
                     }
@@ -1764,7 +1764,7 @@ impl CoreFields {
                 tracing::warn!(
                     error = %e,
                     "shutdown_all_contexts returned an error during shutdown \
-                     (likely ContextManager detached mid-flight)"
+                     (likely supervisor providers detached mid-flight)"
                 );
             }
         }
@@ -1797,7 +1797,7 @@ impl CoreFields {
                 tracing::warn!(
                     error = %e,
                     "flush_all_contexts_sync returned an error during shutdown \
-                     (likely ContextManager detached mid-flight) — \
+                     (likely supervisor providers detached mid-flight) — \
                      context state may not be persisted"
                 );
             }
@@ -1805,7 +1805,7 @@ impl CoreFields {
                 tracing::warn!(
                     error = %e,
                     "shutdown_all_contexts returned an error during shutdown \
-                     (likely ContextManager detached mid-flight)"
+                     (likely supervisor providers detached mid-flight)"
                 );
             }
         }

@@ -134,7 +134,7 @@ use crate::context::supervisor::Supervisor;
 /// contract installs the manager (and lifts every provider slot)
 /// before any FFI caller or test can invoke a helper.
 const ATTACHED_EXPECT: &str = "governance_helpers: Supervisor must be fully attached before helper invocation \
-     (set by Supervisor::attach_context_manager during bridge construction)";
+     (set by Supervisor::with_providers during bridge construction)";
 use crate::context::manager_methods;
 use crate::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,

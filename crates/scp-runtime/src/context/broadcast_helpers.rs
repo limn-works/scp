@@ -47,7 +47,7 @@
 //! [`ContextManager`](crate::context::manager::ContextManager) remain as
 //! one-line forwarders; they thread `self.supervisor()` into each helper
 //! through the `Weak<Supervisor>` back-pointer installed by
-//! [`Supervisor::attach_context_manager`](crate::context::supervisor::Supervisor::attach_context_manager)
+//! [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers)
 //! during bridge construction. These forwarders are deleted alongside
 //! the outer shim in a later ADR-049 commit when the actor handler
 //! body owns the broadcast path directly.
@@ -95,11 +95,11 @@ use crate::context::supervisor::Supervisor;
 
 /// Shared expectation message for `Supervisor::attached_context_manager()`
 /// inside helpers. The attach-time contract (see
-/// [`Supervisor::attach_context_manager`](crate::context::supervisor::Supervisor::attach_context_manager))
+/// [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers))
 /// installs the manager before any FFI caller or test can invoke a
 /// helper, so unwrap is panic-only under a contract violation.
 const ATTACHED_EXPECT: &str = "broadcast_helpers: Supervisor::attached_context_manager must be populated before helper \
-     invocation (set by Supervisor::attach_context_manager during bridge construction)";
+     invocation (set by Supervisor::with_providers during bridge construction)";
 
 // ---------------------------------------------------------------------------
 // 1. subscribe_broadcast (top-level, actor-handler entry point)

@@ -1478,7 +1478,7 @@ pub fn sync_role_state_from_manager(context_id: &str) -> Result<(), ScpPyError> 
         })?
         .ok_or_else(|| {
             ScpPyError::context(format!(
-                "context '{context_id}' not found in ContextManager"
+                "context '{context_id}' not registered with Supervisor"
             ))
         })?;
 

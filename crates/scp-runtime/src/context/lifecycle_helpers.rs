@@ -111,7 +111,7 @@ use crate::context::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 /// Shared expectation message for `Supervisor::attached_context_manager()`
 /// inside helpers (ADR-049 commit 12c.9d).
 const ATTACHED_EXPECT: &str = "lifecycle_helpers: Supervisor must be fully attached before helper invocation \
-     (set by Supervisor::attach_context_manager during bridge construction)";
+     (set by Supervisor::with_providers during bridge construction)";
 
 // ---------------------------------------------------------------------------
 // 1. export_context (top-level)

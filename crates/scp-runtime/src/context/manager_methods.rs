@@ -44,7 +44,7 @@
 //! [`ContextManager`](crate::context::manager::ContextManager) remain as
 //! one-line forwarders that thread `self.supervisor()` into each helper
 //! through the `Weak<Supervisor>` back-pointer installed by
-//! [`Supervisor::attach_context_manager`](crate::context::supervisor::Supervisor::attach_context_manager)
+//! [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers)
 //! during bridge construction. The forwarders are deleted alongside the
 //! outer shim in commit 12c.9g.4.
 //!
@@ -176,7 +176,7 @@ pub async fn relock_context(
 /// Returns [`ContextError::ContextNotRegistered`] if the context is not
 /// in the map, OR [`ContextError::NotInitialized`] if the supervisor's
 /// per-context map slot has not been populated by
-/// [`Supervisor::attach_context_manager`].
+/// [`Supervisor::with_providers`].
 pub fn get_context_arc(
     supervisor: &Supervisor,
     context_id: &str,

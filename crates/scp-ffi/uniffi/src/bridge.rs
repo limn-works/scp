@@ -5982,7 +5982,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             })
         })?
         .ok_or_else(|| {
-            format!("context '{context_id}' not found in ContextManager for capability check")
+            format!("context '{context_id}' not registered with Supervisor for capability check")
         })?;
 
         if scp_core::context::tools::invoke::has_tool_invoke_capability(
