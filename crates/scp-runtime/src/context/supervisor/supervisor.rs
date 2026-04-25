@@ -53,7 +53,7 @@ use crate::context::actor::outcome::Outcome;
 use crate::context::actor::sequence::SendSequenceTracker;
 use crate::context::actor::state::WrappingKeyPair;
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use crate::context::manager::{ContextManager, ContextPersistence, PerContextState};
+use crate::context::manager::{ContextPersistence, PerContextState};
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::context::supervisor::saga_journal::{
     JournalEntry, SagaId, SagaJournal, SagaState, SagaTerminalState,
@@ -232,131 +232,78 @@ pub struct Supervisor {
     /// Per-context crash-count windows (respawn budget state).
     #[allow(dead_code)] // populated by watchdog in commit 11
     pub(in crate::context::supervisor) crash_windows: DashMap<String, CrashWindow>,
-    /// Transitional bridge to the legacy [`ContextManager`].
-    ///
-    /// During the commits-7-to-11 migration window the supervisor
-    /// dispatches queries through the actor-shape handler while all
-    /// mutating paths continue to run on `ContextManager`. This field
-    /// holds the shared reference the shim reads through; it is `None`
-    /// before `attach_context_manager` is called (the field is wired by
-    /// the bridge after both the supervisor and the context manager are
-    /// constructed — see commit-7 bridge wiring).
-    ///
-    /// Deleted in commit 12 with `ContextManager`.
-    context_manager_bridge: OnceLock<Arc<ContextManager>>,
 
     // -----------------------------------------------------------------
-    // ADR-049 commit 12c.9a — providers lifted from ContextManager.
+    // ADR-049 commit 12 — providers lifted from ContextManager (now
+    // authoritative on Supervisor).
     //
-    // During this commit the supervisor holds its own copies of each
-    // provider in `OnceLock`s populated by
-    // [`Self::attach_context_manager`]. [`ContextManager`] continues to
-    // own its own fields (same pointers inside the same `Arc`) so the
-    // `ContextManager::X_ref()` accessors remain byte-identical — this
-    // commit is additive plumbing and zero behavior change. In 12c.9c
-    // onwards, helpers migrate to reading these fields directly through
-    // `&Supervisor` and ContextManager's copies become dead.
+    // Each `OnceLock<Arc<...>>` provider slot is populated directly by
+    // [`Self::with_providers`]. There is no `ContextManager` to attach
+    // — the supervisor IS the source of truth for every provider after
+    // commit 12. Slots are still wrapped in `OnceLock` so the
+    // [`Self::for_query_shim`] constructor path (used by tests +
+    // saga-only call sites) can build a supervisor without providers
+    // and the FFI layer can populate them once at construction time.
     //
-    // All non-Option providers are `OnceLock<Arc<dyn ...>>`. Option-
-    // valued slots (`persistence`, `payment_adapter`, `event_tx`) wrap
-    // the manager's `Option<Arc<...>>` inside their `OnceLock`. The
-    // accessors flatten both the OnceLock-empty ("not attached") and
-    // the inner-None ("attached but not configured") cases to `None`
-    // at the public surface — helper callers arrive after
-    // `attach_context_manager` in production, so collapsing the two
-    // Nones yields the same observable behaviour as the manager's
-    // `Option<&Arc<...>>` signatures while avoiding
-    // `Option<Option<...>>` (flagged by clippy::option_option).
+    // Provider OnceLocks return `Option<&...>` from their accessors —
+    // helpers that consult them either soft-fallback or surface
+    // `ContextError::NotInitialized`. The supervisor-authoritative
+    // direct fields below (`contexts`, `local_dids`,
+    // `standing_contexts`, `next_generation`) are eagerly initialized
+    // in [`Self::new`] and their accessors do not return `Option`.
     // -----------------------------------------------------------------
-    /// Shared crypto provider. Populated from
-    /// [`ContextManager::crypto_ref`] during
-    /// [`Self::attach_context_manager`]. Deleted in 12c.9e with
-    /// `MlsCryptoProvider` concrete type (the old
-    /// `ContextCryptoProvider` trait was deleted in 12c.9e).
-    #[allow(dead_code)] // read in 12c.9c when helpers migrate to &Supervisor
+    /// Shared crypto provider. Populated by [`Self::with_providers`].
     crypto: OnceLock<Arc<crate::crypto::mls::provider::MlsCryptoProvider>>,
-    /// Shared transport provider. Populated from
-    /// [`ContextManager::transport_ref`].
-    #[allow(dead_code)] // read in 12c.9c when helpers migrate to &Supervisor
+    /// Shared transport provider. Populated by [`Self::with_providers`].
     transport: OnceLock<Arc<dyn ContextTransportProvider>>,
-    /// Shared event-log provider. Populated from
-    /// [`ContextManager::event_log_ref`].
-    #[allow(dead_code)] // read in 12c.9c when helpers migrate to &Supervisor
+    /// Shared event-log provider. Populated by [`Self::with_providers`].
     event_log: OnceLock<Arc<dyn ContextEventLogProvider>>,
-    /// Optional persistence provider — the ContextManager-side copy,
-    /// distinct from the supervisor-scoped `persistence` field above.
-    /// The outer `OnceLock` distinguishes "not yet attached" from
-    /// "attached but `None` (no persistence)"; the inner `Option`
-    /// carries the manager's actual configuration (whose
-    /// [`ContextManager::persistence_ref`] is itself `Option`-valued).
-    ///
-    /// In 12c.9a the two fields co-exist because the supervisor's own
-    /// field is used by the saga coordinator while the manager's copy
-    /// feeds the hoisted `lifecycle_helpers` paths. Commits 12c.9c +
-    /// later collapse the two into one once every caller migrates to
-    /// `&Supervisor`.
-    #[allow(dead_code)] // read in 12c.9d when lifecycle helpers migrate
-    cm_persistence: OnceLock<Option<Arc<dyn ContextPersistence>>>,
-    /// Wall-clock source. Populated from
-    /// [`ContextManager::clock_ref`]. Shared ownership via `Arc<dyn Clock>`.
-    #[allow(dead_code)] // read in 12c.9c when helpers migrate to &Supervisor
+    /// Optional helper-side persistence slot — populated by
+    /// [`Self::with_providers`] only when the caller passes
+    /// `Some(persistence)`. Distinct from the supervisor-saga
+    /// [`Self::persistence`] field above (which is always populated;
+    /// defaults to the no-op stub). Helpers branch on
+    /// `persistence_ref().is_some()` to skip best-effort persist
+    /// calls when no real backend is wired.
+    helper_persistence: OnceLock<Arc<dyn ContextPersistence>>,
+    /// Wall-clock source. Populated by [`Self::with_providers`] (or
+    /// defaulted to [`scp_primitives::SystemClock`] when the caller
+    /// passes `None`).
     clock: OnceLock<Arc<dyn Clock>>,
     /// Key resolver for governance signature verification. The type is
     /// itself an `Arc<dyn Fn(...)>` alias (see
     /// [`scp_protocol::context::governance::KeyResolver`]), so storing a
     /// clone is a reference-count bump.
-    #[allow(dead_code)] // read in 12c.9c when helpers migrate to &Supervisor
     key_resolver: OnceLock<KeyResolver>,
-    /// Optional payment adapter. Outer `OnceLock` disambiguates
-    /// "not yet attached" from "attached but not configured".
-    #[allow(dead_code)] // read in 12c.9d when economy helpers migrate
-    payment_adapter: OnceLock<Option<Arc<dyn PaymentAdapterDyn>>>,
+    /// Optional payment adapter. Empty `OnceLock` means "no adapter
+    /// configured"; populated by [`Self::with_providers`] or the
+    /// post-construction setter [`Self::set_payment_adapter`].
+    payment_adapter: OnceLock<Arc<dyn PaymentAdapterDyn>>,
     /// Optional broadcast sender for fan-out of [`ContextEvent`]s to
-    /// external consumers. Outer `OnceLock` disambiguates "not yet
-    /// attached" from "attached but no channel was created".
-    #[allow(dead_code)] // read in 12c.9c when helpers migrate to &Supervisor
-    event_tx: OnceLock<Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>>,
-    /// Shared task set for TTL timers + governance timeouts — same
-    /// `Arc<Mutex<JoinSet<()>>>` the manager owns.
-    #[allow(dead_code)] // read in 12c.9d when lifecycle helpers migrate
+    /// external consumers. Empty `OnceLock` means "no channel
+    /// configured".
+    event_tx: OnceLock<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+    /// Shared task set for TTL timers + governance timeouts.
     task_set: OnceLock<Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>>,
 
     // -----------------------------------------------------------------
-    // ADR-049 commit 12c.9b — ContextManager per-context map + local
-    // DID registry lifted to the supervisor.
+    // ADR-049 commit 12 — supervisor-authoritative direct fields.
     //
-    // Second phase of the 8-phase deletion series: adds a mirror of
-    // [`ContextManager::contexts`] (the per-context `PerContextState`
-    // map) and exposes [`ContextManager::local_dids`] through a
-    // supervisor-level accessor so 12c.9c-g helpers can stop taking
-    // `&ContextManager` and route through `&Supervisor` instead.
-    //
-    // `cm_contexts` is an `OnceLock<Arc<DashMap<...>>>`, populated in
-    // [`Self::attach_context_manager`]. Identity with the manager's
-    // own field is preserved because the source is already an `Arc`
-    // — `Arc::clone` only bumps the reference count.
-    //
-    // `local_dids` does NOT get its own OnceLock slot: the manager's
-    // field is `RwLock<HashSet<DID>>` (not `Arc<RwLock<...>>`), so a
-    // copy would diverge from the source over time. The accessor
-    // [`Self::local_dids_ref`] delegates to the attached manager's own
-    // [`ContextManager::local_dids_ref`] via `context_manager_bridge`,
-    // returning `None` when the supervisor has not been attached —
-    // observationally equivalent to the OnceLock pattern used for
-    // the Arc-wrapped fields. 12c.9c-g callers don't care how the
-    // accessor is implemented; they care that a method on `&Supervisor`
-    // returns `Option<&RwLock<HashSet<DID>>>`. A later cleanup (inside
-    // the deletion series) can restructure the manager's field to
-    // `Arc<RwLock<...>>` and migrate to a proper OnceLock mirror if
-    // the Arc clone is worthwhile, but the behaviour-change budget for
-    // 12c.9b is zero, so nothing is restructured here.
+    // These were previously mirrored from [`ContextManager`]. The
+    // supervisor now owns them directly; eagerly initialized in
+    // [`Self::new`].
     // -----------------------------------------------------------------
-    /// Shared per-context state map. Populated from
-    /// [`ContextManager::contexts_arc`] during
-    /// [`Self::attach_context_manager`]. Same `Arc<DashMap>` allocation
-    /// the manager owns — identity-preserving clone.
-    #[allow(dead_code)] // first caller lands in 12c.9c
-    cm_contexts: OnceLock<Arc<ContextsMap>>,
+    /// Shared per-context state map. Eagerly initialized in
+    /// [`Self::new`] as an empty `Arc<DashMap>`; subsequent inserts
+    /// land via [`crate::context::manager_methods::insert_context`].
+    contexts: Arc<ContextsMap>,
+    /// Global monotonic counter for assigning generation IDs to
+    /// contexts. Starts at 1 so generation 0 (the `#[serde(default)]`
+    /// value for legacy snapshots) is never actively assigned.
+    /// Incremented with `Relaxed` ordering — uniqueness is guaranteed
+    /// by the `fetch_add` atomicity, and no other memory accesses
+    /// depend on the ordering.
+    next_generation: std::sync::atomic::AtomicU64,
 
     /// Concurrent-saga guard. `true` iff a saga is currently in flight
     /// (Initiated / PreparingA / PreparingB / Committing). A second
@@ -395,23 +342,20 @@ impl Supervisor {
             key_package_stores: DashMap::new(),
             health_config,
             crash_windows: DashMap::new(),
-            context_manager_bridge: OnceLock::new(),
-            // ADR-049 commit 12c.9a — providers lifted from
-            // ContextManager. Populated by `attach_context_manager`.
+            // ADR-049 commit 12 — providers lifted from
+            // ContextManager. Populated by `with_providers`.
             crypto: OnceLock::new(),
             transport: OnceLock::new(),
             event_log: OnceLock::new(),
-            cm_persistence: OnceLock::new(),
+            helper_persistence: OnceLock::new(),
             clock: OnceLock::new(),
             key_resolver: OnceLock::new(),
             payment_adapter: OnceLock::new(),
             event_tx: OnceLock::new(),
             task_set: OnceLock::new(),
-            // ADR-049 commit 12c.9b — ContextManager state map lifted
-            // to the supervisor. Populated by `attach_context_manager`.
-            // `local_dids` is not mirrored (see field-group comment);
-            // the accessor delegates through `context_manager_bridge`.
-            cm_contexts: OnceLock::new(),
+            // ADR-049 commit 12 — direct authoritative state.
+            contexts: Arc::new(DashMap::new()),
+            next_generation: std::sync::atomic::AtomicU64::new(1),
             saga_pending_guard: std::sync::atomic::AtomicBool::new(false),
         }
     }
@@ -434,34 +378,24 @@ impl Supervisor {
     }
 
     /// Construct a supervisor with the providers that previously lived on
-    /// [`ContextManager`] (ADR-049 commit 12c.9g.3.6).
+    /// [`crate::context::manager::ContextManager`] (ADR-049 commit 12).
     ///
-    /// FFI bridges previously called [`ContextManager::new`] (or
-    /// [`ContextManager::with_persistence`]) and then
-    /// [`Self::attach_context_manager`] to wire the manager into the
-    /// supervisor. This factory collapses both steps into one call so the
-    /// FFI layer never has to construct or even reference a
-    /// [`ContextManager`]. Internally it still builds a manager and
-    /// invokes [`Self::attach_context_manager`] — the actor handlers and
-    /// hoisted helpers that landed in commits 12c.9c-g still fish
-    /// `attached_context_manager()` for the `clock` / `key_resolver` /
-    /// `local_dids` / `standing_contexts` / `next_generation` /
-    /// per-context state-map accessors that have not yet been lifted to
-    /// the supervisor's own fields. Commit 12c.9g.3.7 deletes the
-    /// internal `ContextManager` construction once those last accessors
-    /// migrate.
+    /// The supervisor is now the authoritative owner of every provider —
+    /// there is no `ContextManager` to attach. FFI bridges call this
+    /// factory once at construction time; the returned `Arc<Supervisor>`
+    /// is the only handle they hold.
     ///
-    /// Saga journal + supervisor-level persistence are wired with the
-    /// same no-op stubs [`Self::for_query_shim`] uses — saga
-    /// orchestration is not yet active in the FFI bridges (it lands with
-    /// the watchdog migration in commit 12c.10), and the supervisor's own
-    /// persistence slot is distinct from the manager's `cm_persistence`
-    /// (the latter is what helper paths actually read; see the
-    /// `cm_persistence` field doc).
+    /// Saga journal + supervisor-level persistence wire to no-op stubs
+    /// the [`Self::for_query_shim`] path uses — saga orchestration is
+    /// not yet active in the FFI bridges (it lands with the watchdog
+    /// migration in commit 12c.10), and the supervisor's own
+    /// persistence slot is wired to a no-op
+    /// [`NoopContextPersistence`] when `persistence` is `None`.
     ///
     /// # Arguments
     ///
-    /// * `crypto` — production [`MlsCryptoProvider`].
+    /// * `crypto` — production
+    ///   [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider).
     /// * `transport` — production transport (typically
     ///   [`scp_core::context::NotConfiguredTransportProvider`],
     ///   [`scp_core::context::LocalTransportProvider`], or a real
@@ -472,15 +406,17 @@ impl Supervisor {
     /// * `key_resolver` — DID-to-Ed25519-key resolver for governance
     ///   signature verification.
     /// * `persistence` — optional context persistence; `None` keeps the
-    ///   manager in-memory.
+    ///   supervisor in-memory only.
+    /// * `payment_adapter` — optional payment adapter for the 9-step
+    ///   paid-action flow (spec §19.2.2).
+    /// * `event_tx` — optional broadcast sender for event fan-out.
+    /// * `clock` — optional [`Clock`] override; defaults to
+    ///   [`scp_primitives::SystemClock`] when `None`.
     ///
     /// # Returns
     ///
-    /// `Arc<Supervisor>` — already wrapped because
-    /// [`Self::attach_context_manager`] requires `self: &Arc<Self>` (the
-    /// downgrade step that installs the back-pointer on the manager). FFI
-    /// bridges keep their per-instance supervisor in an `Arc` slot
-    /// anyway.
+    /// `Arc<Supervisor>` — already wrapped because FFI bridges store
+    /// their per-instance supervisor in an `Arc` slot.
     #[must_use]
     pub fn with_providers(
         crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
@@ -488,300 +424,172 @@ impl Supervisor {
         event_log: Box<dyn ContextEventLogProvider>,
         key_resolver: KeyResolver,
         persistence: Option<Box<dyn ContextPersistence>>,
+        payment_adapter: Option<Arc<dyn PaymentAdapterDyn>>,
+        event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+        clock: Option<Arc<dyn Clock>>,
     ) -> Arc<Self> {
-        let cm = match persistence {
-            Some(p) => Arc::new(ContextManager::with_persistence(
-                crypto,
-                transport,
-                event_log,
-                p,
-                key_resolver,
-            )),
-            None => Arc::new(ContextManager::new(
-                crypto,
-                transport,
-                event_log,
-                key_resolver,
-            )),
-        };
-        let supervisor = Arc::new(Self::for_query_shim());
-        // `attach_context_manager` only fails on a re-attach attempt with a
-        // different pointer; we just constructed the supervisor + manager
-        // pair so a divergent prior attach is unreachable. Use `let _ =`
-        // rather than `.expect(...)` because clippy::expect_used is denied
-        // workspace-wide and the path is genuinely infallible — any failure
-        // would represent a memory-ordering bug detectable by the
-        // [`Self::attach_context_manager`] internal `OnceLock` checks
-        // (which return a typed error rather than panicking).
-        if let Err(err) = supervisor.attach_context_manager(&cm) {
-            tracing::error!(
-                error = %err,
-                "Supervisor::with_providers — attach_context_manager failed for a freshly \
-                 constructed supervisor + manager pair; this should be unreachable and indicates \
-                 an impl bug"
-            );
+        // The supervisor's own `persistence` field is non-Option (saga
+        // code requires a value); when the caller passes `None`, wire
+        // the no-op stub the `for_query_shim` path uses. The
+        // helper-side `helper_persistence` slot stays empty in that
+        // case so `persistence_ref()` returns `None` and helpers skip
+        // best-effort persist calls.
+        let supervisor_persistence: Arc<dyn ContextPersistence>;
+        let helper_persistence_arc: Option<Arc<dyn ContextPersistence>>;
+        match persistence {
+            Some(boxed) => {
+                let arc: Arc<dyn ContextPersistence> = Arc::from(boxed);
+                supervisor_persistence = Arc::clone(&arc);
+                helper_persistence_arc = Some(arc);
+            }
+            None => {
+                supervisor_persistence = Arc::new(NoopContextPersistence);
+                helper_persistence_arc = None;
+            }
         }
+        let saga_journal: Arc<dyn SagaJournal> = Arc::new(NoopSagaJournal);
+        let supervisor = Arc::new(Self::new(
+            supervisor_persistence,
+            saga_journal,
+            SupervisorConfig::default(),
+        ));
+
+        // Populate provider OnceLocks. Each `set(...).is_ok()` returns
+        // false if the slot is already populated — impossible on this
+        // freshly-constructed supervisor, but `let _ = ...` keeps clippy
+        // happy with the discarded `Result`.
+        let _ = supervisor.crypto.set(crypto);
+        let _ = supervisor.transport.set(Arc::from(transport));
+        let _ = supervisor.event_log.set(Arc::from(event_log));
+        if let Some(p) = helper_persistence_arc {
+            let _ = supervisor.helper_persistence.set(p);
+        }
+        let _ = supervisor.key_resolver.set(key_resolver);
+        let clock = clock.unwrap_or_else(|| Arc::new(scp_primitives::SystemClock));
+        let _ = supervisor.clock.set(clock);
+        if let Some(adapter) = payment_adapter {
+            let _ = supervisor.payment_adapter.set(adapter);
+        }
+        if let Some(tx) = event_tx {
+            let _ = supervisor.event_tx.set(tx);
+        }
+        let _ = supervisor.task_set.set(Arc::new(tokio::sync::Mutex::new(
+            tokio::task::JoinSet::new(),
+        )));
+
         supervisor
     }
 
-    /// Attach the legacy [`ContextManager`] used by the commits-7-to-11
-    /// migration shim. The bridge instance constructs both the
-    /// supervisor and the context manager, then calls this method once
-    /// before handing either out to FFI callers.
+    /// Install a payment adapter post-construction. First call wins;
+    /// subsequent calls return [`ContextError::InvalidState`].
     ///
-    /// Idempotent — a second call with the same reference succeeds
-    /// silently; a second call with a different reference returns
-    /// `Err(ContextError::InvalidState(..))` because the supervisor must
-    /// route every query against a stable manager for the full lifetime
-    /// of the bridge instance. Deleted in commit 12 with the bridge
-    /// field itself.
-    ///
-    /// The parameter is taken by reference — the `OnceLock` slot is set
-    /// only when the slot is empty, so the caller's `Arc` is cloned at
-    /// most once. On re-attach with an identical pointer the caller's
-    /// reference is not consumed at all.
+    /// Used by FFI bridges that compose the payment adapter after
+    /// [`Self::with_providers`] runs (typically because the adapter
+    /// depends on a DID resolver wired at a later stage).
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::InvalidState`] if a different
-    /// `ContextManager` was already attached, or if the `OnceLock` slot
-    /// was populated concurrently between the emptiness check and the
-    /// read-back (should not occur under the documented single-attach
-    /// contract but returned rather than panicked on).
-    ///
-    /// # Receiver shape
-    ///
-    /// Takes `self: &Arc<Self>` (ADR-049 commit 12c.9c) so the method
-    /// can derive a [`std::sync::Weak<Supervisor>`] via
-    /// [`Arc::downgrade`] and install it on the attached manager as a
-    /// back-pointer. The manager needs this back-pointer so its
-    /// messaging, broadcast, governance, and economy forwarders
-    /// (`manager/{messaging,broadcast,governance,economy}.rs`) can
-    /// reach the hoisted helpers that now take `&Supervisor` rather
-    /// than `&ContextManager`. The cycle is broken by the `Weak`: the
-    /// supervisor owns `Arc<ContextManager>`, the manager owns
-    /// `Weak<Supervisor>` — dropping the supervisor drops the manager
-    /// drops the weak without leaking.
-    pub fn attach_context_manager(
-        self: &Arc<Self>,
-        manager: &Arc<ContextManager>,
+    /// Returns [`ContextError::InvalidState`] if a payment adapter has
+    /// already been configured.
+    pub fn set_payment_adapter(
+        &self,
+        adapter: Arc<dyn PaymentAdapterDyn>,
     ) -> Result<(), ContextError> {
-        // `OnceLock::set` consumes its argument, so we clone the `Arc`
-        // only when the slot is actually empty. If another caller raced
-        // us, `set` returns Err and we verify the stored value matches.
-        if self.context_manager_bridge.set(Arc::clone(manager)).is_ok() {
-            // First-attach path: populate the lifted-provider slots
-            // (ADR-049 commit 12c.9a). Each slot is an `OnceLock`; set
-            // it atomically from the attached manager's fields. Every
-            // source is an `Arc` / `Option<Arc>` / `KeyResolver` typealias
-            // (itself an `Arc`), so this is ref-count bumps only.
-            //
-            // `set(...).is_ok()` returns `false` when the slot is
-            // already populated — which is impossible on the
-            // first-attach branch (we just observed
-            // `context_manager_bridge` empty), but the compiler does
-            // not know that. Discarding the `Err` is safe because the
-            // only legitimate producer of these `OnceLock`s is this
-            // same branch; a spurious failure would indicate a memory-
-            // ordering bug that would also have failed the
-            // `context_manager_bridge.set` above. Use `let _ = ...` so
-            // clippy does not flag the discarded `Result`.
-            let _ = self.crypto.set(Arc::clone(manager.crypto_ref()));
-            let _ = self.transport.set(Arc::clone(manager.transport_ref()));
-            let _ = self.event_log.set(Arc::clone(manager.event_log_ref()));
-            let _ = self
-                .cm_persistence
-                .set(manager.persistence_ref().map(Arc::clone));
-            let _ = self.clock.set(Arc::clone(manager.clock_ref()));
-            let _ = self
-                .key_resolver
-                .set(Arc::clone(manager.key_resolver_ref()));
-            let _ = self
-                .payment_adapter
-                .set(manager.payment_adapter_ref().map(Arc::clone));
-            let _ = self.event_tx.set(manager.event_tx_ref().cloned());
-            let _ = self.task_set.set(Arc::clone(manager.task_set_ref()));
-            // ADR-049 commit 12c.9b — mirror the manager's per-context
-            // map. `contexts_arc()` returns a freshly-cloned `Arc` to
-            // the same `DashMap` allocation (not a deep copy), so the
-            // supervisor and the manager observe identical per-context
-            // state. `local_dids` has no OnceLock slot — its accessor
-            // delegates via `context_manager_bridge`.
-            let _ = self.cm_contexts.set(manager.contexts_arc());
-            // ADR-049 commit 12c.9c — install the `Weak<Supervisor>`
-            // back-pointer on the manager. This is the final wiring
-            // step in the two-way attach: after this line the
-            // manager's forwarders can reach the helpers through
-            // `self.supervisor().expect(...).as_ref()`. `Arc::downgrade`
-            // is cheap (refcount bump on the weak-count side only),
-            // and the `set_supervisor` contract matches this one
-            // (idempotent on identity, `InvalidState` on divergence).
-            manager.set_supervisor(&Arc::downgrade(self))?;
-            return Ok(());
-        }
-        // `set` returned Err — someone (possibly the same caller)
-        // populated the slot. Accept an identical pointer as idempotent.
-        let existing = self.context_manager_bridge.get().ok_or_else(|| {
+        self.payment_adapter.set(adapter).map_err(|_| {
             ContextError::InvalidState(
-                "Supervisor::attach_context_manager — OnceLock slot observed empty after \
-                 a failed `set`; this should be unreachable and indicates an impl bug"
-                    .to_owned(),
+                "Supervisor::set_payment_adapter — payment adapter already configured".to_owned(),
             )
-        })?;
-        if Arc::ptr_eq(existing, manager) {
-            Ok(())
-        } else {
-            Err(ContextError::InvalidState(
-                "Supervisor::attach_context_manager — a different manager is already \
-                 attached; re-attach is not supported"
-                    .to_owned(),
-            ))
-        }
-    }
-
-    /// Cheap reference to the attached [`ContextManager`]. Returns
-    /// `None` before `attach_context_manager` has been called. Used by
-    /// the query shim.
-    ///
-    /// The method is `pub(in crate::context)` rather than `pub` — FFI
-    /// bridges reach the manager through
-    /// [`CoreFields::try_context_manager`](scp_ffi_common::bridge_instance::CoreFields::try_context_manager)
-    /// and never through `SupervisorHandle`. The `SupervisorHandle`
-    /// capability-reduction contract (plan §"ActorDeps and
-    /// SupervisorHandle") forbids exposing this reference outside the
-    /// runtime crate.
-    #[must_use]
-    pub(in crate::context) fn attached_context_manager(&self) -> Option<&Arc<ContextManager>> {
-        self.context_manager_bridge.get()
+        })
     }
 
     // -------------------------------------------------------------------
-    // ADR-049 commit 12c.9a — lifted-provider accessors.
+    // ADR-049 commit 12 — provider + state accessors.
     //
-    // Each method exposes a slot populated by
-    // `attach_context_manager`. Signatures are fallible (return
-    // `Option<...>`) because the supervisor is constructed before the
-    // [`ContextManager`] in the FFI bridge — `CoreFields::new` calls
-    // `Supervisor::for_query_shim` — so the slots are empty until
-    // `attach_context_manager` runs. In 12c.9c-d helper migrations
-    // will route the None case through [`ContextError::NotInitialized`]
-    // — the same error shape the existing `dispatch_*` methods return
-    // today when reached before attach.
+    // Provider accessors (`crypto_ref`, `transport_ref`, etc.) return
+    // `Option<&...>` because providers are populated only by
+    // [`Self::with_providers`] — the [`Self::for_query_shim`] path
+    // leaves them empty (used by saga + spawn unit tests that don't
+    // touch providers).
     //
-    // For slots whose underlying field on [`ContextManager`] is itself
-    // `Option`-valued (`persistence`, `payment_adapter`, `event_tx`),
-    // the accessor flattens "not attached" and "attached but not
-    // configured" to a single `None`. Callers that need to tell the
-    // two apart can check [`Self::attached_context_manager`] first;
-    // in practice helper paths always run after attach, so the
-    // collapse is observably equivalent to
-    // [`ContextManager::persistence_ref`]'s `Option<&Arc<...>>`.
+    // Direct-state accessors (`contexts_ref`, `contexts_arc`,
+    // `local_dids_ref`, `standing_contexts_ref`, `next_generation_ref`)
+    // return non-Option references — the underlying fields are eagerly
+    // initialized in [`Self::new`] and always populated.
     //
-    // Visibility: `pub(crate)` so the hoisted helper functions can
-    // reach them; external callers go through `SupervisorHandle`.
-    //
-    // `dead_code` allow: first callers arrive in 12c.9c (messaging +
-    // broadcast + governance helpers) and 12c.9d (lifecycle et al.).
-    // Until then the accessors compile as unused-but-tested surface.
+    // Visibility: `pub(crate)` so hoisted helpers can reach them;
+    // external callers go through `SupervisorHandle`.
     // -------------------------------------------------------------------
 
-    /// Cheap reference to the attached manager's shared
+    /// Cheap reference to the supervisor's shared
     /// [`MlsCryptoProvider`](crate::crypto::mls::provider::MlsCryptoProvider).
-    /// Returns `None` before [`Self::attach_context_manager`] has been
-    /// called. See [`ContextManager::crypto_ref`] for the mirrored
-    /// underlying field.
+    /// Returns `None` if [`Self::with_providers`] was not used (e.g. a
+    /// supervisor built via [`Self::for_query_shim`] / [`Self::new`]).
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9c
     pub(crate) fn crypto_ref(
         &self,
     ) -> Option<&Arc<crate::crypto::mls::provider::MlsCryptoProvider>> {
         self.crypto.get()
     }
 
-    /// Cheap reference to the attached manager's shared
-    /// [`ContextTransportProvider`]. Returns `None` before
-    /// [`Self::attach_context_manager`] has been called. See
-    /// [`ContextManager::transport_ref`] for the mirrored underlying
-    /// field.
+    /// Cheap reference to the supervisor's shared
+    /// [`ContextTransportProvider`]. Returns `None` if
+    /// [`Self::with_providers`] was not used.
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9c
     pub(crate) fn transport_ref(&self) -> Option<&Arc<dyn ContextTransportProvider>> {
         self.transport.get()
     }
 
-    /// Cheap reference to the attached manager's shared
-    /// [`ContextEventLogProvider`]. Returns `None` before
-    /// [`Self::attach_context_manager`] has been called. See
-    /// [`ContextManager::event_log_ref`] for the mirrored underlying
-    /// field.
+    /// Cheap reference to the supervisor's shared
+    /// [`ContextEventLogProvider`]. Returns `None` if
+    /// [`Self::with_providers`] was not used.
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9c
     pub(crate) fn event_log_ref(&self) -> Option<&Arc<dyn ContextEventLogProvider>> {
         self.event_log.get()
     }
 
-    /// Cheap reference to the attached manager's persistence slot.
-    /// Returns `None` if [`Self::attach_context_manager`] has not been
-    /// called OR the attached manager has no persistence configured.
-    /// See [`ContextManager::persistence_ref`] for the mirrored
-    /// underlying field.
+    /// Cheap reference to the helper-side persistence slot. Returns
+    /// `None` if [`Self::with_providers`] was not used or the caller
+    /// passed `None` for `persistence` (helpers branch on this to skip
+    /// best-effort persist calls when no real backend is wired).
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9d
     pub(crate) fn persistence_ref(&self) -> Option<&Arc<dyn ContextPersistence>> {
-        self.cm_persistence.get().and_then(Option::as_ref)
+        self.helper_persistence.get()
     }
 
-    /// Cheap reference to the attached manager's wall-clock source.
-    /// Returns `None` before [`Self::attach_context_manager`] has been
-    /// called. See [`ContextManager::clock_ref`] for the mirrored
-    /// underlying field.
+    /// Cheap reference to the supervisor's wall-clock source. Returns
+    /// `None` if [`Self::with_providers`] was not used.
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9c
     pub(crate) fn clock_ref(&self) -> Option<&Arc<dyn Clock>> {
         self.clock.get()
     }
 
-    /// Cheap reference to the attached manager's
+    /// Cheap reference to the supervisor's
     /// [`KeyResolver`](scp_protocol::context::governance::KeyResolver).
-    /// Returns `None` before [`Self::attach_context_manager`] has been
-    /// called. See [`ContextManager::key_resolver_ref`] for the
-    /// mirrored underlying field.
+    /// Returns `None` if [`Self::with_providers`] was not used.
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9c
     pub(crate) fn key_resolver_ref(&self) -> Option<&KeyResolver> {
         self.key_resolver.get()
     }
 
-    /// Cheap reference to the attached manager's payment-adapter slot.
-    /// Returns `None` if [`Self::attach_context_manager`] has not been
-    /// called OR the attached manager has no payment adapter
-    /// configured. See [`ContextManager::payment_adapter_ref`] for the
-    /// mirrored underlying field.
+    /// Cheap reference to the supervisor's payment-adapter slot.
+    /// Returns `None` if no payment adapter has been configured.
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9d
     pub(crate) fn payment_adapter_ref(&self) -> Option<&Arc<dyn PaymentAdapterDyn>> {
-        self.payment_adapter.get().and_then(Option::as_ref)
+        self.payment_adapter.get()
     }
 
-    /// Cheap reference to the attached manager's event fan-out slot.
-    /// Returns `None` if [`Self::attach_context_manager`] has not been
-    /// called OR the attached manager has no event channel configured.
-    /// See [`ContextManager::event_tx_ref`] for the mirrored
-    /// underlying field.
+    /// Cheap reference to the supervisor's event fan-out channel.
+    /// Returns `None` if no event channel has been configured.
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9c
     pub(crate) fn event_tx_ref(
         &self,
     ) -> Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>> {
-        self.event_tx.get().and_then(Option::as_ref)
+        self.event_tx.get()
     }
 
-    /// Cheap reference to the attached manager's shared task-set.
-    /// Returns `None` before [`Self::attach_context_manager`] has been
-    /// called. See [`ContextManager::task_set_ref`] for the mirrored
-    /// underlying field.
+    /// Cheap reference to the supervisor's shared task-set. Returns
+    /// `None` if [`Self::with_providers`] was not used.
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9d
     pub(crate) fn task_set_ref(
         &self,
     ) -> Option<&Arc<tokio::sync::Mutex<tokio::task::JoinSet<()>>>> {
@@ -789,146 +597,50 @@ impl Supervisor {
     }
 
     // -------------------------------------------------------------------
-    // ADR-049 commit 12c.9b — per-context state map + local DID
-    // registry accessors.
-    //
-    // These are the surface 12c.9c-g helpers migrate to when they stop
-    // taking `&ContextManager`. The return types match the manager's
-    // own `contexts_map` / `local_dids_ref` so callers only have to
-    // swap `mgr.contexts_map()` → `supervisor.contexts_ref()?` (and
-    // route the `None` to [`ContextError::NotInitialized`] the same
-    // way the existing `dispatch_*` paths do today).
-    //
-    // `contexts_ref` returns the `Arc<DashMap<...>>` itself (not
-    // `&DashMap`) so callers can either deref-borrow the DashMap for
-    // lookups OR clone the `Arc` into a spawned task — matching the
-    // two use-cases the manager exposes through `contexts_map` +
-    // `contexts_arc`.
-    //
-    // `local_dids_ref` delegates to the attached manager (see
-    // `cm_contexts` field doc for the rationale).
+    // ADR-049 commit 12 — direct-state accessors (always populated).
     // -------------------------------------------------------------------
 
-    /// Cheap reference to the attached manager's per-context state
-    /// map. Returns `None` before [`Self::attach_context_manager`]
-    /// has been called. See [`ContextManager::contexts_arc`] for the
-    /// mirrored underlying field — the `Arc<DashMap>` returned here
-    /// is the same allocation the manager owns.
-    ///
-    /// Callers that only need read-borrowing of the map (the common
-    /// case for synchronous lookups) can `.map(AsRef::as_ref)` to get
-    /// `Option<&DashMap<...>>`; callers that need to clone the `Arc`
-    /// into a spawned task can use the `Arc` directly.
+    /// Cheap reference to the supervisor's per-context state map.
+    /// Always populated — eagerly initialized in [`Self::new`].
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9c
-    pub(crate) fn contexts_ref(&self) -> Option<&Arc<ContextsMap>> {
-        self.cm_contexts.get()
+    pub(crate) fn contexts_ref(&self) -> &Arc<ContextsMap> {
+        &self.contexts
     }
 
-    /// Cheap reference to the attached manager's local-DID registry.
-    /// Returns `None` before [`Self::attach_context_manager`] has
-    /// been called.
-    ///
-    /// Unlike the `Arc`-wrapped provider slots above, this accessor
-    /// does NOT have its own [`OnceLock`] storage: the manager's
-    /// `local_dids` field is a direct [`tokio::sync::RwLock`] (not
-    /// `Arc`-wrapped), so mirroring it on the supervisor without
-    /// restructuring the manager would either duplicate the lock (and
-    /// diverge on writes) or require a ref-lifetime that `OnceLock`
-    /// cannot express. Instead, this method delegates to
-    /// [`ContextManager::local_dids_ref`] through the already-tracked
-    /// `context_manager_bridge` `OnceLock`. The observable contract
-    /// (same `&RwLock<HashSet<DID>>` the manager exposes, or `None`
-    /// before attach) is identical to a mirrored OnceLock slot.
-    ///
-    /// 12c.9c-g callers rewrite
-    /// `mgr.local_dids_ref().read().await` as
-    /// `supervisor.local_dids_ref().ok_or(ContextError::NotInitialized(_))?.read().await`
-    /// — same semantics, routed through the supervisor.
+    /// Returns a freshly-cloned `Arc` to the per-context state map for
+    /// callers that need to move the `Arc` into a spawned task.
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9c
-    pub(crate) fn local_dids_ref(
-        &self,
-    ) -> Option<&tokio::sync::RwLock<std::collections::HashSet<DID>>> {
-        self.context_manager_bridge
-            .get()
-            .map(|mgr| mgr.local_dids_ref())
+    pub(crate) fn contexts_arc(&self) -> Arc<ContextsMap> {
+        Arc::clone(&self.contexts)
     }
 
-    /// Cheap reference to the attached manager's standing-context tracking
-    /// map (peer DID → DID). Returns `None` before
-    /// [`Self::attach_context_manager`] has been called.
+    /// Cheap reference to the supervisor's local-DID registry.
     ///
-    /// Mirrors the [`ContextManager::standing_contexts_ref`] accessor
-    /// added in ADR-049 commit 12c.4. Like
-    /// [`Self::local_dids_ref`], this delegates through the
-    /// `context_manager_bridge` `OnceLock` rather than mirroring the
-    /// underlying `Mutex` on the supervisor — the manager's
-    /// `standing_contexts` field is a direct
-    /// [`tokio::sync::Mutex`] (not `Arc`-wrapped), so duplicating it
-    /// on the supervisor would either diverge on writes or require a
-    /// ref-lifetime `OnceLock` cannot express.
-    ///
-    /// 12c.9g.2 callers rewrite
-    /// `mgr.standing_contexts_ref().lock().await` as
-    /// `supervisor.standing_contexts_ref().ok_or(ContextError::NotInitialized(_))?.lock().await`
-    /// — same semantics, routed through the supervisor.
-    ///
-    /// Note: not to be confused with the `standing_contexts:
-    /// ArcSwap<HashMap<...>>` field on [`Supervisor`] itself, which
-    /// holds the snapshot/restore copy used during attach. This
-    /// accessor returns the live, mutation-tracking `Mutex` owned by
-    /// the attached `ContextManager`.
+    /// The field is `ArcSwap<HashSet<DID>>` per the master plan
+    /// §Supervisor — read sites use `arc_swap.load()` (returns
+    /// `Guard<Arc<HashSet>>`) or `arc_swap.load_full()` (returns
+    /// `Arc<HashSet>`); write sites acquire [`Self::write_lock`] then
+    /// clone-update-store on the snapshot.
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9g.2
-    pub(crate) fn standing_contexts_ref(
-        &self,
-    ) -> Option<&tokio::sync::Mutex<std::collections::HashMap<String, DID>>> {
-        self.context_manager_bridge
-            .get()
-            .map(|mgr| mgr.standing_contexts_ref())
+    pub(crate) fn local_dids_ref(&self) -> &ArcSwap<HashSet<DID>> {
+        &self.local_dids
     }
 
-    /// Returns an owned clone of the attached manager's per-context
-    /// state-map `Arc<DashMap<...>>`. Returns `None` before
-    /// [`Self::attach_context_manager`] has been called.
+    /// Cheap reference to the supervisor's standing-context tracking
+    /// map (peer DID string → peer [`DID`]).
     ///
-    /// Convenience over [`Self::contexts_ref`] for callers that need to
-    /// move the `Arc` into a spawned task (the second use-case the
-    /// manager's [`ContextManager::contexts_arc`] exposes). Equivalent
-    /// to `self.contexts_ref().cloned()` — the cloned `Arc` shares the
-    /// same allocation as the manager's `contexts` field.
-    ///
-    /// 12c.9g.2 callers rewrite `mgr.contexts_arc()` as
-    /// `supervisor.contexts_arc().ok_or(ContextError::NotInitialized(_))?`
-    /// — same semantics, routed through the supervisor.
+    /// `ArcSwap<HashMap<...>>` per the master plan §Supervisor — same
+    /// read/write discipline as [`Self::local_dids_ref`].
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9g.2
-    pub(crate) fn contexts_arc(&self) -> Option<Arc<ContextsMap>> {
-        self.contexts_ref().map(Arc::clone)
+    pub(crate) fn standing_contexts_ref(&self) -> &ArcSwap<HashMap<String, DID>> {
+        &self.standing_contexts
     }
 
-    /// Cheap reference to the attached manager's `next_generation`
-    /// monotonic counter. Returns `None` before
-    /// [`Self::attach_context_manager`] has been called.
-    ///
-    /// The counter feeds [`crate::context::manager_methods::insert_context`]
-    /// via the helper-side `fetch_add` calls inside `import_context` /
-    /// `create_context`. Those pre-fetches are observably redundant with
-    /// `insert_context`'s own stamping (`insert_context` overwrites
-    /// `state.generation` with the fresh value it pulls), but the dual
-    /// increment is preserved here byte-identically with the legacy
-    /// inherent-method form so the post-import counter advances by the
-    /// same delta as before the hoist.
-    ///
-    /// The counter — and this accessor — disappear with [`ContextManager`]
-    /// in ADR-049 commit 12c.9g.4.
+    /// Cheap reference to the supervisor's monotonic generation
+    /// counter. Always populated (initialized to 1 in [`Self::new`]).
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.9g.2
-    pub(crate) fn next_generation_ref(&self) -> Option<&std::sync::atomic::AtomicU64> {
-        self.context_manager_bridge
-            .get()
-            .map(|mgr| mgr.next_generation_ref())
+    pub(crate) fn next_generation_ref(&self) -> &std::sync::atomic::AtomicU64 {
+        &self.next_generation
     }
 
     // -------------------------------------------------------------------
@@ -1046,50 +758,21 @@ impl Supervisor {
     }
 
     /// Build an [`ActorDeps`](crate::context::actor::deps::ActorDeps)
-    /// bundle from the attached legacy [`ContextManager`] (ADR-049 commit
-    /// 12a.5).
+    /// bundle from the supervisor's own provider slots (ADR-049 commit
+    /// 12).
     ///
-    /// Shim-era only. During commits 12a.5 → 12b no `ContextActor` task
-    /// is spawned — handler bodies still delegate to `ContextManager`
-    /// through the supervisor's `dispatch_*` methods. This method
-    /// exists so the test harness can assert every `ActorDeps` field
-    /// populates
-    /// correctly from the legacy manager plus the caller-supplied
-    /// backends (split per ADR §6: `MlsBackend` + `HpkeBackend` +
-    /// `OpenMlsStorageAdapter`) and supervisor-scoped handles
-    /// (`SupervisorHandle`, this identity's `KeyPackageStoreHandle`).
-    ///
-    /// The split-backend and per-identity handles do not exist on the
-    /// legacy `ContextManager` — they're the post-refactor shape — so
-    /// they arrive as parameters here rather than being sourced from
-    /// the attached manager. In commit 12b's `spawn_actor` migration
-    /// this wiring moves inside the supervisor's own spawn path and
-    /// the caller-provided parameters collapse to supervisor-owned
-    /// fields.
-    ///
-    /// # Persistence
-    ///
-    /// [`ActorDeps::persistence`](crate::context::actor::deps::ActorDeps::persistence)
-    /// is `Arc<dyn ContextPersistence>` (non-`Option`), while legacy
-    /// `ContextManager::persistence` is `Option<Arc<...>>`. The caller
-    /// passes a concrete persistence (test harness typically supplies a
-    /// no-op impl). If the attached manager has a `Some(persistence)`,
-    /// callers should pass that `Arc` through; if `None`, callers pass
-    /// a no-op. This method does not perform the substitution itself
-    /// because constructing a no-op lives outside the runtime crate's
-    /// `context/` module (it varies by test harness).
+    /// Reads providers from the supervisor's `OnceLock`s populated by
+    /// [`Self::with_providers`]. Caller-supplied backends (split per
+    /// ADR §6: `MlsBackend` + `HpkeBackend` + `OpenMlsStorageAdapter`)
+    /// and supervisor-scoped handles (`SupervisorHandle`, this
+    /// identity's `KeyPackageStoreHandle`) arrive as parameters
+    /// because they're not part of the supervisor's own owned state.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::NotInitialized`] if no `ContextManager`
-    /// is attached.
-    ///
-    /// # Deleted in commit 12b
-    ///
-    /// This method is a scaffolding point for 12a.5's test; once the
-    /// supervisor owns the spawn path end-to-end, `build_actor_deps`
-    /// replaces this and reads the supervisor's own fields rather than
-    /// the attached manager's.
+    /// Returns [`ContextError::NotInitialized`] if any required
+    /// provider slot is empty (i.e. [`Self::with_providers`] was not
+    /// used).
     ///
     /// # Method receiver
     ///
@@ -1100,8 +783,7 @@ impl Supervisor {
     /// would point at a dangling second supervisor and
     /// [`SupervisorHandle::local_dids`] / [`SupervisorHandle::standing_peer`]
     /// would read empty state.
-    #[cfg(feature = "testing")]
-    pub fn build_actor_deps_from_attached(
+    pub async fn build_actor_deps(
         self: &Arc<Self>,
         persistence: Arc<dyn ContextPersistence>,
         mls: Arc<dyn crate::crypto::mls::backend::MlsBackend>,
@@ -1109,41 +791,40 @@ impl Supervisor {
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
         key_package_store: crate::context::supervisor::key_package_actor::KeyPackageStoreHandle,
     ) -> Result<crate::context::actor::deps::ActorDeps, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::build_actor_deps_from_attached — no ContextManager attached"
-                    .to_owned(),
-            )
-        })?;
+        const ATTACHED: &str =
+            "Supervisor::build_actor_deps — provider slot empty (call with_providers first)";
+        let transport = Arc::clone(
+            self.transport_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?,
+        );
+        let event_log = Arc::clone(
+            self.event_log_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?,
+        );
+        let clock = Arc::clone(
+            self.clock_ref()
+                .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?,
+        );
+        let key_resolver = self
+            .key_resolver_ref()
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?
+            .clone();
 
         let handle = crate::context::supervisor::handle::SupervisorHandle::wrap(Arc::clone(self));
 
         Ok(crate::context::actor::deps::ActorDeps {
-            transport: cm.transport_provider_arc(),
+            transport,
             persistence,
-            event_log: cm.event_log_provider_arc(),
+            event_log,
             supervisor: handle,
             key_package_store,
             mls,
             hpke,
             mls_storage,
-            clock: cm.clock_arc(),
-            event_tx: cm.event_tx_opt(),
-            key_resolver: cm.key_resolver_clone(),
-            payment_adapter: cm.payment_adapter_opt(),
-            // Supervisor owns the authoritative `local_dids` snapshot.
-            // The bundle's field is `Arc<ArcSwap<HashSet<DID>>>` — the
-            // supervisor's own field is `ArcSwap<HashSet<DID>>`
-            // (non-Arc'd). Wrap a fresh `ArcSwap` around the
-            // supervisor's current snapshot so the returned bundle is
-            // clone-cheap. Note: the returned bundle sees the snapshot
-            // AT BUILD-TIME — later supervisor mutations to
-            // `self.local_dids` don't propagate. This matches the
-            // legacy `ContextManager::local_dids` observability:
-            // captured state at read-time, not live view. Post-12b.2b
-            // the authoritative field will live on the supervisor and
-            // this bundle field will hold an `Arc` clone of the
-            // supervisor's own `ArcSwap`, sharing writes live.
+            clock,
+            event_tx: self.event_tx_ref().cloned(),
+            key_resolver,
+            payment_adapter: self.payment_adapter_ref().map(Arc::clone),
             local_dids: Arc::new(arc_swap::ArcSwap::new(self.local_dids.load_full())),
         })
     }
@@ -1178,24 +859,16 @@ impl Supervisor {
     ///   been attached yet — the caller must call
     ///   [`Self::attach_context_manager`] first.
     pub async fn dispatch_query(&self, cmd: QueriesCommand) -> Result<Outcome<()>, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::dispatch_query — no ContextManager attached".to_owned(),
-            )
-        })?;
-
         // Pre-lookup: variants that require a per-context lock all carry
         // a `context_id` field. We route by command variant to preserve
-        // the legacy "context unknown = soft default" contract — see
-        // the variant-by-variant dispatch tables in
-        // `crates/scp-runtime/src/context/manager/queries.rs`.
+        // the legacy "context unknown = soft default" contract.
         match cmd {
             // Variants whose legacy method returns a `ContextError` on
             // unknown context — propagate the error directly.
             QueriesCommand::LocalPseudonym { ref context_id, .. }
             | QueriesCommand::GetBroadcastKeyForLocalAuthor { ref context_id, .. } => {
                 let ctx_id = context_id.clone();
-                Self::dispatch_with_view(cm, &ctx_id, cmd, /*soft_fallback=*/ false).await
+                Self::dispatch_with_view(self, &ctx_id, cmd, /*soft_fallback=*/ false).await
             }
 
             // Variants whose legacy method returns a default value on
@@ -1209,23 +882,22 @@ impl Supervisor {
             | QueriesCommand::PendingCommits { ref context_id, .. }
             | QueriesCommand::CommitFault { ref context_id, .. } => {
                 let ctx_id = context_id.clone();
-                Self::dispatch_with_view(cm, &ctx_id, cmd, /*soft_fallback=*/ true).await
+                Self::dispatch_with_view(self, &ctx_id, cmd, /*soft_fallback=*/ true).await
             }
 
             // `EventLogEntries` takes a 32-byte hash rather than a
-            // context-id string. The legacy method bypasses the
-            // per-context mutex entirely; it delegates straight to
-            // `self.event_log.event_log_entries(...)`. We mirror that
-            // by extracting the reply sender + hash, calling the
-            // provider directly, and sending the typed reply. No view
-            // is constructed because no per-context borrow is needed.
+            // context-id string and delegates straight to the event-log
+            // provider — no per-context lock involved.
             QueriesCommand::EventLogEntries {
                 context_id_bytes,
                 reply,
             } => {
-                let answer = cm
-                    .event_log_provider_arc()
-                    .event_log_entries(&context_id_bytes);
+                let elp = self.event_log_ref().ok_or_else(|| {
+                    ContextError::NotInitialized(
+                        "Supervisor::dispatch_query — event_log provider not configured".to_owned(),
+                    )
+                })?;
+                let answer = elp.event_log_entries(&context_id_bytes);
                 let _ = reply.send(answer);
                 Ok(Outcome::ok(()))
             }
@@ -1236,7 +908,7 @@ impl Supervisor {
             | QueriesCommand::RemainingBudgetForTest { ref context_id, .. }
             | QueriesCommand::VelocityForTest { ref context_id, .. } => {
                 let ctx_id = context_id.clone();
-                Self::dispatch_with_view(cm, &ctx_id, cmd, /*soft_fallback=*/ true).await
+                Self::dispatch_with_view(self, &ctx_id, cmd, /*soft_fallback=*/ true).await
             }
         }
     }
@@ -1335,17 +1007,12 @@ impl Supervisor {
         ctx_id: &str,
         cmd: MessagingCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::dispatch_command — no ContextManager attached".to_owned(),
-            )
-        })?;
-
-        // Resolve the per-context Arc. `ContextNotRegistered` surfaces
-        // directly to the caller — messaging commands have no
+        // Resolve the per-context Arc via the supervisor's lifted
+        // `manager_methods::get_context_arc_pub`. `ContextNotRegistered`
+        // surfaces directly to the caller — messaging commands have no
         // soft-default: a missing context can't encrypt or decrypt a
         // message.
-        let arc = cm.get_context_arc_pub(ctx_id)?;
+        let arc = crate::context::manager_methods::get_context_arc_pub(self, ctx_id)?;
 
         // Phase A: take the tracker out under a brief lock. See the
         // doc comment for the deadlock-avoidance rationale.
@@ -1434,13 +1101,7 @@ impl Supervisor {
         &self,
         cmd: LifecycleCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12c.9d — lifecycle handler takes `&Supervisor`.
-        let _cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::dispatch_lifecycle_command — no ContextManager attached".to_owned(),
-            )
-        })?;
-
+        // ADR-049 commit 12 — lifecycle handler takes `&Supervisor`.
         // `Box::pin` — the combined size of the rebuilt handle,
         // context params, and the per-variant 30s-timeout future
         // crosses clippy's 16-KB stack budget for async futures.
@@ -1474,13 +1135,7 @@ impl Supervisor {
         &self,
         cmd: TtlCloseCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12c.9d — ttl_close handler takes `&Supervisor`.
-        let _cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::dispatch_ttl_close_command — no ContextManager attached".to_owned(),
-            )
-        })?;
-
+        // ADR-049 commit 12 — ttl_close handler takes `&Supervisor`.
         Ok(handlers::ttl_close::dispatch_from_shim(self, cmd).await)
     }
 
@@ -1518,15 +1173,7 @@ impl Supervisor {
         &self,
         cmd: GovernanceCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12c.9c — governance handler takes
-        // `&Supervisor`. Attach check up front preserves the FFI
-        // error surface.
-        let _cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::dispatch_governance_command — no ContextManager attached".to_owned(),
-            )
-        })?;
-
+        // ADR-049 commit 12 — governance handler takes `&Supervisor`.
         // `Box::pin` — see the matching comment on
         // `handlers::governance::dispatch` for the 16-KB stack-future
         // rationale.
@@ -1553,17 +1200,7 @@ impl Supervisor {
         &self,
         cmd: EconomyCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12c.9c — the economy handler now takes
-        // `&Supervisor` (the helper reads `payment_adapter_ref()` off
-        // the lifted slot). Verify the manager is attached up-front so
-        // FFI callers see the same `NotInitialized` error surface as
-        // before the 12c.9c rewire.
-        let _cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::dispatch_economy_command — no ContextManager attached".to_owned(),
-            )
-        })?;
-
+        // ADR-049 commit 12 — economy handler takes `&Supervisor`.
         Ok(handlers::economy::dispatch_from_shim(self, cmd).await)
     }
 
@@ -1584,14 +1221,7 @@ impl Supervisor {
         &self,
         cmd: TrustRecoveryCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12c.9d — trust-recovery handler takes `&Supervisor`.
-        let _cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::dispatch_trust_recovery_command — no ContextManager attached"
-                    .to_owned(),
-            )
-        })?;
-
+        // ADR-049 commit 12 — trust-recovery handler takes `&Supervisor`.
         // `Box::pin` — CreateGovernanceCheckpoint's payload carries
         // multiple 32-byte hashes + a variable-length Ed25519 signature
         // vector; the per-variant locals cross clippy's 16-KB stack-
@@ -1605,28 +1235,31 @@ impl Supervisor {
     /// reply. On soft-fallback + missing context, synthesize the
     /// variant's legacy default via the view-less fallback.
     async fn dispatch_with_view(
-        cm: &Arc<ContextManager>,
+        supervisor: &Supervisor,
         context_id: &str,
         cmd: QueriesCommand,
         soft_fallback: bool,
     ) -> Result<Outcome<()>, ContextError> {
-        // Resolve the per-context Arc explicitly rather than via
-        // `with_query_state`'s closure accessor: the closure path would
-        // force us to move the command (with its oneshot reply sender)
-        // into a sync closure, and `QueriesCommand` is not `Send + Sync
-        // + Unpin` across every variant. Explicit Arc resolution keeps
-        // the lock scope sharp and the future `Send` for the NAPI /
-        // UniFFI spawn paths.
-        let elp = cm.event_log_provider_arc();
-        match cm.get_context_arc_pub(context_id) {
+        // Resolve the per-context Arc via the supervisor's own
+        // `manager_methods::get_context_arc_pub` (lifted in 12c.9g.1).
+        let elp = match supervisor.event_log_ref() {
+            Some(p) => Arc::clone(p),
+            None => {
+                let err = ContextError::NotInitialized(
+                    "Supervisor::dispatch_with_view — event_log provider not configured".to_owned(),
+                );
+                if soft_fallback {
+                    reply_with_soft_default(cmd);
+                } else {
+                    reply_with_error(cmd, err);
+                }
+                return Ok(Outcome::ok(()));
+            }
+        };
+        match crate::context::manager_methods::get_context_arc_pub(supervisor, context_id) {
             Ok(arc) => {
                 let guard = arc.lock().await;
                 handlers::queries::dispatch_from_shim(&guard, &elp, cmd);
-                // Drop the guard explicitly so the per-context mutex is
-                // released before we return — the outer `Ok(...)` does
-                // not use the guard, and clippy's
-                // `significant_drop_tightening` flags the implicit drop
-                // at end-of-scope as unnecessary contention.
                 drop(guard);
                 Ok(Outcome::ok(()))
             }
@@ -1815,13 +1448,7 @@ impl Supervisor {
         &self,
         cmd: StandingCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12c.9d — standing handler takes `&Supervisor`.
-        let _cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::dispatch_standing_command — no ContextManager attached".to_owned(),
-            )
-        })?;
-
+        // ADR-049 commit 12 — standing handler takes `&Supervisor`.
         Ok(Box::pin(handlers::standing::dispatch_from_shim(self, cmd)).await)
     }
 
@@ -1846,13 +1473,7 @@ impl Supervisor {
         &self,
         cmd: ToolsCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12c.9d — tools handler takes `&Supervisor`.
-        let _cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::dispatch_tools_command — no ContextManager attached".to_owned(),
-            )
-        })?;
-
+        // ADR-049 commit 12 — tools handler takes `&Supervisor`.
         Ok(handlers::tools::dispatch_from_shim(self, cmd).await)
     }
 
@@ -1877,15 +1498,7 @@ impl Supervisor {
         &self,
         cmd: BroadcastCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12c.9c — broadcast handlers now take
-        // `&Supervisor`. Verify attach up front so FFI callers see the
-        // familiar `NotInitialized` surface.
-        let _cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::dispatch_broadcast_command — no ContextManager attached".to_owned(),
-            )
-        })?;
-
+        // ADR-049 commit 12 — broadcast handlers take `&Supervisor`.
         Ok(Box::pin(handlers::broadcast::dispatch_from_shim(self, cmd)).await)
     }
 
@@ -1905,14 +1518,7 @@ impl Supervisor {
         cmd: BroadcastCommand,
         custody: &C,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12c.9c — see `dispatch_broadcast_command`.
-        let _cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::dispatch_broadcast_command_with_custody — no ContextManager attached"
-                    .to_owned(),
-            )
-        })?;
-
+        // ADR-049 commit 12 — see `dispatch_broadcast_command`.
         Ok(
             Box::pin(handlers::broadcast::dispatch_from_shim_with_custody(
                 self, cmd, custody,
@@ -2360,50 +1966,19 @@ impl Supervisor {
 
     /// Register a DID as locally controlled by this node / SDK.
     ///
-    /// Mirrors
-    /// [`ContextManager::register_local_did`](crate::context::manager::ContextManager::register_local_did)
-    /// — the registered DIDs participate in the defense-in-depth check
-    /// inside
-    /// [`ContextManager::handle_broadcast_key_request`](crate::context::manager::ContextManager::handle_broadcast_key_request).
     /// Idempotent: registering the same DID twice is a no-op.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
-    ///   been attached yet.
     pub async fn register_local_did(&self, did: DID) -> Result<(), ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::register_local_did — no ContextManager attached".to_owned(),
-            )
-        })?;
-        cm.register_local_did(did).await;
+        crate::context::queries_helpers::register_local_did(self, did).await;
         Ok(())
     }
 
     /// Returns `true` iff `did` is registered as locally controlled.
-    ///
-    /// Mirrors
-    /// [`ContextManager::is_local_did`](crate::context::manager::ContextManager::is_local_did).
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
-    ///   been attached yet.
     pub async fn is_local_did(&self, did: &DID) -> Result<bool, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::is_local_did — no ContextManager attached".to_owned(),
-            )
-        })?;
-        Ok(cm.is_local_did(did).await)
+        Ok(crate::context::queries_helpers::is_local_did(self, did).await)
     }
 
     /// Restore every persisted context from the configured persistence
-    /// provider. Mirrors
-    /// [`ContextManager::restore_all_contexts`](crate::context::manager::ContextManager::restore_all_contexts).
+    /// provider.
     ///
     /// Returns the list of restored context IDs. Contexts in
     /// `Closing` / `Closed` / `Expired` states are skipped (only
@@ -2411,94 +1986,45 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
-    ///   been attached yet.
     /// - [`ContextError::PersistenceFailed`] if the persistence
     ///   provider is unconfigured or `list_persisted_contexts` fails.
     pub async fn restore_all_contexts(&self) -> Result<Vec<String>, ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::restore_all_contexts — no ContextManager attached".to_owned(),
-            )
-        })?;
-        cm.restore_all_contexts().await
+        crate::context::lifecycle_helpers::restore_all_contexts(self).await
     }
 
     /// Best-effort flush of every context's snapshot to the configured
-    /// persistence provider. Mirrors
-    /// [`ContextManager::flush_all_contexts`](crate::context::manager::ContextManager::flush_all_contexts).
+    /// persistence provider.
     ///
-    /// No-op if no persistence provider is configured. Per-context
-    /// lock acquisition is bounded by the manager's
-    /// `FLUSH_LOCK_BUDGET`; contexts that cannot be locked within that
-    /// budget are persisted as a degraded snapshot
-    /// (`needs_reconnect = true`) so the restore path fires the
-    /// reconnection pipeline.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
-    ///   been attached yet.
+    /// No-op if no persistence provider is configured.
     pub async fn flush_all_contexts(&self) -> Result<(), ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::flush_all_contexts — no ContextManager attached".to_owned(),
-            )
-        })?;
-        cm.flush_all_contexts().await;
+        crate::context::lifecycle_helpers::flush_all_contexts(self).await;
         Ok(())
     }
 
-    /// Sync wrapper for [`Self::flush_all_contexts`]. Mirrors
-    /// [`ContextManager::flush_all_contexts_sync`](crate::context::manager::ContextManager::flush_all_contexts_sync).
+    /// Sync wrapper for [`Self::flush_all_contexts`].
     ///
     /// Required by `Drop` and other terminal sync callers that cannot
     /// `.await`. Uses `tokio::runtime::Handle::current` to bridge
     /// sync → async; **callers MUST be inside a tokio runtime**.
     /// No-op if no persistence provider is configured.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
-    ///   been attached yet.
     pub fn flush_all_contexts_sync(&self) -> Result<(), ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::flush_all_contexts_sync — no ContextManager attached".to_owned(),
-            )
-        })?;
-        cm.flush_all_contexts_sync();
+        crate::context::lifecycle_helpers::flush_all_contexts_sync(self);
         Ok(())
     }
 
-    /// Shut down every context the attached manager owns (best-effort,
-    /// local cleanup only). Mirrors
-    /// [`ContextManager::shutdown_all_contexts`](crate::context::manager::ContextManager::shutdown_all_contexts).
+    /// Shut down every context the supervisor owns (best-effort,
+    /// local cleanup only).
     ///
     /// Destroys per-context sender keys + MLS groups + event logs in
     /// that order (zeroize secrets before tearing down structure),
-    /// removes the contexts from the manager's registry, clears the
+    /// removes the contexts from the supervisor's registry, clears the
     /// standing-context tracking, and aborts background tasks (TTL
     /// timers, governance timeouts). Does NOT send leave messages or
     /// notify remote peers — used by
     /// [`scp_ffi_common::BridgeInstance::shutdown`] for process exit /
     /// test teardown.
-    ///
-    /// # Errors
-    ///
-    /// - [`ContextError::NotInitialized`] if no
-    ///   [`ContextManager`](crate::context::manager::ContextManager) has
-    ///   been attached yet.
     pub fn shutdown_all_contexts(&self) -> Result<(), ContextError> {
-        let cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::shutdown_all_contexts — no ContextManager attached".to_owned(),
-            )
-        })?;
-        cm.shutdown_all_contexts();
+        crate::context::lifecycle_helpers::shutdown_all_contexts(self);
         Ok(())
     }
 
@@ -2645,14 +2171,10 @@ impl Supervisor {
         .await
     }
 
-    /// Passthrough to the legacy
-    /// [`ContextManager::try_consume_hard_rate_limit_from_any_context`]
-    /// — runtime-agnostic hard-rate-limit consumption used by FFI
+    /// Runtime-agnostic hard-rate-limit consumption used by FFI
     /// callers that may run inside or outside a tokio runtime.
     ///
-    /// Returns `false` if the bucket is empty or no manager is
-    /// attached. Folded into a real Supervisor handler in commit
-    /// 12c.9g.4.
+    /// Returns `false` if the bucket is empty.
     #[must_use]
     pub fn try_consume_hard_rate_limit_from_any_context(
         self: &Arc<Self>,
@@ -2660,44 +2182,26 @@ impl Supervisor {
         did: &DID,
         now_secs: u64,
     ) -> bool {
-        let Some(cm) = self.attached_context_manager() else {
-            tracing::error!(
-                context_id,
-                "Supervisor::try_consume_hard_rate_limit_from_any_context — no ContextManager \
-                 attached; failing closed"
-            );
-            return false;
-        };
-        let cm = Arc::clone(cm);
-        cm.try_consume_hard_rate_limit_from_any_context(context_id, did, now_secs)
+        crate::context::tools_helpers::try_consume_hard_rate_limit_from_any_context(
+            self, context_id, did, now_secs,
+        )
     }
 
-    /// Passthrough to the legacy
-    /// [`ContextManager::refund_hard_rate_limit_from_any_context`].
-    /// No-op if no manager is attached.
+    /// Refund a hard-rate-limit token from any context (no-op on
+    /// missing context).
     pub fn refund_hard_rate_limit_from_any_context(self: &Arc<Self>, context_id: &str, did: &DID) {
-        let Some(cm) = self.attached_context_manager() else {
-            tracing::error!(
-                context_id,
-                "Supervisor::refund_hard_rate_limit_from_any_context — no ContextManager \
-                 attached; skipping refund"
-            );
-            return;
-        };
-        let cm = Arc::clone(cm);
-        cm.refund_hard_rate_limit_from_any_context(context_id, did);
+        crate::context::tools_helpers::refund_hard_rate_limit_from_any_context(
+            self, context_id, did,
+        );
     }
 
-    /// Passthrough to the legacy
-    /// [`ContextManager::invoke_tool_with_economy`] — invokes a tool
-    /// under the full economy pipeline.
+    /// Invoke a tool under the full economy pipeline.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::NotInitialized`] if no manager is
-    /// attached. Otherwise propagates every error variant the legacy
-    /// method emits (`ContextNotRegistered`, `PermissionDenied`,
-    /// `RateLimited`, schema/economy/UCAN failures).
+    /// Propagates every error variant the helper emits
+    /// (`ContextNotRegistered`, `PermissionDenied`, `RateLimited`,
+    /// schema/economy/UCAN failures).
     #[allow(clippy::too_many_arguments)] // matches legacy signature 1:1
     pub async fn invoke_tool_with_economy<F, Fut>(
         &self,
@@ -2714,12 +2218,8 @@ impl Supervisor {
         F: FnOnce(serde_json::Value) -> Fut,
         Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
     {
-        let cm = self.attached_context_manager().ok_or_else(|| {
-            ContextError::NotInitialized(
-                "Supervisor::invoke_tool_with_economy — no ContextManager attached".to_owned(),
-            )
-        })?;
-        cm.invoke_tool_with_economy(
+        crate::context::tools_helpers::invoke_tool_with_economy(
+            self,
             context_id,
             registry,
             tool_id,
@@ -3234,10 +2734,12 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// Construct a minimal [`crate::context::actor::deps::ActorDeps`] for
-    /// the `spawn_actor_with_state` tests. Builds through the attached
-    /// manager's `build_actor_deps_from_attached` path so we exercise
-    /// real construction rather than invent synthetic mocks.
-    fn test_actor_deps(supervisor: &Arc<Supervisor>) -> crate::context::actor::deps::ActorDeps {
+    /// the `spawn_actor_with_state` tests. Builds through the
+    /// supervisor's `build_actor_deps` path so we exercise real
+    /// construction rather than invent synthetic mocks.
+    async fn test_actor_deps(
+        supervisor: &Arc<Supervisor>,
+    ) -> crate::context::actor::deps::ActorDeps {
         use scp_platform::testing::InMemoryStorage;
 
         let persistence: Arc<dyn ContextPersistence> = Arc::new(TestPersistence);
@@ -3256,15 +2758,16 @@ mod tests {
         );
 
         supervisor
-            .build_actor_deps_from_attached(persistence, mls, hpke, mls_storage, kp_store)
-            .expect("build_actor_deps_from_attached needs manager attached")
+            .build_actor_deps(persistence, mls, hpke, mls_storage, kp_store)
+            .await
+            .expect("build_actor_deps requires providers populated")
     }
 
     /// A tiny `ContextEventLogProvider` that accepts every call and
     /// returns empty data for every read. Exists only so
-    /// [`supervisor_with_manager`] can construct a manager via the
-    /// builder without dragging in the full mock stack from the
-    /// `tests/actor_*_shim.rs` integration harnesses.
+    /// [`supervisor_with_providers`] can construct a supervisor with
+    /// minimal providers without dragging in the full mock stack from
+    /// the `tests/actor_*_shim.rs` integration harnesses.
     struct TestEventLog;
     impl crate::context::builder::ContextEventLogProvider for TestEventLog {
         fn init_event_log(
@@ -3290,14 +2793,14 @@ mod tests {
         }
     }
 
-    /// Build a supervisor WITH an attached `ContextManager` so
+    /// Build a supervisor with minimal providers so
     /// [`test_actor_deps`] can construct `ActorDeps` via the real
-    /// `build_actor_deps_from_attached` path. The `test_supervisor`
-    /// helper above does NOT attach a manager because its saga /
-    /// lookup tests do not need one.
-    fn supervisor_with_manager() -> Arc<Supervisor> {
+    /// `build_actor_deps` path. The plain `test_supervisor` helper
+    /// above does NOT populate providers because its saga / lookup
+    /// tests do not need them.
+    fn supervisor_with_providers() -> Arc<Supervisor> {
         // Minimal providers — the spawn-registry tests only care about
-        // the supervisor's actor map, not the manager's behaviour.
+        // the supervisor's actor map, not the providers' behaviour.
         // `MlsCryptoProvider::new` takes a String DID; the stub DID is
         // never used by the spawn tests because no
         // `create_context` call runs.
@@ -3308,30 +2811,23 @@ mod tests {
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
-        let manager = Arc::new(crate::context::manager::ContextManager::new(
+        let key_resolver: KeyResolver = Arc::new(|_: &DID| None);
+        Supervisor::with_providers(
             crypto,
             transport,
             event_log,
-            Arc::new(|_| None),
-        ));
-
-        let persistence: Arc<dyn ContextPersistence> = Arc::new(TestPersistence);
-        let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
-            scp_platform::testing::InMemoryStorage::new(),
-        )));
-        let supervisor = Arc::new(Supervisor::new(
-            persistence,
-            journal,
-            SupervisorConfig::default(),
-        ));
-        supervisor.attach_context_manager(&manager).unwrap();
-        supervisor
+            key_resolver,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     #[tokio::test]
     async fn spawn_actor_with_state_registers_handle_and_accepts_commands() {
-        let supervisor_arc = supervisor_with_manager();
-        let deps = test_actor_deps(&supervisor_arc);
+        let supervisor_arc = supervisor_with_providers();
+        let deps = test_actor_deps(&supervisor_arc).await;
 
         // Construct a fresh encrypted-mode PerContextState. The
         // context_id is arbitrary for this test — the registry key
@@ -3373,7 +2869,7 @@ mod tests {
         // with the same context_id overwrites. The watchdog / panic-
         // recovery path (commit 11) polices duplicate spawns; this
         // method stays minimal.
-        let supervisor_arc = supervisor_with_manager();
+        let supervisor_arc = supervisor_with_providers();
 
         let ctx_id_bytes = [0xCDu8; 32];
         let ctx_key = hex::encode(ctx_id_bytes);
@@ -3383,7 +2879,7 @@ mod tests {
             1_700_000_000,
             DID("did:example:admin".to_owned()),
         );
-        let deps1 = test_actor_deps(&supervisor_arc);
+        let deps1 = test_actor_deps(&supervisor_arc).await;
         let h1 = supervisor_arc
             .spawn_actor_with_state(state1, deps1, None)
             .await;
@@ -3394,7 +2890,7 @@ mod tests {
             1_700_000_001,
             DID("did:example:admin".to_owned()),
         );
-        let deps2 = test_actor_deps(&supervisor_arc);
+        let deps2 = test_actor_deps(&supervisor_arc).await;
         let h2 = supervisor_arc
             .spawn_actor_with_state(state2, deps2, None)
             .await;
@@ -3403,295 +2899,5 @@ mod tests {
         // Shut down both to avoid leaked tasks.
         let _ = h1.send_shutdown().await;
         let _ = h2.send_shutdown().await;
-    }
-
-    // -----------------------------------------------------------------
-    // ADR-049 commit 12c.9a — lifted-provider accessors
-    // -----------------------------------------------------------------
-
-    /// `attach_context_manager` populates every lifted-provider slot,
-    /// and each slot returns the *same* `Arc` pointer the attached
-    /// [`ContextManager`] exposes through its own `X_ref()` accessors.
-    /// The pointer equality is the mechanical guarantee that
-    /// post-12c.9c helpers reading `&Supervisor` and pre-12c.9c helpers
-    /// reading `&ContextManager` continue to see identical provider
-    /// instances — zero behavior change during the migration window.
-    #[tokio::test]
-    async fn attach_populates_lifted_provider_slots_from_manager() {
-        let supervisor_arc = supervisor_with_manager();
-        let cm = supervisor_arc
-            .attached_context_manager()
-            .expect("supervisor_with_manager attaches a manager");
-
-        // Non-Option slots: the supervisor returns `Some(&Arc)` after
-        // attach; the inner Arc points to the same allocation as the
-        // manager's field.
-        assert!(
-            Arc::ptr_eq(
-                supervisor_arc
-                    .crypto_ref()
-                    .expect("crypto_ref populated after attach"),
-                cm.crypto_ref(),
-            ),
-            "crypto_ref must return the same Arc as the attached manager"
-        );
-        assert!(
-            Arc::ptr_eq(
-                supervisor_arc
-                    .transport_ref()
-                    .expect("transport_ref populated after attach"),
-                cm.transport_ref(),
-            ),
-            "transport_ref must return the same Arc as the attached manager"
-        );
-        assert!(
-            Arc::ptr_eq(
-                supervisor_arc
-                    .event_log_ref()
-                    .expect("event_log_ref populated after attach"),
-                cm.event_log_ref(),
-            ),
-            "event_log_ref must return the same Arc as the attached manager"
-        );
-        assert!(
-            Arc::ptr_eq(
-                supervisor_arc
-                    .clock_ref()
-                    .expect("clock_ref populated after attach"),
-                cm.clock_ref(),
-            ),
-            "clock_ref must return the same Arc as the attached manager"
-        );
-        assert!(
-            Arc::ptr_eq(
-                supervisor_arc
-                    .task_set_ref()
-                    .expect("task_set_ref populated after attach"),
-                cm.task_set_ref(),
-            ),
-            "task_set_ref must return the same Arc as the attached manager"
-        );
-        assert!(
-            Arc::ptr_eq(
-                supervisor_arc
-                    .key_resolver_ref()
-                    .expect("key_resolver_ref populated after attach"),
-                cm.key_resolver_ref(),
-            ),
-            "key_resolver_ref must return the same Arc as the attached manager"
-        );
-
-        // Option slots: `supervisor_with_manager` constructs a manager
-        // via `ContextManager::new` which leaves `persistence`,
-        // `payment_adapter`, and `event_tx` all `None`. The accessors
-        // flatten OnceLock-empty and inner-None to a single `None` —
-        // so the result here is `None`, mirroring the manager's own
-        // `Option<&Arc<...>>` return.
-        assert!(
-            supervisor_arc.persistence_ref().is_none(),
-            "manager has no persistence configured"
-        );
-        assert!(
-            supervisor_arc.payment_adapter_ref().is_none(),
-            "manager has no payment adapter configured"
-        );
-        assert!(
-            supervisor_arc.event_tx_ref().is_none(),
-            "manager has no event channel configured"
-        );
-
-        // But the OnceLock for these slots IS populated — the
-        // `cm_persistence` field holds `Some(None)` post-attach. A
-        // caller that needs to distinguish "not attached" from
-        // "attached but not configured" can check
-        // `attached_context_manager()` first; this test confirms the
-        // OnceLock was populated by observing that non-Option slots
-        // are now Some (above) — they share the same attach hook.
-    }
-
-    /// Before `attach_context_manager`, every lifted-provider accessor
-    /// returns `None`. Confirms the outer-None = "not attached"
-    /// convention documented on each accessor.
-    #[tokio::test]
-    async fn lifted_provider_accessors_return_none_before_attach() {
-        let s = test_supervisor();
-        assert!(s.crypto_ref().is_none());
-        assert!(s.transport_ref().is_none());
-        assert!(s.event_log_ref().is_none());
-        assert!(s.persistence_ref().is_none());
-        assert!(s.clock_ref().is_none());
-        assert!(s.key_resolver_ref().is_none());
-        assert!(s.payment_adapter_ref().is_none());
-        assert!(s.event_tx_ref().is_none());
-        assert!(s.task_set_ref().is_none());
-    }
-
-    /// Re-attaching the same `Arc<ContextManager>` is idempotent: the
-    /// provider accessors still return the same pointers.
-    #[tokio::test]
-    async fn attach_is_idempotent_on_same_manager() {
-        let supervisor_arc = supervisor_with_manager();
-        let cm = supervisor_arc
-            .attached_context_manager()
-            .expect("supervisor_with_manager attaches a manager")
-            .clone();
-
-        // Second attach with the identical Arc must succeed (matches
-        // the documented `attach_context_manager` contract).
-        supervisor_arc
-            .attach_context_manager(&cm)
-            .expect("re-attach with identical Arc must succeed");
-
-        // Accessors still return pointers consistent with the
-        // originally-attached manager — the OnceLock slots are not
-        // rewritten on re-attach, but `cm` is the same `Arc` anyway.
-        assert!(Arc::ptr_eq(
-            supervisor_arc.crypto_ref().expect("still populated"),
-            cm.crypto_ref()
-        ));
-        assert!(Arc::ptr_eq(
-            supervisor_arc.transport_ref().expect("still populated"),
-            cm.transport_ref()
-        ));
-    }
-
-    // -----------------------------------------------------------------
-    // ADR-049 commit 12c.9b — contexts + local_dids accessors
-    // -----------------------------------------------------------------
-
-    /// `attach_context_manager` populates the `cm_contexts` slot, and
-    /// [`Supervisor::contexts_ref`] returns an `Arc<DashMap>` pointing
-    /// at the same allocation the manager's `contexts_arc()` returns.
-    /// Mirrors the 12c.9a identity-preservation contract for the
-    /// per-context state map.
-    #[tokio::test]
-    async fn attach_populates_contexts_slot_with_manager_identity() {
-        let supervisor_arc = supervisor_with_manager();
-        let cm = supervisor_arc
-            .attached_context_manager()
-            .expect("supervisor_with_manager attaches a manager");
-
-        let sup_map = supervisor_arc
-            .contexts_ref()
-            .expect("contexts_ref populated after attach");
-        let mgr_map = cm.contexts_arc();
-        assert!(
-            Arc::ptr_eq(sup_map, &mgr_map),
-            "contexts_ref must return the same Arc<DashMap> as the attached manager"
-        );
-    }
-
-    /// Before `attach_context_manager`, `contexts_ref` and
-    /// `local_dids_ref` both return `None`. The outer-None convention
-    /// is consistent with the 12c.9a accessors.
-    #[tokio::test]
-    async fn contexts_and_local_dids_return_none_before_attach() {
-        let s = test_supervisor();
-        assert!(
-            s.contexts_ref().is_none(),
-            "contexts_ref must be None before attach"
-        );
-        assert!(
-            s.local_dids_ref().is_none(),
-            "local_dids_ref must be None before attach"
-        );
-    }
-
-    /// `local_dids_ref` delegates through `context_manager_bridge` —
-    /// post-attach it returns a pointer identical to the manager's own
-    /// [`ContextManager::local_dids_ref`]. Identity is proven by
-    /// address comparison (`std::ptr::eq`) because the underlying
-    /// `RwLock` is embedded in the manager (not `Arc`-wrapped), so
-    /// pointer equality is the precise mechanical guarantee of "same
-    /// lock, not a divergent copy".
-    #[tokio::test]
-    async fn local_dids_ref_delegates_to_attached_manager() {
-        let supervisor_arc = supervisor_with_manager();
-        let cm = supervisor_arc
-            .attached_context_manager()
-            .expect("supervisor_with_manager attaches a manager");
-
-        let sup_lock = supervisor_arc
-            .local_dids_ref()
-            .expect("local_dids_ref populated after attach");
-        let mgr_lock = cm.local_dids_ref();
-        assert!(
-            std::ptr::eq(sup_lock, mgr_lock),
-            "local_dids_ref must return the same RwLock as the attached manager"
-        );
-    }
-
-    /// Mutations go through the manager-owned `RwLock` and are
-    /// observable via the supervisor's delegating accessor — confirms
-    /// the delegation preserves the single-source-of-truth invariant.
-    #[tokio::test]
-    async fn local_dids_writes_through_manager_visible_via_supervisor() {
-        let supervisor_arc = supervisor_with_manager();
-        let cm = supervisor_arc
-            .attached_context_manager()
-            .expect("supervisor_with_manager attaches a manager");
-
-        let did = DID("did:example:cm-9b-write-through".to_owned());
-        cm.local_dids_ref().write().await.insert(did.clone());
-
-        let sup_view = supervisor_arc
-            .local_dids_ref()
-            .expect("local_dids_ref populated after attach");
-        assert!(
-            sup_view.read().await.contains(&did),
-            "manager writes must be visible via supervisor's delegating accessor"
-        );
-    }
-
-    /// Supervisor's `contexts_ref` and the manager's `contexts_arc`
-    /// observe identical map state at all times — confirmed via
-    /// length-on-both-sides checks before and after a direct map
-    /// mutation on the manager's `Arc<DashMap>`. Identity is proven
-    /// mechanically by `Arc::ptr_eq` in the previous test; this test
-    /// is the observational corollary: any shard-level write is
-    /// visible on both sides because there is exactly one `DashMap`.
-    ///
-    /// Uses the `manager::PerContextState` type — `manager::`
-    /// scoped, `pub(crate)`. We cannot easily construct one because
-    /// the struct has no test helper (it's going to be deleted in
-    /// commit 12). Instead we observe the `len()` of the map via
-    /// both handles before and after a `remove_context` of a
-    /// non-existent key (which is a no-op) to confirm both handles
-    /// wrap the same allocation and report the same size.
-    #[tokio::test]
-    async fn contexts_ref_and_manager_observe_same_map_state() {
-        let supervisor_arc = supervisor_with_manager();
-        let cm = supervisor_arc
-            .attached_context_manager()
-            .expect("supervisor_with_manager attaches a manager");
-
-        let sup_map = supervisor_arc
-            .contexts_ref()
-            .expect("contexts_ref populated after attach");
-        let mgr_map = cm.contexts_arc();
-
-        assert_eq!(
-            sup_map.len(),
-            mgr_map.len(),
-            "supervisor and manager must agree on map size before any writes"
-        );
-
-        // A lookup for a non-existent key through both handles must
-        // produce the same answer — the DashMap shard reads route
-        // through identical internal state.
-        assert_eq!(
-            sup_map.get("absent-ctx").is_some(),
-            mgr_map.get("absent-ctx").is_some()
-        );
-
-        // Inserting an empty-state-free sentinel through one handle
-        // via the raw DashMap API is deliberately avoided — the
-        // inner value type is `Arc<Mutex<PerContextState>>` and
-        // `manager::PerContextState` has no `Default` or test ctor
-        // (it's scheduled for deletion alongside `ContextManager`).
-        // The `Arc::ptr_eq` assertion in the previous test is the
-        // mechanical guarantee of same-allocation; this test
-        // confirms the observable corollary on the public DashMap
-        // surface.
     }
 }
