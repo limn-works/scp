@@ -382,6 +382,20 @@ pub enum OutletError {
         /// Maximum allowed by inbound policy.
         max: u32,
     },
+
+    /// A Query outlet violated the §5.4.2 structural cost floor (SCP-OUT-012).
+    ///
+    /// `OutletKind::Query` outlets MUST declare either no cost or a cost
+    /// whose `amount == 0`, AND MUST NOT carry a `cost_formula`. Declaring
+    /// a positive cost or a pricing formula on a Query outlet is a
+    /// validation failure rejected before the registration reaches the
+    /// event log. Maps to `OutletErrorClass::Protocol::QueryCostViolation`
+    /// per §5.4.4 (typed class lands with SCP-OUT-036/038).
+    #[error("Query outlet cost violation (§5.4.2): {reason}")]
+    QueryCostViolation {
+        /// Human-readable reason — which sub-rule was violated.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

@@ -351,15 +351,19 @@ pub fn py_outlet_register(context_id: &str, registration: &Bound<'_, PyDict>) ->
     // Extract cost metadata (optional, per spec §5.4.1).
     let cost = extract_cost(registration)?;
 
+    // SCP-OUT-012: extract optional `kind` so the §5.4.2 Query cost-floor
+    // check is exercisable end-to-end through the bridge. Defaults to
+    // Action (the §5.4.2 fail-safe). SCP-OUT-017 makes kind REQUIRED at
+    // the SDK surface across all 4 bindings.
+    let kind = extract_kind(registration)?;
+
     // Generate a tool ID from the name (deterministic, human-readable).
     let outlet_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
 
     // Build the scp-core OutletRegistration.
     let core_registration = scp_core::context::tools::OutletRegistration {
         outlet_id,
-        // SCP-OUT-011: bridge constructs default to fail-safe Action per
-        // §5.4.2 until kind plumbing extends to PyO3 (downstream story).
-        kind: scp_core::context::outlets::OutletKind::default(),
+        kind,
         name,
         description,
         schema: scp_core::context::tools::OutletSchema {
@@ -376,7 +380,14 @@ pub fn py_outlet_register(context_id: &str, registration: &Bound<'_, PyDict>) ->
         signature: vec![],
     };
 
-    // Look up the context runtime and register the tool.
+    // Look up the context runtime and register the tool. SCP-OUT-012:
+    // `register_outlet` invokes `OutletRegistration::validate()` first,
+    // which rejects Query+positive-cost (or Query+cost_formula) with
+    // [`OutletError::QueryCostViolation`] before the registration lands
+    // in the registry. The error code surfaces as `SCP-TOOL-6102` at the
+    // runtime governance boundary; here at the bridge we propagate it
+    // through `ScpPyError::context` so the Python caller sees a
+    // `ContextError` carrying the spec citation.
     let registered_id = crate::runtime::with_context(context_id, |rt| {
         let (registered_id, _event) = scp_core::context::tools::register_outlet(
             &mut rt.outlet_registry,
@@ -772,6 +783,36 @@ fn extract_implementation_hash(registration: &Bound<'_, PyDict>) -> PyResult<[u8
     }
 
     Ok(hash)
+}
+
+/// Extracts the optional `kind` field from the registration dict.
+///
+/// Accepts the lowercase strings `"query"` or `"action"` (matching the
+/// §5.4.2 wire form). When the key is absent or `None`, returns
+/// [`OutletKind::default()`] — Action — which is the §5.4.2 fail-safe
+/// default. SCP-OUT-017 makes this field REQUIRED at the SDK surface
+/// across all 4 bindings; SCP-OUT-012 introduces optional plumbing so
+/// the §5.4.2 Query cost-floor check (this story) is exercisable
+/// end-to-end through the `PyO3` bridge.
+fn extract_kind(
+    registration: &Bound<'_, PyDict>,
+) -> PyResult<scp_core::context::outlets::OutletKind> {
+    use scp_core::context::outlets::OutletKind;
+    let val = match registration.get_item("kind")? {
+        Some(v) if !v.is_none() => v,
+        _ => return Ok(OutletKind::default()),
+    };
+    let s: String = val
+        .extract()
+        .map_err(|_| ScpPyError::validation("'kind' must be a string".to_owned()))?;
+    match s.as_str() {
+        "query" => Ok(OutletKind::Query),
+        "action" => Ok(OutletKind::Action),
+        other => Err(ScpPyError::validation(format!(
+            "'kind' must be 'query' or 'action' (§5.4.2 wire vocabulary), got {other:?}"
+        ))
+        .into()),
+    }
 }
 
 /// Extracts optional `cost` metadata from the registration dict.
@@ -1604,12 +1645,15 @@ fn build_outlet_registration_from_py(
     let test_vectors = extract_test_vectors(registration)?;
     let implementation_hash = extract_implementation_hash(registration)?;
     let cost = extract_cost(registration)?;
+    // SCP-OUT-012: optional `kind` (defaults to Action). The §5.4.2
+    // Query cost-floor check runs in `update_outlet` per registry.rs;
+    // accepting `kind` from Python here ensures an update flipping to
+    // Query while retaining a positive cost is rejected.
+    let kind = extract_kind(registration)?;
 
     Ok(scp_core::context::tools::OutletRegistration {
         outlet_id,
-        // SCP-OUT-011: default to fail-safe Action (§5.4.2) until kind
-        // plumbing extends to PyO3 (downstream story).
-        kind: scp_core::context::outlets::OutletKind::default(),
+        kind,
         name,
         description,
         schema: scp_core::context::tools::OutletSchema {

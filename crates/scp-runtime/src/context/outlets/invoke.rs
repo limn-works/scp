@@ -117,6 +117,20 @@ pub enum InvocationError {
         /// The remaining budget for the invoker.
         remaining: u64,
     },
+
+    /// A Query outlet violated the §5.4.2 structural cost floor at the
+    /// runtime event-log commit boundary (SCP-OUT-012).
+    ///
+    /// Surfaces when `OutletRegistration::validate()` fails the second-pass
+    /// re-check inside `ContextManager::execute_register_outlet`. This story
+    /// emits the existing [`InvocationError`] taxonomy; the typed
+    /// `OutletErrorClass::Protocol::QueryCostViolation` lands with
+    /// SCP-OUT-036/038. Error code: `SCP-TOOL-6102`.
+    #[error("Query outlet cost violation (§5.4.2): {reason}")]
+    OutletQueryCostViolation {
+        /// Human-readable reason — which sub-rule was violated.
+        reason: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

@@ -417,6 +417,69 @@ fn tool_register_rejects_empty_name() {
     });
 }
 
+/// SCP-OUT-012 AC: registering a Query outlet with `cost.amount = 1`
+/// fails end-to-end through the `PyO3` bridge. The protocol-level
+/// `OutletRegistration::validate()` rejects the registration with
+/// `OutletError::QueryCostViolation` before it lands in the registry,
+/// and the bridge surfaces the error as a `ContextError`.
+#[test]
+fn outlet_register_rejects_query_with_positive_cost_via_pyo3_bridge() {
+    Python::with_gil(|py| {
+        let did = create_test_identity();
+        let ctx_id = create_test_context(&did);
+
+        // Build a registration shaped exactly like the SDK helper produces,
+        // but flip `kind` to "query" and attach a positive cost — exercises
+        // the §5.4.2 structural floor through the PyO3 wire path.
+        let reg = build_tool_reg(py, "query_paid_outlet", &did);
+        reg.set_item("kind", "query").unwrap();
+        let cost = PyDict::new(py);
+        cost.set_item("amount", 1u64).unwrap();
+        cost.set_item("currency", "USD").unwrap();
+        cost.set_item("payee", &did).unwrap();
+        reg.set_item("cost", cost).unwrap();
+
+        let result = _scp_core::outlets::py_outlet_register(&ctx_id, &reg.as_borrowed());
+        let err = result.expect_err(
+            "Query+cost.amount=1 must be rejected end-to-end through the PyO3 bridge",
+        );
+        let msg = err.to_string();
+        // The bridge propagates the protocol's QueryCostViolation through
+        // ScpPyError::context — the message must mention Query and the
+        // §5.4.2 citation so callers can trace the rejection reason.
+        assert!(
+            msg.contains("Query") || msg.contains("query"),
+            "expected error message to cite Query semantics, got: {msg}"
+        );
+        assert!(
+            msg.contains("§5.4.2") || msg.contains("5.4.2"),
+            "expected error message to cite §5.4.2, got: {msg}"
+        );
+    });
+}
+
+/// SCP-OUT-012 companion: registering a Query outlet with `cost = None`
+/// (or `kind = action` + any cost) succeeds via the `PyO3` bridge — proves
+/// the rejection above is specifically about the §5.4.2 cost floor, not
+/// some unrelated bridge failure.
+#[test]
+fn outlet_register_accepts_query_without_cost_via_pyo3_bridge() {
+    Python::with_gil(|py| {
+        let did = create_test_identity();
+        let ctx_id = create_test_context(&did);
+
+        let reg = build_tool_reg(py, "query_free_outlet", &did);
+        reg.set_item("kind", "query").unwrap();
+        // No `cost` field — should register successfully.
+        let outlet_id = _scp_core::outlets::py_outlet_register(&ctx_id, &reg.as_borrowed())
+            .expect("Query+cost=None must register successfully");
+        assert!(
+            outlet_id.contains("query_free_outlet"),
+            "outlet id should reflect the registered name, got {outlet_id}"
+        );
+    });
+}
+
 // ============================================================================
 // UCAN mint
 // ============================================================================

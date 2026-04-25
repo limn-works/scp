@@ -148,6 +148,60 @@ pub struct OutletRegistration {
     pub signature: Vec<u8>,
 }
 
+impl OutletRegistration {
+    /// Validates structural invariants on the registration that do not
+    /// require any context state — pure on-the-payload checks suitable for
+    /// invocation at registration time and at the runtime event-log commit
+    /// boundary.
+    ///
+    /// # §5.4.2 Query structural cost floor (SCP-OUT-012)
+    ///
+    /// A `Query` outlet MUST declare either `cost == None` or
+    /// `cost.amount == 0`, AND MUST NOT carry a `cost.cost_formula`. A
+    /// dynamic pricing formula on an idempotent read is not coherent
+    /// (§5.4.2). Declaring a positive cost or a pricing formula at
+    /// registration is a validation failure rejected before the
+    /// registration reaches the event log.
+    ///
+    /// `Action` outlets have no structural cost floor — any cost
+    /// configuration is accepted at this layer (§5.4.2). The §5.4.4
+    /// `OutletErrorClass::Protocol::QueryCostViolation` typed class lands
+    /// with SCP-OUT-036/038; this story emits the existing
+    /// [`OutletError::QueryCostViolation`] variant.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletError::QueryCostViolation`] when `kind == Query`
+    /// AND any of:
+    /// - `cost.is_some() && cost.amount > 0` (positive declared cost)
+    /// - `cost.is_some() && cost.cost_formula.is_some()` (dynamic formula)
+    pub fn validate(&self) -> Result<(), OutletError> {
+        if matches!(self.kind, OutletKind::Query)
+            && let Some(cost) = self.cost.as_ref()
+        {
+            if cost.amount > 0 {
+                return Err(OutletError::QueryCostViolation {
+                    reason: format!(
+                        "Query outlet \"{}\" declares positive cost.amount = {} \
+                         (§5.4.2 requires cost == None || cost.amount == 0)",
+                        self.outlet_id, cost.amount
+                    ),
+                });
+            }
+            if cost.cost_formula.is_some() {
+                return Err(OutletError::QueryCostViolation {
+                    reason: format!(
+                        "Query outlet \"{}\" declares cost.cost_formula \
+                         (§5.4.2 forbids dynamic pricing on Query outlets)",
+                        self.outlet_id
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // OutletVerificationResult
 // ---------------------------------------------------------------------------
@@ -260,13 +314,17 @@ impl OutletRegistry {
 /// 3. Implementation hash is 32 bytes (enforced by type system).
 /// 4. Operator DID is resolvable (basic format check).
 /// 5. Tool ID is not already registered.
+/// 6. `OutletRegistration::validate()` — Query structural cost floor
+///    (§5.4.2, SCP-OUT-012).
 ///
 /// On success, stores the registration and returns the tool ID along with a
 /// [`OutletRegisteredEvent`] for the caller to append to the event log.
 ///
 /// # Errors
 ///
-/// Returns [`OutletError`] on validation failure.
+/// Returns [`OutletError`] on validation failure, including
+/// [`OutletError::QueryCostViolation`] when a Query outlet declares a
+/// positive cost or a dynamic cost formula (§5.4.2 structural floor).
 pub fn register_outlet(
     registry: &mut OutletRegistry,
     role_state: &ContextRoleState,
@@ -280,7 +338,13 @@ pub fn register_outlet(
         });
     }
 
-    // 2. Validate schemas.
+    // 2. Pure structural validation (§5.4.2 Query cost floor — SCP-OUT-012).
+    //    Runs before schema validation so a misclassified Query+cost is
+    //    rejected with the precise QueryCostViolation rather than masked
+    //    by an unrelated downstream failure.
+    registration.validate()?;
+
+    // 3. Validate schemas.
     schema::validate_schema(&registration.schema.input_schema)
         .map_err(OutletError::InvalidInputSchema)?;
     schema::validate_schema(&registration.schema.output_schema)
@@ -378,6 +442,12 @@ pub fn update_outlet(
             actual: new_registration.outlet_id,
         });
     }
+
+    // 3b. Pure structural validation (§5.4.2 Query cost floor — SCP-OUT-012).
+    //     An update that flips kind to Query while retaining a positive
+    //     cost (or dynamic cost_formula) MUST be rejected at the same
+    //     boundary as registration.
+    new_registration.validate()?;
 
     // 4. Validate schemas.
     schema::validate_schema(&new_registration.schema.input_schema)
@@ -1661,5 +1731,228 @@ mod tests {
             bytes_q, bytes_a,
             "mutating only kind_byte must flip the canonical hash"
         );
+    }
+
+    // ----- Query structural cost floor (SCP-OUT-012, §5.4.2) -----
+
+    /// Helper for the four-case validate matrix. Returns a registration
+    /// with the requested `kind` and `cost`, schema/`test_vectors` stripped
+    /// to keep the test focused on the cost-floor check.
+    fn validate_fixture(
+        kind: OutletKind,
+        cost: Option<OutletCost>,
+    ) -> OutletRegistration {
+        let mut reg = valid_registration("validate-fixture");
+        reg.kind = kind;
+        reg.cost = cost;
+        reg.test_vectors = Vec::new();
+        reg
+    }
+
+    /// AC1: Action + cost > 0 → accept. Action outlets have no structural
+    /// cost floor (§5.4.2). A positive declared cost is permitted.
+    #[test]
+    fn validate_accepts_action_with_positive_cost() {
+        let reg = validate_fixture(
+            OutletKind::Action,
+            Some(OutletCost {
+                amount: 100,
+                currency: "USD".to_owned(),
+                payee: "did:dht:z6MkPayee".into(),
+                cost_formula: None,
+            }),
+        );
+        assert!(
+            reg.validate().is_ok(),
+            "Action+cost>0 must validate (no structural floor on Action — §5.4.2)"
+        );
+    }
+
+    /// AC2: Action + cost = None → accept. Action outlets accept any cost
+    /// configuration including absence (§5.4.2).
+    #[test]
+    fn validate_accepts_action_with_no_cost() {
+        let reg = validate_fixture(OutletKind::Action, None);
+        assert!(
+            reg.validate().is_ok(),
+            "Action+cost=None must validate (no structural floor on Action — §5.4.2)"
+        );
+    }
+
+    /// AC3: Query + cost > 0 → reject with [`OutletError::QueryCostViolation`].
+    /// A Query outlet declaring a positive per-invocation cost violates
+    /// the §5.4.2 structural floor.
+    #[test]
+    fn validate_rejects_query_with_positive_cost() {
+        let reg = validate_fixture(
+            OutletKind::Query,
+            Some(OutletCost {
+                amount: 1,
+                currency: "USD".to_owned(),
+                payee: "did:dht:z6MkPayee".into(),
+                cost_formula: None,
+            }),
+        );
+        let err = reg.validate().expect_err("Query+cost>0 must be rejected");
+        assert!(
+            matches!(err, OutletError::QueryCostViolation { .. }),
+            "expected QueryCostViolation, got {err:?}"
+        );
+        // Verify the reason mentions the positive cost.
+        if let OutletError::QueryCostViolation { reason } = err {
+            assert!(
+                reason.contains("amount = 1") || reason.contains("amount=1"),
+                "reason should cite the offending amount, got: {reason}"
+            );
+        }
+    }
+
+    /// AC4: Query + cost = None → accept. The structural floor permits an
+    /// absent cost (§5.4.2).
+    #[test]
+    fn validate_accepts_query_with_no_cost() {
+        let reg = validate_fixture(OutletKind::Query, None);
+        assert!(
+            reg.validate().is_ok(),
+            "Query+cost=None must validate per §5.4.2 structural floor"
+        );
+    }
+
+    /// AC4 (companion): Query + `cost { amount = 0, cost_formula = None }`
+    /// → accept. The structural floor permits a present-but-zero cost
+    /// because some auditing flows want the currency/payee fields visible
+    /// even when the per-invocation amount is zero (§5.4.2).
+    #[test]
+    fn validate_accepts_query_with_zero_amount_no_formula() {
+        let reg = validate_fixture(
+            OutletKind::Query,
+            Some(OutletCost {
+                amount: 0,
+                currency: "USD".to_owned(),
+                payee: "did:dht:z6MkPayee".into(),
+                cost_formula: None,
+            }),
+        );
+        assert!(
+            reg.validate().is_ok(),
+            "Query+cost{{amount=0, formula=None}} must validate per §5.4.2"
+        );
+    }
+
+    /// Query + `cost.cost_formula` present → reject. A dynamic pricing
+    /// formula on a Query outlet is forbidden regardless of amount
+    /// (§5.4.2: "a dynamic pricing formula on an idempotent read is not
+    /// coherent").
+    #[test]
+    fn validate_rejects_query_with_cost_formula_even_when_amount_zero() {
+        let reg = validate_fixture(
+            OutletKind::Query,
+            Some(OutletCost {
+                amount: 0,
+                currency: "USD".to_owned(),
+                payee: "did:dht:z6MkPayee".into(),
+                cost_formula: Some("linear".to_owned()),
+            }),
+        );
+        let err = reg
+            .validate()
+            .expect_err("Query+cost_formula must be rejected even at amount=0");
+        assert!(
+            matches!(err, OutletError::QueryCostViolation { .. }),
+            "expected QueryCostViolation, got {err:?}"
+        );
+        if let OutletError::QueryCostViolation { reason } = err {
+            assert!(
+                reason.contains("cost_formula"),
+                "reason should cite cost_formula, got: {reason}"
+            );
+        }
+    }
+
+    /// Defense-in-depth: [`register_outlet`] rejects a Query+cost>0 even
+    /// before the schema check runs — the [`OutletError::QueryCostViolation`]
+    /// surfaces rather than being masked by an unrelated downstream failure.
+    #[test]
+    fn register_outlet_rejects_query_with_positive_cost() {
+        let role_state = test_role_state("did:dht:z6MkCreator");
+        let mut registry = OutletRegistry::new();
+        let mut registration = valid_registration("query-paid");
+        registration.kind = OutletKind::Query;
+        registration.cost = Some(OutletCost {
+            amount: 5,
+            currency: "USD".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
+            cost_formula: None,
+        });
+
+        let result = register_outlet(
+            &mut registry,
+            &role_state,
+            registration,
+            "did:dht:z6MkCreator",
+        );
+        let err = result.expect_err("Query+cost>0 must fail registration");
+        assert!(
+            matches!(err, OutletError::QueryCostViolation { .. }),
+            "expected QueryCostViolation from register_outlet, got {err:?}"
+        );
+        // Registry must remain empty — the registration MUST NOT land.
+        assert!(registry.is_empty(), "rejected registration must not be stored");
+    }
+
+    /// Defense-in-depth: [`update_outlet`] rejects flipping a stored Action
+    /// outlet to Query while retaining a positive cost (§5.4.2 enforced
+    /// at every mutation boundary).
+    #[test]
+    fn update_outlet_rejects_query_with_positive_cost() {
+        let role_state = test_role_state("did:dht:z6MkCreator");
+        let mut registry = OutletRegistry::new();
+
+        // Register a valid Action+cost outlet.
+        let mut original = valid_registration("flip-target");
+        original.kind = OutletKind::Action;
+        original.cost = Some(OutletCost {
+            amount: 50,
+            currency: "USD".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
+            cost_formula: None,
+        });
+        register_outlet(
+            &mut registry,
+            &role_state,
+            original,
+            "did:dht:z6MkCreator",
+        )
+        .unwrap();
+
+        // Try to update by flipping to Query while keeping the positive
+        // cost — must be rejected.
+        let mut flipped = valid_registration("flip-target");
+        flipped.kind = OutletKind::Query;
+        flipped.cost = Some(OutletCost {
+            amount: 50,
+            currency: "USD".to_owned(),
+            payee: "did:dht:z6MkPayee".into(),
+            cost_formula: None,
+        });
+        let err = update_outlet(
+            &mut registry,
+            &role_state,
+            "flip-target",
+            flipped,
+            "did:dht:z6MkCreator",
+        )
+        .expect_err("update flipping to Query+cost>0 must be rejected");
+        assert!(
+            matches!(err, OutletError::QueryCostViolation { .. }),
+            "expected QueryCostViolation from update_outlet, got {err:?}"
+        );
+
+        // Stored registration must still be the original Action+cost.
+        let stored = registry
+            .get("flip-target")
+            .expect("original registration must still exist");
+        assert_eq!(stored.kind, OutletKind::Action);
+        assert_eq!(stored.cost.as_ref().map(|c| c.amount), Some(50));
     }
 }

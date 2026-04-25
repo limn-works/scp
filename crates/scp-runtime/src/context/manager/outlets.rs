@@ -989,5 +989,8 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
         } => ContextError::PermissionDenied(format!(
             "SCP-ECON-12010: budget exceeded for {did}: cost {cost}, remaining {remaining}"
         )),
+        InvocationError::OutletQueryCostViolation { reason } => ContextError::PermissionDenied(
+            format!("SCP-TOOL-6102: Query outlet cost violation (§5.4.2): {reason}"),
+        ),
     }
 }

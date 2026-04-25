@@ -260,6 +260,174 @@ async fn handle_broadcast_key_request_rejects_non_local_did_before_context_looku
 }
 
 // -----------------------------------------------------------------------
+// SCP-OUT-012: Query outlet structural cost floor (§5.4.2)
+// -----------------------------------------------------------------------
+
+/// Helper: build a Query/Action `OutletRegistration` for SCP-OUT-012 tests.
+fn out012_query_reg(
+    outlet_id: &str,
+    kind: scp_protocol::context::outlets::OutletKind,
+    cost: Option<scp_protocol::context::outlets::registry::OutletCost>,
+) -> OutletRegistration {
+    use scp_protocol::context::outlets::registry::OutletSchema;
+    OutletRegistration {
+        outlet_id: outlet_id.to_owned(),
+        kind,
+        name: outlet_id.to_owned(),
+        description: "SCP-OUT-012 fixture".to_owned(),
+        schema: OutletSchema {
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: serde_json::json!({"type": "object"}),
+        },
+        implementation_hash: [0u8; 32],
+        test_vectors: Vec::new(),
+        operator_did: "did:key:test-operator".into(),
+        cost,
+        registered_at: 0,
+        signature: Vec::new(),
+    }
+}
+
+/// Counts the `OutletRegistered` events present in the event log.
+fn out012_count_outlet_events(event_log: &MockEventLogWithActorDid) -> usize {
+    event_log
+        .entries
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, name, _, _, _)| name == "OutletRegistered")
+        .count()
+}
+
+/// SCP-OUT-012 AC: registering a Query outlet with `cost.amount = 1`
+/// fails end-to-end through `ContextManager::execute_register_outlet`
+/// (the runtime event-log commit boundary). The registry is unchanged
+/// and no `OutletRegistered` event lands in the event log.
+#[tokio::test]
+async fn execute_register_outlet_rejects_query_with_positive_cost() {
+    use scp_protocol::context::outlets::OutletKind;
+    use scp_protocol::context::outlets::registry::OutletCost;
+
+    // Use ArcEventLog so we can inspect the event-log contents after
+    // the rejected registration to confirm no event was appended.
+    let event_log = std::sync::Arc::new(MockEventLogWithActorDid::default());
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(ArcEventLog(event_log.clone())),
+        noop_key_resolver(),
+    );
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
+            Capability::OutletRegister,
+        ],
+        ..ContextParams::default()
+    };
+    let _handle = manager
+        .create_context("test-ctx".into(), params, "did:key:creator".into(), None)
+        .await
+        .unwrap();
+
+    // Baseline: no OutletRegistered events landed before the test mutation.
+    assert_eq!(out012_count_outlet_events(&event_log), 0);
+
+    // Bad registration: Query + cost.amount = 1 (§5.4.2 violation).
+    let bad_reg = out012_query_reg(
+        "query-paid",
+        OutletKind::Query,
+        Some(OutletCost {
+            amount: 1,
+            currency: "USD".to_owned(),
+            payee: "did:key:payee".into(),
+            cost_formula: None,
+        }),
+    );
+
+    let pid: ProposalId = [0u8; 32];
+    let err = manager
+        .execute_register_outlet("test-ctx", &bad_reg, pid, "did:key:creator")
+        .await
+        .expect_err("Query+cost.amount=1 must be rejected at the runtime boundary");
+
+    // Verify the typed code surface: SCP-TOOL-6102 (Query cost violation).
+    let err_str = err.to_string();
+    assert!(
+        matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("SCP-TOOL-6102")),
+        "expected PermissionDenied carrying SCP-TOOL-6102, got: {err_str}"
+    );
+    assert!(
+        err_str.contains("§5.4.2"),
+        "error must cite §5.4.2 for traceability, got: {err_str}"
+    );
+
+    // The runtime MUST NOT emit an OutletRegistered event for the rejection.
+    assert_eq!(
+        out012_count_outlet_events(&event_log),
+        0,
+        "rejected Query+cost registration must NOT produce an OutletRegistered event"
+    );
+
+    // Sanity: a subsequent valid Query registration with cost = None
+    // succeeds — proves the rejection was specifically about the cost
+    // (not the ceiling) and the registry is in a clean state.
+    let good_reg = out012_query_reg("query-free", OutletKind::Query, None);
+    manager
+        .execute_register_outlet("test-ctx", &good_reg, pid, "did:key:creator")
+        .await
+        .expect("Query+cost=None must register successfully");
+    assert_eq!(
+        out012_count_outlet_events(&event_log),
+        1,
+        "exactly one OutletRegistered event should land — the valid follow-up"
+    );
+}
+
+/// SCP-OUT-012: a Query outlet with `cost.cost_formula = Some(_)` is
+/// likewise rejected at the runtime event-log commit boundary, even
+/// when `cost.amount = 0` (§5.4.2: dynamic pricing on a Query is
+/// incoherent).
+#[tokio::test]
+async fn execute_register_outlet_rejects_query_with_cost_formula() {
+    use scp_protocol::context::outlets::OutletKind;
+    use scp_protocol::context::outlets::registry::OutletCost;
+
+    let (manager, _handle) = setup_active_context().await;
+
+    let bad_reg = out012_query_reg(
+        "query-formula",
+        OutletKind::Query,
+        Some(OutletCost {
+            amount: 0,
+            currency: "USD".to_owned(),
+            payee: "did:key:payee".into(),
+            cost_formula: Some("linear".to_owned()),
+        }),
+    );
+
+    let pid: ProposalId = [0u8; 32];
+    let err = manager
+        .execute_register_outlet("test-ctx", &bad_reg, pid, "did:key:creator")
+        .await
+        .expect_err("Query+cost_formula must be rejected even at amount=0");
+
+    let err_str = err.to_string();
+    assert!(
+        matches!(err, ContextError::PermissionDenied(ref msg) if msg.contains("SCP-TOOL-6102")),
+        "expected PermissionDenied carrying SCP-TOOL-6102, got: {err_str}"
+    );
+    assert!(
+        err_str.contains("cost_formula"),
+        "error message must cite cost_formula, got: {err_str}"
+    );
+}
+
+// -----------------------------------------------------------------------
 // Collection bounds tests (#360, §5.9)
 // -----------------------------------------------------------------------
 

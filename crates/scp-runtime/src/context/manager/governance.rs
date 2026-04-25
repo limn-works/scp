@@ -3064,6 +3064,19 @@ impl ContextManager {
     /// Registers an outlet in the context. Requires `OutletRegister` in the
     /// context's ceiling (§5.3). Without this capability in the ceiling,
     /// the context does not support outlet registration.
+    ///
+    /// # SCP-OUT-012 — runtime re-check at the event-log commit boundary
+    ///
+    /// [`OutletRegistration::validate()`](scp_protocol::context::outlets::OutletRegistration::validate)
+    /// is invoked HERE, at the runtime event-log commit boundary, before
+    /// the registration is pushed onto `ctx.governance.registered_outlets`
+    /// and before the `OutletRegistered` event is appended to the event
+    /// log. The pure scp-protocol validate runs first at the bridge layer;
+    /// this is the second, defense-in-depth re-check (§5.4.2 Query
+    /// structural cost floor). A Query outlet declaring a positive cost
+    /// (or a `cost_formula`) is rejected with
+    /// [`ContextError::PermissionDenied`] carrying error code
+    /// `SCP-TOOL-6102`, and no event is emitted.
     pub(super) async fn execute_register_outlet(
         &self,
         context_id: &str,
@@ -3071,6 +3084,14 @@ impl ContextManager {
         _proposal_id: ProposalId,
         actor_did: &str,
     ) -> Result<(), ContextError> {
+        // SCP-OUT-012 (§5.4.2): pure structural validate runs BEFORE any
+        // lock acquisition or event-log mutation. A Query outlet declaring
+        // a positive cost (or a cost_formula) is rejected here without
+        // emitting any event.
+        if let Err(err) = registration.validate() {
+            return Err(query_cost_violation_to_context(err));
+        }
+
         let context_id_bytes = context_id_to_bytes(context_id);
 
         let snapshot = {
@@ -6329,5 +6350,30 @@ impl ContextManager {
             ))
         })?;
         Ok(marker)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SCP-OUT-012 helper: map an OutletError from the §5.4.2 Query cost-floor
+// validate() check to the ContextError surface the governance dispatcher
+// returns. Only Query-cost-floor errors flow through this path; any other
+// OutletError variant is upgraded to a generic `PermissionDenied` so the
+// caller still sees a typed rejection rather than a panic.
+// ---------------------------------------------------------------------------
+fn query_cost_violation_to_context(
+    err: scp_protocol::context::outlets::OutletError,
+) -> ContextError {
+    use scp_protocol::context::outlets::OutletError;
+    match err {
+        OutletError::QueryCostViolation { reason } => ContextError::PermissionDenied(format!(
+            "SCP-TOOL-6102: Query outlet cost violation (§5.4.2): {reason}"
+        )),
+        // OutletRegistration::validate() only emits QueryCostViolation
+        // today (SCP-OUT-012). Future structural checks added to validate()
+        // should add explicit arms above; a catch-all keeps the runtime
+        // closed-fail rather than panicking.
+        other => ContextError::PermissionDenied(format!(
+            "SCP-TOOL-6100: outlet registration validation failed: {other}"
+        )),
     }
 }
