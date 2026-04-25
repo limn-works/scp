@@ -89,8 +89,8 @@ use scp_protocol::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext,
 };
 
-use crate::context::state::{context_id_to_bytes, require_active};
 use crate::context::manager_methods;
+use crate::context::state::{context_id_to_bytes, require_active};
 use crate::context::supervisor::Supervisor;
 
 /// Shared expectation message for `Supervisor::attached_context_manager()`

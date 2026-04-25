@@ -49,7 +49,6 @@
 //! plan's "every transport and storage call inside a handler wraps
 //! `tokio::time::timeout(30s, ...)`" contract.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use scp_protocol::context::ContextError;
@@ -472,10 +471,7 @@ async fn handle_send_pseudonym_announcement(
 
     let sk = signing_key.to_signing_key();
     let send_fut = crate::context::messaging_helpers::send_pseudonym_announcement(
-        supervisor,
-        &handle,
-        sender_did,
-        &sk,
+        supervisor, &handle, sender_did, &sk,
     );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {

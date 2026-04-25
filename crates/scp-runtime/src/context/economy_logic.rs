@@ -31,9 +31,6 @@ use scp_protocol::economy::types::PaidActionType;
 
 use crate::economy::adapter::{PaymentAdapterDyn, PaymentReceipt};
 use crate::economy::integration::{self, IntegrationError};
-use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
-
-use super::state::{ContextGeneration, PerContextState};
 
 // ---------------------------------------------------------------------------
 // Spending UCAN signature validation wiring (C1, PR #1606)
@@ -123,7 +120,7 @@ impl RevocationChecker for ContextRevocationChecker<'_> {
 /// - Revocation lookup against the per-context revoked-CID set.
 /// - Nonce reservation against the per-context spending nonce tracker.
 /// - Spending-specific scope, lifetime, and parent attenuation checks.
-pub(crate) fn validate_spending_ucan_or_error(
+pub fn validate_spending_ucan_or_error(
     spending: &scp_protocol::crypto::ucan::UcanToken,
     actor_did: &DID,
     context_id: &str,
@@ -545,7 +542,10 @@ pub fn commit_economy_ticket(
 /// holds the per-context Mutex (Phase 1 error paths under lock).
 ///
 /// Consumes the ticket so the `Drop` guard does not fire.
-pub fn rollback_economy_ticket_inline(ctx: &mut super::state::PerContextState, mut ticket: EconomyTicket) {
+pub fn rollback_economy_ticket_inline(
+    ctx: &mut super::state::PerContextState,
+    mut ticket: EconomyTicket,
+) {
     ticket.consumed = true;
     ctx.governance
         .velocity_tracker

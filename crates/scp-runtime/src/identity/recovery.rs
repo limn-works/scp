@@ -802,10 +802,12 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // Step 2: Advance the MLS epoch for post-compromise security.
         // The ContextManager increments the epoch counter, places the old
         // epoch into the grace window, and emits an event log entry.
-        let result = Self::block_on_async(crate::context::trust_recovery_helpers::recovery_advance_epoch(
-            &self.manager,
-            context_id,
-        ));
+        let result = Self::block_on_async(
+            crate::context::trust_recovery_helpers::recovery_advance_epoch(
+                &self.manager,
+                context_id,
+            ),
+        );
         match result {
             Ok(_epoch) => {
                 // Send a scoped epoch-advance notification including the
@@ -819,14 +821,16 @@ impl RecoveryBackend for ProductionRecoveryBackend {
                 });
                 match serde_json::to_vec(&scoped_payload) {
                     Ok(payload_bytes) => {
-                        let notify_result =
-                            Self::block_on_async(crate::context::trust_recovery_helpers::recovery_send_notification(&self.manager, 
+                        let notify_result = Self::block_on_async(
+                            crate::context::trust_recovery_helpers::recovery_send_notification(
+                                &self.manager,
                                 context_id,
                                 key_rotation.did_after.as_ref(),
                                 &payload_bytes,
                                 0, // sequence 0: MLS epoch-advance notification
                                 &self.signing_key,
-                            ));
+                            ),
+                        );
                         // Notification failure is non-fatal — the epoch was
                         // already advanced, which is the critical security step.
                         if let Err(e) = notify_result {
@@ -896,13 +900,16 @@ impl RecoveryBackend for ProductionRecoveryBackend {
 
         // Distribute the revocation via the context manager's recovery
         // notification channel so all members receive and merge it.
-        let result = Self::block_on_async(crate::context::trust_recovery_helpers::recovery_send_notification(&self.manager, 
-            context_id,
-            key_rotation.did_after.as_ref(),
-            &revocation_payload,
-            1, // sequence 1: UCAN revocation notification
-            &self.signing_key,
-        ));
+        let result = Self::block_on_async(
+            crate::context::trust_recovery_helpers::recovery_send_notification(
+                &self.manager,
+                context_id,
+                key_rotation.did_after.as_ref(),
+                &revocation_payload,
+                1, // sequence 1: UCAN revocation notification
+                &self.signing_key,
+            ),
+        );
         match result {
             Ok(()) => Ok(()),
             Err(mut e) => {
@@ -944,13 +951,16 @@ impl RecoveryBackend for ProductionRecoveryBackend {
 
         // Send the key-package-rotation notification via the recovery
         // notification channel. This records the event and alerts members.
-        let result = Self::block_on_async(crate::context::trust_recovery_helpers::recovery_send_notification(&self.manager, 
-            context_id,
-            sender_did,
-            payload.as_bytes(),
-            2, // sequence 2: key-package rotation notification
-            &self.signing_key,
-        ));
+        let result = Self::block_on_async(
+            crate::context::trust_recovery_helpers::recovery_send_notification(
+                &self.manager,
+                context_id,
+                sender_did,
+                payload.as_bytes(),
+                2, // sequence 2: key-package rotation notification
+                &self.signing_key,
+            ),
+        );
         match result {
             Ok(()) => Ok(()),
             Err(mut e) => {
@@ -1119,13 +1129,16 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // Send via recovery notification. We use a synthetic context ID
         // derived from "identity-private-state" since PSK rotation is
         // identity-scoped, not context-scoped.
-        let result = Self::block_on_async(crate::context::trust_recovery_helpers::recovery_send_notification(&self.manager, 
-            "identity-private-state",
-            "system",
-            &payload,
-            3, // sequence 3: PSK rotation notification
-            &self.signing_key,
-        ));
+        let result = Self::block_on_async(
+            crate::context::trust_recovery_helpers::recovery_send_notification(
+                &self.manager,
+                "identity-private-state",
+                "system",
+                &payload,
+                3, // sequence 3: PSK rotation notification
+                &self.signing_key,
+            ),
+        );
 
         result.is_ok()
     }

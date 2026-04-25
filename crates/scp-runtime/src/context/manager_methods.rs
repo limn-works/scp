@@ -94,11 +94,6 @@ use crate::context::state::{
 };
 use crate::context::supervisor::Supervisor;
 
-/// Shared expectation message for `Supervisor::attached_context_manager()`
-/// inside cross-domain helpers (ADR-049 commit 12c.9g.1).
-const ATTACHED_EXPECT: &str = "manager_methods: Supervisor must be fully attached before helper invocation \
-     (set by Supervisor::attach_context_manager during bridge construction)";
-
 // ---------------------------------------------------------------------------
 // 1. lock_context
 // ---------------------------------------------------------------------------

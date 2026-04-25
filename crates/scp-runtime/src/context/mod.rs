@@ -32,14 +32,14 @@ pub mod app_sandbox;
 pub(crate) mod broadcast_helpers;
 pub mod builder;
 pub(crate) mod economy_helpers;
+pub(crate) mod economy_logic;
 pub mod export_import;
 pub mod governance;
 pub(crate) mod governance_helpers;
+pub(crate) mod governance_logic;
 pub mod key_destruction;
 pub(crate) mod lifecycle_helpers;
 pub(crate) mod lifecycle_logic;
-pub(crate) mod economy_logic;
-pub(crate) mod governance_logic;
 pub(crate) mod manager_methods;
 pub(crate) mod messaging_helpers;
 pub mod persistence;
@@ -201,8 +201,9 @@ const fn _assert_send_sync() {
 // persistence (ADR-049 commit 12).
 // ---------------------------------------------------------------------------
 
-/// Constructs a fresh test-only [`supervisor::Supervisor`] from the
-/// caller-supplied providers. Mirror of the legacy
+/// Constructs a fresh test-only [`supervisor::Supervisor`].
+///
+/// Mirror of the legacy
 /// `attach_test_supervisor(ContextManager::new(...))` shorthand: the
 /// `ContextManager` type is gone in commit 12, so callers now build a
 /// supervisor directly via [`supervisor::Supervisor::with_providers`].

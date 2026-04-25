@@ -102,10 +102,10 @@ use scp_protocol::trust::consequence::{ConsequenceRule, evaluate_consequence_rul
 use crate::context::ContextHandle;
 use crate::context::builder::ContextEventLogProvider;
 use crate::context::governance_helpers;
+use crate::context::manager_methods;
 use crate::context::state::{
     self, PSEUDONYM_ANNOUNCEMENT_TAG, PerContextState, PseudonymAnnouncement,
 };
-use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
 
 /// Shared expectation message for `Supervisor::attached_context_manager()`
@@ -289,23 +289,25 @@ pub fn enforce_send_economy(
         .message_pricing
         .as_ref()
         .unwrap_or(&pricing_default);
-    crate::context::economy_logic::enforce_economy(crate::context::economy_logic::EnforceEconomyRequest {
-        economic_policy: governance.economic_policy.as_ref(),
-        budget_tracker: &mut governance.budget_tracker,
-        velocity_tracker: &governance.velocity_tracker,
-        member_count,
-        action_type: scp_protocol::economy::types::PaidActionType::MessageSend,
-        actor_did: sender_did,
-        now,
-        spending_ucan,
-        action_label: "messages:write",
-        context_id,
-        clock,
-        pricing,
-        nonce_tracker: &mut governance.spending_nonce_tracker,
-        revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
-        key_resolver,
-    })
+    crate::context::economy_logic::enforce_economy(
+        crate::context::economy_logic::EnforceEconomyRequest {
+            economic_policy: governance.economic_policy.as_ref(),
+            budget_tracker: &mut governance.budget_tracker,
+            velocity_tracker: &governance.velocity_tracker,
+            member_count,
+            action_type: scp_protocol::economy::types::PaidActionType::MessageSend,
+            actor_did: sender_did,
+            now,
+            spending_ucan,
+            action_label: "messages:write",
+            context_id,
+            clock,
+            pricing,
+            nonce_tracker: &mut governance.spending_nonce_tracker,
+            revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
+            key_resolver,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -811,8 +813,13 @@ pub async fn send_message(
             // Authorization failure — roll back the ticket. The sequence
             // number rollback is also needed because Phase 1 already
             // incremented it for non-broadcast.
-            crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen)
-                .await;
+            crate::context::economy_logic::rollback_economy_ticket(
+                supervisor,
+                &context_id,
+                ticket,
+                &ctx_gen,
+            )
+            .await;
             if !is_broadcast {
                 if let Ok(mut guard) = manager_methods::relock_context(supervisor, &ctx_gen).await {
                     let ctx = &mut *guard;
@@ -851,7 +858,13 @@ pub async fn send_message(
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
         }
-        crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen).await;
+        crate::context::economy_logic::rollback_economy_ticket(
+            supervisor,
+            &context_id,
+            ticket,
+            &ctx_gen,
+        )
+        .await;
         if !is_broadcast {
             if let Ok(mut guard) = manager_methods::relock_context(supervisor, &ctx_gen).await {
                 let ctx = &mut *guard;

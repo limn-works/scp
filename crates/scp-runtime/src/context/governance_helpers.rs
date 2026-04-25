@@ -135,6 +135,7 @@ use crate::context::supervisor::Supervisor;
 /// before any FFI caller or test can invoke a helper.
 const ATTACHED_EXPECT: &str = "governance_helpers: Supervisor must be fully attached before helper invocation \
      (set by Supervisor::attach_context_manager during bridge construction)";
+use crate::context::manager_methods;
 use crate::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
     ContentKeysRotatedResult, ContextGeneration, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
@@ -146,7 +147,6 @@ use crate::context::state::{
     context_id_to_bytes, push_welcome_event, require_active, require_migrating_out,
     strip_event_payload,
 };
-use crate::context::manager_methods;
 
 // The governance-domain free functions below are mechanically hoisted from the
 // legacy `impl ContextManager { ... }` block in `manager/governance.rs`. Each

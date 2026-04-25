@@ -436,19 +436,16 @@ impl Supervisor {
         // helper-side `helper_persistence` slot stays empty in that
         // case so `persistence_ref()` returns `None` and helpers skip
         // best-effort persist calls.
-        let supervisor_persistence: Arc<dyn ContextPersistence>;
-        let helper_persistence_arc: Option<Arc<dyn ContextPersistence>>;
-        match persistence {
-            Some(boxed) => {
+        let (supervisor_persistence, helper_persistence_arc) = persistence.map_or_else(
+            || {
+                let stub: Arc<dyn ContextPersistence> = Arc::new(NoopContextPersistence);
+                (stub, None)
+            },
+            |boxed| {
                 let arc: Arc<dyn ContextPersistence> = Arc::from(boxed);
-                supervisor_persistence = Arc::clone(&arc);
-                helper_persistence_arc = Some(arc);
-            }
-            None => {
-                supervisor_persistence = Arc::new(NoopContextPersistence);
-                helper_persistence_arc = None;
-            }
-        }
+                (Arc::clone(&arc), Some(arc))
+            },
+        );
         let saga_journal: Arc<dyn SagaJournal> = Arc::new(NoopSagaJournal);
         let supervisor = Arc::new(Self::new(
             supervisor_persistence,
@@ -605,7 +602,7 @@ impl Supervisor {
     /// Cheap reference to the supervisor's per-context state map.
     /// Always populated — eagerly initialized in [`Self::new`].
     #[must_use]
-    pub(crate) fn contexts_ref(&self) -> &Arc<ContextsMap> {
+    pub(crate) const fn contexts_ref(&self) -> &Arc<ContextsMap> {
         &self.contexts
     }
 
@@ -624,7 +621,7 @@ impl Supervisor {
     /// `Arc<HashSet>`); write sites acquire [`Self::write_lock`] then
     /// clone-update-store on the snapshot.
     #[must_use]
-    pub(crate) fn local_dids_ref(&self) -> &ArcSwap<HashSet<DID>> {
+    pub(crate) const fn local_dids_ref(&self) -> &ArcSwap<HashSet<DID>> {
         &self.local_dids
     }
 
@@ -634,14 +631,14 @@ impl Supervisor {
     /// `ArcSwap<HashMap<...>>` per the master plan §Supervisor — same
     /// read/write discipline as [`Self::local_dids_ref`].
     #[must_use]
-    pub(crate) fn standing_contexts_ref(&self) -> &ArcSwap<HashMap<String, DID>> {
+    pub(crate) const fn standing_contexts_ref(&self) -> &ArcSwap<HashMap<String, DID>> {
         &self.standing_contexts
     }
 
     /// Cheap reference to the supervisor's monotonic generation
     /// counter. Always populated (initialized to 1 in [`Self::new`]).
     #[must_use]
-    pub(crate) fn next_generation_ref(&self) -> &std::sync::atomic::AtomicU64 {
+    pub(crate) const fn next_generation_ref(&self) -> &std::sync::atomic::AtomicU64 {
         &self.next_generation
     }
 
@@ -785,6 +782,11 @@ impl Supervisor {
     /// would point at a dangling second supervisor and
     /// [`SupervisorHandle::local_dids`] / [`SupervisorHandle::standing_peer`]
     /// would read empty state.
+    #[allow(clippy::unused_async)]
+    // Test fixtures call `build_actor_deps(...).await` on this method;
+    // keeping it `async` preserves the call shape across migration even
+    // though the body no longer awaits anything after ADR-049 commit 12
+    // dropped the legacy ContextManager attach.
     pub async fn build_actor_deps(
         self: &Arc<Self>,
         persistence: Arc<dyn ContextPersistence>,
@@ -1237,26 +1239,25 @@ impl Supervisor {
     /// reply. On soft-fallback + missing context, synthesize the
     /// variant's legacy default via the view-less fallback.
     async fn dispatch_with_view(
-        supervisor: &Supervisor,
+        supervisor: &Self,
         context_id: &str,
         cmd: QueriesCommand,
         soft_fallback: bool,
     ) -> Result<Outcome<()>, ContextError> {
         // Resolve the per-context Arc via the supervisor's own
         // `manager_methods::get_context_arc_pub` (lifted in 12c.9g.1).
-        let elp = match supervisor.event_log_ref() {
-            Some(p) => Arc::clone(p),
-            None => {
-                let err = ContextError::NotInitialized(
-                    "Supervisor::dispatch_with_view — event_log provider not configured".to_owned(),
-                );
-                if soft_fallback {
-                    reply_with_soft_default(cmd);
-                } else {
-                    reply_with_error(cmd, err);
-                }
-                return Ok(Outcome::ok(()));
+        let elp = if let Some(p) = supervisor.event_log_ref() {
+            Arc::clone(p)
+        } else {
+            let err = ContextError::NotInitialized(
+                "Supervisor::dispatch_with_view — event_log provider not configured".to_owned(),
+            );
+            if soft_fallback {
+                reply_with_soft_default(cmd);
+            } else {
+                reply_with_error(cmd, err);
             }
+            return Ok(Outcome::ok(()));
         };
         match crate::context::manager_methods::get_context_arc_pub(supervisor, context_id) {
             Ok(arc) => {
@@ -1969,12 +1970,22 @@ impl Supervisor {
     /// Register a DID as locally controlled by this node / SDK.
     ///
     /// Idempotent: registering the same DID twice is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Currently always returns `Ok(())` — the `Result` shape preserves
+    /// the legacy method's signature so callers can keep their
+    /// `?`-style propagation untouched.
     pub async fn register_local_did(&self, did: DID) -> Result<(), ContextError> {
         crate::context::queries_helpers::register_local_did(self, did).await;
         Ok(())
     }
 
     /// Returns `true` iff `did` is registered as locally controlled.
+    ///
+    /// # Errors
+    ///
+    /// Currently always returns `Ok(_)`.
     pub async fn is_local_did(&self, did: &DID) -> Result<bool, ContextError> {
         Ok(crate::context::queries_helpers::is_local_did(self, did).await)
     }
@@ -2013,6 +2024,13 @@ impl Supervisor {
     /// persistence provider.
     ///
     /// No-op if no persistence provider is configured.
+    ///
+    /// # Errors
+    ///
+    /// Currently always returns `Ok(())` — the `Result` shape preserves
+    /// the legacy method's signature for callers that propagate with
+    /// `?`. Per-context flush failures are logged via `tracing::warn!`
+    /// inside the helper.
     pub async fn flush_all_contexts(&self) -> Result<(), ContextError> {
         crate::context::lifecycle_helpers::flush_all_contexts(self).await;
         Ok(())
@@ -2024,6 +2042,11 @@ impl Supervisor {
     /// `.await`. Uses `tokio::runtime::Handle::current` to bridge
     /// sync → async; **callers MUST be inside a tokio runtime**.
     /// No-op if no persistence provider is configured.
+    ///
+    /// # Errors
+    ///
+    /// Currently always returns `Ok(())`. Per-context flush failures
+    /// are logged via `tracing::warn!` inside the helper.
     pub fn flush_all_contexts_sync(&self) -> Result<(), ContextError> {
         crate::context::lifecycle_helpers::flush_all_contexts_sync(self);
         Ok(())
@@ -2040,6 +2063,11 @@ impl Supervisor {
     /// notify remote peers — used by
     /// [`scp_ffi_common::BridgeInstance::shutdown`] for process exit /
     /// test teardown.
+    ///
+    /// # Errors
+    ///
+    /// Currently always returns `Ok(())`. Best-effort cleanup logs
+    /// per-context failures via `tracing::warn!` inside the helper.
     pub fn shutdown_all_contexts(&self) -> Result<(), ContextError> {
         crate::context::lifecycle_helpers::shutdown_all_contexts(self);
         Ok(())
@@ -2338,7 +2366,8 @@ impl Supervisor {
         source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     ) -> Result<(), ContextError> {
-        const ATTACHED: &str = "Supervisor::send_message — provider slot empty (call with_providers first)";
+        const ATTACHED: &str =
+            "Supervisor::send_message — provider slot empty (call with_providers first)";
         let clock = self
             .clock_ref()
             .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?
@@ -2372,10 +2401,7 @@ impl Supervisor {
     pub async fn list_proposals(
         &self,
         context_id: &str,
-    ) -> Result<
-        Vec<scp_protocol::context::governance::GovernanceProposal>,
-        ContextError,
-    > {
+    ) -> Result<Vec<scp_protocol::context::governance::GovernanceProposal>, ContextError> {
         crate::context::governance_helpers::list_proposals(self, context_id).await
     }
 
@@ -2498,6 +2524,68 @@ impl Supervisor {
             voter_did,
         )
         .await
+    }
+
+    // -------------------------------------------------------------------
+    // Query passthroughs — wrap the queries_helpers::* free functions
+    // that were called from the deleted `ContextManager` query methods.
+    // FFI bridges call these passthroughs directly; the helpers remain
+    // accessible via crate::context::queries_helpers for any caller that
+    // already imports them.
+    // -------------------------------------------------------------------
+
+    /// Passthrough to [`crate::context::queries_helpers::local_pseudonym`].
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`ContextError`] from the helper.
+    pub async fn local_pseudonym(
+        &self,
+        context_id: &str,
+    ) -> Result<Option<[u8; 32]>, ContextError> {
+        crate::context::queries_helpers::local_pseudonym(self, context_id).await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::queries_helpers::pending_commits`] — returns
+    /// every commit currently in the per-context retry queue.
+    #[must_use]
+    pub async fn pending_commits(
+        &self,
+        context_id: &str,
+    ) -> Vec<crate::context::state::PendingCommit> {
+        crate::context::queries_helpers::pending_commits(self, context_id).await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::queries_helpers::commit_fault`] — returns the
+    /// active fail-close marker, if any.
+    #[must_use]
+    pub async fn commit_fault(
+        &self,
+        context_id: &str,
+    ) -> Option<crate::context::state::CommitFaultMarker> {
+        crate::context::queries_helpers::commit_fault(self, context_id).await
+    }
+
+    /// Passthrough to
+    /// [`crate::context::queries_helpers::report_degraded_mode`] —
+    /// emits a `DegradedMode` event when an envelope's
+    /// [`scp_protocol::envelope::VersionCompatibility`] indicates the
+    /// remote peer's minor version is unknown to us.
+    pub async fn report_degraded_mode(
+        &self,
+        context_id: &str,
+        compat: scp_protocol::envelope::VersionCompatibility,
+        unsupported_features: Vec<String>,
+    ) {
+        crate::context::queries_helpers::report_degraded_mode(
+            self,
+            context_id,
+            compat,
+            unsupported_features,
+        )
+        .await;
     }
 }
 

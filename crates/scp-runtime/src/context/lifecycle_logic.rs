@@ -5,13 +5,10 @@
 
 use std::collections::HashMap;
 
-use scp_protocol::context::builder::ContextCreationError;
-use scp_protocol::context::params::Capability;
-use scp_protocol::context::roles::CapabilityCeiling;
 use scp_protocol::context::ContextError;
-use scp_protocol::economy::types::EconomicPolicy;
+use scp_protocol::context::builder::ContextCreationError;
 
-use super::state::{GovernanceState, PerContextState};
+use super::state::PerContextState;
 use scp_identity::DID;
 
 /// Builds an [`IdentityDepthAssessment`] for a member in a context.
@@ -213,8 +210,9 @@ pub fn post_join_bookkeeping(
     let merkle_root = event_log
         .event_log_merkle_root(&context_id_bytes)
         .unwrap_or([0u8; 32]);
-    let join_events =
-        super::governance_logic::event_log_entries_for_consequences(ctx, context_id, now, event_log);
+    let join_events = super::governance_logic::event_log_entries_for_consequences(
+        ctx, context_id, now, event_log,
+    );
     if !join_events.is_empty()
         && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
             &join_events,

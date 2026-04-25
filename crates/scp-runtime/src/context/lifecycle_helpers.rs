@@ -100,11 +100,11 @@ use scp_protocol::economy::budget::MemberBudgetTracker;
 use crate::context::ContextHandle;
 use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
 use crate::context::governance_helpers;
+use crate::context::manager_methods;
 use crate::context::state::{
     self, AccessControlState, CommitOperation, EpochState, GovernanceState, PerContextState,
     TtlState,
 };
-use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
 use crate::context::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 
@@ -315,10 +315,8 @@ pub async fn import_context(
     }
 
     // 5. Reconstruct governance engine from snapshot.
-    let governance_engine = state::restore_governance_engine_from_snapshot(
-        &export.snapshot,
-        Arc::clone(key_resolver),
-    )?;
+    let governance_engine =
+        state::restore_governance_engine_from_snapshot(&export.snapshot, Arc::clone(key_resolver))?;
 
     // 6. Build PerContextState from the snapshot.
     let initial_members: HashSet<DID> = export
@@ -375,7 +373,9 @@ pub async fn import_context(
         None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
     };
     let validated_message_pricing = export.snapshot.message_pricing.clone().or_else(|| {
-        crate::context::lifecycle_logic::derive_message_pricing(export.snapshot.economic_policy.as_ref())
+        crate::context::lifecycle_logic::derive_message_pricing(
+            export.snapshot.economic_policy.as_ref(),
+        )
     });
     if let Some(ref pricing) = validated_message_pricing {
         pricing.validate().map_err(|e| {
@@ -871,7 +871,11 @@ pub async fn join_context(
         // rollback restores the deducted amount AND the velocity+hard-rate state.
         // M13: Sybil resistance check BEFORE economy enforcement so that
         // a rejected sybil attacker doesn't consume budget. Fail-closed.
-        crate::context::lifecycle_logic::evaluate_sybil_resistance(ctx, &member_did, clock.now_secs())?;
+        crate::context::lifecycle_logic::evaluate_sybil_resistance(
+            ctx,
+            &member_did,
+            clock.now_secs(),
+        )?;
 
         // Defense-in-depth hard rate limit on joins (Matrix-style token
         // bucket). On any subsequent failure we refund the token.
@@ -942,8 +946,13 @@ pub async fn join_context(
     {
         Ok(auth) => auth,
         Err(payment_err) => {
-            crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen)
-                .await;
+            crate::context::economy_logic::rollback_economy_ticket(
+                supervisor,
+                &context_id,
+                ticket,
+                &ctx_gen,
+            )
+            .await;
             return Err(payment_err);
         }
     };
@@ -957,8 +966,13 @@ pub async fn join_context(
             if let Some(a) = auth {
                 crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
             }
-            crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen)
-                .await;
+            crate::context::economy_logic::rollback_economy_ticket(
+                supervisor,
+                &context_id,
+                ticket,
+                &ctx_gen,
+            )
+            .await;
             return Err(e);
         }
     };
@@ -970,7 +984,13 @@ pub async fn join_context(
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
         }
-        crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen).await;
+        crate::context::economy_logic::rollback_economy_ticket(
+            supervisor,
+            &context_id,
+            ticket,
+            &ctx_gen,
+        )
+        .await;
         return Err(e);
     }
 
@@ -1010,7 +1030,13 @@ pub async fn join_context(
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
         }
-        crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen).await;
+        crate::context::economy_logic::rollback_economy_ticket(
+            supervisor,
+            &context_id,
+            ticket,
+            &ctx_gen,
+        )
+        .await;
         return Err(e);
     }
 
@@ -1023,7 +1049,13 @@ pub async fn join_context(
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
         }
-        crate::context::economy_logic::rollback_economy_ticket(supervisor, &context_id, ticket, &ctx_gen).await;
+        crate::context::economy_logic::rollback_economy_ticket(
+            supervisor,
+            &context_id,
+            ticket,
+            &ctx_gen,
+        )
+        .await;
         return Err(e);
     }
 
@@ -1990,9 +2022,7 @@ pub fn load_persisted_context_state(
             ))
         })?
         .ok_or_else(|| {
-            ContextError::PersistenceFailed(format!(
-                "no persisted context state for {context_id}"
-            ))
+            ContextError::PersistenceFailed(format!("no persisted context state for {context_id}"))
         })?;
 
     let broadcast_ctx = persistence
@@ -2044,7 +2074,7 @@ fn restore_event_log_best_effort(supervisor: &Supervisor, context_id: &str) {
 ///
 /// # Arguments
 ///
-/// * `supervisor` — supervisor providing crypto / event_log / clock /
+/// * `supervisor` — supervisor providing crypto / `event_log` / clock /
 ///   persistence accessors.
 /// * `context_id` — the context identifier to restore.
 /// * `handle` — a pre-created `ContextHandle` for the context.
@@ -2061,14 +2091,14 @@ pub async fn restore_context(
     context_id: &str,
     handle: &crate::context::ContextHandle,
 ) -> Result<(), ContextError> {
+    use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
+    use crate::context::lifecycle_logic::{
+        derive_message_pricing, sanitize_cooldown_until, validate_consequence_rules_for_import,
+    };
     use crate::context::state::{
         context_id_to_bytes, restore_governance_engine_from_snapshot,
         restore_grace_store_from_snapshot,
     };
-    use crate::context::lifecycle_logic::{
-        sanitize_cooldown_until, validate_consequence_rules_for_import, derive_message_pricing,
-    };
-    use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
     use scp_protocol::context::governance::mls_integration::EpochCoordinator;
     use scp_protocol::context::membership::ReceiveBuffer;
     use std::collections::HashSet;
@@ -2153,18 +2183,17 @@ pub async fn restore_context(
     let validated_velocity_tracker = match ctx_snapshot.velocity_tracker_state {
         Some(vts) => {
             let mut entries = vts.entries;
-            scp_protocol::economy::antispam::SenderVelocityTracker
-                ::validate_and_sanitize_snapshot(
-                    &mut entries,
-                    60,
-                    now_for_validation,
-                    scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
-                )
-                .map_err(|e| {
-                    ContextError::PersistenceFailed(format!(
-                        "restore: velocity snapshot validation failed: {e}"
-                    ))
-                })?;
+            scp_protocol::economy::antispam::SenderVelocityTracker::validate_and_sanitize_snapshot(
+                &mut entries,
+                60,
+                now_for_validation,
+                scp_protocol::economy::antispam::SNAPSHOT_CLOCK_SKEW_TOLERANCE_SECS,
+            )
+            .map_err(|e| {
+                ContextError::PersistenceFailed(format!(
+                    "restore: velocity snapshot validation failed: {e}"
+                ))
+            })?;
             scp_protocol::economy::antispam::SenderVelocityTracker::from_snapshot(60, entries)
         }
         None => scp_protocol::economy::antispam::SenderVelocityTracker::new(60),
@@ -2226,12 +2255,11 @@ pub async fn restore_context(
             velocity_tracker: validated_velocity_tracker,
             participation_cache: ctx_snapshot.participation_cache,
             cooldown_until: ctx_snapshot.cooldown_until,
-            spending_nonce_tracker:
-                scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
-                    context_id.to_owned(),
-                    Arc::clone(&clock),
-                    ctx_snapshot.spending_nonce_tracker_state,
-                ),
+            spending_nonce_tracker: scp_protocol::crypto::ucan::nonce::NonceTracker::from_snapshot(
+                context_id.to_owned(),
+                Arc::clone(&clock),
+                ctx_snapshot.spending_nonce_tracker_state,
+            ),
             revoked_spending_ucan_cids: HashSet::new(),
             proposal_timestamps: ctx_snapshot.proposal_timestamps,
         },
@@ -2305,9 +2333,7 @@ pub async fn restore_context(
 /// contexts fails (no persistence provider configured, or list call
 /// fails).
 #[tracing::instrument(skip_all)]
-pub async fn restore_all_contexts(
-    supervisor: &Supervisor,
-) -> Result<Vec<String>, ContextError> {
+pub async fn restore_all_contexts(supervisor: &Supervisor) -> Result<Vec<String>, ContextError> {
     let Some(persistence) = supervisor.persistence_ref() else {
         return Err(ContextError::PersistenceFailed(
             "no persistence provider configured".into(),
@@ -2333,10 +2359,8 @@ pub async fn restore_all_contexts(
             continue;
         }
 
-        let handle = crate::context::ContextHandle::new(
-            ctx_id.clone(),
-            ctx_snapshot.context_params.clone(),
-        );
+        let handle =
+            crate::context::ContextHandle::new(ctx_id.clone(), ctx_snapshot.context_params.clone());
         if handle.transition_to(&ContextState::Active).await.is_err() {
             continue;
         }
@@ -2464,9 +2488,9 @@ fn build_degraded_snapshot(context_id: &str) -> crate::context::state::ContextSn
     let role_state = scp_protocol::context::roles::ContextRoleState {
         context_id: context_id.to_owned(),
         creator_did: String::new(),
-        ceiling: scp_protocol::context::roles::CapabilityCeiling::new(
-            std::iter::empty::<scp_protocol::context::roles::Capability>(),
-        ),
+        ceiling: scp_protocol::context::roles::CapabilityCeiling::new(std::iter::empty::<
+            scp_protocol::context::roles::Capability,
+        >()),
         role_definitions: HashMap::new(),
         assignments: HashMap::new(),
         members: HashSet::new(),
@@ -2559,14 +2583,14 @@ pub fn shutdown_all_contexts(supervisor: &Supervisor) {
                 );
             }
         }
-        if let Some(ref event_log) = event_log_opt {
-            if let Err(e) = event_log.destroy_event_log(&ctx_id_bytes) {
-                tracing::debug!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to destroy event log during shutdown — may already be gone"
-                );
-            }
+        if let Some(ref event_log) = event_log_opt
+            && let Err(e) = event_log.destroy_event_log(&ctx_id_bytes)
+        {
+            tracing::debug!(
+                context_id = %context_id,
+                error = %e,
+                "failed to destroy event log during shutdown — may already be gone"
+            );
         }
 
         supervisor.contexts_ref().remove(context_id);
@@ -2582,10 +2606,10 @@ pub fn shutdown_all_contexts(supervisor: &Supervisor) {
         }
     }
 
-    if let Some(task_set) = supervisor.task_set_ref() {
-        if let Ok(mut tasks) = task_set.try_lock() {
-            tasks.abort_all();
-        }
+    if let Some(task_set) = supervisor.task_set_ref()
+        && let Ok(mut tasks) = task_set.try_lock()
+    {
+        tasks.abort_all();
     }
 
     tracing::info!(

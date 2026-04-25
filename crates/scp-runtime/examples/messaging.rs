@@ -16,26 +16,30 @@ use scp_identity::DID;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::KeyPackage;
 use scp_protocol::context::{Capability, ContextMode, ContextParams};
-use scp_runtime::context::manager::ContextManager;
+use scp_runtime::context::supervisor::Supervisor;
 
 mod support;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Build a ContextManager with mock providers.
+    // 1. Build a Supervisor with mock providers.
     let key_resolver: KeyResolver = Arc::new(|_did| None);
-    let manager = ContextManager::new(
+    let manager = Supervisor::with_providers(
         support::example_crypto("did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK"),
         Box::new(support::MockTransport),
         Box::new(support::MockEventLog),
         key_resolver,
+        None,
+        None,
+        None,
+        None,
     );
 
     // 2. Register two participants.
     let alice: DID = "did:dht:z6MkAlice".into();
     let bob: DID = "did:dht:z6MkBob".into();
-    manager.register_local_did(alice.clone()).await;
-    manager.register_local_did(bob.clone()).await;
+    manager.register_local_did(alice.clone()).await?;
+    manager.register_local_did(bob.clone()).await?;
 
     // 3. Alice creates a context with messaging capabilities.
     let params = ContextParams {

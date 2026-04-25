@@ -288,9 +288,9 @@ async fn build_actor_deps_populates_every_field() {
     );
     tx.send(probe.clone())
         .expect("send through ActorDeps.event_tx should reach receivers subscribed on supervisor");
-    let received = event_rx.try_recv().expect(
-        "receiver subscribed on the supervisor must observe the ActorDeps.event_tx send",
-    );
+    let received = event_rx
+        .try_recv()
+        .expect("receiver subscribed on the supervisor must observe the ActorDeps.event_tx send");
     assert_eq!(
         received, probe,
         "event_tx must be the same broadcast channel as the supervisor's — round-trip check"

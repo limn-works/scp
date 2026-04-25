@@ -3,7 +3,18 @@
 // on its impl block. The hoisted bodies preserve the same lock-hold-across-await
 // patterns deliberately (narrowing changes lock-ordering semantics); allowing
 // the lint crate-locally keeps the hoist byte-identical to the legacy behavior.
-#![allow(clippy::significant_drop_tightening)]
+//
+// `dead_code` is allowed module-wide because this module is the
+// authoritative home for query-domain free functions consumed by FFI
+// bridges (PyO3 / NAPI / UniFFI / WASM) and by external test crates
+// behind `feature = "testing"`. After ADR-049 commit 12 deleted the
+// `ContextManager` forwarders, several public helpers (access-key
+// management, checkpoint comparison, Merkle proofs, budget/velocity
+// test accessors) lost their in-tree callers; they remain public so
+// FFI bridges and tests can reach them. Where appropriate the
+// `Supervisor` exposes a passthrough; where it does not, callers
+// continue to use `crate::context::queries_helpers::X` directly.
+#![allow(clippy::significant_drop_tightening, dead_code)]
 
 //! Queries-domain helpers with explicit-collaborator signatures
 //! (ADR-049 §12c.5).
@@ -117,11 +128,11 @@ use scp_protocol::context::{ContextError, ContextParams};
 use zeroize::Zeroizing;
 
 use crate::context::builder::ContextEventLogProvider;
+use crate::context::manager_methods;
+use crate::context::providers::event_log::EventLogEntry;
 use crate::context::state::{
     CommitFaultMarker, PendingCommit, PerContextState, context_id_to_bytes,
 };
-use crate::context::manager_methods;
-use crate::context::providers::event_log::EventLogEntry;
 use crate::context::supervisor::Supervisor;
 
 /// Shared expectation message for `Supervisor::attached_context_manager()`
@@ -163,9 +174,14 @@ pub async fn register_local_did(supervisor: &Supervisor, did: DID) {
 
 /// Returns `true` if the given DID is registered as locally controlled.
 ///
-/// Hoisted body of the legacy
-/// [`ContextManager::is_local_did`](crate::context::manager::ContextManager::is_local_did)
+/// Hoisted body of the legacy `ContextManager::is_local_did` method
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
+///
+/// `async` is preserved (despite no `await` after the §12 lock-free
+/// read migration) to keep the signature symmetric with
+/// `register_local_did` and the legacy method, matching the call shape
+/// the FFI bridges + `Supervisor::is_local_did` passthrough expect.
+#[allow(clippy::unused_async)]
 pub async fn is_local_did(supervisor: &Supervisor, did: &DID) -> bool {
     // Lock-free read (ADR-049 §Decision 12).
     supervisor.local_dids_ref().load().contains(did)

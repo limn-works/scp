@@ -814,8 +814,7 @@ pub enum GovernanceCommand {
         /// bytes depending on the inner action).
         payload: Box<ExecuteGovernanceActionPayload>,
         /// Oneshot reply channel.
-        reply:
-            oneshot::Sender<Result<crate::context::state::GovernanceActionResult, ContextError>>,
+        reply: oneshot::Sender<Result<crate::context::state::GovernanceActionResult, ContextError>>,
     },
 
     /// Reads a single proposal by ID. Mirrors
@@ -890,8 +889,7 @@ pub enum GovernanceCommand {
         context_id: String,
         /// Oneshot reply channel. `Ok(None)` iff the context is unknown
         /// or not migrating (matches the legacy contract).
-        reply:
-            oneshot::Sender<Result<Option<crate::context::state::MigrationState>, ContextError>>,
+        reply: oneshot::Sender<Result<Option<crate::context::state::MigrationState>, ContextError>>,
     },
 
     /// Acknowledges and clears a commit-fault marker for a context
@@ -1789,9 +1787,8 @@ pub enum QueriesCommand {
         /// Context identifier string.
         context_id: String,
         /// Oneshot reply channel. `Ok(None)` iff no fault or unknown.
-        reply: oneshot::Sender<
-            Result<Option<crate::context::state::CommitFaultMarker>, ContextError>,
-        >,
+        reply:
+            oneshot::Sender<Result<Option<crate::context::state::CommitFaultMarker>, ContextError>>,
     },
     /// Merkle event-log entries for a context (ADR-011). Delegates to
     /// the shared `ContextEventLogProvider` — read-only.

@@ -405,7 +405,8 @@ async fn rollback_tool_economy_ticket(
 ) {
     ticket.consumed = true;
 
-    if let (Some(adapter), Some(prepared)) = (supervisor.payment_adapter_ref(), ticket.escrow.as_ref())
+    if let (Some(adapter), Some(prepared)) =
+        (supervisor.payment_adapter_ref(), ticket.escrow.as_ref())
     {
         invoke::void_tool_escrow(adapter.as_ref(), prepared).await;
     }
@@ -730,12 +731,13 @@ where
         let ctx = &mut *guard;
 
         let now = clock.now_secs();
-        let events_for_consequences = crate::context::governance_logic::event_log_entries_for_consequences(
-            ctx,
-            context_id,
-            now,
-            event_log.as_ref(),
-        );
+        let events_for_consequences =
+            crate::context::governance_logic::event_log_entries_for_consequences(
+                ctx,
+                context_id,
+                now,
+                event_log.as_ref(),
+            );
         let consequence_rules = ctx.governance.consequence_rules.clone();
 
         let triggered = post_tool_invocation_bookkeeping(

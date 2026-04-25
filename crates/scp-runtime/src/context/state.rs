@@ -23,12 +23,11 @@ use super::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
 use super::ttl::{TtlExtension, TtlTimer};
 use scp_identity::DID;
 use scp_primitives::Clock;
-use scp_protocol::context::broadcast::{BroadcastAdmission, BroadcastContext, GovernanceBanResult};
+use scp_protocol::context::broadcast::{BroadcastContext, GovernanceBanResult};
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::{
-    AccessScope, CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint,
-    GovernanceAction, GovernanceContext, GovernanceEngine, GovernanceEvent, GovernanceModelConfig,
-    GovernanceProposal, KeyResolver, ProposalId, ProposalStatus, PruningPolicy, SingleAdminEngine,
+    AccessScope, GovernanceEngine, GovernanceModelConfig, GovernanceProposal, KeyResolver,
+    ProposalId, ProposalStatus, PruningPolicy, SingleAdminEngine,
     majority::MajorityVoteEngine,
     mls_integration::{CoordinationRecord, EpochCoordinator},
     multisig::ThresholdEngine,
@@ -36,10 +35,8 @@ use scp_protocol::context::governance::{
 };
 use scp_protocol::context::membership::{ContextEvent, MembershipState, ReceiveBuffer};
 use scp_protocol::context::params::GovernanceModel;
-use scp_protocol::context::params::{ContextMode, TemplateId, ToolRegistration};
-use scp_protocol::context::roles::{
-    self, Capability, CapabilityCeiling, ContextRoleState, RoleAssignment,
-};
+use scp_protocol::context::params::ToolRegistration;
+use scp_protocol::context::roles::{Capability, ContextRoleState};
 use scp_protocol::context::tools::interface::ToolInterface;
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::budget::MemberBudgetTracker;
@@ -809,26 +806,9 @@ pub struct VelocityTrackerSnapshot {
     pub entries: HashMap<String, Vec<u64>>,
 }
 
-// ---------------------------------------------------------------------------
-// ContextPersistence -- unified persistence provider
-// ---------------------------------------------------------------------------
+// `ContextPersistence` trait moved to `crate::context::persistence` in
+// ADR-049 commit 12.
 
-/// Provider for persisting full context state across process restarts.
-///
-/// Replaces the previous `BroadcastPersistence` trait. This is the single
-/// persistence trait for all context state: both the full context snapshot
-/// (membership, roles, governance, TTL) and the broadcast-specific state
-/// (author keys, subscribers, block lists).
-///
-/// Implementors must be dyn-compatible (`Send + Sync`, no generics, no
-/// RPITIT). All methods return `Result<_, Box<dyn Error + Send + Sync>>`
-/// for best-effort semantics: the `ContextManager` logs errors but does
-/// not abort mutations when persistence fails.
-///
-/// The canonical implementation is `ProtocolRepositoryContextBridge<S>` which
-/// wraps `Arc<ProtocolRepository<S>>`.
-///
-/// See spec section 17.4.
 // ---------------------------------------------------------------------------
 // PerContextState -- internal per-context tracking
 // ---------------------------------------------------------------------------
@@ -1431,6 +1411,9 @@ impl PerContextState {
     /// production call graphs.
     #[must_use]
     #[cfg(feature = "testing")]
+    #[allow(dead_code)] // test-only accessor reachable through the testing
+    // feature; consumed by external integration tests that import the
+    // `scp_runtime::context::state` module.
     pub(crate) const fn send_tracker_last_issued(&self) -> u64 {
         self.send_tracker.last_issued()
     }
@@ -1828,141 +1811,12 @@ pub(crate) fn require_migrating_out(handle: &ContextHandle) -> Result<(), Contex
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Governance engine construction helpers (SCP-267, ADR-031)
-// ---------------------------------------------------------------------------
-
-/// Validates that a [`GovernanceModel`] variant is consistent with a
-/// [`GovernanceModelConfig`] variant. Returns a creation error on mismatch.
-pub(crate) fn validate_governance_consistency(
-    model: &GovernanceModel,
-    config: &GovernanceModelConfig,
-) -> Result<(), ContextCreationError> {
-    let consistent = matches!(
-        (model, config),
-        (
-            GovernanceModel::SingleAdmin,
-            GovernanceModelConfig::SingleAdmin { .. }
-        ) | (
-            GovernanceModel::Threshold { .. },
-            GovernanceModelConfig::Threshold { .. }
-        ) | (
-            GovernanceModel::Majority { .. },
-            GovernanceModelConfig::Majority { .. }
-        ) | (
-            GovernanceModel::Unanimity { .. },
-            GovernanceModelConfig::Unanimity { .. }
-        )
-    );
-    if !consistent {
-        return Err(ContextCreationError::CreationFailed(format!(
-            "GovernanceModel::{model:?} does not match GovernanceModelConfig variant"
-        )));
-    }
-    Ok(())
-}
-
-/// Constructs a boxed [`GovernanceEngine`] from a [`GovernanceModelConfig`].
-///
-/// For `Majority` and `Unanimity` models, `initial_voters` provides the
-/// initial eligible voter set (typically the context creator at creation
-/// time). For `SingleAdmin` and `Threshold`, voters are embedded in the
-/// config itself. The voter set is updated by the `ContextManager` when
-/// members join/leave.
-///
-/// Validates configuration parameters (threshold bounds, empty signers,
-/// `min_participation_bps` range) and returns a creation error on invalid input.
-pub(crate) fn build_governance_engine(
-    config: GovernanceModelConfig,
-    initial_voters: Vec<DID>,
-    key_resolver: KeyResolver,
-) -> Result<Box<dyn GovernanceEngine>, ContextCreationError> {
-    match config {
-        GovernanceModelConfig::SingleAdmin { admin_did } => {
-            Ok(Box::new(SingleAdminEngine::new(admin_did, key_resolver)))
-        }
-        GovernanceModelConfig::Threshold {
-            signers,
-            threshold,
-            voting_window_secs,
-        } => {
-            let engine = ThresholdEngine::new(signers, threshold, voting_window_secs, key_resolver)
-                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-            Ok(Box::new(engine))
-        }
-        GovernanceModelConfig::Majority {
-            voting_window_secs,
-            min_participation_bps,
-        } => {
-            let engine = MajorityVoteEngine::new(
-                initial_voters,
-                voting_window_secs,
-                min_participation_bps,
-                key_resolver,
-            )
-            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-            Ok(Box::new(engine))
-        }
-        GovernanceModelConfig::Unanimity { voting_window_secs } => {
-            let engine = UnanimityEngine::new(initial_voters, voting_window_secs, key_resolver)
-                .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-            Ok(Box::new(engine))
-        }
-    }
-}
-
-/// Mints `GovernancePropose` and `GovernanceVote` UCAN tokens for each
-/// designated voter in the governance engine (ADR-031 §6).
-///
-/// For `SingleAdmin`, the admin already receives these via the admin role.
-/// For multi-party models, each signer/voter receives both capabilities.
-///
-/// Returns the minted tokens. The tokens are also stored in the context's
-/// role state by the caller.
-pub(crate) fn mint_governance_tokens(
-    context_id: &str,
-    creator_did: &DID,
-    engine: &dyn GovernanceEngine,
-    clock: &dyn Clock,
-) -> Vec<scp_protocol::context::roles::UcanToken> {
-    use scp_protocol::context::roles::{Capability, UcanAttestation, UcanToken};
-
-    let config = engine.model_config();
-    let voter_dids: Vec<DID> = match &config {
-        GovernanceModelConfig::SingleAdmin { admin_did } => vec![admin_did.clone()],
-        GovernanceModelConfig::Threshold { signers, .. } => signers.clone(),
-        GovernanceModelConfig::Majority { .. } | GovernanceModelConfig::Unanimity { .. } => {
-            // For Majority/Unanimity, voters are "all members with GovernanceVote
-            // capability." At creation time, the creator is the only member.
-            vec![creator_did.clone()]
-        }
-    };
-
-    let capabilities = [Capability::GovernancePropose, Capability::GovernanceVote];
-    let mut tokens = Vec::with_capacity(voter_dids.len() * capabilities.len());
-
-    for voter in &voter_dids {
-        for cap in &capabilities {
-            let att = UcanAttestation {
-                with: format!("scp:ctx:{context_id}/{cap}"),
-                can: "invoke".to_owned(),
-            };
-            // Nonce generation: if the clock is unavailable, fall back to a
-            // static nonce (acceptable for governance tokens minted at creation
-            // time — replay prevention is handled by the engine's proposal-ID
-            // scheme).
-            let nonce = scp_protocol::crypto::ucan::nonce::generate_nonce(clock);
-            tokens.push(UcanToken {
-                iss: creator_did.to_string(),
-                aud: voter.to_string(),
-                att: vec![att],
-                nnc: nonce,
-            });
-        }
-    }
-
-    tokens
-}
+// `validate_governance_consistency`, `build_governance_engine`, and
+// `mint_governance_tokens` were called from the deleted manager
+// submodules' `impl ContextManager` blocks. The active alternative
+// (`create_governance_engine` above) covers the same surface for the
+// hoisted `lifecycle_helpers::create_context` path. Removed in
+// ADR-049 commit 12 alongside the rest of the manager-only code.
 
 /// Uses the canonical SHA-256 context ID byte derivation.
 /// Delegates to [`scp_protocol::context::context_id_bytes`] to match builder.rs.

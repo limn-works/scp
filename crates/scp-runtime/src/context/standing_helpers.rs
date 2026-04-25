@@ -242,8 +242,11 @@ pub async fn standing_context(
 
 /// Returns the number of tracked standing contexts.
 ///
-/// Hoisted body of the legacy
-/// [`ContextManager::standing_context_count`](crate::context::manager::ContextManager::standing_context_count).
+/// Hoisted body of the legacy `ContextManager::standing_context_count`
+/// method. `async` is preserved (despite no `await` after the lock-free
+/// migration) to keep the signature symmetric with the rest of the
+/// standing-domain helpers and the legacy actor-handler entry point.
+#[allow(clippy::unused_async)]
 pub async fn standing_context_count(supervisor: &Supervisor) -> usize {
     // Lock-free read (ADR-049 §Decision 12).
     supervisor.standing_contexts_ref().load().len()
@@ -255,8 +258,11 @@ pub async fn standing_context_count(supervisor: &Supervisor) -> usize {
 
 /// Returns `true` if a standing context exists for the given peer DID.
 ///
-/// Hoisted body of the legacy
-/// [`ContextManager::has_standing_context`](crate::context::manager::ContextManager::has_standing_context).
+/// Hoisted body of the legacy `ContextManager::has_standing_context`
+/// method. `async` is preserved (despite no `await` after the
+/// lock-free migration) to match the rest of the standing-domain
+/// helper signatures.
+#[allow(clippy::unused_async)]
 pub async fn has_standing_context(supervisor: &Supervisor, peer_did: &DID) -> bool {
     // Lock-free read (ADR-049 §Decision 12).
     supervisor
@@ -327,12 +333,8 @@ pub async fn reconnect_all_standing(supervisor: &Supervisor) -> Result<usize, Co
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
 
-    let local_did_list: Vec<scp_identity::DID> = supervisor
-        .local_dids_ref()
-        .load()
-        .iter()
-        .cloned()
-        .collect();
+    let local_did_list: Vec<scp_identity::DID> =
+        supervisor.local_dids_ref().load().iter().cloned().collect();
 
     // Phase 1b: Resolve context IDs and clone handles under individual
     // per-context Mutexes only (no standing_contexts or local_dids held).
@@ -386,12 +388,8 @@ pub async fn reconnect_all_standing(supervisor: &Supervisor) -> Result<usize, Co
     // standing_contexts lock acquisition.
     if !terminal_context_ids.is_empty() {
         // Lock-free read of local_dids (ADR-049 §Decision 12).
-        let local_did_set: std::collections::HashSet<DID> = supervisor
-            .local_dids_ref()
-            .load()
-            .iter()
-            .cloned()
-            .collect();
+        let local_did_set: std::collections::HashSet<DID> =
+            supervisor.local_dids_ref().load().iter().cloned().collect();
         // ArcSwap+write_lock for the standing_contexts mutation.
         let _guard = supervisor.write_lock.lock().await;
         let snapshot = supervisor.standing_contexts_ref().load_full();

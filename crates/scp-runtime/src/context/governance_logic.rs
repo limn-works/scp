@@ -2,31 +2,17 @@
 //! free-function logic hoisted out of the deleted `manager/` directory
 //! in ADR-049 commit 12.
 
-use std::sync::Arc;
-
 use scp_identity::DID;
-use scp_primitives::Clock;
-use scp_protocol::context::governance::{
-    AccessScope, GovernanceAction, GovernanceContext, GovernanceEvent, GovernanceProposal,
-    ProposalId, ProposalStatus, PruningPolicy,
-};
-use scp_protocol::context::membership::ContextEvent;
-use scp_protocol::context::params::{Capability, ContextParams, GovernanceModel};
-use scp_protocol::context::roles;
-use scp_protocol::context::tools::interface::ToolInterface;
 use scp_protocol::context::ContextError;
-use scp_protocol::context::params::ToolRegistration;
-use scp_protocol::economy::types::EconomicPolicy;
+use scp_protocol::context::governance::GovernanceAction;
+use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::params::{Capability, GovernanceModel};
+use scp_protocol::context::roles;
 use scp_protocol::trust::consequence::{
     ConsequenceRule, TriggeredConsequence, evaluate_consequence_rules,
 };
-use tracing::instrument;
 
-use super::state::{
-    CommitFaultMarker, CommitOperation, GovernanceActionResult, MAX_COMMIT_AGE_SECS,
-    MAX_COMMIT_RETRIES, MigrationProposedResult, MigrationState, PendingCommit, PerContextState,
-    ProposalOutcome, commit_retry_backoff, context_id_to_bytes,
-};
+use super::state::{CommitOperation, PerContextState, context_id_to_bytes};
 
 // ---------------------------------------------------------------------------
 // RuntimeConsequenceDispatcher — bridges PerContextState to the shared trait
@@ -82,7 +68,9 @@ pub fn dispatch_consequences(
     now: u64,
     clock: &dyn scp_primitives::Clock,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
-    event_tx: Option<&tokio::sync::broadcast::Sender<(String, scp_protocol::context::membership::ContextEvent)>>,
+    event_tx: Option<
+        &tokio::sync::broadcast::Sender<(String, scp_protocol::context::membership::ContextEvent)>,
+    >,
 ) {
     if ctx.governance.consequence_rules.is_empty() {
         return;
@@ -220,7 +208,12 @@ pub struct EnforceConsequencesCtx<'a> {
     pub event_log: &'a dyn crate::context::builder::ContextEventLogProvider,
     /// Optional broadcast channel for event propagation from free
     /// functions that lack `&self` access to [`ContextManager`].
-    pub event_tx: Option<&'a tokio::sync::broadcast::Sender<(String, scp_protocol::context::membership::ContextEvent)>>,
+    pub event_tx: Option<
+        &'a tokio::sync::broadcast::Sender<(
+            String,
+            scp_protocol::context::membership::ContextEvent,
+        )>,
+    >,
 }
 
 /// Enforces a set of pre-evaluated triggered consequences.

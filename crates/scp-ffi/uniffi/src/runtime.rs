@@ -801,7 +801,9 @@ struct ArcContextPersistence {
 }
 
 impl ArcContextPersistence {
-    fn new(inner: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>) -> Self {
+    fn new(
+        inner: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
+    ) -> Self {
         Self { inner }
     }
 }
