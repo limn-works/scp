@@ -809,11 +809,11 @@ fn compute_wire_message(
 /// 4-digit number falls in the closed range \[6100, 6199\].
 #[must_use]
 pub fn validate_outlet_error_code(code: &str) -> bool {
-    // Hand-rolled byte comparison against the §5.4.4 prefix. Built via
-    // `concat!` so the source string never contains a literal
-    // `SCP-TOOL-<digits>` pattern that `scripts/check-error-codes.sh` would
-    // greedy-match as an out-of-range error code.
-    const PREFIX: &[u8] = concat!("SCP", "-TOOL-", "6", "1").as_bytes();
+    // Hand-rolled byte comparison against the §5.4.4 prefix. The literal
+    // is exempt from `scripts/check-error-codes.sh` Phase 1 via the inline
+    // marker below — this is a validator self-reference (the function
+    // checks inputs against this prefix), not an emitted error code.
+    const PREFIX: &[u8] = b"SCP-TOOL-61"; // SCP-CODE-OK: validator self-reference (§5.4.4 prefix check)
     if code.len() != 13 {
         return false;
     }
@@ -1156,14 +1156,14 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Negative-test input string. The runtime value is the 7-prefix variant
-    /// outside the §5.4.4 6100-6199 sub-block. Constructed via `concat!` so
-    /// the error-code CI gate (`scripts/check-error-codes.sh`) does not
-    /// greedy-match it as a real out-of-range code.
-    const INVALID_SUBBLOCK_CODE: &str = concat!("SCP", "-TOOL-7000");
+    /// outside the §5.4.4 6100-6199 sub-block. Phase 1 of the error-code CI
+    /// gate (`scripts/check-error-codes.sh`) skips this line via the inline
+    /// `SCP-CODE-OK:` exemption — a test fixture proving the rejection path.
+    const INVALID_SUBBLOCK_CODE: &str = "SCP-TOOL-7000"; // SCP-CODE-OK: negative-test fixture (§5.4.4 sub-block rejection)
     /// Negative-test input — a non-canonical-prefix code. The first segment
-    /// after `SCP-` is not in the `sdk-common.md` allowlist. Constructed via
-    /// `concat!` for the same CI-gate reason as above.
-    const NON_CANONICAL_PREFIX_CODE: &str = concat!("SCP", "-OUTLET-6100");
+    /// after `SCP-` is not in the `sdk-common.md` allowlist. Phase 1 skips
+    /// this line via the inline `SCP-CODE-OK:` exemption.
+    const NON_CANONICAL_PREFIX_CODE: &str = "SCP-OUTLET-6100"; // SCP-CODE-OK: negative-test fixture (non-canonical prefix rejection)
 
     #[test]
     fn constructor_validates_code_regex() {
@@ -1222,17 +1222,17 @@ mod tests {
         for code in ["SCP-TOOL-6100", "SCP-TOOL-6110", "SCP-TOOL-6199"] {
             assert!(validate_outlet_error_code(code), "expected valid: {code}");
         }
-        // Negative-test inputs — built via `concat!` so the error-code CI
-        // gate (`scripts/check-error-codes.sh`) does not greedy-match them as
-        // real out-of-range codes. The runtime values are byte-equal to the
-        // literal forms shown in the comments.
+        // Negative-test inputs. Phase 1 of `scripts/check-error-codes.sh`
+        // skips lines carrying the inline `SCP-CODE-OK:` marker so that
+        // these fixture values — which intentionally fall outside the
+        // §5.4.4 6100-6199 sub-block — do not trip the range check.
         let invalid_codes: [&str; 6] = [
-            concat!("SCP", "-TOOL-6099"), // below the §5.4.4 sub-block
-            concat!("SCP", "-TOOL-6200"), // above the §5.4.4 sub-block
-            INVALID_SUBBLOCK_CODE,        // 7-prefix variant outside the sub-block
-            NON_CANONICAL_PREFIX_CODE,    // non-canonical prefix segment
-            "scp-tool-6100",              // wrong case
-            "",                           // empty
+            "SCP-TOOL-6099",       // SCP-CODE-OK: negative-test fixture (below §5.4.4 sub-block)
+            "SCP-TOOL-6200",       // SCP-CODE-OK: negative-test fixture (above §5.4.4 sub-block)
+            INVALID_SUBBLOCK_CODE, // 7-prefix variant outside the sub-block
+            NON_CANONICAL_PREFIX_CODE, // non-canonical prefix segment
+            "scp-tool-6100",       // wrong case
+            "",                    // empty
         ];
         for code in invalid_codes {
             assert!(

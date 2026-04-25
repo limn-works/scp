@@ -19,6 +19,14 @@
 #
 # Exit 0 on success, 1 on any violation.
 # Usage: ./scripts/check-error-codes.sh
+#
+# Inline exemption marker:
+#   `SCP-CODE-OK: <reason>` — when present on a line, the line is skipped by
+#   Phase 1 range/prefix validation. Use sparingly and only for legitimate
+#   cases such as validator self-references where the canonical prefix
+#   appears in a `starts_with` / `b"..."` byte comparison rather than as an
+#   actual error code emission. Mirrors the `SCP-DEFAULT-INSTANCE-OK`
+#   pattern from `check-no-default-in-tests.sh`.
 
 set -euo pipefail
 
@@ -87,6 +95,30 @@ cd "$REPO_ROOT"
 # Excludes: .git, target, build, node_modules, .docs (specs/ADRs use codes in prose),
 #           sdk-common.md (the definition file itself), this script, CLAUDE.md files.
 while IFS=: read -r file line_num content; do
+    # Phase 1 mirrors Phase 2's test-file skip — test fixtures legitimately
+    # contain out-of-range codes to verify rejection logic, and module-level
+    # `#[cfg(test)]` blocks contain the same kinds of intentionally-wrong
+    # codes. Without this skip, contributors would be tempted to game the
+    # greedy `SCP-[A-Z]+-[0-9]+` regex via `concat!` / split string tricks.
+    case "$file" in
+        */tests/*|*/Tests/*|*_test.rs|*_test.ts|*_test.py|*.test.ts|*.test.js|*Tests.swift|*Test.kt) continue ;;
+    esac
+
+    # Honour the inline `SCP-CODE-OK:` exemption marker. This is the only
+    # mechanism by which a production-source line can carry a literal
+    # canonical prefix (e.g. validator self-references). Marker must appear
+    # on the same line; whole-file exemption is intentionally not supported.
+    case "$content" in
+        *"SCP-CODE-OK:"*) continue ;;
+    esac
+
+    # Inline-test heuristic — mirrors Phase 2 (lines 142-152). Lines that
+    # carry assertion/test-attribute markers are inside `#[cfg(test)]` blocks
+    # in inline-test files, where intentionally-wrong codes are legitimate.
+    case "$content" in
+        *assert_eq*|*assert!*|*assert_ne*|*matches!*|*"#[test]"*|*"#[cfg(test)]"*) continue ;;
+    esac
+
     # Extract all SCP codes from the line
     while [[ "$content" =~ SCP-([A-Z]+)-([0-9]+) ]]; do
         full_code="SCP-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}"
