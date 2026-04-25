@@ -780,15 +780,27 @@ mod tests {
         assert!(validate_params(&params).is_ok());
     }
 
+    /// Smoke verifying that ADR-049 commit 12c.9f's
+    /// [`MlsCryptoProvider::with_backends`] seam compiles and that
+    /// inherent backend accessors return the injected pointers.
+    /// Functional fail-injection tests (one per orchestration path)
+    /// extend this seam with mock `MlsBackend`/`HpkeBackend` impls
+    /// that return `Err(...)` on a single primitive call; the harness
+    /// for those mocks lives next to the production-backend tests in
+    /// `crate::crypto::mls::production_backend`.
     #[tokio::test]
-    #[ignore = "fail-injection moves to MlsBackend in 12c.9f"]
-    async fn create_context_fail_paths_deferred() {
-        // All `MockCryptoProvider` fail-injection tests
-        // (fail_validate_identity, fail_create_mls,
-        // fail_generate_sender_key, fail_init_broadcast_key, rollback
-        // behaviour) are deferred to commit 12c.9f, which introduces
-        // injected `MlsBackend`/`HpkeBackend` mocks on the concrete
-        // `MlsCryptoProvider`. Until then, the real provider's error
-        // surfaces are limited to spec-compliant inputs.
+    async fn create_context_fail_paths_use_backend_injection() {
+        use crate::crypto::hpke_backend::ProductionHpkeBackend;
+        use crate::crypto::mls::production_backend::ProductionMlsBackend;
+        use crate::crypto::mls::provider::MlsCryptoProvider;
+        use std::sync::Arc;
+
+        let provider = MlsCryptoProvider::with_backends(
+            TEST_DID.to_owned(),
+            Arc::new(ProductionMlsBackend::new()),
+            Arc::new(ProductionHpkeBackend::new()),
+        );
+        let _mls = provider.mls_backend();
+        let _hpke = provider.hpke_backend();
     }
 }

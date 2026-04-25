@@ -764,6 +764,120 @@ impl Supervisor {
             .map(|mgr| mgr.local_dids_ref())
     }
 
+    // -------------------------------------------------------------------
+    // ADR-049 commit 12c.9f — per-identity wrapping-key accessors.
+    //
+    // The plan §"MlsCryptoProvider dissolution" lifts the wrapping
+    // keypair off [`crate::crypto::mls::provider::MlsCryptoProvider`]
+    // (where it was held in `Mutex<[u8;32]>` / `Mutex<Zeroizing<...>>`
+    // fields) onto the supervisor's per-identity
+    // `wrapping_keys: DashMap<DID, ArcSwap<WrappingKeyPair>>` map. The
+    // following accessors give helper code on `&Supervisor` (the
+    // 12c.9c-d hoisted helper paths) a stable read/write surface
+    // without requiring callers to reach for `&self.wrapping_keys`
+    // directly.
+    //
+    // Read accessors return `Arc<Vec<u8>>` / `Arc<Zeroizing<Vec<u8>>>`
+    // newly allocated for each call so the caller owns a fresh
+    // refcounted handle. The map itself stays the source of truth;
+    // the caller is responsible for dropping the returned `Arc`
+    // promptly so a subsequent rotation can zeroize the prior bytes
+    // when the last reference drops.
+    //
+    // The write accessor [`Self::set_wrapping_keys`] acquires
+    // [`Self::write_lock`] before any per-identity mutation per the
+    // struct-level docs ("any mutation of `actors`, `standing_contexts`,
+    // `local_dids`, or `wrapping_keys` acquires `Self::write_lock`
+    // first"). The async lock is fine because the write path is rare
+    // (initial keypair generation + governance-driven rotations).
+    // -------------------------------------------------------------------
+
+    /// Returns a freshly-cloned `Arc` to the X25519 wrapping public key
+    /// for `did`, or `None` if no keypair has been registered.
+    ///
+    /// The returned `Arc<Vec<u8>>` carries the public key bytes the
+    /// HPKE seal path uses; the caller MUST drop the `Arc` within the
+    /// same poll (no storage in async-state struct fields) so a
+    /// subsequent [`Self::set_wrapping_keys`] rotation can drop the
+    /// prior bytes promptly.
+    #[must_use]
+    #[allow(dead_code)] // first caller lands in 12c.10 with the dissolution finale
+    pub(crate) fn wrapping_public_key_for(&self, did: &DID) -> Option<Arc<Vec<u8>>> {
+        self.wrapping_keys.get(did).map(|entry| {
+            let pair = entry.value().load_full();
+            Arc::new(pair.public.to_vec())
+        })
+    }
+
+    /// Returns a freshly-cloned `Arc` to the X25519 wrapping secret
+    /// key for `did`, or `None` if no keypair has been registered.
+    ///
+    /// Same reader discipline as [`Self::wrapping_public_key_for`]:
+    /// drop the returned `Arc` within the same poll. The inner
+    /// [`Zeroizing`] wrapper guarantees the bytes are zeroed on drop.
+    #[must_use]
+    #[allow(dead_code)] // first caller lands in 12c.10 with the dissolution finale
+    pub(crate) fn wrapping_secret_key_for(
+        &self,
+        did: &DID,
+    ) -> Option<Arc<zeroize::Zeroizing<Vec<u8>>>> {
+        self.wrapping_keys.get(did).map(|entry| {
+            let pair = entry.value().load_full();
+            Arc::new(zeroize::Zeroizing::new(pair.secret.to_vec()))
+        })
+    }
+
+    /// Atomically registers (or rotates) the X25519 wrapping keypair
+    /// for `did`. Acquires [`Self::write_lock`] first per the
+    /// supervisor's write-path discipline; the per-identity
+    /// `ArcSwap<WrappingKeyPair>` handles the atomic swap.
+    ///
+    /// Idempotent — calling with the same DID a second time replaces
+    /// the prior keypair (the old `Arc<WrappingKeyPair>` zeroizes its
+    /// secret on drop when the last reference releases).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::InvalidState`] if `public` or `secret`
+    /// are not exactly 32 bytes (X25519 keypair fixed sizes per
+    /// RFC 7748 §5).
+    pub async fn set_wrapping_keys(
+        self: &Arc<Self>,
+        did: DID,
+        public: Vec<u8>,
+        secret: zeroize::Zeroizing<Vec<u8>>,
+    ) -> Result<(), ContextError> {
+        let _guard = self.write_lock.lock().await;
+        // Convert from runtime-API `Vec<u8>` to the per-identity
+        // [`crate::context::actor::state::WrappingKeyPair`] shape
+        // (fixed 32-byte arrays, secret behind `Zeroizing`). Length
+        // mismatches surface as `InvalidState` so misuse fails loudly
+        // rather than silently truncating key material.
+        let public_arr: [u8; 32] = public.as_slice().try_into().map_err(|_| {
+            ContextError::InvalidState(format!(
+                "Supervisor::set_wrapping_keys — wrapping public key must be 32 bytes (got {})",
+                public.len(),
+            ))
+        })?;
+        let secret_arr: [u8; 32] = secret.as_slice().try_into().map_err(|_| {
+            ContextError::InvalidState(format!(
+                "Supervisor::set_wrapping_keys — wrapping secret key must be 32 bytes (got {})",
+                secret.len(),
+            ))
+        })?;
+        let pair = WrappingKeyPair {
+            public: public_arr,
+            secret: zeroize::Zeroizing::new(secret_arr),
+        };
+        match self.wrapping_keys.get(&did) {
+            Some(entry) => entry.value().store(Arc::new(pair)),
+            None => {
+                self.wrapping_keys.insert(did, ArcSwap::from_pointee(pair));
+            }
+        }
+        Ok(())
+    }
+
     /// Build an [`ActorDeps`](crate::context::actor::deps::ActorDeps)
     /// bundle from the attached legacy [`ContextManager`] (ADR-049 commit
     /// 12a.5).
@@ -2578,6 +2692,83 @@ mod tests {
         assert!(s.lookup("any-ctx").is_none());
         assert!(s.local_dids.load().is_empty());
         assert!(s.standing_contexts.load().is_empty());
+    }
+
+    /// ADR-049 commit 12c.9f: per-identity wrapping-key accessors lift
+    /// the keypair off `MlsCryptoProvider`. Verifies that `set` →
+    /// `get` returns the same bytes via the supervisor's
+    /// `DashMap<DID, ArcSwap<WrappingKeyPair>>`.
+    #[tokio::test]
+    async fn wrapping_keys_set_and_get_round_trip() {
+        let s = Arc::new(test_supervisor());
+        let did = DID("did:example:wrap-roundtrip".to_owned());
+        let public = vec![0x11u8; 32];
+        let secret = zeroize::Zeroizing::new(vec![0x22u8; 32]);
+
+        // Pre-set the slot is empty for this DID.
+        assert!(s.wrapping_public_key_for(&did).is_none());
+        assert!(s.wrapping_secret_key_for(&did).is_none());
+
+        s.set_wrapping_keys(did.clone(), public.clone(), secret.clone())
+            .await
+            .expect("set_wrapping_keys succeeds for valid 32-byte inputs");
+
+        let got_pub = s.wrapping_public_key_for(&did).expect("public set");
+        assert_eq!(*got_pub, public);
+        let got_sec = s.wrapping_secret_key_for(&did).expect("secret set");
+        assert_eq!(&**got_sec, &*secret);
+    }
+
+    /// Rotation replaces the prior keypair atomically; subsequent
+    /// reads observe the new bytes.
+    #[tokio::test]
+    async fn wrapping_keys_rotation_atomically_replaces() {
+        let s = Arc::new(test_supervisor());
+        let did = DID("did:example:wrap-rotate".to_owned());
+
+        s.set_wrapping_keys(
+            did.clone(),
+            vec![0x01u8; 32],
+            zeroize::Zeroizing::new(vec![0x02u8; 32]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*s.wrapping_public_key_for(&did).unwrap(), vec![0x01u8; 32]);
+
+        s.set_wrapping_keys(
+            did.clone(),
+            vec![0xAAu8; 32],
+            zeroize::Zeroizing::new(vec![0xBBu8; 32]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*s.wrapping_public_key_for(&did).unwrap(), vec![0xAAu8; 32]);
+        assert_eq!(
+            &**s.wrapping_secret_key_for(&did).unwrap(),
+            &vec![0xBBu8; 32]
+        );
+    }
+
+    /// Wrong-length inputs surface as `InvalidState` rather than
+    /// silently truncating key material.
+    #[tokio::test]
+    async fn wrapping_keys_rejects_wrong_byte_length() {
+        let s = Arc::new(test_supervisor());
+        let did = DID("did:example:wrap-bad-len".to_owned());
+        let err = s
+            .set_wrapping_keys(
+                did.clone(),
+                vec![0u8; 16],
+                zeroize::Zeroizing::new(vec![0u8; 32]),
+            )
+            .await
+            .expect_err("16-byte public must reject");
+        assert!(matches!(err, ContextError::InvalidState(_)));
+        let err = s
+            .set_wrapping_keys(did, vec![0u8; 32], zeroize::Zeroizing::new(vec![0u8; 16]))
+            .await
+            .expect_err("16-byte secret must reject");
+        assert!(matches!(err, ContextError::InvalidState(_)));
     }
 
     #[tokio::test]

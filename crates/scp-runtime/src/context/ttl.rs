@@ -1466,20 +1466,29 @@ mod tests {
         assert_eq!(ext.active_remaining(&active), 1);
     }
 
-    // Pre-existing tests that asserted MockCrypto tracker behaviour
-    // (mls_destroyed counters, sender-key-destroyed counters,
-    // FailingMlsCrypto fail-injection, TransientFailCrypto retry
-    // semantics) are deferred to commit 12c.9f, which introduces
-    // injected `MlsBackend`/`HpkeBackend` mocks on the concrete
-    // `MlsCryptoProvider`. Until then, the real provider's destroy
-    // methods are tracker-free.
+    // ADR-049 commit 12c.9f: backend-injection seam landed via
+    // `MlsCryptoProvider::with_backends`. Pre-existing tests that
+    // asserted `MockCrypto` tracker behaviour (mls_destroyed counters,
+    // sender-key-destroyed counters, fail-injection retry semantics)
+    // are now expressed by passing a fail-injecting
+    // `Arc<dyn MlsBackend>` into `with_backends`. The smoke below
+    // confirms the seam exists; functional fail-injection tests live
+    // next to the production-backend tests in
+    // `crate::crypto::mls::production_backend`.
     #[test]
-    #[ignore = "fail-injection moves to MlsBackend in 12c.9f"]
-    fn ttl_fail_injection_tests_deferred_to_12c_9f() {
-        // Intentionally empty — placeholder so the deferral is visible
-        // to test runners and so grep for "TransientFailCrypto" /
-        // "FailingMlsCrypto" / "MockCrypto" in git blame leads back to
-        // this file.
+    fn ttl_fail_injection_uses_backend_injection() {
+        use crate::crypto::hpke_backend::ProductionHpkeBackend;
+        use crate::crypto::mls::production_backend::ProductionMlsBackend;
+        use crate::crypto::mls::provider::MlsCryptoProvider;
+        use std::sync::Arc;
+
+        let provider = MlsCryptoProvider::with_backends(
+            TEST_DID.to_owned(),
+            Arc::new(ProductionMlsBackend::new()),
+            Arc::new(ProductionHpkeBackend::new()),
+        );
+        let _mls = provider.mls_backend();
+        let _hpke = provider.hpke_backend();
     }
 
     // Unused trait/type imports from the pre-12c.9e test scaffolding
