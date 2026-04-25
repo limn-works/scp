@@ -3205,11 +3205,12 @@ pub(crate) fn metadata_record_to_json_on(
     })
 }
 
-/// Per-bridge-instance implementation of [`metadata_record_from_json`].
-pub(crate) fn metadata_record_from_json_on(
-    _bi: &NapiBridgeInstance,
-    json_str: String,
-) -> napi::Result<String> {
+/// Pure protocol helper — parses, validates, and re-serializes a `MetadataRecord` JSON.
+///
+/// Touches no per-instance state, so it is a top-level free function per ADR-048 §1
+/// ("Pure protocol helpers stay free functions at the FFI Rust layer").
+#[napi(js_name = "metadataRecordFromJson")]
+pub fn metadata_record_from_json(json_str: String) -> napi::Result<String> {
     use scp_core::context::metadata::MetadataRecord;
 
     let record: MetadataRecord = serde_json::from_str(&json_str).map_err(|e| {
@@ -3250,11 +3251,12 @@ pub(crate) fn metadata_record_from_json_on(
 // Context template inspection (§5.14, #615)
 // ---------------------------------------------------------------------------
 
-/// Per-bridge-instance implementation of `template_get_params`.
-pub(crate) fn template_get_params_on(
-    _bi: &NapiBridgeInstance,
-    template_id: String,
-) -> napi::Result<String> {
+/// Pure protocol helper — looks up the canonical `ContextParams` for a template ID.
+///
+/// Touches no per-instance state, so it is a top-level free function per ADR-048 §1
+/// ("Pure protocol helpers stay free functions at the FFI Rust layer").
+#[napi(js_name = "templateGetParams")]
+pub fn template_get_params(template_id: String) -> napi::Result<String> {
     use scp_core::context::templates::template_params;
 
     let tid = parse_template_id_napi(&template_id)?;
@@ -3267,11 +3269,12 @@ pub(crate) fn template_get_params_on(
     })
 }
 
-/// Per-bridge-instance implementation of `validate_against_template`.
-pub(crate) fn validate_against_template_on(
-    _bi: &NapiBridgeInstance,
-    params_json: String,
-) -> napi::Result<Option<String>> {
+/// Pure protocol helper — validates `ContextParams` JSON against template constraints.
+///
+/// Touches no per-instance state, so it is a top-level free function per ADR-048 §1
+/// ("Pure protocol helpers stay free functions at the FFI Rust layer").
+#[napi(js_name = "validateAgainstTemplate")]
+pub fn validate_against_template(params_json: String) -> napi::Result<Option<String>> {
     use scp_core::context::templates::validate_against_template;
 
     let params: scp_core::context::ContextParams =
@@ -3288,11 +3291,12 @@ pub(crate) fn validate_against_template_on(
     }
 }
 
-/// Per-bridge-instance implementation of `validate_context_params`.
-pub(crate) fn validate_context_params_on(
-    _bi: &NapiBridgeInstance,
-    params_json: String,
-) -> napi::Result<Option<String>> {
+/// Pure protocol helper — validates `ContextParams` JSON for shape correctness.
+///
+/// Touches no per-instance state, so it is a top-level free function per ADR-048 §1
+/// ("Pure protocol helpers stay free functions at the FFI Rust layer").
+#[napi(js_name = "validateContextParams")]
+pub fn validate_context_params(params_json: String) -> napi::Result<Option<String>> {
     use scp_core::context::templates::validate_context_params;
 
     let params: scp_core::context::ContextParams =

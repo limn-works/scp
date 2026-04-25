@@ -43,13 +43,23 @@ import type { Node, Relay } from "./server";
 
 /**
  * Shape of the native addon — a subset sufficient to describe the
- * `SCP` class and its static factories.
+ * `SCP` class, its static factories, and the module-level free
+ * functions for pure protocol helpers (per ADR-048 §1: pure helpers
+ * stay free functions at the FFI Rust layer).
  */
 type NativeAddon = {
   // The raw addon exports `SCP` as an opaque napi-rs class. We refine to
   // `NativeScpCtor` after a runtime `typeof` check; `unknown` keeps
   // biome's `noExplicitAny` happy while the check provides the real type.
   SCP?: unknown;
+  // Pure protocol helpers — exported at module scope per ADR-048 §1
+  // because they touch no per-instance state. The `SCP` class methods
+  // for these names route to these module-level exports per ADR-048 §7
+  // (TS keeps the method shape as a TS-local ergonomic choice).
+  metadataRecordFromJson?: unknown;
+  templateGetParams?: unknown;
+  validateAgainstTemplate?: unknown;
+  validateContextParams?: unknown;
 };
 
 /**
@@ -116,10 +126,11 @@ function resolveNapiPackage(): string {
 }
 
 let _nativeScp: NativeScpCtor | null = null;
+let _nativeAddon: NativeAddon | null = null;
 
-function nativeScp(): NativeScpCtor {
-  if (_nativeScp !== null) {
-    return _nativeScp;
+function loadAddon(): NativeAddon {
+  if (_nativeAddon !== null) {
+    return _nativeAddon;
   }
 
   if (typeof process === "undefined" || !process.versions?.node) {
@@ -157,8 +168,52 @@ function nativeScp(): NativeScpCtor {
     );
   }
 
+  _nativeAddon = addon;
   _nativeScp = addon.SCP as unknown as NativeScpCtor;
+  return _nativeAddon;
+}
+
+function nativeScp(): NativeScpCtor {
+  if (_nativeScp !== null) {
+    return _nativeScp;
+  }
+  // loadAddon() either populates _nativeScp or throws — it never returns
+  // without setting the cache.
+  loadAddon();
+  if (_nativeScp === null) {
+    // Defensive: should be unreachable because loadAddon() either
+    // throws (above) or populates _nativeScp before returning.
+    throw new ValidationError(
+      "Native addon loaded but SCP constructor is unavailable — internal " +
+        "invariant violated. File an issue against scp-ts.",
+      "SCP-VALID-7005",
+    );
+  }
   return _nativeScp;
+}
+
+/**
+ * Returns the loaded native addon's module-level export for a pure
+ * protocol helper. Pure helpers live at module scope on the addon per
+ * ADR-048 §1; `SCP` class methods that wrap them route through this
+ * accessor instead of `this.#native[name]`.
+ *
+ * Throws `SCP-VALID-7005` if the addon is unloadable or does not
+ * export the named function (e.g., a stale prebuilt addon predating
+ * the §1 split).
+ */
+function nativeFreeFn<T>(name: keyof NativeAddon): T {
+  const addon = loadAddon();
+  const fn = addon[name];
+  if (typeof fn !== "function") {
+    throw new ValidationError(
+      `Native addon does not export the module-level free function "${String(name)}" — ` +
+        "the addon may be stale (predating ADR-048 §1 pure-helper split). " +
+        "Rebuild with `cargo build -p scp-ffi-napi` or upgrade the platform package.",
+      "SCP-VALID-7005",
+    );
+  }
+  return fn as T;
 }
 
 // ---------------------------------------------------------------------------
@@ -1146,20 +1201,31 @@ export class SCP {
     )(contextId, sequence, signerDid, timestamp, structuralJson, operationalJson, signatureHex);
   }
 
+  // The four pure protocol helpers below are method-shaped on `SCP` for
+  // TS-local ergonomic consistency (ADR-048 §7), but the FFI Rust source
+  // exposes them as module-level free functions per ADR-048 §1 (no
+  // per-instance state to read). Each method routes to the addon's
+  // module-level NAPI export; the `this` receiver carries no runtime
+  // weight in these calls.
+
   metadataRecordFromJson(jsonStr: string): string {
-    return (this.#native.metadataRecordFromJson as (j: string) => string)(jsonStr);
+    const fn = nativeFreeFn<(j: string) => string>("metadataRecordFromJson");
+    return fn(jsonStr);
   }
 
   templateGetParams(templateId: string): string {
-    return (this.#native.templateGetParams as (t: string) => string)(templateId);
+    const fn = nativeFreeFn<(t: string) => string>("templateGetParams");
+    return fn(templateId);
   }
 
   validateAgainstTemplate(paramsJson: string): string | null {
-    return (this.#native.validateAgainstTemplate as (p: string) => string | null)(paramsJson);
+    const fn = nativeFreeFn<(p: string) => string | null>("validateAgainstTemplate");
+    return fn(paramsJson);
   }
 
   validateContextParams(paramsJson: string): string | null {
-    return (this.#native.validateContextParams as (p: string) => string | null)(paramsJson);
+    const fn = nativeFreeFn<(p: string) => string | null>("validateContextParams");
+    return fn(paramsJson);
   }
 
   // ───────────────────────────────────────────────────────────────────────

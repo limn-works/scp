@@ -2592,30 +2592,6 @@ impl Scp {
         )
     }
 
-    /// Per-instance equivalent of the free-function `metadata_record_from_json`.
-    #[napi(js_name = "metadataRecordFromJson")]
-    pub fn metadata_record_from_json(&self, json_str: String) -> napi::Result<String> {
-        crate::context::metadata_record_from_json_on(&self.inner, json_str)
-    }
-
-    /// Per-instance equivalent of the free-function `template_get_params`.
-    #[napi(js_name = "templateGetParams")]
-    pub fn template_get_params(&self, template_id: String) -> napi::Result<String> {
-        crate::context::template_get_params_on(&self.inner, template_id)
-    }
-
-    /// Per-instance equivalent of the free-function `validate_against_template`.
-    #[napi(js_name = "validateAgainstTemplate")]
-    pub fn validate_against_template(&self, params_json: String) -> napi::Result<Option<String>> {
-        crate::context::validate_against_template_on(&self.inner, params_json)
-    }
-
-    /// Per-instance equivalent of the free-function `validate_context_params`.
-    #[napi(js_name = "validateContextParams")]
-    pub fn validate_context_params(&self, params_json: String) -> napi::Result<Option<String>> {
-        crate::context::validate_context_params_on(&self.inner, params_json)
-    }
-
     // ===== sub-slice C: tools =====
 
     /// Per-instance equivalent of the free-function `tool_register`.
