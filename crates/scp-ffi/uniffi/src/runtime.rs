@@ -262,7 +262,7 @@ impl UniffiBridgeInstance {
     }
 
     /// Constructs a new `UniffiBridgeInstance` with an explicit
-    /// [`scp_core::context::manager::ContextPersistence`] provider.
+    /// [`scp_core::context::persistence::ContextPersistence`] provider.
     ///
     /// Used by callers that already have a persistence strategy (typically
     /// unit tests; production persistence is wired through PR 3's
@@ -270,7 +270,7 @@ impl UniffiBridgeInstance {
     /// [`UniffiBridgeInstance::with_storage_uniffi`]).
     #[must_use]
     pub fn with_persistence_uniffi(
-        persistence: Box<dyn scp_core::context::manager::ContextPersistence + Send + Sync>,
+        persistence: Box<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
     ) -> Self {
         let (_event_log, protocol_repository) =
             scp_ffi_common::bridge_runtime::build_event_log_provider();
@@ -321,7 +321,7 @@ impl UniffiBridgeInstance {
                         let persistence_repo =
                             Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
                         let persistence: Arc<
-                            dyn scp_core::context::manager::ContextPersistence + Send + Sync,
+                            dyn scp_core::context::persistence::ContextPersistence + Send + Sync,
                         > = Arc::new(
                             scp_core::store::context::ProtocolRepositoryContextBridge::new(
                                 persistence_repo,
@@ -375,7 +375,7 @@ impl UniffiBridgeInstance {
     /// `Arc<SqliteStorage>`.
     #[must_use]
     fn with_persistence_uniffi_arc_and_repo(
-        persistence: Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>,
+        persistence: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
         protocol_repository: ProtocolRepoVariant,
     ) -> Self {
         Self {
@@ -797,20 +797,20 @@ fn not_configured_key_resolver() -> scp_core::context::governance::KeyResolver {
 /// the same provider, so suspend/resume flush + `flush_all_contexts_sync`
 /// operate on the same underlying storage.
 struct ArcContextPersistence {
-    inner: Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>,
+    inner: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>,
 }
 
 impl ArcContextPersistence {
-    fn new(inner: Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>) -> Self {
+    fn new(inner: Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>) -> Self {
         Self { inner }
     }
 }
 
-impl scp_core::context::manager::ContextPersistence for ArcContextPersistence {
+impl scp_core::context::persistence::ContextPersistence for ArcContextPersistence {
     fn persist_context(
         &self,
         context_id: &str,
-        snapshot: &scp_core::context::manager::ContextSnapshot,
+        snapshot: &scp_core::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner.persist_context(context_id, snapshot)
     }
@@ -819,7 +819,7 @@ impl scp_core::context::manager::ContextPersistence for ArcContextPersistence {
         &self,
         context_id: &str,
     ) -> Result<
-        Option<scp_core::context::manager::ContextSnapshot>,
+        Option<scp_core::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         self.inner.load_context(context_id)
@@ -877,12 +877,12 @@ fn build_supervisor(
     crypto: Arc<MlsCryptoProvider>,
     transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
-    persistence: Option<Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>>,
+    persistence: Option<Arc<dyn scp_core::context::persistence::ContextPersistence + Send + Sync>>,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
-    let persistence_box: Option<Box<dyn scp_core::context::manager::ContextPersistence>> =
+    let persistence_box: Option<Box<dyn scp_core::context::persistence::ContextPersistence>> =
         persistence.map(|shared| {
             Box::new(ArcContextPersistence::new(shared))
-                as Box<dyn scp_core::context::manager::ContextPersistence>
+                as Box<dyn scp_core::context::persistence::ContextPersistence>
         });
     scp_core::context::supervisor::Supervisor::with_providers(
         crypto,

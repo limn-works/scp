@@ -992,11 +992,11 @@ mod tests {
     /// Minimal persistence stub for the `ContextActor::new` test.
     /// Returns empty reads and silently accepts every write.
     struct TestPersistence;
-    impl crate::context::manager::ContextPersistence for TestPersistence {
+    impl crate::context::persistence::ContextPersistence for TestPersistence {
         fn persist_context(
             &self,
             _: &str,
-            _: &crate::context::manager::ContextSnapshot,
+            _: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
@@ -1004,7 +1004,7 @@ mod tests {
             &self,
             _: &str,
         ) -> Result<
-            Option<crate::context::manager::ContextSnapshot>,
+            Option<crate::context::state::ContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)

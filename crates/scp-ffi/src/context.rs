@@ -2070,14 +2070,14 @@ fn py_context_import(data: &[u8]) -> PyResult<String> {
 ///
 /// Returns `RuntimeError` if the context manager is not initialized, the
 /// proposal JSON is invalid, or governance execution fails.
-/// Maps a [`GovernanceActionResult`](scp_core::context::manager::GovernanceActionResult)
+/// Maps a [`GovernanceActionResult`](scp_core::context::state::GovernanceActionResult)
 /// to its canonical `PascalCase` name for the SDK-facing return
 /// string. Factored out of `py_governance_execute` to keep that
 /// function below the `too_many_lines` clippy threshold.
 const fn governance_action_result_name(
-    result: &scp_core::context::manager::GovernanceActionResult,
+    result: &scp_core::context::state::GovernanceActionResult,
 ) -> &'static str {
-    use scp_core::context::manager::GovernanceActionResult;
+    use scp_core::context::state::GovernanceActionResult;
     match result {
         GovernanceActionResult::MemberAdded => "MemberAdded",
         GovernanceActionResult::MemberRemoved => "MemberRemoved",

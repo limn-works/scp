@@ -325,7 +325,7 @@ pub(crate) struct PerContextState {
     consequence_rules: Vec<scp_protocol::trust::consequence::ConsequenceRule>,
     /// Per-rule cooldown timers (`rule_index` → Unix second until which the
     /// rule should not re-fire). Mirrors
-    /// `scp_runtime::context::manager::PerContextState.governance.cooldown_until`
+    /// `scp_runtime::context::state::PerContextState.governance.cooldown_until`
     /// and is consulted by [`crate::consequence::dispatch_consequences_for_subject`]
     /// to prevent re-firing within a rule's window.
     cooldown_until: HashMap<usize, u64>,
@@ -5741,7 +5741,7 @@ struct WasmContextExportSnapshot {
     #[serde(default)]
     resolved_proposals_json: HashMap<String, serde_json::Value>,
     /// Consequence rules declared at context creation (ADR-017). Mirrors
-    /// `scp_runtime::context::manager::ContextSnapshot.consequence_rules` and
+    /// `scp_runtime::context::state::ContextSnapshot.consequence_rules` and
     /// is wired to `evaluate_consequence_rules` via the WASM
     /// `consequence::dispatch_consequences_for_subject` helper.
     #[serde(default)]

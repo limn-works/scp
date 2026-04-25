@@ -181,7 +181,7 @@ fn compute_entry_hash(
 
 /// Persistence adapter for `MerkleEventLogProvider` event log entries.
 ///
-/// Mirrors the [`ContextPersistence`](crate::context::manager::ContextPersistence)
+/// Mirrors the [`ContextPersistence`](crate::context::persistence::ContextPersistence)
 /// pattern: synchronous trait methods, bridged to async `ProtocolRepository` via
 /// `tokio::task::block_in_place` in production.
 ///

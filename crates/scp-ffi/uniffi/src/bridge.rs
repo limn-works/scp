@@ -7952,7 +7952,7 @@ pub async fn governance_execute(
                 })?
                 .map_err(ScpError::from)?;
             // Serialize the result variant name for the caller.
-            use scp_core::context::manager::GovernanceActionResult;
+            use scp_core::context::state::GovernanceActionResult;
             let result_str = match result {
                 GovernanceActionResult::MemberAdded => "MemberAdded",
                 GovernanceActionResult::MemberRemoved => "MemberRemoved",

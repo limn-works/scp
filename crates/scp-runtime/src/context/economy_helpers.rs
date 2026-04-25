@@ -276,7 +276,7 @@ pub async fn complete_paid_action(
         .await?;
 
     // Store receipt in event log.
-    let context_id_bytes = crate::context::manager::context_id_to_bytes(context_id);
+    let context_id_bytes = crate::context::state::context_id_to_bytes(context_id);
     if let Err(e) =
         event_log.append_context_event(&context_id_bytes, "PaymentReceived", payer_did.as_ref())
     {

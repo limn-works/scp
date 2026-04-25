@@ -9,7 +9,7 @@
 //! provides an additional in-memory implementation suitable for integration
 //! tests that need persistence semantics without a storage backend.
 //!
-//! [`ContextPersistence`]: crate::context::manager::ContextPersistence
+//! [`ContextPersistence`]: crate::context::persistence::ContextPersistence
 
 use std::collections::HashMap;
 #[allow(

@@ -97,7 +97,7 @@ use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
 
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
-use crate::context::manager::ContextPersistence;
+use crate::context::persistence::ContextPersistence;
 use crate::context::supervisor::handle::SupervisorHandle;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::crypto::hpke_backend::HpkeBackend;

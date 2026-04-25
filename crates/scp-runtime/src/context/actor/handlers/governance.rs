@@ -514,7 +514,7 @@ async fn handle_withdraw_governance_vote(
 async fn handle_execute_governance_action(
     supervisor: &Supervisor,
     p: ExecuteGovernanceActionPayload,
-    reply: oneshot::Sender<Result<crate::context::manager::GovernanceActionResult, ContextError>>,
+    reply: oneshot::Sender<Result<crate::context::state::GovernanceActionResult, ContextError>>,
 ) -> Outcome<()> {
     let context_id = p.context_id.clone();
     let proposal = p.proposal;
@@ -737,7 +737,7 @@ async fn handle_tombstone_migrated_context(
 async fn handle_migration_state(
     supervisor: &Supervisor,
     context_id: &str,
-    reply: oneshot::Sender<Result<Option<crate::context::manager::MigrationState>, ContextError>>,
+    reply: oneshot::Sender<Result<Option<crate::context::state::MigrationState>, ContextError>>,
 ) -> Outcome<()> {
     let migration_fut = crate::context::governance_helpers::migration_state(supervisor, context_id);
 
@@ -762,7 +762,7 @@ async fn handle_migration_state(
 async fn handle_acknowledge_commit_fault(
     supervisor: &Supervisor,
     context_id: &str,
-    reply: oneshot::Sender<Result<crate::context::manager::CommitFaultMarker, ContextError>>,
+    reply: oneshot::Sender<Result<crate::context::state::CommitFaultMarker, ContextError>>,
 ) -> Outcome<()> {
     let ack_fut =
         crate::context::governance_helpers::acknowledge_commit_fault(supervisor, context_id);

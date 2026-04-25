@@ -1971,7 +1971,7 @@ pub fn load_persisted_context_state(
     context_id: &str,
 ) -> Result<
     (
-        crate::context::manager::ContextSnapshot,
+        crate::context::state::ContextSnapshot,
         Option<scp_protocol::context::broadcast::BroadcastContext>,
     ),
     ContextError,
@@ -2012,7 +2012,7 @@ pub fn load_persisted_context_state(
 /// Hoisted from `ContextManager::restore_event_log_best_effort`
 /// (ADR-049 commit 12). Byte-identical behavior.
 fn restore_event_log_best_effort(supervisor: &Supervisor, context_id: &str) {
-    use crate::context::manager::context_id_to_bytes;
+    use crate::context::state::context_id_to_bytes;
     let ctx_id_bytes = context_id_to_bytes(context_id);
     let Some(event_log) = supervisor.event_log_ref() else {
         return;
@@ -2457,7 +2457,7 @@ fn persist_degraded_snapshot(supervisor: &Supervisor, context_id: &str) {
 
 /// Builds a minimal `ContextSnapshot` marked for reconnection. Mirrors
 /// `ContextManager::build_degraded_snapshot`.
-fn build_degraded_snapshot(context_id: &str) -> crate::context::manager::ContextSnapshot {
+fn build_degraded_snapshot(context_id: &str) -> crate::context::state::ContextSnapshot {
     use scp_protocol::context::ContextParams;
     use scp_protocol::context::membership::MembershipState;
 
@@ -2473,7 +2473,7 @@ fn build_degraded_snapshot(context_id: &str) -> crate::context::manager::Context
         member_capabilities: HashMap::new(),
         suspended_capabilities: HashMap::new(),
     };
-    crate::context::manager::ContextSnapshot {
+    crate::context::state::ContextSnapshot {
         context_id: context_id.to_owned(),
         state: ContextState::Active,
         context_params: ContextParams::default(),
@@ -2529,7 +2529,7 @@ fn build_degraded_snapshot(context_id: &str) -> crate::context::manager::Context
 /// [`ContextManager::shutdown_all_contexts`]
 /// (ADR-049 commit 12). Byte-identical behavior.
 pub fn shutdown_all_contexts(supervisor: &Supervisor) {
-    use crate::context::manager::context_id_to_bytes;
+    use crate::context::state::context_id_to_bytes;
 
     let context_ids: Vec<String> = supervisor
         .contexts_ref()

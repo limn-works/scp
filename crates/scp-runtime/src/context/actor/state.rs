@@ -37,7 +37,7 @@
 //!
 //! Commit 12a populates [`PerContextState`], [`ContextCryptoState`], and
 //! [`BroadcastState`] with every field the legacy manager's
-//! [`crate::context::manager::PerContextState`] +
+//! [`crate::context::state::PerContextState`] +
 //! `MlsCryptoProvider::contexts[ctx_id]` owns. No handler body moves
 //! here — the shim still delegates through `ContextManager` via
 //! `view.manager()`. The purpose is to give 12b+ a complete field-set
@@ -395,7 +395,7 @@ pub struct ContextCryptoState {
     /// Per-member access-key store for content-encryption-key wrapping
     /// (spec §9.17, ADR-038). Scoped to encrypted contexts: legacy
     /// stored this on
-    /// [`AccessControlState::access_key_store`](crate::context::manager::AccessControlState)
+    /// [`AccessControlState::access_key_store`](crate::context::state::AccessControlState)
     /// on every `PerContextState` — per task §2, commit 12a hoists the
     /// field to [`ContextCryptoState`] because it is encrypted-mode-
     /// specific (broadcast contexts use the per-author AES-GCM layer
@@ -520,7 +520,7 @@ impl ContextModeState {
 /// # Field-for-field parity with legacy
 ///
 /// Commit 12a mirrors every field on
-/// [`crate::context::manager::PerContextState`] so 12b+ handler-body
+/// [`crate::context::state::PerContextState`] so 12b+ handler-body
 /// migrations move calls mechanically off `manager.foo` onto
 /// `state.foo`. The new-per-actor fields at the bottom of the struct
 /// (`send_tracker`, `recv_tracker`, `saga_pending`, `welcome_scratchpad`,
@@ -555,7 +555,7 @@ pub struct PerContextState {
     pub created_at: u64,
 
     /// Monotonic generation counter inherited from legacy
-    /// [`crate::context::manager::PerContextState::generation`]
+    /// [`crate::context::state::PerContextState::generation`]
     /// (manager/mod.rs). Legacy used it to detect the confused-deputy
     /// scenario on lock-drop / re-acquire. The actor model does not
     /// rely on a generation counter (each actor IS a generation in

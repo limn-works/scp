@@ -2,7 +2,7 @@
 //!
 //! See [`QueriesCommand`](crate::context::actor::commands::QueriesCommand)
 //! for the full variant set. Every handler takes a borrowed
-//! [`PerContextState`](crate::context::manager::PerContextState) plus the
+//! [`PerContextState`](crate::context::state::PerContextState) plus the
 //! shared event-log provider, and returns
 //! `Outcome { mutated: false }` by construction — the dispatch function
 //! uses [`Outcome::ok(())`](crate::context::actor::outcome::Outcome::ok)
@@ -43,7 +43,7 @@ use crate::context::actor::commands::QueriesCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::context::builder::ContextEventLogProvider;
-use crate::context::manager::PerContextState;
+use crate::context::state::PerContextState;
 
 /// Dispatch a [`QueriesCommand`] against a per-context read borrow. Every
 /// arm sends a typed reply on the variant's oneshot and returns
@@ -65,7 +65,7 @@ use crate::context::manager::PerContextState;
 /// without further churn.
 ///
 /// `pub(crate)` because the parameter type
-/// [`PerContextState`](crate::context::manager::PerContextState) is
+/// [`PerContextState`](crate::context::state::PerContextState) is
 /// `pub(crate)` (it lives on the legacy `ContextManager` shim and is
 /// deleted in commit 12). The actor's `run()` loop lives in the same
 /// crate so this visibility is sufficient.

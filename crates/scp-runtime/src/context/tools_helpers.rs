@@ -434,7 +434,7 @@ struct Phase1Snapshot {
     handle: crate::context::ContextHandle,
     role_state: scp_protocol::context::roles::ContextRoleState,
     ticket: ToolEconomyTicket,
-    ctx_gen: crate::context::manager::ContextGeneration,
+    ctx_gen: crate::context::state::ContextGeneration,
 }
 
 /// Invokes a tool under the full economy pipeline without holding the

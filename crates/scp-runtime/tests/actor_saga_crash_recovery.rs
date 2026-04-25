@@ -33,11 +33,11 @@ use scp_runtime::context::supervisor::{
 };
 
 struct NoopPersistence;
-impl scp_runtime::context::manager::ContextPersistence for NoopPersistence {
+impl scp_runtime::context::persistence::ContextPersistence for NoopPersistence {
     fn persist_context(
         &self,
         _: &str,
-        _: &scp_runtime::context::manager::ContextSnapshot,
+        _: &scp_runtime::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
@@ -45,7 +45,7 @@ impl scp_runtime::context::manager::ContextPersistence for NoopPersistence {
         &self,
         _: &str,
     ) -> Result<
-        Option<scp_runtime::context::manager::ContextSnapshot>,
+        Option<scp_runtime::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         Ok(None)
@@ -96,7 +96,7 @@ async fn inject(
 }
 
 fn build_supervisor(storage: &Arc<InMemoryStorage>) -> Supervisor {
-    let persistence: Arc<dyn scp_runtime::context::manager::ContextPersistence> =
+    let persistence: Arc<dyn scp_runtime::context::persistence::ContextPersistence> =
         Arc::new(NoopPersistence);
     let journal: Arc<dyn SagaJournal> =
         Arc::new(ProtocolRepositorySagaJournal::new(Arc::clone(storage)));

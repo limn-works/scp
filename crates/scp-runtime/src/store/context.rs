@@ -382,7 +382,7 @@ impl<S: Storage> ProtocolRepository<S> {
     /// Scans for keys matching `context/*/full_snapshot` by listing all keys
     /// with the `context/` prefix and filtering for snapshot keys. Used by
     /// [`ProtocolRepositoryContextBridge`] to implement
-    /// [`crate::context::manager::ContextPersistence::list_persisted_contexts`].
+    /// [`crate::context::persistence::ContextPersistence::list_persisted_contexts`].
     ///
     /// The returned list is a point-in-time snapshot. In a concurrent
     /// environment, contexts may be created or deleted between the list
@@ -411,7 +411,7 @@ impl<S: Storage> ProtocolRepository<S> {
 
     /// Stores a full context snapshot for persistence across restarts.
     ///
-    /// Serializes the [`crate::context::manager::ContextSnapshot`] under
+    /// Serializes the [`crate::context::state::ContextSnapshot`] under
     /// `context/{context_id}/full_snapshot` as a single atomic blob.
     /// Buffer zeroization is applied after write (defense-in-depth for
     /// any key material that may be referenced in the snapshot).
@@ -425,7 +425,7 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn store_full_snapshot(
         &self,
         context_id: &str,
-        snapshot: &crate::context::manager::ContextSnapshot,
+        snapshot: &crate::context::state::ContextSnapshot,
     ) -> Result<(), StoreError> {
         let key = full_snapshot_key(context_id)?;
         let mut bytes = Self::serialize(snapshot)?;
@@ -442,7 +442,7 @@ impl<S: Storage> ProtocolRepository<S> {
     /// Loads a full context snapshot from persistence.
     ///
     /// Returns `None` if no full snapshot has been persisted for the given
-    /// context. The caller should use the returned [`crate::context::manager::ContextSnapshot`] to
+    /// context. The caller should use the returned [`crate::context::state::ContextSnapshot`] to
     /// reconstruct `PerContextState` during restart.
     ///
     /// See SCP-PERSIST-021 and spec section 17.4.
@@ -454,7 +454,7 @@ impl<S: Storage> ProtocolRepository<S> {
     pub async fn load_full_snapshot(
         &self,
         context_id: &str,
-    ) -> Result<Option<crate::context::manager::ContextSnapshot>, StoreError> {
+    ) -> Result<Option<crate::context::state::ContextSnapshot>, StoreError> {
         let key = full_snapshot_key(context_id)?;
         self.load_value(&key).await
     }
@@ -913,7 +913,7 @@ impl<S: Storage> ProtocolRepository<S> {
 /// `ProtocolRepository<S>`.
 ///
 /// Wraps `Arc<ProtocolRepository<S>>` and implements the synchronous
-/// [`crate::context::manager::ContextPersistence`] trait by blocking on the async `ProtocolRepository`
+/// [`crate::context::persistence::ContextPersistence`] trait by blocking on the async `ProtocolRepository`
 /// methods via `tokio::task::block_in_place` + `Handle::block_on`. This is
 /// safe because `ContextPersistence` methods are always called from within a
 /// tokio runtime context (after the `contexts` mutex is released).
@@ -930,13 +930,13 @@ impl<S: Storage> ProtocolRepositoryContextBridge<S> {
     }
 }
 
-impl<S: Storage + 'static> crate::context::manager::ContextPersistence
+impl<S: Storage + 'static> crate::context::persistence::ContextPersistence
     for ProtocolRepositoryContextBridge<S>
 {
     fn persist_context(
         &self,
         context_id: &str,
-        snapshot: &crate::context::manager::ContextSnapshot,
+        snapshot: &crate::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let store = self.store.clone();
         let ctx_id = context_id.to_owned();
@@ -952,7 +952,7 @@ impl<S: Storage + 'static> crate::context::manager::ContextPersistence
         &self,
         context_id: &str,
     ) -> Result<
-        Option<crate::context::manager::ContextSnapshot>,
+        Option<crate::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         let store = self.store.clone();
@@ -1701,7 +1701,7 @@ mod tests {
         );
     }
 
-    fn make_context_snapshot() -> crate::context::manager::ContextSnapshot {
+    fn make_context_snapshot() -> crate::context::state::ContextSnapshot {
         use scp_protocol::context::membership::MembershipState;
         use scp_protocol::context::roles::ContextRoleState;
         use scp_protocol::context::{ContextParams, ContextState};
@@ -1718,7 +1718,7 @@ mod tests {
         )
         .unwrap();
 
-        crate::context::manager::ContextSnapshot {
+        crate::context::state::ContextSnapshot {
             context_id: "ctx-snap-1".to_owned(),
             state: ContextState::Active,
             context_params: ContextParams::default(),
@@ -1815,7 +1815,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn protocol_repository_persistence_context_roundtrip() {
-        use crate::context::manager::ContextPersistence;
+        use crate::context::persistence::ContextPersistence;
 
         let store = std::sync::Arc::new(make_store());
         let bridge = super::ProtocolRepositoryContextBridge::new(store);
@@ -1834,7 +1834,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn protocol_repository_persistence_broadcast_roundtrip() {
-        use crate::context::manager::ContextPersistence;
+        use crate::context::persistence::ContextPersistence;
 
         let store = std::sync::Arc::new(make_store());
         let bridge = super::ProtocolRepositoryContextBridge::new(store);
@@ -1854,7 +1854,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn protocol_repository_persistence_delete_and_list() {
-        use crate::context::manager::ContextPersistence;
+        use crate::context::persistence::ContextPersistence;
 
         let store = std::sync::Arc::new(make_store());
         let bridge = super::ProtocolRepositoryContextBridge::new(store.clone());
@@ -1889,7 +1889,7 @@ mod tests {
     fn protocol_repository_persistence_is_object_safe() {
         // Compile-time dyn-compatibility check: verifies that
         // ProtocolRepositoryContextBridge can be used as a trait object.
-        fn assert_object_safe(_: &dyn crate::context::manager::ContextPersistence) {}
+        fn assert_object_safe(_: &dyn crate::context::persistence::ContextPersistence) {}
         let store = std::sync::Arc::new(make_store());
         let bridge = super::ProtocolRepositoryContextBridge::new(store);
         assert_object_safe(&bridge);

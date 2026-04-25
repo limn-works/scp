@@ -61,7 +61,7 @@ use dashmap::DashMap;
 use scp_core::context::builder::{
     ContextCreationError, ContextEventLogProvider, ContextTransportProvider,
 };
-use scp_core::context::manager::ContextPersistence;
+use scp_core::context::persistence::ContextPersistence;
 use scp_core::context::providers::ProtocolRepositoryContextBridge;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
 use scp_core::context::tools::ToolRegistry;
@@ -1017,7 +1017,7 @@ impl ContextPersistence for ArcContextPersistence {
     fn persist_context(
         &self,
         context_id: &str,
-        snapshot: &scp_core::context::manager::ContextSnapshot,
+        snapshot: &scp_core::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.inner.persist_context(context_id, snapshot)
     }
@@ -1026,7 +1026,7 @@ impl ContextPersistence for ArcContextPersistence {
         &self,
         context_id: &str,
     ) -> Result<
-        Option<scp_core::context::manager::ContextSnapshot>,
+        Option<scp_core::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         self.inner.load_context(context_id)

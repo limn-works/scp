@@ -548,7 +548,7 @@ pub enum LifecycleCommand {
     /// [`ContextManager::restore_context`](crate::context::manager::ContextManager::restore_context).
     ///
     /// The legacy method loads a snapshot from the configured
-    /// [`ContextPersistence`](crate::context::manager::ContextPersistence)
+    /// [`ContextPersistence`](crate::context::persistence::ContextPersistence)
     /// provider, validates / sanitizes consequence rules + cooldown
     /// state, restores the MLS crypto state, and reconstructs the
     /// per-context governance / membership / broadcast structures.
@@ -624,7 +624,7 @@ pub type ProposeGovernanceActionReply = oneshot::Sender<
         (
             scp_protocol::context::governance::GovernanceProposal,
             Vec<scp_protocol::context::governance::GovernanceEvent>,
-            Option<crate::context::manager::GovernanceActionResult>,
+            Option<crate::context::state::GovernanceActionResult>,
         ),
         ContextError,
     >,
@@ -636,7 +636,7 @@ pub type ProposeGovernanceActionReply = oneshot::Sender<
 /// execution result. Factored out for the same reason as
 /// [`ProposeGovernanceActionReply`].
 pub type ProposeGovernanceActionCheckedReply =
-    oneshot::Sender<Result<crate::context::manager::ProposalOutcome, ContextError>>;
+    oneshot::Sender<Result<crate::context::state::ProposalOutcome, ContextError>>;
 
 /// Reply-channel type alias for [`GovernanceCommand::VoteOnProposal`].
 /// Mirrors the legacy method: `(ProposalStatus, Vec<GovernanceEvent>)`.
@@ -815,7 +815,7 @@ pub enum GovernanceCommand {
         payload: Box<ExecuteGovernanceActionPayload>,
         /// Oneshot reply channel.
         reply:
-            oneshot::Sender<Result<crate::context::manager::GovernanceActionResult, ContextError>>,
+            oneshot::Sender<Result<crate::context::state::GovernanceActionResult, ContextError>>,
     },
 
     /// Reads a single proposal by ID. Mirrors
@@ -891,7 +891,7 @@ pub enum GovernanceCommand {
         /// Oneshot reply channel. `Ok(None)` iff the context is unknown
         /// or not migrating (matches the legacy contract).
         reply:
-            oneshot::Sender<Result<Option<crate::context::manager::MigrationState>, ContextError>>,
+            oneshot::Sender<Result<Option<crate::context::state::MigrationState>, ContextError>>,
     },
 
     /// Acknowledges and clears a commit-fault marker for a context
@@ -901,7 +901,7 @@ pub enum GovernanceCommand {
         /// Context identifier string.
         context_id: String,
         /// Oneshot reply channel. Carries the cleared fault marker.
-        reply: oneshot::Sender<Result<crate::context::manager::CommitFaultMarker, ContextError>>,
+        reply: oneshot::Sender<Result<crate::context::state::CommitFaultMarker, ContextError>>,
     },
 }
 
@@ -1781,7 +1781,7 @@ pub enum QueriesCommand {
         /// Context identifier string.
         context_id: String,
         /// Oneshot reply channel. Empty vec iff the context is unknown.
-        reply: oneshot::Sender<Result<Vec<crate::context::manager::PendingCommit>, ContextError>>,
+        reply: oneshot::Sender<Result<Vec<crate::context::state::PendingCommit>, ContextError>>,
     },
     /// Active commit-fault marker. `Some` iff the context is in
     /// fail-close state (PR #1606 C6).
@@ -1790,7 +1790,7 @@ pub enum QueriesCommand {
         context_id: String,
         /// Oneshot reply channel. `Ok(None)` iff no fault or unknown.
         reply: oneshot::Sender<
-            Result<Option<crate::context::manager::CommitFaultMarker>, ContextError>,
+            Result<Option<crate::context::state::CommitFaultMarker>, ContextError>,
         >,
     },
     /// Merkle event-log entries for a context (ADR-011). Delegates to

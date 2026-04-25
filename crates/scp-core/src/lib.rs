@@ -86,7 +86,9 @@ pub mod context {
         NotConfiguredTransportProvider,
     };
     pub use scp_runtime::context::manager::ContextManager;
+    pub use scp_runtime::context::persistence;
     pub use scp_runtime::context::persistence::ContextPersistence;
+    pub use scp_runtime::context::state;
     /// Supervisor module — re-exported from `scp-runtime` so the FFI
     /// bridges (which depend on `scp-core`, not `scp-runtime` directly)
     /// can construct the commits-7-to-11 query shim. Shrinks back to an

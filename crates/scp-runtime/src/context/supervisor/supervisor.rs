@@ -2349,7 +2349,7 @@ impl ContextPersistence for NoopContextPersistence {
     fn persist_context(
         &self,
         _context_id: &str,
-        _snapshot: &crate::context::manager::ContextSnapshot,
+        _snapshot: &crate::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
@@ -2358,7 +2358,7 @@ impl ContextPersistence for NoopContextPersistence {
         &self,
         _context_id: &str,
     ) -> Result<
-        Option<crate::context::manager::ContextSnapshot>,
+        Option<crate::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         Ok(None)
@@ -2549,7 +2549,7 @@ mod tests {
         fn persist_context(
             &self,
             _: &str,
-            _: &crate::context::manager::ContextSnapshot,
+            _: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
@@ -2557,7 +2557,7 @@ mod tests {
             &self,
             _: &str,
         ) -> Result<
-            Option<crate::context::manager::ContextSnapshot>,
+            Option<crate::context::state::ContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)

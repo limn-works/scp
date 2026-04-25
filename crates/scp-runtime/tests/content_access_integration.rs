@@ -39,7 +39,7 @@ use scp_protocol::identity::block_list::{BlockListEvent, BlockListState};
 use scp_runtime::context::ContextHandle;
 use scp_runtime::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use scp_runtime::context::manager::ContextManager;
-use scp_runtime::context::manager::ProposalOutcome;
+use scp_runtime::context::state::ProposalOutcome;
 use scp_runtime::crypto::access_keys::lifecycle::{
     handle_block_as_blocked_party, handle_block_as_blocker, restore_access_key, revoke_access_key,
     revoke_read_access, revoke_write_access,

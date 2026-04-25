@@ -197,11 +197,11 @@ mod tests {
     use zeroize::Zeroizing;
 
     struct TestPersistence;
-    impl crate::context::manager::ContextPersistence for TestPersistence {
+    impl crate::context::persistence::ContextPersistence for TestPersistence {
         fn persist_context(
             &self,
             _: &str,
-            _: &crate::context::manager::ContextSnapshot,
+            _: &crate::context::state::ContextSnapshot,
         ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Ok(())
         }
@@ -209,7 +209,7 @@ mod tests {
             &self,
             _: &str,
         ) -> Result<
-            Option<crate::context::manager::ContextSnapshot>,
+            Option<crate::context::state::ContextSnapshot>,
             Box<dyn std::error::Error + Send + Sync>,
         > {
             Ok(None)
@@ -241,7 +241,7 @@ mod tests {
     }
 
     fn test_handle() -> (Arc<Supervisor>, SupervisorHandle) {
-        let persistence: Arc<dyn crate::context::manager::ContextPersistence> =
+        let persistence: Arc<dyn crate::context::persistence::ContextPersistence> =
             Arc::new(TestPersistence);
         let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
             InMemoryStorage::new(),

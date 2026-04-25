@@ -14,7 +14,7 @@ use std::sync::Arc;
 use napi::Error as NapiError;
 use napi_derive::napi;
 use scp_core::context::governance::{GovernanceAction, GovernanceProposal, ProposalStatus};
-use scp_core::context::manager::GovernanceActionResult;
+use scp_core::context::state::GovernanceActionResult;
 use scp_core::context::{ContextHandle, ContextState};
 use scp_identity::DID;
 use scp_primitives::Clock;
