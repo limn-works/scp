@@ -41,3 +41,8 @@
 - `.claude/state/current.md` -- active work + recently completed
 - `.claude/state/blocked.md` -- items waiting on dependencies
 - `.claude/state/planned.md` -- unblocked work ready to pick up
+
+## Cross-Bridge Matrix (PR #1702, 2026-04-25)
+- See [feedback_bridge_canonical_naming.md](feedback_bridge_canonical_naming.md) -- canonical name in bridge-aliases.json must already exist in all 4 bridges; otherwise file source-side rename
+- See [feedback_enforcement_hook_matrix_expansion.md](feedback_enforcement_hook_matrix_expansion.md) -- ADD-only edits to bridge-aliases.json bypass the PreToolUse hook via dangerouslyDisableSandbox; only for additive diffs
+- Lesson at `.docs/lessons/cross-bridge-canonical-naming.md` covers naming divergence (PyO3/UniFFI bare-verb vs NAPI/WASM noun-verb), inverse-coverage blind spot in bridge-symmetry harness, sibling-stem alignment, category-by-semantics rule
