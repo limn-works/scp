@@ -229,6 +229,18 @@ pub enum EventType {
     /// `Tool-InterfaceEstablished` variant: the interface is established —
     /// bidirectionally bound with committed IKMs per ADR-049 round 4 —
     /// only once both sides have appended their acceptance.
+    ///
+    /// The payload of an `OutletInterfaceAccepted` event is the
+    /// MessagePack-serialized `InterfaceEstablished` struct from
+    /// `scp-protocol`'s `context::outlets::interface` module. Per ADR-049
+    /// round 5 + round 6, the struct carries the cryptographic checkpoint
+    /// (`epoch_a`, `epoch_b`, `ikm_a`, `ikm_a_sig`, `ikm_b`, `ikm_b_sig`)
+    /// and cluster-detection metadata (`creator_did`, `admin_set`,
+    /// `capability_holder_set`) required by §6.2.0.1 (see SCP-OUT-042a).
+    /// This crate stores the payload as opaque bytes inside [`EventPayload`];
+    /// the round-trip invariant — appending the serialized struct and
+    /// retrieving it via [`EventLog::get_event`] returns byte-identical
+    /// bytes — is exercised by the schema-level tests in `scp-protocol`.
     OutletInterfaceAccepted,
     /// An outlet interface was revoked (ADR-049, spec §5.4.6). Revocation
     /// destroys the interface record on both sides and triggers the

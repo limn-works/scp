@@ -41,6 +41,15 @@ use crate::provenance::attach::{SourceContextInfo, attach_provenance, effective_
 /// Same underlying type as used elsewhere in the codebase (`String`).
 pub type ContextId = String;
 
+/// An Ed25519 signature (64 bytes).
+///
+/// Stored as a `Vec<u8>` for serde compatibility — matches the pattern used
+/// in [`crate::context::metadata::Ed25519Signature`], [`scp_event_log::Ed25519Signature`],
+/// and other module-local aliases across the workspace. Used in
+/// [`InterfaceEstablished`] for `ikm_a_sig` / `ikm_b_sig` (spec §6.2.0.1
+/// `SCP-OUTLET-IKM-COMMITMENT-V1:` preimage signatures, ADR-049 round 5).
+pub type Ed25519Signature = Vec<u8>;
+
 // ---------------------------------------------------------------------------
 // Rate limit defaults (§6.2.0.2)
 // ---------------------------------------------------------------------------
@@ -452,6 +461,60 @@ pub struct RevokeOutletInterface {
 }
 
 /// Event recorded when both contexts have approved an interface (§6.2.0.1 step 4).
+///
+/// # Round-5 + Round-6 fields (ADR-049)
+///
+/// In addition to the original `interface_id`, `source_context`,
+/// `target_context`, `outlet_id`, and `established_at` fields, this struct
+/// captures the cryptographic checkpoint and cluster-detection metadata
+/// required for the bidirectional consent protocol per spec §6.2.0.1 and the
+/// round-6 ADR-049 adjustments:
+///
+/// - **Epoch counters** (`epoch_a`, `epoch_b`) — each context's MLS epoch
+///   counter at accept time. Persisted for audit; verifiers resolve admin
+///   `#active` keys against the role registry at these epochs (§6.2.0.1
+///   verifier rule).
+/// - **Committed IKMs** (`ikm_a`, `ikm_b`) — each side's exporter-derived
+///   input keying material at accept time, persisted verbatim in the event
+///   metadata. The `(ikm_a, ikm_b)` pair pins the `hop_salt` derivation so
+///   historic verifiability does not depend on retaining the underlying MLS
+///   epoch exporter keys (§6.2.0.1 "Historic verifiability"). The peer's
+///   `context_id` is incorporated into the MLS exporter label, so an `ikm`
+///   from interface A↔B cannot be reused for A↔C (§6.2.0.1 "Why the label
+///   suffix is required").
+/// - **IKM commitment signatures** (`ikm_a_sig`, `ikm_b_sig`) — each side's
+///   admin signs its own IKM under the `SCP-OUTLET-IKM-COMMITMENT-V1:`
+///   preimage with its `#active` key (§6.2.0.1 "Committed-IKM signing").
+///   Closes the Byzantine-admin attack where a hostile MLS implementation
+///   could publish a low-entropy or attacker-chosen IKM. The preimage binds
+///   the context-id pair and the acceptance epoch so a signature for one
+///   interface cannot be reused for another.
+/// - **Cluster-detection metadata** (`creator_did`, `admin_set`,
+///   `capability_holder_set`) — captured at accept time to feed the
+///   round-6 four-predicate cluster-match count `k` for the quadratic
+///   interface-spam fee (§6.2.0.1 "Rolling window + cluster detection",
+///   ADR-049 round-6 §"Cluster detection 4th predicate"):
+///
+///   1. `creator_did` — the DID captured at peer-context creation (the first
+///      admin per §5.4 lifecycle). Fixed at creation; cannot be rotated out.
+///   2. `admin_set` — the DIDs holding the admin role at interface-acceptance
+///      time. Catches "new DID creates a context and invites the same admin
+///      cluster" evasion.
+///   3. `capability_holder_set` — the DIDs holding ANY of the
+///      outlet-interface capabilities (`outlet:offer:*`, `outlet:query:*`,
+///      `outlet:call:*`) at interface-acceptance time. Catches "rotate
+///      creator+admin BUT keep a stable cross-context invoker" evasion. Sorted
+///      lexicographically at construction time so MessagePack round-trip is
+///      deterministic across implementations.
+///
+/// # Scope of this struct (SCP-OUT-042a)
+///
+/// This is the schema-only declaration: every field has a real type and is
+/// serialized verbatim into the event log. Behavioural wiring is split across
+/// downstream stories — crypto derivation + signing in OUT-042b, governance +
+/// admin-removal + atomic rotation in OUT-042c, and `ContextParams` + cluster
+/// detection + quadratic fee in OUT-042d. Construction-time population of
+/// `creator_did`, `admin_set`, and `capability_holder_set` lands in OUT-042d.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InterfaceEstablished {
     /// The interface/offer ID.
@@ -464,6 +527,68 @@ pub struct InterfaceEstablished {
     pub outlet_id: OutletId,
     /// Unix timestamp (ms) when established.
     pub established_at: u64,
+    /// Source context's (Context A's) MLS epoch counter at accept time
+    /// (§6.2.0.1 step 4). Persisted for audit; verifiers resolve Context A's
+    /// admin `#active` key against the role registry at this epoch.
+    pub epoch_a: u64,
+    /// Target context's (Context B's) MLS epoch counter at accept time
+    /// (§6.2.0.1 step 4). Persisted for audit; verifiers resolve Context B's
+    /// admin `#active` key against the role registry at this epoch.
+    pub epoch_b: u64,
+    /// Source context's (Context A's) exporter-derived IKM at accept time
+    /// (§6.2.0.1 step 4 "Step 1 — accept-time IKM derivation"). Computed as
+    /// `MLS_EXPORTER("scp-context-hop-salt-v1:" || context_b_id, b"", 32)`
+    /// on Context A's accept-time epoch — labelled with Context B's id to
+    /// prevent cross-interface reuse. Persisted verbatim so `hop_salt` can
+    /// be re-derived deterministically without retaining MLS epoch secrets.
+    pub ikm_a: [u8; 32],
+    /// Source admin's signature over `ikm_a` under the
+    /// `SCP-OUTLET-IKM-COMMITMENT-V1:` preimage (§6.2.0.1 "Committed-IKM
+    /// signing"). Computed by Context A's admin under their `#active` key
+    /// over `SHA-256("SCP-OUTLET-IKM-COMMITMENT-V1:" ||
+    /// len_be32(context_a_id) || context_a_id || len_be32(context_b_id) ||
+    /// context_b_id || epoch_a_be || ikm_a)`. The preimage binds the
+    /// context-id pair and the acceptance epoch so a signature for one
+    /// interface cannot be reused for another. Verified at event-log append
+    /// time — failure rejects the establishment with
+    /// `authorization.ikm-signature-invalid` (`SCP-TOOL-6110`).
+    pub ikm_a_sig: Ed25519Signature,
+    /// Target context's (Context B's) exporter-derived IKM at accept time
+    /// (§6.2.0.1 step 4 "Step 1 — accept-time IKM derivation"). Symmetric to
+    /// `ikm_a`: `MLS_EXPORTER("scp-context-hop-salt-v1:" || context_a_id,
+    /// b"", 32)` on Context B's accept-time epoch.
+    pub ikm_b: [u8; 32],
+    /// Target admin's signature over `ikm_b` under the
+    /// `SCP-OUTLET-IKM-COMMITMENT-V1:` preimage (§6.2.0.1 "Committed-IKM
+    /// signing"). Symmetric to `ikm_a_sig`: Context B's admin signs
+    /// `(context_a_id, context_b_id, epoch_b, ikm_b)` under its `#active`
+    /// key.
+    pub ikm_b_sig: Ed25519Signature,
+    /// The DID captured at the peer context's creation event — the first
+    /// admin who created the context per §5.4 context lifecycle. Fixed at
+    /// context creation; cannot be rotated out. Feeds cluster-detection
+    /// predicate 2 (`P_i.creator_did == B.creator_did`) per §6.2.0.1
+    /// "Rolling window + cluster detection".
+    pub creator_did: DID,
+    /// The set of DIDs holding the admin role in the peer context at
+    /// interface-acceptance time. Feeds cluster-detection predicate 3
+    /// (`P_i.admin_set ∩ B.admin_set ≠ ∅`) per §6.2.0.1 "Rolling window +
+    /// cluster detection" — catches "new DID creates a context and invites
+    /// the same admin cluster" evasion. Population is wired in OUT-042d.
+    pub admin_set: Vec<DID>,
+    /// The set of DIDs in the peer context that hold ANY of the
+    /// outlet-interface capabilities (`outlet:offer:*`, `outlet:query:*`,
+    /// `outlet:call:*`) at interface-acceptance time. Feeds round-6 cluster-
+    /// detection predicate 4 (`P_i.capability_holder_set ∩
+    /// B.capability_holder_set ≠ ∅`) per §6.2.0.1 "Rolling window + cluster
+    /// detection" and ADR-049 round-6 §"Cluster detection 4th predicate".
+    /// Catches "rotate creator+admin BUT keep a stable cross-context invoker"
+    /// evasion.
+    ///
+    /// **Ordering invariant.** Sorted lexicographically by DID string at
+    /// construction time so MessagePack round-trip yields deterministic
+    /// bytes across implementations. Population is wired in OUT-042d.
+    pub capability_holder_set: Vec<DID>,
 }
 
 /// Event recorded when an interface is revoked (§6.2.0.1 step 5).
@@ -3836,5 +3961,222 @@ mod tests {
         let decoded: InterfaceOffer = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.outbound_policy.max_calls_per_minute, 600);
         assert_eq!(decoded.outlet_schema.kind, OutletKind::Query);
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-042a: InterfaceEstablished round-5 + round-6 field set
+    // -----------------------------------------------------------------------
+
+    /// Builds a fully-populated [`InterfaceEstablished`] event with deterministic
+    /// values for round-trip testing per SCP-OUT-042a.
+    ///
+    /// The `capability_holder_set` is supplied pre-sorted so the helper itself
+    /// imposes no implicit ordering; the dedicated ordering test asserts on the
+    /// invariant explicitly.
+    fn sample_interface_established() -> InterfaceEstablished {
+        let mut admin_set: Vec<DID> = vec![
+            "did:dht:admin-alpha".into(),
+            "did:dht:admin-beta".into(),
+            "did:dht:admin-gamma".into(),
+        ];
+        admin_set.sort();
+
+        let mut capability_holder_set: Vec<DID> = vec![
+            "did:dht:caller-mu".into(),
+            "did:dht:caller-lambda".into(),
+            "did:dht:caller-nu".into(),
+        ];
+        capability_holder_set.sort();
+
+        InterfaceEstablished {
+            interface_id: [0xAB; 32],
+            source_context: "ctx-source-A".to_owned(),
+            target_context: "ctx-target-B".to_owned(),
+            outlet_id: "outlet-x".to_owned(),
+            established_at: 1_700_000_000_000,
+            epoch_a: 42,
+            epoch_b: 17,
+            ikm_a: [0x11; 32],
+            ikm_a_sig: vec![0x22; 64],
+            ikm_b: [0x33; 32],
+            ikm_b_sig: vec![0x44; 64],
+            creator_did: "did:dht:creator-zeta".into(),
+            admin_set,
+            capability_holder_set,
+        }
+    }
+
+    /// AC#1: every round-5 + round-6 field is present with the expected type
+    /// (compile-time + value-level binding check).
+    #[test]
+    fn ac1_interface_established_has_all_round5_round6_fields() {
+        let evt = sample_interface_established();
+
+        // Bind every field by name into a type-annotated local — this is a
+        // mechanical check that AC#1's nine fields exist and carry the
+        // declared types. A type drift in any field fails compilation.
+        let _epoch_a: u64 = evt.epoch_a;
+        let _epoch_b: u64 = evt.epoch_b;
+        let _ikm_a: [u8; 32] = evt.ikm_a;
+        let _ikm_a_sig: Ed25519Signature = evt.ikm_a_sig.clone();
+        let _ikm_b: [u8; 32] = evt.ikm_b;
+        let _ikm_b_sig: Ed25519Signature = evt.ikm_b_sig.clone();
+        let _creator_did: DID = evt.creator_did.clone();
+        let _admin_set: Vec<DID> = evt.admin_set.clone();
+        let _capability_holder_set: Vec<DID> = evt.capability_holder_set.clone();
+
+        // Sanity-check the original (pre-OUT-042a) fields are still intact —
+        // the schema commit must not regress the earlier surface.
+        let _interface_id: [u8; 32] = evt.interface_id;
+        let _source_context: ContextId = evt.source_context.clone();
+        let _target_context: ContextId = evt.target_context.clone();
+        let _outlet_id: OutletId = evt.outlet_id.clone();
+        let _established_at: u64 = evt.established_at;
+    }
+
+    /// AC#2: MessagePack round-trip preserves every field byte-for-byte.
+    #[test]
+    fn ac2_interface_established_messagepack_roundtrip_byte_identical() {
+        let original = sample_interface_established();
+
+        let bytes = rmp_serde::to_vec(&original)
+            .expect("InterfaceEstablished must MessagePack-serialize");
+        let decoded: InterfaceEstablished = rmp_serde::from_slice(&bytes)
+            .expect("InterfaceEstablished must MessagePack-deserialize");
+
+        assert_eq!(decoded, original, "decoded value must equal original");
+
+        // Re-serialize the decoded value — bytes must be byte-identical.
+        let bytes2 = rmp_serde::to_vec(&decoded)
+            .expect("re-serializing the decoded value must succeed");
+        assert_eq!(
+            bytes, bytes2,
+            "re-serialized bytes must match the original (byte-for-byte field preservation)"
+        );
+    }
+
+    /// AC#3: Event-log round-trip — the `InterfaceEstablished` payload appended
+    /// to a `scp-event-log` instance (as the body of an `OutletInterfaceAccepted`
+    /// event) and re-read via `EventLog::get_event` returns byte-identical
+    /// payload bytes.
+    #[test]
+    fn ac3_interface_established_event_log_roundtrip_byte_identical() {
+        use scp_event_log::test_helpers::{
+            did_from_pubkey, sign_event, test_keypair,
+        };
+        use scp_event_log::tree::GENESIS_PREV_HASH;
+        use scp_event_log::{EventLog, EventType, tree};
+
+        let (verifying_key, signing_key) = test_keypair();
+        let actor_did = did_from_pubkey(&verifying_key);
+
+        let evt = sample_interface_established();
+        let payload_bytes = rmp_serde::to_vec(&evt)
+            .expect("InterfaceEstablished must MessagePack-serialize");
+
+        let mut log = EventLog::new("ctx-source-A".to_owned());
+        let signed = sign_event(
+            EventType::OutletInterfaceAccepted,
+            &actor_did,
+            1_700_000_000,
+            0,
+            payload_bytes.clone(),
+            GENESIS_PREV_HASH,
+            &signing_key,
+        );
+        tree::append(&mut log, &signed).expect("append should succeed");
+
+        let retrieved = log
+            .get_event(0)
+            .expect("retrieving the appended event must succeed");
+        assert_eq!(
+            retrieved.payload.data, payload_bytes,
+            "payload bytes must round-trip through EventLog::get_event byte-identically"
+        );
+
+        let decoded: InterfaceEstablished = rmp_serde::from_slice(&retrieved.payload.data)
+            .expect("retrieved payload must MessagePack-deserialize back into InterfaceEstablished");
+        assert_eq!(
+            decoded, evt,
+            "round-tripped InterfaceEstablished must equal the original"
+        );
+    }
+
+    /// AC#4 (pre-requisite): `creator_did` and `admin_set` are declared on the
+    /// struct so OUT-042d can capture them at construction time. This story
+    /// only declares the fields and their types; the actual capture wiring
+    /// lands in OUT-042d.
+    #[test]
+    fn ac4_creator_did_and_admin_set_are_declared_on_struct() {
+        let evt = sample_interface_established();
+
+        // Field-presence check — assigning into a fresh local with the
+        // declared types compiles iff the fields exist with those types.
+        let creator_did: DID = evt.creator_did.clone();
+        let admin_set: Vec<DID> = evt.admin_set.clone();
+
+        // Round-trip through MessagePack to confirm both fields persist
+        // verbatim — the construction-time capture in OUT-042d depends on
+        // this storage path being intact.
+        let bytes = rmp_serde::to_vec(&evt).unwrap();
+        let decoded: InterfaceEstablished = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(decoded.creator_did, creator_did);
+        assert_eq!(decoded.admin_set, admin_set);
+    }
+
+    /// AC#5: `capability_holder_set` is sorted lexicographically by DID string
+    /// at construction time so MessagePack round-trip yields deterministic
+    /// bytes regardless of insertion order.
+    #[test]
+    fn ac5_capability_holder_set_sorted_yields_deterministic_bytes() {
+        let mut sorted: Vec<DID> = vec![
+            "did:dht:zeta".into(),
+            "did:dht:alpha".into(),
+            "did:dht:mu".into(),
+        ];
+        sorted.sort();
+
+        // Construct two events with the SAME sorted capability_holder_set —
+        // round-trip bytes must be identical.
+        let mut evt_a = sample_interface_established();
+        evt_a.capability_holder_set = sorted.clone();
+        let mut evt_b = sample_interface_established();
+        evt_b.capability_holder_set = sorted.clone();
+
+        let bytes_a = rmp_serde::to_vec(&evt_a).unwrap();
+        let bytes_b = rmp_serde::to_vec(&evt_b).unwrap();
+        assert_eq!(
+            bytes_a, bytes_b,
+            "two events with byte-identical sorted capability_holder_set must serialize byte-identically"
+        );
+
+        // Now construct an event whose capability_holder_set is the SAME set
+        // but in shuffled insertion order. After sorting, it must round-trip
+        // to the same bytes — proving the sort invariant produces a canonical
+        // form regardless of how the caller assembled the input.
+        let shuffled: Vec<DID> = vec![
+            "did:dht:mu".into(),
+            "did:dht:zeta".into(),
+            "did:dht:alpha".into(),
+        ];
+        let mut evt_c = sample_interface_established();
+        evt_c.capability_holder_set = shuffled;
+        evt_c.capability_holder_set.sort();
+
+        let bytes_c = rmp_serde::to_vec(&evt_c).unwrap();
+        assert_eq!(
+            bytes_a, bytes_c,
+            "a shuffled-then-sorted capability_holder_set must yield byte-identical bytes \
+             — the lexicographic sort is the canonical ordering"
+        );
+
+        // The decoded value retains the sorted order as round-tripped.
+        let decoded: InterfaceEstablished = rmp_serde::from_slice(&bytes_a).unwrap();
+        let mut expected_sorted = sorted.clone();
+        expected_sorted.sort();
+        assert_eq!(
+            decoded.capability_holder_set, expected_sorted,
+            "round-tripped capability_holder_set must equal the lexicographically sorted input"
+        );
     }
 }

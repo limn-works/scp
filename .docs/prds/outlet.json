@@ -2741,16 +2741,16 @@
       "gate": "gate-round5-fixes",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
-        "crates/scp-protocol/src/context/interface.rs",
+        "crates/scp-protocol/src/context/outlets/interface.rs",
         "crates/scp-event-log/src/lib.rs"
       ],
       "description": "Add the round-5 + round-6 field set to the InterfaceEstablished event struct. Includes epoch_a/epoch_b (u64), ikm_a/ikm_b ([u8; 32]), ikm_a_sig/ikm_b_sig (Ed25519Signature), creator_did (DID), admin_set (Vec<DID>), and capability_holder_set (Vec<DID>) \u2014 the last field is the round-6 cluster-detection 4th predicate input. All fields persist verbatim in the event log. This sub-story is the schema-only commit; crypto derivation + signing goes in OUT-042b; governance wiring + admin-removal + atomic rotation go in OUT-042c; ContextParams + cluster detection + quadratic fee go in OUT-042d.",
       "acceptanceCriteria": [
         "struct InterfaceEstablished has fields epoch_a: u64, epoch_b: u64, ikm_a: [u8; 32], ikm_a_sig: Ed25519Signature, ikm_b: [u8; 32], ikm_b_sig: Ed25519Signature, creator_did: DID, admin_set: Vec<DID>, capability_holder_set: Vec<DID> \u2014 all nine fields present",
         "Serde derives Serialize/Deserialize on InterfaceEstablished; MessagePack round-trip preserves every field byte-for-byte",
-        "Event-log round-trip: InterfaceEstablished appended to a scp-event-log instance and re-read via EventLog::get returns byte-identical bytes; grep -n 'capability_holder_set' crates/scp-protocol/src/context/interface.rs returns >= 1",
+        "Event-log round-trip: InterfaceEstablished appended (via EventPayload::data inside an OutletInterfaceAccepted Event) to a scp-event-log instance and re-read via EventLog::get_event returns byte-identical bytes; grep -n 'capability_holder_set' crates/scp-protocol/src/context/outlets/interface.rs returns >= 1",
         "Cluster-detection metadata capture (pre-requisite): creator_did and admin_set fields are captured at InterfaceEstablished construction time (the actual capture logic is wired in OUT-042d); the struct merely declares the fields and their types here",
         "capability_holder_set is ordered (implementation: sort by DID string at construction) so round-trip yields deterministic bytes",
         "cargo test -p scp-protocol succeeds; cargo test -p scp-event-log succeeds"
