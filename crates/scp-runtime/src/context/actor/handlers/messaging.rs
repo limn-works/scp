@@ -61,7 +61,6 @@ use crate::context::actor::commands::MessagingCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::sequence::SequenceReservation;
-use crate::context::manager::ContextManager;
 use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for mutation handlers. Plan §"Transport

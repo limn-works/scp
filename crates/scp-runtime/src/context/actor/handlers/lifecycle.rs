@@ -499,15 +499,6 @@ async fn handle_restore_context(
     params: scp_protocol::context::params::ContextParams,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let Some(manager) = supervisor.attached_context_manager() else {
-        let err = ContextError::NotInitialized(
-            "handle_restore_context: ContextManager must be attached".to_owned(),
-        );
-        let sketch = outcome_error_sketch(&err);
-        let _ = reply.send(Err(err));
-        return Outcome::err(sketch);
-    };
-
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -518,7 +509,11 @@ async fn handle_restore_context(
         return Outcome::err(sketch);
     }
 
-    let restore_fut = manager.restore_context(&context_id, &handle);
+    // ADR-049 commit 12 — calls the hoisted free function on
+    // &Supervisor (replacing the prior `manager.restore_context(...)`
+    // delegation now that the bridge is gone).
+    let restore_fut =
+        crate::context::lifecycle_helpers::restore_context(supervisor, &context_id, &handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, restore_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
