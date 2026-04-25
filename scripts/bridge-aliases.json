@@ -2562,7 +2562,7 @@
       },
       {
         "canonical": "init_storage",
-        "reason": "Other bridges use SCP::with_storage(StorageConfig) factory (PR #1684); PyO3 retains init_storage for incremental initialization compatibility with pre-Phase-4 callers."
+        "reason": "WASM has no scp-platform per ADR-034 (no persistent storage), so neither SCP::with_storage factory nor PyO3's init_storage applies; storage is deferred to the host JS runtime."
       }
     ]
   }
