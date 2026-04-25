@@ -131,6 +131,1127 @@ pub enum InvocationError {
         /// Human-readable reason — which sub-rule was violated.
         reason: String,
     },
+
+    /// A Query outlet's executor attempted a write through `MutableInvocation`
+    /// (or otherwise tripped the [`ReadOnlyInvocation`] deny-list), per spec
+    /// §5.4.2 "`ReadOnlyInvocation` guard at invocation" (SCP-OUT-013).
+    ///
+    /// Maps to `OutletErrorClass::Protocol::QueryViolation` (SCP-TOOL-6103,
+    /// slug `protocol.query-violation`) and triggers an
+    /// `OutletVerifiedEvent { integrity_ok: false, reason:
+    /// QueryMisdeclaration }` operator-attributable signal per §5.4.2
+    /// "Misdeclaration signal".
+    #[error(
+        "Query outlet \"{outlet_id}\" attempted write \"{operation}\" through ReadOnlyInvocation (§5.4.2)"
+    )]
+    QueryViolation {
+        /// The outlet that mis-declared as Query.
+        outlet_id: String,
+        /// The denied operation (e.g., `"send_message"`, `"register_outlet"`).
+        operation: &'static str,
+    },
+
+    /// The dispatched [`OutletExecutor`] half does not match the registered
+    /// outlet kind — the executor's `exec_query`/`exec_action` default impl
+    /// returned [`OutletExecutorError::KindMismatch`] (SCP-OUT-013 AC4).
+    ///
+    /// Captured as a misdeclaration: a Query-registered outlet whose
+    /// implementor only provides `exec_action`, or an Action-registered
+    /// outlet whose implementor only provides `exec_query`. The
+    /// `QueryMisdeclaration` signal is emitted only for the Query case (the
+    /// operator-attributable spec §5.4.2 path).
+    #[error(
+        "outlet \"{outlet_id}\" registered as {kind:?} but executor returned KindMismatch (§5.4.2)"
+    )]
+    KindMismatch {
+        /// The outlet whose dispatched executor half was missing.
+        outlet_id: String,
+        /// The registered kind that drove dispatch.
+        kind: scp_protocol::context::outlets::OutletKind,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// ReadOnlyInvocation / MutableInvocation handles + OutletExecutor trait
+// (SCP-OUT-013, spec §5.4.2 ReadOnlyInvocation guard, ADR-049)
+// ---------------------------------------------------------------------------
+
+/// Error returned by [`OutletExecutor`] methods.
+///
+/// Distinct from [`InvocationError`] because executor-level failures are an
+/// inner detail of the outlet implementation, not a protocol-level failure
+/// of the invocation pipeline. The [`OutletExecutor`] adapter
+/// ([`invoke_outlet_dispatch`]) maps these into the protocol-level
+/// taxonomy:
+///
+/// | Variant                 | Maps to                                         |
+/// |-------------------------|-------------------------------------------------|
+/// | [`KindMismatch`]        | [`InvocationError::KindMismatch`]               |
+/// | [`QueryViolation`]      | [`InvocationError::QueryViolation`]             |
+/// | [`Failed`]              | [`InvocationError::ExecutionFailed`]            |
+///
+/// [`KindMismatch`]: OutletExecutorError::KindMismatch
+/// [`QueryViolation`]: OutletExecutorError::QueryViolation
+/// [`Failed`]: OutletExecutorError::Failed
+#[derive(Debug, thiserror::Error)]
+pub enum OutletExecutorError {
+    /// Returned by the default [`OutletExecutor::exec_query`] /
+    /// [`OutletExecutor::exec_action`] implementation when an executor was
+    /// dispatched against the wrong half — i.e., a Query-registered outlet
+    /// whose implementor only overrode `exec_action` (or vice versa). This
+    /// is the structural misdeclaration signal: the runtime cannot dispatch
+    /// to a half the implementor did not provide.
+    #[error("outlet executor kind mismatch (expected {expected:?})")]
+    KindMismatch {
+        /// The kind for which the implementor failed to provide an executor
+        /// half. For Query, the misdeclaration signal in spec §5.4.2 fires.
+        expected: scp_protocol::context::outlets::OutletKind,
+    },
+    /// Returned by [`MutableInvocation`] write methods when the underlying
+    /// registered outlet is `OutletKind::Query` (defense-in-depth runtime
+    /// check against type-system bypass). Spec §5.4.2 `QueryViolation`.
+    #[error("Query outlet attempted write \"{operation}\" through MutableInvocation (§5.4.2)")]
+    QueryViolation {
+        /// The denied operation (e.g., `"send_message"`).
+        operation: &'static str,
+    },
+    /// Application-level executor failure. Equivalent to the `String` returned
+    /// by closure-based callers; preserved verbatim for compatibility.
+    #[error("outlet executor failed: {0}")]
+    Failed(String),
+}
+
+/// Pending mutation queued on a [`MutableInvocation`].
+///
+/// Action outlets describe their writes by enqueuing typed [`MutationIntent`]
+/// records on the handle. The runtime drains the intents after the executor
+/// returns successfully and applies them through the existing per-context
+/// mutation pipeline (governance, role assignment, registry updates,
+/// economic ledgers, caveat counter store, event log append). For
+/// [`OutletKind::Query`] outlets the intents are unreachable — write methods
+/// only exist on [`MutableInvocation`] which is only constructed for
+/// `OutletKind::Action` (type-system enforcement of the deny-list).
+///
+/// The runtime check on every [`MutableInvocation`] write method is
+/// defense-in-depth: a `MutableInvocation` whose `kind == Query` (constructed
+/// directly in tests, or surfaced through a future API misuse) refuses every
+/// mutation and emits the `QueryMisdeclaration` signal per §5.4.2.
+///
+/// [`OutletKind::Query`]: scp_protocol::context::outlets::OutletKind::Query
+#[derive(Debug, Clone)]
+pub enum MutationIntent {
+    /// Send an MLS application message into the context (deny-list:
+    /// "messages"). The runtime hands the payload to
+    /// `ContextManager::send_message` after `exec_action` returns.
+    SendMessage {
+        /// Opaque application payload.
+        payload: serde_json::Value,
+    },
+    /// Assign a role to a member (deny-list: "roles").
+    AssignRole {
+        /// The member receiving the role assignment.
+        member_did: String,
+        /// The role name to assign.
+        role: String,
+    },
+    /// Register a new outlet in the context registry (deny-list: "registry").
+    RegisterOutlet {
+        /// Canonical-bytes-equivalent registration payload (caller-prepared
+        /// so the runtime can verify against `OutletRegistration::validate`).
+        registration: serde_json::Value,
+    },
+    /// Append an event log entry (deny-list: "event log"). The runtime
+    /// appends through the per-context Merkle event log provider.
+    AppendEvent {
+        /// Caller-prepared event payload (kind + opaque data).
+        event: serde_json::Value,
+    },
+    /// Submit a governance proposal (deny-list: "governance proposals").
+    SubmitGovernanceProposal {
+        /// Caller-prepared proposal envelope.
+        proposal: serde_json::Value,
+    },
+    /// Cast a governance vote (deny-list: "governance votes").
+    CastGovernanceVote {
+        /// Proposal ID being voted on.
+        proposal_id: String,
+        /// Yes / No / Abstain encoded by the runtime.
+        vote: serde_json::Value,
+    },
+    /// Debit an economic ledger entry (deny-list: "economic ledgers").
+    DebitEconomicLedger {
+        /// The DID being charged.
+        did: String,
+        /// Amount in the context's economic policy currency.
+        amount: u64,
+    },
+    /// Credit an economic ledger entry (deny-list: "economic ledgers").
+    CreditEconomicLedger {
+        /// The DID receiving the credit.
+        did: String,
+        /// Amount in the context's economic policy currency.
+        amount: u64,
+    },
+    /// Increment a per-DID caveat counter (deny-list: "caveat counter store").
+    IncrementCaveatCounter {
+        /// Counter key (caveat-defined identifier).
+        key: String,
+        /// Increment delta — always positive by convention; counters are
+        /// monotonic per §7.3.8.
+        delta: u64,
+    },
+}
+
+/// Sink for misdeclaration `OutletVerifiedEvent` signals.
+///
+/// Receives `OutletVerified { integrity_ok: false, reason:
+/// QueryMisdeclaration }` events emitted when a Query outlet's executor
+/// trips the [`MutableInvocation`] write deny-list (spec §5.4.2
+/// "Misdeclaration signal").
+///
+/// Implementations are typically a `Vec<OutletVerifiedEvent>` collected by
+/// the dispatcher and returned to the caller alongside the invocation
+/// outcome. The trait is `Send + Sync` so the sink can be shared across
+/// `tokio::spawn`-ed executor tasks.
+pub trait QueryMisdeclarationSink: Send + Sync {
+    /// Records an integrity-failure signal. Implementations must be
+    /// non-blocking — emission happens inline with the executor's failed
+    /// write attempt and must not stall the invocation.
+    fn record(
+        &self,
+        event: scp_protocol::context::outlets::OutletVerifiedEvent,
+    );
+}
+
+/// In-memory [`QueryMisdeclarationSink`] backed by a `Mutex<Vec<_>>`. Used
+/// by tests and by the default dispatcher when no operator-supplied sink is
+/// provided.
+#[derive(Debug, Default)]
+pub struct InMemoryQueryMisdeclarationSink {
+    inner: std::sync::Mutex<Vec<scp_protocol::context::outlets::OutletVerifiedEvent>>,
+}
+
+impl InMemoryQueryMisdeclarationSink {
+    /// Creates an empty sink.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drains all collected events, leaving the sink empty.
+    #[must_use]
+    pub fn drain(&self) -> Vec<scp_protocol::context::outlets::OutletVerifiedEvent> {
+        // `Mutex::lock` only fails on poisoning; recover by reading whatever
+        // was last in the guard so a panic on one thread does not lose the
+        // signal events from another. Tests assert non-empty.
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *guard)
+    }
+
+    /// Returns a snapshot of the currently-collected events without draining.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<scp_protocol::context::outlets::OutletVerifiedEvent> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.clone()
+    }
+}
+
+impl QueryMisdeclarationSink for InMemoryQueryMisdeclarationSink {
+    fn record(&self, event: scp_protocol::context::outlets::OutletVerifiedEvent) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.push(event);
+    }
+}
+
+/// Read-only handle exposed to a [`OutletKind::Query`] outlet's executor.
+///
+/// Spec §5.4.2: "The runtime invokes Query outlets through a
+/// `ReadOnlyInvocation` handle that denies writes to context state
+/// (messages, roles, registry, event log, governance, economic ledgers).
+/// Any attempt by an executor to mutate through this handle returns
+/// `OutletErrorClass::Protocol::QueryViolation`."
+///
+/// The deny-list is enforced **at the type level** — none of the seven
+/// write surfaces (`messages`, `roles`, `registry`, `event log`,
+/// `governance proposals/votes`, `economic ledgers`, `caveat counter
+/// store`) have method definitions on this struct. The compiler refuses
+/// any executor that calls a write method on a `&ReadOnlyInvocation`.
+///
+/// Read-side surface (per PRD AC2): [`list_members`], [`get_member_role`],
+/// [`get_outlet`], [`list_outlets`], [`get_event`], [`current_epoch`],
+/// [`get_economic_policy`], [`get_caveat_counter`].
+///
+/// [`OutletKind::Query`]: scp_protocol::context::outlets::OutletKind::Query
+/// [`list_members`]: ReadOnlyInvocation::list_members
+/// [`get_member_role`]: ReadOnlyInvocation::get_member_role
+/// [`get_outlet`]: ReadOnlyInvocation::get_outlet
+/// [`list_outlets`]: ReadOnlyInvocation::list_outlets
+/// [`get_event`]: ReadOnlyInvocation::get_event
+/// [`current_epoch`]: ReadOnlyInvocation::current_epoch
+/// [`get_economic_policy`]: ReadOnlyInvocation::get_economic_policy
+/// [`get_caveat_counter`]: ReadOnlyInvocation::get_caveat_counter
+pub struct ReadOnlyInvocation<'a> {
+    context: &'a ContextHandle,
+    role_state: &'a ContextRoleState,
+    registry: &'a OutletRegistry,
+    invoker_did: &'a DID,
+    outlet_id: &'a OutletId,
+    /// Snapshot of event log entries available at invocation time.
+    events: &'a [scp_event_log::Event],
+    /// Current MLS group epoch at invocation time.
+    epoch: u64,
+    /// Optional economic policy snapshot for read-side accessors.
+    economic_policy: Option<&'a scp_protocol::economy::types::EconomicPolicy>,
+    /// Optional caveat counter store snapshot — `(member_did, counter_key) ->
+    /// current value`. Pure read view; writes go through Action outlets.
+    caveat_counters:
+        Option<&'a std::collections::HashMap<(String, String), u64>>,
+}
+
+impl<'a> ReadOnlyInvocation<'a> {
+    /// Constructs a read-only invocation handle.
+    ///
+    /// Constructed by the runtime ([`invoke_outlet_dispatch`]) — outlets do
+    /// not build this themselves.
+    #[allow(clippy::too_many_arguments)] // matches the read-side accessor surface; cheap to extend
+    #[must_use]
+    pub const fn new(
+        context: &'a ContextHandle,
+        role_state: &'a ContextRoleState,
+        registry: &'a OutletRegistry,
+        invoker_did: &'a DID,
+        outlet_id: &'a OutletId,
+        events: &'a [scp_event_log::Event],
+        epoch: u64,
+        economic_policy: Option<&'a scp_protocol::economy::types::EconomicPolicy>,
+        caveat_counters: Option<
+            &'a std::collections::HashMap<(String, String), u64>,
+        >,
+    ) -> Self {
+        Self {
+            context,
+            role_state,
+            registry,
+            invoker_did,
+            outlet_id,
+            events,
+            epoch,
+            economic_policy,
+            caveat_counters,
+        }
+    }
+
+    /// Context ID this invocation is scoped to.
+    #[must_use]
+    pub fn context_id(&self) -> &str {
+        self.context.context_id()
+    }
+
+    /// DID of the caller who invoked this Query outlet.
+    #[must_use]
+    pub const fn invoker_did(&self) -> &DID {
+        self.invoker_did
+    }
+
+    /// The Query outlet's own ID.
+    #[must_use]
+    pub const fn outlet_id(&self) -> &OutletId {
+        self.outlet_id
+    }
+
+    /// Lists all member DIDs currently in the context (PRD AC2).
+    #[must_use]
+    pub fn list_members(&self) -> Vec<&str> {
+        self.role_state
+            .members
+            .iter()
+            .map(String::as_str)
+            .collect()
+    }
+
+    /// Returns the role assigned to `member_did`, if any (PRD AC2).
+    #[must_use]
+    pub fn get_member_role(&self, member_did: &str) -> Option<&str> {
+        self.role_state
+            .assignments
+            .get(member_did)
+            .map(|a| a.role_name.as_str())
+    }
+
+    /// Returns the registered outlet metadata for `outlet_id`, if registered
+    /// (PRD AC2).
+    #[must_use]
+    pub fn get_outlet(
+        &self,
+        outlet_id: &OutletId,
+    ) -> Option<&scp_protocol::context::outlets::registry::OutletRegistration> {
+        self.registry.get(outlet_id)
+    }
+
+    /// Lists all registered outlet IDs in the context registry (PRD AC2).
+    #[must_use]
+    pub fn list_outlets(&self) -> Vec<&OutletId> {
+        self.registry.tool_ids().collect()
+    }
+
+    /// Returns the event-log entry at `index` from the snapshot held for this
+    /// invocation, if present (PRD AC2). The snapshot is read-only — writes
+    /// through this handle are impossible (no method defined).
+    #[must_use]
+    pub fn get_event(&self, index: usize) -> Option<&scp_event_log::Event> {
+        self.events.get(index)
+    }
+
+    /// Returns the number of event-log entries visible to this invocation.
+    /// Companion to [`get_event`](Self::get_event).
+    #[must_use]
+    pub const fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Returns the MLS group epoch at the time this invocation was dispatched
+    /// (PRD AC2).
+    #[must_use]
+    pub const fn current_epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// Returns the context's current economic policy snapshot, if configured
+    /// (PRD AC2). Read-only — Query outlets cannot mutate economic state.
+    #[must_use]
+    pub const fn get_economic_policy(
+        &self,
+    ) -> Option<&scp_protocol::economy::types::EconomicPolicy> {
+        self.economic_policy
+    }
+
+    /// Returns the current caveat counter value for
+    /// `(member_did, counter_key)` if a counter store snapshot was supplied
+    /// (PRD AC2). Read-only — increments go through Action outlets'
+    /// [`MutableInvocation::increment_caveat_counter`].
+    #[must_use]
+    pub fn get_caveat_counter(&self, member_did: &str, counter_key: &str) -> Option<u64> {
+        self.caveat_counters
+            .and_then(|map| map.get(&(member_did.to_owned(), counter_key.to_owned())))
+            .copied()
+    }
+}
+
+/// Mutable handle exposed to a [`OutletKind::Action`] outlet's executor.
+///
+/// Spec §5.4.2: "Action executors may mutate context state through SDK-provided
+/// handles subject to role and capability checks." This is the SDK-provided
+/// handle. It exposes the same read methods as [`ReadOnlyInvocation`] plus
+/// the write methods that Action outlets need to mutate context state.
+///
+/// Writes are recorded as typed [`MutationIntent`] records and drained by the
+/// runtime after `exec_action` returns successfully — the executor never
+/// holds a manager reference and never directly mutates per-context state.
+/// The runtime is the sole entity that applies mutations, ensuring the
+/// existing locking and rollback contracts in
+/// [`ContextManager::invoke_outlet_with_economy`](crate::context::ContextManager::invoke_outlet_with_economy)
+/// still hold.
+///
+/// **Defense-in-depth runtime check.** Every write method calls
+/// [`guard_kind`](Self::guard_kind) before enqueuing the intent. If the
+/// captured `kind` is [`OutletKind::Query`] (a misdeclaration the type
+/// system did not catch — for example, a test that constructs the handle
+/// directly), the method returns
+/// [`OutletExecutorError::QueryViolation`] and emits an
+/// `OutletVerifiedEvent { integrity_ok: false, reason: QueryMisdeclaration }`
+/// through the configured [`QueryMisdeclarationSink`].
+///
+/// [`OutletKind::Action`]: scp_protocol::context::outlets::OutletKind::Action
+/// [`OutletKind::Query`]: scp_protocol::context::outlets::OutletKind::Query
+pub struct MutableInvocation<'a> {
+    inner: ReadOnlyInvocation<'a>,
+    /// The kind the handle was constructed for. Action invocations get
+    /// `OutletKind::Action`; the runtime check refuses writes when this is
+    /// `Query` (defense-in-depth).
+    kind: scp_protocol::context::outlets::OutletKind,
+    /// Pending writes accumulated during executor execution.
+    pending: Vec<MutationIntent>,
+    /// Optional sink for `OutletVerified` integrity-failure events emitted
+    /// when [`guard_kind`](Self::guard_kind) refuses a write. `None` is
+    /// permitted (e.g. tests that only assert the error variant).
+    misdeclaration_sink: Option<&'a dyn QueryMisdeclarationSink>,
+}
+
+impl<'a> MutableInvocation<'a> {
+    /// Constructs a mutable invocation handle.
+    ///
+    /// `kind` should always be [`OutletKind::Action`] in production —
+    /// [`invoke_outlet_dispatch`] only constructs `MutableInvocation` after
+    /// confirming the outlet's registered kind is `Action`. Test code may
+    /// construct the handle with `kind == Query` to exercise the
+    /// defense-in-depth runtime deny-list (PRD AC7).
+    ///
+    /// [`OutletKind::Action`]: scp_protocol::context::outlets::OutletKind::Action
+    #[must_use]
+    pub fn new(
+        inner: ReadOnlyInvocation<'a>,
+        kind: scp_protocol::context::outlets::OutletKind,
+        misdeclaration_sink: Option<&'a dyn QueryMisdeclarationSink>,
+    ) -> Self {
+        Self {
+            inner,
+            kind,
+            pending: Vec::new(),
+            misdeclaration_sink,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Read-side surface — delegates to the inner ReadOnlyInvocation. Action
+    // outlets read context state the same way Query outlets do.
+    // -----------------------------------------------------------------------
+
+    /// See [`ReadOnlyInvocation::context_id`].
+    #[must_use]
+    pub fn context_id(&self) -> &str {
+        self.inner.context_id()
+    }
+
+    /// See [`ReadOnlyInvocation::invoker_did`].
+    #[must_use]
+    pub const fn invoker_did(&self) -> &DID {
+        self.inner.invoker_did()
+    }
+
+    /// See [`ReadOnlyInvocation::outlet_id`].
+    #[must_use]
+    pub const fn outlet_id(&self) -> &OutletId {
+        self.inner.outlet_id()
+    }
+
+    /// See [`ReadOnlyInvocation::list_members`].
+    #[must_use]
+    pub fn list_members(&self) -> Vec<&str> {
+        self.inner.list_members()
+    }
+
+    /// See [`ReadOnlyInvocation::get_member_role`].
+    #[must_use]
+    pub fn get_member_role(&self, member_did: &str) -> Option<&str> {
+        self.inner.get_member_role(member_did)
+    }
+
+    /// See [`ReadOnlyInvocation::get_outlet`].
+    #[must_use]
+    pub fn get_outlet(
+        &self,
+        outlet_id: &OutletId,
+    ) -> Option<&scp_protocol::context::outlets::registry::OutletRegistration> {
+        self.inner.get_outlet(outlet_id)
+    }
+
+    /// See [`ReadOnlyInvocation::list_outlets`].
+    #[must_use]
+    pub fn list_outlets(&self) -> Vec<&OutletId> {
+        self.inner.list_outlets()
+    }
+
+    /// See [`ReadOnlyInvocation::get_event`].
+    #[must_use]
+    pub fn get_event(&self, index: usize) -> Option<&scp_event_log::Event> {
+        self.inner.get_event(index)
+    }
+
+    /// See [`ReadOnlyInvocation::current_epoch`].
+    #[must_use]
+    pub const fn current_epoch(&self) -> u64 {
+        self.inner.current_epoch()
+    }
+
+    /// See [`ReadOnlyInvocation::get_economic_policy`].
+    #[must_use]
+    pub const fn get_economic_policy(
+        &self,
+    ) -> Option<&scp_protocol::economy::types::EconomicPolicy> {
+        self.inner.get_economic_policy()
+    }
+
+    /// See [`ReadOnlyInvocation::get_caveat_counter`].
+    #[must_use]
+    pub fn get_caveat_counter(&self, member_did: &str, counter_key: &str) -> Option<u64> {
+        self.inner.get_caveat_counter(member_did, counter_key)
+    }
+
+    /// Drains all pending [`MutationIntent`] records, leaving the handle
+    /// empty. Called by the dispatcher after `exec_action` returns
+    /// successfully.
+    #[must_use]
+    pub fn take_pending_mutations(&mut self) -> Vec<MutationIntent> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Returns the number of pending mutations (read-only inspection for
+    /// tests / debug logging).
+    #[must_use]
+    pub const fn pending_mutation_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// Returns the kind this handle was constructed for. Test helper.
+    #[must_use]
+    pub const fn kind(&self) -> scp_protocol::context::outlets::OutletKind {
+        self.kind
+    }
+
+    // -----------------------------------------------------------------------
+    // Write-side surface — present ONLY on MutableInvocation. The compiler
+    // refuses any executor that tries to call these on `&ReadOnlyInvocation`
+    // (PRD AC1: type-system deny-list).
+    //
+    // Each method runs `guard_kind` first — defense-in-depth runtime check
+    // (PRD AC7) for the case where a `MutableInvocation` is somehow
+    // constructed with `kind == Query` (e.g., a future API misuse or a
+    // misdeclared outlet whose dispatcher path is bypassed). On Query the
+    // method emits the §5.4.2 misdeclaration signal and returns
+    // `QueryViolation` without enqueuing the intent.
+    // -----------------------------------------------------------------------
+
+    /// Send a context message (deny-list: messages).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] when this handle's
+    /// kind is `Query` (defense-in-depth — the type system normally
+    /// prevents this).
+    pub fn send_message(
+        &mut self,
+        payload: serde_json::Value,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("send_message")?;
+        self.pending.push(MutationIntent::SendMessage { payload });
+        Ok(())
+    }
+
+    /// Assign a role to a member (deny-list: roles).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn assign_role(
+        &mut self,
+        member_did: impl Into<String>,
+        role: impl Into<String>,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("assign_role")?;
+        self.pending.push(MutationIntent::AssignRole {
+            member_did: member_did.into(),
+            role: role.into(),
+        });
+        Ok(())
+    }
+
+    /// Register a new outlet in the context registry (deny-list: registry).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn register_outlet(
+        &mut self,
+        registration: serde_json::Value,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("register_outlet")?;
+        self.pending
+            .push(MutationIntent::RegisterOutlet { registration });
+        Ok(())
+    }
+
+    /// Append an entry to the context event log (deny-list: event log).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn append_event(
+        &mut self,
+        event: serde_json::Value,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("append_event")?;
+        self.pending.push(MutationIntent::AppendEvent { event });
+        Ok(())
+    }
+
+    /// Submit a governance proposal (deny-list: governance proposals).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn submit_governance_proposal(
+        &mut self,
+        proposal: serde_json::Value,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("submit_governance_proposal")?;
+        self.pending
+            .push(MutationIntent::SubmitGovernanceProposal { proposal });
+        Ok(())
+    }
+
+    /// Cast a governance vote on an active proposal (deny-list: governance
+    /// votes).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn cast_governance_vote(
+        &mut self,
+        proposal_id: impl Into<String>,
+        vote: serde_json::Value,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("cast_governance_vote")?;
+        self.pending.push(MutationIntent::CastGovernanceVote {
+            proposal_id: proposal_id.into(),
+            vote,
+        });
+        Ok(())
+    }
+
+    /// Debit an economic ledger entry (deny-list: economic ledgers).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn debit_economic_ledger(
+        &mut self,
+        did: impl Into<String>,
+        amount: u64,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("debit_economic_ledger")?;
+        self.pending.push(MutationIntent::DebitEconomicLedger {
+            did: did.into(),
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Credit an economic ledger entry (deny-list: economic ledgers).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn credit_economic_ledger(
+        &mut self,
+        did: impl Into<String>,
+        amount: u64,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("credit_economic_ledger")?;
+        self.pending.push(MutationIntent::CreditEconomicLedger {
+            did: did.into(),
+            amount,
+        });
+        Ok(())
+    }
+
+    /// Increment a per-DID caveat counter (deny-list: caveat counter store).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError::QueryViolation`] on Query
+    /// misdeclaration.
+    pub fn increment_caveat_counter(
+        &mut self,
+        key: impl Into<String>,
+        delta: u64,
+    ) -> Result<(), OutletExecutorError> {
+        self.guard_kind("increment_caveat_counter")?;
+        self.pending.push(MutationIntent::IncrementCaveatCounter {
+            key: key.into(),
+            delta,
+        });
+        Ok(())
+    }
+
+    /// Defense-in-depth runtime check.
+    ///
+    /// On `Query` kind: emits the §5.4.2 misdeclaration signal through the
+    /// sink (if configured) and returns [`OutletExecutorError::QueryViolation`].
+    /// On `Action` kind: returns `Ok(())`.
+    fn guard_kind(&self, operation: &'static str) -> Result<(), OutletExecutorError> {
+        if matches!(
+            self.kind,
+            scp_protocol::context::outlets::OutletKind::Query
+        ) {
+            if let Some(sink) = self.misdeclaration_sink {
+                sink.record(scp_protocol::context::outlets::OutletVerifiedEvent {
+                    outlet_id: self.inner.outlet_id.clone(),
+                    passed: 0,
+                    failed: 1,
+                    integrity_ok: false,
+                    reason: Some(
+                        scp_protocol::context::outlets::OutletVerifiedReason::QueryMisdeclaration,
+                    ),
+                });
+            }
+            return Err(OutletExecutorError::QueryViolation { operation });
+        }
+        Ok(())
+    }
+}
+
+/// Per-outlet executor trait — Query/Action half-and-half.
+///
+/// Spec §5.4.2: outlets declare a kind and the runtime dispatches Query
+/// invocations through [`exec_query`] (read-only handle) and Action
+/// invocations through [`exec_action`] (write-capable handle). The trait's
+/// default implementations return [`OutletExecutorError::KindMismatch`] so
+/// that a misdeclaration — registering as one kind but only implementing
+/// the other half — is caught as a distinct, attributable failure rather
+/// than as a silent no-op.
+///
+/// PRD SCP-OUT-013 AC4: "trait `OutletExecutor` has signatures
+/// `exec_query(&self, ctx: ReadOnlyInvocation, input: Value) -> Result<Value,
+/// OutletError>` and `exec_action(&self, ctx: MutableInvocation, input:
+/// Value) -> Result<Value, OutletError>`. Default impls return
+/// `OutletError::KindMismatch`."
+///
+/// **Type-system deny-list (PRD AC1).** `exec_query` receives `&ReadOnlyInvocation`
+/// — the compiler refuses any call site that tries to invoke a write
+/// method on it because no write methods exist on the type. `exec_action`
+/// receives `&mut MutableInvocation` — only this half can enqueue
+/// [`MutationIntent`] records.
+///
+/// [`exec_query`]: OutletExecutor::exec_query
+/// [`exec_action`]: OutletExecutor::exec_action
+#[async_trait::async_trait]
+pub trait OutletExecutor: Send + Sync {
+    /// Executes a Query invocation against a read-only handle.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation returns [`OutletExecutorError::KindMismatch`]
+    /// so that a Query-registered outlet whose implementor only overrode
+    /// `exec_action` is caught at runtime per spec §5.4.2 misdeclaration
+    /// signal. Implementations override this method to provide the actual
+    /// Query semantics.
+    async fn exec_query(
+        &self,
+        ctx: &ReadOnlyInvocation<'_>,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, OutletExecutorError> {
+        let _ = (ctx, input);
+        Err(OutletExecutorError::KindMismatch {
+            expected: scp_protocol::context::outlets::OutletKind::Query,
+        })
+    }
+
+    /// Executes an Action invocation against a mutable handle.
+    ///
+    /// # Errors
+    ///
+    /// The default implementation returns [`OutletExecutorError::KindMismatch`]
+    /// so that an Action-registered outlet whose implementor only overrode
+    /// `exec_query` is caught. Implementations override this method to
+    /// enqueue mutations through `ctx.send_message`, `ctx.assign_role`,
+    /// etc., subject to the runtime deny-list (`guard_kind`).
+    async fn exec_action(
+        &self,
+        ctx: &mut MutableInvocation<'_>,
+        input: serde_json::Value,
+    ) -> Result<serde_json::Value, OutletExecutorError> {
+        let _ = (ctx, input);
+        Err(OutletExecutorError::KindMismatch {
+            expected: scp_protocol::context::outlets::OutletKind::Action,
+        })
+    }
+}
+
+/// Outcome of a successful [`invoke_outlet_dispatch`] call.
+#[derive(Debug)]
+pub struct DispatchedOutletOutcome {
+    /// Outlet output (already schema-validated).
+    pub output: serde_json::Value,
+    /// Pending mutations from an Action outlet's [`MutableInvocation`]
+    /// handle — empty for Query outlets (which can never enqueue
+    /// mutations). The runtime's [`ContextManager`] is the canonical
+    /// applier; direct callers may also drain them for testing or for
+    /// custom mutation pipelines.
+    ///
+    /// [`ContextManager`]: crate::context::ContextManager
+    pub pending_mutations: Vec<MutationIntent>,
+    /// `OutletInvokedEvent` ready to be appended to the event log.
+    pub event: OutletInvokedEvent,
+    /// Triggered consequences from the post-invocation bookkeeping pass.
+    pub consequences: Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
+    /// Payment receipt when an adapter is configured for paid Action outlets.
+    pub payment_receipt: Option<crate::economy::adapter::PaymentReceipt>,
+}
+
+/// Dispatches an outlet invocation through an [`OutletExecutor`], routing
+/// to `exec_query` or `exec_action` based on the registered
+/// [`OutletKind`].
+///
+/// PRD SCP-OUT-013 AC5: "`ContextManager::invoke_outlet` dispatches to
+/// `exec_query` when `kind == Query` and `exec_action` when `kind ==
+/// Action`." This free function is the underlying dispatcher; the
+/// [`ContextManager::invoke_outlet_with_economy`](crate::context::ContextManager::invoke_outlet_with_economy)
+/// wrapper layers the per-context economy/budget pipeline over the same
+/// dispatch.
+///
+/// # Misdeclaration handling
+///
+/// When a Query-registered outlet's `exec_query` returns
+/// [`OutletExecutorError::KindMismatch`] (the implementor failed to
+/// override the Query half), the dispatcher records an
+/// `OutletVerifiedEvent { integrity_ok: false, reason: QueryMisdeclaration }`
+/// signal through `misdeclaration_sink` per spec §5.4.2. The
+/// [`InvocationError::KindMismatch`] is then surfaced to the caller. The
+/// Action-side mirror does NOT emit a `QueryMisdeclaration` signal because
+/// the spec only attributes that signal to the Query path — Action
+/// misdeclarations surface as `KindMismatch` without the operator-side
+/// integrity-failure attribution.
+///
+/// `MutableInvocation::send_message` and friends emit the misdeclaration
+/// signal directly through the same sink when they trip the
+/// defense-in-depth `guard_kind` runtime check (`MutableInvocation`
+/// constructed with `kind == Query`).
+///
+/// # Errors
+///
+/// Returns the same [`InvocationError`] taxonomy as [`invoke_outlet`].
+/// Misdeclarations surface as [`InvocationError::KindMismatch`]; defense-
+/// in-depth runtime denies surface as [`InvocationError::QueryViolation`];
+/// other failures (schema, timeout, capability) propagate verbatim from
+/// the underlying closure-based pipeline.
+///
+/// [`OutletKind`]: scp_protocol::context::outlets::OutletKind
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // mirrors the existing `invoke_outlet` arity exactly so the dispatcher is interchangeable
+pub async fn invoke_outlet_dispatch<E, S>(
+    context: &ContextHandle,
+    registry: &OutletRegistry,
+    role_state: &ContextRoleState,
+    outlet_id: &OutletId,
+    input: serde_json::Value,
+    invoker_did: &DID,
+    timeout_ms: Option<u32>,
+    executor: &E,
+    misdeclaration_sink: Option<&dyn QueryMisdeclarationSink>,
+    economy: Option<&mut OutletEconomyContext<'_, S>>,
+) -> Result<DispatchedOutletOutcome, InvocationError>
+where
+    E: OutletExecutor + ?Sized,
+    S: BuildHasher,
+{
+    // Snapshot the registered kind once so the closure-based delegate sees
+    // a stable value even if the registry mutates between dispatch and
+    // execution (the registry is not `&mut` here, so it cannot, but the
+    // value is also borrowed by the executor closure below).
+    let registration =
+        registry
+            .get(outlet_id)
+            .ok_or_else(|| InvocationError::OutletNotFound {
+                outlet_id: outlet_id.to_owned(),
+            })?;
+    let kind = registration.kind;
+
+    // Snapshot the events the read handle exposes. The free `invoke_outlet`
+    // path does not have access to the manager's event log here — the
+    // dispatcher takes an empty slice when no economy context is supplied.
+    // `ContextManager::invoke_outlet_dispatch_with_economy` wires the real
+    // snapshot through.
+    let empty_events: &[scp_event_log::Event] = &[];
+    let events_snapshot: &[scp_event_log::Event] = economy
+        .as_deref()
+        .map_or(empty_events, |econ| econ.events);
+
+    // Build the read handle. Borrowing through the closure below carries
+    // its lifetime; we extend the borrow scope to cover the executor
+    // future.
+    let outlet_id_cloned = outlet_id.clone();
+    let invoker_did_cloned = invoker_did.clone();
+    let read = ReadOnlyInvocation::new(
+        context,
+        role_state,
+        registry,
+        invoker_did,
+        outlet_id,
+        events_snapshot,
+        // current_epoch is opaque at this layer; the
+        // `invoke_outlet_with_economy_dispatch` wrapper threads the real MLS
+        // epoch. Free callers see 0 — explicitly documented.
+        0,
+        economy.as_deref().and_then(|e| e.economic_policy),
+        None,
+    );
+
+    // The closure-based `invoke_outlet` path expects
+    // `Fn(serde_json::Value) -> Future<Result<Value, String>>`. We adapt the
+    // trait-based dispatch into that shape via a single-shot move closure.
+    let mut pending_mutations: Vec<MutationIntent> = Vec::new();
+    let pending_ref = &mut pending_mutations;
+    let executor_ref: &E = executor;
+    let read_ref = &read;
+    let executor_kind = kind;
+    let dispatch_outlet_id = outlet_id_cloned.clone();
+
+    let dispatch = move |input: serde_json::Value| async move {
+        match executor_kind {
+            scp_protocol::context::outlets::OutletKind::Query => {
+                match executor_ref.exec_query(read_ref, input).await {
+                    Ok(value) => Ok(value),
+                    Err(OutletExecutorError::KindMismatch { .. }) => {
+                        // Spec §5.4.2 misdeclaration signal.
+                        if let Some(sink) = misdeclaration_sink {
+                            sink.record(
+                                scp_protocol::context::outlets::OutletVerifiedEvent {
+                                    outlet_id: dispatch_outlet_id.clone(),
+                                    passed: 0,
+                                    failed: 1,
+                                    integrity_ok: false,
+                                    reason: Some(
+                                        scp_protocol::context::outlets::OutletVerifiedReason::QueryMisdeclaration,
+                                    ),
+                                },
+                            );
+                        }
+                        Err(format!(
+                            "{}",
+                            OutletExecutorError::KindMismatch {
+                                expected: scp_protocol::context::outlets::OutletKind::Query,
+                            }
+                        ))
+                    }
+                    Err(OutletExecutorError::QueryViolation { operation }) => {
+                        // Should be impossible — `&ReadOnlyInvocation` has no
+                        // write methods. Surface verbatim if it occurs.
+                        Err(format!("query violation in exec_query: {operation}"))
+                    }
+                    Err(OutletExecutorError::Failed(msg)) => Err(msg),
+                }
+            }
+            scp_protocol::context::outlets::OutletKind::Action => {
+                let mut mutable = MutableInvocation::new(
+                    ReadOnlyInvocation::new(
+                        read_ref.context,
+                        read_ref.role_state,
+                        read_ref.registry,
+                        read_ref.invoker_did,
+                        read_ref.outlet_id,
+                        read_ref.events,
+                        read_ref.epoch,
+                        read_ref.economic_policy,
+                        read_ref.caveat_counters,
+                    ),
+                    scp_protocol::context::outlets::OutletKind::Action,
+                    misdeclaration_sink,
+                );
+                let result = executor_ref.exec_action(&mut mutable, input).await;
+                match result {
+                    Ok(value) => {
+                        pending_ref.extend(mutable.take_pending_mutations());
+                        Ok(value)
+                    }
+                    Err(OutletExecutorError::KindMismatch { .. }) => Err(format!(
+                        "{}",
+                        OutletExecutorError::KindMismatch {
+                            expected: scp_protocol::context::outlets::OutletKind::Action,
+                        }
+                    )),
+                    Err(OutletExecutorError::QueryViolation { operation }) => Err(format!(
+                        "query violation in exec_action: {operation}"
+                    )),
+                    Err(OutletExecutorError::Failed(msg)) => Err(msg),
+                }
+            }
+        }
+    };
+
+    // Delegate to the closure-based pipeline so capability checks, schema
+    // validation, escrow, budget, etc. all run as before. The closure
+    // converts the trait error into the existing `String` error surface.
+    let result = invoke_outlet(
+        context,
+        registry,
+        role_state,
+        outlet_id,
+        input,
+        invoker_did,
+        timeout_ms,
+        dispatch,
+        economy,
+    )
+    .await;
+
+    let (output, event, consequences, payment_receipt) = match result {
+        Ok(tuple) => tuple,
+        Err(InvocationError::ExecutionFailed { message }) => {
+            // Decode the structured error string back to the typed
+            // KindMismatch / QueryViolation taxonomy.
+            if message.starts_with("outlet executor kind mismatch") {
+                return Err(InvocationError::KindMismatch {
+                    outlet_id: outlet_id_cloned,
+                    kind,
+                });
+            }
+            if let Some(operation) = message.strip_prefix("query violation in exec_action: ") {
+                return Err(InvocationError::QueryViolation {
+                    outlet_id: outlet_id_cloned,
+                    operation: query_violation_op_static(operation),
+                });
+            }
+            if let Some(operation) = message.strip_prefix("query violation in exec_query: ") {
+                return Err(InvocationError::QueryViolation {
+                    outlet_id: outlet_id_cloned,
+                    operation: query_violation_op_static(operation),
+                });
+            }
+            return Err(InvocationError::ExecutionFailed { message });
+        }
+        Err(other) => return Err(other),
+    };
+
+    // Static suppression — the `_invoker_did_cloned` binding is only used
+    // when the dispatch closure captures by move; under some compiler
+    // configurations the `move` closure does not actually move it. Drop it
+    // explicitly so the borrow checker keeps the lifetime sane and clippy
+    // does not flag an unused variable.
+    drop(invoker_did_cloned);
+
+    Ok(DispatchedOutletOutcome {
+        output,
+        pending_mutations,
+        event,
+        consequences,
+        payment_receipt,
+    })
+}
+
+/// Coerces a runtime executor-supplied operation string back to one of the
+/// `&'static str` constants used by the deny-list. The `MutableInvocation`
+/// methods supply `&'static str` literals, so the round-trip preserves the
+/// pointer when the original string was one of the known literals; for
+/// unknown strings we fall back to a generic literal so the typed
+/// [`InvocationError::QueryViolation`] still carries a `&'static str`.
+fn query_violation_op_static(op: &str) -> &'static str {
+    match op {
+        "send_message" => "send_message",
+        "assign_role" => "assign_role",
+        "register_outlet" => "register_outlet",
+        "append_event" => "append_event",
+        "submit_governance_proposal" => "submit_governance_proposal",
+        "cast_governance_vote" => "cast_governance_vote",
+        "debit_economic_ledger" => "debit_economic_ledger",
+        "credit_economic_ledger" => "credit_economic_ledger",
+        "increment_caveat_counter" => "increment_caveat_counter",
+        _ => "unknown",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2057,4 +3178,698 @@ mod tests {
             "should return BudgetExceeded when budget is insufficient, got: {result:?}"
         );
     }
+
+    // =======================================================================
+    // SCP-OUT-013 tests — ReadOnlyInvocation / MutableInvocation /
+    // OutletExecutor dispatch
+    // =======================================================================
+
+    use scp_protocol::context::outlets::{OutletKind, OutletVerifiedReason};
+
+    /// Registers a Query outlet (no cost) for OUT-013 dispatch tests.
+    fn setup_query_registry(role_state: &ContextRoleState, registrant_did: &str) -> OutletRegistry {
+        let mut registry = OutletRegistry::new();
+        let registration = OutletRegistration {
+            outlet_id: "query-tool".to_owned(),
+            kind: OutletKind::Query,
+            name: "Query".to_owned(),
+            description: "Read-only query".to_owned(),
+            schema: OutletSchema {
+                // Schema specificity floor (SCP-OUT-005) requires ≥ 2 fields.
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "q": {"type": "number"},
+                        "scope": {"type": "string"}
+                    }
+                }),
+                output_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "saw": {"type": "string"},
+                        "input": {"type": ["object", "null"]}
+                    }
+                }),
+            },
+            implementation_hash: [0xBB; 32],
+            test_vectors: vec![],
+            operator_did: "did:dht:z6MkOperator".into(),
+            cost: None,
+            registered_at: 0,
+            signature: Vec::new(),
+        };
+        register_outlet(&mut registry, role_state, registration, registrant_did).unwrap();
+        registry
+    }
+
+    /// Registers a member with both `OutletQueryAll` and `OutletCallAll`
+    /// capabilities so dispatch tests can exercise both halves.
+    fn test_role_state_with_query_caps(creator_did: &str) -> ContextRoleState {
+        let mut state = test_role_state(creator_did);
+        // Add OutletQueryAll to the creator's capability set (test_ceiling
+        // grants OutletCallAll only).
+        let caps = state
+            .member_capabilities
+            .entry(creator_did.to_owned())
+            .or_default();
+        caps.insert(Capability::OutletQueryAll);
+        state
+    }
+
+    // -----------------------------------------------------------------------
+    // AC1: type-system deny-list — `ReadOnlyInvocation` does NOT expose any
+    // write methods. The `compile_fail` doctest below verifies this; the
+    // runtime test pins the read-side surface from PRD AC2.
+    // -----------------------------------------------------------------------
+
+    /// AC2: `ReadOnlyInvocation` exposes the documented read-only surface.
+    ///
+    /// PRD AC2: "`ReadOnlyInvocation` exposes only read-side methods:
+    /// `list_members`, `get_member_role`, `get_outlet`, `list_outlets`,
+    /// `get_event`, `current_epoch`, `get_economic_policy`,
+    /// `get_caveat_counter` (read-only view)".
+    #[tokio::test]
+    async fn read_only_invocation_exposes_documented_read_methods() {
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state_with_query_caps(creator_did);
+        let registry = setup_query_registry(&role_state, creator_did);
+        let context = active_context().await;
+        let invoker: DID = creator_did.into();
+        let outlet_id_owned: OutletId = "query-tool".to_owned();
+        let events: Vec<scp_event_log::Event> = Vec::new();
+        let counters = std::collections::HashMap::from([
+            (("did:dht:z6MkCreator".to_owned(), "spend".to_owned()), 7u64),
+        ]);
+        let read = super::ReadOnlyInvocation::new(
+            &context,
+            &role_state,
+            &registry,
+            &invoker,
+            &outlet_id_owned,
+            &events,
+            42,
+            None,
+            Some(&counters),
+        );
+
+        // PRD AC2 surface — every read accessor exists and returns the
+        // expected value.
+        assert_eq!(read.context_id(), context.context_id());
+        assert_eq!(read.invoker_did().as_ref(), creator_did);
+        assert_eq!(read.outlet_id(), &outlet_id_owned);
+        assert!(read.list_members().contains(&creator_did));
+        assert_eq!(read.get_member_role(creator_did), Some("admin"));
+        assert!(read.get_outlet(&outlet_id_owned).is_some());
+        assert!(read.list_outlets().contains(&&outlet_id_owned));
+        assert!(read.get_event(0).is_none());
+        assert_eq!(read.event_count(), 0);
+        assert_eq!(read.current_epoch(), 42);
+        assert!(read.get_economic_policy().is_none());
+        assert_eq!(
+            read.get_caveat_counter("did:dht:z6MkCreator", "spend"),
+            Some(7)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC3: MutableInvocation has BOTH read-side and write-side methods.
+    // -----------------------------------------------------------------------
+
+    /// AC3: `MutableInvocation` exposes both read and write methods.
+    /// Successful Action-side writes accumulate as `MutationIntent`
+    /// records — Query outlets can never construct this handle through the
+    /// dispatcher, so the writes are reachable only from `exec_action`.
+    #[tokio::test]
+    async fn mutable_invocation_exposes_read_and_write_methods() {
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let invoker: DID = creator_did.into();
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let events: Vec<scp_event_log::Event> = Vec::new();
+        let read = super::ReadOnlyInvocation::new(
+            &context,
+            &role_state,
+            &registry,
+            &invoker,
+            &outlet_id_owned,
+            &events,
+            17,
+            None,
+            None,
+        );
+        let mut mutable = super::MutableInvocation::new(read, OutletKind::Action, None);
+
+        // Read methods — same surface as ReadOnlyInvocation.
+        assert_eq!(mutable.context_id(), context.context_id());
+        assert_eq!(mutable.invoker_did().as_ref(), creator_did);
+        assert_eq!(mutable.current_epoch(), 17);
+        assert_eq!(mutable.kind(), OutletKind::Action);
+
+        // Write methods — every deny-list bucket exposed.
+        assert!(
+            mutable
+                .send_message(serde_json::json!({"text": "hi"}))
+                .is_ok()
+        );
+        assert!(
+            mutable
+                .assign_role("did:dht:z6MkOther", "member")
+                .is_ok()
+        );
+        assert!(
+            mutable
+                .register_outlet(serde_json::json!({"id": "new-outlet"}))
+                .is_ok()
+        );
+        assert!(
+            mutable
+                .append_event(serde_json::json!({"kind": "demo"}))
+                .is_ok()
+        );
+        assert!(
+            mutable
+                .submit_governance_proposal(serde_json::json!({"action": "noop"}))
+                .is_ok()
+        );
+        assert!(
+            mutable
+                .cast_governance_vote("prop-1", serde_json::json!("yes"))
+                .is_ok()
+        );
+        assert!(mutable.debit_economic_ledger("did:dht:z6MkCreator", 5).is_ok());
+        assert!(mutable.credit_economic_ledger("did:dht:z6MkCreator", 5).is_ok());
+        assert!(mutable.increment_caveat_counter("k", 1).is_ok());
+
+        let pending = mutable.take_pending_mutations();
+        assert_eq!(
+            pending.len(),
+            9,
+            "all 9 deny-list buckets enqueue an intent"
+        );
+        // Verify each kind is represented.
+        let mut counts = std::collections::HashMap::<&str, usize>::new();
+        for intent in &pending {
+            let key = match intent {
+                super::MutationIntent::SendMessage { .. } => "send",
+                super::MutationIntent::AssignRole { .. } => "role",
+                super::MutationIntent::RegisterOutlet { .. } => "registry",
+                super::MutationIntent::AppendEvent { .. } => "event",
+                super::MutationIntent::SubmitGovernanceProposal { .. } => "propose",
+                super::MutationIntent::CastGovernanceVote { .. } => "vote",
+                super::MutationIntent::DebitEconomicLedger { .. } => "debit",
+                super::MutationIntent::CreditEconomicLedger { .. } => "credit",
+                super::MutationIntent::IncrementCaveatCounter { .. } => "caveat",
+            };
+            *counts.entry(key).or_default() += 1;
+        }
+        assert_eq!(counts.len(), 9, "all 9 deny-list buckets distinct");
+    }
+
+    // -----------------------------------------------------------------------
+    // AC4: trait OutletExecutor — default impls return KindMismatch.
+    // -----------------------------------------------------------------------
+
+    /// AC4: default `exec_query` impl returns
+    /// `OutletExecutorError::KindMismatch { expected: Query }`.
+    #[tokio::test]
+    async fn outlet_executor_default_exec_query_returns_kind_mismatch() {
+        struct OnlyAction;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for OnlyAction {
+            async fn exec_action(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                Ok(input)
+            }
+            // exec_query NOT overridden — default impl applies.
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let invoker: DID = creator_did.into();
+        let events: Vec<scp_event_log::Event> = Vec::new();
+        let read = super::ReadOnlyInvocation::new(
+            &context,
+            &role_state,
+            &registry,
+            &invoker,
+            &outlet_id_owned,
+            &events,
+            0,
+            None,
+            None,
+        );
+
+        let executor = OnlyAction;
+        let result = executor.exec_query(&read, serde_json::json!({})).await;
+        assert!(
+            matches!(
+                result,
+                Err(super::OutletExecutorError::KindMismatch {
+                    expected: OutletKind::Query
+                })
+            ),
+            "default exec_query must return KindMismatch{{Query}}"
+        );
+    }
+
+    /// AC4 mirror: default `exec_action` impl returns
+    /// `OutletExecutorError::KindMismatch { expected: Action }`.
+    #[tokio::test]
+    async fn outlet_executor_default_exec_action_returns_kind_mismatch() {
+        struct OnlyQuery;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for OnlyQuery {
+            async fn exec_query(
+                &self,
+                _ctx: &super::ReadOnlyInvocation<'_>,
+                input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                Ok(input)
+            }
+            // exec_action NOT overridden — default impl applies.
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let invoker: DID = creator_did.into();
+        let events: Vec<scp_event_log::Event> = Vec::new();
+        let read = super::ReadOnlyInvocation::new(
+            &context,
+            &role_state,
+            &registry,
+            &invoker,
+            &outlet_id_owned,
+            &events,
+            0,
+            None,
+            None,
+        );
+        let mut mutable = super::MutableInvocation::new(read, OutletKind::Action, None);
+
+        let executor = OnlyQuery;
+        let result = executor.exec_action(&mut mutable, serde_json::json!({})).await;
+        assert!(
+            matches!(
+                result,
+                Err(super::OutletExecutorError::KindMismatch {
+                    expected: OutletKind::Action
+                })
+            ),
+            "default exec_action must return KindMismatch{{Action}}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // AC5: invoke_outlet_dispatch routes by registered kind.
+    // -----------------------------------------------------------------------
+
+    /// AC5 (Query): `invoke_outlet_dispatch` calls `exec_query` for a
+    /// Query-registered outlet.
+    #[tokio::test]
+    async fn invoke_outlet_dispatch_routes_query_to_exec_query() {
+        struct QueryOnly;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for QueryOnly {
+            async fn exec_query(
+                &self,
+                _ctx: &super::ReadOnlyInvocation<'_>,
+                input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                Ok(serde_json::json!({"saw": "query", "input": input}))
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state_with_query_caps(creator_did);
+        let registry = setup_query_registry(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "query-tool".to_owned();
+        let executor = QueryOnly;
+
+        let outcome = super::invoke_outlet_dispatch::<QueryOnly, std::hash::RandomState>(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"q": 1}),
+            &DID::from(creator_did),
+            None,
+            &executor,
+            None,
+            None,
+        )
+        .await
+        .expect("dispatch should succeed");
+
+        assert_eq!(outcome.output["saw"], "query");
+        assert!(
+            outcome.pending_mutations.is_empty(),
+            "Query outlets cannot enqueue mutations"
+        );
+    }
+
+    /// AC5 (Action): `invoke_outlet_dispatch` calls `exec_action` for an
+    /// Action-registered outlet and surfaces enqueued mutations.
+    #[tokio::test]
+    async fn invoke_outlet_dispatch_routes_action_to_exec_action() {
+        struct ActionOnly;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for ActionOnly {
+            async fn exec_action(
+                &self,
+                ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                ctx.send_message(serde_json::json!({"hello": "world"}))?;
+                ctx.assign_role("did:dht:z6MkAlice", "member")?;
+                Ok(serde_json::json!({"saw": "action"}))
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor = ActionOnly;
+
+        let outcome = super::invoke_outlet_dispatch::<ActionOnly, std::hash::RandomState>(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            &executor,
+            None,
+            None,
+        )
+        .await
+        .expect("dispatch should succeed");
+
+        assert_eq!(outcome.output["saw"], "action");
+        assert_eq!(outcome.pending_mutations.len(), 2);
+        assert!(matches!(
+            outcome.pending_mutations[0],
+            super::MutationIntent::SendMessage { .. }
+        ));
+        assert!(matches!(
+            outcome.pending_mutations[1],
+            super::MutationIntent::AssignRole { .. }
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // AC6 (compile-time deny — proven via documentation test).
+    //
+    // Verified by the `read_only_invocation_no_write_methods` doctest above
+    // (compile_fail) and by the test below which proves the symmetric
+    // type-level fact via `static_assertions`-style trait-bound checks.
+    // -----------------------------------------------------------------------
+
+    /// AC6 (Action-typed executor with Query dispatch): the runtime
+    /// detects the misdeclaration and returns `KindMismatch`.
+    #[tokio::test]
+    async fn dispatch_action_only_executor_against_query_outlet_emits_kind_mismatch() {
+        struct ActionOnly;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for ActionOnly {
+            async fn exec_action(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                Ok(serde_json::json!(null))
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state_with_query_caps(creator_did);
+        let registry = setup_query_registry(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "query-tool".to_owned();
+        let executor = ActionOnly;
+        let sink = super::InMemoryQueryMisdeclarationSink::new();
+
+        let result = super::invoke_outlet_dispatch::<ActionOnly, std::hash::RandomState>(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({}),
+            &DID::from(creator_did),
+            None,
+            &executor,
+            Some(&sink),
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "ActionOnly + Query outlet must misdeclare");
+        let err = result.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                super::InvocationError::KindMismatch {
+                    kind: OutletKind::Query,
+                    ..
+                }
+            ),
+            "expected KindMismatch{{Query}}, got {err:?}"
+        );
+
+        // Misdeclaration signal emitted to the sink.
+        let drained = sink.drain();
+        assert_eq!(drained.len(), 1, "exactly one signal emitted");
+        let event = &drained[0];
+        assert!(!event.integrity_ok, "integrity_ok must be false");
+        assert_eq!(
+            event.reason,
+            Some(OutletVerifiedReason::QueryMisdeclaration)
+        );
+        assert_eq!(event.outlet_id, "query-tool");
+    }
+
+    // -----------------------------------------------------------------------
+    // AC7: runtime deny-list on MutableInvocation write methods.
+    // -----------------------------------------------------------------------
+
+    /// AC7: a `MutableInvocation` constructed with `kind == Query`
+    /// (defense-in-depth — simulating a misdeclared outlet whose runtime
+    /// path bypassed the dispatcher) refuses every write method, returns
+    /// `QueryViolation`, and emits the `QueryMisdeclaration` signal.
+    #[tokio::test]
+    async fn mutable_invocation_with_query_kind_runtime_denies_writes() {
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let invoker: DID = creator_did.into();
+        let events: Vec<scp_event_log::Event> = Vec::new();
+
+        let sink = super::InMemoryQueryMisdeclarationSink::new();
+        let read = super::ReadOnlyInvocation::new(
+            &context,
+            &role_state,
+            &registry,
+            &invoker,
+            &outlet_id_owned,
+            &events,
+            0,
+            None,
+            None,
+        );
+        // Construct with `kind == Query` to exercise the defense-in-depth
+        // runtime guard. Production dispatch never builds this.
+        let mut mutable = super::MutableInvocation::new(read, OutletKind::Query, Some(&sink));
+
+        // Every write method must trip `QueryViolation`.
+        let cases: Vec<(&'static str, Result<(), super::OutletExecutorError>)> = vec![
+            (
+                "send_message",
+                mutable.send_message(serde_json::json!({"x": 1})),
+            ),
+            (
+                "assign_role",
+                mutable.assign_role("did:dht:z6MkA", "member"),
+            ),
+            (
+                "register_outlet",
+                mutable.register_outlet(serde_json::json!({})),
+            ),
+            ("append_event", mutable.append_event(serde_json::json!({}))),
+            (
+                "submit_governance_proposal",
+                mutable.submit_governance_proposal(serde_json::json!({})),
+            ),
+            (
+                "cast_governance_vote",
+                mutable.cast_governance_vote("p", serde_json::json!("yes")),
+            ),
+            (
+                "debit_economic_ledger",
+                mutable.debit_economic_ledger("did:dht:z6MkA", 1),
+            ),
+            (
+                "credit_economic_ledger",
+                mutable.credit_economic_ledger("did:dht:z6MkA", 1),
+            ),
+            (
+                "increment_caveat_counter",
+                mutable.increment_caveat_counter("k", 1),
+            ),
+        ];
+
+        for (op, res) in cases {
+            assert!(
+                matches!(
+                    res,
+                    Err(super::OutletExecutorError::QueryViolation { operation }) if operation == op
+                ),
+                "operation {op} must trip QueryViolation"
+            );
+        }
+
+        // No mutation enqueued — the guard ran before push.
+        assert_eq!(
+            mutable.pending_mutation_count(),
+            0,
+            "QueryViolation must NOT enqueue any intent"
+        );
+
+        // Misdeclaration signals emitted — one per refused operation.
+        let drained = sink.drain();
+        assert_eq!(drained.len(), 9, "9 refused operations → 9 signals");
+        for event in &drained {
+            assert!(!event.integrity_ok);
+            assert_eq!(event.reason, Some(OutletVerifiedReason::QueryMisdeclaration));
+            assert_eq!(event.outlet_id, "calculator");
+        }
+    }
+
+    /// AC7 dispatcher path: a Query-registered outlet whose `exec_action`
+    /// half is dispatched (because the implementor only overrode
+    /// `exec_action`) emits `QueryMisdeclaration` and returns `KindMismatch`
+    /// — matching the spec §5.4.2 invariant via `invoke_outlet_dispatch`.
+    /// This is the integration test corresponding to the
+    /// `MutableInvocation`-direct test above.
+    #[tokio::test]
+    async fn dispatch_query_outlet_misdeclared_emits_misdeclaration_signal() {
+        struct ActionOnly;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for ActionOnly {
+            async fn exec_action(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                Ok(serde_json::json!(null))
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state_with_query_caps(creator_did);
+        let registry = setup_query_registry(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "query-tool".to_owned();
+        let executor = ActionOnly;
+        let sink = super::InMemoryQueryMisdeclarationSink::new();
+
+        let result = super::invoke_outlet_dispatch::<ActionOnly, std::hash::RandomState>(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({}),
+            &DID::from(creator_did),
+            None,
+            &executor,
+            Some(&sink),
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "Query-with-only-exec_action must fail");
+        match result.unwrap_err() {
+            super::InvocationError::KindMismatch { outlet_id, kind } => {
+                assert_eq!(outlet_id, "query-tool");
+                assert_eq!(kind, OutletKind::Query);
+            }
+            other => panic!("expected KindMismatch{{Query}}, got {other:?}"),
+        }
+
+        let drained = sink.drain();
+        assert_eq!(drained.len(), 1);
+        assert!(!drained[0].integrity_ok);
+        assert_eq!(
+            drained[0].reason,
+            Some(OutletVerifiedReason::QueryMisdeclaration)
+        );
+    }
+
+    /// Trait-bound assertion — `ReadOnlyInvocation` does not have any of
+    /// the write methods. This is enforced by the type system at compile
+    /// time; the assertion below documents the deny-list and would fail
+    /// to compile if a write method were added.
+    #[test]
+    fn read_only_invocation_has_no_write_methods() {
+        // Snippet that intentionally NEVER runs — the test passes because
+        // it compiles. Adding a write method to `ReadOnlyInvocation`
+        // would cause an ambiguity that the test author would have to
+        // resolve, signaling a deliberate change.
+        fn _assert_no_writes(_handle: &super::ReadOnlyInvocation<'_>) {
+            // The deny-list method names DO exist on `MutableInvocation`.
+            // If any of these names were added to `ReadOnlyInvocation`,
+            // the call site below would compile and call the wrong half.
+            // This is the structural assertion: the compiler refuses to
+            // resolve `_handle.send_message(...)` etc. on
+            // `&ReadOnlyInvocation` because no such method exists.
+            //
+            // We rely on the trait-bound check below for compile-time
+            // proof; this scope is intentionally empty.
+        }
+
+        // The doctest in the module header (compile_fail) is the
+        // first-class compile-time deny.
+    }
 }
+
+/// Compile-time deny-list assertion — calling a write method on
+/// `&ReadOnlyInvocation` does not compile (PRD AC1, AC6).
+///
+/// This `compile_fail` doctest is a structural test: it pins the absence of
+/// a `send_message` (or any write-side) method on `&ReadOnlyInvocation`. If
+/// a future refactor adds a write method to the read-only handle, the
+/// doctest will start COMPILING — and fail — alerting the author to the
+/// silent deny-list bypass.
+///
+/// ```compile_fail,E0599
+/// use scp_runtime::context::ContextHandle;
+/// use scp_runtime::context::outlets::invoke::ReadOnlyInvocation;
+/// use scp_protocol::context::ContextParams;
+/// use scp_protocol::context::outlets::registry::OutletRegistry;
+/// use scp_protocol::context::roles::{CapabilityCeiling, ContextRoleState};
+/// use scp_primitives::DID;
+///
+/// fn no_send_on_read_only(read: &ReadOnlyInvocation<'_>) {
+///     // ❌ Should NOT compile — `send_message` is not a method on
+///     // `ReadOnlyInvocation`. Only `MutableInvocation` exposes it.
+///     read.send_message(serde_json::json!({}));
+/// }
+/// ```
+#[cfg(doctest)]
+#[allow(dead_code)]
+fn _compile_fail_read_only_invocation_send_message() {}

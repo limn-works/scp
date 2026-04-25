@@ -4777,3 +4777,205 @@ async fn event_channel_receives_member_left_on_leave() {
         "MemberLeft must appear on channel after leave_context"
     );
 }
+
+// =============================================================================
+// SCP-OUT-013 — ContextManager::invoke_outlet_dispatch_with_economy tests
+// =============================================================================
+
+/// AC5 (manager wrapper, Action): the manager dispatches an Action-registered
+/// outlet through `exec_action` and returns enqueued mutations alongside the
+/// invocation outcome.
+#[tokio::test]
+async fn manager_dispatch_routes_action_outlet_through_exec_action() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::context::outlets::registry::OutletRegistry;
+
+    use crate::context::outlets::invoke::{
+        MutableInvocation, MutationIntent, OutletExecutor, OutletExecutorError,
+        ReadOnlyInvocation,
+    };
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+    let mut params = governance_params();
+    params
+        .ceiling
+        .push(scp_protocol::context::params::Capability::OutletCallAll);
+    let _handle = manager
+        .create_context(
+            "dispatch-action-ctx".into(),
+            params,
+            "did:key:invoker".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut registry = OutletRegistry::new();
+    registry.insert(test_outlet_registration("echo"));
+
+    struct EchoAction;
+    #[async_trait::async_trait]
+    impl OutletExecutor for EchoAction {
+        async fn exec_action(
+            &self,
+            ctx: &mut MutableInvocation<'_>,
+            input: serde_json::Value,
+        ) -> Result<serde_json::Value, OutletExecutorError> {
+            ctx.send_message(serde_json::json!({"echoed": input}))?;
+            Ok(serde_json::json!({}))
+        }
+
+        async fn exec_query(
+            &self,
+            _ctx: &ReadOnlyInvocation<'_>,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, OutletExecutorError> {
+            // Should never be dispatched for an Action outlet.
+            Err(OutletExecutorError::Failed("misroute".into()))
+        }
+    }
+
+    let executor = EchoAction;
+    let outcome = manager
+        .invoke_outlet_dispatch_with_economy(
+            "dispatch-action-ctx",
+            &registry,
+            &OutletId::from("echo"),
+            serde_json::json!({}),
+            &"did:key:invoker".into(),
+            None,
+            None,
+            &executor,
+            None,
+        )
+        .await
+        .expect("dispatch should succeed");
+
+    assert_eq!(outcome.pending_mutations.len(), 1);
+    assert!(matches!(
+        outcome.pending_mutations[0],
+        MutationIntent::SendMessage { .. }
+    ));
+}
+
+/// AC7 (manager wrapper): a Query-registered outlet whose implementor only
+/// overrode `exec_action` is caught at dispatch — the manager surfaces a
+/// `KindMismatch` permission error and the misdeclaration sink records the
+/// `OutletVerifiedEvent { reason: QueryMisdeclaration }` signal.
+#[tokio::test]
+async fn manager_dispatch_query_outlet_misdeclared_emits_signal() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::context::outlets::registry::OutletRegistry;
+    use scp_protocol::context::outlets::{OutletKind, OutletVerifiedReason};
+
+    use crate::context::outlets::invoke::{
+        InMemoryQueryMisdeclarationSink, MutableInvocation, OutletExecutor, OutletExecutorError,
+    };
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+    let mut params = governance_params();
+    // Query stem (OUT-014) so the outlet auth check passes.
+    params
+        .ceiling
+        .push(scp_protocol::context::params::Capability::OutletQueryAll);
+    params
+        .ceiling
+        .push(scp_protocol::context::params::Capability::OutletCallAll);
+    let _handle = manager
+        .create_context(
+            "dispatch-query-ctx".into(),
+            params,
+            "did:key:invoker".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut registry = OutletRegistry::new();
+    let mut reg = test_outlet_registration("ro-tool");
+    reg.kind = OutletKind::Query;
+    reg.cost = None; // Query outlets must have cost == None || amount == 0
+    reg.schema.input_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "q": {"type": "number"},
+            "scope": {"type": "string"}
+        }
+    });
+    reg.schema.output_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "ok": {"type": "boolean"},
+            "data": {"type": ["object", "null"]}
+        }
+    });
+    // test vector matches the new schemas
+    reg.test_vectors = vec![
+        scp_protocol::context::outlets::registry::OutletTestVector {
+            input: serde_json::json!({"q": 1, "scope": "a"}),
+            expected_output: serde_json::json!({"ok": true, "data": null}),
+            description: "noop".to_owned(),
+        },
+    ];
+    registry.insert(reg);
+
+    struct ActionOnly;
+    #[async_trait::async_trait]
+    impl OutletExecutor for ActionOnly {
+        async fn exec_action(
+            &self,
+            _ctx: &mut MutableInvocation<'_>,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, OutletExecutorError> {
+            Ok(serde_json::json!({"ok": true, "data": null}))
+        }
+    }
+
+    let executor = ActionOnly;
+    let sink = InMemoryQueryMisdeclarationSink::new();
+
+    let result = manager
+        .invoke_outlet_dispatch_with_economy(
+            "dispatch-query-ctx",
+            &registry,
+            &OutletId::from("ro-tool"),
+            serde_json::json!({"q": 1, "scope": "a"}),
+            &"did:key:invoker".into(),
+            None,
+            None,
+            &executor,
+            Some(&sink),
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "manager dispatch must fail for Query outlet with only exec_action"
+    );
+    let err = result.unwrap_err();
+    let err_str = err.to_string();
+    assert!(
+        err_str.contains("SCP-TOOL-6103"),
+        "expected SCP-TOOL-6103 in {err_str}"
+    );
+
+    let drained = sink.drain();
+    assert_eq!(drained.len(), 1, "exactly one misdeclaration signal");
+    let event = &drained[0];
+    assert!(!event.integrity_ok);
+    assert_eq!(
+        event.reason,
+        Some(OutletVerifiedReason::QueryMisdeclaration)
+    );
+    assert_eq!(event.outlet_id, "ro-tool");
+}

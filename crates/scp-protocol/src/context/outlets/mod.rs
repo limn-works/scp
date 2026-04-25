@@ -444,9 +444,42 @@ pub struct OutletUpdatedEvent {
     pub changed_fields: Vec<String>,
 }
 
+/// Reason for an `OutletVerifiedEvent` integrity-failure (spec §5.4.2).
+///
+/// Disambiguates the cause of `integrity_ok == false`:
+///
+/// - [`OutletVerifiedReason::TestVectorFailed`] — one or more registered test
+///   vectors did not match the executor's output. Carries no further detail —
+///   the [`OutletVerificationResult`] alongside the event holds the per-vector
+///   results.
+/// - [`OutletVerifiedReason::QueryMisdeclaration`] — a Query outlet's executor
+///   attempted a write through `MutableInvocation` (or invoked through the
+///   wrong `OutletExecutor` half), tripping the runtime deny-list. The
+///   operator-attributable signal defined in spec §5.4.2 "Misdeclaration
+///   signal" — used by participation records (§7.3.2) to attribute the
+///   failure to the outlet's `operator_did`. Wire form: `"query-misdeclaration"`
+///   so the on-wire string matches the spec's `query_misdeclaration` slug
+///   (with the canonical kebab-case rendering used elsewhere in the
+///   `OutletErrorClass` slug taxonomy — §5.4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OutletVerifiedReason {
+    /// At least one registered test vector failed to match the executor's
+    /// output during a [`verify_outlet`](registry::verify_outlet) run.
+    TestVectorFailed,
+    /// A Query outlet's executor attempted to mutate context state through a
+    /// write-side handle (or the dispatched executor half returned
+    /// `KindMismatch`). Operator-attributable per spec §5.4.2 — wired by the
+    /// `ReadOnlyInvocation` deny-list (SCP-OUT-013).
+    QueryMisdeclaration,
+}
+
 /// Event payload for a `ToolVerified` event in the context event log.
 ///
-/// Records the verification result for auditability.
+/// Records the verification result for auditability. `reason` carries the
+/// failure category when `integrity_ok == false`; it is omitted from the
+/// wire envelope when `integrity_ok == true` per the spec §5.4.2 invariant
+/// that a successful verification has no failure reason to attribute.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct OutletVerifiedEvent {
     /// The verified tool's ID.
@@ -457,6 +490,12 @@ pub struct OutletVerifiedEvent {
     pub failed: usize,
     /// Overall integrity assessment.
     pub integrity_ok: bool,
+    /// Categorized reason for `integrity_ok == false` (spec §5.4.2
+    /// "Misdeclaration signal"). `None` when `integrity_ok == true` or when
+    /// emitted from legacy code paths that pre-date the kebab-case taxonomy.
+    /// Always `Some` when the runtime emits an integrity-failure event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<OutletVerifiedReason>,
 }
 
 // ---------------------------------------------------------------------------

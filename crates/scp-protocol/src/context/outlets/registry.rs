@@ -566,6 +566,14 @@ where
         passed: passed_count,
         failed: failed_count,
         integrity_ok,
+        // `verify_outlet` only attributes test-vector failures here; the
+        // QueryMisdeclaration reason is emitted from the runtime
+        // `ReadOnlyInvocation` deny-list (SCP-OUT-013), not from this path.
+        reason: if integrity_ok {
+            None
+        } else {
+            Some(super::OutletVerifiedReason::TestVectorFailed)
+        },
     };
 
     Ok((result, event))

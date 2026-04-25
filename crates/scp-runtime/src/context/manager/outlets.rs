@@ -939,6 +939,234 @@ impl ContextManager {
             payment_receipt,
         })
     }
+
+    /// Dispatches an outlet invocation through an [`OutletExecutor`] under
+    /// the full economy pipeline (SCP-OUT-013).
+    ///
+    /// Wraps [`Self::invoke_outlet_with_economy`] with a kind-aware adapter
+    /// so the registered [`OutletKind`](scp_protocol::context::outlets::OutletKind)
+    /// drives dispatch to `exec_query` (read-only handle) or `exec_action`
+    /// (mutable handle, write-capable). Pending mutations enqueued through
+    /// [`crate::context::outlets::invoke::MutableInvocation`] are returned
+    /// alongside the standard invocation outcome so the caller can apply
+    /// them (or assert on them in tests). The `misdeclaration_sink`
+    /// receives `OutletVerifiedEvent { integrity_ok: false, reason:
+    /// QueryMisdeclaration }` events whenever the
+    /// [`MutableInvocation::guard_kind`](crate::context::outlets::invoke::MutableInvocation)
+    /// runtime check refuses a write or the dispatched executor half
+    /// returns [`OutletExecutorError::KindMismatch`](crate::context::outlets::invoke::OutletExecutorError::KindMismatch).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same [`ContextError`] taxonomy as
+    /// [`Self::invoke_outlet_with_economy`]. Misdeclaration paths surface
+    /// as `ContextError::PermissionDenied(SCP-TOOL-6103: ...)`.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub async fn invoke_outlet_dispatch_with_economy<E>(
+        &self,
+        context_id: &str,
+        registry: &OutletRegistry,
+        outlet_id: &OutletId,
+        input: serde_json::Value,
+        invoker_did: &DID,
+        spending_ucan: Option<&UcanToken>,
+        timeout_ms: Option<u32>,
+        executor: &E,
+        misdeclaration_sink: Option<&dyn crate::context::outlets::invoke::QueryMisdeclarationSink>,
+    ) -> Result<DispatchedManagedOutletInvocationOutput, ContextError>
+    where
+        E: crate::context::outlets::invoke::OutletExecutor + ?Sized,
+    {
+        // Snapshot the outlet kind under the registry so the closure-based
+        // adapter sees a stable value.
+        let registration = registry.get(outlet_id).ok_or_else(|| {
+            ContextError::PermissionDenied(format!(
+                "SCP-TOOL-6082: outlet not found: {outlet_id}"
+            ))
+        })?;
+        let kind = registration.kind;
+
+        // Snapshot the read-side context state once so the
+        // ReadOnlyInvocation handle is stable across the off-lock executor.
+        // We re-acquire the lock briefly to snapshot what the handle needs
+        // to expose (events, epoch, members, role state, registry,
+        // economic policy snapshot). The dispatcher does not stress
+        // membership/ceiling checks — those are already enforced by the
+        // existing capability gate inside `invoke_outlet_with_economy`.
+        let (handle_snapshot, role_state_snapshot, events_snapshot, epoch_snapshot, policy_snapshot) =
+            {
+                let (guard, _ctx_gen) = self.lock_context(context_id).await.map_err(|_| {
+                    ContextError::ContextNotRegistered(context_id.to_owned())
+                })?;
+                let ctx = &*guard;
+                let now_secs = self.clock.now_secs();
+                let events = super::governance::event_log_entries_for_consequences(
+                    ctx,
+                    context_id,
+                    now_secs,
+                    self.event_log.as_ref(),
+                );
+                (
+                    ctx.handle.clone(),
+                    ctx.role_state.clone(),
+                    events,
+                    ctx.epoch.mls_epoch,
+                    ctx.governance.economic_policy.clone(),
+                )
+            };
+
+        // Adapt the trait-based dispatch into the closure-based pipeline.
+        // The closure has to hold `&mut Vec<MutationIntent>` so it can
+        // collect the writes from `MutableInvocation::take_pending_mutations`
+        // — `Mutex` keeps us cleanly across the `move` boundary while
+        // satisfying `Send`.
+        let pending: std::sync::Mutex<Vec<crate::context::outlets::invoke::MutationIntent>> =
+            std::sync::Mutex::new(Vec::new());
+        let pending_ref = &pending;
+        let outlet_id_owned = outlet_id.clone();
+        let invoker_did_owned = invoker_did.clone();
+        let role_state_ref = &role_state_snapshot;
+        let registry_ref: &OutletRegistry = registry;
+        let events_ref = &events_snapshot;
+        let policy_ref = policy_snapshot.as_ref();
+        let handle_ref = &handle_snapshot;
+        let executor_ref: &E = executor;
+        let executor_kind = kind;
+
+        let closure = move |input: serde_json::Value| {
+            let outlet_id_inner = outlet_id_owned.clone();
+            let invoker_did_inner = invoker_did_owned.clone();
+            async move {
+                let read = crate::context::outlets::invoke::ReadOnlyInvocation::new(
+                    handle_ref,
+                    role_state_ref,
+                    registry_ref,
+                    &invoker_did_inner,
+                    &outlet_id_inner,
+                    events_ref,
+                    epoch_snapshot,
+                    policy_ref,
+                    None,
+                );
+                match executor_kind {
+                    scp_protocol::context::outlets::OutletKind::Query => {
+                        match executor_ref.exec_query(&read, input).await {
+                            Ok(value) => Ok(value),
+                            Err(crate::context::outlets::invoke::OutletExecutorError::KindMismatch { .. }) => {
+                                if let Some(sink) = misdeclaration_sink {
+                                    sink.record(
+                                        scp_protocol::context::outlets::OutletVerifiedEvent {
+                                            outlet_id: outlet_id_inner.clone(),
+                                            passed: 0,
+                                            failed: 1,
+                                            integrity_ok: false,
+                                            reason: Some(
+                                                scp_protocol::context::outlets::OutletVerifiedReason::QueryMisdeclaration,
+                                            ),
+                                        },
+                                    );
+                                }
+                                Err("SCP-TOOL-6103: outlet kind mismatch (Query expected)".to_owned())
+                            }
+                            Err(crate::context::outlets::invoke::OutletExecutorError::QueryViolation { operation }) => {
+                                Err(format!(
+                                    "SCP-TOOL-6103: query violation in exec_query: {operation}"
+                                ))
+                            }
+                            Err(crate::context::outlets::invoke::OutletExecutorError::Failed(msg)) => {
+                                Err(msg)
+                            }
+                        }
+                    }
+                    scp_protocol::context::outlets::OutletKind::Action => {
+                        let mut mutable = crate::context::outlets::invoke::MutableInvocation::new(
+                            crate::context::outlets::invoke::ReadOnlyInvocation::new(
+                                handle_ref,
+                                role_state_ref,
+                                registry_ref,
+                                &invoker_did_inner,
+                                &outlet_id_inner,
+                                events_ref,
+                                epoch_snapshot,
+                                policy_ref,
+                                None,
+                            ),
+                            scp_protocol::context::outlets::OutletKind::Action,
+                            misdeclaration_sink,
+                        );
+                        match executor_ref.exec_action(&mut mutable, input).await {
+                            Ok(value) => {
+                                let collected = mutable.take_pending_mutations();
+                                if !collected.is_empty() {
+                                    let mut guard = pending_ref
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    guard.extend(collected);
+                                }
+                                Ok(value)
+                            }
+                            Err(crate::context::outlets::invoke::OutletExecutorError::KindMismatch { .. }) => {
+                                Err("SCP-TOOL-6103: outlet kind mismatch (Action expected)".to_owned())
+                            }
+                            Err(crate::context::outlets::invoke::OutletExecutorError::QueryViolation { operation }) => {
+                                Err(format!(
+                                    "SCP-TOOL-6103: query violation in exec_action: {operation}"
+                                ))
+                            }
+                            Err(crate::context::outlets::invoke::OutletExecutorError::Failed(msg)) => {
+                                Err(msg)
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let outcome = self
+            .invoke_outlet_with_economy(
+                context_id,
+                registry,
+                outlet_id,
+                input,
+                invoker_did,
+                spending_ucan,
+                timeout_ms,
+                closure,
+            )
+            .await?;
+
+        let pending_mutations = pending
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        Ok(DispatchedManagedOutletInvocationOutput {
+            output: outcome.output,
+            event: outcome.event,
+            consequences: outcome.consequences,
+            payment_receipt: outcome.payment_receipt,
+            pending_mutations,
+        })
+    }
+}
+
+/// Result of [`ContextManager::invoke_outlet_dispatch_with_economy`].
+///
+/// Mirrors [`ManagedOutletInvocationOutput`] with the addition of the
+/// `pending_mutations` drained from the Action outlet's
+/// [`MutableInvocation`](crate::context::outlets::invoke::MutableInvocation).
+/// For Query outlets the vector is always empty.
+#[derive(Debug)]
+pub struct DispatchedManagedOutletInvocationOutput {
+    /// Outlet output JSON.
+    pub output: serde_json::Value,
+    /// Event to append to the event log.
+    pub event: OutletInvokedEvent,
+    /// Consequences triggered by the invocation.
+    pub consequences: Vec<scp_protocol::trust::consequence::TriggeredConsequence>,
+    /// Payment receipt when a payment adapter is configured.
+    pub payment_receipt: Option<crate::economy::adapter::PaymentReceipt>,
+    /// Pending mutations enqueued through `MutableInvocation` write methods.
+    pub pending_mutations: Vec<crate::context::outlets::invoke::MutationIntent>,
 }
 
 /// Bundle of Phase-1 outputs handed to Phase 2. Exists only so the
@@ -992,5 +1220,14 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
         InvocationError::OutletQueryCostViolation { reason } => ContextError::PermissionDenied(
             format!("SCP-TOOL-6102: Query outlet cost violation (§5.4.2): {reason}"),
         ),
+        InvocationError::QueryViolation {
+            outlet_id,
+            operation,
+        } => ContextError::PermissionDenied(format!(
+            "SCP-TOOL-6103: Query outlet \"{outlet_id}\" attempted write \"{operation}\" through ReadOnlyInvocation (§5.4.2)"
+        )),
+        InvocationError::KindMismatch { outlet_id, kind } => ContextError::PermissionDenied(format!(
+            "SCP-TOOL-6103: outlet \"{outlet_id}\" registered as {kind:?} but executor returned KindMismatch (§5.4.2)"
+        )),
     }
 }
