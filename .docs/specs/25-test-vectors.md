@@ -644,3 +644,78 @@ cargo test -p scp-event-log --test test_vectors -- --nocapture
 The test vector generation test is defined in `crates/scp-core/tests/test_vectors.rs` and `crates/scp-event-log/tests/test_vectors.rs`. These tests print hex-encoded intermediate and final values for each vector defined above.
 
 Independent implementations SHOULD run these tests against the Rust implementation to obtain the expected outputs, then embed those outputs in their own test suites.
+
+## 25.19 Outlet Registration V2 Vectors (§5.4.1)
+
+Domain: `"SCP-OUTLET-REGISTRATION-V2:"` — supersedes the deleted pre-rename `"SCP-TOOL-REGISTRATION-V1:"` domain (ADR-049 §1, hard-break, no aliases).
+
+The canonical conformance fixture lives at:
+
+```
+tests/conformance/vectors/outlet_registration_v2.json
+```
+
+The fixture documents **12 known-input / known-output vectors**, each signed under the RFC 8032 §7.1 Test Vector 1 Ed25519 keypair (§25.2 reference key material). Every entry carries:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Stable case identifier (e.g., `minimal-query`, `with-100-test-vectors`). |
+| `notes` | string | Human-readable description and spec cross-reference. |
+| `input` | object | The `OutletRegistration` field set (excluding `signature`). |
+| `expected_preimage` | hex string | Raw byte sequence fed into SHA-256, beginning `"SCP-OUTLET-REGISTRATION-V2:"`. |
+| `expected_canonical_hash` | hex string | SHA-256 of `expected_preimage` (32 bytes / 64 hex). Equals the output of `compute_outlet_registration_canonical_bytes`. |
+| `expected_signature` | hex string | Ed25519 signature over `expected_canonical_hash` (64 bytes / 128 hex). |
+| `operator_did` | string | The signing operator's DID (the same across all vectors for determinism). |
+| `operator_public_key` | hex string | The operator's Ed25519 verifying key (32 bytes / 64 hex). |
+
+### 25.19.1 Vector index
+
+| # | Name | Shape |
+|---|------|-------|
+| 1 | `minimal-query` | Read-only outlet, `cost = None`. |
+| 2 | `minimal-action` | Mutating outlet, `cost = None`. |
+| 3 | `query-cost-none` | Query outlet, explicit `cost = None` (exercises absent-cost preimage branch). |
+| 4 | `query-cost-zero` | Query outlet with `OutletCost { amount: 0 }` (cost-present-but-zero branch). |
+| 5 | `action-cost-positive` | Action outlet with `cost.amount > 0`, including currency + payee fields. |
+| 6 | `with-aggregate-schema` | Output schema declares an `aggregate` sub-object describing the streamed-aggregate shape (§5.4.5). |
+| 7 | `max-size-schema` | Input schema approaches the §5.4.1 64 KiB serialized cap. |
+| 8 | `with-100-test-vectors` | Carries 100 registration test vectors (the §5.4.1 maximum). |
+| 9 | `llm-backed-impl-hash` | `implementation_hash = SHA-256(model_id \|\| ":" \|\| system_prompt_utf8)` per the LLM-backed §5.4.1 rule. |
+| 10 | `remote-service-impl-hash` | `implementation_hash = SHA-256(canonical_jcs(openapi_spec))` per the remote-service §5.4.1 rule, plus `cost_formula` for dynamic pricing (§19.4). |
+| 11 | `multi-caveat-invocation-target` | Paid Action outlet whose registered shape is compatible with multi-caveat UCAN invocation (§7.3.8). |
+| 12 | `cross-context-invocation-target` | Action outlet exposed via cross-context interface (§6.2.0.1). |
+
+The current `OutletRegistration` struct does not yet carry the `kind`, `aggregate_schema`, or `message_catalog` fields specified in §5.4.1; those land with SCP-OUT-011 / SCP-OUT-013 / SCP-OUT-024 / SCP-OUT-015. Vectors 1–12 are signed under the transitional V2 preimage produced by `compute_outlet_registration_canonical_bytes` (placeholder `kind_byte = 0x01` per SCP-OUT-002). When the structural stories ship, the vectors will be regenerated under the full §5.4.1 preimage and committed in the same PR.
+
+### 25.19.2 V1 rejection corpus
+
+The fixture additionally carries 12 paired entries under `v1_rejection_corpus`. Each entry contains:
+
+- `v1_preimage` — the byte sequence under the deleted `SCP-TOOL-REGISTRATION-V1:` domain for the same logical input;
+- `v1_canonical_hash` — `SHA-256(v1_preimage)`;
+- `v2_canonical_hash` — copy of the matching V2 entry's `expected_canonical_hash`.
+
+Conformance test `CONF-045` enforces that for every entry `v1_canonical_hash != v2_canonical_hash` AND that `v2_canonical_hash` matches the live `compute_outlet_registration_canonical_bytes` output. Pre-migration signatures over the V1 preimage do not validate against any V2 code path — this is the ADR-049 §1 hard break, demonstrated mechanically.
+
+### 25.19.3 Conformance procedure
+
+The four FFI bridges (PyO3, NAPI, UniFFI Swift / Kotlin) and the WASM bridge all funnel through `scp_protocol::context::outlets::registry::compute_outlet_registration_canonical_bytes` whenever they sign or verify an outlet registration; validating the vectors against the Rust core therefore transitively validates every bridge. The conformance suite enforces this:
+
+```bash
+cargo test -p scp-testing --test conformance \
+  conf_043_outlet_registration_v2_shape \
+  conf_044_outlet_registration_v2_sign_verify \
+  conf_045_outlet_registration_v1_rejected \
+  conf_046_outlet_registration_v2_matches_generator -- --nocapture
+```
+
+Independent implementations SHOULD parse `outlet_registration_v2.json`, reconstruct each registration from `input`, recompute the V2 preimage byte-for-byte, verify SHA-256 matches `expected_canonical_hash`, and verify the Ed25519 signature against `operator_public_key`. Implementers MUST also confirm that `v1_preimage` for each rejection-corpus entry produces a hash distinct from the matching `v2_canonical_hash`.
+
+### 25.19.4 Regenerating the fixture
+
+```bash
+cargo test -p scp-testing --test conformance \
+  conf_outlet_registration_v2_regen -- --ignored --nocapture
+```
+
+The regenerator is `#[ignore]` by default so the default `cargo test` run does not write to disk. Fixture drift (live code changes that should but do not invalidate the JSON) is caught by `CONF-046`, which compares the on-disk file byte-for-byte to the generator's current output.

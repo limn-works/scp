@@ -370,8 +370,12 @@ mod tests {
     }
 
     #[test]
-    fn parse_tool_invoke_assistant() {
-        let uri: CapabilityUri = "scp:ctx:abc123/outlet_invoke:assistant".parse().unwrap();
+    fn parse_outlet_call_assistant() {
+        // ADR-049 §2: the pre-rename `outlet_invoke:*` stem is deleted (hard break);
+        // outlet capabilities split into `outlet_call:*` (Action) and
+        // `outlet_query:*` (Query). Validates the parser accepts the post-rename
+        // stem without resurrecting the deleted form.
+        let uri: CapabilityUri = "scp:ctx:abc123/outlet_call:assistant".parse().unwrap();
         assert_eq!(uri.context_id(), Some("abc123"));
         assert_eq!(uri.resource(), "outlet_call");
         assert_eq!(uri.action(), "assistant");

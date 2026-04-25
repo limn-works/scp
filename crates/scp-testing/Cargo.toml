@@ -20,6 +20,7 @@ scp-core = { path = "../scp-core", features = ["allow_unencrypted_storage", "tes
 scp-identity = { path = "../scp-identity", features = ["testing"] }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
 scp-primitives = { path = "../scp-primitives" }
+scp-protocol = { path = "../scp-protocol" }
 scp-node = { path = "../scp-node", features = ["allow_unencrypted_storage"] }
 scp-transport = { path = "../scp-transport" }
 ed25519-dalek = { workspace = true }
@@ -38,6 +39,7 @@ rmp-serde = { workspace = true }
 tls_codec = "0.4"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
+serde = { workspace = true }
 
 [dev-dependencies]
 scp-core = { path = "../scp-core", features = ["testing"] }

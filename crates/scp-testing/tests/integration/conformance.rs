@@ -1883,3 +1883,322 @@ fn conf_042_cross_implementation_sync() {
 
     println!("  PASS: Cross-implementation sync recovery verified");
 }
+
+// ===========================================================================
+// §26 Outlet Registration Conformance — SCP-OUT-009
+// ===========================================================================
+
+/// CONF-043: Outlet Registration V2 Vector File Shape
+/// Layer: Bridge | Tier: Full | Spec: §5.4.1, §25 | ADR-049 | Story: SCP-OUT-009
+fn load_outlet_registration_vector_file()
+-> scp_testing::conformance::outlet_registration::OutletRegistrationVectorFile {
+    let path = scp_testing::conformance::outlet_registration::vectors_path();
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "outlet registration vector file missing at {}: {}",
+            path.display(),
+            e
+        )
+    });
+    serde_json::from_str(&raw).expect("vector file must be valid JSON")
+}
+
+#[test]
+fn conf_043_outlet_registration_v2_shape() {
+    println!("=== CONF-043: Outlet Registration V2 Vector File Shape ===");
+    let file = load_outlet_registration_vector_file();
+    print_step(1, "Vector file declares V2 domain separator");
+    assert_eq!(file.domain_separator, "SCP-OUTLET-REGISTRATION-V2:");
+    assert_eq!(
+        file.rejected_predecessor_separator,
+        "SCP-TOOL-REGISTRATION-V1:"
+    );
+    print_step(2, "Vector file enumerates exactly 12 entries");
+    assert_eq!(
+        file.vectors.len(),
+        12,
+        "SCP-OUT-009 AC1 requires exactly 12 vectors, got {}",
+        file.vectors.len()
+    );
+    print_step(3, "Each entry carries the required fields");
+    let names: std::collections::HashSet<&str> =
+        file.vectors.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(
+        names.len(),
+        12,
+        "vector names must be unique (set has {} entries)",
+        names.len()
+    );
+    for v in &file.vectors {
+        assert!(!v.expected_preimage.is_empty(), "preimage hex empty");
+        assert!(
+            !v.expected_canonical_hash.is_empty(),
+            "canonical hash hex empty"
+        );
+        assert_eq!(
+            v.expected_signature.len(),
+            128,
+            "Ed25519 signature must be 64 bytes (128 hex)"
+        );
+        assert!(
+            v.operator_did.starts_with("did:"),
+            "operator_did must be a DID"
+        );
+        assert_eq!(
+            v.operator_public_key.len(),
+            64,
+            "Ed25519 public key must be 32 bytes (64 hex)"
+        );
+        let input = v.input.as_object().expect("input must be JSON object");
+        for required_field in [
+            "outlet_id",
+            "name",
+            "description",
+            "schema",
+            "implementation_hash",
+            "test_vectors",
+            "operator_did",
+            "registered_at",
+        ] {
+            assert!(
+                input.contains_key(required_field),
+                "vector '{}' missing input field '{}'",
+                v.name,
+                required_field
+            );
+        }
+    }
+    println!("  PASS: V2 vector file shape conforms to SCP-OUT-009 AC1+AC2");
+}
+
+/// CONF-044: Outlet Registration V2 Sign-Verify Round-Trip
+/// Layer: Bridge | Tier: Full | Spec: §5.4.1 | ADR-049 | Story: SCP-OUT-009
+#[test]
+fn conf_044_outlet_registration_v2_sign_verify() {
+    use scp_core::context::outlets::registry::{
+        compute_outlet_registration_canonical_bytes, verify_outlet_registration_signature,
+    };
+    use scp_testing::conformance::outlet_registration as orv;
+
+    println!("=== CONF-044: Outlet Registration V2 Sign-Verify Round-Trip ===");
+    let file = load_outlet_registration_vector_file();
+    print_step(
+        1,
+        "Reconstruct each registration from the on-disk JSON input payload",
+    );
+    print_step(
+        2,
+        "Recompute canonical preimage byte-for-byte and the V2 SHA-256 digest",
+    );
+    print_step(3, "Verify Ed25519 signature against operator_public_key");
+    print_step(
+        4,
+        "Confirm the manual preimage matches compute_outlet_registration_canonical_bytes",
+    );
+    for vector in &file.vectors {
+        let registration =
+            orv::registration_from_json_input(&vector.input, &vector.expected_signature)
+                .unwrap_or_else(|e| panic!("vector '{}' input malformed: {e}", vector.name));
+
+        let manual_preimage = orv::compute_v2_preimage(&registration);
+        let actual_preimage_hex = hex::encode(&manual_preimage);
+        assert_eq!(
+            actual_preimage_hex, vector.expected_preimage,
+            "vector '{}' preimage mismatch",
+            vector.name
+        );
+
+        let manual_hash: [u8; 32] = Sha256::digest(&manual_preimage).into();
+        assert_eq!(
+            hex::encode(manual_hash),
+            vector.expected_canonical_hash,
+            "vector '{}' canonical hash mismatch",
+            vector.name
+        );
+
+        let core_hash = compute_outlet_registration_canonical_bytes(&registration);
+        assert_eq!(
+            core_hash.as_slice(),
+            manual_hash,
+            "vector '{}' Rust core compute_outlet_registration_canonical_bytes diverges from manual preimage",
+            vector.name
+        );
+
+        let pub_bytes_vec =
+            hex::decode(&vector.operator_public_key).expect("operator_public_key hex");
+        let pub_bytes: [u8; 32] = pub_bytes_vec
+            .as_slice()
+            .try_into()
+            .expect("operator_public_key must be 32 bytes");
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&pub_bytes)
+            .expect("operator_public_key must be a valid Ed25519 verifying key");
+
+        verify_outlet_registration_signature(&registration, &verifying_key).unwrap_or_else(|e| {
+            panic!(
+                "vector '{}' signature verification failed: {e:?}",
+                vector.name
+            )
+        });
+
+        // Also verify directly using the Ed25519 verifier against the canonical hash bytes
+        // (the message that Ed25519 actually signs).
+        let sig_bytes_vec =
+            hex::decode(&vector.expected_signature).expect("expected_signature hex");
+        let sig_bytes: [u8; 64] = sig_bytes_vec
+            .as_slice()
+            .try_into()
+            .expect("expected_signature must be 64 bytes");
+        let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+        verifying_key
+            .verify(&core_hash, &signature)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "vector '{}' direct Ed25519 verify failed: {e:?}",
+                    vector.name
+                )
+            });
+    }
+    println!(
+        "  PASS: 12 vectors round-trip through manual preimage, in-tree hasher, and Ed25519 verify"
+    );
+}
+
+/// CONF-045: V1 Domain Separator Rejection (Negative Corpus)
+/// Layer: Bridge | Tier: Full | Spec: §5.4.1 hard-break | ADR-049 §1 | Story: SCP-OUT-009
+#[test]
+fn conf_045_outlet_registration_v1_rejected() {
+    use scp_core::context::outlets::registry::compute_outlet_registration_canonical_bytes;
+    use scp_testing::conformance::outlet_registration as orv;
+
+    println!("=== CONF-045: V1 Domain Separator Rejection (Negative Corpus) ===");
+    let file = load_outlet_registration_vector_file();
+    print_step(
+        1,
+        "Vector file documents the deleted V1 domain separator for the rejection corpus",
+    );
+    assert!(
+        !file.v1_rejection_corpus.is_empty(),
+        "v1 rejection corpus must be populated"
+    );
+    assert_eq!(
+        file.v1_rejection_corpus.len(),
+        file.vectors.len(),
+        "every V2 vector must have a paired V1-rejection entry"
+    );
+    print_step(
+        2,
+        "Each V1 preimage starts with SCP-TOOL-REGISTRATION-V1: (deleted domain)",
+    );
+    for entry in &file.v1_rejection_corpus {
+        let preimage_bytes = hex::decode(&entry.v1_preimage).expect("v1_preimage hex");
+        assert!(
+            preimage_bytes.starts_with(b"SCP-TOOL-REGISTRATION-V1:"),
+            "V1 corpus entry '{}' must start with SCP-TOOL-REGISTRATION-V1:",
+            entry.name
+        );
+        let v1_hash: [u8; 32] = Sha256::digest(&preimage_bytes).into();
+        assert_eq!(
+            hex::encode(v1_hash),
+            entry.v1_canonical_hash,
+            "V1 hash mismatch for entry '{}'",
+            entry.name
+        );
+    }
+    print_step(
+        3,
+        "V1 hash MUST NOT equal the V2 canonical hash for the same logical input",
+    );
+    for entry in &file.v1_rejection_corpus {
+        assert_ne!(
+            entry.v1_canonical_hash, entry.v2_canonical_hash,
+            "V1 and V2 hashes collide for entry '{}' — domain separation broken",
+            entry.name
+        );
+    }
+    print_step(
+        4,
+        "V1 hash MUST NOT match what the live code path produces for the same logical input",
+    );
+    for (entry, (name, _notes, registration)) in file
+        .v1_rejection_corpus
+        .iter()
+        .zip(orv::reference_registrations().iter())
+    {
+        assert_eq!(
+            &entry.name, name,
+            "rejection corpus order must match reference_registrations() order"
+        );
+        let live_v2 = compute_outlet_registration_canonical_bytes(registration);
+        assert_eq!(
+            hex::encode(&live_v2),
+            entry.v2_canonical_hash,
+            "live code's V2 hash diverges from corpus expectation for '{}'",
+            entry.name
+        );
+        assert_ne!(
+            hex::encode(&live_v2),
+            entry.v1_canonical_hash,
+            "live code's V2 hash must NEVER equal the V1 hash for '{}' — rename hard-break violated",
+            entry.name
+        );
+    }
+    println!(
+        "  PASS: V1 preimage rejected — pre-rename SCP-TOOL-REGISTRATION-V1 domain produces a distinct hash that never validates against the V2 code path"
+    );
+}
+
+/// CONF-046: Outlet Registration V2 Vectors Match Generator
+/// Layer: Bridge | Tier: Full | Spec: §5.4.1 | ADR-049 | Story: SCP-OUT-009
+///
+/// Confirms the on-disk JSON file is byte-identical to what the generator
+/// would currently produce. Detects accidental drift between the in-tree
+/// reference registrations and the committed vectors.
+#[test]
+fn conf_046_outlet_registration_v2_matches_generator() {
+    use scp_testing::conformance::outlet_registration as orv;
+
+    println!("=== CONF-046: V2 Vectors Match Generator ===");
+    let on_disk = load_outlet_registration_vector_file();
+    let regenerated = orv::build_vector_file();
+    print_step(
+        1,
+        "On-disk vector file matches build_vector_file() output exactly",
+    );
+    let on_disk_json =
+        serde_json::to_value(&on_disk).expect("on-disk file serializable to JSON value");
+    let regen_json =
+        serde_json::to_value(&regenerated).expect("regen file serializable to JSON value");
+    assert_eq!(
+        on_disk_json, regen_json,
+        "outlet_registration_v2.json drifted from in-tree generator — re-run \
+         `cargo test -p scp-testing --test conformance \
+         conf_outlet_registration_v2_regen -- --ignored --nocapture` to refresh"
+    );
+    println!("  PASS: on-disk vectors are byte-identical to the generator output");
+}
+
+/// Regenerator (ignored by default). Run with:
+///
+/// ```bash
+/// cargo test -p scp-testing --test conformance \
+///   conf_outlet_registration_v2_regen -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "writes to disk; run explicitly when intentionally regenerating vectors"]
+fn conf_outlet_registration_v2_regen() {
+    use scp_testing::conformance::outlet_registration as orv;
+
+    let path = orv::vectors_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create vectors parent directory");
+    }
+    let file = orv::build_vector_file();
+    let serialized = serde_json::to_string_pretty(&file).expect("serialize vector file");
+    std::fs::write(&path, serialized + "\n").expect("write vector file");
+    println!(
+        "Regenerated outlet registration V2 vectors → {} ({} entries, {} V1-rejection entries)",
+        path.display(),
+        file.vectors.len(),
+        file.v1_rejection_corpus.len()
+    );
+}
