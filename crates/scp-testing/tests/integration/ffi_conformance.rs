@@ -1162,6 +1162,9 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "tool_register",
     "tool_invoke",
     "tool_verify",
+    "tool_interface_expose",
+    "tool_interface_accept",
+    "tool_interface_revoke",
     // UCAN
     "ucan_validate",
     "ucan_mint",
@@ -1176,6 +1179,9 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "broadcast_unsubscribe",
     "broadcast_publish",
     "broadcast_block",
+    "broadcast_subscriber_count",
+    "broadcast_is_subscriber",
+    "broadcast_admission",
     // Trust
     "trust_query_score",
     "trust_verify_attestation",
@@ -1240,6 +1246,7 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "broadcast_unblock",
     // Identity (7)
     "identity_link_attestations",
+    "identity_create_link_attestation",
     "identity_create_with_agent_key",
     "identity_execute_recovery",
     "identity_execute_custody_migration",

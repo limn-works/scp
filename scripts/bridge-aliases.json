@@ -2749,12 +2749,250 @@
       "wasm": [
         "mcp_get_stdio_allowlist"
       ]
+    },
+    {
+      "canonical": "mcp_server",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_server",
+        "mcp_server",
+        "py_mcp_serve",
+        "mcp_serve"
+      ],
+      "uniffi": [
+        "mcp_server"
+      ],
+      "napi": [
+        "mcp_server",
+        "mcp_server_create"
+      ],
+      "wasm": [
+        "mcp_server"
+      ]
+    },
+    {
+      "canonical": "mcp_client",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_client",
+        "mcp_client",
+        "py_mcp_client_connect_stdio",
+        "mcp_client_connect_stdio"
+      ],
+      "uniffi": [
+        "mcp_client"
+      ],
+      "napi": [
+        "mcp_client",
+        "mcp_client_connect_stdio"
+      ],
+      "wasm": [
+        "mcp_client"
+      ]
+    },
+    {
+      "canonical": "tool_interface_expose",
+      "category": "tools",
+      "wasm_required": true,
+      "pyo3": [
+        "tool_interface_expose"
+      ],
+      "uniffi": [
+        "tool_interface_expose"
+      ],
+      "napi": [
+        "tool_interface_expose"
+      ],
+      "wasm": [
+        "tool_interface_expose"
+      ]
+    },
+    {
+      "canonical": "tool_interface_accept",
+      "category": "tools",
+      "wasm_required": true,
+      "pyo3": [
+        "tool_interface_accept"
+      ],
+      "uniffi": [
+        "tool_interface_accept"
+      ],
+      "napi": [
+        "tool_interface_accept"
+      ],
+      "wasm": [
+        "tool_interface_accept"
+      ]
+    },
+    {
+      "canonical": "tool_interface_revoke",
+      "category": "tools",
+      "wasm_required": true,
+      "pyo3": [
+        "tool_interface_revoke"
+      ],
+      "uniffi": [
+        "tool_interface_revoke"
+      ],
+      "napi": [
+        "tool_interface_revoke"
+      ],
+      "wasm": [
+        "tool_interface_revoke"
+      ]
+    },
+    {
+      "canonical": "broadcast_subscriber_count",
+      "category": "broadcast",
+      "wasm_required": true,
+      "pyo3": [
+        "broadcast_subscriber_count"
+      ],
+      "uniffi": [
+        "broadcast_subscriber_count"
+      ],
+      "napi": [
+        "context_broadcast_subscriber_count"
+      ],
+      "wasm": [
+        "broadcast_subscriber_count"
+      ]
+    },
+    {
+      "canonical": "broadcast_is_subscriber",
+      "category": "broadcast",
+      "wasm_required": true,
+      "pyo3": [
+        "broadcast_is_subscriber"
+      ],
+      "uniffi": [
+        "broadcast_is_subscriber"
+      ],
+      "napi": [
+        "context_is_broadcast_subscriber"
+      ],
+      "wasm": [
+        "broadcast_is_subscriber"
+      ]
+    },
+    {
+      "canonical": "broadcast_admission",
+      "category": "broadcast",
+      "wasm_required": true,
+      "pyo3": [
+        "broadcast_admission"
+      ],
+      "uniffi": [
+        "broadcast_admission"
+      ],
+      "napi": [
+        "context_broadcast_admission"
+      ],
+      "wasm": [
+        "broadcast_admission"
+      ]
+    },
+    {
+      "canonical": "identity_create_link_attestation",
+      "category": "identity",
+      "wasm_required": true,
+      "pyo3": [
+        "create_identity_link_attestation"
+      ],
+      "uniffi": [
+        "identity_create_link_attestation"
+      ],
+      "napi": [
+        "identity_create_link_attestation"
+      ],
+      "wasm": [
+        "identity_create_link_attestation"
+      ]
+    },
+    {
+      "canonical": "node_start_in_memory",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "node_start_in_memory"
+      ],
+      "uniffi": [
+        "node_start_in_memory"
+      ],
+      "napi": [
+        "node_start_in_memory"
+      ],
+      "wasm": [
+        "node_start_in_memory"
+      ]
+    },
+    {
+      "canonical": "node_start_local",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "node_start_local"
+      ],
+      "uniffi": [
+        "node_start_local"
+      ],
+      "napi": [
+        "node_start_local"
+      ],
+      "wasm": [
+        "node_start_local"
+      ]
+    },
+    {
+      "canonical": "relay_start_in_memory",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "relay_start_in_memory"
+      ],
+      "uniffi": [
+        "relay_start_in_memory"
+      ],
+      "napi": [
+        "relay_start_in_memory"
+      ],
+      "wasm": [
+        "relay_start_in_memory"
+      ]
+    },
+    {
+      "canonical": "relay_start_local",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "relay_start_local"
+      ],
+      "uniffi": [
+        "relay_start_local"
+      ],
+      "napi": [
+        "relay_start_local"
+      ],
+      "wasm": [
+        "relay_start_local"
+      ]
     }
   ],
   "exemptions": {
     "_comment": "Per-bridge exemptions for operations that are intentionally not implemented in that bridge. This is a MIRROR of the language-level exemptions in .docs/standards/sdk-capability-matrix.json, keyed by bridge name (pyo3 / uniffi / napi / wasm) rather than SDK language. The symmetry script consults this map in addition to the wasm_required flag before emitting a finding.",
     "pyo3": [],
-    "uniffi": [],
+    "uniffi": [
+      {
+        "canonical": "mcp_server",
+        "reason": "UniFFI targets mobile; MCP is PyO3/NAPI only"
+      },
+      {
+        "canonical": "mcp_client",
+        "reason": "UniFFI targets mobile; MCP is PyO3/NAPI only"
+      }
+    ],
     "napi": [
       {
         "canonical": "identity_migrate",
@@ -2833,6 +3071,22 @@
       {
         "canonical": "mcp_get_stdio_allowlist",
         "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "node_start_in_memory",
+        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no openmls direct linkage / no transport per ADR-034."
+      },
+      {
+        "canonical": "node_start_local",
+        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no openmls direct linkage / no transport per ADR-034."
+      },
+      {
+        "canonical": "relay_start_in_memory",
+        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no openmls direct linkage / no transport per ADR-034."
+      },
+      {
+        "canonical": "relay_start_local",
+        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no openmls direct linkage / no transport per ADR-034."
       }
     ]
   }
