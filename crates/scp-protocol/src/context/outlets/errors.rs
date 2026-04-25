@@ -562,6 +562,34 @@ pub const REGISTRATION_EVENT_ID_LEN: usize = 32;
 /// Length of the `outlet_message_key` HMAC key (§5.4.4 round-5).
 pub const OUTLET_MESSAGE_KEY_LEN: usize = 32;
 
+/// Hard upper bound on `source_chain` padded length (§5.4.4 round-5,
+/// registered as a protocol constant in §9.18.B).
+///
+/// The emitter computes `max_padded_trail_depth = min(ContextParams::max_chain_depth,
+/// MAX_TRAIL_PAD_DEPTH)` so envelopes stay bounded even when an operator
+/// configures `max_chain_depth = 255` (the `u8` ceiling). Capping at 16
+/// bounds an envelope's worst-case `source_chain` size to a few hundred
+/// bytes regardless of the hosting context's depth budget.
+///
+/// **Not configurable.** This constant is part of the wire contract; an
+/// emitter that pads beyond `MAX_TRAIL_PAD_DEPTH` produces an envelope that
+/// receivers structurally reject.
+///
+/// See SCP-OUT-029 for the wrap-time application of this cap.
+pub const MAX_TRAIL_PAD_DEPTH: u8 = 16;
+
+/// Domain separator for [`MAX_TRAIL_PAD_DEPTH`] pad-entry HMAC pseudonyms
+/// (§5.4.4 round-5, registered in §9.18.2).
+///
+/// Pad entries derive their `context_id` as
+/// `HMAC-SHA-256(pad_nonce, MAX_TRAIL_PAD_HMAC_LABEL || slot_index_be)[..32]`
+/// where `slot_index_be` is the 2-byte big-endian slot index. The label is
+/// distinct from every other §9.18.2 separator and from the cross-context
+/// `hop_salt`-keyed HMAC over real `context_id`s — the two keyings are
+/// independent (`pad_nonce` vs. `hop_salt`) so a pad entry can never collide
+/// with a real entry under any honest emitter.
+pub const MAX_TRAIL_PAD_HMAC_LABEL: &[u8] = b"SCP-OUTLET-HOP-PAD-V1:";
+
 // ---------------------------------------------------------------------------
 // OutletError — typed §5.4.4 envelope (struct form)
 // ---------------------------------------------------------------------------

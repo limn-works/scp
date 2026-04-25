@@ -5437,6 +5437,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "hex",
  "hkdf",
+ "hmac",
  "jsonschema",
  "lru 0.16.3",
  "metrics",

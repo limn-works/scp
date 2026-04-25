@@ -84,10 +84,10 @@ mod queries;
 // reachable from FFI bridges and integration tests through the same
 // `manager::*` path as the chain-depth helpers.
 pub use outlets::{
-    CrossContextHopAccepted, OutletAmplificationError, OutletInterfaceDefaults,
-    action_chain_budget, amplification_error_to_context, cross_context_invoke,
-    cross_context_rate_tier_default, origin_kind_from_ucan_stem, query_chain_budget,
-    record_amplification_rejection,
+    CrossContextHopAccepted, OuterCallerStems, OutletAmplificationError, OutletErrorWrapView,
+    OutletInterfaceDefaults, action_chain_budget, amplification_error_to_context,
+    cross_context_invoke, cross_context_rate_tier_default, origin_kind_from_ucan_stem,
+    query_chain_budget, record_amplification_rejection, wrap_cross_context_error,
 };
 pub(crate) mod standing;
 mod trust_recovery;

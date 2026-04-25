@@ -1822,6 +1822,1771 @@ pub fn amplification_error_to_context(err: &OutletAmplificationError) -> Context
     ContextError::PermissionDenied(err.to_string())
 }
 
+// ===========================================================================
+// SCP-OUT-029 — Cross-context error wrapping with ContextHop pseudonymization
+// ===========================================================================
+//
+// Implements spec §5.4.4 (Outlet Error Taxonomy) round-3 oracle collapse +
+// round-5 trail-length padding + round-6 unconditional pad_nonce emission,
+// and §6.2 cross-context wrapping. At each cross-context bridge hop, when an
+// `OutletError` propagates back to the caller, the caller's wrapping layer
+// prepends a `ContextHop` to `source_chain` with the wrapping context's id,
+// the wrap-counter `hop_index = prev.last + 1`, and `wrapped_code =
+// prev.code` (preserved — NOT remapped). Purpose: the outermost caller sees
+// the original error code AND the trail of contexts the error traversed.
+// This is the opposite of HTTP gateway remapping.
+//
+// Pseudonymization (§5.4.4): each `ContextHop.context_id` the *receiving*
+// caller (the wrap-time observer) is not a member of is replaced by
+// `HMAC-SHA-256(hop_salt, raw_context_id)[..32]` where `hop_salt` is the
+// 32-byte per-context-pair salt established at outlet-interface acceptance
+// (§6.2.0.1, the per-pair salt persisted via `InterfaceEstablished.ikm_a /
+// ikm_b` at accept time). The receiving caller's own context (`hop_index ==
+// 0`-equivalent under §5.4.4 prose — i.e., caller_ctx == observer_ctx) is
+// never pseudonymized.
+//
+// Query-oracle collapse (§5.4.4 round-3): when the receiving caller holds
+// neither `outlet_query:{id}` nor `outlet_call:{id}` on the innermost outlet
+// id, the wrapped error's `code` is collapsed to `SCP-TOOL-6110` /
+// `authorization.denied` regardless of the underlying cause (missing
+// outlet, deregistered outlet, kind-mismatch). A caller holding at least one
+// matching stem disambiguates. `AmplificationViolation` collapses to
+// `authorization.denied` for any caller missing BOTH stems.
+//
+// Trail-length padding (§5.4.4 round-5): when any hop is opaque to the
+// observer, `source_chain` is length-padded to `min(ContextParams::max_chain_depth,
+// MAX_TRAIL_PAD_DEPTH=16)`. Each entry (real or pad) carries `hop_index =
+// slot_index ∈ [0, max_padded_trail_depth - 1]` — IDENTICAL encoding for
+// real and pad. Pad entries derive their `context_id` as
+// `HMAC-SHA-256(pad_nonce, "SCP-OUTLET-HOP-PAD-V1:" || slot_index_be)[..32]`.
+// `pad_nonce` is fresh per envelope (CSPRNG-sampled by the caller) and
+// emitted unconditionally on EVERY error envelope (no Option wrapper) per
+// §5.4.4 round-5/6 — closing the visibility-vs-absence oracle.
+//
+// Full visibility short-circuit: callers with membership on every hop AND a
+// matching stem on every hop target see the un-padded `source_chain` with
+// raw context_ids. `pad_nonce` is still emitted (not as a signal — its
+// presence is unconditional).
+
+use hmac::Mac as _;
+use scp_protocol::context::metadata::ContextId;
+use scp_protocol::context::outlets::errors::{
+    ContextHop, MAX_TRAIL_PAD_DEPTH, MAX_TRAIL_PAD_HMAC_LABEL, OutletError, OutletErrorClass,
+    PAD_NONCE_LEN,
+};
+
+/// Outlet error code emitted under round-3 query-oracle collapse — `SCP-TOOL-6110`.
+const COLLAPSED_AUTHORIZATION_DENIED_CODE: &str = "SCP-TOOL-6110"; // SCP-CODE-OK: §5.4.4 round-3 oracle-collapse target (constant pinned at file scope)
+
+/// Slug for round-3 query-oracle collapse — `authorization.denied`.
+const COLLAPSED_AUTHORIZATION_DENIED_SLUG: &str = "authorization.denied";
+
+/// Capability-stem visibility for the innermost outlet whose error is
+/// being wrapped.
+///
+/// Used by [`OutletErrorWrapView`] to apply the §5.4.4 round-3
+/// oracle-collapse rule when the receiving caller does not hold a
+/// disambiguating stem on the originating outlet.
+///
+/// `holds_query`/`holds_call` reflect the receiving caller's UCAN-validated
+/// stems on the innermost outlet id at the moment of wrap. The wrap function
+/// never re-validates the caller's UCAN — the caller computes these flags
+/// from its already-validated capability set and passes them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OuterCallerStems {
+    /// `true` iff the receiving caller holds `outlet_query:{innermost_outlet_id}`
+    /// (or its `outlet_query:*` superset) at wrap time.
+    pub holds_query: bool,
+    /// `true` iff the receiving caller holds `outlet_call:{innermost_outlet_id}`
+    /// (or its `outlet_call:*` superset) at wrap time.
+    pub holds_call: bool,
+}
+
+impl OuterCallerStems {
+    /// Returns `true` iff the caller holds at least one disambiguating stem.
+    /// Per §5.4.4 round-3 a caller without any matching stem must see the
+    /// collapsed `authorization.denied` code; a caller with at least one
+    /// stem disambiguates.
+    #[must_use]
+    pub const fn has_any_stem(self) -> bool {
+        self.holds_query || self.holds_call
+    }
+
+    /// Returns `true` iff the caller holds BOTH stems (full disambiguation
+    /// surface for §5.4.4 round-3 `AmplificationViolation` distinction).
+    #[must_use]
+    pub const fn has_both_stems(self) -> bool {
+        self.holds_query && self.holds_call
+    }
+}
+
+/// Receiving-caller view used by [`wrap_cross_context_error`] to apply the
+/// §5.4.4 hop-by-hop pseudonymization, oracle collapse, and trail-padding
+/// rules.
+///
+/// All inputs are computed by the caller (the runtime above this function)
+/// from its already-validated state: which contexts the receiving caller is
+/// a member of, the `hop_salts` pinned at each outlet-interface acceptance,
+/// and the receiving caller's UCAN stems on the innermost outlet id. The
+/// wrap function performs no re-validation — it is a pure projection.
+///
+/// # Determinism
+///
+/// All inputs are concrete byte arrays / boolean flags. The wrap function is
+/// deterministic given identical inputs. Tests construct an
+/// [`OutletErrorWrapView`] directly and assert the resulting envelope's
+/// shape.
+///
+/// # Field-by-field
+///
+/// - `observer_ctx` — receiving caller's own context id. The wrap function
+///   compares each `ContextHop.context_id` against this id: equal → never
+///   pseudonymized (the caller is always a member of their own context, per
+///   §5.4.4); not equal → pseudonymization gated on `member_of_context`.
+/// - `member_of_context` — closure: given a context id, returns `true` iff
+///   the receiving caller is a member of that context. Used to decide
+///   pseudonymization per hop.
+/// - `hop_salts` — closure: given a target context id, returns the
+///   per-pair `hop_salt: [u8; 32]` for the receiving-caller↔target
+///   interface, or `None` if no interface salt is known. `None` is treated
+///   as "non-member, no salt" — the hop is still pseudonymized but with a
+///   sentinel HMAC keyed by an all-zero salt so the on-wire shape is
+///   indistinguishable from a known-salt pseudonym (32 bytes). Real
+///   deployments wire this from the per-context `InterfaceEstablished`
+///   event-log entries (§6.2.0.1 step 4).
+/// - `outer_caller_stems` — receiving caller's stems on the innermost
+///   outlet id. Drives oracle collapse.
+/// - `inner_outlet_kind` — the kind (`Query`/`Action`) of the innermost
+///   outlet, when known. Used to decide whether the underlying error was a
+///   kind-mismatch / not-found situation that requires collapse. `None`
+///   means "kind unknown" — the wrap function treats unknown-kind as a
+///   collapse trigger for callers without any stem.
+/// - `pad_nonce` — fresh CSPRNG-sampled 16-byte nonce. The caller MUST
+///   resample per envelope; the wrap function uses it verbatim and writes
+///   it onto the resulting envelope. Reusing across envelopes is a §5.4.4
+///   round-5 anti-correlation violation.
+/// - `max_padded_trail_depth` — `min(ContextParams::max_chain_depth,
+///   MAX_TRAIL_PAD_DEPTH)`. The caller computes this from the emitting
+///   context's parameters; the wrap function applies it only when at least
+///   one hop is opaque to the receiving caller. Full-visibility callers see
+///   the unpadded `source_chain` regardless of this value.
+pub struct OutletErrorWrapView<'a> {
+    /// Receiving caller's own context id.
+    pub observer_ctx: &'a ContextId,
+    /// Returns `true` iff the receiving caller is a member of the given
+    /// context id. Used to gate pseudonymization per hop.
+    pub member_of_context: &'a dyn Fn(&str) -> bool,
+    /// Returns the 32-byte `hop_salt` for the receiving caller's interface
+    /// with the given target context, or `None` if no salt is known.
+    pub hop_salts: &'a dyn Fn(&str) -> Option<[u8; 32]>,
+    /// Receiving caller's stems on the innermost outlet id (the originator
+    /// of the error).
+    pub outer_caller_stems: OuterCallerStems,
+    /// The innermost outlet's `OutletKind`, when known. `None` triggers
+    /// stem-based collapse for callers without any matching stem.
+    pub inner_outlet_kind: Option<OutletKind>,
+    /// Fresh CSPRNG-sampled `pad_nonce: [u8; 16]` for this envelope. MUST
+    /// be regenerated per envelope; reusing across envelopes is a §5.4.4
+    /// round-5 anti-correlation violation.
+    pub pad_nonce: [u8; PAD_NONCE_LEN],
+    /// `min(ContextParams::max_chain_depth, MAX_TRAIL_PAD_DEPTH)`. Capped
+    /// at [`MAX_TRAIL_PAD_DEPTH`] regardless of the input value so envelope
+    /// size stays bounded.
+    pub max_padded_trail_depth: u8,
+}
+
+/// Per-pair `hop_salt` HMAC-SHA-256 of a raw `context_id`.
+///
+/// Returns the truncated 32-byte HMAC output that occupies a
+/// pseudonymized [`ContextHop::context_id`]. Used by
+/// [`wrap_cross_context_error`] to produce the §5.4.4 wire form for hops
+/// the receiving caller is not a member of.
+fn hmac_pseudonymize_context_id(hop_salt: &[u8; 32], raw_context_id: &str) -> [u8; 32] {
+    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+    let mut out = [0u8; 32];
+    if let Ok(mut mac) = <HmacSha256 as hmac::Mac>::new_from_slice(hop_salt) {
+        mac.update(raw_context_id.as_bytes());
+        let full = mac.finalize().into_bytes();
+        out.copy_from_slice(&full[..32]);
+    }
+    out
+}
+
+/// Per-envelope `pad_nonce` HMAC-SHA-256 of
+/// `MAX_TRAIL_PAD_HMAC_LABEL || slot_index_be` — the §5.4.4 round-5
+/// pad-entry `context_id` derivation.
+///
+/// `slot_index` is encoded as a 2-byte big-endian `u16`. The output is
+/// truncated to 32 bytes to match the §5.4.4 `ContextHop.context_id`
+/// pseudonym width.
+fn derive_pad_context_id(pad_nonce: &[u8; PAD_NONCE_LEN], slot_index: u16) -> [u8; 32] {
+    type HmacSha256 = hmac::Hmac<sha2::Sha256>;
+    let mut out = [0u8; 32];
+    if let Ok(mut mac) = <HmacSha256 as hmac::Mac>::new_from_slice(pad_nonce) {
+        mac.update(MAX_TRAIL_PAD_HMAC_LABEL);
+        mac.update(&slot_index.to_be_bytes());
+        let full = mac.finalize().into_bytes();
+        out.copy_from_slice(&full[..32]);
+    }
+    out
+}
+
+/// Hex-encodes a 32-byte HMAC pseudonym output for storage in
+/// [`ContextHop::context_id`]. The on-wire `context_id` is a `String`
+/// (§5.4.4 schema), so the 32-byte HMAC is stored as 64 hex chars. This
+/// keeps the JSON/MessagePack wire shape stable across the
+/// pseudonymization boundary.
+fn pseudonym_to_string(bytes: [u8; 32]) -> String {
+    hex::encode(bytes)
+}
+
+/// Returns the appropriate wire form for a hop's `context_id` from the
+/// receiving caller's view.
+///
+/// - Same as `observer_ctx` → raw (member of own context).
+/// - Member of `raw_context_id` → raw.
+/// - Otherwise → 32-byte HMAC under the per-pair `hop_salt` (or all-zero
+///   salt if no salt is known, preserving the on-wire opacity shape).
+fn project_hop_context_id(raw_context_id: &str, view: &OutletErrorWrapView<'_>) -> String {
+    if raw_context_id == *view.observer_ctx {
+        return raw_context_id.to_owned();
+    }
+    if (view.member_of_context)(raw_context_id) {
+        return raw_context_id.to_owned();
+    }
+    // Non-member: pseudonymize. If no salt is configured for this pair, use
+    // all-zeros (per the OutletErrorWrapView::hop_salts contract — the
+    // pseudonym is still 32 bytes, indistinguishable on the wire).
+    let salt = (view.hop_salts)(raw_context_id).unwrap_or([0u8; 32]);
+    let pseudonym = hmac_pseudonymize_context_id(&salt, raw_context_id);
+    pseudonym_to_string(pseudonym)
+}
+
+/// Returns `true` iff the receiving caller can see the per-hop
+/// `wrapped_code` un-collapsed for the given hop (i.e., they are a member
+/// of that hop's context, OR they hold a matching stem on the hop target).
+/// Per §5.4.4 round-3, callers without visibility see `wrapped_code`
+/// collapsed to `SCP-TOOL-6110` (`authorization.denied`).
+///
+/// This implementation conservatively collapses on every hop the caller is
+/// not a member of when the caller holds no stem. With at least one stem,
+/// the caller observes the per-hop `wrapped_code` raw on the assumption
+/// that the stem grants per-outlet visibility into the trail's
+/// fine-grained error type — matching the spec's "callers with a matching
+/// stem on the hop target see the original `wrapped_code` and slug
+/// unchanged" rule.
+fn observer_can_see_wrapped_code(hop: &ContextHop, view: &OutletErrorWrapView<'_>) -> bool {
+    if hop.context_id == *view.observer_ctx {
+        return true;
+    }
+    if (view.member_of_context)(&hop.context_id) {
+        return true;
+    }
+    // Stem-based per-hop visibility (§5.4.4 round-3, applied to source_chain
+    // entries): a caller holding any matching stem on the *hop target* sees
+    // the un-collapsed `wrapped_code`. Without per-outlet membership info
+    // for inner hops, we rely on the outermost caller's stem holding on the
+    // innermost outlet as a proxy — the wrapping layer preserves the chain
+    // when the outer caller has visibility.
+    view.outer_caller_stems.has_any_stem()
+}
+
+/// Returns `true` iff the underlying outermost `code` should collapse to
+/// `authorization.denied` per §5.4.4 round-3.
+///
+/// Collapse fires when:
+/// 1. The receiving caller holds NEITHER `outlet_query:{id}` nor
+///    `outlet_call:{id}` on the innermost outlet — every authorization-class
+///    error collapses regardless of the underlying cause (missing outlet,
+///    deregistered, kind-mismatch).
+/// 2. The error was an `AmplificationViolation` (slug
+///    `authorization.amplification-violation`) and the caller does not hold
+///    BOTH stems — distinguishing amplification from kind-specific denial
+///    requires both stems per §5.4.4 round-3.
+fn outermost_code_should_collapse(prev: &OutletError, view: &OutletErrorWrapView<'_>) -> bool {
+    let class = prev.class;
+    let slug = prev.slug.as_str();
+
+    // Authorization-class catch-all: callers without any stem cannot
+    // disambiguate — collapse.
+    let authorization_or_protocol_disclosure = matches!(
+        class,
+        OutletErrorClass::Authorization | OutletErrorClass::Protocol | OutletErrorClass::Governance
+    );
+    if authorization_or_protocol_disclosure && !view.outer_caller_stems.has_any_stem() {
+        return true;
+    }
+
+    // AmplificationViolation: needs BOTH stems to see the disambiguated
+    // slug (§5.4.4 round-3).
+    if slug == "authorization.amplification-violation" && !view.outer_caller_stems.has_both_stems()
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Cross-context error wrapping per spec §5.4.4 / §6.2 / ADR-049 — the
+/// SCP-OUT-029 entry point.
+///
+/// Prepends a [`ContextHop`] to `prev_error.source_chain` with
+/// `context_id = caller_ctx`, `hop_index = prev.last + 1` (or `1` if
+/// `prev.source_chain` is empty), and `wrapped_code = prev.code`. Preserves
+/// the original `prev.code` on the new envelope (§5.4.4 cross-context
+/// wrapping rule — the original code is NOT remapped). Applies §5.4.4
+/// round-3 oracle collapse, hop-by-hop pseudonymization, and round-5
+/// trail-length padding from the receiving caller's view.
+///
+/// # Inputs
+///
+/// - `caller_ctx` — the wrapping context's own id. Becomes the new
+///   [`ContextHop::context_id`] (raw or pseudonymized depending on the
+///   receiving caller's membership relative to `caller_ctx`).
+/// - `prev_error` — the [`OutletError`] returned by the inner outlet (or
+///   wrapped at an inner cross-context layer). The function consumes
+///   `prev_error` and returns a new envelope; `prev_error.source_chain`
+///   entries are projected into the receiving caller's view (raw or
+///   pseudonymized) before being copied into the new envelope.
+/// - `view` — receiving caller's projection: membership, `hop_salts`,
+///   stems, kind hint, fresh `pad_nonce`, and `max_padded_trail_depth`.
+///   See [`OutletErrorWrapView`] for the field-by-field contract.
+///
+/// # Round-3 oracle collapse (§5.4.4)
+///
+/// When the receiving caller holds NEITHER `outlet_query:{id}` nor
+/// `outlet_call:{id}` on the innermost outlet, the wrapped error's `code`
+/// is collapsed to [`COLLAPSED_AUTHORIZATION_DENIED_CODE`] / slug
+/// `authorization.denied`. This makes "missing outlet", "deregistered
+/// outlet", and "kind-mismatch outlet" indistinguishable to such a caller
+/// — closing the §5.4.4 query oracle. `AmplificationViolation` collapses
+/// to `authorization.denied` for any caller missing BOTH stems.
+///
+/// # Round-5 trail-length padding (§5.4.4)
+///
+/// When at least one hop is opaque to the receiving caller, `source_chain`
+/// is length-padded to `view.max_padded_trail_depth` with indistinguishable
+/// pad entries. Each entry (real or pad) carries `hop_index = slot_index ∈
+/// [0, max_padded_trail_depth - 1]`, IDENTICAL encoding for both — so an
+/// observer cannot read off `k` (the real chain length) from `hop_index`
+/// values. Pad entries derive their `context_id` from a fresh per-envelope
+/// `pad_nonce: [u8; 16]` via
+/// `HMAC-SHA-256(pad_nonce, "SCP-OUTLET-HOP-PAD-V1:" || slot_index_be)[..32]`;
+/// `wrapped_code = SCP-TOOL-6110`, slug `authorization.denied`.
+/// `pad_nonce` is emitted on EVERY envelope (no Option wrapper) per
+/// §5.4.4 round-5/6 — closing the visibility-vs-absence oracle.
+///
+/// # Partial-visibility honest disclosure (§5.4.4 round-5)
+///
+/// The pad + real-hop construction hides `k` (the chain length) only from
+/// observers who hold no `hop_salt`. A receiver who IS a member of some
+/// hop `i` holds the `hop_salt` for that hop and can therefore compute
+/// `HMAC(hop_salt, their_context_id)` and identify exactly which slot
+/// corresponds to their hop — labeling that slot as "real". They cannot
+/// identify other real slots (those use different hop-salt keys the
+/// observer does not hold), so they still do not learn `k`. The pad
+/// continues to hide `k` from such observers; it does NOT hide the
+/// existence of the member's own hop (which the member already knows).
+/// The pad fully hides `k` only from observers who hold no `hop_salt` —
+/// i.e., non-members of every hop. Quoting the spec verbatim:
+///
+/// > The pad continues to hide `k` from such an observer; it does NOT
+/// > hide the existence of the member's own hop (which the member already
+/// > knows). The pad fully hides `k` only from observers who hold no
+/// > `hop_salt` — i.e., non-members of every hop.
+///
+/// > A cryptographic construction giving universal opacity would require
+/// > re-HMACing every real-hop slot under `pad_nonce` too (producing
+/// > `HMAC(pad_nonce, SCP-OUTLET-SLOT-V1 || slot_index || HMAC(hop_salt,
+/// > raw_context_id))` on the wire), which was considered and rejected:
+/// > the partial-visibility length oracle is a niche attack available
+/// > only to someone who is already a hop member (and therefore already
+/// > sees their hop structurally), and the extra re-HMACing imposes
+/// > verifier and SDK complexity on every real-hop read without closing
+/// > a practically-exploitable channel.
+///
+/// Downstream maintainers MUST NOT attempt to implement the rejected
+/// re-HMAC-under-`pad_nonce` closure.
+///
+/// # Full-visibility short-circuit
+///
+/// Callers with membership on every hop AND a matching stem on the
+/// innermost outlet see the un-padded `source_chain` (length `k`) with
+/// raw `context_id` values. `pad_nonce` is still emitted on the envelope
+/// (per §5.4.4 round-5 unconditional emission) — its presence is NOT a
+/// signal that the observer lacks full visibility.
+///
+/// # Wire-form invariants
+///
+/// - `wrapped.code == prev.code` — preserved unless oracle collapse
+///   applies.
+/// - `wrapped.message`, `wrapped.retry`, `wrapped.detail`,
+///   `wrapped.registration_event_id`, `wrapped.unknown_fields` are
+///   carried through verbatim.
+/// - `wrapped.pad_nonce` equals `view.pad_nonce` — the function does NOT
+///   regenerate the nonce internally; the caller MUST supply a fresh
+///   nonce per envelope.
+/// - `wrapped.source_chain.first().context_id` is the receiving caller's
+///   view of `caller_ctx` (raw or 64-hex-char HMAC pseudonym).
+/// - `wrapped.source_chain.first().hop_index ==
+///   prev.source_chain.last().hop_index + 1` (or `1` if empty).
+/// - When padded, `wrapped.source_chain.len() == view.max_padded_trail_depth`
+///   AND every entry's `hop_index == slot_index`.
+///
+/// # Spec
+///
+/// - §5.4.4 (Outlet Error Taxonomy) — round-3 oracle collapse, round-5
+///   trail-length padding, round-6 unconditional `pad_nonce`.
+/// - §6.2 (Cross-context outlet interfaces) — wrapping at each boundary.
+/// - §6.2.0.1 (Outlet-interface acceptance) — `hop_salt` per-pair
+///   establishment.
+/// - §9.18.B — `MAX_TRAIL_PAD_DEPTH = 16` protocol constant.
+/// - §9.18.2 — `SCP-OUTLET-HOP-PAD-V1:` domain separator.
+/// - ADR-049 §4 — typed error envelope structural rules.
+///
+/// # Story
+///
+/// SCP-OUT-029. Builds on SCP-OUT-024 (`OutletError` envelope),
+/// SCP-OUT-042a (`InterfaceEstablished` `hop_salt` derivation context).
+#[must_use]
+pub fn wrap_cross_context_error(
+    caller_ctx: &ContextId,
+    prev_error: OutletError,
+    view: &OutletErrorWrapView<'_>,
+) -> OutletError {
+    // Step 1 — compute the new hop's wrap-counter index. The wrap-counter
+    // is monotonic per wrap call; it is distinct from the round-5
+    // slot_index (which equals position in a *padded* chain). For the
+    // un-padded path, the new wrap_counter is one greater than the largest
+    // hop_index already in prev.source_chain, ensuring strict monotonicity
+    // regardless of array ordering convention. The PRD AC text says
+    // `prev.last()`; the robust formula is `max(hop_index) + 1`, which
+    // coincides with the AC text under the front=highest convention.
+    let new_wrap_counter = next_wrap_counter(&prev_error);
+
+    let collapse_outermost = outermost_code_should_collapse(&prev_error, view);
+    let real_chain = build_real_chain(
+        caller_ctx,
+        &prev_error,
+        view,
+        new_wrap_counter,
+        collapse_outermost,
+    );
+    let full_visibility =
+        observer_has_full_visibility_with_caller(caller_ctx, &prev_error.source_chain, view);
+
+    // Step 4 — apply round-5 trail-length padding when not in full
+    // visibility. Cap at `MAX_TRAIL_PAD_DEPTH` regardless of the caller-
+    // supplied `max_padded_trail_depth` so the protocol invariant holds
+    // even if the caller mis-computes the cap.
+    let final_chain = if full_visibility {
+        real_chain
+    } else {
+        build_padded_chain(real_chain, view)
+    };
+
+    let (new_code, new_slug, new_class) =
+        compute_outermost_code_slug_class(&prev_error, view, collapse_outermost);
+
+    // The on-wire `message` HMAC is preserved verbatim — re-deriving it
+    // requires `outlet_message_key` which is not available at wrap time.
+    // Per §5.4.4 the receiver reverse-lookups the HMAC against the
+    // outlet's registered catalog; for round-3 collapse the slug rewrite
+    // is observer-side semantic only.
+    let OutletError {
+        message,
+        retry,
+        detail,
+        registration_event_id,
+        unknown_fields,
+        ..
+    } = prev_error;
+
+    OutletError {
+        code: new_code,
+        slug: new_slug,
+        class: new_class,
+        message,
+        retry,
+        detail,
+        source_chain: final_chain,
+        pad_nonce: view.pad_nonce,
+        registration_event_id,
+        unknown_fields,
+    }
+}
+
+/// Returns the strictly-monotonic wrap-counter for the new hop. Per the
+/// PRD AC: `1` if `prev.source_chain` is empty, else `max(hop_index) + 1`.
+fn next_wrap_counter(prev: &OutletError) -> u16 {
+    if prev.source_chain.is_empty() {
+        1
+    } else {
+        prev.source_chain
+            .iter()
+            .map(|h| h.hop_index)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1)
+    }
+}
+
+/// Builds the real (un-padded) source chain by prepending the new outermost
+/// wrap hop and projecting prior hops through the receiving caller's view.
+fn build_real_chain(
+    caller_ctx: &ContextId,
+    prev: &OutletError,
+    view: &OutletErrorWrapView<'_>,
+    new_wrap_counter: u16,
+    collapse_outermost: bool,
+) -> Vec<ContextHop> {
+    let mut real_chain: Vec<ContextHop> = Vec::with_capacity(prev.source_chain.len() + 1);
+    let new_hop_context_id = project_hop_context_id(caller_ctx, view);
+    let new_hop_wrapped_code = if collapse_outermost {
+        COLLAPSED_AUTHORIZATION_DENIED_CODE.to_owned()
+    } else {
+        prev.code.clone()
+    };
+    real_chain.push(ContextHop {
+        context_id: new_hop_context_id,
+        hop_index: new_wrap_counter,
+        wrapped_code: new_hop_wrapped_code,
+    });
+    for hop in &prev.source_chain {
+        let projected_id = project_hop_context_id(&hop.context_id, view);
+        let projected_code = if observer_can_see_wrapped_code(hop, view) {
+            hop.wrapped_code.clone()
+        } else {
+            COLLAPSED_AUTHORIZATION_DENIED_CODE.to_owned()
+        };
+        real_chain.push(ContextHop {
+            context_id: projected_id,
+            hop_index: hop.hop_index,
+            wrapped_code: projected_code,
+        });
+    }
+    real_chain
+}
+
+/// Decides full-visibility against the caller-plus-prev raw chain (caller
+/// is always a member of itself, so the new hop's membership is automatic).
+fn observer_has_full_visibility_with_caller(
+    caller_ctx: &ContextId,
+    prev_chain: &[ContextHop],
+    view: &OutletErrorWrapView<'_>,
+) -> bool {
+    if !view.outer_caller_stems.has_any_stem() {
+        return false;
+    }
+    if caller_ctx != view.observer_ctx && !(view.member_of_context)(caller_ctx) {
+        return false;
+    }
+    prev_chain.iter().all(|hop| {
+        hop.context_id == *view.observer_ctx || (view.member_of_context)(&hop.context_id)
+    })
+}
+
+/// Builds the padded source chain. Real entries are reassigned slot indices
+/// `0..k-1`; pad entries fill `k..target_len-1` with HMAC-derived
+/// pseudonymized `context_id`s under `view.pad_nonce`.
+fn build_padded_chain(
+    real_chain: Vec<ContextHop>,
+    view: &OutletErrorWrapView<'_>,
+) -> Vec<ContextHop> {
+    let capped_depth = view.max_padded_trail_depth.min(MAX_TRAIL_PAD_DEPTH);
+    let k = real_chain.len();
+    let target_len = (capped_depth as usize).max(k);
+    let mut padded: Vec<ContextHop> = Vec::with_capacity(target_len);
+    for (slot, hop) in real_chain.into_iter().enumerate() {
+        let slot_u16 = u16::try_from(slot).unwrap_or(u16::MAX);
+        padded.push(ContextHop {
+            context_id: hop.context_id,
+            hop_index: slot_u16,
+            wrapped_code: hop.wrapped_code,
+        });
+    }
+    for slot in k..target_len {
+        let slot_u16 = u16::try_from(slot).unwrap_or(u16::MAX);
+        let pad_id_bytes = derive_pad_context_id(&view.pad_nonce, slot_u16);
+        padded.push(ContextHop {
+            context_id: pseudonym_to_string(pad_id_bytes),
+            hop_index: slot_u16,
+            wrapped_code: COLLAPSED_AUTHORIZATION_DENIED_CODE.to_owned(),
+        });
+    }
+    padded
+}
+
+/// Decides the outermost (`prev.code`-replacing) `code`/`slug`/`class`
+/// triple per §5.4.4 round-3 oracle collapse and the kind-hint fallback.
+fn compute_outermost_code_slug_class(
+    prev: &OutletError,
+    view: &OutletErrorWrapView<'_>,
+    collapse_outermost: bool,
+) -> (String, String, OutletErrorClass) {
+    if collapse_outermost {
+        (
+            COLLAPSED_AUTHORIZATION_DENIED_CODE.to_owned(),
+            COLLAPSED_AUTHORIZATION_DENIED_SLUG.to_owned(),
+            OutletErrorClass::Authorization,
+        )
+    } else if !view.outer_caller_stems.has_any_stem() && view.inner_outlet_kind.is_none() {
+        // Kind-mismatch / not-found fallback for the ambiguous-kind case
+        // (caller has no stem AND we don't know the kind).
+        (
+            COLLAPSED_AUTHORIZATION_DENIED_CODE.to_owned(),
+            COLLAPSED_AUTHORIZATION_DENIED_SLUG.to_owned(),
+            OutletErrorClass::Authorization,
+        )
+    } else {
+        (prev.code.clone(), prev.slug.clone(), prev.class)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod wrap_cross_context_error_tests {
+    //! SCP-OUT-029 acceptance criteria — all 22 ACs verified here against
+    //! the `wrap_cross_context_error` public surface above. Each test cites
+    //! the AC it covers.
+
+    use super::*;
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::context::outlets::errors::{
+        CatalogKey, MAX_TRAIL_PAD_DEPTH, MAX_TRAIL_PAD_HMAC_LABEL, OutletError, OutletErrorClass,
+        PAD_NONCE_LEN, REGISTRATION_EVENT_ID_LEN, RetryPolicy, WIRE_MESSAGE_LEN,
+    };
+    use std::collections::HashMap;
+
+    /// Convenience aliases for the boxed test-fixture closures so we don't
+    /// repeat the verbose `Box<dyn Fn(&str) -> ...>` shape.
+    type MemberClosure = Box<dyn Fn(&str) -> bool>;
+    type SaltClosure = Box<dyn Fn(&str) -> Option<[u8; 32]>>;
+
+    // ----------------- helpers -----------------
+
+    fn fixed_outlet_message_key() -> [u8; 32] {
+        [0x42; 32]
+    }
+
+    fn fixed_pad_nonce() -> [u8; PAD_NONCE_LEN] {
+        [0x55; PAD_NONCE_LEN]
+    }
+
+    fn fixed_registration_event_id() -> [u8; REGISTRATION_EVENT_ID_LEN] {
+        [0xAB; REGISTRATION_EVENT_ID_LEN]
+    }
+
+    fn registered() -> Vec<CatalogKey> {
+        vec![
+            CatalogKey::try_new("authorization.denied").unwrap(),
+            CatalogKey::try_new("authorization.amplification-violation").unwrap(),
+            CatalogKey::try_new("protocol.outlet-not-found").unwrap(),
+            CatalogKey::try_new("execution.handler-panic").unwrap(),
+        ]
+    }
+
+    fn build_inner_authorization_error() -> OutletError {
+        let outlet_id: OutletId = "outlet-inner".to_owned();
+        let key = CatalogKey::try_new("authorization.denied").unwrap();
+        OutletError::new(
+            &outlet_id,
+            &fixed_outlet_message_key(),
+            fixed_registration_event_id(),
+            &key,
+            &registered(),
+            OutletErrorClass::Authorization,
+            "SCP-TOOL-6110",
+            "authorization.denied",
+            RetryPolicy::Never,
+            None,
+            fixed_pad_nonce(),
+        )
+        .unwrap()
+    }
+
+    fn build_inner_amplification_error() -> OutletError {
+        let outlet_id: OutletId = "outlet-amp".to_owned();
+        let key = CatalogKey::try_new("authorization.amplification-violation").unwrap();
+        OutletError::new(
+            &outlet_id,
+            &fixed_outlet_message_key(),
+            fixed_registration_event_id(),
+            &key,
+            &registered(),
+            OutletErrorClass::Authorization,
+            "SCP-TOOL-6120",
+            "authorization.amplification-violation",
+            RetryPolicy::Never,
+            None,
+            fixed_pad_nonce(),
+        )
+        .unwrap()
+    }
+
+    /// View where the observer is a full member of every named context
+    /// AND holds both stems on the inner outlet. Used to exercise the
+    /// full-visibility short-circuit.
+    #[allow(dead_code)] // members/salts are kept on the struct so they live as long as the closures that capture clones of them.
+    struct FullVisibilityFixture {
+        observer: ContextId,
+        members: std::collections::HashSet<String>,
+        salts: HashMap<String, [u8; 32]>,
+        nonce: [u8; PAD_NONCE_LEN],
+        member_closure: MemberClosure,
+        salt_closure: SaltClosure,
+    }
+
+    impl FullVisibilityFixture {
+        fn new() -> Self {
+            let observer: ContextId = "ctx-observer".to_owned();
+            let mut members = std::collections::HashSet::new();
+            members.insert(observer.clone());
+            members.insert("ctx-b".to_owned());
+            members.insert("ctx-c".to_owned());
+            members.insert("ctx-a".to_owned());
+            members.insert("ctx-inner".to_owned());
+            let salts = HashMap::new();
+            let members_for_closure = members.clone();
+            let salts_for_closure = salts.clone();
+            let member_closure: MemberClosure =
+                Box::new(move |c: &str| members_for_closure.contains(c));
+            let salt_closure: SaltClosure =
+                Box::new(move |c: &str| salts_for_closure.get(c).copied());
+            Self {
+                observer,
+                members,
+                salts,
+                nonce: [0xCC; PAD_NONCE_LEN],
+                member_closure,
+                salt_closure,
+            }
+        }
+
+        fn view(
+            &self,
+            stems: OuterCallerStems,
+            kind: Option<OutletKind>,
+            max_pad: u8,
+        ) -> OutletErrorWrapView<'_> {
+            OutletErrorWrapView {
+                observer_ctx: &self.observer,
+                member_of_context: self.member_closure.as_ref(),
+                hop_salts: self.salt_closure.as_ref(),
+                outer_caller_stems: stems,
+                inner_outlet_kind: kind,
+                pad_nonce: self.nonce,
+                max_padded_trail_depth: max_pad,
+            }
+        }
+    }
+
+    /// View where the observer is NOT a member of any named hop, holds NO
+    /// stems on the inner outlet, and per-pair salts are configured for
+    /// each known peer. Drives the §5.4.4 round-3 collapse + round-5 pad
+    /// path.
+    #[allow(dead_code)] // `members`/`salts` are retained for test introspection (e.g., AC-11 byte-equality assert) even when unused on the read path.
+    struct NonMemberFixture {
+        observer: ContextId,
+        members: std::collections::HashSet<String>,
+        salts: HashMap<String, [u8; 32]>,
+        nonce: [u8; PAD_NONCE_LEN],
+        member_closure: MemberClosure,
+        salt_closure: SaltClosure,
+    }
+
+    impl NonMemberFixture {
+        fn new() -> Self {
+            let observer: ContextId = "ctx-observer".to_owned();
+            let mut members = std::collections::HashSet::new();
+            members.insert(observer.clone()); // observer always member of own ctx
+            let mut salts = HashMap::new();
+            salts.insert("ctx-b".to_owned(), [0x11; 32]);
+            salts.insert("ctx-c".to_owned(), [0x22; 32]);
+            salts.insert("ctx-a".to_owned(), [0x33; 32]);
+            salts.insert("ctx-inner".to_owned(), [0x44; 32]);
+            let members_for_closure = members.clone();
+            let salts_for_closure = salts.clone();
+            let member_closure: MemberClosure =
+                Box::new(move |c: &str| members_for_closure.contains(c));
+            let salt_closure: SaltClosure =
+                Box::new(move |c: &str| salts_for_closure.get(c).copied());
+            Self {
+                observer,
+                members,
+                salts,
+                nonce: [0xDD; PAD_NONCE_LEN],
+                member_closure,
+                salt_closure,
+            }
+        }
+
+        fn view(
+            &self,
+            stems: OuterCallerStems,
+            kind: Option<OutletKind>,
+            max_pad: u8,
+        ) -> OutletErrorWrapView<'_> {
+            OutletErrorWrapView {
+                observer_ctx: &self.observer,
+                member_of_context: self.member_closure.as_ref(),
+                hop_salts: self.salt_closure.as_ref(),
+                outer_caller_stems: stems,
+                inner_outlet_kind: kind,
+                pad_nonce: self.nonce,
+                max_padded_trail_depth: max_pad,
+            }
+        }
+    }
+
+    // ============================================================
+    // AC-1 / AC-2 / AC-3 / AC-4 / AC-5 — basic prepend semantics
+    // ============================================================
+
+    #[test]
+    fn ac1_one_hop_wrap_prepends_context_hop() {
+        // AC-1: wrap_cross_context_error prepends a ContextHop.
+        // AC-2: wrapped.code == prev.code (preserved when caller has stems).
+        // AC-3: wrapped.source_chain.first().context_id == caller_ctx (raw
+        //       when caller is a member).
+        // AC-4: wrapped.source_chain.first().hop_index == prev.last + 1
+        //       (or 1 if empty).
+        // AC-5: wrapped.source_chain.first().wrapped_code == prev.code.
+        let fix = FullVisibilityFixture::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let view = fix.view(stems, Some(OutletKind::Query), MAX_TRAIL_PAD_DEPTH);
+
+        let prev = build_inner_authorization_error();
+        let prev_code = prev.code.clone();
+        let caller_ctx: ContextId = "ctx-b".to_owned();
+
+        let wrapped = wrap_cross_context_error(&caller_ctx, prev, &view);
+
+        // AC-2: code preserved.
+        assert_eq!(wrapped.code, prev_code, "AC-2: code preserved");
+
+        // AC-1 / AC-3 / AC-4 / AC-5.
+        assert!(!wrapped.source_chain.is_empty(), "AC-1: hop prepended");
+        let first = &wrapped.source_chain[0];
+        assert_eq!(first.context_id, caller_ctx, "AC-3: first.context_id");
+        assert_eq!(first.hop_index, 1, "AC-4: first.hop_index = 1 when empty");
+        assert_eq!(
+            first.wrapped_code, prev_code,
+            "AC-5: wrapped_code = prev.code"
+        );
+    }
+
+    #[test]
+    fn ac6_one_hop_wrap_unit_test() {
+        // AC-6: Unit test — one-hop wrap. Covered by ac1_one_hop_wrap_prepends_context_hop above
+        // plus the assertion that the resulting source_chain has length 1
+        // when prev was empty and we are in full visibility.
+        let fix = FullVisibilityFixture::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let view = fix.view(stems, Some(OutletKind::Query), MAX_TRAIL_PAD_DEPTH);
+        let prev = build_inner_authorization_error();
+        let caller_ctx: ContextId = "ctx-b".to_owned();
+        let wrapped = wrap_cross_context_error(&caller_ctx, prev, &view);
+        assert_eq!(wrapped.source_chain.len(), 1, "single-hop trail length");
+    }
+
+    #[test]
+    fn ac7_three_hop_wrap_monotonic_hop_index() {
+        // AC-7: three-hop wrap asserts source_chain is ordered with monotonic
+        // hop_index. Apply wrap three times and verify the trail is built
+        // up correctly with each wrap incrementing the wrap-counter.
+        let fix = FullVisibilityFixture::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let view = fix.view(stems, Some(OutletKind::Query), MAX_TRAIL_PAD_DEPTH);
+
+        let prev = build_inner_authorization_error();
+        let original_code = prev.code.clone();
+
+        // Wrap 1: ctx-c (innermost wrap).
+        let after1 = wrap_cross_context_error(&"ctx-c".to_owned(), prev, &view);
+        assert_eq!(after1.source_chain.len(), 1);
+        assert_eq!(after1.source_chain[0].hop_index, 1);
+        assert_eq!(after1.code, original_code);
+
+        // Wrap 2: ctx-b (next outer wrap).
+        let after2 = wrap_cross_context_error(&"ctx-b".to_owned(), after1, &view);
+        assert_eq!(after2.source_chain.len(), 2);
+        assert_eq!(after2.source_chain[0].hop_index, 2, "second wrap hop_index");
+        assert_eq!(
+            after2.source_chain[1].hop_index, 1,
+            "preserved inner hop_index"
+        );
+        assert_eq!(after2.code, original_code, "code preserved through wrap 2");
+
+        // Wrap 3: observer (outermost wrap).
+        let after3 = wrap_cross_context_error(&fix.observer.clone(), after2, &view);
+        assert_eq!(after3.source_chain.len(), 3);
+        assert_eq!(after3.source_chain[0].hop_index, 3, "third wrap hop_index");
+        assert_eq!(after3.source_chain[1].hop_index, 2);
+        assert_eq!(after3.source_chain[2].hop_index, 1);
+        assert_eq!(after3.code, original_code, "code preserved through wrap 3");
+
+        // Monotonic hop_index in front-to-back order (descending wrap-counter).
+        let indices: Vec<u16> = after3.source_chain.iter().map(|h| h.hop_index).collect();
+        for window in indices.windows(2) {
+            assert!(
+                window[0] > window[1],
+                "front-to-back monotonic decreasing: {indices:?}"
+            );
+        }
+    }
+
+    // ============================================================
+    // AC-8 — Integration test: A → B → C invocation, A observes
+    // ============================================================
+
+    #[test]
+    fn ac8_integration_three_context_chain_with_original_code_and_trail() {
+        // AC-8: Context A → B → C invocation where C returns OutletError.
+        // A observes code == original AND source_chain shows B and C.
+        let fix = FullVisibilityFixture::new(); // A is observer; member of A,B,C,inner.
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let view = fix.view(stems, Some(OutletKind::Query), MAX_TRAIL_PAD_DEPTH);
+
+        // C produces error.
+        let inner_err = build_inner_authorization_error();
+        let inner_code = inner_err.code.clone();
+
+        // C wraps as it crosses out to B.
+        let wrapped_at_c = wrap_cross_context_error(&"ctx-c".to_owned(), inner_err, &view);
+        // B wraps as the error crosses through it on the way to A.
+        let wrapped_at_b = wrap_cross_context_error(&"ctx-b".to_owned(), wrapped_at_c, &view);
+
+        // A consumes. Code preserved.
+        assert_eq!(wrapped_at_b.code, inner_code, "A observes original code");
+        // source_chain shows B and C entries (front=B, back=C).
+        assert_eq!(wrapped_at_b.source_chain.len(), 2);
+        assert_eq!(wrapped_at_b.source_chain[0].context_id, "ctx-b");
+        assert_eq!(wrapped_at_b.source_chain[1].context_id, "ctx-c");
+        assert_eq!(wrapped_at_b.source_chain[0].wrapped_code, inner_code);
+        assert_eq!(wrapped_at_b.source_chain[1].wrapped_code, inner_code);
+    }
+
+    // ============================================================
+    // AC-10 / AC-11 — pseudonymization (HMAC under hop_salt)
+    // ============================================================
+
+    #[test]
+    fn ac11_outermost_caller_not_member_sees_pseudonymized_innermost_hop() {
+        // AC-11: outermost caller NOT a member of innermost hop sees an
+        // HMAC-pseudonymized context_id (32 bytes / 64 hex chars).
+        let fix = NonMemberFixture::new();
+        // Caller holds at least one stem so we don't trigger oracle
+        // collapse; we want to verify pseudonymization in isolation.
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: false,
+        };
+        let view = fix.view(stems, Some(OutletKind::Query), 0); // no padding
+
+        let prev = build_inner_authorization_error();
+        let wrapped = wrap_cross_context_error(&"ctx-b".to_owned(), prev, &view);
+
+        // The observer is NOT a member of ctx-b, so the front hop's
+        // context_id is HMAC-pseudonymized (64 hex chars = 32 bytes).
+        let first_id = &wrapped.source_chain[0].context_id;
+        assert_eq!(
+            first_id.len(),
+            64,
+            "AC-11: pseudonym is 32 bytes / 64 hex chars, got len={}",
+            first_id.len()
+        );
+        assert_ne!(first_id, "ctx-b", "AC-11: raw id NOT exposed");
+
+        // Verify the pseudonym is the expected HMAC under the per-pair salt.
+        let salt = fix.salts.get("ctx-b").copied().unwrap();
+        let expected = pseudonym_to_string(hmac_pseudonymize_context_id(&salt, "ctx-b"));
+        assert_eq!(first_id, &expected, "HMAC matches per-pair salt");
+    }
+
+    #[test]
+    fn ac12_full_visibility_caller_sees_raw_context_ids() {
+        // AC-12: outermost caller IS a member of every hop sees raw
+        // context_ids (no pseudonymization).
+        let fix = FullVisibilityFixture::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let view = fix.view(stems, Some(OutletKind::Query), MAX_TRAIL_PAD_DEPTH);
+
+        let prev = build_inner_authorization_error();
+        let wrapped_c = wrap_cross_context_error(&"ctx-c".to_owned(), prev, &view);
+        let wrapped_b = wrap_cross_context_error(&"ctx-b".to_owned(), wrapped_c, &view);
+
+        assert_eq!(wrapped_b.source_chain[0].context_id, "ctx-b", "raw");
+        assert_eq!(wrapped_b.source_chain[1].context_id, "ctx-c", "raw");
+    }
+
+    #[test]
+    fn ac13_two_relationships_produce_different_pseudonyms_for_same_target() {
+        // AC-13: two independent interface relationships (A↔B and A↔C)
+        // produce different pseudonyms for the same B context_id when A is
+        // the observer but A is not a member of B (each relationship uses
+        // its own per-pair salt).
+        //
+        // The wrap function uses `view.hop_salts(&target_id)` to pick the
+        // per-pair salt at projection time; passing TWO different salts
+        // for the same raw context_id (simulating two relationships)
+        // produces two different pseudonyms.
+        let observer: ContextId = "ctx-a".to_owned();
+        let mut members = std::collections::HashSet::new();
+        members.insert(observer.clone()); // member of own only
+
+        // Relationship 1: A↔B with salt_1.
+        let mut salts1 = HashMap::new();
+        salts1.insert("ctx-b".to_owned(), [0x01; 32]);
+
+        // Relationship 2: A↔B with salt_2 (pretend a different relationship
+        // path supplies a different salt; in reality a single A↔B interface
+        // has one salt, but the AC asserts ABSTRACT non-correlation across
+        // relationships). For this test we model it as two distinct
+        // hop_salts views.
+        let mut salts2 = HashMap::new();
+        salts2.insert("ctx-b".to_owned(), [0x02; 32]);
+
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: false,
+        };
+        let nonce = [0xEE; PAD_NONCE_LEN];
+
+        let view1 = OutletErrorWrapView {
+            observer_ctx: &observer,
+            member_of_context: &|c| members.contains(c),
+            hop_salts: &|c| salts1.get(c).copied(),
+            outer_caller_stems: stems,
+            inner_outlet_kind: Some(OutletKind::Query),
+            pad_nonce: nonce,
+            max_padded_trail_depth: 0, // no padding to isolate the per-pair test
+        };
+        let view2 = OutletErrorWrapView {
+            observer_ctx: &observer,
+            member_of_context: &|c| members.contains(c),
+            hop_salts: &|c| salts2.get(c).copied(),
+            outer_caller_stems: stems,
+            inner_outlet_kind: Some(OutletKind::Query),
+            pad_nonce: nonce,
+            max_padded_trail_depth: 0,
+        };
+
+        let prev1 = build_inner_authorization_error();
+        let prev2 = build_inner_authorization_error();
+        let w1 = wrap_cross_context_error(&"ctx-b".to_owned(), prev1, &view1);
+        let w2 = wrap_cross_context_error(&"ctx-b".to_owned(), prev2, &view2);
+
+        assert_ne!(
+            w1.source_chain[0].context_id, w2.source_chain[0].context_id,
+            "different per-pair salts produce different pseudonyms"
+        );
+        // Sanity: both are HMAC-shape.
+        assert_eq!(w1.source_chain[0].context_id.len(), 64);
+        assert_eq!(w2.source_chain[0].context_id.len(), 64);
+    }
+
+    // ============================================================
+    // AC-14 / AC-15 / AC-16 — query oracle collapse
+    // ============================================================
+
+    #[test]
+    fn ac14_no_stem_caller_receives_collapsed_authorization_denied_for_three_underlying_causes() {
+        // AC-14: caller with no stem receives SCP-TOOL-6110 'authorization.denied'
+        // for missing outlet, deregistered outlet, kind-mismatch — all three
+        // produce the same code+slug.
+        // AC-15: same as AC-14 with explicit per-cause inputs.
+
+        // We synthesize three "underlying causes" by emitting different inner
+        // errors. Each must collapse to authorization.denied for a no-stem
+        // caller.
+        let outlet_id: OutletId = "outlet-test".to_owned();
+        let causes: Vec<(&str, &str, OutletErrorClass, &str)> = vec![
+            (
+                "missing outlet",
+                "SCP-TOOL-6110",
+                OutletErrorClass::Authorization,
+                "authorization.denied",
+            ),
+            (
+                "deregistered",
+                "SCP-TOOL-6171",
+                OutletErrorClass::Governance,
+                "governance.outlet-deregistered",
+            ),
+            (
+                "kind-mismatch",
+                "SCP-TOOL-6103",
+                OutletErrorClass::Protocol,
+                "protocol.kind-mismatch",
+            ),
+        ];
+
+        let fix = NonMemberFixture::new();
+        let stems = OuterCallerStems {
+            holds_query: false,
+            holds_call: false,
+        };
+        let view = fix.view(stems, None, MAX_TRAIL_PAD_DEPTH);
+
+        for (label, code, class, slug) in causes {
+            // Need to add the slug to the registered catalog for this fixture.
+            let mut all_keys = registered();
+            for k in ["governance.outlet-deregistered", "protocol.kind-mismatch"] {
+                all_keys.push(CatalogKey::try_new(k).unwrap());
+            }
+            let inner = OutletError::new(
+                &outlet_id,
+                &fixed_outlet_message_key(),
+                fixed_registration_event_id(),
+                &CatalogKey::try_new(slug).unwrap(),
+                &all_keys,
+                class,
+                code,
+                slug,
+                RetryPolicy::Never,
+                None,
+                fixed_pad_nonce(),
+            )
+            .unwrap();
+
+            let wrapped = wrap_cross_context_error(&"ctx-b".to_owned(), inner, &view);
+            assert_eq!(
+                wrapped.code, COLLAPSED_AUTHORIZATION_DENIED_CODE,
+                "AC-14/15: no-stem caller sees collapsed code for {label}"
+            );
+            assert_eq!(
+                wrapped.slug, COLLAPSED_AUTHORIZATION_DENIED_SLUG,
+                "AC-14/15: no-stem caller sees collapsed slug for {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn ac16_caller_with_query_stem_receives_disambiguated_error() {
+        // AC-16: caller with outlet_query:{id} on a Query outlet that
+        // DOESN'T exist receives a more-specific error — disambiguation
+        // allowed when caller holds at least one matching stem.
+        let outlet_id: OutletId = "outlet-test".to_owned();
+        let mut all_keys = registered();
+        all_keys.push(CatalogKey::try_new("protocol.outlet-not-found").unwrap());
+        let inner = OutletError::new(
+            &outlet_id,
+            &fixed_outlet_message_key(),
+            fixed_registration_event_id(),
+            &CatalogKey::try_new("protocol.outlet-not-found").unwrap(),
+            &all_keys,
+            OutletErrorClass::Protocol,
+            "SCP-TOOL-6101",
+            "protocol.outlet-not-found",
+            RetryPolicy::Never,
+            None,
+            fixed_pad_nonce(),
+        )
+        .unwrap();
+        let original_code = inner.code.clone();
+        let original_slug = inner.slug.clone();
+
+        let fix = NonMemberFixture::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: false,
+        };
+        let view = fix.view(stems, Some(OutletKind::Query), 0);
+
+        let wrapped = wrap_cross_context_error(&"ctx-b".to_owned(), inner, &view);
+        assert_eq!(
+            wrapped.code, original_code,
+            "AC-16: stem-holder sees original code"
+        );
+        assert_eq!(
+            wrapped.slug, original_slug,
+            "AC-16: stem-holder sees original slug"
+        );
+    }
+
+    // ============================================================
+    // AC-17 — AmplificationViolation collapse
+    // ============================================================
+
+    #[test]
+    fn ac17_amplification_collapses_for_caller_holding_only_one_stem() {
+        // AC-17: caller holding only outlet_query:{id} (NOT outlet_call:{id})
+        // observing an amplification attempt receives 'authorization.denied';
+        // caller holding BOTH stems receives 'authorization.amplification-violation'.
+
+        let inner = build_inner_amplification_error();
+        let original_slug = inner.slug.clone();
+
+        // Caller with only outlet_query (no outlet_call): collapses.
+        let fix1 = NonMemberFixture::new();
+        let stems_query_only = OuterCallerStems {
+            holds_query: true,
+            holds_call: false,
+        };
+        let view_query_only = fix1.view(stems_query_only, Some(OutletKind::Action), 0);
+        let wrapped_q =
+            wrap_cross_context_error(&"ctx-b".to_owned(), inner.clone(), &view_query_only);
+        assert_eq!(
+            wrapped_q.slug, COLLAPSED_AUTHORIZATION_DENIED_SLUG,
+            "AC-17: query-only caller sees collapse"
+        );
+        assert_eq!(
+            wrapped_q.code, COLLAPSED_AUTHORIZATION_DENIED_CODE,
+            "AC-17: query-only caller sees collapsed code"
+        );
+
+        // Caller with BOTH stems: sees the disambiguated slug.
+        let fix2 = NonMemberFixture::new();
+        let stems_both = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let view_both = fix2.view(stems_both, Some(OutletKind::Action), 0);
+        let wrapped_b = wrap_cross_context_error(&"ctx-b".to_owned(), inner, &view_both);
+        assert_eq!(
+            wrapped_b.slug, original_slug,
+            "AC-17: both-stem caller sees disambiguated slug"
+        );
+    }
+
+    // ============================================================
+    // AC-18 — trail-length padding to max_padded_trail_depth
+    // ============================================================
+
+    #[test]
+    fn ac18_no_member_caller_observes_padded_trail_at_max_depth() {
+        // AC-18: caller with no membership observing a 3-hop chain (with
+        // max_padded_trail_depth = 8) receives source_chain of length 8;
+        // the last 5 entries are pad; every entry's hop_index equals its
+        // slot_index; the 3 real entries are still observable via
+        // HMAC(hop_salt, raw_context_id) at the membership-visible slots.
+        //
+        // Per the wrap contract, padding fires at the OUTERMOST observing
+        // layer (the one that actually projects to the consumer's view).
+        // Intermediate wraps use a permissive view (full-visibility, zero
+        // pad depth) so they only append the new ContextHop without
+        // padding/collapse. Final wrap at the consumer's layer applies the
+        // observer-specific projection.
+
+        // Permissive intermediate-wrap view used by the inner B/C layers —
+        // they are "members of everything" relative to themselves so they
+        // simply forward raw context_ids.
+        let intermediate_observer: ContextId = "ctx-passthrough".to_owned();
+        let mut intermediate_members = std::collections::HashSet::new();
+        intermediate_members.insert("ctx-c".to_owned());
+        intermediate_members.insert("ctx-b".to_owned());
+        intermediate_members.insert("ctx-a".to_owned());
+        intermediate_members.insert(intermediate_observer.clone());
+        let intermediate_salts: HashMap<String, [u8; 32]> = HashMap::new();
+        let intermediate_view = OutletErrorWrapView {
+            observer_ctx: &intermediate_observer,
+            member_of_context: &|c| intermediate_members.contains(c),
+            hop_salts: &|c| intermediate_salts.get(c).copied(),
+            outer_caller_stems: OuterCallerStems {
+                holds_query: true,
+                holds_call: true,
+            },
+            inner_outlet_kind: Some(OutletKind::Query),
+            pad_nonce: [0x00; PAD_NONCE_LEN], // unused — no padding at intermediate layers
+            max_padded_trail_depth: 0,
+        };
+
+        // Outermost no-member observer view — padding fires here.
+        let observer: ContextId = "ctx-observer".to_owned();
+        let mut members = std::collections::HashSet::new();
+        members.insert(observer.clone()); // observer member of own only
+        let mut salts = HashMap::new();
+        salts.insert("ctx-c".to_owned(), [0x01; 32]);
+        salts.insert("ctx-b".to_owned(), [0x02; 32]);
+        salts.insert("ctx-a".to_owned(), [0x03; 32]);
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let nonce = [0x77; PAD_NONCE_LEN];
+        let outer_view = OutletErrorWrapView {
+            observer_ctx: &observer,
+            member_of_context: &|c| members.contains(c),
+            hop_salts: &|c| salts.get(c).copied(),
+            outer_caller_stems: stems,
+            inner_outlet_kind: Some(OutletKind::Query),
+            pad_nonce: nonce,
+            max_padded_trail_depth: 8,
+        };
+
+        // Build a 3-hop chain via two intermediate wraps + one outer.
+        let inner = build_inner_authorization_error();
+        let after_c = wrap_cross_context_error(&"ctx-c".to_owned(), inner, &intermediate_view);
+        let after_b = wrap_cross_context_error(&"ctx-b".to_owned(), after_c, &intermediate_view);
+        // Final wrap at the consumer's layer — projects to observer's view
+        // and pads.
+        let after_a = wrap_cross_context_error(&"ctx-a".to_owned(), after_b, &outer_view);
+
+        // AC-18 length 8.
+        assert_eq!(
+            after_a.source_chain.len(),
+            8,
+            "AC-18: padded length = max_padded_trail_depth (8)"
+        );
+
+        // Every entry's hop_index == slot_index.
+        for (slot, hop) in after_a.source_chain.iter().enumerate() {
+            assert_eq!(
+                hop.hop_index as usize, slot,
+                "AC-18: hop_index == slot_index for slot {slot}"
+            );
+        }
+
+        // The 3 real entries are at slots 0..2; pads at slots 3..7.
+        // Real entries are pseudonymized via per-pair salts.
+        let real_slots = &after_a.source_chain[0..3];
+        let pad_slots = &after_a.source_chain[3..8];
+
+        // Verify pads are HMAC under pad_nonce.
+        for (slot, hop) in pad_slots.iter().enumerate() {
+            let real_slot_index = u16::try_from(slot + 3).expect("slot + 3 fits in u16");
+            let expected = pseudonym_to_string(derive_pad_context_id(&nonce, real_slot_index));
+            assert_eq!(
+                hop.context_id,
+                expected,
+                "AC-18: pad slot {} matches HMAC-derived id",
+                slot + 3
+            );
+            assert_eq!(hop.wrapped_code, COLLAPSED_AUTHORIZATION_DENIED_CODE);
+        }
+
+        // Verify real entries are NOT byte-equal to a pad-derived value at
+        // their slot (real uses hop_salt, pad uses pad_nonce).
+        for (slot, hop) in real_slots.iter().enumerate() {
+            let slot_u16 = u16::try_from(slot).expect("slot fits in u16");
+            let pad_at_slot = pseudonym_to_string(derive_pad_context_id(&nonce, slot_u16));
+            assert_ne!(
+                hop.context_id, pad_at_slot,
+                "AC-18: real slot {slot} not equal to pad derivation"
+            );
+        }
+    }
+
+    // ============================================================
+    // AC-19 — full-visibility unpadded
+    // ============================================================
+
+    #[test]
+    fn ac19_full_visibility_observes_unpadded_chain() {
+        // AC-19: caller with full visibility (membership on every hop AND
+        // matching stem on every hop target) observes the true k-length
+        // source_chain (no padding); max_padded_trail_depth is unused.
+        let fix = FullVisibilityFixture::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let view = fix.view(stems, Some(OutletKind::Query), 16);
+
+        let inner = build_inner_authorization_error();
+        let after_c = wrap_cross_context_error(&"ctx-c".to_owned(), inner, &view);
+        let after_b = wrap_cross_context_error(&"ctx-b".to_owned(), after_c, &view);
+        let after_a = wrap_cross_context_error(&"ctx-a".to_owned(), after_b, &view);
+        assert_eq!(
+            after_a.source_chain.len(),
+            3,
+            "AC-19: unpadded length = k = 3"
+        );
+    }
+
+    // ============================================================
+    // AC-20 — pad_nonce unconditional emission + round-trip
+    // ============================================================
+
+    #[test]
+    fn ac20_pad_nonce_round_trips_byte_identical() {
+        // AC-20: a full-visibility OutletError carries a 16-byte pad_nonce
+        // that round-trips byte-identical; presence of pad_nonce is NOT a
+        // signal that the observer lacks full visibility.
+        let fix = FullVisibilityFixture::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let nonce_value = [0xAB; PAD_NONCE_LEN];
+        let view = fix.view(stems, Some(OutletKind::Query), 8);
+        // `view` shadows `pad_nonce`; recreate with the AC-pinned value.
+        let view = OutletErrorWrapView {
+            pad_nonce: nonce_value,
+            ..view
+        };
+
+        let inner = build_inner_authorization_error();
+        let wrapped = wrap_cross_context_error(&"ctx-b".to_owned(), inner, &view);
+        // pad_nonce is on the envelope.
+        assert_eq!(wrapped.pad_nonce, nonce_value);
+        // Round-trip MessagePack and verify pad_nonce preserved.
+        let bytes = rmp_serde::to_vec_named(&wrapped).unwrap();
+        let back: OutletError = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(back.pad_nonce, nonce_value);
+        assert_eq!(back.pad_nonce.len(), PAD_NONCE_LEN);
+    }
+
+    #[test]
+    fn ac20_wire_layer_rejects_missing_pad_nonce_tag_11() {
+        // AC-20: wire-layer deserialization rejects an envelope whose
+        // tag-11 (pad_nonce) field is absent. This is enforced at the
+        // OutletError struct level (`#[serde(rename = "11", with =
+        // "serde_pad_nonce")]`); wrap_cross_context_error inherits the
+        // invariant by copying the field through verbatim.
+        let fix = FullVisibilityFixture::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let view = fix.view(stems, Some(OutletKind::Query), 0);
+        let inner = build_inner_authorization_error();
+        let wrapped = wrap_cross_context_error(&"ctx-b".to_owned(), inner, &view);
+
+        // Round-trip with tag 11 dropped: must fail.
+        let bytes = rmp_serde::to_vec_named(&wrapped).unwrap();
+        let value: rmpv::Value = rmp_serde::from_slice(&bytes).unwrap();
+        let pairs = match value {
+            rmpv::Value::Map(m) => m,
+            other => panic!("expected map, got {other:?}"),
+        };
+        let kept: Vec<(rmpv::Value, rmpv::Value)> = pairs
+            .into_iter()
+            .filter(|(k, _)| match k {
+                rmpv::Value::String(s) => s.as_str() != Some("11"),
+                _ => true,
+            })
+            .collect();
+        let truncated = rmp_serde::to_vec_named(&rmpv::Value::Map(kept)).unwrap();
+        let result: Result<OutletError, _> = rmp_serde::from_slice(&truncated);
+        assert!(
+            result.is_err(),
+            "AC-20: wire-layer rejection of missing tag-11"
+        );
+    }
+
+    // ============================================================
+    // AC-21 — pad entries DIFFER between independent streams
+    // ============================================================
+
+    #[test]
+    fn ac21_pad_entries_differ_across_independent_streams() {
+        // AC-21: pad-entry context_ids do not correlate across independent
+        // streams — two different streams produce different pad_nonce
+        // values; re-invoking the same outlet under the same interface
+        // twice produces different pad entries in each error's
+        // source_chain.
+        let observer: ContextId = "ctx-observer".to_owned();
+        let mut members = std::collections::HashSet::new();
+        members.insert(observer.clone());
+        let salts: HashMap<String, [u8; 32]> = HashMap::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+
+        let nonce_a = [0xAA; PAD_NONCE_LEN];
+        let nonce_b = [0xBB; PAD_NONCE_LEN];
+
+        let view_a = OutletErrorWrapView {
+            observer_ctx: &observer,
+            member_of_context: &|c| members.contains(c),
+            hop_salts: &|c| salts.get(c).copied(),
+            outer_caller_stems: stems,
+            inner_outlet_kind: Some(OutletKind::Query),
+            pad_nonce: nonce_a,
+            max_padded_trail_depth: 8,
+        };
+        let view_b = OutletErrorWrapView {
+            observer_ctx: &observer,
+            member_of_context: &|c| members.contains(c),
+            hop_salts: &|c| salts.get(c).copied(),
+            outer_caller_stems: stems,
+            inner_outlet_kind: Some(OutletKind::Query),
+            pad_nonce: nonce_b,
+            max_padded_trail_depth: 8,
+        };
+
+        let inner_a = build_inner_authorization_error();
+        let inner_b = build_inner_authorization_error();
+        let wrapped_a = wrap_cross_context_error(&"ctx-x".to_owned(), inner_a, &view_a);
+        let wrapped_b = wrap_cross_context_error(&"ctx-x".to_owned(), inner_b, &view_b);
+
+        assert_ne!(wrapped_a.pad_nonce, wrapped_b.pad_nonce);
+
+        // Pad entries (slots 1..7 — slot 0 is the real wrap) differ between
+        // the two streams.
+        let pads_a: Vec<&str> = wrapped_a.source_chain[1..]
+            .iter()
+            .map(|h| h.context_id.as_str())
+            .collect();
+        let pads_b: Vec<&str> = wrapped_b.source_chain[1..]
+            .iter()
+            .map(|h| h.context_id.as_str())
+            .collect();
+        assert_eq!(pads_a.len(), pads_b.len());
+        for (a, b) in pads_a.iter().zip(pads_b.iter()) {
+            assert_ne!(a, b, "pad entries DIFFER across streams");
+        }
+    }
+
+    // ============================================================
+    // AC-22 — partial-visibility honest disclosure documentation
+    // ============================================================
+
+    #[test]
+    fn ac22_rustdoc_mentions_partial_visibility_honest_disclosure() {
+        // AC-22: the rustdoc on wrap_cross_context_error states plainly
+        // that the pad hides k only from observers who hold no hop_salt.
+        // This is a structural test that the documentation surface mentions
+        // the round-5 honest-disclosure prose verbatim.
+        //
+        // Rust does not expose rustdoc to runtime, so we assert against a
+        // file-level grep proxy: read the source file at compile-time and
+        // verify the relevant phrases appear.
+        let source = include_str!("outlets.rs");
+        assert!(
+            source.contains("The pad continues to hide `k` from such an observer"),
+            "AC-22: rustdoc must contain spec round-5 honest-disclosure quote"
+        );
+        assert!(
+            source.contains("hide `k` only from observers who hold no `hop_salt`"),
+            "AC-22: rustdoc must mention partial-visibility scope"
+        );
+        assert!(
+            source.contains("re-HMAC-under-`pad_nonce` closure")
+                || source.contains("re-HMAC-under-pad_nonce"),
+            "AC-22: rustdoc must warn against the rejected re-HMAC closure"
+        );
+    }
+
+    // ============================================================
+    // AC-9 — cargo test --workspace succeeds (covered by the test
+    //        runner; this body is intentionally empty as the AC is
+    //        environmental).
+    // ============================================================
+
+    // ============================================================
+    // Bonus adversarial tests to satisfy the "8+ adversarial unit
+    // tests" highlight.
+    // ============================================================
+
+    #[test]
+    fn adversarial_collapse_does_not_change_pad_nonce() {
+        // A collapsed envelope still carries a fresh pad_nonce.
+        let fix = NonMemberFixture::new();
+        let stems = OuterCallerStems {
+            holds_query: false,
+            holds_call: false,
+        };
+        let view = fix.view(stems, None, 8);
+        let inner = build_inner_authorization_error();
+        let wrapped = wrap_cross_context_error(&"ctx-b".to_owned(), inner, &view);
+        assert_eq!(wrapped.pad_nonce, fix.nonce);
+    }
+
+    #[test]
+    fn adversarial_wrapped_message_field_is_32_bytes() {
+        // The HMAC `message` field is ALWAYS 32 bytes (preserved verbatim
+        // through wrapping).
+        let fix = FullVisibilityFixture::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let view = fix.view(stems, Some(OutletKind::Query), 0);
+        let inner = build_inner_authorization_error();
+        let wrapped = wrap_cross_context_error(&"ctx-b".to_owned(), inner, &view);
+        assert_eq!(wrapped.message.len(), WIRE_MESSAGE_LEN);
+        assert_eq!(wrapped.message.len(), 32);
+    }
+
+    #[test]
+    fn adversarial_max_padded_trail_depth_capped_at_protocol_constant() {
+        // A caller passing max_padded_trail_depth > MAX_TRAIL_PAD_DEPTH must
+        // be capped at MAX_TRAIL_PAD_DEPTH = 16.
+        let fix = NonMemberFixture::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let view = fix.view(stems, Some(OutletKind::Query), 200); // way over
+        let inner = build_inner_authorization_error();
+        let wrapped = wrap_cross_context_error(&"ctx-b".to_owned(), inner, &view);
+        assert!(
+            wrapped.source_chain.len() <= usize::from(MAX_TRAIL_PAD_DEPTH),
+            "padded length capped at MAX_TRAIL_PAD_DEPTH=16"
+        );
+    }
+
+    #[test]
+    fn adversarial_observer_ctx_never_pseudonymized() {
+        // The observer's own context id, if it ever appears as caller_ctx
+        // (e.g., the outermost wrap before consumption), is NEVER
+        // pseudonymized.
+        let observer: ContextId = "ctx-observer".to_owned();
+        let mut members = std::collections::HashSet::new();
+        members.insert(observer.clone());
+        let salts: HashMap<String, [u8; 32]> = HashMap::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let view = OutletErrorWrapView {
+            observer_ctx: &observer,
+            member_of_context: &|c| members.contains(c),
+            hop_salts: &|c| salts.get(c).copied(),
+            outer_caller_stems: stems,
+            inner_outlet_kind: Some(OutletKind::Query),
+            pad_nonce: [0x00; PAD_NONCE_LEN],
+            max_padded_trail_depth: 0,
+        };
+        let inner = build_inner_authorization_error();
+        let wrapped = wrap_cross_context_error(&observer, inner, &view);
+        assert_eq!(
+            wrapped.source_chain[0].context_id, observer,
+            "observer's own ctx never pseudonymized"
+        );
+    }
+
+    type HmacSha256ForTest = hmac::Hmac<sha2::Sha256>;
+
+    #[test]
+    fn adversarial_pad_entries_use_protocol_label_constant() {
+        // The pad-entry HMAC uses the registered SCP-OUTLET-HOP-PAD-V1:
+        // domain separator. Independently re-derive a pad slot and check
+        // byte-equality.
+        let nonce = [0xAA; PAD_NONCE_LEN];
+        let slot = 5u16;
+
+        // Re-derive via raw HMAC.
+        let mut mac = <HmacSha256ForTest as hmac::Mac>::new_from_slice(&nonce).unwrap();
+        mac.update(MAX_TRAIL_PAD_HMAC_LABEL);
+        mac.update(&slot.to_be_bytes());
+        let expected: [u8; 32] = mac.finalize().into_bytes()[..32].try_into().unwrap();
+
+        let actual = derive_pad_context_id(&nonce, slot);
+        assert_eq!(actual, expected, "pad derivation matches protocol label");
+        assert_eq!(MAX_TRAIL_PAD_HMAC_LABEL, b"SCP-OUTLET-HOP-PAD-V1:");
+    }
+
+    #[test]
+    fn adversarial_padded_chain_real_entries_at_first_k_slots() {
+        // Real entries occupy slot_indices 0..k-1; pad at k..max-1.
+        // Padding fires once at the outermost layer; intermediate wraps
+        // just append a real ContextHop without padding.
+        let observer: ContextId = "ctx-observer".to_owned();
+        let mut members = std::collections::HashSet::new();
+        members.insert(observer.clone());
+        let salts: HashMap<String, [u8; 32]> = HashMap::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        // Permissive intermediate view (no padding).
+        let intermediate_observer: ContextId = "ctx-passthrough".to_owned();
+        let mut intermediate_members = std::collections::HashSet::new();
+        intermediate_members.insert("ctx-b".to_owned());
+        intermediate_members.insert("ctx-a".to_owned());
+        intermediate_members.insert(intermediate_observer.clone());
+        let intermediate_salts: HashMap<String, [u8; 32]> = HashMap::new();
+        let intermediate_view = OutletErrorWrapView {
+            observer_ctx: &intermediate_observer,
+            member_of_context: &|c| intermediate_members.contains(c),
+            hop_salts: &|c| intermediate_salts.get(c).copied(),
+            outer_caller_stems: stems,
+            inner_outlet_kind: Some(OutletKind::Query),
+            pad_nonce: [0x00; PAD_NONCE_LEN],
+            max_padded_trail_depth: 0,
+        };
+        // Outer observing view (padding=8).
+        let outer_view = OutletErrorWrapView {
+            observer_ctx: &observer,
+            member_of_context: &|c| members.contains(c),
+            hop_salts: &|c| salts.get(c).copied(),
+            outer_caller_stems: stems,
+            inner_outlet_kind: Some(OutletKind::Query),
+            pad_nonce: [0x88; PAD_NONCE_LEN],
+            max_padded_trail_depth: 8,
+        };
+        let inner = build_inner_authorization_error();
+        let after_b = wrap_cross_context_error(&"ctx-b".to_owned(), inner, &intermediate_view);
+        let after_a = wrap_cross_context_error(&"ctx-a".to_owned(), after_b, &outer_view);
+        // k = 2 real entries; pads at slots 2..7.
+        assert_eq!(after_a.source_chain.len(), 8);
+        for (slot, hop) in after_a.source_chain.iter().enumerate() {
+            assert_eq!(hop.hop_index as usize, slot);
+        }
+    }
+
+    #[test]
+    fn adversarial_full_visibility_path_skips_padding_even_at_zero_depth() {
+        // A full-visibility caller with max_padded_trail_depth=0 still
+        // sees an unpadded chain — padding only fires for opaque hops.
+        let fix = FullVisibilityFixture::new();
+        let stems = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let view = fix.view(stems, Some(OutletKind::Query), 0);
+        let inner = build_inner_authorization_error();
+        let wrapped = wrap_cross_context_error(&"ctx-b".to_owned(), inner, &view);
+        assert_eq!(wrapped.source_chain.len(), 1);
+    }
+
+    #[test]
+    fn adversarial_per_hop_wrapped_code_collapses_for_no_visibility_caller() {
+        // Per §5.4.4 round-3, per-hop wrapped_code collapses to
+        // SCP-TOOL-6110 / authorization.denied for hops the no-stem caller
+        // cannot see. This test builds a multi-hop chain at full visibility
+        // then re-wraps under a no-stem view and verifies the trail's
+        // wrapped_codes collapse.
+        let fix_full = FullVisibilityFixture::new();
+        let stems_full = OuterCallerStems {
+            holds_query: true,
+            holds_call: true,
+        };
+        let view_full = fix_full.view(stems_full, Some(OutletKind::Query), 0);
+        let inner = build_inner_authorization_error();
+        let wrapped_at_c = wrap_cross_context_error(&"ctx-c".to_owned(), inner, &view_full);
+
+        // Now an observer with NO stems re-wraps at outer layer.
+        let fix_none = NonMemberFixture::new();
+        let stems_none = OuterCallerStems {
+            holds_query: false,
+            holds_call: false,
+        };
+        let view_none = fix_none.view(stems_none, None, 0);
+        let wrapped_at_b = wrap_cross_context_error(&"ctx-b".to_owned(), wrapped_at_c, &view_none);
+
+        // No-stem observer: outer code collapses + per-hop wrapped_codes
+        // collapse for inner hops.
+        assert_eq!(wrapped_at_b.code, COLLAPSED_AUTHORIZATION_DENIED_CODE);
+        for hop in &wrapped_at_b.source_chain {
+            assert_eq!(
+                hop.wrapped_code, COLLAPSED_AUTHORIZATION_DENIED_CODE,
+                "per-hop wrapped_code collapse for no-stem observer"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod amplification_tests {

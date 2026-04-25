@@ -42,6 +42,7 @@ aes = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
 serde_bytes = { workspace = true }
 serde_json = { workspace = true }
 serde_json_canonicalizer = { workspace = true }
