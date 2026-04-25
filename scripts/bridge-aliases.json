@@ -2042,7 +2042,7 @@
       ]
     },
     {
-      "canonical": "broadcast_unblock_subscriber",
+      "canonical": "broadcast_unblock",
       "category": "broadcast",
       "wasm_required": false,
       "pyo3": [
@@ -2216,7 +2216,7 @@
     },
     {
       "canonical": "evaluate_invitation",
-      "category": "context",
+      "category": "membership",
       "wasm_required": false,
       "pyo3": [
         "evaluate_invitation"
