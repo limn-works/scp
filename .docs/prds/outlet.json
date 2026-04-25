@@ -1050,9 +1050,10 @@
       "gate": "gate-classification",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
-        "crates/scp-runtime/src/context/manager/outlets.rs"
+        "crates/scp-runtime/src/context/manager/outlets.rs",
+        "crates/scp-runtime/src/context/manager/mod.rs"
       ],
       "description": "Implement \u00a76.2.0.3 (amplification rule) and \u00a76.2.0.4 (chain depth split). The cross-context invocation path carries an `origin_kind: OutletKind` that is propagated from the outermost caller. At each hop, the runtime checks: (a) `origin_kind != Query OR hop_kind == Query` \u2014 else reject with `OutletErrorClass::Authorization::AmplificationViolation`; (b) the kind-appropriate counter: Query uses `max_chain_depth`, Action uses `max(1, max_chain_depth / 2)`. The counter decrement happens on each cross-context hop. A failed check produces a structured rejection event in both event logs.",
       "acceptanceCriteria": [
