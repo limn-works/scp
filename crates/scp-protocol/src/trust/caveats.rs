@@ -43,9 +43,10 @@ use scp_primitives::DID;
 // Mint-time structural limits (§7.3.8 mint-limits table)
 // ---------------------------------------------------------------------------
 
-/// Maximum number of populated non-`origin_kind` caveats in a single
-/// `InvocationCaveats` record (§7.3.8 mint-limits table). `origin_kind` is a
-/// structural attenuation invariant and does NOT count against this cap.
+/// Maximum number of populated non-`origin_kind` caveats in a single record.
+///
+/// See §7.3.8 mint-limits table. `origin_kind` is a structural attenuation
+/// invariant and does NOT count against this cap.
 pub const MAX_POPULATED_CAVEATS: usize = 8;
 
 /// Maximum serialized size, in bytes, of the JSON Schema attached as
@@ -83,7 +84,7 @@ pub const CAVEAT_MINT_LIMIT_EXCEEDED_CODE: &str = "SCP-TOOL-6114";
 /// boundary.
 ///
 /// Serialization is transparent: the wire encoding is the inner `u32`, so
-/// MessagePack and JSON treat the mask exactly like a plain unsigned 32-bit
+/// `MessagePack` and JSON treat the mask exactly like a plain unsigned 32-bit
 /// integer. Round-trips through `from_bits` re-validate the width invariant.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
@@ -146,7 +147,7 @@ impl HoursOfDayMask {
 /// impossible across any SDK boundary.
 ///
 /// Serialization is transparent: the wire encoding is the inner `u8`, so
-/// MessagePack and JSON treat the mask exactly like a plain unsigned 8-bit
+/// `MessagePack` and JSON treat the mask exactly like a plain unsigned 8-bit
 /// integer. Round-trips through `from_bits` re-validate the width invariant.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
@@ -222,9 +223,9 @@ pub struct RateWindow {
 /// caveat surface is finite enough to fuzz to saturation.
 ///
 /// Field naming on the wire matches the §7.3.8 vocabulary verbatim. JSON,
-/// MessagePack, and JCS all use the same camelCase string keys (`amountMaxPerCall`,
+/// `MessagePack`, and JCS all use the same camelCase string keys (`amountMaxPerCall`,
 /// `validFrom`, etc.) so a UCAN library that emits the `nb` block as JSON for
-/// signing and as MessagePack for transport produces field-by-field identical
+/// signing and as `MessagePack` for transport produces field-by-field identical
 /// caveats.
 ///
 /// All fields are `Option`; `None` means "parent's setting applies"
@@ -342,7 +343,7 @@ impl InvocationCaveats {
     /// [`MAX_POPULATED_CAVEATS`] cap; `origin_kind` is exempt per §7.3.8
     /// mint-limits.
     #[must_use]
-    pub fn populated_non_origin_kind_count(&self) -> usize {
+    pub const fn populated_non_origin_kind_count(&self) -> usize {
         let mut count = 0;
         if self.amount_max_per_call.is_some() {
             count += 1;
@@ -406,32 +407,29 @@ impl InvocationCaveats {
             });
         }
 
-        if let Some(window) = &caveats.rate_window {
-            if window.window_secs == 0 || window.window_secs > MAX_RATE_WINDOW_SECS {
+        if let Some(window) = &caveats.rate_window
+            && (window.window_secs == 0 || window.window_secs > MAX_RATE_WINDOW_SECS) {
                 return Err(CaveatMintError::RateWindowSecsOutOfRange {
                     window_secs: window.window_secs,
                 });
             }
-        }
 
-        if let Some(adapters) = &caveats.allowed_adapters {
-            if adapters.len() > MAX_LIST_ENTRIES {
+        if let Some(adapters) = &caveats.allowed_adapters
+            && adapters.len() > MAX_LIST_ENTRIES {
                 return Err(CaveatMintError::ListTooLong {
                     field: "allowedAdapters",
                     len: adapters.len(),
                     cap: MAX_LIST_ENTRIES,
                 });
             }
-        }
-        if let Some(dids) = &caveats.allowed_target_dids {
-            if dids.len() > MAX_LIST_ENTRIES {
+        if let Some(dids) = &caveats.allowed_target_dids
+            && dids.len() > MAX_LIST_ENTRIES {
                 return Err(CaveatMintError::ListTooLong {
                     field: "allowedTargetDids",
                     len: dids.len(),
                     cap: MAX_LIST_ENTRIES,
                 });
             }
-        }
 
         if let Some(schema) = &caveats.input_schema {
             check_input_schema_size_and_depth(schema)?;
@@ -515,14 +513,13 @@ impl InvocationCaveats {
             None
         };
 
-        if let (Some(declared), Some(inferred)) = (caveats.origin_kind, inferred_kind) {
-            if declared != inferred {
+        if let (Some(declared), Some(inferred)) = (caveats.origin_kind, inferred_kind)
+            && declared != inferred {
                 return Err(CaveatMintError::OriginKindStemMismatch {
                     declared,
                     inferred,
                 });
             }
-        }
 
         // Run the structural mint check.
         Self::try_new(caveats)
@@ -533,7 +530,7 @@ impl InvocationCaveats {
     /// that observes the same logical caveats produces byte-identical
     /// canonical bytes.
     ///
-    /// MessagePack is the wire format for transport (`rmp_serde`); JCS is
+    /// `MessagePack` is the wire format for transport (`rmp_serde`); JCS is
     /// the format for hashing.
     ///
     /// # Errors
@@ -570,17 +567,15 @@ impl InvocationCaveats {
 /// Returns [`MaskWidthError::HoursOfDayHighBitsSet`] or
 /// [`MaskWidthError::DaysOfWeekHighBitSet`] if either mask carries bits
 /// outside its legal range.
-pub fn assert_mask_widths(caveats: &InvocationCaveats) -> Result<(), MaskWidthError> {
-    if let Some(mask) = caveats.hours_of_day {
-        if mask.bits() & !HoursOfDayMask::VALID_BITS != 0 {
+pub const fn assert_mask_widths(caveats: &InvocationCaveats) -> Result<(), MaskWidthError> {
+    if let Some(mask) = caveats.hours_of_day
+        && mask.bits() & !HoursOfDayMask::VALID_BITS != 0 {
             return Err(MaskWidthError::HoursOfDayHighBitsSet { bits: mask.bits() });
         }
-    }
-    if let Some(mask) = caveats.days_of_week {
-        if mask.bits() & !DaysOfWeekMask::VALID_BITS != 0 {
+    if let Some(mask) = caveats.days_of_week
+        && mask.bits() & !DaysOfWeekMask::VALID_BITS != 0 {
             return Err(MaskWidthError::DaysOfWeekHighBitSet { bits: mask.bits() });
         }
-    }
     Ok(())
 }
 
@@ -781,9 +776,11 @@ impl CaveatMintError {
     }
 }
 
-/// Errors returned by [`assert_mask_widths`]. Composed into both
-/// [`CaveatMintError`] (mint side) and [`AttenuationViolation`] (narrow side
-/// — SCP-OUT-019) so the two call sites share a single assertion helper.
+/// Errors returned by [`assert_mask_widths`].
+///
+/// Composed into both [`CaveatMintError`] (mint side) and
+/// [`AttenuationViolation`] (narrow side — SCP-OUT-019) so the two call sites
+/// share a single assertion helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum MaskWidthError {
     /// `hours_of_day` carries bits outside `0..=23`.
@@ -800,9 +797,10 @@ pub enum MaskWidthError {
     },
 }
 
-/// Errors returned by `narrow()` (SCP-OUT-019). This story (SCP-OUT-018)
-/// declares the variants only; the narrow-layer enforcement lives in
-/// SCP-OUT-019. The variants are surfaced here so the
+/// Errors returned by `narrow()` (SCP-OUT-019).
+///
+/// This story (SCP-OUT-018) declares the variants only; the narrow-layer
+/// enforcement lives in SCP-OUT-019. The variants are surfaced here so the
 /// [`assert_mask_widths`] helper and downstream callers can construct the
 /// `MaskWidth` variant from a [`MaskWidthError`].
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -854,6 +852,11 @@ pub enum CaveatSerError {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic
+)]
 mod tests {
     use super::*;
     use crate::context::roles::Capability;

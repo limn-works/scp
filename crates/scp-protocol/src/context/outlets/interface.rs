@@ -504,7 +504,7 @@ pub struct RevokeOutletInterface {
 ///      outlet-interface capabilities (`outlet:offer:*`, `outlet:query:*`,
 ///      `outlet:call:*`) at interface-acceptance time. Catches "rotate
 ///      creator+admin BUT keep a stable cross-context invoker" evasion. Sorted
-///      lexicographically at construction time so MessagePack round-trip is
+///      lexicographically at construction time so `MessagePack` round-trip is
 ///      deterministic across implementations.
 ///
 /// # Scope of this struct (SCP-OUT-042a)
@@ -586,7 +586,7 @@ pub struct InterfaceEstablished {
     /// evasion.
     ///
     /// **Ordering invariant.** Sorted lexicographically by DID string at
-    /// construction time so MessagePack round-trip yields deterministic
+    /// construction time so `MessagePack` round-trip yields deterministic
     /// bytes across implementations. Population is wired in OUT-042d.
     pub capability_holder_set: Vec<DID>,
 }
@@ -4012,29 +4012,29 @@ mod tests {
     fn ac1_interface_established_has_all_round5_round6_fields() {
         let evt = sample_interface_established();
 
-        // Bind every field by name into a type-annotated local — this is a
-        // mechanical check that AC#1's nine fields exist and carry the
+        // Bind every field by name into a type-annotated reference — this is
+        // a mechanical check that AC#1's nine fields exist and carry the
         // declared types. A type drift in any field fails compilation.
-        let _epoch_a: u64 = evt.epoch_a;
-        let _epoch_b: u64 = evt.epoch_b;
-        let _ikm_a: [u8; 32] = evt.ikm_a;
-        let _ikm_a_sig: Ed25519Signature = evt.ikm_a_sig.clone();
-        let _ikm_b: [u8; 32] = evt.ikm_b;
-        let _ikm_b_sig: Ed25519Signature = evt.ikm_b_sig.clone();
-        let _creator_did: DID = evt.creator_did.clone();
-        let _admin_set: Vec<DID> = evt.admin_set.clone();
-        let _capability_holder_set: Vec<DID> = evt.capability_holder_set.clone();
+        let _: &u64 = &evt.epoch_a;
+        let _: &u64 = &evt.epoch_b;
+        let _: &[u8; 32] = &evt.ikm_a;
+        let _: &Ed25519Signature = &evt.ikm_a_sig;
+        let _: &[u8; 32] = &evt.ikm_b;
+        let _: &Ed25519Signature = &evt.ikm_b_sig;
+        let _: &DID = &evt.creator_did;
+        let _: &Vec<DID> = &evt.admin_set;
+        let _: &Vec<DID> = &evt.capability_holder_set;
 
         // Sanity-check the original (pre-OUT-042a) fields are still intact —
         // the schema commit must not regress the earlier surface.
-        let _interface_id: [u8; 32] = evt.interface_id;
-        let _source_context: ContextId = evt.source_context.clone();
-        let _target_context: ContextId = evt.target_context.clone();
-        let _outlet_id: OutletId = evt.outlet_id.clone();
-        let _established_at: u64 = evt.established_at;
+        let _: &[u8; 32] = &evt.interface_id;
+        let _: &ContextId = &evt.source_context;
+        let _: &ContextId = &evt.target_context;
+        let _: &OutletId = &evt.outlet_id;
+        let _: &u64 = &evt.established_at;
     }
 
-    /// AC#2: MessagePack round-trip preserves every field byte-for-byte.
+    /// AC#2: `MessagePack` round-trip preserves every field byte-for-byte.
     #[test]
     fn ac2_interface_established_messagepack_roundtrip_byte_identical() {
         let original = sample_interface_established();
@@ -4125,7 +4125,7 @@ mod tests {
     }
 
     /// AC#5: `capability_holder_set` is sorted lexicographically by DID string
-    /// at construction time so MessagePack round-trip yields deterministic
+    /// at construction time so `MessagePack` round-trip yields deterministic
     /// bytes regardless of insertion order.
     #[test]
     fn ac5_capability_holder_set_sorted_yields_deterministic_bytes() {
