@@ -739,4 +739,61 @@ pub trait ContextCryptoProvider: Send + Sync {
             "join_from_welcome not supported".into(),
         ))
     }
+
+    // -- Outlet interface IKM commitment hooks (§6.2.0.1, SCP-OUT-042b) -----
+
+    /// Returns the current MLS group epoch counter for the given context.
+    ///
+    /// Used by the outlet-interface accept-time IKM commitment construction
+    /// (§6.2.0.1 step 4): the persisted `epoch_a` / `epoch_b` field on
+    /// `InterfaceEstablished` is read from this method at accept time.
+    ///
+    /// The default implementation returns
+    /// [`ContextError::CryptoFailed`] so non-MLS providers do not silently
+    /// report a fabricated epoch. Production providers backed by an MLS
+    /// group MUST override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] when the provider is not
+    /// MLS-backed or the group state has been destroyed.
+    fn current_mls_epoch_for_context(&self, _context_id: &[u8; 32]) -> Result<u64, ContextError> {
+        Err(ContextError::CryptoFailed(
+            "current_mls_epoch_for_context not supported by this provider".into(),
+        ))
+    }
+
+    /// Runs the MLS exporter (RFC 9420 §8) on the current group epoch with
+    /// the supplied label and context, returning `length` bytes of
+    /// application-specific keying material.
+    ///
+    /// Used by the outlet-interface accept-time IKM commitment construction
+    /// (§6.2.0.1 step 1) — each side derives
+    /// `MLS_EXPORTER("scp-context-hop-salt-v1:" || peer_context_id, b"", 32)`
+    /// at acceptance and persists the result verbatim into
+    /// `InterfaceEstablished.ikm_a` / `.ikm_b`.
+    ///
+    /// The returned bytes are wrapped in [`Zeroizing`] so the keying material
+    /// is zeroed on drop in error paths.
+    ///
+    /// The default implementation returns
+    /// [`ContextError::CryptoFailed`]. Production providers backed by an
+    /// MLS group MUST override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::CryptoFailed`] when the provider is not
+    /// MLS-backed, the group state has been destroyed, or the exporter call
+    /// fails.
+    fn export_secret_for_context(
+        &self,
+        _context_id: &[u8; 32],
+        _label: &[u8],
+        _context: &[u8],
+        _length: usize,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, ContextError> {
+        Err(ContextError::CryptoFailed(
+            "export_secret_for_context not supported by this provider".into(),
+        ))
+    }
 }

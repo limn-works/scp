@@ -68,6 +68,7 @@ use zeroize::Zeroizing;
 mod broadcast;
 mod economy;
 mod governance;
+mod interface;
 mod lifecycle;
 mod messaging;
 mod outlets;

@@ -31,6 +31,7 @@ pub mod app_sandbox;
 pub mod builder;
 pub mod export_import;
 pub mod governance;
+pub mod interface;
 pub mod manager;
 pub mod policy;
 pub mod providers;

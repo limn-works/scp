@@ -1764,6 +1764,72 @@ impl ContextCryptoProvider for MlsCryptoProvider {
 
         Ok(())
     }
+
+    // -- Outlet interface IKM commitment hooks (§6.2.0.1, SCP-OUT-042b) -----
+
+    fn current_mls_epoch_for_context(&self, context_id: &[u8; 32]) -> Result<u64, ContextError> {
+        let contexts = self
+            .contexts
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        let state = contexts.get(context_id).ok_or_else(|| {
+            ContextError::CryptoFailed(format!(
+                "no MLS group registered for context {}",
+                hex::encode(context_id)
+            ))
+        })?;
+        state
+            .mls_group
+            .epoch()
+            .map_err(|e| ContextError::CryptoFailed(format!("MLS epoch unavailable: {e}")))
+    }
+
+    fn export_secret_for_context(
+        &self,
+        context_id: &[u8; 32],
+        label: &[u8],
+        context: &[u8],
+        length: usize,
+    ) -> Result<Zeroizing<Vec<u8>>, ContextError> {
+        // RFC 9420 §8 caps the exporter output at u16::MAX bytes; reject
+        // oversize requests at the boundary so the OpenMLS call cannot panic
+        // on `length as u16` truncation.
+        if length > u16::MAX as usize {
+            return Err(ContextError::CryptoFailed(format!(
+                "MLS exporter length {length} exceeds u16::MAX"
+            )));
+        }
+        let contexts = self
+            .contexts
+            .lock()
+            .map_err(|e| ContextError::CryptoFailed(format!("lock poisoned: {e}")))?;
+        let state = contexts.get(context_id).ok_or_else(|| {
+            ContextError::CryptoFailed(format!(
+                "no MLS group registered for context {}",
+                hex::encode(context_id)
+            ))
+        })?;
+        let group = state
+            .mls_group
+            .group
+            .as_ref()
+            .ok_or_else(|| ContextError::CryptoFailed("MLS group destroyed".to_string()))?;
+        // RFC 9420 §8 — MLS exporter on the current epoch's exporter secret.
+        // Domain separation is supplied by the caller via `label`; the
+        // §6.2.0.1 invariant requires `label` to be peer-context-suffixed.
+        let label_str = std::str::from_utf8(label).map_err(|e| {
+            ContextError::CryptoFailed(format!("MLS exporter label not UTF-8: {e}"))
+        })?;
+        let bytes = group
+            .export_secret(
+                state.mls_group.provider.crypto(),
+                label_str,
+                context,
+                length,
+            )
+            .map_err(|e| ContextError::CryptoFailed(format!("MLS exporter failed: {e}")))?;
+        Ok(Zeroizing::new(bytes))
+    }
 }
 
 #[cfg(test)]
