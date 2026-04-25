@@ -929,11 +929,14 @@
       "gate": "gate-classification",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/outlets/invoke.rs",
-        "crates/scp-runtime/src/context/providers/mod.rs",
-        "crates/scp-runtime/src/context/manager/outlets.rs"
+        "crates/scp-runtime/src/context/manager/outlets.rs",
+        "crates/scp-runtime/src/context/manager/tests/messaging.rs",
+        "crates/scp-protocol/src/context/outlets/mod.rs",
+        "crates/scp-protocol/src/context/outlets/registry.rs",
+        "crates/scp-protocol/src/lib.rs"
       ],
       "description": "Introduce a `ReadOnlyInvocation` handle type that executors receive in place of the normal mutable-context handle when the outlet is `Query`. The handle denies writes to: messages, roles, registry (outlet/bridge/role), event log, governance proposals/votes, economic ledgers, and the caveat counter store. Any attempt by the executor to mutate returns `OutletErrorClass::Protocol::QueryViolation` from the handle method itself (no panic, no silent corruption). Deny-list is explicit: the handle exposes read methods only; the write methods exist on a separate handle type that only `Action` invocations see.",
       "acceptanceCriteria": [
