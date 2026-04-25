@@ -273,6 +273,9 @@ pub async fn outlet_register(
 
     let core_registration = scp_core::context::tools::OutletRegistration {
         outlet_id,
+        // SCP-OUT-011: default to fail-safe Action (§5.4.2) until kind
+        // plumbing extends to NAPI (downstream story).
+        kind: scp_core::context::outlets::OutletKind::default(),
         name: definition.name,
         description: definition.description,
         schema: scp_core::context::tools::OutletSchema {
@@ -1231,6 +1234,8 @@ fn build_outlet_registration_from_napi(
 
     Ok(scp_core::context::tools::OutletRegistration {
         outlet_id,
+        // SCP-OUT-011: default to fail-safe Action (§5.4.2).
+        kind: scp_core::context::outlets::OutletKind::default(),
         name: definition.name,
         description: definition.description,
         schema: scp_core::context::tools::OutletSchema {

@@ -1373,6 +1373,7 @@ mod tests {
         let action = GovernanceAction::RegisterOutlet {
             registration: Box::new(OutletRegistration {
                 outlet_id: "test-tool".to_owned(),
+                kind: scp_protocol::context::outlets::OutletKind::Action,
                 name: "tool-{inject}".to_owned(),
                 description: "a tool".to_owned(),
                 schema: OutletSchema {
@@ -1399,6 +1400,7 @@ mod tests {
         let action = GovernanceAction::RegisterOutlet {
             registration: Box::new(OutletRegistration {
                 outlet_id: "test-tool".to_owned(),
+                kind: scp_protocol::context::outlets::OutletKind::Action,
                 name: "my-tool".to_owned(),
                 description: "a <script>alert(1)</script> tool".to_owned(),
                 schema: OutletSchema {

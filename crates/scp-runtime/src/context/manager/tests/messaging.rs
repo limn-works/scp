@@ -2483,6 +2483,7 @@ fn strict_output_tool_registration(id: &str) -> OutletRegistration {
     use scp_protocol::context::outlets::registry::{OutletSchema, OutletTestVector};
     OutletRegistration {
         outlet_id: id.to_owned(),
+        kind: scp_protocol::context::outlets::OutletKind::Action,
         name: id.to_owned(),
         description: "strict-output test tool".to_owned(),
         schema: OutletSchema {

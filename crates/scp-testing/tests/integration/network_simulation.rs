@@ -1290,6 +1290,7 @@ async fn application_layer_demo() {
 
     let search_tool = OutletRegistration {
         outlet_id: "search-web".to_owned(),
+        kind: scp_core::context::outlets::OutletKind::Action,
         name: "Web Search".to_owned(),
         description: "Search the web for information".to_owned(),
         schema: OutletSchema {
@@ -1341,6 +1342,7 @@ async fn application_layer_demo() {
     // Register a second tool.
     let calc_tool = OutletRegistration {
         outlet_id: "calculator".to_owned(),
+        kind: scp_core::context::outlets::OutletKind::Action,
         name: "Calculator".to_owned(),
         description: "Perform arithmetic operations".to_owned(),
         schema: OutletSchema {

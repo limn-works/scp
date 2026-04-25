@@ -287,6 +287,7 @@ fn build_tools(tools: &[String]) -> Vec<OutletRegistration> {
         .iter()
         .map(|name| OutletRegistration {
             outlet_id: name.clone(),
+            kind: scp_core::context::outlets::OutletKind::default(),
             name: name.clone(),
             description: String::new(),
             schema: scp_core::context::tools::OutletSchema {

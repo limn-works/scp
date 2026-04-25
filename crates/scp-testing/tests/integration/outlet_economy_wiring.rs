@@ -262,6 +262,7 @@ fn priced_policy(per_outlet_call: u64) -> EconomicPolicy {
 fn echo_outlet() -> OutletRegistration {
     OutletRegistration {
         outlet_id: "echo".to_owned(),
+        kind: scp_core::context::outlets::OutletKind::Action,
         name: "echo".to_owned(),
         description: "echo outlet for C4 wiring test".to_owned(),
         schema: OutletSchema {

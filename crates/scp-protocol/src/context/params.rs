@@ -1038,6 +1038,7 @@ mod tests {
             ],
             tools: vec![OutletRegistration {
                 outlet_id: "recipe-search".to_owned(),
+                kind: crate::context::outlets::OutletKind::Action,
                 name: "recipe-search".to_owned(),
                 description: "Search for recipes".to_owned(),
                 schema: OutletSchema {
@@ -1105,6 +1106,7 @@ mod tests {
     fn outlet_registration_clone_eq() {
         let tool = OutletRegistration {
             outlet_id: "search".to_owned(),
+            kind: crate::context::outlets::OutletKind::Action,
             name: "search".to_owned(),
             description: "Search tool".to_owned(),
             schema: OutletSchema {

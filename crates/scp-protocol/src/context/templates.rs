@@ -1606,6 +1606,7 @@ mod tests {
         params.ttl = Some(Duration::from_mins(5));
         params.tools = vec![super::super::outlets::OutletRegistration {
             outlet_id: "rogue-tool".to_owned(),
+            kind: super::super::outlets::OutletKind::Action,
             name: "rogue-tool".to_owned(),
             description: "Rogue tool for testing".to_owned(),
             schema: super::super::outlets::OutletSchema {

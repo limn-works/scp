@@ -1208,6 +1208,7 @@ mod tests {
         let mut registry = OutletRegistry::new();
         let registration = OutletRegistration {
             outlet_id: "calculator".to_owned(),
+            kind: scp_protocol::context::outlets::OutletKind::Action,
             name: "Calculator".to_owned(),
             description: "A simple calculator".to_owned(),
             schema: OutletSchema {

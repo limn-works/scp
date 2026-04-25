@@ -3988,6 +3988,9 @@ pub async fn outlet_register(
 
             let core_registration = scp_core::context::tools::OutletRegistration {
                 outlet_id: outlet_id.clone(),
+                // SCP-OUT-011: default to fail-safe Action (§5.4.2) until
+                // kind plumbing extends to UniFFI (downstream story).
+                kind: scp_core::context::outlets::OutletKind::default(),
                 name: definition.name,
                 description: definition.description,
                 schema: scp_core::context::tools::OutletSchema {
@@ -5144,6 +5147,8 @@ fn build_outlet_registration_from_uniffi(
 
     Ok(scp_core::context::tools::OutletRegistration {
         outlet_id,
+        // SCP-OUT-011: default to fail-safe Action (§5.4.2).
+        kind: scp_core::context::outlets::OutletKind::default(),
         name: definition.name,
         description: definition.description,
         schema: scp_core::context::tools::OutletSchema {

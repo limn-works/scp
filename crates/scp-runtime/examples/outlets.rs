@@ -7,6 +7,7 @@
 //!   `cargo run -p scp-runtime --features testing --example outlets`
 
 use scp_identity::DID;
+use scp_protocol::context::outlets::OutletKind;
 use scp_protocol::context::outlets::lifecycle::OutletStatus;
 use scp_protocol::context::outlets::registry::{
     OutletRegistration, OutletRegistry, OutletSchema, register_outlet,
@@ -44,6 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut registry = OutletRegistry::new();
     let registration = OutletRegistration {
         outlet_id: "calculator".to_owned(),
+        kind: OutletKind::Action,
         name: "Calculator".to_owned(),
         description: "A simple arithmetic calculator".to_owned(),
         schema: OutletSchema {

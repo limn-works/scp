@@ -1816,6 +1816,7 @@ pub(super) fn test_outlet_registration(id: &str) -> OutletRegistration {
     use scp_protocol::context::outlets::registry::{OutletSchema, OutletTestVector};
     OutletRegistration {
         outlet_id: id.to_owned(),
+        kind: scp_protocol::context::outlets::OutletKind::Action,
         name: id.to_owned(),
         description: "test tool".to_owned(),
         schema: OutletSchema {

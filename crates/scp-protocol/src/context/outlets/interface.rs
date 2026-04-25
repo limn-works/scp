@@ -1217,6 +1217,7 @@ mod tests {
         let mut registry = OutletRegistry::new();
         let registration = OutletRegistration {
             outlet_id: "calculator".to_owned(),
+            kind: crate::context::outlets::OutletKind::Action,
             name: "Calculator".to_owned(),
             description: "A simple calculator".to_owned(),
             schema: OutletSchema {
@@ -2327,6 +2328,7 @@ mod tests {
             target_context: "ctx-b".to_owned(),
             outlet_schema: OutletRegistration {
                 outlet_id: "t".to_owned(),
+                kind: crate::context::outlets::OutletKind::Action,
                 name: "T".to_owned(),
                 description: "test".to_owned(),
                 schema: OutletSchema {

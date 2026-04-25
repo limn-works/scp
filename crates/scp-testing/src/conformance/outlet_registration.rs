@@ -44,6 +44,7 @@ use scp_core::context::outlets::registry::{
     OutletCost, OutletRegistration, OutletSchema, OutletTestVector,
     compute_outlet_registration_canonical_bytes, verify_outlet_registration_signature,
 };
+use scp_core::context::outlets::OutletKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -139,15 +140,17 @@ pub fn reference_signing_key() -> SigningKey {
 /// 11. registration-targeting-multi-caveat-ucan-invocation,
 /// 12. registration-targeting-cross-context-invocation.
 ///
-/// The current `OutletRegistration` struct does not yet carry the `kind`,
-/// `aggregate_schema`, or `message_catalog` fields specified in §5.4.1 — those
-/// land with SCP-OUT-011 / SCP-OUT-013 / SCP-OUT-024 / SCP-OUT-015. The
-/// vectors here are signed under the transitional V2 preimage produced by
-/// `compute_outlet_registration_canonical_bytes` (placeholder
-/// `kind_byte = 0x01` per SCP-OUT-002). The semantic distinctions ("Query"
-/// vs "Action", presence of aggregate_schema, etc.) are encoded in
-/// `description`, `name`, and `outlet_id` so independent implementers can
-/// regenerate against the in-tree preimage byte-for-byte.
+/// As of SCP-OUT-011 the `OutletRegistration` struct carries an explicit
+/// `kind: OutletKind` field; vectors 1, 3, and 4 declare `OutletKind::Query`
+/// and the remaining nine declare `OutletKind::Action` (matching their
+/// descriptions). The §5.4.1 `kind_byte` (0x00 Query, 0x01 Action) is now
+/// driven by the field rather than the SCP-OUT-002 placeholder.
+///
+/// The `aggregate_schema` and `message_catalog` fields specified in §5.4.1
+/// still land with SCP-OUT-013 / SCP-OUT-024 / SCP-OUT-015. Their semantic
+/// distinctions remain encoded in `description`, `name`, and `outlet_id`
+/// here so independent implementers can regenerate against the in-tree
+/// preimage byte-for-byte.
 #[must_use]
 pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
     let mut out = Vec::with_capacity(12);
@@ -158,6 +161,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
         "Read-only outlet (Query semantics). cost = None. Smallest valid registration.".to_owned(),
         OutletRegistration {
             outlet_id: "minimal-query-outlet".to_owned(),
+            kind: OutletKind::Query,
             name: "Minimal Query".to_owned(),
             description: "Smallest valid Query outlet — no cost, two-field schema.".to_owned(),
             schema: OutletSchema {
@@ -179,6 +183,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
         "Mutating outlet (Action semantics, the fail-safe default). cost = None.".to_owned(),
         OutletRegistration {
             outlet_id: "minimal-action-outlet".to_owned(),
+            kind: OutletKind::Action,
             name: "Minimal Action".to_owned(),
             description: "Smallest valid Action outlet — no cost, two-field schema.".to_owned(),
             schema: OutletSchema {
@@ -200,6 +205,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
         "Query outlet with explicit cost=None — exercises the absent-cost preimage branch (0x00 sentinel).".to_owned(),
         OutletRegistration {
             outlet_id: "query-cost-none-outlet".to_owned(),
+            kind: OutletKind::Query,
             name: "Query Without Cost".to_owned(),
             description: "Query outlet, cost field omitted (None). Free read-only access.".to_owned(),
             schema: OutletSchema {
@@ -221,6 +227,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
         "Query outlet with explicit OutletCost { amount: 0 } — cost present but zero. §5.4.2 Query structural floor.".to_owned(),
         OutletRegistration {
             outlet_id: "query-cost-zero-outlet".to_owned(),
+            kind: OutletKind::Query,
             name: "Query With Zero Cost".to_owned(),
             description: "Query outlet, cost present with amount=0. Demonstrates the cost-present-but-zero preimage path.".to_owned(),
             schema: OutletSchema {
@@ -247,6 +254,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
         "Action outlet with cost.amount > 0. Exercises the cost-present-positive preimage path including currency + payee fields.".to_owned(),
         OutletRegistration {
             outlet_id: "action-cost-positive-outlet".to_owned(),
+            kind: OutletKind::Action,
             name: "Action With Positive Cost".to_owned(),
             description: "Paid Action outlet — cost amount=12345 USD, payee = operator DID.".to_owned(),
             schema: OutletSchema {
@@ -276,6 +284,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
         "Registration whose output_schema declares an `aggregate` sub-object describing the streamed-aggregate shape (§5.4.5). The dedicated `aggregate_schema` field is added by SCP-OUT-013/024; this vector uses the current output_schema slot as its forward-compatible representation.".to_owned(),
         OutletRegistration {
             outlet_id: "aggregate-schema-outlet".to_owned(),
+            kind: OutletKind::Action,
             name: "Outlet With Aggregate Output Schema".to_owned(),
             description: "Outlet that streams chunks plus an aggregate value. The output_schema describes both per-chunk and aggregate shapes.".to_owned(),
             schema: OutletSchema {
@@ -307,6 +316,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
         "Registration with input schema that approaches the 64 KiB serialized cap (§5.4.1). Stress-tests preimage byte concatenation across large variable-length fields.".to_owned(),
         OutletRegistration {
             outlet_id: "max-size-schema-outlet".to_owned(),
+            kind: OutletKind::Action,
             name: "Outlet With Maximum-Size Schema".to_owned(),
             description: "Stress vector for large schemas approaching the 64 KiB serialized boundary.".to_owned(),
             schema: OutletSchema {
@@ -343,6 +353,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
         "Registration carrying the §5.4.1 maximum-supported test vector count (100 entries). Exercises the test-vector iteration path in the canonical preimage construction.".to_owned(),
         OutletRegistration {
             outlet_id: "hundred-vectors-outlet".to_owned(),
+            kind: OutletKind::Action,
             name: "Outlet With 100 Test Vectors".to_owned(),
             description: "Outlet carrying the maximum-supported number of registration test vectors.".to_owned(),
             schema: OutletSchema {
@@ -371,6 +382,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
         "Registration whose implementation_hash is computed per §5.4.1 LLM-backed rule (SHA-256(model_id || \":\" || system_prompt_utf8)).".to_owned(),
         OutletRegistration {
             outlet_id: "llm-outlet".to_owned(),
+            kind: OutletKind::Action,
             name: "LLM-Backed Outlet".to_owned(),
             description: "Outlet backed by a hosted LLM (model gpt-4-turbo, fixed system prompt).".to_owned(),
             schema: OutletSchema {
@@ -398,6 +410,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
         "Registration whose implementation_hash is computed per §5.4.1 remote-service rule (SHA-256(canonical_jcs(openapi_spec))). Includes a cost_formula for dynamic pricing (§19.4).".to_owned(),
         OutletRegistration {
             outlet_id: "remote-service-outlet".to_owned(),
+            kind: OutletKind::Action,
             name: "Remote-Service Outlet".to_owned(),
             description: "Outlet backed by an external HTTP API; impl hash covers the canonical OpenAPI spec.".to_owned(),
             schema: OutletSchema {
@@ -425,6 +438,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
         "Registration intended for invocation under a UCAN with multiple caveats (§7.3.8 InvocationCaveats — amount_max_per_call, valid_until, allowed_adapters, etc.). The vector exercises a representative paid-Action shape against which a multi-caveat token would be minted.".to_owned(),
         OutletRegistration {
             outlet_id: "multi-caveat-outlet".to_owned(),
+            kind: OutletKind::Action,
             name: "Multi-Caveat-Compatible Action".to_owned(),
             description: "Action outlet whose registered shape is compatible with multi-caveat UCAN invocation (amount_max_per_call + valid_until + allowed_adapters).".to_owned(),
             schema: OutletSchema {
@@ -460,6 +474,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
         "Registration intended for cross-context invocation through a §6.2.0.1 InterfaceOffer. Description signals the cross-context nature; preimage shape is the same as any Action outlet.".to_owned(),
         OutletRegistration {
             outlet_id: "cross-context-outlet".to_owned(),
+            kind: OutletKind::Action,
             name: "Cross-Context Action".to_owned(),
             description: "Action outlet exposed via cross-context interface (§6.2.0.1). Operator DID accountable across the bridged peer context.".to_owned(),
             schema: OutletSchema {
@@ -492,9 +507,10 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
 /// The byte sequence is the SHA-256 input that hashes to the canonical
 /// V2 outlet-registration digest. This function mirrors
 /// `compute_outlet_registration_canonical_bytes` byte-for-byte for the
-/// transitional V2 layout (§5.4.1 with placeholder kind_byte 0x01 per
-/// SCP-OUT-002). Independent implementers regenerate this and check
-/// equality.
+/// transitional V2 layout (§5.4.1, §5.4.2). As of SCP-OUT-011 the
+/// `kind_byte` is sourced from `reg.kind` (`0x00` Query, `0x01` Action) —
+/// the SCP-OUT-002 placeholder is removed. Independent implementers
+/// regenerate this and check equality.
 #[must_use]
 pub fn compute_v2_preimage(reg: &OutletRegistration) -> Vec<u8> {
     let mut buf = Vec::new();
@@ -507,7 +523,8 @@ pub fn compute_v2_preimage(reg: &OutletRegistration) -> Vec<u8> {
     };
 
     length_prefix(&mut buf, reg.outlet_id.as_bytes());
-    buf.push(0x01_u8); // placeholder kind_byte (SCP-OUT-002; SCP-OUT-011 wires real kind)
+    // §5.4.1 kind_byte sourced from reg.kind (SCP-OUT-011).
+    buf.push(reg.kind.canonical_byte());
     length_prefix(&mut buf, reg.name.as_bytes());
     length_prefix(&mut buf, reg.description.as_bytes());
 
@@ -707,6 +724,14 @@ fn serialize_registration_for_json(reg: &OutletRegistration) -> Value {
 
     let mut m = serde_json::Map::new();
     m.insert("outlet_id".to_owned(), Value::from(reg.outlet_id.clone()));
+    // SCP-OUT-011: explicit kind in vector input payloads.
+    m.insert(
+        "kind".to_owned(),
+        Value::from(match reg.kind {
+            OutletKind::Query => "query",
+            OutletKind::Action => "action",
+        }),
+    );
     m.insert("name".to_owned(), Value::from(reg.name.clone()));
     m.insert(
         "description".to_owned(),
@@ -749,6 +774,18 @@ pub fn registration_from_json_input(
         .and_then(Value::as_str)
         .ok_or_else(|| "missing outlet_id".to_owned())?
         .to_owned();
+    // SCP-OUT-011: read explicit kind. Absent field falls back to the
+    // §5.4.2 fail-safe default (Action) so legacy fixture inputs still
+    // round-trip.
+    let kind = match obj.get("kind") {
+        None | Some(Value::Null) => OutletKind::default(),
+        Some(Value::String(s)) => match s.as_str() {
+            "query" => OutletKind::Query,
+            "action" => OutletKind::Action,
+            other => return Err(format!("invalid kind: {other:?} (expected 'query' or 'action')")),
+        },
+        Some(other) => return Err(format!("kind must be string, got {other}")),
+    };
     let name = obj
         .get("name")
         .and_then(Value::as_str)
@@ -856,6 +893,7 @@ pub fn registration_from_json_input(
 
     Ok(OutletRegistration {
         outlet_id,
+        kind,
         name,
         description,
         schema: OutletSchema {

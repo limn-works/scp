@@ -2395,6 +2395,7 @@ mod tests {
             crate::runtime::with_context(&ctx_id, |rt| {
                 let registration = scp_core::context::tools::OutletRegistration {
                     outlet_id: "calculator".to_owned(),
+                    kind: scp_core::context::outlets::OutletKind::Action,
                     name: "Calculator".to_owned(),
                     description: "A simple calculator".to_owned(),
                     schema: scp_core::context::tools::OutletSchema {

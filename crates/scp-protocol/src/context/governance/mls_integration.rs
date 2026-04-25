@@ -609,6 +609,7 @@ mod tests {
         let action = GovernanceAction::RegisterOutlet {
             registration: Box::new(OutletRegistration {
                 outlet_id: "search".to_owned(),
+                kind: crate::context::outlets::OutletKind::Action,
                 name: "search".to_owned(),
                 description: "Search tool".to_owned(),
                 schema: crate::context::outlets::OutletSchema {

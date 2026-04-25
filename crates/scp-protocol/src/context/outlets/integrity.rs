@@ -351,6 +351,7 @@ mod tests {
         let mut registry = OutletRegistry::new();
         let reg = OutletRegistration {
             outlet_id: outlet_id.to_owned(),
+            kind: crate::context::outlets::OutletKind::Action,
             name: format!("Test Tool {outlet_id}"),
             description: "A test tool".to_owned(),
             schema: OutletSchema {

@@ -338,6 +338,7 @@ async fn phase2_end_to_end_integration() {
         ],
         tools: vec![OutletRegistration {
             outlet_id: "calculator".to_owned(),
+            kind: scp_protocol::context::outlets::OutletKind::Action,
             name: "calculator".to_owned(),
             description: "Calculator tool".to_owned(),
             schema: OutletSchema {
@@ -381,6 +382,7 @@ async fn phase2_end_to_end_integration() {
     let mut outlet_registry = OutletRegistry::new();
     let calc_registration = OutletRegistration {
         outlet_id: "calculator".to_owned(),
+        kind: scp_protocol::context::outlets::OutletKind::Action,
         name: "Calculator".to_owned(),
         description: "A simple arithmetic calculator".to_owned(),
         schema: OutletSchema {

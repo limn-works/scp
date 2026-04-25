@@ -955,6 +955,7 @@ async fn register_outlet_rejected_without_ceiling_capability() {
 
     let reg = scp_protocol::context::params::OutletRegistration {
         outlet_id: "test".to_owned(),
+        kind: scp_protocol::context::outlets::OutletKind::Action,
         name: "test".to_owned(),
         description: "test".to_owned(),
         schema: OutletSchema {
@@ -999,6 +1000,7 @@ async fn register_outlet_succeeds_with_ceiling_capability() {
 
     let reg = scp_protocol::context::params::OutletRegistration {
         outlet_id: "test".to_owned(),
+        kind: scp_protocol::context::outlets::OutletKind::Action,
         name: "test".to_owned(),
         description: "test".to_owned(),
         schema: OutletSchema {
@@ -7979,6 +7981,7 @@ async fn test_outlet_call_setup(
     let mut registry = scp_protocol::context::outlets::registry::OutletRegistry::new();
     let registration = OutletRegistration {
         outlet_id: "calculator".to_owned(),
+        kind: scp_protocol::context::outlets::OutletKind::Action,
         name: "Calculator".to_owned(),
         description: "A simple calculator".to_owned(),
         schema: OutletSchema {

@@ -357,6 +357,9 @@ pub fn py_outlet_register(context_id: &str, registration: &Bound<'_, PyDict>) ->
     // Build the scp-core OutletRegistration.
     let core_registration = scp_core::context::tools::OutletRegistration {
         outlet_id,
+        // SCP-OUT-011: bridge constructs default to fail-safe Action per
+        // §5.4.2 until kind plumbing extends to PyO3 (downstream story).
+        kind: scp_core::context::outlets::OutletKind::default(),
         name,
         description,
         schema: scp_core::context::tools::OutletSchema {
@@ -1590,6 +1593,9 @@ fn build_outlet_registration_from_py(
 
     Ok(scp_core::context::tools::OutletRegistration {
         outlet_id,
+        // SCP-OUT-011: default to fail-safe Action (§5.4.2) until kind
+        // plumbing extends to PyO3 (downstream story).
+        kind: scp_core::context::outlets::OutletKind::default(),
         name,
         description,
         schema: scp_core::context::tools::OutletSchema {

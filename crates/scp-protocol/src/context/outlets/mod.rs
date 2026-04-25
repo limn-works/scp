@@ -62,6 +62,70 @@ pub use registry::{
 pub use schema::{SchemaValidationError, validate_schema, validate_value_against_schema};
 
 // ---------------------------------------------------------------------------
+// OutletKind
+// ---------------------------------------------------------------------------
+
+/// Structural classification of an outlet (spec §5.4.2).
+///
+/// Every outlet declares its semantic class at registration time. The
+/// classification is structural, not advisory — the runtime enforces it.
+///
+/// - [`OutletKind::Query`] — read-only, idempotent, semantically cacheable
+///   (§5.4.2 cache property; §5.4.3 cache deferred). A Query outlet MUST
+///   declare either no cost or `cost.amount == 0` and MUST NOT carry a
+///   `cost_formula`. Invocation runs through a `ReadOnlyInvocation` handle
+///   that denies writes to context state. UCAN stem: `outlet_query:{id}`.
+/// - [`OutletKind::Action`] — may mutate context state. No structural cost
+///   floor. Invocation runs through a `MutableInvocation` handle. UCAN stem:
+///   `outlet_call:{id}`.
+///
+/// **Default.** [`OutletKind::Action`] is the fail-safe default per §5.4.2 —
+/// an undeclared kind cannot accidentally be treated as read-only. Wire
+/// deserialization that omits the `kind` field produces `Action` for the
+/// same reason.
+///
+/// **Wire form.** Serializes as the lowercase string `"query"` or `"action"`
+/// (§5.4.2 wire vocabulary). The struct field on
+/// [`registry::OutletRegistration`] is named `kind`, so the on-wire
+/// representation is `"kind": "query"` or `"kind": "action"`.
+///
+/// **Canonical preimage.** The §5.4.1 `SCP-OUTLET-REGISTRATION-V2:` preimage
+/// includes a fixed-width `kind_byte` between `outlet_id` and `name`:
+/// `0x00` for Query, `0x01` for Action.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Default,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum OutletKind {
+    /// Read-only, idempotent, cacheable. `ReadOnlyInvocation` guard applies
+    /// (§5.4.2). UCAN stem: `outlet_query:{id}`.
+    Query,
+    /// May mutate context state. Never cached (§5.4.2). UCAN stem:
+    /// `outlet_call:{id}`. Fail-safe default.
+    #[default]
+    Action,
+}
+
+impl OutletKind {
+    /// Returns the canonical 1-byte preimage tag for this kind per §5.4.1.
+    ///
+    /// - `OutletKind::Query` → `0x00`
+    /// - `OutletKind::Action` → `0x01`
+    ///
+    /// The byte is included verbatim in the
+    /// `SCP-OUTLET-REGISTRATION-V2:` canonical preimage between `outlet_id`
+    /// and `name`. Adding new variants in the future requires extending the
+    /// preimage rule and bumping the domain separator.
+    #[must_use]
+    pub const fn canonical_byte(self) -> u8 {
+        match self {
+            Self::Query => 0x00,
+            Self::Action => 0x01,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // OutletId
 // ---------------------------------------------------------------------------
 

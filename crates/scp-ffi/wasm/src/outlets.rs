@@ -413,6 +413,9 @@ pub fn outlet_register(context: &WasmContextHandle, definition_json: String) -> 
 
         let registration = runtime::OutletRegistration {
             outlet_id: outlet_id.clone(),
+            // SCP-OUT-011: default to fail-safe Action (§5.4.2) until kind
+            // plumbing extends to WASM (downstream story).
+            kind: scp_protocol::context::outlets::OutletKind::default(),
             name,
             description,
             schema: runtime::OutletSchema {
@@ -630,6 +633,8 @@ fn build_outlet_registration_from_json(
 
     Ok(runtime::OutletRegistration {
         outlet_id,
+        // SCP-OUT-011: default to fail-safe Action (§5.4.2).
+        kind: scp_protocol::context::outlets::OutletKind::default(),
         name,
         description,
         schema: runtime::OutletSchema {

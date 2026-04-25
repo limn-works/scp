@@ -116,6 +116,7 @@ fn simple_economic_policy() -> EconomicPolicy {
 fn simple_tool_registration() -> scp_core::context::params::OutletRegistration {
     scp_core::context::params::OutletRegistration {
         outlet_id: "search".to_owned(),
+        kind: scp_core::context::outlets::OutletKind::Action,
         name: "search".to_owned(),
         description: "Search tool".to_owned(),
         schema: OutletSchema {

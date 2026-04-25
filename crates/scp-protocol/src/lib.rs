@@ -39,7 +39,7 @@ pub use context::outlets::registry::{
 };
 pub use context::outlets::{
     OutletCancel, OutletError, OutletErrorCode, OutletExecutionError, OutletInvokedEvent,
-    OutletRegisteredEvent, OutletRequest, OutletResponse, OutletStatus, OutletUpdatedEvent,
-    OutletVerifiedEvent,
+    OutletKind, OutletRegisteredEvent, OutletRequest, OutletResponse, OutletStatus,
+    OutletUpdatedEvent, OutletVerifiedEvent,
 };
 pub use context::roles::OutletId;

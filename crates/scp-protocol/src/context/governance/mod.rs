@@ -2108,6 +2108,7 @@ mod tests {
             GovernanceAction::RegisterOutlet {
                 registration: Box::new(OutletRegistration {
                     outlet_id: "search".to_owned(),
+                    kind: crate::context::outlets::OutletKind::Action,
                     name: "search".to_owned(),
                     description: "Search tool".to_owned(),
                     schema: crate::context::outlets::OutletSchema {
@@ -2672,6 +2673,7 @@ mod tests {
             GovernanceAction::RegisterOutlet {
                 registration: Box::new(OutletRegistration {
                     outlet_id: "calc".to_owned(),
+                    kind: crate::context::outlets::OutletKind::Action,
                     name: "calc".to_owned(),
                     description: "Calculator tool".to_owned(),
                     schema: crate::context::outlets::OutletSchema {

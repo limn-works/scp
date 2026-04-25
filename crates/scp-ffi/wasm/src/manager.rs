@@ -3690,6 +3690,8 @@ impl WasmContextManager {
         let registered_at = crate::time::now_secs();
         let reg = OutletRegistration {
             outlet_id: outlet_id.to_owned(),
+            // SCP-OUT-011: default to fail-safe Action (§5.4.2).
+            kind: scp_protocol::context::outlets::OutletKind::default(),
             name: name.to_owned(),
             description: description.to_owned(),
             schema: crate::runtime::OutletSchema {
