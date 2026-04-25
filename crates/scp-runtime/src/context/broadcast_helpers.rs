@@ -667,13 +667,8 @@ pub async fn handle_broadcast_key_request(
     // Defense-in-depth: verify the local SDK controls the author DID.
     // Transport-layer auth (section 9.16.6) is the primary gate; this prevents
     // misuse if the method is ever called from a different context.
-    if !supervisor
-        .local_dids_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-        .read()
-        .await
-        .contains(author_did)
-    {
+    // Lock-free read (ADR-049 §Decision 12).
+    if !supervisor.local_dids_ref().load().contains(author_did) {
         return Err(ContextError::PermissionDenied(format!(
             "author DID is not controlled by the local node: {author_did}"
         )));

@@ -203,9 +203,7 @@ pub async fn import_context(
     let event_log = supervisor
         .event_log_ref()
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let next_generation = supervisor
-        .next_generation_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
+    let next_generation = supervisor.next_generation_ref();
     // 1. Validate export.
     crate::context::export_import::validate_export_for_import(&export)?;
     // C3: Validate consequence rules on import. Uses
@@ -622,9 +620,7 @@ pub async fn create_context(
     let key_resolver = supervisor
         .key_resolver_ref()
         .ok_or_else(|| ContextCreationError::CreationFailed(ATTACHED_EXPECT.to_owned()))?;
-    let next_generation = supervisor
-        .next_generation_ref()
-        .ok_or_else(|| ContextCreationError::CreationFailed(ATTACHED_EXPECT.to_owned()))?;
+    let next_generation = supervisor.next_generation_ref();
     // Defense-in-depth: verify creator's SDK version satisfies min_protocol_version.
     params.check_version_compatibility(scp_protocol::envelope::SCP_PROTOCOL_VERSION)?;
     manager::validate_governance_model(&params.governance)?;
@@ -1859,13 +1855,7 @@ pub async fn spawn_ttl_timer(
         );
         return;
     };
-    let Some(contexts_ref_arc) = supervisor.contexts_arc() else {
-        tracing::error!(
-            context_id,
-            "spawn_ttl_timer: Supervisor contexts map not initialized — skipping"
-        );
-        return;
-    };
+    let contexts_ref_arc = supervisor.contexts_arc();
     let Some(task_set_arc) = supervisor.task_set_ref() else {
         tracing::error!(
             context_id,

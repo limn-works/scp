@@ -935,13 +935,8 @@ pub async fn deliver_incoming(
     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
     // Phase 1: state check + read local member DID + access key.
-    // Read local_dids FIRST (RwLock read, low contention) to avoid
-    // nested lock ordering issues with the contexts Mutex.
-    let local_dids = supervisor
-        .local_dids_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-        .read()
-        .await;
+    // Lock-free read of local_dids (ADR-049 §Decision 12).
+    let local_dids = supervisor.local_dids_ref().load_full();
     let (local_member_did, access_key) = {
         let ctx_arc = manager_methods::get_context_arc_pub(supervisor, context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;

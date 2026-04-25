@@ -154,12 +154,14 @@ pub async fn standing_context(
                 // Step 2: Active or still being set up -- return immediately.
                 Some(ContextState::Active | ContextState::Creating) => {
                     drop(ctx);
-                    let mut standing = supervisor
+                    // ArcSwap+write_lock pattern (ADR-049 §Decision 12).
+                    let _guard = supervisor.write_lock.lock().await;
+                    let snapshot = supervisor.standing_contexts_ref().load_full();
+                    let mut updated: std::collections::HashMap<String, DID> = (*snapshot).clone();
+                    updated.insert(peer_did.to_string(), peer_did.clone());
+                    supervisor
                         .standing_contexts_ref()
-                        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-                        .lock()
-                        .await;
-                    standing.insert(peer_did.to_string(), peer_did.clone());
+                        .store(std::sync::Arc::new(updated));
                     return Ok(context_id);
                 }
                 // Step 4: Peer has left, context ended, or the handle's
@@ -220,13 +222,16 @@ pub async fn standing_context(
         }
     }
 
-    // Re-acquire lock to track the standing context.
-    let mut standing = supervisor
-        .standing_contexts_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-        .lock()
-        .await;
-    standing.insert(peer_did.to_string(), peer_did.clone());
+    // Track the standing context (ArcSwap+write_lock, ADR-049 §Decision 12).
+    {
+        let _guard = supervisor.write_lock.lock().await;
+        let snapshot = supervisor.standing_contexts_ref().load_full();
+        let mut updated: std::collections::HashMap<String, DID> = (*snapshot).clone();
+        updated.insert(peer_did.to_string(), peer_did.clone());
+        supervisor
+            .standing_contexts_ref()
+            .store(std::sync::Arc::new(updated));
+    }
 
     Ok(context_id)
 }
@@ -240,13 +245,8 @@ pub async fn standing_context(
 /// Hoisted body of the legacy
 /// [`ContextManager::standing_context_count`](crate::context::manager::ContextManager::standing_context_count).
 pub async fn standing_context_count(supervisor: &Supervisor) -> usize {
-    // ADR-049 commit 12c.9g.2 — returns `usize` so an unpopulated attach
-    // slot degrades to a safe zero. Defense-in-depth against a contract
-    // violation.
-    let Some(standing) = supervisor.standing_contexts_ref() else {
-        return 0;
-    };
-    standing.lock().await.len()
+    // Lock-free read (ADR-049 §Decision 12).
+    supervisor.standing_contexts_ref().load().len()
 }
 
 // ---------------------------------------------------------------------------
@@ -258,13 +258,11 @@ pub async fn standing_context_count(supervisor: &Supervisor) -> usize {
 /// Hoisted body of the legacy
 /// [`ContextManager::has_standing_context`](crate::context::manager::ContextManager::has_standing_context).
 pub async fn has_standing_context(supervisor: &Supervisor, peer_did: &DID) -> bool {
-    // ADR-049 commit 12c.9g.2 — returns `bool` so an unpopulated attach
-    // slot degrades to `false`. Defense-in-depth against a contract
-    // violation.
-    let Some(standing) = supervisor.standing_contexts_ref() else {
-        return false;
-    };
-    standing.lock().await.contains_key(peer_did.as_ref())
+    // Lock-free read (ADR-049 §Decision 12).
+    supervisor
+        .standing_contexts_ref()
+        .load()
+        .contains_key(peer_did.as_ref())
 }
 
 // ---------------------------------------------------------------------------
@@ -280,17 +278,14 @@ pub async fn has_standing_context(supervisor: &Supervisor, peer_did: &DID) -> bo
 /// Hoisted body of the legacy
 /// [`ContextManager::register_standing_context`](crate::context::manager::ContextManager::register_standing_context).
 pub async fn register_standing_context(supervisor: &Supervisor, peer_did: DID) {
-    // ADR-049 commit 12c.9g.2 — returns `()` so an unpopulated attach
-    // slot degrades to a no-op with a tracing error for observability.
-    let Some(standing) = supervisor.standing_contexts_ref() else {
-        tracing::error!(
-            peer_did = %peer_did,
-            "register_standing_context: Supervisor is not attached — skipping registration \
-             (contract violation; see ADR-049 commit 12c.9d)"
-        );
-        return;
-    };
-    standing.lock().await.insert(peer_did.to_string(), peer_did);
+    // ArcSwap+write_lock pattern (ADR-049 §Decision 12).
+    let _guard = supervisor.write_lock.lock().await;
+    let snapshot = supervisor.standing_contexts_ref().load_full();
+    let mut updated: std::collections::HashMap<String, DID> = (*snapshot).clone();
+    updated.insert(peer_did.to_string(), peer_did);
+    supervisor
+        .standing_contexts_ref()
+        .store(std::sync::Arc::new(updated));
 }
 
 // ---------------------------------------------------------------------------
@@ -324,28 +319,20 @@ pub async fn reconnect_all_standing(supervisor: &Supervisor) -> Result<usize, Co
     // otherwise occur: standing_context() acquires per-context Mutex
     // then standing_contexts, so reconnect_all_standing must NOT hold
     // standing_contexts while acquiring per-context Mutexes.
-    let standing_entries: Vec<(String, scp_identity::DID)> = {
-        let standing = supervisor
-            .standing_contexts_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-            .lock()
-            .await;
-        standing
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    };
-    // standing_contexts lock DROPPED.
+    // Lock-free reads (ADR-049 §Decision 12).
+    let standing_entries: Vec<(String, scp_identity::DID)> = supervisor
+        .standing_contexts_ref()
+        .load()
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
-    let local_did_list: Vec<scp_identity::DID> = {
-        let local_dids = supervisor
-            .local_dids_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-            .read()
-            .await;
-        local_dids.iter().cloned().collect()
-    };
-    // local_dids lock DROPPED.
+    let local_did_list: Vec<scp_identity::DID> = supervisor
+        .local_dids_ref()
+        .load()
+        .iter()
+        .cloned()
+        .collect();
 
     // Phase 1b: Resolve context IDs and clone handles under individual
     // per-context Mutexes only (no standing_contexts or local_dids held).
@@ -398,20 +385,17 @@ pub async fn reconnect_all_standing(supervisor: &Supervisor) -> Result<usize, Co
     // Collecting into a HashSet avoids holding the RwLock across the
     // standing_contexts lock acquisition.
     if !terminal_context_ids.is_empty() {
+        // Lock-free read of local_dids (ADR-049 §Decision 12).
         let local_did_set: std::collections::HashSet<DID> = supervisor
             .local_dids_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-            .read()
-            .await
+            .load()
             .iter()
             .cloned()
             .collect();
-        let mut standing = supervisor
-            .standing_contexts_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-            .lock()
-            .await;
-        let to_remove: Vec<String> = standing
+        // ArcSwap+write_lock for the standing_contexts mutation.
+        let _guard = supervisor.write_lock.lock().await;
+        let snapshot = supervisor.standing_contexts_ref().load_full();
+        let to_remove: Vec<String> = snapshot
             .iter()
             .filter(|(_key, peer_did)| {
                 local_did_set.iter().any(|local_did| {
@@ -421,8 +405,14 @@ pub async fn reconnect_all_standing(supervisor: &Supervisor) -> Result<usize, Co
             })
             .map(|(key, _)| key.clone())
             .collect();
-        for key in &to_remove {
-            standing.remove(key);
+        if !to_remove.is_empty() {
+            let mut updated: std::collections::HashMap<String, DID> = (*snapshot).clone();
+            for key in &to_remove {
+                updated.remove(key);
+            }
+            supervisor
+                .standing_contexts_ref()
+                .store(std::sync::Arc::new(updated));
         }
     }
 

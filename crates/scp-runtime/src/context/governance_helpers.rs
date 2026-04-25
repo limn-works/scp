@@ -5297,13 +5297,7 @@ pub async fn start_governance_timeout_task(supervisor: &Supervisor, context_id: 
         collect_active_voters, process_pending_proposals, update_detection_state,
     };
 
-    let Some(contexts_arc) = supervisor.contexts_ref().map(Arc::clone) else {
-        tracing::error!(
-            context_id,
-            "start_governance_timeout_task: Supervisor is not attached — skipping"
-        );
-        return;
-    };
+    let contexts_arc = supervisor.contexts_arc();
     let Some(clock_arc) = supervisor.clock_ref().map(Arc::clone) else {
         return;
     };

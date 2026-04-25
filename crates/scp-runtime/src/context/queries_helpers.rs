@@ -149,14 +149,16 @@ const MAX_RETAINED_CHECKPOINTS: usize = 100;
 /// [`ContextManager::register_local_did`](crate::context::manager::ContextManager::register_local_did)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn register_local_did(supervisor: &Supervisor, did: DID) {
-    let Some(local_dids) = supervisor.local_dids_ref() else {
-        tracing::error!(
-            did = %did,
-            "register_local_did: Supervisor is not attached — skipping registration"
-        );
-        return;
-    };
-    local_dids.write().await.insert(did);
+    // ArcSwap+write_lock pattern (ADR-049 §Decision 12). Reads are
+    // lock-free; writes serialize on the supervisor write_lock to
+    // avoid lost updates against the cloned snapshot.
+    let _guard = supervisor.write_lock.lock().await;
+    let snapshot = supervisor.local_dids_ref().load_full();
+    let mut updated: std::collections::HashSet<DID> = (*snapshot).clone();
+    updated.insert(did);
+    supervisor
+        .local_dids_ref()
+        .store(std::sync::Arc::new(updated));
 }
 
 /// Returns `true` if the given DID is registered as locally controlled.
@@ -165,10 +167,8 @@ pub async fn register_local_did(supervisor: &Supervisor, did: DID) {
 /// [`ContextManager::is_local_did`](crate::context::manager::ContextManager::is_local_did)
 /// (ADR-049 commit 12c.5). Byte-identical behavior.
 pub async fn is_local_did(supervisor: &Supervisor, did: &DID) -> bool {
-    let Some(local_dids) = supervisor.local_dids_ref() else {
-        return false;
-    };
-    local_dids.read().await.contains(did)
+    // Lock-free read (ADR-049 §Decision 12).
+    supervisor.local_dids_ref().load().contains(did)
 }
 
 // ===========================================================================
@@ -216,11 +216,9 @@ pub async fn get_broadcast_key_for_local_author(
     context_id: &str,
     author_did: &str,
 ) -> Result<(Zeroizing<[u8; 32]>, u64), ContextError> {
-    let local_dids = supervisor
-        .local_dids_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    // Verify the DID is locally controlled.
-    if !local_dids.read().await.contains(author_did) {
+    // Verify the DID is locally controlled (lock-free read, ADR-049
+    // §Decision 12).
+    if !supervisor.local_dids_ref().load().contains(author_did) {
         return Err(ContextError::PermissionDenied(format!(
             "author DID is not controlled by the local node: {author_did}"
         )));

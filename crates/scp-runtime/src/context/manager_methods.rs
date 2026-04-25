@@ -186,10 +186,8 @@ pub fn get_context_arc(
     supervisor: &Supervisor,
     context_id: &str,
 ) -> Result<Arc<Mutex<PerContextState>>, ContextError> {
-    let contexts = supervisor
+    supervisor
         .contexts_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    contexts
         .get(context_id)
         .map(|entry| Arc::clone(entry.value()))
         .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))
@@ -244,13 +242,8 @@ pub fn insert_context(
     mut state: PerContextState,
 ) -> Result<(), ContextCreationError> {
     use dashmap::mapref::entry::Entry;
-    let mgr = supervisor
-        .attached_context_manager()
-        .ok_or_else(|| ContextCreationError::CreationFailed(ATTACHED_EXPECT.to_owned()))?;
-    let contexts = supervisor
-        .contexts_ref()
-        .ok_or_else(|| ContextCreationError::CreationFailed(ATTACHED_EXPECT.to_owned()))?;
-    let generation = mgr
+    let contexts = supervisor.contexts_ref();
+    let generation = supervisor
         .next_generation_ref()
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     state.generation = generation;
@@ -281,8 +274,7 @@ pub fn remove_context(
     supervisor: &Supervisor,
     context_id: &str,
 ) -> Option<Arc<Mutex<PerContextState>>> {
-    let contexts = supervisor.contexts_ref()?;
-    contexts.remove(context_id).map(|(_, v)| v)
+    supervisor.contexts_ref().remove(context_id).map(|(_, v)| v)
 }
 
 // ---------------------------------------------------------------------------
@@ -322,9 +314,7 @@ pub fn has_persistence(supervisor: &Supervisor) -> bool {
 /// Best-effort: if no metrics recorder is installed, these are no-ops
 /// (#1467). On a detached supervisor, both gauges are skipped.
 pub fn update_context_gauges(supervisor: &Supervisor) {
-    let Some(contexts) = supervisor.contexts_ref() else {
-        return;
-    };
+    let contexts = supervisor.contexts_ref();
     crate::metrics::set_active_contexts(contexts.len());
     // Collect Arcs first to release DashMap shard locks.
     let arcs: Vec<(String, Arc<Mutex<PerContextState>>)> = contexts

@@ -395,9 +395,7 @@ pub async fn recovery_notify_contact(
     payload: &[u8],
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<(), ContextError> {
-    let contexts = supervisor
-        .contexts_arc()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
+    let contexts = supervisor.contexts_arc();
     // Find a context where both the recovering DID and the contact DID
     // are members. The first matching context is used for delivery.
     // Collect (key, Arc) pairs first to release DashMap shard locks before
