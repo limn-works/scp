@@ -11,6 +11,7 @@
 //! home of these types.
 
 // Public re-exports (cross-crate visible).
+#[allow(unused_imports)] // surfaces the cross-crate type names; deletion of manager/ in agent 4 makes this authoritative
 pub use crate::context::manager::{
     CommitFaultMarker, CommitOperation, ContextSnapshot, GovernanceActionResult,
     MAX_COMMIT_AGE_SECS, MAX_COMMIT_RETRIES, MAX_PENDING_COMMITS, MigrationProposedResult,
@@ -20,6 +21,7 @@ pub use crate::context::manager::{
 };
 
 // Crate-internal re-exports (used by helpers + supervisor).
+#[allow(unused_imports)] // ditto for crate-internal items
 pub(crate) use crate::context::manager::{
     COMMIT_RETRY_BACKOFFS, ContentKeysRotatedResult, ContextGeneration, EXECUTED_PROPOSALS_TTL_SECS,
     GovernanceReconfiguredResult, PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement,
