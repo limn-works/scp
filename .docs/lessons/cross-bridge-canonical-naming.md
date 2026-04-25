@@ -36,3 +36,15 @@ The PreToolUse hook on `scripts/bridge-aliases.json` blocks the `Edit` tool beca
 **Workaround used in PR #1702:** `dangerouslyDisableSandbox` to proceed with ADD-only edits. This is acceptable for matrix expansion that strictly grows coverage, never for edits that remove or weaken existing entries.
 
 **Better long-term fix:** refine the hook to allow ADD-only diffs to `bridge-aliases.json` (new top-level keys, new alias entries within existing keys) and continue blocking removal or modification of existing entries. Until then, document the bypass clearly in PR descriptions so reviewers can verify the diff is additive.
+
+## Lockstep enforcement: matrix and ratchet must move together
+
+The `aliases_json_is_in_sync_with_parity_operations` test in `crates/scp-testing/tests/integration/ffi_conformance.rs` asserts that the set of operations marked `wasm_required:true` in `scripts/bridge-aliases.json` is exactly equal to the `WASM_REQUIRED_OPERATIONS` constant in the Rust ratchet. The two artifacts encode the same fact in different syntaxes, and the test fails compilation/run if they diverge by even one op.
+
+The common failure mode this catches: a contributor edits the JSON matrix to flip `wasm_required` from `false` to `true` (because WASM has the function and exemption is no longer warranted) but forgets to update the Rust `WASM_REQUIRED_OPERATIONS` array — or vice versa. Either direction leaves the matrix and the ratchet describing different realities, which silently weakens enforcement.
+
+**Rule:** Any PR that promotes (or demotes) a `wasm_required` entry must edit *both* files atomically in the same commit:
+1. `scripts/bridge-aliases.json` — flip `"wasm_required": true` on the entry.
+2. `crates/scp-testing/tests/integration/ffi_conformance.rs` — add the op name to `WASM_REQUIRED_OPERATIONS`.
+
+PR #1703 (Batch 2 of #1543) promoted 33 ops in lockstep this way, validating the pattern. The test gives a sharp diff on mismatch, so the workflow is mechanical: edit one, run the test, edit the other until green. Treat the JSON and the constant as a single logical artifact split across two files for tooling reasons — never edit one without the other.
