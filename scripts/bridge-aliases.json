@@ -1768,6 +1768,536 @@
       "wasm": [
         "context_add_checkpoint_cosignature"
       ]
+    },
+    {
+      "canonical": "context_governance_propose",
+      "category": "governance",
+      "wasm_required": false,
+      "pyo3": [
+        "governance_propose"
+      ],
+      "uniffi": [
+        "governance_propose"
+      ],
+      "napi": [
+        "context_governance_propose"
+      ],
+      "wasm": [
+        "context_governance_propose"
+      ]
+    },
+    {
+      "canonical": "context_governance_approve",
+      "category": "governance",
+      "wasm_required": false,
+      "pyo3": [
+        "governance_approve"
+      ],
+      "uniffi": [
+        "governance_approve"
+      ],
+      "napi": [
+        "context_governance_approve"
+      ],
+      "wasm": [
+        "context_governance_approve"
+      ]
+    },
+    {
+      "canonical": "context_governance_reject",
+      "category": "governance",
+      "wasm_required": false,
+      "pyo3": [
+        "governance_reject"
+      ],
+      "uniffi": [
+        "governance_reject"
+      ],
+      "napi": [
+        "context_governance_reject"
+      ],
+      "wasm": [
+        "context_governance_reject"
+      ]
+    },
+    {
+      "canonical": "context_governance_withdraw",
+      "category": "governance",
+      "wasm_required": false,
+      "pyo3": [
+        "governance_withdraw"
+      ],
+      "uniffi": [
+        "governance_withdraw"
+      ],
+      "napi": [
+        "context_governance_withdraw"
+      ],
+      "wasm": [
+        "context_governance_withdraw"
+      ]
+    },
+    {
+      "canonical": "context_finalize_close",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "finalize_close"
+      ],
+      "uniffi": [
+        "finalize_close"
+      ],
+      "napi": [
+        "context_finalize_close"
+      ],
+      "wasm": [
+        "context_finalize_close"
+      ]
+    },
+    {
+      "canonical": "context_apply_pending_ceiling_modification",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "apply_pending_ceiling_modification"
+      ],
+      "uniffi": [
+        "apply_pending_ceiling_modification"
+      ],
+      "napi": [
+        "context_apply_pending_ceiling_modification"
+      ],
+      "wasm": [
+        "context_apply_pending_ceiling_modification"
+      ]
+    },
+    {
+      "canonical": "context_get_economic_policy",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "get_economic_policy"
+      ],
+      "uniffi": [
+        "get_economic_policy"
+      ],
+      "napi": [
+        "context_get_economic_policy"
+      ],
+      "wasm": [
+        "context_get_economic_policy"
+      ]
+    },
+    {
+      "canonical": "context_set_economic_policy",
+      "category": "economy",
+      "wasm_required": false,
+      "pyo3": [
+        "set_economic_policy"
+      ],
+      "uniffi": [
+        "set_economic_policy"
+      ],
+      "napi": [
+        "context_set_economic_policy"
+      ],
+      "wasm": [
+        "context_set_economic_policy"
+      ]
+    },
+    {
+      "canonical": "context_restore",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "restore_context"
+      ],
+      "uniffi": [
+        "restore_context"
+      ],
+      "napi": [
+        "context_restore"
+      ],
+      "wasm": [
+        "context_restore"
+      ]
+    },
+    {
+      "canonical": "context_restore_all",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "restore_all_contexts"
+      ],
+      "uniffi": [
+        "restore_all_contexts"
+      ],
+      "napi": [
+        "context_restore_all"
+      ],
+      "wasm": [
+        "context_restore_all"
+      ]
+    },
+    {
+      "canonical": "context_handle_ttl_expiry",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "context_handle_ttl_expiry"
+      ],
+      "uniffi": [
+        "context_handle_ttl_expiry"
+      ],
+      "napi": [
+        "context_handle_ttl_expiry"
+      ],
+      "wasm": [
+        "context_handle_ttl_expiry"
+      ]
+    },
+    {
+      "canonical": "context_propose_ttl_extension",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "context_propose_ttl_extension"
+      ],
+      "uniffi": [
+        "context_propose_ttl_extension"
+      ],
+      "napi": [
+        "context_propose_ttl_extension"
+      ],
+      "wasm": [
+        "context_propose_ttl_extension"
+      ]
+    },
+    {
+      "canonical": "context_reset_ttl_timer",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "context_reset_ttl_timer"
+      ],
+      "uniffi": [
+        "context_reset_ttl_timer"
+      ],
+      "napi": [
+        "context_reset_ttl_timer"
+      ],
+      "wasm": [
+        "context_reset_ttl_timer"
+      ]
+    },
+    {
+      "canonical": "broadcast_publish_asset",
+      "category": "broadcast",
+      "wasm_required": false,
+      "pyo3": [
+        "broadcast_publish_asset"
+      ],
+      "uniffi": [
+        "broadcast_publish_asset"
+      ],
+      "napi": [
+        "broadcast_publish_asset"
+      ],
+      "wasm": [
+        "broadcast_publish_asset"
+      ]
+    },
+    {
+      "canonical": "broadcast_publish_assets",
+      "category": "broadcast",
+      "wasm_required": false,
+      "pyo3": [
+        "broadcast_publish_assets"
+      ],
+      "uniffi": [
+        "broadcast_publish_assets"
+      ],
+      "napi": [
+        "broadcast_publish_assets"
+      ],
+      "wasm": [
+        "broadcast_publish_assets"
+      ]
+    },
+    {
+      "canonical": "broadcast_handle_key_request",
+      "category": "broadcast",
+      "wasm_required": false,
+      "pyo3": [
+        "broadcast_handle_key_request"
+      ],
+      "uniffi": [
+        "broadcast_handle_key_request"
+      ],
+      "napi": [
+        "broadcast_handle_key_request"
+      ],
+      "wasm": [
+        "broadcast_handle_key_request"
+      ]
+    },
+    {
+      "canonical": "broadcast_unblock_subscriber",
+      "category": "broadcast",
+      "wasm_required": false,
+      "pyo3": [
+        "broadcast_unblock_subscriber"
+      ],
+      "uniffi": [
+        "broadcast_unblock_subscriber"
+      ],
+      "napi": [
+        "broadcast_unblock_subscriber"
+      ],
+      "wasm": [
+        "broadcast_unblock"
+      ]
+    },
+    {
+      "canonical": "identity_link_attestations",
+      "category": "identity",
+      "wasm_required": false,
+      "pyo3": [
+        "identity_link_attestations"
+      ],
+      "uniffi": [
+        "identity_link_attestations"
+      ],
+      "napi": [
+        "identity_link_attestations"
+      ],
+      "wasm": [
+        "identity_link_attestations"
+      ]
+    },
+    {
+      "canonical": "identity_create_with_agent_key",
+      "category": "identity",
+      "wasm_required": false,
+      "pyo3": [
+        "identity_create_with_agent_key"
+      ],
+      "uniffi": [
+        "identity_create_with_agent_key"
+      ],
+      "napi": [
+        "identity_create_with_agent_key"
+      ],
+      "wasm": [
+        "identity_create_with_agent_key"
+      ]
+    },
+    {
+      "canonical": "identity_execute_recovery",
+      "category": "identity",
+      "wasm_required": false,
+      "pyo3": [
+        "identity_execute_recovery"
+      ],
+      "uniffi": [
+        "identity_execute_recovery"
+      ],
+      "napi": [
+        "identity_execute_recovery"
+      ],
+      "wasm": [
+        "identity_execute_recovery"
+      ]
+    },
+    {
+      "canonical": "identity_execute_custody_migration",
+      "category": "identity",
+      "wasm_required": false,
+      "pyo3": [
+        "identity_execute_custody_migration"
+      ],
+      "uniffi": [
+        "identity_execute_custody_migration"
+      ],
+      "napi": [
+        "identity_execute_custody_migration"
+      ],
+      "wasm": [
+        "identity_execute_custody_migration"
+      ]
+    },
+    {
+      "canonical": "identity_add_agent_key",
+      "category": "identity",
+      "wasm_required": false,
+      "pyo3": [
+        "identity_add_agent_key"
+      ],
+      "uniffi": [
+        "add_agent_key"
+      ],
+      "napi": [
+        "add_agent_key"
+      ],
+      "wasm": [
+        "identity_add_agent_key",
+        "add_agent_key"
+      ]
+    },
+    {
+      "canonical": "identity_remove_agent_key",
+      "category": "identity",
+      "wasm_required": false,
+      "pyo3": [
+        "identity_remove_agent_key"
+      ],
+      "uniffi": [
+        "remove_agent_key"
+      ],
+      "napi": [
+        "remove_agent_key"
+      ],
+      "wasm": [
+        "identity_remove_agent_key",
+        "remove_agent_key"
+      ]
+    },
+    {
+      "canonical": "identity_rotate_agent_key",
+      "category": "identity",
+      "wasm_required": false,
+      "pyo3": [
+        "identity_rotate_agent_key"
+      ],
+      "uniffi": [
+        "rotate_agent_key"
+      ],
+      "napi": [
+        "rotate_agent_key"
+      ],
+      "wasm": [
+        "identity_rotate_agent_key",
+        "rotate_agent_key"
+      ]
+    },
+    {
+      "canonical": "address_resolve",
+      "category": "discovery",
+      "wasm_required": false,
+      "pyo3": [
+        "address_resolve"
+      ],
+      "uniffi": [
+        "address_resolve"
+      ],
+      "napi": [
+        "address_resolve"
+      ],
+      "wasm": [
+        "address_resolve"
+      ]
+    },
+    {
+      "canonical": "aggregate_trust_input",
+      "category": "trust",
+      "wasm_required": false,
+      "pyo3": [
+        "aggregate_trust_input"
+      ],
+      "uniffi": [
+        "aggregate_trust_input"
+      ],
+      "napi": [
+        "aggregate_trust_input"
+      ],
+      "wasm": [
+        "aggregate_trust_input"
+      ]
+    },
+    {
+      "canonical": "evaluate_invitation",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "evaluate_invitation"
+      ],
+      "uniffi": [
+        "evaluate_invitation"
+      ],
+      "napi": [
+        "evaluate_invitation"
+      ],
+      "wasm": [
+        "evaluate_invitation"
+      ]
+    },
+    {
+      "canonical": "transport_disconnect",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "transport_disconnect"
+      ],
+      "uniffi": [
+        "transport_disconnect"
+      ],
+      "napi": [
+        "transport_disconnect"
+      ],
+      "wasm": [
+        "transport_disconnect"
+      ]
+    },
+    {
+      "canonical": "provenance_redact_counterparties",
+      "category": "provenance",
+      "wasm_required": false,
+      "pyo3": [
+        "provenance_redact_counterparties"
+      ],
+      "uniffi": [
+        "provenance_redact_counterparties"
+      ],
+      "napi": [
+        "provenance_redact_counterparties"
+      ],
+      "wasm": [
+        "provenance_redact_counterparties"
+      ]
+    },
+    {
+      "canonical": "provenance_pseudonymize_counterparties",
+      "category": "provenance",
+      "wasm_required": false,
+      "pyo3": [
+        "provenance_pseudonymize_counterparties"
+      ],
+      "uniffi": [
+        "provenance_pseudonymize_counterparties"
+      ],
+      "napi": [
+        "provenance_pseudonymize_counterparties"
+      ],
+      "wasm": [
+        "provenance_pseudonymize_counterparties"
+      ]
+    },
+    {
+      "canonical": "provenance_update_source_type",
+      "category": "provenance",
+      "wasm_required": false,
+      "pyo3": [
+        "provenance_update_source_type"
+      ],
+      "uniffi": [
+        "provenance_update_source_type"
+      ],
+      "napi": [
+        "provenance_update_source_type"
+      ],
+      "wasm": [
+        "provenance_update_source_type"
+      ]
     }
   ],
   "exemptions": {
