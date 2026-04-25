@@ -2079,3 +2079,78 @@ pub async fn deliver_message_and_drain_buffered(
 
     Ok(false)
 }
+
+// ===========================================================================
+// send_pseudonym_announcement (hoisted from ContextManager — ADR-049 commit 12)
+// ===========================================================================
+
+/// Sends a pseudonym announcement MLS message so other members can map the
+/// announcing member's DID to their per-context pseudonym routing ID.
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::send_pseudonym_announcement`](crate::context::manager::ContextManager::send_pseudonym_announcement)
+/// (ADR-049 commit 12). Byte-identical behavior — best-effort delivery
+/// with internal logging on transport / serialization failures.
+pub async fn send_pseudonym_announcement(
+    supervisor: &Supervisor,
+    handle: &ContextHandle,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+) {
+    let context_id = handle.context_id().to_owned();
+    let pseudonym = {
+        let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, &context_id) else {
+            return;
+        };
+        let guard = ctx_arc.lock().await;
+        guard.local_pseudonym
+    };
+    let Some(pseudonym) = pseudonym else {
+        return;
+    };
+    let announcement = manager::PseudonymAnnouncement {
+        tag: manager::PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+        member_did: sender_did.as_ref().to_owned(),
+        pseudonym,
+    };
+    let Ok(payload) = rmp_serde::to_vec_named(&announcement) else {
+        tracing::warn!(
+            context_id = %context_id,
+            "failed to serialize pseudonym announcement"
+        );
+        return;
+    };
+    let Some(clock) = supervisor.clock_ref() else {
+        tracing::warn!(
+            context_id = %context_id,
+            "send_pseudonym_announcement: clock provider not configured"
+        );
+        return;
+    };
+    let Some(key_resolver) = supervisor.key_resolver_ref() else {
+        tracing::warn!(
+            context_id = %context_id,
+            "send_pseudonym_announcement: key_resolver not configured"
+        );
+        return;
+    };
+    if let Err(e) = send_message(
+        supervisor,
+        clock,
+        key_resolver,
+        handle,
+        sender_did,
+        &payload,
+        Some(signing_key),
+        None,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(
+            context_id = %context_id,
+            error = %e,
+            "failed to send pseudonym announcement — other members will use shared routing"
+        );
+    }
+}

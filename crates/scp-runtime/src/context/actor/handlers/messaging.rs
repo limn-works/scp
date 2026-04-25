@@ -197,20 +197,27 @@ async fn handle_send_message(
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    // Derive the attached manager once so we can read its `clock_ref`
-    // and `key_resolver_ref` without re-hopping through the supervisor
-    // per argument. The attach contract guarantees this is populated;
-    // on violation we surface `NotInitialized` through the reply and
-    // the handler's `Outcome`.
-    let Some(manager) = supervisor.attached_context_manager() else {
+    // ADR-049 commit 12 — providers read directly from the supervisor
+    // (no manager backpointer). The Supervisor::with_providers contract
+    // guarantees every provider OnceLock is populated; on violation we
+    // surface `NotInitialized` through the reply and the handler's
+    // `Outcome`.
+    let Some(clock) = supervisor.clock_ref() else {
         let err = ContextError::NotInitialized(
-            "handle_send_message: ContextManager must be attached".to_owned(),
+            "handle_send_message: clock provider not configured".to_owned(),
         );
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
         return Outcome::err(sketch);
     };
-    let manager: &Arc<ContextManager> = manager;
+    let Some(key_resolver) = supervisor.key_resolver_ref() else {
+        let err = ContextError::NotInitialized(
+            "handle_send_message: key_resolver provider not configured".to_owned(),
+        );
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err(sketch);
+    };
 
     // Step 1: reserve the next actor-shape sequence number. The RAII
     // guard rolls back on any early `?` return below, on transport
@@ -248,8 +255,8 @@ async fn handle_send_message(
     let sk_ref = sk.as_ref();
     let send_fut = crate::context::messaging_helpers::send_message(
         supervisor,
-        manager.clock_ref(),
-        manager.key_resolver_ref(),
+        clock,
+        key_resolver,
         &handle,
         sender_did,
         payload,
@@ -345,19 +352,27 @@ async fn handle_deliver_incoming(
     envelope_bytes: &[u8],
     reply: crate::context::actor::commands::DeliverIncomingReply,
 ) -> Outcome<()> {
-    let Some(manager) = supervisor.attached_context_manager() else {
+    // ADR-049 commit 12 — providers read directly from the supervisor.
+    let Some(clock) = supervisor.clock_ref() else {
         let err = ContextError::NotInitialized(
-            "handle_deliver_incoming: ContextManager must be attached".to_owned(),
+            "handle_deliver_incoming: clock provider not configured".to_owned(),
         );
         let sketch = outcome_error_sketch(&err);
         let _ = reply.send(Err(err));
         return Outcome::err(sketch);
     };
-    let manager: &Arc<ContextManager> = manager;
+    let Some(key_resolver) = supervisor.key_resolver_ref() else {
+        let err = ContextError::NotInitialized(
+            "handle_deliver_incoming: key_resolver provider not configured".to_owned(),
+        );
+        let sketch = outcome_error_sketch(&err);
+        let _ = reply.send(Err(err));
+        return Outcome::err(sketch);
+    };
     let deliver_fut = crate::context::messaging_helpers::deliver_incoming(
         supervisor,
-        manager.clock_ref(),
-        manager.key_resolver_ref(),
+        clock,
+        key_resolver,
         context_id,
         envelope_bytes,
     );
@@ -442,16 +457,6 @@ async fn handle_send_pseudonym_announcement(
     signing_key: &crate::context::actor::commands::SigningKeyBytes,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let Some(manager) = supervisor.attached_context_manager() else {
-        let err = ContextError::NotInitialized(
-            "handle_send_pseudonym_announcement: ContextManager must be attached".to_owned(),
-        );
-        let sketch = outcome_error_sketch(&err);
-        let _ = reply.send(Err(err));
-        return Outcome::err(sketch);
-    };
-    let manager: &Arc<ContextManager> = manager;
-
     // Rebuild the ephemeral handle the legacy method takes by
     // reference; transition it to `Active` so the underlying
     // `send_message` path (called inside `send_pseudonym_announcement`)
@@ -467,7 +472,12 @@ async fn handle_send_pseudonym_announcement(
     }
 
     let sk = signing_key.to_signing_key();
-    let send_fut = manager.send_pseudonym_announcement(&handle, sender_did, &sk);
+    let send_fut = crate::context::messaging_helpers::send_pseudonym_announcement(
+        supervisor,
+        &handle,
+        sender_did,
+        &sk,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {
         Ok(()) => (Outcome::ok_mutated(()), Ok(())),
