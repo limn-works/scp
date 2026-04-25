@@ -45,7 +45,7 @@ pub mod policy;
 pub mod providers;
 pub(crate) mod queries_helpers;
 pub(crate) mod standing_helpers;
-pub(crate) mod state;
+pub mod state;
 pub mod supervisor;
 pub(crate) mod tools_helpers;
 pub(crate) mod trust_recovery_helpers;

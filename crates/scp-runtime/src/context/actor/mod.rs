@@ -1039,9 +1039,8 @@ mod tests {
     /// `actor_with_state_acks_placeholder_with_not_implemented` test.
     /// Extracted so the test function stays below the `too_many_lines`
     /// clippy threshold.
-    fn new_test_deps() -> deps::ActorDeps {
-        use crate::context::supervisor::supervisor::{Supervisor, SupervisorConfig};
-        use crate::context::supervisor::{ProtocolRepositorySagaJournal, SagaJournal};
+    async fn new_test_deps() -> deps::ActorDeps {
+        use crate::context::supervisor::supervisor::Supervisor;
         use scp_identity::DID;
         use scp_platform::testing::InMemoryStorage;
         use std::sync::Arc;
@@ -1053,24 +1052,20 @@ mod tests {
             Box::new(crate::context::builder::NotConfiguredTransportProvider);
         let event_log: Box<dyn crate::context::builder::ContextEventLogProvider> =
             Box::new(TestEventLog);
-        let manager = Arc::new(crate::context::manager::ContextManager::new(
+        let key_resolver: scp_protocol::context::governance::KeyResolver = Arc::new(|_| None);
+
+        let persistence: Arc<dyn crate::context::persistence::ContextPersistence> =
+            Arc::new(TestPersistence);
+        let supervisor = Supervisor::with_providers(
             crypto,
             transport,
             event_log,
-            Arc::new(|_| None),
-        ));
-
-        let persistence: Arc<dyn crate::context::manager::ContextPersistence> =
-            Arc::new(TestPersistence);
-        let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
-            InMemoryStorage::new(),
-        )));
-        let supervisor = Arc::new(Supervisor::new(
-            persistence.clone(),
-            journal,
-            SupervisorConfig::default(),
-        ));
-        supervisor.attach_context_manager(&manager).unwrap();
+            key_resolver,
+            None,
+            None,
+            None,
+            None,
+        );
 
         let mls: Arc<dyn crate::crypto::mls::backend::MlsBackend> =
             Arc::new(crate::crypto::mls::production_backend::ProductionMlsBackend::new());
@@ -1086,8 +1081,9 @@ mod tests {
             DID("did:example:actor-with-state-test".to_owned()),
         );
         supervisor
-            .build_actor_deps_from_attached(persistence, mls, hpke, mls_storage, kp_store)
-            .expect("build_actor_deps_from_attached")
+            .build_actor_deps(persistence, mls, hpke, mls_storage, kp_store)
+            .await
+            .expect("build_actor_deps")
     }
 
     /// `ContextActor::new` constructs an actor that owns `PerContextState`
@@ -1104,7 +1100,7 @@ mod tests {
     /// unit test focuses on the actor struct's constructor + run-loop.
     #[tokio::test]
     async fn actor_with_state_acks_placeholder_with_not_implemented() {
-        let deps = new_test_deps();
+        let deps = new_test_deps().await;
         let state = state::PerContextState::new_for_test_encrypted(
             [0x42u8; 32],
             1_700_000_000,

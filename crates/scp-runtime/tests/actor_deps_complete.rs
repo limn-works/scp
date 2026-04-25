@@ -1,19 +1,17 @@
 //! Integration test for the ADR-049 commit-12a.5 `ActorDeps` expansion.
 //!
 //! Asserts that
-//! [`Supervisor::build_actor_deps_from_attached`](scp_runtime::context::supervisor::Supervisor::build_actor_deps_from_attached)
+//! [`Supervisor::build_actor_deps`](scp_runtime::context::supervisor::Supervisor::build_actor_deps)
 //! populates **every** field of
 //! [`ActorDeps`](scp_runtime::context::actor::ActorDeps) from the
-//! attached legacy [`ContextManager`](scp_runtime::context::manager::ContextManager).
+//! supervisor's directly-owned providers (post commit-12 — there is no
+//! `ContextManager` to attach).
 //!
 //! No handler body migration happens in commit 12a.5 — the deps bundle
 //! is wired but not yet consumed by `MutationStateView`-based handlers (the adapter was deleted in commit 12c.7).
 //! This test is the mechanical check that the wiring is correct so
 //! commit 12b can move call sites onto `deps.X` one submodule at a
 //! time without discovering missing fields mid-migration.
-//!
-//! The test exercises the same test-harness shape used by the other
-//! `actor_*_shim.rs` integration tests (commits 7-11).
 
 #![allow(
     clippy::unwrap_used,
@@ -36,10 +34,8 @@ use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::KeyResolver;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::params::ContextParams;
-use scp_runtime::context::manager::{ContextManager, ContextPersistence};
-use scp_runtime::context::supervisor::{
-    ProtocolRepositorySagaJournal, SagaJournal, Supervisor, SupervisorConfig,
-};
+use scp_runtime::context::persistence::ContextPersistence;
+use scp_runtime::context::supervisor::Supervisor;
 use scp_runtime::crypto::mls::provider::MlsCryptoProvider;
 
 // ---------------------------------------------------------------------------
@@ -101,7 +97,7 @@ impl ContextPersistence for NoopPersistence {
     fn persist_context(
         &self,
         _: &str,
-        _: &scp_runtime::context::manager::ContextSnapshot,
+        _: &scp_runtime::context::state::ContextSnapshot,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(())
     }
@@ -109,7 +105,7 @@ impl ContextPersistence for NoopPersistence {
         &self,
         _: &str,
     ) -> Result<
-        Option<scp_runtime::context::manager::ContextSnapshot>,
+        Option<scp_runtime::context::state::ContextSnapshot>,
         Box<dyn std::error::Error + Send + Sync>,
     > {
         Ok(None)
@@ -150,46 +146,46 @@ fn mock_key_resolver() -> KeyResolver {
     })
 }
 
-/// Fixture — a fully-wired `ContextManager` + `Supervisor` with the
-/// manager attached, matching the other actor-shim tests. The manager
-/// has an event channel configured so the test can assert `event_tx`
-/// propagates through `ActorDeps`.
-fn new_fixture() -> (Arc<ContextManager>, Arc<Supervisor>) {
+/// Fixture — a fully-wired `Supervisor` with providers populated and an
+/// event channel attached. Returns the supervisor along with a
+/// pre-subscribed receiver so the caller can witness `event_tx`
+/// propagation through `ActorDeps`.
+fn new_fixture() -> (
+    Arc<Supervisor>,
+    tokio::sync::broadcast::Receiver<(String, ContextEvent)>,
+) {
     let captures = Arc::new(TransportCaptures::default());
-    let mut manager = ContextManager::builder()
-        .crypto(Arc::new(MlsCryptoProvider::new(
-            "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
-        )))
-        .transport(Box::new(MockTransport::new(Arc::clone(&captures))))
-        .event_log(Box::new(MockEventLog))
-        .key_resolver(mock_key_resolver())
-        .build()
-        .unwrap();
-    manager.with_event_channel(16);
-    let manager = Arc::new(manager);
-    let persistence: Arc<dyn ContextPersistence> = Arc::new(NoopPersistence);
-    let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
-        InMemoryStorage::new(),
-    )));
-    let supervisor = Arc::new(Supervisor::new(
-        persistence,
-        journal,
-        SupervisorConfig::default(),
+    let crypto = Arc::new(MlsCryptoProvider::new(
+        "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK".to_owned(),
     ));
-    supervisor.attach_context_manager(&manager).unwrap();
-    (manager, supervisor)
+    let transport: Box<dyn scp_runtime::context::builder::ContextTransportProvider> =
+        Box::new(MockTransport::new(Arc::clone(&captures)));
+    let event_log: Box<dyn scp_runtime::context::builder::ContextEventLogProvider> =
+        Box::new(MockEventLog);
+    let (event_tx, event_rx) = tokio::sync::broadcast::channel(16);
+    let supervisor = Supervisor::with_providers(
+        crypto,
+        transport,
+        event_log,
+        mock_key_resolver(),
+        None,
+        None,
+        Some(event_tx),
+        None,
+    );
+    (supervisor, event_rx)
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Every `ActorDeps` field populates from the attached manager + the
+/// Every `ActorDeps` field populates from the supervisor + the
 /// caller-supplied backends. Baseline "no panic, no missing field"
 /// assertion.
 #[tokio::test]
 async fn build_actor_deps_populates_every_field() {
-    let (manager, supervisor) = new_fixture();
+    let (supervisor, mut event_rx) = new_fixture();
 
     let persistence: Arc<dyn ContextPersistence> = Arc::new(NoopPersistence);
     let mls: Arc<dyn scp_runtime::crypto::mls::backend::MlsBackend> =
@@ -207,14 +203,15 @@ async fn build_actor_deps_populates_every_field() {
     ));
 
     let deps = supervisor
-        .build_actor_deps_from_attached(
+        .build_actor_deps(
             Arc::clone(&persistence),
             Arc::clone(&mls),
             Arc::clone(&hpke),
             Arc::clone(&mls_storage),
             kp_store.clone(),
         )
-        .expect("build_actor_deps_from_attached should succeed with manager attached");
+        .await
+        .expect("build_actor_deps should succeed when providers are populated");
 
     // 8 existing fields — witness by downcast-free usage patterns.
     assert!(
@@ -224,7 +221,7 @@ async fn build_actor_deps_populates_every_field() {
     // persistence, event_log, mls, hpke, mls_storage — witness by Arc
     // pointer equality with the inputs we passed in (for the ones we
     // supplied) and non-empty trait-object for the ones sourced from
-    // the manager.
+    // the supervisor.
     assert!(
         Arc::ptr_eq(&deps.persistence, &persistence),
         "persistence field must be the exact Arc the caller supplied"
@@ -260,8 +257,8 @@ async fn build_actor_deps_populates_every_field() {
 
     // New 12a.5 fields.
 
-    // `clock` — `Arc<dyn scp_primitives::Clock>`. The manager's default
-    // is `SystemClock`; assert a sensible wall-clock value.
+    // `clock` — `Arc<dyn scp_primitives::Clock>`. The supervisor's
+    // default is `SystemClock`; assert a sensible wall-clock value.
     let seconds_since_epoch = deps.clock.now_secs();
     assert!(
         seconds_since_epoch > 1_700_000_000,
@@ -275,17 +272,14 @@ async fn build_actor_deps_populates_every_field() {
          ms={millis_since_epoch})"
     );
 
-    // `event_tx` — the Sender half the manager is holding. Cloneable
+    // `event_tx` — the Sender half the supervisor is holding. Cloneable
     // (Arc inside). Verify it's the SAME broadcast channel as the
-    // manager's: subscribe through the manager's public API and check
-    // that sending on the ActorDeps copy reaches the receiver.
+    // supervisor's by sending on the ActorDeps copy and observing the
+    // pre-subscribed receiver.
     let tx = deps
         .event_tx
         .as_ref()
-        .expect("event_tx must populate — manager builder attached one");
-    let mut rx = manager
-        .subscribe_events()
-        .expect("manager must expose a receiver because the fixture called with_event_channel");
+        .expect("event_tx must populate — fixture passed Some(event_tx) to with_providers");
     let probe = (
         "probe-ctx".to_owned(),
         ContextEvent::MemberLeft {
@@ -293,13 +287,13 @@ async fn build_actor_deps_populates_every_field() {
         },
     );
     tx.send(probe.clone())
-        .expect("send through ActorDeps.event_tx should reach receivers subscribed on manager");
-    let received = rx
-        .try_recv()
-        .expect("receiver subscribed on the manager must observe the ActorDeps.event_tx send");
+        .expect("send through ActorDeps.event_tx should reach receivers subscribed on supervisor");
+    let received = event_rx.try_recv().expect(
+        "receiver subscribed on the supervisor must observe the ActorDeps.event_tx send",
+    );
     assert_eq!(
         received, probe,
-        "event_tx must be the same broadcast channel as the manager's — round-trip check"
+        "event_tx must be the same broadcast channel as the supervisor's — round-trip check"
     );
 
     // `key_resolver` — `Arc<dyn Fn(&DID) -> Option<VerifyingKey> + ..>`.
@@ -312,35 +306,26 @@ async fn build_actor_deps_populates_every_field() {
     );
 
     // `payment_adapter` — not configured in the fixture → `None` from
-    // the manager. Witness by `Option::is_none`.
+    // the supervisor. Witness by `Option::is_none`.
     assert!(
         deps.payment_adapter.is_none(),
-        "payment_adapter must populate as `None` when the manager has no adapter configured"
+        "payment_adapter must populate as `None` when the supervisor has no adapter configured"
     );
 
-    // `local_dids` — wired from the supervisor's own `ArcSwap`. Fresh
-    // supervisor has an empty set; witness by loading the snapshot.
+    // `local_dids` — wired from the supervisor's authoritative snapshot.
+    // Fresh supervisor has an empty set; witness by loading the
+    // snapshot.
     assert!(
         deps.local_dids.load().is_empty(),
         "local_dids must populate — fresh supervisor starts with empty set"
     );
 }
 
-/// `build_actor_deps_from_attached` fails clean if no ContextManager is
-/// attached.
+/// `build_actor_deps` fails clean if the supervisor was constructed via
+/// `for_query_shim()` (no providers populated).
 #[tokio::test]
-async fn build_actor_deps_fails_when_no_manager_attached() {
-    let persistence_outer: Arc<dyn ContextPersistence> = Arc::new(NoopPersistence);
-    let journal: Arc<dyn SagaJournal> = Arc::new(ProtocolRepositorySagaJournal::new(Arc::new(
-        InMemoryStorage::new(),
-    )));
-    let supervisor = Arc::new(Supervisor::new(
-        persistence_outer,
-        journal,
-        SupervisorConfig::default(),
-    ));
-
-    // No attach_context_manager call.
+async fn build_actor_deps_fails_when_no_providers() {
+    let supervisor = Arc::new(Supervisor::for_query_shim());
 
     let persistence: Arc<dyn ContextPersistence> = Arc::new(NoopPersistence);
     let mls: Arc<dyn scp_runtime::crypto::mls::backend::MlsBackend> =
@@ -356,17 +341,13 @@ async fn build_actor_deps_fails_when_no_manager_attached() {
     let kp_store =
         scp_runtime::context::supervisor::KeyPackageStoreActor::spawn(DID::from("did:example:a"));
 
-    let result = supervisor.build_actor_deps_from_attached(
-        persistence,
-        mls,
-        hpke,
-        mls_storage,
-        kp_store.clone(),
-    );
+    let result = supervisor
+        .build_actor_deps(persistence, mls, hpke, mls_storage, kp_store.clone())
+        .await;
     // `ActorDeps` does not impl `Debug`, so we cannot use `expect_err`
     // — match on the Result shape explicitly.
     match result {
-        Ok(_) => panic!("build_actor_deps_from_attached must fail when no manager is attached"),
+        Ok(_) => panic!("build_actor_deps must fail when supervisor has no providers"),
         Err(ContextError::NotInitialized(_)) => {}
         Err(other) => panic!("expected NotInitialized, got {other:?}"),
     }
@@ -380,12 +361,12 @@ async fn build_actor_deps_fails_when_no_manager_attached() {
 /// build path must bump the refcount.
 ///
 /// Regression guard for the `self: &Arc<Self>` receiver choice on
-/// `build_actor_deps_from_attached`. If the body switched to
+/// `build_actor_deps`. If the body switched to
 /// `Arc::new(Supervisor::for_query_shim())`, `strong_count(&supervisor)`
 /// would NOT increase when the handle is constructed.
 #[tokio::test]
 async fn supervisor_handle_holds_outer_arc_not_throwaway() {
-    let (_manager, supervisor) = new_fixture();
+    let (supervisor, _event_rx) = new_fixture();
 
     let count_before = Arc::strong_count(&supervisor);
 
@@ -405,7 +386,8 @@ async fn supervisor_handle_holds_outer_arc_not_throwaway() {
     ));
 
     let deps = supervisor
-        .build_actor_deps_from_attached(persistence, mls, hpke, mls_storage, kp_store.clone())
+        .build_actor_deps(persistence, mls, hpke, mls_storage, kp_store.clone())
+        .await
         .unwrap();
 
     let count_after = Arc::strong_count(&supervisor);
