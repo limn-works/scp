@@ -2487,122 +2487,190 @@
       ]
     },
     {
-      "canonical": "template_get_params",
-      "category": "context",
+      "canonical": "mcp_server_create",
+      "category": "mcp",
       "wasm_required": false,
       "pyo3": [
-        "py_template_get_params"
+        "py_mcp_serve"
       ],
       "uniffi": [
-        "template_get_params"
+        "mcp_server_create"
       ],
       "napi": [
-        "template_get_params"
+        "mcp_server_create"
       ],
       "wasm": [
-        "template_get_params"
+        "mcp_server_create"
       ]
     },
     {
-      "canonical": "validate_against_template",
-      "category": "context",
+      "canonical": "mcp_server_stop",
+      "category": "mcp",
       "wasm_required": false,
       "pyo3": [
-        "py_validate_against_template"
+        "py_mcp_server_stop"
       ],
       "uniffi": [
-        "validate_against_template"
+        "mcp_server_stop"
       ],
       "napi": [
-        "validate_against_template"
+        "mcp_server_stop"
       ],
       "wasm": [
-        "validate_against_template"
+        "mcp_server_stop"
       ]
     },
     {
-      "canonical": "validate_context_params",
-      "category": "context",
+      "canonical": "mcp_client_connect_stdio",
+      "category": "mcp",
       "wasm_required": false,
       "pyo3": [
-        "py_validate_context_params"
+        "py_mcp_client_connect_stdio"
       ],
       "uniffi": [
-        "validate_context_params"
+        "mcp_client_connect_stdio"
       ],
       "napi": [
-        "validate_context_params"
+        "mcp_client_connect_stdio"
       ],
       "wasm": [
-        "validate_context_params"
+        "mcp_client_connect_stdio"
       ]
     },
     {
-      "canonical": "metadata_record_from_json",
-      "category": "context",
+      "canonical": "mcp_client_connect_sse",
+      "category": "mcp",
       "wasm_required": false,
       "pyo3": [
-        "py_metadata_record_from_json"
+        "py_mcp_client_connect_sse"
       ],
       "uniffi": [
-        "metadata_record_from_json"
+        "mcp_client_connect_sse"
       ],
       "napi": [
-        "metadata_record_from_json"
+        "mcp_client_connect_sse"
       ],
       "wasm": [
-        "metadata_record_from_json"
+        "mcp_client_connect_sse"
       ]
     },
     {
-      "canonical": "discovery_create_query",
-      "category": "discovery",
+      "canonical": "mcp_client_disconnect",
+      "category": "mcp",
       "wasm_required": false,
       "pyo3": [
-        "py_discovery_create_query"
+        "py_mcp_client_disconnect"
       ],
       "uniffi": [
-        "discovery_create_query"
+        "mcp_client_disconnect"
       ],
       "napi": [
-        "discovery_create_query"
+        "mcp_client_disconnect"
       ],
       "wasm": [
-        "discovery_create_query"
+        "mcp_client_disconnect"
       ]
     },
     {
-      "canonical": "context_discover",
-      "category": "discovery",
+      "canonical": "mcp_client_list_tools",
+      "category": "mcp",
       "wasm_required": false,
       "pyo3": [
-        "py_context_discover"
+        "py_mcp_client_list_tools"
       ],
       "uniffi": [
-        "context_discover"
+        "mcp_client_list_tools"
       ],
       "napi": [
-        "context_discover"
+        "mcp_client_list_tools"
       ],
       "wasm": [
-        "context_discover"
+        "mcp_client_list_tools"
       ]
     },
     {
-      "canonical": "identity_remove_link_attestation",
-      "category": "identity",
+      "canonical": "mcp_client_invoke",
+      "category": "mcp",
       "wasm_required": false,
       "pyo3": [
-        "remove_identity_link_attestation"
+        "py_mcp_client_invoke"
       ],
       "uniffi": [
-        "identity_remove_link_attestation"
+        "mcp_client_invoke"
       ],
       "napi": [
-        "identity_remove_link_attestation"
+        "mcp_client_invoke"
       ],
       "wasm": [
-        "identity_remove_link_attestation"
+        "mcp_client_invoke"
+      ]
+    },
+    {
+      "canonical": "mcp_configure_stdio_allowlist",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_configure_stdio_allowlist"
+      ],
+      "uniffi": [
+        "mcp_configure_stdio_allowlist"
+      ],
+      "napi": [
+        "mcp_configure_stdio_allowlist"
+      ],
+      "wasm": [
+        "mcp_configure_stdio_allowlist"
+      ]
+    },
+    {
+      "canonical": "mcp_disable_stdio_allowlist",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_disable_stdio_allowlist"
+      ],
+      "uniffi": [
+        "mcp_disable_stdio_allowlist"
+      ],
+      "napi": [
+        "mcp_disable_stdio_allowlist"
+      ],
+      "wasm": [
+        "mcp_disable_stdio_allowlist"
+      ]
+    },
+    {
+      "canonical": "mcp_reset_stdio_allowlist",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_reset_stdio_allowlist"
+      ],
+      "uniffi": [
+        "mcp_reset_stdio_allowlist"
+      ],
+      "napi": [
+        "mcp_reset_stdio_allowlist"
+      ],
+      "wasm": [
+        "mcp_reset_stdio_allowlist"
+      ]
+    },
+    {
+      "canonical": "mcp_get_stdio_allowlist",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_get_stdio_allowlist"
+      ],
+      "uniffi": [
+        "mcp_get_stdio_allowlist"
+      ],
+      "napi": [
+        "mcp_get_stdio_allowlist"
+      ],
+      "wasm": [
+        "mcp_get_stdio_allowlist"
       ]
     }
   ],
@@ -2653,6 +2721,50 @@
       {
         "canonical": "access_key_restore",
         "reason": "Restoration reads persisted access key state; WASM has no scp-platform per ADR-034."
+      },
+      {
+        "canonical": "mcp_server_create",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_server_stop",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_client_connect_stdio",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_client_connect_sse",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_client_disconnect",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_client_list_tools",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_client_invoke",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_configure_stdio_allowlist",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_disable_stdio_allowlist",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_reset_stdio_allowlist",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_get_stdio_allowlist",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
       }
     ]
   }
