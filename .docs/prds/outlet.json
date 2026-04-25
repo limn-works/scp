@@ -1109,7 +1109,7 @@
       "gate": "gate-classification",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-protocol/src/context/outlets/interface.rs",
         "crates/scp-protocol/src/context/params.rs",
