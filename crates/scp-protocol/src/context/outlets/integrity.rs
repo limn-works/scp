@@ -71,7 +71,7 @@ pub fn schema_compatible(expected: &Value, actual: &Value) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// verify_tool_integrity
+// verify_outlet_integrity
 // ---------------------------------------------------------------------------
 
 /// Schema-based verification result for a single test vector.
@@ -112,7 +112,7 @@ pub struct SchemaVerificationResult {
 /// # Errors
 ///
 /// Returns [`OutletError::OutletNotFound`] if the tool is not in the registry.
-pub fn verify_tool_integrity<F>(
+pub fn verify_outlet_integrity<F>(
     registry: &OutletRegistry,
     outlet_id: &str,
     verifier_did: &DID,
@@ -200,7 +200,7 @@ where
 /// Converts a [`SchemaVerificationResult`] to a [`OutletVerificationResult`]
 /// for backward compatibility with the existing exact-match API.
 #[must_use]
-pub fn schema_result_to_tool_result(result: &SchemaVerificationResult) -> OutletVerificationResult {
+pub fn schema_result_to_outlet_result(result: &SchemaVerificationResult) -> OutletVerificationResult {
     OutletVerificationResult {
         outlet_id: result.outlet_id.clone(),
         vector_results: result
@@ -443,7 +443,7 @@ mod tests {
         let verifier = DID::from("did:dht:verifier");
 
         let clock = scp_primitives::SystemClock;
-        let (verification, result) = verify_tool_integrity(
+        let (verification, result) = verify_outlet_integrity(
             &registry,
             "calc",
             &verifier,
@@ -474,7 +474,7 @@ mod tests {
         let verifier = DID::from("did:dht:verifier");
 
         let clock = scp_primitives::SystemClock;
-        let (verification, result) = verify_tool_integrity(
+        let (verification, result) = verify_outlet_integrity(
             &registry,
             "calc",
             &verifier,
@@ -502,7 +502,7 @@ mod tests {
         let verifier = DID::from("did:dht:verifier");
 
         let clock = scp_primitives::SystemClock;
-        let err = verify_tool_integrity(&registry, "missing", &verifier, &clock, |_| json!({}))
+        let err = verify_outlet_integrity(&registry, "missing", &verifier, &clock, |_| json!({}))
             .unwrap_err();
 
         match err {
@@ -530,7 +530,7 @@ mod tests {
 
         let clock = scp_primitives::SystemClock;
         let (_, result) =
-            verify_tool_integrity(&registry, "multi", &verifier, &clock, |_| json!({"a": 1}))
+            verify_outlet_integrity(&registry, "multi", &verifier, &clock, |_| json!({"a": 1}))
                 .unwrap();
 
         assert!(result.integrity_ok);
@@ -556,12 +556,12 @@ mod tests {
             ],
             integrity_ok: false,
         };
-        let tool_result = schema_result_to_tool_result(&schema_result);
-        assert_eq!(tool_result.outlet_id, "t1");
-        assert!(!tool_result.integrity_ok);
-        assert_eq!(tool_result.vector_results.len(), 2);
-        assert!(tool_result.vector_results[0].passed);
-        assert!(!tool_result.vector_results[1].passed);
+        let outlet_result = schema_result_to_outlet_result(&schema_result);
+        assert_eq!(outlet_result.outlet_id, "t1");
+        assert!(!outlet_result.integrity_ok);
+        assert_eq!(outlet_result.vector_results.len(), 2);
+        assert!(outlet_result.vector_results[0].passed);
+        assert!(!outlet_result.vector_results[1].passed);
     }
 
     #[test]

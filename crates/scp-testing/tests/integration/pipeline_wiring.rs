@@ -50,7 +50,7 @@ const WASM_CONSEQUENCE_SRC: &str =
 // `ContextManager::invoke_outlet_with_economy` so per-invocation pricing,
 // spending UCAN, velocity tracking, budget enforcement, and the hard
 // rate limit are enforced for Python / Node / Swift / Kotlin clients.
-// The structural assertions in `c4_tool_invoke_economy_*` below pin
+// The structural assertions in `c4_outlet_invoke_economy_*` below pin
 // the bridge → runtime delegation so a future refactor cannot silently
 // regress to the bypass path.
 const PYO3_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/outlets.rs");
@@ -64,7 +64,15 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 38;
+// Raised from 38 -> 52 by SCP-OUT-008: ratchet brought up to reflect the
+// current active-assertion count (total_tests=57 − 1 stale-ignore-comment
+// false-positive − meta_tests=4 = 52 active). Adds 5 new outlet-surface
+// assertions pinning register_outlet / invoke_outlet / deregister_outlet /
+// verify_outlet / update_outlet delegation from the 3 non-WASM FFI bridges
+// to the runtime pipeline — AC22. The negative meta-assertion
+// `out008_no_tool_symbols_in_outlet_assertion_table` counts toward the
+// meta_tests deduction below, not the active-assertion floor.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 52;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -493,10 +501,10 @@ fn governance_enforces_economic_policy() {
     );
 }
 
-// --- Per-DID anti-spam escalation for tool invocations (§19.7) ---
+// --- Per-DID anti-spam escalation for outlet invocations (§19.7) ---
 
 #[test]
-fn invoke_tool_with_economy_wires_escalation_and_rollback() {
+fn invoke_outlet_with_economy_wires_escalation_and_rollback() {
     // The manager wrapper must (a) call the free invoke_outlet, (b) record the
     // new velocity entry so compute_escalated_cost sees it, (c) thread the
     // per-context velocity_tracker and message_pricing into OutletEconomyContext,
@@ -526,13 +534,13 @@ fn invoke_tool_with_economy_wires_escalation_and_rollback() {
 
 /// D4: `invoke_outlet_with_economy` must reference the hard rate limit.
 /// Enforced structurally so a future refactor cannot silently drop
-/// the Matrix Synapse–style defense-in-depth cap on the tool path.
+/// the Matrix Synapse–style defense-in-depth cap on the outlet path.
 #[test]
-fn invoke_tool_with_economy_enforces_hard_rate_limit() {
+fn invoke_outlet_with_economy_enforces_hard_rate_limit() {
     assert!(
         fn_body_contains(MANAGER_SRC, "invoke_outlet_with_economy", "hard_rate_limit"),
         "invoke_outlet_with_economy must reference hard_rate_limit so the Matrix Synapse–style \
-         defense-in-depth cap is enforced on the tool path (D4)"
+         defense-in-depth cap is enforced on the outlet path (D4)"
     );
     assert!(
         fn_body_contains(MANAGER_SRC, "invoke_outlet_with_economy", "try_consume"),
@@ -544,27 +552,27 @@ fn invoke_tool_with_economy_enforces_hard_rate_limit() {
 /// D4: every Phase 1 failure branch in `invoke_outlet_with_economy`
 /// MUST refund the hard rate limit token. We expect at least 3 inline
 /// refund sites: `economy_pre_check` failure, `record_spend` failure,
-/// and `authorize_tool_payment` failure. Dropping any branch leaks a
+/// and `authorize_outlet_payment` failure. Dropping any branch leaks a
 /// rate-limit token on failure.
 #[test]
-fn invoke_tool_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
+fn invoke_outlet_with_economy_refunds_hard_rate_limit_on_every_phase1_failure() {
     let body = extract_fn_body(MANAGER_SRC, "invoke_outlet_with_economy")
         .expect("invoke_outlet_with_economy body must exist");
     let refund_sites = body.matches("hard_rate_limit.refund").count();
     assert!(
         refund_sites >= 3,
         "invoke_outlet_with_economy must have at least 3 inline hard_rate_limit.refund sites \
-         (economy_pre_check failure, record_spend failure, authorize_tool_payment failure); \
+         (economy_pre_check failure, record_spend failure, authorize_outlet_payment failure); \
          found {refund_sites}. Dropping any branch leaks a rate-limit token on failure."
     );
 }
 
 #[test]
-fn invoke_tool_with_economy_releases_lock_before_executor() {
+fn invoke_outlet_with_economy_releases_lock_before_executor() {
     // F1-F3 lock-split invariant: the caller-supplied executor must run
     // WITHOUT holding the `ContextManager.contexts` mutex. The wrapper
     // must explicitly release the Phase-1 lock before dispatching the
-    // executor. A mis-behaving tool executor blocked every concurrent
+    // executor. A mis-behaving outlet executor blocked every concurrent
     // manager call until this refactor landed; regressions here reintroduce
     // a process-wide stall bug.
     //
@@ -698,14 +706,14 @@ fn wasm_send_message_inspects_spending_ucan_and_economic_policy() {
     );
 }
 
-// C4 (#1606) — Bridge tool-invoke economy wiring
+// C4 (#1606) — Bridge outlet-invoke economy wiring
 //
-// All 3 non-WASM FFI bridges (PyO3, NAPI, UniFFI) MUST route tool
+// All 3 non-WASM FFI bridges (PyO3, NAPI, UniFFI) MUST route outlet
 // invocation through `ContextManager::invoke_outlet_with_economy`. The
 // previous bypass path called `try_consume_hard_rate_limit_*` directly
-// against the bridge-owned tool registry, which disabled per-invocation
+// against the bridge-owned outlet registry, which disabled per-invocation
 // pricing, spending UCAN AND-composition, velocity tracking, budget
-// enforcement, and the `ToolEconomyTicket` lifecycle for Python /
+// enforcement, and the `OutletEconomyTicket` lifecycle for Python /
 // Node / Swift / Kotlin clients.
 //
 // These structural assertions catch any future regression to the
@@ -715,7 +723,7 @@ fn wasm_send_message_inspects_spending_ucan_and_economic_policy() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn c4_pyo3_tool_invoke_routes_through_invoke_tool_with_economy() {
+fn c4_pyo3_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     assert!(
         fn_body_contains(PYO3_OUTLETS_SRC, "py_outlet_invoke", "invoke_outlet_with_economy"),
         "PyO3 py_outlet_invoke must call ContextManager::invoke_outlet_with_economy \
@@ -727,7 +735,7 @@ fn c4_pyo3_tool_invoke_routes_through_invoke_tool_with_economy() {
 }
 
 #[test]
-fn c4_pyo3_tool_invoke_accepts_spending_ucan() {
+fn c4_pyo3_outlet_invoke_accepts_spending_ucan() {
     // The bridge MUST accept the spending UCAN parameter — the
     // runtime's `invoke_outlet_with_economy` requires it for §19.5
     // AND-composition on paid actions.
@@ -736,7 +744,7 @@ fn c4_pyo3_tool_invoke_accepts_spending_ucan() {
     assert!(
         body.contains("spending_ucan"),
         "PyO3 py_outlet_invoke must accept and forward a spending UCAN argument \
-         (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
+         (PR #1606 / C4). Without it, paid outlet invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
@@ -747,25 +755,25 @@ fn c4_pyo3_tool_invoke_accepts_spending_ucan() {
 }
 
 #[test]
-fn c4_napi_tool_invoke_routes_through_invoke_tool_with_economy() {
+fn c4_napi_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     assert!(
         fn_body_contains(NAPI_OUTLETS_SRC, "outlet_invoke", "invoke_outlet_with_economy"),
         "NAPI outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). The previous bypass path called \
-         try_consume_hard_rate_limit against the bridge-owned tool registry, \
+         try_consume_hard_rate_limit against the bridge-owned outlet registry, \
          disabling per-invocation pricing, spending UCAN, velocity tracking, \
          and budget enforcement for Node clients."
     );
 }
 
 #[test]
-fn c4_napi_tool_invoke_accepts_spending_ucan() {
+fn c4_napi_outlet_invoke_accepts_spending_ucan() {
     let body =
         extract_fn_body(NAPI_OUTLETS_SRC, "outlet_invoke").expect("NAPI outlet_invoke body must exist");
     assert!(
         body.contains("spending_ucan_jwt"),
         "NAPI outlet_invoke must accept and forward a spending_ucan_jwt argument \
-         (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
+         (PR #1606 / C4). Without it, paid outlet invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
@@ -848,27 +856,27 @@ fn wasm_set_economic_policy_governance_rejects_paid_policy() {
 }
 
 #[test]
-fn c4_uniffi_tool_invoke_routes_through_invoke_tool_with_economy() {
+fn c4_uniffi_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     // `extract_fn_body` returns the first match, which is the
     // top-level `outlet_invoke` (not `outlet_invoke_cross_context`).
     assert!(
         fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_invoke", "invoke_outlet_with_economy"),
         "UniFFI outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). The previous bypass path called \
-         try_consume_hard_rate_limit against the bridge-owned tool registry, \
+         try_consume_hard_rate_limit against the bridge-owned outlet registry, \
          disabling per-invocation pricing, spending UCAN, velocity tracking, \
          and budget enforcement for Swift / Kotlin clients."
     );
 }
 
 #[test]
-fn c4_uniffi_tool_invoke_accepts_spending_ucan() {
+fn c4_uniffi_outlet_invoke_accepts_spending_ucan() {
     let body = extract_fn_body(UNIFFI_BRIDGE_SRC, "outlet_invoke")
         .expect("UniFFI outlet_invoke body must exist");
     assert!(
         body.contains("spending_ucan_jwt"),
         "UniFFI outlet_invoke must accept and forward a spending_ucan_jwt argument \
-         (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
+         (PR #1606 / C4). Without it, paid outlet invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
@@ -877,6 +885,214 @@ fn c4_uniffi_tool_invoke_accepts_spending_ucan() {
          before passing it to invoke_outlet_with_economy."
     );
 }
+
+// ===========================================================================
+// SCP-OUT-008 AC22 — outlet surface reaches runtime pipeline
+//
+// The FFI bridges MUST delegate register / invoke / deregister / verify /
+// update to the scp_core::context::tools runtime facade (which re-exports
+// the protocol-level outlet registry + runtime invocation pipeline).
+// Each outlet lifecycle verb is asserted on all 3 non-WASM FFI bridges
+// (PyO3, NAPI, UniFFI). invoke is already covered by the C4 assertions
+// above; these additions cover the remaining verbs.
+// ===========================================================================
+
+/// `register_outlet` reaches the runtime pipeline via the protocol-level
+/// registry function (`scp_core::context::tools::register_outlet`) from all
+/// three non-WASM FFI bridges.
+#[test]
+fn out008_register_outlet_reaches_runtime_pipeline() {
+    assert!(
+        fn_body_contains(PYO3_OUTLETS_SRC, "py_outlet_register", "register_outlet"),
+        "PyO3 py_outlet_register must delegate to scp_core::context::tools::register_outlet \
+         so outlet registration flows through the runtime pipeline (SCP-OUT-008 AC22)"
+    );
+    assert!(
+        fn_body_contains(NAPI_OUTLETS_SRC, "outlet_register", "register_outlet"),
+        "NAPI outlet_register must delegate to scp_core::context::tools::register_outlet \
+         so outlet registration flows through the runtime pipeline (SCP-OUT-008 AC22)"
+    );
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_register", "register_outlet"),
+        "UniFFI outlet_register must delegate to scp_core::context::tools::register_outlet \
+         so outlet registration flows through the runtime pipeline (SCP-OUT-008 AC22)"
+    );
+}
+
+/// `invoke_outlet` reaches the runtime pipeline via
+/// `ContextManager::invoke_outlet_with_economy` on all three non-WASM FFI
+/// bridges. The C4 assertions above cover the same invariant in isolation;
+/// this test asserts the 3-bridge set under the SCP-OUT-008 AC22 name so the
+/// outlet surface is enumerated uniformly with register / update / verify /
+/// deregister.
+#[test]
+fn out008_invoke_outlet_reaches_runtime_pipeline() {
+    assert!(
+        fn_body_contains(PYO3_OUTLETS_SRC, "py_outlet_invoke", "invoke_outlet_with_economy"),
+        "PyO3 py_outlet_invoke must call ContextManager::invoke_outlet_with_economy \
+         (SCP-OUT-008 AC22)"
+    );
+    assert!(
+        fn_body_contains(NAPI_OUTLETS_SRC, "outlet_invoke", "invoke_outlet_with_economy"),
+        "NAPI outlet_invoke must call ContextManager::invoke_outlet_with_economy \
+         (SCP-OUT-008 AC22)"
+    );
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_invoke", "invoke_outlet_with_economy"),
+        "UniFFI outlet_invoke must call ContextManager::invoke_outlet_with_economy \
+         (SCP-OUT-008 AC22)"
+    );
+}
+
+/// `update_outlet` reaches the runtime pipeline via the protocol-level
+/// registry function (`scp_core::context::tools::update_outlet`) from all
+/// three non-WASM FFI bridges.
+#[test]
+fn out008_update_outlet_reaches_runtime_pipeline() {
+    assert!(
+        fn_body_contains(PYO3_OUTLETS_SRC, "py_outlet_update", "update_outlet"),
+        "PyO3 py_outlet_update must delegate to scp_core::context::tools::update_outlet \
+         so outlet updates flow through the runtime pipeline (SCP-OUT-008 AC22)"
+    );
+    assert!(
+        fn_body_contains(NAPI_OUTLETS_SRC, "outlet_update", "update_outlet"),
+        "NAPI outlet_update must delegate to scp_core::context::tools::update_outlet \
+         so outlet updates flow through the runtime pipeline (SCP-OUT-008 AC22)"
+    );
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_update", "update_outlet"),
+        "UniFFI outlet_update must delegate to scp_core::context::tools::update_outlet \
+         so outlet updates flow through the runtime pipeline (SCP-OUT-008 AC22)"
+    );
+}
+
+/// `verify_outlet` reaches the runtime pipeline via the protocol-level
+/// registry function (`scp_core::context::tools::verify_outlet`) from all
+/// three non-WASM FFI bridges.
+#[test]
+fn out008_verify_outlet_reaches_runtime_pipeline() {
+    assert!(
+        fn_body_contains(PYO3_OUTLETS_SRC, "py_outlet_verify", "verify_outlet"),
+        "PyO3 py_outlet_verify must delegate to scp_core::context::tools::verify_outlet \
+         so outlet verification flows through the runtime pipeline (SCP-OUT-008 AC22)"
+    );
+    assert!(
+        fn_body_contains(NAPI_OUTLETS_SRC, "outlet_verify", "verify_outlet"),
+        "NAPI outlet_verify must delegate to scp_core::context::tools::verify_outlet \
+         so outlet verification flows through the runtime pipeline (SCP-OUT-008 AC22)"
+    );
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_verify", "verify_outlet"),
+        "UniFFI outlet_verify must delegate to scp_core::context::tools::verify_outlet \
+         so outlet verification flows through the runtime pipeline (SCP-OUT-008 AC22)"
+    );
+}
+
+/// `deregister_outlet` reaches the runtime pipeline via the protocol-level
+/// `outlet_registry` mutation (`OutletRegistry::remove`) from all three
+/// non-WASM FFI bridges. The protocol registry IS the runtime pipeline for
+/// outlet deregistration (no higher-level wrapper exists — mirrors the
+/// shape of register/update/verify which also delegate to registry-level
+/// functions).
+#[test]
+fn out008_deregister_outlet_reaches_runtime_pipeline() {
+    assert!(
+        fn_body_contains(PYO3_OUTLETS_SRC, "py_outlet_deregister", "outlet_registry"),
+        "PyO3 py_outlet_deregister must mutate the runtime outlet_registry \
+         (SCP-OUT-008 AC22)"
+    );
+    assert!(
+        fn_body_contains(NAPI_OUTLETS_SRC, "outlet_deregister", "outlet_registry"),
+        "NAPI outlet_deregister must mutate the runtime outlet_registry \
+         (SCP-OUT-008 AC22)"
+    );
+    assert!(
+        fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_deregister", "outlet_registry"),
+        "UniFFI outlet_deregister must mutate the runtime outlet_registry \
+         (SCP-OUT-008 AC22)"
+    );
+}
+
+/// Negative assertion: no `tool_*` runtime-pipeline symbols remain in the
+/// pipeline_wiring assertion table. After the SCP-OUT-002/004/005/006
+/// rename, every outlet-surface assertion references `outlet_*` and
+/// `invoke_outlet_with_economy` — any `tool_*` symbol appearing in a
+/// live assertion (outside this negative meta-test, its own forbidden list,
+/// and the MCP external boundary vocabulary) indicates the rename regressed.
+///
+/// The forbidden symbols are deliberately quoted with angle-brackets instead
+/// of parentheses so this meta-test's own forbidden list does NOT contain
+/// literal `tool_*` tokens that would self-match. The check rebuilds the
+/// actual runtime-pipeline token from an angle-bracket-quoted template at
+/// runtime before scanning the source.
+/// Rebuild the literal tool_* token from an angle-bracket-quoted template,
+/// preserving the original capitalization (so "T<>l" → "Tool", "t<>l" →
+/// "tool"). Used by the `out008_no_tool_symbols_in_outlet_assertion_table`
+/// meta-test so this file can list forbidden tokens without self-matching.
+fn unquote_tool_template(template: &str) -> String {
+    template.replace("T<>l", "Tool").replace("t<>l", "tool")
+}
+
+#[test]
+fn out008_no_tool_symbols_in_outlet_assertion_table() {
+    let source = include_str!("pipeline_wiring.rs");
+
+    // Forbidden-list entries are angle-bracket-quoted templates rather than
+    // the literal tool_* strings so this test's own body does not match.
+    // Each template maps t<>l to `tool` at runtime via `unquote_tool_template`.
+    let forbidden_templates: &[&str] = &[
+        "invoke_t<>l_with_economy",
+        "register_t<>l(",
+        "update_t<>l(",
+        "verify_t<>l(",
+        "deregister_t<>l(",
+        "T<>lRegistration",
+        "T<>lRegistry",
+        "T<>lSchema",
+        "T<>lEconomyTicket",
+    ];
+
+    // Build the stripped source: replace this function's body with a
+    // placeholder so the forbidden-list templates in our source code do
+    // not themselves self-match after unquoting. We use a sentinel comment
+    // marker rather than brace matching so string literals and nested
+    // braces don't confuse us.
+    let self_fn = "fn out008_no_tool_symbols_in_outlet_assertion_table";
+    let end_marker = "// END_OF_OUT008_NO_TOOL_SYMBOLS_FN";
+    let cleaned: String = source.find(self_fn).map_or_else(
+        || source.to_string(),
+        |start| {
+            let after = &source[start..];
+            after.find(end_marker).map_or_else(
+                || source.to_string(),
+                |end_off| {
+                    let abs_end = start + end_off + end_marker.len();
+                    format!(
+                        "{}\n{}_STRIPPED_FOR_SELF_CHECK\n{}",
+                        &source[..start],
+                        self_fn,
+                        &source[abs_end..]
+                    )
+                },
+            )
+        },
+    );
+
+    let mut hits: Vec<String> = Vec::new();
+    for template in forbidden_templates {
+        let needle = unquote_tool_template(template);
+        if cleaned.contains(&needle) {
+            hits.push(needle);
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "pipeline_wiring.rs assertion table still references tool_* runtime-pipeline \
+         symbols after SCP-OUT-008 rename: {hits:?}. Rename them to outlet_* or \
+         remove the assertion."
+    );
+}
+// END_OF_OUT008_NO_TOOL_SYMBOLS_FN
 
 // ===========================================================================
 // Batch 3 — Transport/infra wiring (all #[ignore] until implemented)
@@ -1025,7 +1241,7 @@ fn pipeline_active_assertions_never_decrease() {
         .filter(|line| line.trim() == "#[test]")
         .count();
     let ignored = source.matches("#[ignore = \"").count();
-    let meta_tests = 3; // this test + claude_md_enforcement_sections_present + no_stale_ignores
+    let meta_tests = 4; // this test + claude_md_enforcement_sections_present + no_stale_ignores + out008_no_tool_symbols_in_outlet_assertion_table
     let active = total_tests - ignored - meta_tests;
     assert!(
         active >= MIN_ACTIVE_PIPELINE_ASSERTIONS,

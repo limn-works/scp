@@ -78,7 +78,7 @@ while IFS= read -r line; do
 
     # Hunk headers: detect #[cfg(test)] and impl blocks in context
     # Git hunk headers show the enclosing scope after the second @@:
-    #   @@ -100,5 +100,7 @@ impl ToolRegistry {
+    #   @@ -100,5 +100,7 @@ impl OutletRegistry {
     if [[ "$line" =~ ^@@.*@@ ]]; then
         if [[ "$line" == *"cfg(test)"* ]]; then
             IN_CFG_TEST=1
@@ -176,21 +176,34 @@ for i in "${!NEW_PUB_FNS[@]}"; do
     found=0
 
     if [[ -n "$FFI_ADDED" ]]; then
+        # Use `grep -c` rather than `grep -q` here: under `set -o pipefail`,
+        # `grep -q` exits as soon as it finds a match, causing `echo` to
+        # receive SIGPIPE, which pipefail then propagates as a pipeline
+        # failure — even though the match succeeded. `grep -c` reads the
+        # entire input, avoiding the SIGPIPE, and we check the count.
+
         # Exact name match (word boundary — prevents "send" matching "send_message")
-        if echo "$FFI_ADDED" | grep -qw "$fn_name"; then
+        count=$(echo "$FFI_ADDED" | grep -cw "$fn_name" || true)
+        if [[ "$count" -gt 0 ]]; then
             found=1
         fi
 
         # PyO3 py_ prefix
-        if [[ $found -eq 0 ]] && echo "$FFI_ADDED" | grep -qw "py_${fn_name}"; then
-            found=1
+        if [[ $found -eq 0 ]]; then
+            count=$(echo "$FFI_ADDED" | grep -cw "py_${fn_name}" || true)
+            if [[ "$count" -gt 0 ]]; then
+                found=1
+            fi
         fi
 
         # camelCase conversion: foo_bar_baz → fooBarBaz
         # Use perl (not sed) — BSD sed on macOS doesn't support \U
-        camel=$(echo "$fn_name" | perl -pe 's/_([a-z])/uc($1)/ge')
-        if [[ $found -eq 0 ]] && echo "$FFI_ADDED" | grep -qw "$camel"; then
-            found=1
+        if [[ $found -eq 0 ]]; then
+            camel=$(echo "$fn_name" | perl -pe 's/_([a-z])/uc($1)/ge')
+            count=$(echo "$FFI_ADDED" | grep -cw "$camel" || true)
+            if [[ "$count" -gt 0 ]]; then
+                found=1
+            fi
         fi
     fi
 

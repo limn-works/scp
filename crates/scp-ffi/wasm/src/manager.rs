@@ -6286,13 +6286,13 @@ mod tests {
             serde_json::json!({"AddMember": {"did": "d", "role": "r"}}),
             serde_json::json!({"RemoveMember": {"did": "d", "reason": null}}),
             serde_json::json!({"ChangeRole": {"did": "d", "new_role": "r"}}),
-            serde_json::json!({"RegisterTool": {"registration": {
+            serde_json::json!({"RegisterOutlet": {"registration": {
                 "outlet_id": "t", "name": "n", "description": "d",
                 "schema": {"input_schema": {}, "output_schema": {}},
                 "implementation_hash": vec![0u8; 32], "test_vectors": [],
                 "operator_did": "did:dht:zop"
             }}}),
-            serde_json::json!({"RemoveTool": {"outlet_id": "t"}}),
+            serde_json::json!({"RemoveOutlet": {"outlet_id": "t"}}),
             serde_json::json!({"ModifyCeiling": {"new_ceiling": []}}),
             serde_json::json!({"CloseContext": {"reason": null}}),
             serde_json::json!({"ExtendTtl": {"additional_secs": 1}}),

@@ -6,7 +6,7 @@
     clippy::too_many_lines
 )]
 
-//! C4 (#1606) — Bridge tool-invoke economy wiring integration test.
+//! C4 (#1606) — Bridge outlet-invoke economy wiring integration test.
 //!
 //! Verifies that `ContextManager::invoke_outlet_with_economy` — the SINGLE
 //! entry point all 3 non-WASM FFI bridges (PyO3, NAPI, UniFFI) now route
@@ -15,10 +15,10 @@
 //! returns the executor output, and produces a `OutletInvokedEvent` with
 //! the correct cost.
 //!
-//! Before C4 the bridges bypassed this method entirely and tools cost
+//! Before C4 the bridges bypassed this method entirely and outlets cost
 //! ZERO from a Python/Node/Swift/Kotlin client's perspective regardless
 //! of `EconomicPolicy`. The pipeline_wiring assertions cover the
-//! structural fact that the bridge tool-invoke functions now CALL
+//! structural fact that the bridge outlet-invoke functions now CALL
 //! `invoke_outlet_with_economy`; this test covers the runtime semantics
 //! that the bridges' delegations now inherit.
 //!
@@ -263,7 +263,7 @@ fn echo_outlet() -> OutletRegistration {
     OutletRegistration {
         outlet_id: "echo".to_owned(),
         name: "echo".to_owned(),
-        description: "echo tool for C4 wiring test".to_owned(),
+        description: "echo outlet for C4 wiring test".to_owned(),
         schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
@@ -409,7 +409,7 @@ fn signed_spending_ucan_for(actor_did: &DID) -> scp_core::crypto::ucan::UcanToke
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
+async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
     // C1b: happy-path invocations now require a fully signed spending UCAN
     // bound to the invoker DID. Use mock_key_resolver so validate_spending_ucan_signed
     // can resolve the verifying key, and signed_spending_ucan_for to produce a
@@ -422,7 +422,7 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
     );
 
     let invoker = DID::from("did:key:invoker");
-    let context_id = "ctx-c4-tool-economy".to_owned();
+    let context_id = "ctx-c4-outlet-economy".to_owned();
     let mut params = governance_params_with_tools();
     params.economic_policy = Some(priced_policy(7));
 
@@ -470,7 +470,7 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
             |input: serde_json::Value| async move { Ok(serde_json::json!({"echoed": input})) },
         )
         .await
-        .expect("invoke_outlet_with_economy must succeed for free-budget paid tool");
+        .expect("invoke_outlet_with_economy must succeed for free-budget paid outlet");
 
     // Verify the executor ran and produced the expected output.
     assert_eq!(
@@ -513,7 +513,7 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
     );
     assert_eq!(
         outcome.event.outlet_id, "echo",
-        "OutletInvokedEvent.outlet_id must match the invoked tool"
+        "OutletInvokedEvent.outlet_id must match the invoked outlet"
     );
     assert_eq!(
         outcome.event.invoker_did, invoker,
@@ -533,7 +533,7 @@ async fn invoke_tool_with_economy_deducts_budget_and_records_velocity() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn invoke_tool_with_economy_rejects_insufficient_budget() {
+async fn invoke_outlet_with_economy_rejects_insufficient_budget() {
     let manager = ContextManager::new(
         Box::new(MockCrypto),
         Box::new(MockTransport::connected()),
@@ -544,7 +544,7 @@ async fn invoke_tool_with_economy_rejects_insufficient_budget() {
     let invoker = DID::from("did:key:invoker");
     let context_id = "ctx-c4-budget-rejected".to_owned();
     let mut params = governance_params_with_tools();
-    // Price the tool above any granted budget.
+    // Price the outlet above any granted budget.
     params.economic_policy = Some(priced_policy(100));
 
     let _handle = manager

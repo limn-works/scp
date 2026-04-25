@@ -174,6 +174,7 @@ class TestBridgeGuard:
     async def test_invoke_cross_context_without_bridge(self) -> None:
         with patch("scp_sdk.outlets._scp_core", None):
             with pytest.raises(ContextError):
+                # SCP-DEFAULT-INSTANCE-OK: OutletNamespace.invoke_cross_context method, not deprecated free function
                 await _ns().invoke_cross_context(
                     target=_DUMMY_CTX_TGT,
                     outlet_id=_DUMMY_OUTLET,
@@ -214,6 +215,7 @@ class TestInvokeCrossContext:
         mock_bridge = MagicMock()
         mock_bridge.context_outlet_invoke_cross_context.return_value = {"ok": True}
         with patch("scp_sdk.outlets._scp_core", mock_bridge):
+            # SCP-DEFAULT-INSTANCE-OK: OutletNamespace.invoke_cross_context method, not deprecated free function
             result = await _ns().invoke_cross_context(
                 target=_DUMMY_CTX_TGT,
                 outlet_id=_DUMMY_OUTLET,
@@ -232,11 +234,13 @@ class TestInvokeCrossContext:
                 input={"x": 1},
                 ucan=_DUMMY_UCAN,
             )
+            # SCP-DEFAULT-INSTANCE-OK: OutletNamespace.invoke_cross_context method, not deprecated free function
             result = await _ns().invoke_cross_context(opts)
         assert result == {"ok": True}
 
     async def test_missing_required_rejected(self) -> None:
         with pytest.raises(ValidationError):
+            # SCP-DEFAULT-INSTANCE-OK: OutletNamespace.invoke_cross_context method, not deprecated free function
             await _ns().invoke_cross_context(
                 target=_DUMMY_CTX_TGT,
                 input={},
@@ -251,6 +255,7 @@ class TestInvokeCrossContext:
             ucan=_DUMMY_UCAN,
         )
         with pytest.raises(ValidationError):
+            # SCP-DEFAULT-INSTANCE-OK: OutletNamespace.invoke_cross_context method, not deprecated free function
             await _ns().invoke_cross_context(opts, target=_DUMMY_CTX_TGT)
 
     @pytest.mark.parametrize("depth", [-1, 256, 1.5, True, False])
@@ -258,6 +263,7 @@ class TestInvokeCrossContext:
         mock_bridge = MagicMock()
         with patch("scp_sdk.outlets._scp_core", mock_bridge):
             with pytest.raises(ValidationError):
+                # SCP-DEFAULT-INSTANCE-OK: OutletNamespace.invoke_cross_context method, not deprecated free function
                 await _ns().invoke_cross_context(
                     target=_DUMMY_CTX_TGT,
                     outlet_id=_DUMMY_OUTLET,

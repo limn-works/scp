@@ -27,6 +27,28 @@
 "after"
 "token"
 
+# Outlet-vocabulary tokens that may appear in payload-carrying ClientMessage
+# variants (bridge registrations, cross-context forwards, catalog-key fields).
+# SCP-OUT-008 adds these alongside the legacy tool_ spellings so the fuzzer
+# exercises both the new vocabulary AND rejection of the legacy form per
+# ADR-049 §1 (hard break, no aliases).
+"outlet_id"
+"outlet_register"
+"outlet_invoke"
+"outlet_update"
+"outlet_deregister"
+"outlet_verify"
+
+# Retained legacy tool_* tokens as INVALID-input corpus entries. Any observed
+# behavior under `tool_*` inputs should return an OldFormatRejected or
+# OutletErrorClass::Protocol::UnknownOperation error.
+"tool_id"
+"tool_register"
+"tool_invoke"
+"tool_update"
+"tool_deregister"
+"tool_verify"
+
 # MessagePack fixmap headers (map with N items)
 "\x81"
 "\x82"

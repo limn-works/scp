@@ -130,45 +130,95 @@ ALIASES: dict[tuple[str, str], dict[str, list[str]]] = {
         "kotlin": ["validateBroadcastKeyHex"],
         "swift": ["validateBroadcastKeyHex"],
     },
-    # Tools -- TypeScript uses domain-prefixed naming
-    ("Tools", "register"): {
-        "typescript": ["registerTool"],
+    # Outlets -- domain-prefixed naming where the bare verb would be ambiguous.
+    # `register`, `invoke`, `verify`, `update`, `list`, `get`, `deregister` live
+    # on the OutletNamespace class in every SDK (ctx.outlets.register(),
+    # ctx.outlets.invoke(), etc.), so the bare method name is present in the
+    # extracted symbol set. Cross-context and session verbs use the outlet
+    # prefix on bridges that flatten the namespace onto the Context surface.
+    ("Outlets", "register"): {
+        "python": ["register"],
+        "typescript": ["register", "registerOutlet"],
+        "kotlin": ["register"],
+        "swift": ["register"],
     },
-    ("Tools", "invoke"): {
+    ("Outlets", "invoke"): {
         "python": ["invoke"],
-        "typescript": ["invokeTool"],
+        "typescript": ["invoke", "invokeOutlet"],
+        "kotlin": ["invoke"],
+        "swift": ["invoke"],
     },
-    ("Tools", "verify"): {
+    ("Outlets", "verify"): {
         "python": ["verify"],
-        "typescript": ["verifyTool"],
+        "typescript": ["verify", "verifyOutlet"],
+        "kotlin": ["verify"],
+        "swift": ["verify"],
     },
-    ("Tools", "invoke_cross_context"): {
-        "typescript": ["toolInvokeCrossContext"],
-        "swift": ["toolInvokeCrossContext"],
+    ("Outlets", "update"): {
+        "python": ["update"],
+        "typescript": ["update", "updateOutlet"],
+        "kotlin": ["update"],
+        "swift": ["update"],
     },
-    ("Tools", "session_create"): {
-        "typescript": ["toolSessionCreate"],
-        "swift": ["toolSessionCreate"],
+    ("Outlets", "deregister"): {
+        "python": ["deregister"],
+        "typescript": ["deregister", "deregisterOutlet"],
+        "kotlin": ["deregister"],
+        "swift": ["deregister"],
     },
-    ("Tools", "session_invoke"): {
-        "typescript": ["toolSessionInvoke"],
-        "swift": ["toolSessionInvoke"],
+    ("Outlets", "list"): {
+        "python": ["list"],
+        "typescript": ["list"],
+        "kotlin": ["list"],
+        "swift": ["list"],
     },
-    ("Tools", "session_close"): {
-        "typescript": ["toolSessionClose"],
-        "swift": ["toolSessionClose"],
+    ("Outlets", "get"): {
+        "python": ["get"],
+        "typescript": ["get"],
+        "kotlin": ["get"],
+        "swift": ["get"],
     },
-    ("Tools", "interface_expose"): {
-        "typescript": ["exposeToolInterface"],
-        "swift": ["exposeToolInterface"],
+    ("Outlets", "invoke_cross_context"): {
+        "python": ["invoke_cross_context"],
+        "typescript": ["invokeCrossContext", "outletInvokeCrossContext"],
+        "kotlin": ["invokeCrossContext"],
+        "swift": ["invokeCrossContext", "outletInvokeCrossContext"],
     },
-    ("Tools", "interface_accept"): {
-        "typescript": ["acceptToolInterface"],
-        "swift": ["acceptToolInterface"],
+    ("Outlets", "session_create"): {
+        "python": ["open"],
+        "typescript": ["open", "outletSessionCreate"],
+        "kotlin": ["open"],
+        "swift": ["open", "outletSessionCreate"],
     },
-    ("Tools", "interface_revoke"): {
-        "typescript": ["revokeToolInterface"],
-        "swift": ["revokeToolInterface"],
+    ("Outlets", "session_invoke"): {
+        "python": ["invoke"],
+        "typescript": ["invoke", "outletSessionInvoke"],
+        "kotlin": ["invoke"],
+        "swift": ["invoke", "outletSessionInvoke"],
+    },
+    ("Outlets", "session_close"): {
+        "python": ["close"],
+        "typescript": ["close", "outletSessionClose"],
+        "kotlin": ["close"],
+        "swift": ["close", "outletSessionClose"],
+    },
+    ("Outlets", "interface_expose"): {
+        "python": ["expose", "propose"],
+        "typescript": ["exposeOutletInterface", "propose"],
+        "kotlin": ["propose"],
+        "swift": ["exposeOutletInterface", "propose"],
+    },
+    ("Outlets", "interface_accept"): {
+        "python": ["accept"],
+        "typescript": ["acceptOutletInterface", "accept"],
+        "kotlin": ["accept"],
+        "swift": ["acceptOutletInterface", "accept"],
+    },
+    ("Outlets", "interface_revoke"): {
+        "python": ["revoke"],
+        "typescript": ["revokeOutletInterface", "revoke"],
+        "kotlin": ["revoke"],
+        "swift": ["revokeOutletInterface", "revoke"],
     },
     # Governance -- uses different naming in all SDKs
     ("Governance", "execute_action"): {

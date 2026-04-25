@@ -51,4 +51,20 @@
 "scp:ctx:"
 "messages:write"
 "messages:read"
+
+# Outlet capability URIs (SCP-OUT-008 — post-rename vocabulary).
+# Wire form uses underscore; SDK-facing display form uses colon (ADR-049 §1).
+# The split outlet_query: / outlet_call: stems land in SCP-OUT-020; this
+# story adds outlet_invoke: as a placeholder so the fuzzer still exercises
+# the capability-URI parser on outlet-vocabulary tokens.
+"outlet_invoke:*"
+"outlet_query:*"
+"outlet_call:*"
+"outlet:query:*"
+"outlet:call:*"
+
+# Retained: legacy tool_invoke:* is an INVALID-input corpus entry per ADR-049
+# (hard break, no aliases). The fuzzer should exercise rejection of the
+# legacy form — either as `OldFormatRejected` or as
+# `OutletErrorClass::Protocol::UnknownOperation`.
 "tool_invoke:*"

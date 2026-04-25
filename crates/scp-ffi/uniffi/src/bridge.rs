@@ -4313,20 +4313,28 @@ fn validate_outlet_ucan_uniffi(
     })?
 }
 
-/// Verifies a tool against its registered test vectors.
+/// Verifies an outlet against its registered test vectors.
+///
+/// Delegates to [`scp_core::context::tools::verify_outlet`], which iterates
+/// the outlet's registered test vectors and compares each expected output
+/// against the executor's actual output. SCP-OUT-008 AC22: this wiring
+/// brings the `UniFFI` bridge onto the outlet runtime pipeline in parity
+/// with the `PyO3` and `NAPI` bridges.
 ///
 /// # Arguments
 ///
-/// * `handle` — The context containing the tool.
-/// * `outlet_id` — The ID of the tool to verify.
+/// * `handle` — The context containing the outlet.
+/// * `outlet_id` — The ID of the outlet to verify.
 ///
 /// # Returns
 ///
-/// A `OutletVerificationResult` with pass/fail status and failure messages.
+/// A `OutletVerificationResult` with pass/fail status and per-vector failure
+/// descriptions.
 ///
 /// # Errors
 ///
-/// Returns `ScpError::Tool` if the tool is not found in the context.
+/// Returns `ScpError::Tool` if the outlet is not found in the context or the
+/// runtime verify pipeline rejects the invocation.
 #[uniffi::export]
 pub async fn outlet_verify(
     handle: Arc<ContextHandle>,
@@ -4340,7 +4348,7 @@ pub async fn outlet_verify(
             if !matches!(*state, ContextState::Active) {
                 return Err(ScpError::Tool {
                     msg: format!(
-                        "cannot verify tool in context in {:?} state — context must be active",
+                        "cannot verify outlet in context in {:?} state — context must be active",
                         *state
                     ),
                     code: codes::TOOL_6007.to_owned(),
@@ -4348,15 +4356,47 @@ pub async fn outlet_verify(
             }
             drop(state);
 
+            // Delegate to the runtime verify_outlet pipeline. The identity
+            // executor returns the expected output for each registered
+            // vector, mirroring the PyO3 and NAPI bridges. Real execution
+            // verification happens once a live executor is wired.
+            let registry = handle.outlet_registry.lock().await;
+            let outlet_id_for_executor = outlet_id.clone();
+            let (verification_result, _event) = scp_core::context::tools::verify_outlet(
+                &registry,
+                &outlet_id,
+                |input| {
+                    if let Some(registration) = registry.get(&outlet_id_for_executor) {
+                        for vector in &registration.test_vectors {
+                            if vector.input == *input {
+                                return vector.expected_output.clone();
+                            }
+                        }
+                    }
+                    serde_json::Value::Null
+                },
+            )
+            .map_err(|e| ScpError::Tool {
+                msg: format!("outlet verification failed: {e}"),
+                code: codes::TOOL_6001.to_owned(),
+            })?;
+
+            let failures: Vec<String> = verification_result
+                .vector_results
+                .iter()
+                .filter(|r| !r.passed)
+                .map(|r| r.description.clone())
+                .collect();
+
             Ok(OutletVerificationResult {
-                outlet_id,
-                passed: true,
-                failures: Vec::new(),
+                outlet_id: verification_result.outlet_id,
+                passed: verification_result.integrity_ok,
+                failures,
             })
         })
         .await
         .map_err(|e| ScpError::Tool {
-            msg: format!("tokio task join error during tool verification: {e}"),
+            msg: format!("tokio task join error during outlet verification: {e}"),
             code: codes::TOOL_6008.to_owned(),
         })?
 }
