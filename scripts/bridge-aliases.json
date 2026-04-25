@@ -2451,6 +2451,40 @@
       "wasm": [
         "access_key_restore"
       ]
+    },
+    {
+      "canonical": "context_governance_get_proposal",
+      "category": "governance",
+      "wasm_required": true,
+      "pyo3": [
+        "governance_get_proposal"
+      ],
+      "uniffi": [
+        "governance_get_proposal"
+      ],
+      "napi": [
+        "context_governance_get_proposal"
+      ],
+      "wasm": [
+        "context_governance_get_proposal"
+      ]
+    },
+    {
+      "canonical": "context_governance_list_proposals",
+      "category": "governance",
+      "wasm_required": true,
+      "pyo3": [
+        "governance_list_proposals"
+      ],
+      "uniffi": [
+        "governance_list_proposals"
+      ],
+      "napi": [
+        "context_governance_list_proposals"
+      ],
+      "wasm": [
+        "context_governance_list_proposals"
+      ]
     }
   ],
   "exemptions": {

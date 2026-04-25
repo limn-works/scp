@@ -1220,6 +1220,8 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "context_governance_approve",
     "context_governance_reject",
     "context_governance_withdraw",
+    "context_governance_get_proposal",
+    "context_governance_list_proposals",
     // Context lifecycle (6)
     "context_finalize_close",
     "context_apply_pending_ceiling_modification",
