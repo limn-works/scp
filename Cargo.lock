@@ -5386,6 +5386,7 @@ dependencies = [
  "getrandom 0.3.4",
  "hex",
  "hkdf",
+ "hmac",
  "jsonschema",
  "lru 0.16.3",
  "metrics",

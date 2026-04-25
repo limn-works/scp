@@ -42,6 +42,7 @@
 //! - [`OutletErrorCode`] -- Error code enum. (Re-exported from [`lifecycle`].)
 //! - [`OutletCancel`] -- Cancellation request. (Re-exported from [`lifecycle`].)
 
+pub mod errors;
 pub mod integrity;
 pub mod interface;
 pub mod lifecycle;

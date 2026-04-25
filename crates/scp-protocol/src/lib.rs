@@ -43,3 +43,18 @@ pub use context::outlets::{
     OutletUpdatedEvent, OutletVerifiedEvent, OutletVerifiedReason,
 };
 pub use context::roles::OutletId;
+
+// Typed §5.4.4 OutletError envelope and supporting types (SCP-OUT-024 / ADR-049
+// §4). The `errors` submodule provides the typed envelope struct under that
+// path because the crate-root `OutletError` name is currently bound to the
+// legacy thiserror enum (re-exported above). Stories SCP-OUT-027 / 036 / 038
+// retire the legacy enum and promote the typed envelope to the crate-root
+// `OutletError` slot; until that migration lands, downstream code reaches the
+// typed envelope via `scp_protocol::context::outlets::errors::OutletError` or
+// the convenience alias [`OutletErrorEnvelope`] re-exported below.
+pub use context::outlets::errors::{
+    CATALOG_KEY_MAX_BYTES, CatalogKey, CatalogKeyError, ContextHop, DetailBody, DetailKind,
+    MESSAGE_MAX_BYTES, OUTLET_MESSAGE_KEY_LEN, OutletError as OutletErrorEnvelope,
+    OutletErrorClass, OutletErrorConstructionFailed, PAD_NONCE_LEN, REGISTRATION_EVENT_ID_LEN,
+    RelayUrlKind, RetryPolicy, WIRE_MESSAGE_LEN, validate_catalog_key, validate_outlet_error_code,
+};
