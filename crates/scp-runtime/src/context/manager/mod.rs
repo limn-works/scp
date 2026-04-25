@@ -19,10 +19,7 @@ use super::ContextHandle;
 use super::builder::{
     ContextEventLogProvider, ContextTransportProvider, create_context as builder_create_context,
 };
-use super::governance::timeout::{
-    DeadlockDetectionState, GovernanceTimeoutTask, collect_active_voters,
-    process_pending_proposals, update_detection_state,
-};
+use super::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
 use super::supervisor::Supervisor;
 use super::ttl::{CloseResult, TtlExtension, TtlTimer};
 use scp_identity::DID;
@@ -1081,7 +1078,13 @@ impl GovernanceState {
     /// state:
     /// - `participation_cache`: removes DIDs not in `last_known_members`.
     /// - `cooldown_until`: removes entries where `now >= expiry`.
-    fn evict_stale_entries(&mut self, now: u64) {
+    ///
+    /// Visibility widened to `pub(crate)` in ADR-049 commit 12c.9g.1 so
+    /// the hoisted
+    /// [`crate::context::governance_helpers::start_governance_timeout_task`]
+    /// free function can call it from outside the `manager/` submodule
+    /// tree.
+    pub(crate) fn evict_stale_entries(&mut self, now: u64) {
         // M25: O(1) membership check per entry via HashSet::contains.
         // last_known_members is HashSet<DID> which implements Borrow<str>,
         // so we can look up &str keys directly.
@@ -2822,6 +2825,9 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::ContextNotRegistered`] if `context_id`
     /// is not in the map.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::lock_context`] free function
+    /// (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
     pub(crate) async fn lock_context(
         &self,
         context_id: &str,
@@ -2832,13 +2838,12 @@ impl ContextManager {
         ),
         ContextError,
     > {
-        let arc = self.get_context_arc(context_id)?;
-        let guard = arc.lock_owned().await;
-        let token = ContextGeneration {
-            context_id: context_id.to_owned(),
-            generation: guard.generation,
-        };
-        Ok((guard, token))
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::lock_context — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::manager_methods::lock_context(&sup, context_id).await
     }
 
     /// Reacquires the per-context `Mutex` and verifies the generation
@@ -2850,19 +2855,20 @@ impl ContextManager {
     ///
     /// - [`ContextError::ContextNotRegistered`] if the context is gone.
     /// - [`ContextError::PermissionDenied`] if the generation changed.
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::relock_context`] free function
+    /// (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
     pub(crate) async fn relock_context(
         &self,
         token: &ContextGeneration,
     ) -> Result<tokio::sync::OwnedMutexGuard<PerContextState>, ContextError> {
-        let arc = self.get_context_arc(&token.context_id)?;
-        let guard = arc.lock_owned().await;
-        if guard.generation != token.generation {
-            return Err(ContextError::PermissionDenied(format!(
-                "context {} was removed and recreated (generation {} != {})",
-                token.context_id, guard.generation, token.generation,
-            )));
-        }
-        Ok(guard)
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::relock_context — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::manager_methods::relock_context(&sup, token).await
     }
 
     /// Clones the `Arc<Mutex<PerContextState>>` for a context without
@@ -2873,14 +2879,19 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::ContextNotRegistered`] if the context is
     /// not in the map.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::get_context_arc`] free function
+    /// (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
     pub(crate) fn get_context_arc(
         &self,
         context_id: &str,
     ) -> Result<Arc<Mutex<PerContextState>>, ContextError> {
-        self.contexts
-            .get(context_id)
-            .map(|entry| Arc::clone(entry.value()))
-            .ok_or_else(|| ContextError::ContextNotRegistered(context_id.to_owned()))
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::get_context_arc — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::manager_methods::get_context_arc(&sup, context_id)
     }
 
     // -------------------------------------------------------------------
@@ -2898,11 +2909,19 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::ContextNotRegistered`] if the context is
     /// unknown.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::get_context_arc_pub`] free
+    /// function (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
     pub(crate) fn get_context_arc_pub(
         &self,
         context_id: &str,
     ) -> Result<Arc<Mutex<PerContextState>>, ContextError> {
-        self.get_context_arc(context_id)
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "ContextManager::get_context_arc_pub — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::manager_methods::get_context_arc_pub(&sup, context_id)
     }
 
     /// Destructively move per-context state out of the manager's
@@ -3339,31 +3358,30 @@ impl ContextManager {
     /// Assigns a monotonically increasing generation counter so that
     /// [`relock_context`](Self::relock_context) can detect remove-and-recreate
     /// races.
-    #[allow(clippy::needless_pass_by_value)] // DashMap::entry takes ownership
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::insert_context`] free function
+    /// (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
     pub(crate) fn insert_context(
         &self,
         context_id: String,
-        mut state: PerContextState,
+        state: PerContextState,
     ) -> Result<(), ContextCreationError> {
-        use dashmap::mapref::entry::Entry;
-        let generation = self
-            .next_generation
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        state.generation = generation;
-        match self.contexts.entry(context_id.clone()) {
-            Entry::Occupied(_) => Err(ContextCreationError::CreationFailed(format!(
-                "context '{context_id}' already registered"
-            ))),
-            Entry::Vacant(v) => {
-                v.insert(Arc::new(Mutex::new(state)));
-                Ok(())
-            }
-        }
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextCreationError::CreationFailed(
+                "ContextManager::insert_context — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::manager_methods::insert_context(&sup, context_id, state)
     }
 
     /// Remove a context from the map, returning its state `Arc` if it existed.
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::remove_context`] free function
+    /// (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
     pub(crate) fn remove_context(&self, context_id: &str) -> Option<Arc<Mutex<PerContextState>>> {
-        self.contexts.remove(context_id).map(|(_, v)| v)
+        let sup = self.supervisor()?;
+        crate::context::manager_methods::remove_context(&sup, context_id)
     }
 
     /// Check if a context is registered.
@@ -3373,6 +3391,7 @@ impl ContextManager {
     }
 
     /// Number of registered contexts.
+    #[allow(dead_code)] // ADR-049 commit 12c.9g.1: only caller (`update_context_gauges`) hoisted to free function.
     pub(super) fn context_count(&self) -> usize {
         self.contexts.len()
     }
@@ -3409,9 +3428,15 @@ impl ContextManager {
     /// Use this to guard snapshot creation so that expensive deep-clones
     /// of `PerContextState` are skipped when no persistence provider
     /// exists (the common case for most bridges).
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::has_persistence`] free function
+    /// (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
     #[inline]
     pub(crate) fn has_persistence(&self) -> bool {
-        self.persistence.is_some()
+        // On a detached supervisor the helper returns `false` — observably
+        // identical to the legacy method when there is no persistence.
+        self.supervisor()
+            .is_some_and(|sup| crate::context::manager_methods::has_persistence(&sup))
     }
 
     /// Persists a context snapshot if a persistence provider is configured.
@@ -3433,131 +3458,82 @@ impl ContextManager {
     /// Called after mutations that change context count or buffer state.
     /// Takes the contexts lock, so callers must NOT hold it. Best-effort:
     /// if no metrics recorder is installed, these are no-ops (#1467).
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::update_context_gauges`] free
+    /// function (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
     pub(crate) fn update_context_gauges(&self) {
-        crate::metrics::set_active_contexts(self.context_count());
-        // Collect Arcs first to release DashMap shard locks.
-        let arcs = self.collect_context_arcs();
-        let mut total_buffered: usize = 0;
-        for (_id, arc) in arcs {
-            // Use try_lock to avoid convoy effects: metrics are approximate,
-            // so skipping locked contexts is acceptable.
-            if let Ok(ctx) = arc.try_lock() {
-                total_buffered += ctx.receive_buffer.len();
-            }
-        }
-        crate::metrics::set_buffer_occupancy(total_buffered);
+        let Some(sup) = self.supervisor() else {
+            return;
+        };
+        crate::context::manager_methods::update_context_gauges(&sup);
     }
 
-    pub(crate) fn persist_context_snapshot(&self, context_id: &str, mut snapshot: ContextSnapshot) {
-        if let Some(ref persistence) = self.persistence {
-            // Export MLS crypto state alongside the context snapshot (#645).
-            // Populate `mls_crypto_state` in-place on the owned snapshot (#711).
-            //
-            // AC3 bug 2 fix: on export failure, mark the snapshot
-            // `needs_reconnect = true` and persist an empty crypto blob.
-            // Previously the error branch silently persisted a snapshot with
-            // a default (empty) `mls_crypto_state` and no reconnect signal
-            // — the restore path would then load the context, attempt to
-            // resume MLS encryption against an empty state, and fail in a
-            // way that required manual operator intervention. With the
-            // flag set, the restore path fires the §23.11 reconnection
-            // pipeline exactly as it would for any other unrecoverable
-            // crypto state, so the context heals automatically.
-            let ctx_id_bytes = context_id_to_bytes(context_id);
-            match self.crypto.export_crypto_state(&ctx_id_bytes) {
-                Ok(state) => snapshot.mls_crypto_state = state,
-                Err(e) => {
-                    snapshot.needs_reconnect = true;
-                    snapshot.mls_crypto_state = Vec::new();
-                    tracing::warn!(
-                        context_id = %context_id,
-                        error = %e,
-                        "failed to export MLS crypto state for persistence; \
-                         snapshot marked needs_reconnect=true so restore \
-                         fires the §23.11 reconnection pipeline"
-                    );
-                }
-            }
-            if let Err(e) = persistence.persist_context(context_id, &snapshot) {
-                // Best-effort persistence: log but don't fail the operation.
-                // In-memory state remains authoritative.
-                crate::metrics::record_persistence_failure();
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to persist context snapshot"
-                );
-            }
-        }
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::persist_context_snapshot`] free
+    /// function (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
+    pub(crate) fn persist_context_snapshot(&self, context_id: &str, snapshot: ContextSnapshot) {
+        let Some(sup) = self.supervisor() else {
+            return;
+        };
+        crate::context::manager_methods::persist_context_snapshot(&sup, context_id, snapshot);
     }
 
     /// Persists a broadcast context snapshot if a persistence provider is
     /// configured. Best-effort: logs errors but does not propagate.
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::persist_broadcast_snapshot`]
+    /// free function (ADR-049 commit 12c.9g.1). Deleted in commit
+    /// 12c.9g.4.
     pub(crate) fn persist_broadcast_snapshot(
         &self,
         context_id: &str,
         snapshot: &BroadcastContextSnapshot,
     ) {
-        if let Some(ref persistence) = self.persistence
-            && let Err(e) = persistence.persist_broadcast(context_id, snapshot)
-        {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to persist broadcast snapshot"
-            );
-        }
+        let Some(sup) = self.supervisor() else {
+            return;
+        };
+        crate::context::manager_methods::persist_broadcast_snapshot(&sup, context_id, snapshot);
     }
 
     /// Initializes a `BroadcastContext` if the context is in Broadcast mode
     /// (SCP-227). Derives admission policy from `template_id` and registers
     /// the creator as the first author. Persists the initial broadcast state
     /// for crash recovery.
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::init_broadcast_context`] free
+    /// function (ADR-049 commit 12c.9g.1). Deleted in commit 12c.9g.4.
     pub(crate) fn init_broadcast_context(
         &self,
         context_id: &str,
         params: &ContextParams,
         creator_did: &DID,
     ) -> Result<Option<BroadcastContext>, ContextCreationError> {
-        if params.mode != ContextMode::Broadcast {
-            return Ok(None);
-        }
-        let admission = match params.template_id {
-            Some(TemplateId::GatedBroadcast) => BroadcastAdmission::Gated,
-            Some(TemplateId::PublicBroadcast | TemplateId::PaidBroadcast) => {
-                BroadcastAdmission::Open
-            }
-            _ => BroadcastAdmission::Open,
-        };
-        let mut bc = BroadcastContext::new(context_id.to_owned(), &params.mode, admission)
-            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-        // Register the creator as the first author (messagesWrite).
-        bc.add_author(creator_did)
-            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
-        // Persist initial broadcast state for crash recovery.
-        if self.has_persistence() {
-            self.persist_broadcast_snapshot(context_id, &bc.to_snapshot());
-        }
-        Ok(Some(bc))
+        let sup = self.supervisor().ok_or_else(|| {
+            ContextCreationError::CreationFailed(
+                "ContextManager::init_broadcast_context — Supervisor must be attached".to_owned(),
+            )
+        })?;
+        crate::context::manager_methods::init_broadcast_context(
+            &sup,
+            context_id,
+            params,
+            creator_did,
+        )
     }
 
     /// Persists context and broadcast state if a persistence provider is configured.
+    ///
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::persist_context_and_broadcast`]
+    /// free function (ADR-049 commit 12c.9g.1). Deleted in commit
+    /// 12c.9g.4.
     pub(crate) async fn persist_context_and_broadcast(&self, context_id: &str) {
-        if self.has_persistence()
-            && let Ok(arc) = self.get_context_arc(context_id)
-        {
-            let ctx = arc.lock().await;
-            let snapshot = Self::snapshot_context(&ctx);
-            let bc_snapshot = ctx
-                .broadcast_context
-                .as_ref()
-                .map(BroadcastContext::to_snapshot);
-            drop(ctx);
-            self.persist_context_snapshot(context_id, snapshot);
-            if let Some(ref bcs) = bc_snapshot {
-                self.persist_broadcast_snapshot(context_id, bcs);
-            }
-        }
+        let Some(sup) = self.supervisor() else {
+            return;
+        };
+        crate::context::manager_methods::persist_context_and_broadcast(&sup, context_id).await;
     }
 
     /// Takes a `ContextSnapshot` from the current `PerContextState`.
@@ -3645,6 +3621,10 @@ impl ContextManager {
     /// The method is `pub(crate)` so that unit tests can invoke it directly
     /// without needing to construct the internal `PaidActionAuthorization`
     /// type. Not part of the public API.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::record_payment_capture_failure`]
+    /// free function (ADR-049 commit 12c.9g.1). Deleted in commit
+    /// 12c.9g.4.
     pub(crate) async fn record_payment_capture_failure(
         &self,
         context_id: &str,
@@ -3653,34 +3633,18 @@ impl ContextManager {
         error_msg: &str,
         cost: Option<scp_protocol::economy::types::Amount>,
     ) {
-        let context_id_bytes = context_id_to_bytes(context_id);
-        let payload = serde_json::json!({
-            "action": action,
-            "error": error_msg,
-            "cost": cost.map(scp_protocol::economy::types::Amount::value),
-        });
-        if let Err(log_err) = self.event_log.append_context_event_with_payload(
-            &context_id_bytes,
-            "PaymentCaptureFailed",
-            actor_did.as_ref(),
-            Some(&payload),
-        ) {
-            tracing::warn!(
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
                 context_id,
-                "failed to append PaymentCaptureFailed to event log: {log_err}"
+                "ContextManager::record_payment_capture_failure — Supervisor is not attached; \
+                 skipping (contract violation; see ADR-049 commit 12c.9g.1)"
             );
-        }
-        if let Ok(arc) = self.get_context_arc(context_id) {
-            let mut ctx = arc.lock().await;
-            ctx.checkpoint_events_since += 1;
-            let event = ContextEvent::PaymentCaptureFailed {
-                action: action.to_owned(),
-                actor_did: actor_did.clone(),
-                error: error_msg.to_owned(),
-                cost: cost.map(scp_protocol::economy::types::Amount::value),
-            };
-            ctx.emit_event(event, context_id, self.event_tx.as_ref());
-        }
+            return;
+        };
+        crate::context::manager_methods::record_payment_capture_failure(
+            &sup, context_id, action, actor_did, error_msg, cost,
+        )
+        .await;
     }
 }
 

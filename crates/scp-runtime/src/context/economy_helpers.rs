@@ -1,3 +1,11 @@
+// Module-level allow — the legacy inherent-impl form in
+// `manager/economy.rs` carried `#[allow(clippy::significant_drop_tightening)]`
+// on its impl block. The hoisted bodies preserve the same lock-hold-across-await
+// patterns deliberately (narrowing changes lock-ordering semantics across the
+// per-context mutex); allowing the lint crate-locally keeps the hoist
+// byte-identical to the legacy behavior.
+#![allow(clippy::significant_drop_tightening)]
+
 //! Economy helpers with explicit-collaborator signatures (ADR-049 §12c.3).
 //!
 //! # Purpose
@@ -42,19 +50,35 @@
 //!
 //! [`verify_payment_receipts`].
 //!
-//! # Not hoisted (kept as pub(crate) on `ContextManager`)
+//! # Escrow primitives hoisted (ADR-049 commit 12c.9g.1)
 //!
-//! `authorize_paid_action`, `complete_paid_action`, `void_paid_action`,
-//! and `record_payment_capture_failure` are cross-domain infrastructure
-//! already reached from the hoisted messaging / lifecycle helpers via
-//! `mgr.X(...)`; they remain as inherent methods on
-//! [`ContextManager`](crate::context::manager::ContextManager) for this
-//! commit. They migrate implicitly with the messaging / lifecycle
-//! handlers, not as dedicated commands.
+//! [`authorize_paid_action`], [`complete_paid_action`], and
+//! [`void_paid_action`] are the three-phase escrow primitives reached
+//! from the hoisted messaging / lifecycle helpers via `mgr.X(...)`. The
+//! 12c.9g.1 hoist commit moves their bodies here as free functions on
+//! `&Supervisor`; the legacy methods on
+//! [`ContextManager`](crate::context::manager::ContextManager) become
+//! one-line forwarders. The companion `record_payment_capture_failure`
+//! lives in [`crate::context::manager_methods`] (cross-domain
+//! infrastructure used by both messaging and economy paths).
 
+use std::sync::Arc;
+
+use scp_identity::DID;
+use scp_protocol::context::ContextError;
+use scp_protocol::economy::policy::ObservableMetrics;
+use scp_protocol::economy::types::PaidActionType;
+
+use crate::context::manager::economy::PaidActionAuthorization;
 use crate::context::supervisor::Supervisor;
-use crate::economy::adapter::PaymentReceipt;
+use crate::economy::adapter::{PaymentMetadata, PaymentReceipt};
+use crate::economy::integration;
 use crate::economy::receipt::{ReceiptVerification, ReceiptVerificationError};
+
+/// Shared expectation message for `Supervisor::attached_context_manager()`
+/// inside economy helpers (ADR-049 commit 12c.9g.1).
+const ATTACHED_EXPECT: &str = "economy_helpers: Supervisor must be fully attached before helper invocation \
+     (set by Supervisor::attach_context_manager during bridge construction)";
 
 // ---------------------------------------------------------------------------
 // verify_payment_receipts (top-level, actor-handler entry point)
@@ -97,4 +121,206 @@ pub async fn verify_payment_receipts(
         results.push(result);
     }
     results
+}
+
+// ---------------------------------------------------------------------------
+// authorize_paid_action (escrow phase 1; ADR-049 commit 12c.9g.1)
+// ---------------------------------------------------------------------------
+
+/// Authorizes a paid action (escrow pattern, step 1).
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::authorize_paid_action`](crate::context::manager::ContextManager::authorize_paid_action)
+/// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
+///
+/// Evaluates cost, checks spending UCAN, checks budget, and calls
+/// `adapter.authorize` to create an escrow hold. The caller performs the
+/// action, then calls [`complete_paid_action`] or [`void_paid_action`].
+///
+/// Returns `Ok(None)` when no payment adapter is configured or cost is
+/// zero.
+///
+/// # Errors
+///
+/// Returns [`ContextError::NotInitialized`] if the supervisor has not
+/// been attached, [`ContextError::ContextNotRegistered`] if the context
+/// is unknown, or any error from the payment integration layer
+/// (mapped via `integration_error_to_context`).
+pub async fn authorize_paid_action(
+    supervisor: &Supervisor,
+    action_type: PaidActionType,
+    payer_did: &DID,
+    context_id: &str,
+) -> Result<Option<PaidActionAuthorization>, ContextError> {
+    // Early exit: no adapter means no payment flow.
+    let Some(adapter_arc) = supervisor.payment_adapter_ref().map(Arc::clone) else {
+        return Ok(None);
+    };
+    let clock = supervisor
+        .clock_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
+
+    // Phase 1: Extract policy + metrics under lock, then drop.
+    let (policy, metrics) = {
+        let ctx_arc = crate::context::manager_methods::get_context_arc(supervisor, context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let guard = ctx_arc.lock().await;
+        let ctx = &*guard;
+
+        let policy = ctx.governance.economic_policy.clone();
+        let member_count = u64::try_from(ctx.membership.count()).unwrap_or(u64::MAX);
+        let velocity = ctx
+            .governance
+            .velocity_tracker
+            .get_velocity(payer_did, clock.now_secs());
+
+        let now_secs = clock.now_secs();
+        let metrics = ObservableMetrics {
+            sender_velocity: velocity,
+            member_count,
+            context_message_rate: ctx.governance.velocity_tracker.aggregate_velocity(now_secs),
+            relay_queue_depth: 0,
+            time_of_day: now_secs % 86400,
+            storage_usage: 0,
+        };
+        (policy, metrics)
+    };
+
+    // No economic policy -> no payment flow.
+    let Some(policy) = policy else {
+        return Ok(None);
+    };
+
+    // Evaluate cost — zero cost means no payment needed.
+    if scp_protocol::economy::policy::evaluate_cost(&policy, &action_type, &metrics)
+        .as_ref()
+        .is_none_or(|c| c.0 == 0)
+    {
+        return Ok(None);
+    }
+
+    // Phase 2: Authorize (escrow) via adapter (no lock held).
+    let metadata = PaymentMetadata {
+        action_type: action_type.clone(),
+        context_id: Some(context_id.to_owned()),
+        idempotency_key: crate::context::manager::economy::rand_idempotency_key(),
+    };
+
+    let prepared = integration::prepare_paid_action(
+        adapter_arc.as_ref(),
+        Some(&policy),
+        action_type,
+        payer_did,
+        Some(context_id.to_owned()),
+        &metrics,
+        metadata,
+        Vec::new(),
+    )
+    .await
+    .map_err(crate::context::manager::economy::integration_error_to_context)?;
+
+    Ok(Some(PaidActionAuthorization {
+        prepared,
+        adapter: adapter_arc,
+        policy,
+        metrics,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// complete_paid_action (escrow phase 3; ADR-049 commit 12c.9g.1)
+// ---------------------------------------------------------------------------
+
+/// Completes a paid action after successful execution (escrow capture).
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::complete_paid_action`](crate::context::manager::ContextManager::complete_paid_action)
+/// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
+///
+/// Calls `adapter.capture`, verifies the receipt, stores it in the event
+/// log, and records budget spend.
+///
+/// # Errors
+///
+/// Returns [`ContextError::NotInitialized`] if the supervisor has not
+/// been attached, or any error from the payment integration layer.
+pub async fn complete_paid_action(
+    supervisor: &Supervisor,
+    auth: PaidActionAuthorization,
+    payer_did: &DID,
+    context_id: &str,
+) -> Result<Option<PaymentReceipt>, ContextError> {
+    let event_log = supervisor
+        .event_log_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
+    // Capture the escrowed authorization via process_paid_action.
+    let processed = integration::process_paid_action(
+        auth.adapter.as_ref(),
+        Some(&auth.policy),
+        &auth.prepared.envelope,
+        &auth.metrics,
+        |payload| async move { Ok(payload) },
+    )
+    .await
+    .map_err(crate::context::manager::economy::integration_error_to_context)?;
+
+    let Some(receipt) = processed.receipt else {
+        return Ok(None);
+    };
+
+    // Verify the receipt.
+    crate::context::manager::economy::verify_and_check_receipt(auth.adapter.as_ref(), &receipt)
+        .await?;
+
+    // Store receipt in event log.
+    let context_id_bytes = crate::context::manager::context_id_to_bytes(context_id);
+    if let Err(e) =
+        event_log.append_context_event(&context_id_bytes, "PaymentReceived", payer_did.as_ref())
+    {
+        tracing::warn!(
+            context_id,
+            "failed to store payment receipt in event log: {e}"
+        );
+    }
+
+    // Checkpoint tracking: count this event for threshold-based checkpoints.
+    {
+        if let Ok(ctx_arc) =
+            crate::context::manager_methods::get_context_arc(supervisor, context_id)
+        {
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
+            ctx.checkpoint_events_since += 1;
+        }
+    }
+
+    Ok(Some(receipt))
+}
+
+// ---------------------------------------------------------------------------
+// void_paid_action (escrow rollback; ADR-049 commit 12c.9g.1)
+// ---------------------------------------------------------------------------
+
+/// Voids a paid action authorization on failure (escrow rollback).
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::void_paid_action`](crate::context::manager::ContextManager::void_paid_action)
+/// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
+///
+/// Calls `adapter.void` to release the escrow hold. Best-effort —
+/// logs but does not propagate void failures.
+///
+/// Used by `send_message` when `encrypt_and_send` fails after
+/// `authorize_paid_action` succeeded (escrow pattern: authorize →
+/// action → complete on success / void on failure).
+pub async fn void_paid_action(
+    _supervisor: &Supervisor,
+    auth: PaidActionAuthorization,
+    context_id: &str,
+) {
+    if let Some(ref authorization) = auth.prepared.envelope.authorization
+        && let Err(e) = auth.adapter.void_dyn(authorization).await
+    {
+        tracing::warn!(context_id, "failed to void payment authorization: {e}");
+    }
 }

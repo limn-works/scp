@@ -4,11 +4,10 @@ use super::{
     AccessScope, Arc, Capability, Clock, CommitFaultMarker, CommitOperation, ConsequenceRule,
     ContextError, ContextEvent, ContextManager, ContextParams, DID, EconomicPolicy,
     GovernanceAction, GovernanceActionResult, GovernanceContext, GovernanceEvent, GovernanceModel,
-    GovernanceProposal, HashSet, MAX_COMMIT_AGE_SECS, MAX_COMMIT_RETRIES, MigrationProposedResult,
+    GovernanceProposal, MAX_COMMIT_AGE_SECS, MAX_COMMIT_RETRIES, MigrationProposedResult,
     MigrationState, PendingCommit, PerContextState, ProposalId, ProposalOutcome, ProposalStatus,
-    PruningPolicy, ToolInterface, ToolRegistration, TriggeredConsequence, collect_active_voters,
-    commit_retry_backoff, context_id_to_bytes, evaluate_consequence_rules, instrument,
-    process_pending_proposals, roles, update_detection_state,
+    PruningPolicy, ToolInterface, ToolRegistration, TriggeredConsequence, commit_retry_backoff,
+    context_id_to_bytes, evaluate_consequence_rules, instrument, roles,
 };
 
 // ---------------------------------------------------------------------------
@@ -2437,7 +2436,13 @@ impl ContextManager {
 
     /// Translates governance events from timeout processing into
     /// [`ContextEvent`]s for the receive buffer (ADR-031 §5, §10).
-    fn translate_timeout_events(
+    ///
+    /// Visibility widened to `pub(crate)` in ADR-049 commit 12c.9g.1 so
+    /// the hoisted
+    /// [`crate::context::governance_helpers::start_governance_timeout_task`]
+    /// free function can call it from outside the `manager/` submodule
+    /// tree.
+    pub(crate) fn translate_timeout_events(
         result_events: &[GovernanceEvent],
         mls_epoch: u64,
         conditions: &[crate::context::governance::timeout::DeadlockCondition],
@@ -2518,189 +2523,20 @@ impl ContextManager {
     ///
     /// The task stops when the context is no longer `Active` or when
     /// cancelled via [`GovernanceTimeoutTask::cancel()`].
-    #[allow(clippy::too_many_lines)] // Five-phase task spawn closure; phases are factored into helper methods.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::governance_helpers::start_governance_timeout_task`]
+    /// free function (ADR-049 commit 12c.9g.1). Deleted in commit
+    /// 12c.9g.4.
     pub(crate) async fn start_governance_timeout_task(&self, context_id: &str) {
-        let contexts = self.contexts_arc();
-        let clock = Arc::clone(&self.clock);
-        let event_log = Arc::clone(&self.event_log);
-        // PR #1606 C6: capture the transport so the commit retry phase can
-        // re-attempt MLS Commit broadcasts without needing a `&self` reference
-        // (the spawned task does not own the manager).
-        let transport = Arc::clone(&self.transport);
-        let event_tx = self.event_tx.clone();
-        let ctx_id = context_id.to_owned();
-
-        // Lock ordering: task_set before contexts (consistent with spawn_ttl_timer).
-        let mut task_set = self.task_set.lock().await;
-        let Ok(ctx_arc) = self.get_context_arc(&ctx_id) else {
+        let Some(sup) = self.supervisor() else {
+            tracing::error!(
+                context_id,
+                "ContextManager::start_governance_timeout_task — Supervisor is not attached; \
+                 skipping (contract violation; see ADR-049 commit 12c.9g.1)"
+            );
             return;
         };
-        let mut guard = ctx_arc.lock().await;
-        let ctx = &mut *guard;
-
-        ctx.governance.timeout_task.start_in(&mut task_set, {
-            let ctx_id = ctx_id.clone();
-            let clock = Arc::clone(&clock);
-            let event_log = Arc::clone(&event_log);
-            let transport = Arc::clone(&transport);
-            let event_tx = event_tx.clone();
-            move || {
-                let contexts = Arc::clone(&contexts);
-                let clock = Arc::clone(&clock);
-                let event_log = Arc::clone(&event_log);
-                let event_tx = event_tx.clone();
-                let transport_for_retry = Arc::clone(&transport);
-                let event_log_for_retry = Arc::clone(&event_log);
-                let clock_for_retry = Arc::clone(&clock);
-                let ctx_id = ctx_id.clone();
-                async move {
-                    // Phase 1: Acquire lock, snapshot data, process proposals,
-                    // detect deadlock, release lock.
-                    let (result, conditions, mls_epoch, recovery_in_progress) = {
-                        let Some(ctx_entry) = contexts.get(&ctx_id) else {
-                            return false; // Context removed — stop the loop.
-                        };
-                        let ctx_arc = Arc::clone(ctx_entry.value());
-                        drop(ctx_entry);
-                        let mut guard = ctx_arc.lock().await;
-                        let ctx = &mut *guard;
-
-                        // Use try_read_state() to avoid deadlock: the per-context
-                        // Mutex is already held, and handle.state().await would
-                        // await on the ContextHandle RwLock, deadlocking against
-                        // any task holding the RwLock write and waiting for this
-                        // Mutex.
-                        let current_state = ctx.handle.try_read_state();
-                        if !matches!(
-                            current_state,
-                            Some(scp_protocol::context::ContextState::Active)
-                        ) {
-                            // None = write-contended, try again next tick.
-                            // Not Active = context closing, stop the loop.
-                            return current_state.is_none(); // true = continue, false = stop
-                        }
-
-                        let gov_ctx = Self::build_governance_context(ctx, &*clock);
-                        // Detect departed members since last tick.
-                        let current_members: HashSet<DID> =
-                            ctx.membership.members().map(|m| m.did.clone()).collect();
-                        let departed: Vec<DID> = ctx
-                            .governance
-                            .last_known_members
-                            .difference(&current_members)
-                            .cloned()
-                            .collect();
-                        ctx.governance.last_known_members = current_members;
-
-                        // Evict stale cache entries to prevent unbounded growth
-                        // of participation_cache and cooldown_until (#1530).
-                        ctx.governance.evict_stale_entries(clock.now_secs());
-
-                        // Drain epoch-reset members accumulated since last tick
-                        // (ADR-031 §5: votes from reset members are invalidated).
-                        let epoch_resets: Vec<DID> =
-                            std::mem::take(&mut ctx.governance.pending_epoch_resets);
-
-                        let mls_epoch = ctx.epoch.mls_epoch;
-                        let recovery_in_progress = ctx.governance.deadlock.recovery_in_progress;
-
-                        // Snapshot active voters BEFORE processing proposals so
-                        // voters on about-to-resolve proposals are still visible.
-                        let active_voters = collect_active_voters(ctx.governance.engine.as_ref());
-
-                        // Process pending proposals for timeout/departures/epoch resets.
-                        let result = process_pending_proposals(
-                            ctx.governance.engine.as_mut(),
-                            &gov_ctx,
-                            &departed,
-                            &epoch_resets,
-                        );
-
-                        // Update deadlock detection state before detecting
-                        // deadlock so missed-window counters reflect this tick.
-                        update_detection_state(
-                            &mut ctx.governance.deadlock,
-                            ctx.governance.engine.as_ref(),
-                            &gov_ctx,
-                            &active_voters,
-                        );
-
-                        // Detect deadlock conditions (ADR-031 §10).
-                        let conditions = crate::context::governance::timeout::detect_deadlock(
-                            ctx.governance.engine.as_ref(),
-                            &gov_ctx,
-                            &ctx.governance.deadlock,
-                        );
-
-                        (result, conditions, mls_epoch, recovery_in_progress)
-                        // Lock dropped here.
-                    };
-
-                    // Phase 2: Build context events (no lock needed).
-                    let ctx_events = Self::translate_timeout_events(
-                        &result.events,
-                        mls_epoch,
-                        &conditions,
-                        recovery_in_progress,
-                    );
-
-                    // Phase 3: Write results back and update recovery state.
-                    let needs_write = !ctx_events.is_empty()
-                        || (conditions.is_empty() && recovery_in_progress)
-                        || (!conditions.is_empty() && !recovery_in_progress);
-                    if needs_write && let Some(ctx_entry) = contexts.get(&ctx_id) {
-                        let ctx_arc = Arc::clone(ctx_entry.value());
-                        drop(ctx_entry);
-                        let mut guard = ctx_arc.lock().await;
-                        let ctx = &mut *guard;
-                        for ctx_event in ctx_events {
-                            ctx.emit_event(ctx_event, &ctx_id, event_tx.as_ref());
-                        }
-                        // Reset recovery_in_progress when deadlock conditions
-                        // clear so future deadlocks can be detected.
-                        if conditions.is_empty() && recovery_in_progress {
-                            ctx.governance.deadlock.recovery_in_progress = false;
-                        } else if !conditions.is_empty() && !recovery_in_progress {
-                            ctx.governance.deadlock.recovery_in_progress = true;
-                        }
-                    }
-
-                    // Phase 4: Periodic consequence evaluation (#1531).
-                    Self::evaluate_periodic_consequences(
-                        &contexts,
-                        &ctx_id,
-                        &*clock,
-                        &*event_log,
-                        event_tx.as_ref(),
-                    )
-                    .await;
-
-                    // Phase 5 (PR #1606 C6): drain the persistent MLS
-                    // commit retry queue. Retries any pending commits
-                    // whose backoff timer has elapsed and either dequeues
-                    // them on success or marks the context fail-closed
-                    // when the retry budget is exhausted.
-                    //
-                    // Note: this phase needs `&self` (transport, event log,
-                    // clock) which the closure captures via Self in the
-                    // outer task. The outer task does not have a `self`
-                    // reference, so we delegate to the static helper
-                    // `process_pending_commits_static` that takes the same
-                    // bag of providers the closure already captures.
-                    Self::process_pending_commits_static(
-                        &contexts,
-                        &ctx_id,
-                        Arc::clone(&transport_for_retry),
-                        Arc::clone(&event_log_for_retry),
-                        Arc::clone(&clock_for_retry),
-                        event_tx.clone(),
-                    )
-                    .await;
-
-                    true // Continue the loop.
-                }
-            }
-        });
+        crate::context::governance_helpers::start_governance_timeout_task(&sup, context_id).await;
     }
 
     /// Phase 4 of the governance timeout task: evaluates consequence rules for
@@ -2709,7 +2545,13 @@ impl ContextManager {
     /// Time-based rules (e.g., "if no messages in 1 hour, downgrade role") must
     /// fire even when no user action occurs. Evaluates all members on every
     /// tick. Early return when no rules are configured (the common case).
-    async fn evaluate_periodic_consequences(
+    ///
+    /// Visibility widened to `pub(crate)` in ADR-049 commit 12c.9g.1 so
+    /// the hoisted
+    /// [`crate::context::governance_helpers::start_governance_timeout_task`]
+    /// free function can call it from outside the `manager/` submodule
+    /// tree.
+    pub(crate) async fn evaluate_periodic_consequences(
         contexts: &Arc<super::DashMap<String, Arc<super::Mutex<PerContextState>>>>,
         ctx_id: &str,
         clock: &dyn Clock,
@@ -2898,7 +2740,13 @@ impl ContextManager {
     ///
     /// All transport sends happen with the contexts lock RELEASED to
     /// avoid holding the lock across I/O.
-    pub(super) async fn process_pending_commits_static(
+    ///
+    /// Visibility widened to `pub(crate)` in ADR-049 commit 12c.9g.1 so
+    /// the hoisted
+    /// [`crate::context::governance_helpers::start_governance_timeout_task`]
+    /// free function can call it from outside the `manager/` submodule
+    /// tree.
+    pub(crate) async fn process_pending_commits_static(
         contexts: &Arc<super::DashMap<String, Arc<super::Mutex<PerContextState>>>>,
         context_id: &str,
         transport: Arc<dyn super::ContextTransportProvider>,
