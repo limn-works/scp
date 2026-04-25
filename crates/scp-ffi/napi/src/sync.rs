@@ -1,10 +1,9 @@
 //! napi-rs bridge for sync/offline operations.
 //!
-//! Exposes SCP sync operations to Node.js/Bun:
-//!
-//! - [`sync_classify_offline`] -- Classify offline duration into a tier.
-//! - [`sync_get_policy`] -- Get the current sync policy parameters.
-//! - [`sync_classify_offline_custom`] -- Classify with custom thresholds.
+//! Per-bridge-instance (`_on`) implementations consumed by the corresponding
+//! methods on [`crate::scp::Scp`]. Phase D (#1695) deleted the
+//! free-function wrappers that routed through the process-global default
+//! bridge instance.
 //!
 //! See ADR-029 in `.docs/adrs/phase-6.md`.
 
@@ -14,6 +13,7 @@ use scp_ffi_common::error_codes as codes;
 use scp_core::sync::{OfflineTier, SyncPolicy, classify_offline_duration};
 
 use crate::error::ScpNapiError;
+use crate::runtime::NapiBridgeInstance;
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -57,14 +57,19 @@ fn validate_non_negative_timestamp(value: i64, name: &str) -> napi::Result<u64> 
 }
 
 // ---------------------------------------------------------------------------
-// Bridge functions
+// Per-bridge-instance implementations
 // ---------------------------------------------------------------------------
 
-/// Classifies an offline duration into the appropriate recovery tier.
+/// Per-bridge-instance implementation of `sync_classify_offline`.
 ///
-/// Returns `"short"`, `"extended"`, or `"long"`.
-#[napi]
-pub fn sync_classify_offline(last_relay_contact: i64, now: i64) -> napi::Result<String> {
+/// Pure function — takes `_bi` only to preserve the `_on` helper shape used
+/// by the rest of the NAPI bridge. Offline-tier classification does not
+/// touch any per-bridge state.
+pub(crate) fn sync_classify_offline_on(
+    _bi: &NapiBridgeInstance,
+    last_relay_contact: i64,
+    now: i64,
+) -> napi::Result<String> {
     let last = validate_non_negative_timestamp(last_relay_contact, "last_relay_contact")?;
     let current = validate_non_negative_timestamp(now, "now")?;
     Ok(match classify_offline_duration(last, current) {
@@ -74,10 +79,16 @@ pub fn sync_classify_offline(last_relay_contact: i64, now: i64) -> napi::Result<
     })
 }
 
-/// Returns the default sync policy parameters.
+/// Per-bridge-instance implementation of `sync_get_policy`.
+///
+/// Pure function — takes `_bi` only for `_on` helper shape symmetry.
 #[must_use]
-#[napi]
-pub fn sync_get_policy() -> NapiSyncPolicy {
+pub(crate) fn sync_get_policy_on(_bi: &NapiBridgeInstance) -> NapiSyncPolicy {
+    sync_get_policy_impl()
+}
+
+#[must_use]
+fn sync_get_policy_impl() -> NapiSyncPolicy {
     let policy = SyncPolicy::default();
 
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
@@ -93,11 +104,11 @@ pub fn sync_get_policy() -> NapiSyncPolicy {
     }
 }
 
-/// Classifies an offline duration using custom policy thresholds.
+/// Per-bridge-instance implementation of `sync_classify_offline_custom`.
 ///
-/// Returns `"short"`, `"extended"`, or `"long"`.
-#[napi]
-pub fn sync_classify_offline_custom(
+/// Pure function — takes `_bi` only to preserve the `_on` helper shape.
+pub(crate) fn sync_classify_offline_custom_on(
+    _bi: &NapiBridgeInstance,
     last_relay_contact: i64,
     now: i64,
     tier_1_threshold_secs: i64,
@@ -127,58 +138,74 @@ pub fn sync_classify_offline_custom(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::runtime::NapiBridgeInstance;
+
+    fn test_bi() -> NapiBridgeInstance {
+        NapiBridgeInstance::new_napi()
+    }
 
     #[test]
     fn classify_short_offline() {
+        let bi = test_bi();
         assert_eq!(
-            sync_classify_offline(1_000_000, 1_003_600).unwrap(),
+            sync_classify_offline_on(&bi, 1_000_000, 1_003_600).unwrap(),
             "short"
         );
     }
 
     #[test]
     fn classify_extended_offline() {
+        let bi = test_bi();
         assert_eq!(
-            sync_classify_offline(1_000_000, 1_100_000).unwrap(),
+            sync_classify_offline_on(&bi, 1_000_000, 1_100_000).unwrap(),
             "extended"
         );
     }
 
     #[test]
     fn classify_long_offline() {
-        assert_eq!(sync_classify_offline(1_000_000, 2_000_000).unwrap(), "long");
+        let bi = test_bi();
+        assert_eq!(
+            sync_classify_offline_on(&bi, 1_000_000, 2_000_000).unwrap(),
+            "long"
+        );
     }
 
     #[test]
     fn get_policy_returns_defaults() {
-        let policy = sync_get_policy();
+        let bi = test_bi();
+        let policy = sync_get_policy_on(&bi);
         assert_eq!(policy.tier_1_threshold_secs, 14_400);
         assert_eq!(policy.tier_2_threshold_secs, 604_800);
     }
 
     #[test]
     fn classify_negative_last_relay_contact_errors() {
-        let result = sync_classify_offline(-1, 1_000_000);
+        let bi = test_bi();
+        let result = sync_classify_offline_on(&bi, -1, 1_000_000);
         assert!(result.is_err(), "negative last_relay_contact should error");
     }
 
     #[test]
     fn classify_negative_now_errors() {
-        let result = sync_classify_offline(0, -1);
+        let bi = test_bi();
+        let result = sync_classify_offline_on(&bi, 0, -1);
         assert!(result.is_err(), "negative now should error");
     }
 
     #[test]
     fn classify_i64_min_boundary_errors() {
-        let result = sync_classify_offline(i64::MIN, 1_000_000);
+        let bi = test_bi();
+        let result = sync_classify_offline_on(&bi, i64::MIN, 1_000_000);
         assert!(result.is_err(), "i64::MIN should error");
-        let result2 = sync_classify_offline(0, i64::MIN);
+        let result2 = sync_classify_offline_on(&bi, 0, i64::MIN);
         assert!(result2.is_err(), "i64::MIN as now should error");
     }
 
     #[test]
     fn classify_custom_negative_threshold_errors() {
-        let result = sync_classify_offline_custom(0, 100, -3600, 259_200);
+        let bi = test_bi();
+        let result = sync_classify_offline_custom_on(&bi, 0, 100, -3600, 259_200);
         assert!(result.is_err(), "negative tier_1_threshold should error");
     }
 }

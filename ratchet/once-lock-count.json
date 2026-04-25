@@ -1,31 +1,17 @@
 {
-  "_comment": "Ratchet baseline for module-level `static` declarations in FFI bridges that are NOT on the explicit allowlist in scripts/check-no-bridge-globals.sh. The allowlist covers DEFAULT_BRIDGE_INSTANCE, RUNTIME, HANDLE_COUNT, SHARED_DHT_CLIENT, INSTANCE_ID_COUNTER, and `std::sync::Once` init guards. Anything else is counted here. The gate fails when the count goes UP — existing statics are grandfathered; new ones must move onto the per-bridge instance or extend the allowlist with justification.",
-  "_updated": "2026-04-18 (Phase 4 PR 4 tightening)",
-  "_context": "Post-#1549 Phase 4 PR 3. Each remaining counted static is a fallback `EMPTY_*` OnceLock used when the default bridge instance has not been initialized. `FFI_CRYPTO` was removed in PR 3 (ADR-048 § \"Removal of FfiBridgeCrypto\"); uniffi count dropped from 6 to 5. All remaining entries are scheduled for removal in subsequent PRs; the ratchet exists to prevent regression, not to condone them.",
+  "_comment": "Ratchet baseline for module-level `static` declarations in FFI bridges that are NOT on the explicit allowlist in scripts/check-no-bridge-globals.sh. The allowlist covers RUNTIME, HANDLE_COUNT, SHARED_DHT_CLIENT, INSTANCE_ID_COUNTER, and `std::sync::Once` init guards. Anything else is counted here. The gate fails when the count goes UP — new statics must move onto the per-bridge instance or extend the allowlist with justification.",
+  "_updated": "2026-04-19 (Phase 4 PR 4 façade deletion — ratchet drops to zero)",
+  "_context": "Phase 4 PR 4 (#1549) deleted `DEFAULT_BRIDGE_INSTANCE` along with every free-function façade forwarder, and the EMPTY_* fallback registries that existed to cover the uninitialised-default-instance case. Every per-identity singleton now lives on a per-bridge instance (PyBridgeInstance / NapiBridgeInstance / UniffiBridgeInstance). The ratchet now floors at zero in every bridge — any new module-level static is a regression.",
   "bridges": {
-    "pyo3": 4,
-    "napi": 2,
-    "uniffi": 5,
+    "pyo3": 0,
+    "napi": 0,
+    "uniffi": 0,
     "common": 0
   },
   "_breakdown": {
-    "pyo3": [
-      "crates/scp-ffi/src/runtime.rs: EMPTY_FFI_BRIDGE_STATE",
-      "crates/scp-ffi/src/bridge_connector.rs: EMPTY_CREDENTIAL_STORE",
-      "crates/scp-ffi/src/mcp.rs: EMPTY_SERVER_REGISTRY",
-      "crates/scp-ffi/src/mcp.rs: EMPTY_CLIENT_REGISTRY"
-    ],
-    "napi": [
-      "crates/scp-ffi/napi/src/mcp.rs: EMPTY_SERVER_REGISTRY",
-      "crates/scp-ffi/napi/src/mcp.rs: EMPTY_CLIENT_REGISTRY"
-    ],
-    "uniffi": [
-      "crates/scp-ffi/uniffi/src/bridge.rs: EMPTY_IDENTITY_LINK_ATTESTATION_REGISTRY",
-      "crates/scp-ffi/uniffi/src/bridge.rs: EMPTY_IDENTITY_CUSTODY_REGISTRY",
-      "crates/scp-ffi/uniffi/src/bridge.rs: EMPTY_CONTEXT_HANDLE_REGISTRY",
-      "crates/scp-ffi/uniffi/src/bridge.rs: EMPTY_MCP_SERVER_REGISTRY",
-      "crates/scp-ffi/uniffi/src/bridge.rs: EMPTY_MCP_CLIENT_REGISTRY"
-    ],
+    "pyo3": [],
+    "napi": [],
+    "uniffi": [],
     "common": []
   }
 }

@@ -1,26 +1,35 @@
 //! `PyO3` bridge functions for discovery operations.
 //!
-//! Exposes SCP discovery operations to Python:
+//! Exposes SCP discovery operations to Python. Stateful operations are methods
+//! on the `SCP` class; pure helpers remain as free `#[pyfunction]` exports.
+//!
+//! Pure helpers (no bridge state):
 //!
 //! - [`py_discovery_parse_address`] -- Parse an SCP address string.
 //! - [`py_discovery_create_query`] -- Create a discovery query.
 //! - [`py_discovery_normalize_address`] -- Normalize an address string.
 //! - [`py_context_discover`] -- Discover contexts from a DID or `scp://` URI.
-//! - [`py_petname_set`] -- Set a petname for a DID.
-//! - [`py_petname_remove`] -- Remove a petname from a DID.
-//! - [`py_petname_resolve_did`] -- Resolve a petname to DIDs.
-//! - [`py_petname_resolve_context`] -- Resolve a petname to context IDs.
-//! - [`py_petname_get_for_did`] -- Get the petname assigned to a DID.
-//! - [`py_petname_get_for_context`] -- Get the petname assigned to a context.
-//! - [`py_petname_set_context`] -- Set a petname for a context.
-//! - [`py_petname_remove_context`] -- Remove a petname from a context.
-//! - [`py_handle_register`] -- Register a handle in a context with discovery tools.
-//! - [`py_handle_lookup`] -- Look up a handle in a context with discovery tools.
-//! - [`py_handle_deregister`] -- Deregister a handle from a context with discovery tools.
-//! - [`py_scope_register`] -- Register a scope name (§22.3.5, ADR-043).
-//! - [`py_scope_lookup`] -- Look up a scope name (§22.3.5, ADR-043).
-//! - [`py_scope_deregister`] -- Deregister a scope name (§22.3.5, ADR-043).
-//! - [`py_address_resolve`] -- Resolve an address via multi-path resolution.
+//!
+//! `SCP` methods (bridge-state accessors):
+//!
+//! - `PyScp::petname_set` -- Set a petname for a DID.
+//! - `PyScp::petname_remove` -- Remove a petname from a DID.
+//! - `PyScp::petname_resolve_did` -- Resolve a petname to DIDs.
+//! - `PyScp::petname_resolve_context` -- Resolve a petname to context IDs.
+//! - `PyScp::petname_get_for_did` -- Get the petname assigned to a DID.
+//! - `PyScp::petname_get_for_context` -- Get the petname assigned to a context.
+//! - `PyScp::petname_set_context` -- Set a petname for a context.
+//! - `PyScp::petname_remove_context` -- Remove a petname from a context.
+//! - `PyScp::handle_register` -- Register a handle in a context with discovery tools.
+//! - `PyScp::handle_lookup` -- Look up a handle in a context with discovery tools.
+//! - `PyScp::handle_deregister` -- Deregister a handle from a context with discovery tools.
+//! - `PyScp::scope_register` -- Register a scope name (§22.3.5, ADR-043).
+//! - `PyScp::scope_lookup` -- Look up a scope name (§22.3.5, ADR-043).
+//! - `PyScp::scope_deregister` -- Deregister a scope name (§22.3.5, ADR-043).
+//! - `PyScp::address_resolve` -- Resolve an address via multi-path resolution.
+//!
+//! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
+//! methods in Phase 4 PR 4 sub-slice D (#1549).
 //!
 //! See ADR-020 in `.docs/adrs/phase-4.md` and spec section 22 (Addressing).
 
@@ -41,25 +50,20 @@ use scp_identity::DID;
 use scp_ffi_common::petname_helpers::{self, LocalHandleQuerier, address_resolution_to_json};
 
 use crate::error::ScpPyError;
-use crate::runtime::default_bridge_instance;
 
 // ---------------------------------------------------------------------------
 // Test-only reset helpers
 // ---------------------------------------------------------------------------
 
+// Phase D (#1695): petname / handle-registry reset helpers are no-ops now
+// that the default bridge instance is gone. The underlying tests still call
+// them for historical reasons but should construct fresh `PyBridgeInstance`
+// instances to guarantee isolation.
 #[cfg(test)]
-fn reset_petname_map_for(owner_did: &str) {
-    if let Ok(bi) = default_bridge_instance() {
-        petname_helpers::reset_petname_map_for(&bi.core, owner_did);
-    }
-}
+const fn reset_petname_map_for(_owner_did: &str) {}
 
 #[cfg(test)]
-fn reset_handle_registry_for(context_id: &str) {
-    if let Ok(bi) = default_bridge_instance() {
-        petname_helpers::reset_handle_registry_for(&bi.core, context_id);
-    }
-}
+const fn reset_handle_registry_for(_context_id: &str) {}
 
 // ---------------------------------------------------------------------------
 // Bridge functions
@@ -320,527 +324,537 @@ pub fn py_context_discover<'py>(py: Python<'py>, query: &str) -> PyResult<Bound<
 }
 
 // ---------------------------------------------------------------------------
-// Petname bridge functions (§22.4)
+// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
 // ---------------------------------------------------------------------------
 
-/// Sets a petname for a DID.
-///
-/// Petnames are stored per-identity. The `owner_did` identifies which
-/// identity's petname map to modify.
-///
-/// # Arguments
-///
-/// * `owner_did` -- The DID of the identity that owns this petname map.
-/// * `target_did` -- The DID to assign the petname to.
-/// * `name` -- The petname string.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if the owner DID or target DID is empty.
-#[pyfunction]
-#[pyo3(name = "petname_set")]
-pub fn py_petname_set(owner_did: &str, target_did: &str, name: &str) -> PyResult<()> {
-    if owner_did.is_empty() {
-        return Err(ScpPyError::ValidationError {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }
-        .into());
-    }
-    if target_did.is_empty() {
-        return Err(ScpPyError::ValidationError {
-            message: "target_did must not be empty".to_owned(),
-            code: codes::VALID_7111.to_owned(),
-        }
-        .into());
-    }
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    let map = guard.entry(owner_did.to_owned()).or_default();
-    map.set_petname(DID::from(target_did), name.to_owned());
-    Ok(())
-}
-
-/// Removes a petname from a DID.
-///
-/// # Arguments
-///
-/// * `owner_did` -- The DID of the identity that owns this petname map.
-/// * `target_did` -- The DID whose petname to remove.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if the owner DID or target DID is empty.
-#[pyfunction]
-#[pyo3(name = "petname_remove")]
-pub fn py_petname_remove(owner_did: &str, target_did: &str) -> PyResult<()> {
-    if owner_did.is_empty() {
-        return Err(ScpPyError::ValidationError {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }
-        .into());
-    }
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    if let Some(map) = guard.get_mut(owner_did) {
-        map.remove_petname(&DID::from(target_did));
-    }
-    Ok(())
-}
-
-/// Sets a petname for a context.
-///
-/// # Arguments
-///
-/// * `owner_did` -- The DID of the identity that owns this petname map.
-/// * `context_id` -- The context ID to assign the petname to.
-/// * `name` -- The petname string.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if the owner DID or context ID is empty.
-#[pyfunction]
-#[pyo3(name = "petname_set_context")]
-pub fn py_petname_set_context(owner_did: &str, context_id: &str, name: &str) -> PyResult<()> {
-    if owner_did.is_empty() {
-        return Err(ScpPyError::ValidationError {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }
-        .into());
-    }
-    if context_id.is_empty() {
-        return Err(ScpPyError::ValidationError {
-            message: "context_id must not be empty".to_owned(),
-            code: codes::VALID_7113.to_owned(),
-        }
-        .into());
-    }
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    let map = guard.entry(owner_did.to_owned()).or_default();
-    map.set_context_petname(context_id.to_owned(), name.to_owned());
-    Ok(())
-}
-
-/// Removes a petname from a context.
-///
-/// # Arguments
-///
-/// * `owner_did` -- The DID of the identity that owns this petname map.
-/// * `context_id` -- The context ID whose petname to remove.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if the owner DID is empty.
-#[pyfunction]
-#[pyo3(name = "petname_remove_context")]
-pub fn py_petname_remove_context(owner_did: &str, context_id: &str) -> PyResult<()> {
-    if owner_did.is_empty() {
-        return Err(ScpPyError::ValidationError {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }
-        .into());
-    }
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    if let Some(map) = guard.get_mut(owner_did) {
-        map.remove_context_petname(&context_id.to_owned());
-    }
-    Ok(())
-}
-
-/// Resolves a petname to DIDs.
-///
-/// Returns all DIDs associated with this petname. Multiple results
-/// indicate ambiguity (§22.4).
-///
-/// # Arguments
-///
-/// * `owner_did` -- The DID of the identity that owns this petname map.
-/// * `name` -- The petname to resolve.
-///
-/// # Returns
-///
-/// A list of DID strings.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if the owner DID is empty.
-#[pyfunction]
-#[pyo3(name = "petname_resolve_did")]
-pub fn py_petname_resolve_did(owner_did: &str, name: &str) -> PyResult<Vec<String>> {
-    if owner_did.is_empty() {
-        return Err(ScpPyError::ValidationError {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }
-        .into());
-    }
-    let bi = default_bridge_instance()?;
-    let guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    let dids = guard
-        .get(owner_did)
-        .map(|map| {
-            map.resolve_did(name)
-                .into_iter()
-                .map(|d| d.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
-    Ok(dids)
-}
-
-/// Resolves a petname to context IDs.
-///
-/// Returns all context IDs associated with this petname.
-///
-/// # Arguments
-///
-/// * `owner_did` -- The DID of the identity that owns this petname map.
-/// * `name` -- The petname to resolve.
-///
-/// # Returns
-///
-/// A list of context ID strings.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if the owner DID is empty.
-#[pyfunction]
-#[pyo3(name = "petname_resolve_context")]
-pub fn py_petname_resolve_context(owner_did: &str, name: &str) -> PyResult<Vec<String>> {
-    if owner_did.is_empty() {
-        return Err(ScpPyError::ValidationError {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }
-        .into());
-    }
-    let bi = default_bridge_instance()?;
-    let guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    let ids = guard
-        .get(owner_did)
-        .map(|map| map.resolve_context(name))
-        .unwrap_or_default();
-    Ok(ids)
-}
-
-/// Gets the petname assigned to a DID.
-///
-/// # Arguments
-///
-/// * `owner_did` -- The DID of the identity that owns this petname map.
-/// * `target_did` -- The DID to look up.
-///
-/// # Returns
-///
-/// The petname string, or `None` if no petname is assigned.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if the owner DID is empty.
-#[pyfunction]
-#[pyo3(name = "petname_get_for_did")]
-pub fn py_petname_get_for_did(owner_did: &str, target_did: &str) -> PyResult<Option<String>> {
-    if owner_did.is_empty() {
-        return Err(ScpPyError::ValidationError {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }
-        .into());
-    }
-    let bi = default_bridge_instance()?;
-    let guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    let name = guard.get(owner_did).and_then(|map| {
-        map.petname_for_did(&DID::from(target_did))
-            .map(str::to_owned)
-    });
-    Ok(name)
-}
-
-/// Gets the petname assigned to a context.
-///
-/// # Arguments
-///
-/// * `owner_did` -- The DID of the identity that owns this petname map.
-/// * `context_id` -- The context ID to look up.
-///
-/// # Returns
-///
-/// The petname string, or `None` if no petname is assigned.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if the owner DID is empty.
-#[pyfunction]
-#[pyo3(name = "petname_get_for_context")]
-pub fn py_petname_get_for_context(owner_did: &str, context_id: &str) -> PyResult<Option<String>> {
-    if owner_did.is_empty() {
-        return Err(ScpPyError::ValidationError {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }
-        .into());
-    }
-    let bi = default_bridge_instance()?;
-    let guard = bi
-        .core
-        .petname_maps()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("petname lock poisoned: {e}"),
-            code: codes::VALID_7112.to_owned(),
-        })?;
-    let name = guard.get(owner_did).and_then(|map| {
-        map.petname_for_context(&context_id.to_owned())
-            .map(str::to_owned)
-    });
-    Ok(name)
-}
-
-// ---------------------------------------------------------------------------
-// Handle registry bridge functions (§22.3.1)
-// ---------------------------------------------------------------------------
-
-/// Registers a handle in a context with discovery tools.
-///
-/// # Arguments
-///
-/// * `discovery_context_id` -- The context ID.
-/// * `handle` -- The local-part to register (e.g., `"alice"`).
-/// * `target_json` -- JSON string describing the target. Either
-///   `{"type": "identity", "did": "did:..."}` or
-///   `{"type": "context", "context_id": "...", "relay_urls": [...]}`.
-/// * `registrant_did` -- The DID of the authenticated caller.
-/// * `description` -- Optional description metadata.
-/// * `tags` -- Optional list of tag strings.
-///
-/// # Returns
-///
-/// A JSON string with `status` (`"registered"`, `"conflict"`,
-/// `"ownership_mismatch"`, or `"capacity_exceeded"`) and optional `entry_id`.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if parameters are invalid.
-#[pyfunction]
-#[pyo3(name = "handle_register")]
-#[pyo3(signature = (discovery_context_id, handle, target_json, registrant_did, description=None, tags=None))]
-pub fn py_handle_register(
-    discovery_context_id: &str,
-    handle: &str,
-    target_json: &str,
-    registrant_did: &str,
-    description: Option<String>,
-    tags: Option<Vec<String>>,
-) -> PyResult<String> {
-    let target = parse_handle_target(target_json)?;
-
-    let params = HandleRegisterParams {
-        handle: handle.to_owned(),
-        target,
-        metadata: Some(HandleMetadata { description, tags }),
-    };
-
-    let bi = default_bridge_instance()?;
-    let mut guard =
-        bi.core
-            .handle_registries()
-            .lock()
-            .map_err(|e| ScpPyError::ValidationError {
-                message: format!("handle registry lock poisoned: {e}"),
-                code: codes::VALID_7120.to_owned(),
-            })?;
-
-    let registry = guard
-        .entry(discovery_context_id.to_owned())
-        .or_insert_with(|| HandleRegistry::new(discovery_context_id.to_owned()));
-
-    let result = registry.register(
-        &params,
-        &DID::from(registrant_did),
-        &scp_primitives::SystemClock,
-    );
-
-    serde_json::to_string(&result).map_err(|e| {
-        ScpPyError::ValidationError {
-            message: format!("failed to serialize handle register result: {e}"),
-            code: codes::VALID_7122.to_owned(),
-        }
-        .into()
-    })
-}
-
-/// Looks up a handle in a context with discovery tools.
-///
-/// # Arguments
-///
-/// * `discovery_context_id` -- The context ID.
-/// * `handle` -- The local-part to look up.
-/// * `type_filter` -- Optional type filter: `"identity"` or `"context"`.
-///
-/// # Returns
-///
-/// A JSON string with a `results` array of handle entries.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if the type filter is invalid.
-#[pyfunction]
-#[pyo3(name = "handle_lookup")]
-#[pyo3(signature = (discovery_context_id, handle, type_filter=None))]
-pub fn py_handle_lookup(
-    discovery_context_id: &str,
-    handle: &str,
-    type_filter: Option<&str>,
-) -> PyResult<String> {
-    let filter = match type_filter {
-        Some("identity") => Some(HandleTypeFilter::Identity),
-        Some("context") => Some(HandleTypeFilter::Context),
-        Some(other) => {
+#[pymethods]
+impl crate::scp::PyScp {
+    /// Sets a petname for a DID.
+    ///
+    /// Petnames are stored per-identity. The `owner_did` identifies which
+    /// identity's petname map to modify.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` -- The DID of the identity that owns this petname map.
+    /// * `target_did` -- The DID to assign the petname to.
+    /// * `name` -- The petname string.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the owner DID or target DID is empty.
+    #[pyo3(name = "petname_set")]
+    pub fn petname_set(&self, owner_did: &str, target_did: &str, name: &str) -> PyResult<()> {
+        let bi = &*self.inner;
+        if owner_did.is_empty() {
             return Err(ScpPyError::ValidationError {
-                message: format!("invalid type_filter '{other}': expected 'identity' or 'context'"),
-                code: codes::VALID_7123.to_owned(),
+                message: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
             }
             .into());
         }
-        None => None,
-    };
-
-    let bi = default_bridge_instance()?;
-    let guard = bi
-        .core
-        .handle_registries()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("handle registry lock poisoned: {e}"),
-            code: codes::VALID_7120.to_owned(),
-        })?;
-
-    let result = guard.get(discovery_context_id).map_or_else(
-        || scp_core::discovery::HandleLookupResult {
-            results: Vec::new(),
-        },
-        |registry| {
-            registry.lookup(&HandleLookupParams {
-                handle: handle.to_owned(),
-                type_filter: filter,
-            })
-        },
-    );
-
-    serde_json::to_string(&result).map_err(|e| {
-        ScpPyError::ValidationError {
-            message: format!("failed to serialize handle lookup result: {e}"),
-            code: codes::VALID_7124.to_owned(),
+        if target_did.is_empty() {
+            return Err(ScpPyError::ValidationError {
+                message: "target_did must not be empty".to_owned(),
+                code: codes::VALID_7111.to_owned(),
+            }
+            .into());
         }
-        .into()
-    })
-}
-
-/// Deregisters a handle from a context with discovery tools.
-///
-/// Only succeeds if the provided DID matches the handle owner.
-///
-/// # Arguments
-///
-/// * `discovery_context_id` -- The context ID.
-/// * `handle` -- The local-part to deregister.
-/// * `did` -- The registrant's DID (must match the handle owner).
-///
-/// # Returns
-///
-/// A JSON string with `removed` (bool).
-///
-/// # Errors
-///
-/// Raises `ValidationError` on serialization failure.
-#[pyfunction]
-#[pyo3(name = "handle_deregister")]
-pub fn py_handle_deregister(
-    discovery_context_id: &str,
-    handle: &str,
-    did: &str,
-) -> PyResult<String> {
-    let bi = default_bridge_instance()?;
-    let mut guard =
-        bi.core
-            .handle_registries()
+        let mut guard = bi
+            .core
+            .petname_maps()
             .lock()
             .map_err(|e| ScpPyError::ValidationError {
-                message: format!("handle registry lock poisoned: {e}"),
-                code: codes::VALID_7120.to_owned(),
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
             })?;
+        let map = guard.entry(owner_did.to_owned()).or_default();
+        map.set_petname(DID::from(target_did), name.to_owned());
+        Ok(())
+    }
 
-    let result = guard.get_mut(discovery_context_id).map_or_else(
-        || scp_core::discovery::HandleDeregisterResult { removed: false },
-        |registry| {
-            registry.deregister(&HandleDeregisterParams {
-                handle: handle.to_owned(),
-                did: DID::from(did),
-            })
-        },
-    );
-
-    serde_json::to_string(&result).map_err(|e| {
-        ScpPyError::ValidationError {
-            message: format!("failed to serialize handle deregister result: {e}"),
-            code: codes::VALID_7125.to_owned(),
+    /// Removes a petname from a DID.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` -- The DID of the identity that owns this petname map.
+    /// * `target_did` -- The DID whose petname to remove.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the owner DID or target DID is empty.
+    #[pyo3(name = "petname_remove")]
+    pub fn petname_remove(&self, owner_did: &str, target_did: &str) -> PyResult<()> {
+        let bi = &*self.inner;
+        if owner_did.is_empty() {
+            return Err(ScpPyError::ValidationError {
+                message: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            }
+            .into());
         }
-        .into()
-    })
+        let mut guard = bi
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        if let Some(map) = guard.get_mut(owner_did) {
+            map.remove_petname(&DID::from(target_did));
+        }
+        Ok(())
+    }
+
+    /// Sets a petname for a context.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` -- The DID of the identity that owns this petname map.
+    /// * `context_id` -- The context ID to assign the petname to.
+    /// * `name` -- The petname string.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the owner DID or context ID is empty.
+    #[pyo3(name = "petname_set_context")]
+    pub fn petname_set_context(
+        &self,
+        owner_did: &str,
+        context_id: &str,
+        name: &str,
+    ) -> PyResult<()> {
+        let bi = &*self.inner;
+        if owner_did.is_empty() {
+            return Err(ScpPyError::ValidationError {
+                message: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            }
+            .into());
+        }
+        if context_id.is_empty() {
+            return Err(ScpPyError::ValidationError {
+                message: "context_id must not be empty".to_owned(),
+                code: codes::VALID_7113.to_owned(),
+            }
+            .into());
+        }
+        let mut guard = bi
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let map = guard.entry(owner_did.to_owned()).or_default();
+        map.set_context_petname(context_id.to_owned(), name.to_owned());
+        Ok(())
+    }
+
+    /// Removes a petname from a context.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` -- The DID of the identity that owns this petname map.
+    /// * `context_id` -- The context ID whose petname to remove.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the owner DID is empty.
+    #[pyo3(name = "petname_remove_context")]
+    pub fn petname_remove_context(&self, owner_did: &str, context_id: &str) -> PyResult<()> {
+        let bi = &*self.inner;
+        if owner_did.is_empty() {
+            return Err(ScpPyError::ValidationError {
+                message: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            }
+            .into());
+        }
+        let mut guard = bi
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        if let Some(map) = guard.get_mut(owner_did) {
+            map.remove_context_petname(&context_id.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Resolves a petname to DIDs.
+    ///
+    /// Returns all DIDs associated with this petname. Multiple results
+    /// indicate ambiguity (§22.4).
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` -- The DID of the identity that owns this petname map.
+    /// * `name` -- The petname to resolve.
+    ///
+    /// # Returns
+    ///
+    /// A list of DID strings.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the owner DID is empty.
+    #[pyo3(name = "petname_resolve_did")]
+    pub fn petname_resolve_did(&self, owner_did: &str, name: &str) -> PyResult<Vec<String>> {
+        let bi = &*self.inner;
+        if owner_did.is_empty() {
+            return Err(ScpPyError::ValidationError {
+                message: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            }
+            .into());
+        }
+        let guard = bi
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let dids = guard
+            .get(owner_did)
+            .map(|map| {
+                map.resolve_did(name)
+                    .into_iter()
+                    .map(|d| d.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(dids)
+    }
+
+    /// Resolves a petname to context IDs.
+    ///
+    /// Returns all context IDs associated with this petname.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` -- The DID of the identity that owns this petname map.
+    /// * `name` -- The petname to resolve.
+    ///
+    /// # Returns
+    ///
+    /// A list of context ID strings.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the owner DID is empty.
+    #[pyo3(name = "petname_resolve_context")]
+    pub fn petname_resolve_context(&self, owner_did: &str, name: &str) -> PyResult<Vec<String>> {
+        let bi = &*self.inner;
+        if owner_did.is_empty() {
+            return Err(ScpPyError::ValidationError {
+                message: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            }
+            .into());
+        }
+        let guard = bi
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let ids = guard
+            .get(owner_did)
+            .map(|map| map.resolve_context(name))
+            .unwrap_or_default();
+        Ok(ids)
+    }
+
+    /// Gets the petname assigned to a DID.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` -- The DID of the identity that owns this petname map.
+    /// * `target_did` -- The DID to look up.
+    ///
+    /// # Returns
+    ///
+    /// The petname string, or `None` if no petname is assigned.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the owner DID is empty.
+    #[pyo3(name = "petname_get_for_did")]
+    pub fn petname_get_for_did(
+        &self,
+        owner_did: &str,
+        target_did: &str,
+    ) -> PyResult<Option<String>> {
+        let bi = &*self.inner;
+        if owner_did.is_empty() {
+            return Err(ScpPyError::ValidationError {
+                message: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            }
+            .into());
+        }
+        let guard = bi
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let name = guard.get(owner_did).and_then(|map| {
+            map.petname_for_did(&DID::from(target_did))
+                .map(str::to_owned)
+        });
+        Ok(name)
+    }
+
+    /// Gets the petname assigned to a context.
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` -- The DID of the identity that owns this petname map.
+    /// * `context_id` -- The context ID to look up.
+    ///
+    /// # Returns
+    ///
+    /// The petname string, or `None` if no petname is assigned.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the owner DID is empty.
+    #[pyo3(name = "petname_get_for_context")]
+    pub fn petname_get_for_context(
+        &self,
+        owner_did: &str,
+        context_id: &str,
+    ) -> PyResult<Option<String>> {
+        let bi = &*self.inner;
+        if owner_did.is_empty() {
+            return Err(ScpPyError::ValidationError {
+                message: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            }
+            .into());
+        }
+        let guard = bi
+            .core
+            .petname_maps()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("petname lock poisoned: {e}"),
+                code: codes::VALID_7112.to_owned(),
+            })?;
+        let name = guard.get(owner_did).and_then(|map| {
+            map.petname_for_context(&context_id.to_owned())
+                .map(str::to_owned)
+        });
+        Ok(name)
+    }
+
+    // -----------------------------------------------------------------------
+    // Handle registry methods (§22.3.1)
+    // -----------------------------------------------------------------------
+
+    /// Registers a handle in a context with discovery tools.
+    ///
+    /// # Arguments
+    ///
+    /// * `discovery_context_id` -- The context ID.
+    /// * `handle` -- The local-part to register (e.g., `"alice"`).
+    /// * `target_json` -- JSON string describing the target. Either
+    ///   `{"type": "identity", "did": "did:..."}` or
+    ///   `{"type": "context", "context_id": "...", "relay_urls": [...]}`.
+    /// * `registrant_did` -- The DID of the authenticated caller.
+    /// * `description` -- Optional description metadata.
+    /// * `tags` -- Optional list of tag strings.
+    ///
+    /// # Returns
+    ///
+    /// A JSON string with `status` (`"registered"`, `"conflict"`,
+    /// `"ownership_mismatch"`, or `"capacity_exceeded"`) and optional `entry_id`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if parameters are invalid.
+    #[pyo3(name = "handle_register")]
+    #[pyo3(signature = (discovery_context_id, handle, target_json, registrant_did, description=None, tags=None))]
+    pub fn handle_register(
+        &self,
+        discovery_context_id: &str,
+        handle: &str,
+        target_json: &str,
+        registrant_did: &str,
+        description: Option<String>,
+        tags: Option<Vec<String>>,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        let target = parse_handle_target(target_json)?;
+
+        let params = HandleRegisterParams {
+            handle: handle.to_owned(),
+            target,
+            metadata: Some(HandleMetadata { description, tags }),
+        };
+
+        let mut guard =
+            bi.core
+                .handle_registries()
+                .lock()
+                .map_err(|e| ScpPyError::ValidationError {
+                    message: format!("handle registry lock poisoned: {e}"),
+                    code: codes::VALID_7120.to_owned(),
+                })?;
+
+        let registry = guard
+            .entry(discovery_context_id.to_owned())
+            .or_insert_with(|| HandleRegistry::new(discovery_context_id.to_owned()));
+
+        let result = registry.register(
+            &params,
+            &DID::from(registrant_did),
+            &scp_primitives::SystemClock,
+        );
+
+        serde_json::to_string(&result).map_err(|e| {
+            ScpPyError::ValidationError {
+                message: format!("failed to serialize handle register result: {e}"),
+                code: codes::VALID_7122.to_owned(),
+            }
+            .into()
+        })
+    }
+
+    /// Looks up a handle in a context with discovery tools.
+    ///
+    /// # Arguments
+    ///
+    /// * `discovery_context_id` -- The context ID.
+    /// * `handle` -- The local-part to look up.
+    /// * `type_filter` -- Optional type filter: `"identity"` or `"context"`.
+    ///
+    /// # Returns
+    ///
+    /// A JSON string with a `results` array of handle entries.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the type filter is invalid.
+    #[pyo3(name = "handle_lookup")]
+    #[pyo3(signature = (discovery_context_id, handle, type_filter=None))]
+    pub fn handle_lookup(
+        &self,
+        discovery_context_id: &str,
+        handle: &str,
+        type_filter: Option<&str>,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        let filter = match type_filter {
+            Some("identity") => Some(HandleTypeFilter::Identity),
+            Some("context") => Some(HandleTypeFilter::Context),
+            Some(other) => {
+                return Err(ScpPyError::ValidationError {
+                    message: format!(
+                        "invalid type_filter '{other}': expected 'identity' or 'context'"
+                    ),
+                    code: codes::VALID_7123.to_owned(),
+                }
+                .into());
+            }
+            None => None,
+        };
+
+        let guard =
+            bi.core
+                .handle_registries()
+                .lock()
+                .map_err(|e| ScpPyError::ValidationError {
+                    message: format!("handle registry lock poisoned: {e}"),
+                    code: codes::VALID_7120.to_owned(),
+                })?;
+
+        let result = guard.get(discovery_context_id).map_or_else(
+            || scp_core::discovery::HandleLookupResult {
+                results: Vec::new(),
+            },
+            |registry| {
+                registry.lookup(&HandleLookupParams {
+                    handle: handle.to_owned(),
+                    type_filter: filter,
+                })
+            },
+        );
+
+        serde_json::to_string(&result).map_err(|e| {
+            ScpPyError::ValidationError {
+                message: format!("failed to serialize handle lookup result: {e}"),
+                code: codes::VALID_7124.to_owned(),
+            }
+            .into()
+        })
+    }
+
+    /// Deregisters a handle from a context with discovery tools.
+    ///
+    /// Only succeeds if the provided DID matches the handle owner.
+    ///
+    /// # Arguments
+    ///
+    /// * `discovery_context_id` -- The context ID.
+    /// * `handle` -- The local-part to deregister.
+    /// * `did` -- The registrant's DID (must match the handle owner).
+    ///
+    /// # Returns
+    ///
+    /// A JSON string with `removed` (bool).
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` on serialization failure.
+    #[pyo3(name = "handle_deregister")]
+    pub fn handle_deregister(
+        &self,
+        discovery_context_id: &str,
+        handle: &str,
+        did: &str,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        let mut guard =
+            bi.core
+                .handle_registries()
+                .lock()
+                .map_err(|e| ScpPyError::ValidationError {
+                    message: format!("handle registry lock poisoned: {e}"),
+                    code: codes::VALID_7120.to_owned(),
+                })?;
+
+        let result = guard.get_mut(discovery_context_id).map_or_else(
+            || scp_core::discovery::HandleDeregisterResult { removed: false },
+            |registry| {
+                registry.deregister(&HandleDeregisterParams {
+                    handle: handle.to_owned(),
+                    did: DID::from(did),
+                })
+            },
+        );
+
+        serde_json::to_string(&result).map_err(|e| {
+            ScpPyError::ValidationError {
+                message: format!("failed to serialize handle deregister result: {e}"),
+                code: codes::VALID_7125.to_owned(),
+            }
+            .into()
+        })
+    }
 }
 
 /// Parses a [`HandleTarget`] from a JSON string, delegating to `scp-ffi-common`.
@@ -855,323 +869,323 @@ fn parse_handle_target(json: &str) -> PyResult<HandleTarget> {
 }
 
 // ---------------------------------------------------------------------------
-// Scope registry bridge functions (§22.3.5, ADR-043)
+// PyScp methods — scope registry (§22.3.5, ADR-043) and address resolve (§22.8)
 // ---------------------------------------------------------------------------
 
-/// Registers a scope name in a scope registry.
-///
-/// Scope tools use independent structs and separate storage from handle tools.
-/// `ScopeTarget` is context-only by construction — no identity variant.
-///
-/// # Arguments
-///
-/// * `scope_context_id` -- The context ID hosting the scope registry.
-/// * `name` -- The scope name to register (validated via `validate_scope_name`).
-/// * `target_context_id` -- The context ID the scope name resolves to.
-/// * `relay_urls` -- Relay URLs for the target context.
-/// * `registrant_did` -- The DID of the authenticated caller.
-/// * `description` -- Optional description metadata.
-/// * `tags` -- Optional list of tag strings.
-///
-/// # Returns
-///
-/// A JSON string with `status` (`"registered"`, `"conflict"`, or `"updated"`)
-/// and optional `entry_id`.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if parameters are invalid.
-#[pyfunction]
-#[pyo3(name = "scope_register")]
-#[pyo3(signature = (scope_context_id, name, target_context_id, relay_urls, registrant_did, description=None, tags=None))]
-#[allow(clippy::too_many_arguments)]
-pub fn py_scope_register(
-    scope_context_id: &str,
-    name: &str,
-    target_context_id: &str,
-    relay_urls: Vec<String>,
-    registrant_did: &str,
-    description: Option<String>,
-    tags: Option<Vec<String>>,
-) -> PyResult<String> {
-    // Validate inputs at the FFI boundary (defense-in-depth)
-    crate::validate::validate_context_id(scope_context_id)?;
-    crate::validate::validate_context_id(target_context_id)?;
-    crate::validate::validate_did(registrant_did)?;
+#[pymethods]
+impl crate::scp::PyScp {
+    /// Registers a scope name in a scope registry.
+    ///
+    /// Scope tools use independent structs and separate storage from handle tools.
+    /// `ScopeTarget` is context-only by construction — no identity variant.
+    ///
+    /// # Arguments
+    ///
+    /// * `scope_context_id` -- The context ID hosting the scope registry.
+    /// * `name` -- The scope name to register (validated via `validate_scope_name`).
+    /// * `target_context_id` -- The context ID the scope name resolves to.
+    /// * `relay_urls` -- Relay URLs for the target context.
+    /// * `registrant_did` -- The DID of the authenticated caller.
+    /// * `description` -- Optional description metadata.
+    /// * `tags` -- Optional list of tag strings.
+    ///
+    /// # Returns
+    ///
+    /// A JSON string with `status` (`"registered"`, `"conflict"`, or `"updated"`)
+    /// and optional `entry_id`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if parameters are invalid.
+    #[pyo3(name = "scope_register")]
+    #[pyo3(signature = (scope_context_id, name, target_context_id, relay_urls, registrant_did, description=None, tags=None))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn scope_register(
+        &self,
+        scope_context_id: &str,
+        name: &str,
+        target_context_id: &str,
+        relay_urls: Vec<String>,
+        registrant_did: &str,
+        description: Option<String>,
+        tags: Option<Vec<String>>,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        // Validate inputs at the FFI boundary (defense-in-depth)
+        crate::validate::validate_context_id(scope_context_id)?;
+        crate::validate::validate_context_id(target_context_id)?;
+        crate::validate::validate_did(registrant_did)?;
 
-    // Validate relay URLs at the FFI boundary (defense-in-depth)
-    for url in &relay_urls {
-        crate::validate::validate_relay_url(url)?;
-    }
-
-    let params = scp_core::discovery::ScopeRegisterParams {
-        name: name.to_owned(),
-        target: scp_core::discovery::ScopeTarget {
-            context_id: target_context_id.to_owned(),
-            relay_urls,
-        },
-        metadata: if description.is_some() || tags.is_some() {
-            Some(scp_core::discovery::ScopeMetadata { description, tags })
-        } else {
-            None
-        },
-    };
-
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .scope_registries()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("scope registry lock poisoned: {e}"),
-            code: codes::VALID_7130.to_owned(),
-        })?;
-
-    let registry = guard
-        .entry(scope_context_id.to_owned())
-        .or_insert_with(|| scp_core::discovery::ScopeRegistry::new(scope_context_id.to_owned()));
-
-    let result = registry
-        .register(
-            &params,
-            &DID::from(registrant_did),
-            &scp_primitives::SystemClock,
-        )
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("scope registration failed: {e}"),
-            code: codes::VALID_7131.to_owned(),
-        })?;
-
-    serde_json::to_string(&result).map_err(|e| {
-        ScpPyError::ValidationError {
-            message: format!("failed to serialize scope register result: {e}"),
-            code: codes::VALID_7132.to_owned(),
+        // Validate relay URLs at the FFI boundary (defense-in-depth)
+        for url in &relay_urls {
+            crate::validate::validate_relay_url(url)?;
         }
-        .into()
-    })
-}
 
-/// Looks up a scope name in a scope registry.
-///
-/// # Arguments
-///
-/// * `scope_context_id` -- The context ID hosting the scope registry.
-/// * `name` -- The scope name to look up.
-///
-/// # Returns
-///
-/// A JSON string with a `results` array of scope entries.
-///
-/// # Errors
-///
-/// Raises `ValidationError` on failure.
-#[pyfunction]
-#[pyo3(name = "scope_lookup")]
-pub fn py_scope_lookup(scope_context_id: &str, name: &str) -> PyResult<String> {
-    crate::validate::validate_context_id(scope_context_id)?;
+        let params = scp_core::discovery::ScopeRegisterParams {
+            name: name.to_owned(),
+            target: scp_core::discovery::ScopeTarget {
+                context_id: target_context_id.to_owned(),
+                relay_urls,
+            },
+            metadata: if description.is_some() || tags.is_some() {
+                Some(scp_core::discovery::ScopeMetadata { description, tags })
+            } else {
+                None
+            },
+        };
 
-    let bi = default_bridge_instance()?;
-    let guard = bi
-        .core
-        .scope_registries()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("scope registry lock poisoned: {e}"),
-            code: codes::VALID_7130.to_owned(),
-        })?;
-
-    let result = match guard.get(scope_context_id) {
-        Some(registry) => registry
-            .lookup(&scp_core::discovery::ScopeLookupParams {
-                name: name.to_owned(),
-            })
-            .map_err(|e| ScpPyError::ValidationError {
-                message: format!("scope lookup failed: {e}"),
-                code: codes::VALID_7133.to_owned(),
-            })?,
-        None => scp_core::discovery::ScopeLookupResult {
-            results: Vec::new(),
-        },
-    };
-
-    serde_json::to_string(&result).map_err(|e| {
-        ScpPyError::ValidationError {
-            message: format!("failed to serialize scope lookup result: {e}"),
-            code: codes::VALID_7133.to_owned(),
-        }
-        .into()
-    })
-}
-
-/// Deregisters a scope name from a scope registry.
-///
-/// Only succeeds if the provided DID matches the scope entry owner.
-///
-/// # Arguments
-///
-/// * `scope_context_id` -- The context ID hosting the scope registry.
-/// * `name` -- The scope name to deregister.
-/// * `did` -- The registrant's DID (must match the entry owner).
-///
-/// # Returns
-///
-/// A JSON string with `removed` (bool).
-///
-/// # Errors
-///
-/// Raises `ValidationError` on serialization failure.
-#[pyfunction]
-#[pyo3(name = "scope_deregister")]
-pub fn py_scope_deregister(scope_context_id: &str, name: &str, did: &str) -> PyResult<String> {
-    crate::validate::validate_context_id(scope_context_id)?;
-    crate::validate::validate_did(did)?;
-
-    let bi = default_bridge_instance()?;
-    let mut guard = bi
-        .core
-        .scope_registries()
-        .lock()
-        .map_err(|e| ScpPyError::ValidationError {
-            message: format!("scope registry lock poisoned: {e}"),
-            code: codes::VALID_7130.to_owned(),
-        })?;
-
-    let result = match guard.get_mut(scope_context_id) {
-        Some(registry) => registry
-            .deregister(&scp_core::discovery::ScopeDeregisterParams {
-                name: name.to_owned(),
-                did: DID::from(did),
-            })
-            .map_err(|e| ScpPyError::ValidationError {
-                message: format!("scope deregister failed: {e}"),
-                code: codes::VALID_7134.to_owned(),
-            })?,
-        None => scp_core::discovery::ScopeDeregisterResult { removed: false },
-    };
-
-    serde_json::to_string(&result).map_err(|e| {
-        ScpPyError::ValidationError {
-            message: format!("failed to serialize scope deregister result: {e}"),
-            code: codes::VALID_7134.to_owned(),
-        }
-        .into()
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Address resolve bridge function (§22.8)
-// ---------------------------------------------------------------------------
-
-/// Resolves a human-readable address string via multi-path resolution.
-///
-/// Uses the caller's petname map and all known handle registries as
-/// context handles. Results are sorted by trust level (descending).
-///
-/// # Arguments
-///
-/// * `owner_did` -- The DID of the identity whose petname map to use.
-/// * `address` -- The address string to resolve.
-/// * `known_contexts_json` -- Optional JSON object mapping scope names to
-///   context IDs, e.g., `{"cooking": "ctx-abc"}`. If absent,
-///   all known handle registries are used with their context IDs as scope
-///   names.
-///
-/// # Returns
-///
-/// A JSON string with an array of `AddressResolution` objects.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if the address is malformed or resolution fails.
-#[pyfunction]
-#[pyo3(name = "address_resolve")]
-#[pyo3(signature = (owner_did, address, known_contexts_json=None))]
-pub fn py_address_resolve(
-    owner_did: &str,
-    address: &str,
-    known_contexts_json: Option<&str>,
-) -> PyResult<String> {
-    if owner_did.is_empty() {
-        return Err(ScpPyError::ValidationError {
-            message: "owner_did must not be empty".to_owned(),
-            code: codes::VALID_7110.to_owned(),
-        }
-        .into());
-    }
-
-    let bi = default_bridge_instance()?;
-
-    let mut known_contexts: HashMap<String, String> = if let Some(json) = known_contexts_json {
-        serde_json::from_str(json).map_err(|e| ScpPyError::ValidationError {
-            message: format!("invalid known_contexts_json: {e}"),
-            code: codes::VALID_7090.to_owned(),
-        })?
-    } else {
-        // Use all known handle registries with context IDs as scope names.
-        let guard =
+        let mut guard =
             bi.core
-                .handle_registries()
+                .scope_registries()
                 .lock()
                 .map_err(|e| ScpPyError::ValidationError {
-                    message: format!("handle registry lock poisoned: {e}"),
-                    code: codes::VALID_7120.to_owned(),
+                    message: format!("scope registry lock poisoned: {e}"),
+                    code: codes::VALID_7130.to_owned(),
                 })?;
-        guard.keys().map(|k| (k.clone(), k.clone())).collect()
-    };
 
-    // Merge scope registry contexts into known_contexts for two-hop resolution (§22.3.5).
-    let scope_contexts = petname_helpers::known_contexts_from_scope_registries(&bi.core);
-    for (name, ctx_id) in scope_contexts {
-        known_contexts.entry(name).or_insert(ctx_id);
-    }
+        let registry = guard.entry(scope_context_id.to_owned()).or_insert_with(|| {
+            scp_core::discovery::ScopeRegistry::new(scope_context_id.to_owned())
+        });
 
-    let known_domains: Vec<&str> = Vec::new();
-
-    // Get the petname map for this owner. We need to clone it since
-    // AddressResolver.resolve() takes a reference, and we can't hold
-    // the mutex across the async boundary.
-    let petname_map = {
-        let guard = bi
-            .core
-            .petname_maps()
-            .lock()
-            .map_err(|e| ScpPyError::ValidationError {
-                message: format!("petname lock poisoned: {e}"),
-                code: codes::VALID_7112.to_owned(),
-            })?;
-        guard.get(owner_did).cloned().unwrap_or_default()
-    };
-
-    let rt = crate::runtime()?;
-    let results = rt.block_on(async {
-        let mut resolver = scp_core::discovery::AddressResolver::new();
-        let querier = LocalHandleQuerier::new(&bi.core);
-        resolver
-            .resolve(
-                address,
-                &petname_map,
-                &querier,
-                &known_contexts,
-                &known_domains,
+        let result = registry
+            .register(
+                &params,
+                &DID::from(registrant_did),
                 &scp_primitives::SystemClock,
             )
-            .await
             .map_err(|e| ScpPyError::ValidationError {
-                message: format!("address resolution failed: {e}"),
-                code: codes::VALID_7091.to_owned(),
-            })
-    })?;
+                message: format!("scope registration failed: {e}"),
+                code: codes::VALID_7131.to_owned(),
+            })?;
 
-    let json_results: Vec<serde_json::Value> =
-        results.iter().map(address_resolution_to_json).collect();
+        serde_json::to_string(&result).map_err(|e| {
+            ScpPyError::ValidationError {
+                message: format!("failed to serialize scope register result: {e}"),
+                code: codes::VALID_7132.to_owned(),
+            }
+            .into()
+        })
+    }
 
-    serde_json::to_string(&json_results).map_err(|e| {
-        ScpPyError::ValidationError {
-            message: format!("failed to serialize address resolution results: {e}"),
-            code: codes::VALID_7092.to_owned(),
+    /// Looks up a scope name in a scope registry.
+    ///
+    /// # Arguments
+    ///
+    /// * `scope_context_id` -- The context ID hosting the scope registry.
+    /// * `name` -- The scope name to look up.
+    ///
+    /// # Returns
+    ///
+    /// A JSON string with a `results` array of scope entries.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` on failure.
+    #[pyo3(name = "scope_lookup")]
+    pub fn scope_lookup(&self, scope_context_id: &str, name: &str) -> PyResult<String> {
+        let bi = &*self.inner;
+        crate::validate::validate_context_id(scope_context_id)?;
+
+        let guard = bi
+            .core
+            .scope_registries()
+            .lock()
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("scope registry lock poisoned: {e}"),
+                code: codes::VALID_7130.to_owned(),
+            })?;
+
+        let result = match guard.get(scope_context_id) {
+            Some(registry) => registry
+                .lookup(&scp_core::discovery::ScopeLookupParams {
+                    name: name.to_owned(),
+                })
+                .map_err(|e| ScpPyError::ValidationError {
+                    message: format!("scope lookup failed: {e}"),
+                    code: codes::VALID_7133.to_owned(),
+                })?,
+            None => scp_core::discovery::ScopeLookupResult {
+                results: Vec::new(),
+            },
+        };
+
+        serde_json::to_string(&result).map_err(|e| {
+            ScpPyError::ValidationError {
+                message: format!("failed to serialize scope lookup result: {e}"),
+                code: codes::VALID_7133.to_owned(),
+            }
+            .into()
+        })
+    }
+
+    /// Deregisters a scope name from a scope registry.
+    ///
+    /// Only succeeds if the provided DID matches the scope entry owner.
+    ///
+    /// # Arguments
+    ///
+    /// * `scope_context_id` -- The context ID hosting the scope registry.
+    /// * `name` -- The scope name to deregister.
+    /// * `did` -- The registrant's DID (must match the entry owner).
+    ///
+    /// # Returns
+    ///
+    /// A JSON string with `removed` (bool).
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` on serialization failure.
+    #[pyo3(name = "scope_deregister")]
+    pub fn scope_deregister(
+        &self,
+        scope_context_id: &str,
+        name: &str,
+        did: &str,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        crate::validate::validate_context_id(scope_context_id)?;
+        crate::validate::validate_did(did)?;
+
+        let mut guard =
+            bi.core
+                .scope_registries()
+                .lock()
+                .map_err(|e| ScpPyError::ValidationError {
+                    message: format!("scope registry lock poisoned: {e}"),
+                    code: codes::VALID_7130.to_owned(),
+                })?;
+
+        let result = match guard.get_mut(scope_context_id) {
+            Some(registry) => registry
+                .deregister(&scp_core::discovery::ScopeDeregisterParams {
+                    name: name.to_owned(),
+                    did: DID::from(did),
+                })
+                .map_err(|e| ScpPyError::ValidationError {
+                    message: format!("scope deregister failed: {e}"),
+                    code: codes::VALID_7134.to_owned(),
+                })?,
+            None => scp_core::discovery::ScopeDeregisterResult { removed: false },
+        };
+
+        serde_json::to_string(&result).map_err(|e| {
+            ScpPyError::ValidationError {
+                message: format!("failed to serialize scope deregister result: {e}"),
+                code: codes::VALID_7134.to_owned(),
+            }
+            .into()
+        })
+    }
+
+    /// Resolves a human-readable address string via multi-path resolution.
+    ///
+    /// Uses the caller's petname map and all known handle registries as
+    /// context handles. Results are sorted by trust level (descending).
+    ///
+    /// # Arguments
+    ///
+    /// * `owner_did` -- The DID of the identity whose petname map to use.
+    /// * `address` -- The address string to resolve.
+    /// * `known_contexts_json` -- Optional JSON object mapping scope names to
+    ///   context IDs, e.g., `{"cooking": "ctx-abc"}`. If absent,
+    ///   all known handle registries are used with their context IDs as scope
+    ///   names.
+    ///
+    /// # Returns
+    ///
+    /// A JSON string with an array of `AddressResolution` objects.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the address is malformed or resolution fails.
+    #[pyo3(name = "address_resolve")]
+    #[pyo3(signature = (owner_did, address, known_contexts_json=None))]
+    pub fn address_resolve(
+        &self,
+        owner_did: &str,
+        address: &str,
+        known_contexts_json: Option<&str>,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        if owner_did.is_empty() {
+            return Err(ScpPyError::ValidationError {
+                message: "owner_did must not be empty".to_owned(),
+                code: codes::VALID_7110.to_owned(),
+            }
+            .into());
         }
-        .into()
-    })
+
+        let mut known_contexts: HashMap<String, String> =
+            if let Some(json) = known_contexts_json {
+                serde_json::from_str(json).map_err(|e| ScpPyError::ValidationError {
+                    message: format!("invalid known_contexts_json: {e}"),
+                    code: codes::VALID_7090.to_owned(),
+                })?
+            } else {
+                // Use all known handle registries with context IDs as scope names.
+                let guard = bi.core.handle_registries().lock().map_err(|e| {
+                    ScpPyError::ValidationError {
+                        message: format!("handle registry lock poisoned: {e}"),
+                        code: codes::VALID_7120.to_owned(),
+                    }
+                })?;
+                guard.keys().map(|k| (k.clone(), k.clone())).collect()
+            };
+
+        // Merge scope registry contexts into known_contexts for two-hop resolution (§22.3.5).
+        let scope_contexts = petname_helpers::known_contexts_from_scope_registries(&bi.core);
+        for (name, ctx_id) in scope_contexts {
+            known_contexts.entry(name).or_insert(ctx_id);
+        }
+
+        let known_domains: Vec<&str> = Vec::new();
+
+        // Get the petname map for this owner. We need to clone it since
+        // AddressResolver.resolve() takes a reference, and we can't hold
+        // the mutex across the async boundary.
+        let petname_map = {
+            let guard = bi
+                .core
+                .petname_maps()
+                .lock()
+                .map_err(|e| ScpPyError::ValidationError {
+                    message: format!("petname lock poisoned: {e}"),
+                    code: codes::VALID_7112.to_owned(),
+                })?;
+            guard.get(owner_did).cloned().unwrap_or_default()
+        };
+
+        let rt = crate::runtime()?;
+        let results = rt.block_on(async {
+            let mut resolver = scp_core::discovery::AddressResolver::new();
+            let querier = LocalHandleQuerier::new(&bi.core);
+            resolver
+                .resolve(
+                    address,
+                    &petname_map,
+                    &querier,
+                    &known_contexts,
+                    &known_domains,
+                    &scp_primitives::SystemClock,
+                )
+                .await
+                .map_err(|e| ScpPyError::ValidationError {
+                    message: format!("address resolution failed: {e}"),
+                    code: codes::VALID_7091.to_owned(),
+                })
+        })?;
+
+        let json_results: Vec<serde_json::Value> =
+            results.iter().map(address_resolution_to_json).collect();
+
+        serde_json::to_string(&json_results).map_err(|e| {
+            ScpPyError::ValidationError {
+                message: format!("failed to serialize address resolution results: {e}"),
+                code: codes::VALID_7092.to_owned(),
+            }
+            .into()
+        })
+    }
 }
 
 // address_resolution_to_json, trust_level_to_json, resolution_path_to_json
@@ -1181,7 +1195,13 @@ pub fn py_address_resolve(
 // Module registration
 // ---------------------------------------------------------------------------
 
-/// Registers discovery bridge functions on the `_scp_core` module.
+/// Registers discovery bridge free functions on the `_scp_core` module.
+///
+/// Post-migration (Phase 4 PR 4 sub-slice D), stateful discovery operations
+/// (petname, handle registry, scope registry, address resolve) are exposed as
+/// methods on `SCP`. Only pure helpers (address parsing, query construction,
+/// normalization, DID/URI context discovery) remain as free `#[pyfunction]`
+/// exports.
 ///
 /// # Errors
 ///
@@ -1191,25 +1211,6 @@ pub fn register_discovery(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_discovery_create_query, m)?)?;
     m.add_function(wrap_pyfunction!(py_discovery_normalize_address, m)?)?;
     m.add_function(wrap_pyfunction!(py_context_discover, m)?)?;
-    // Petname operations (§22.4)
-    m.add_function(wrap_pyfunction!(py_petname_set, m)?)?;
-    m.add_function(wrap_pyfunction!(py_petname_remove, m)?)?;
-    m.add_function(wrap_pyfunction!(py_petname_set_context, m)?)?;
-    m.add_function(wrap_pyfunction!(py_petname_remove_context, m)?)?;
-    m.add_function(wrap_pyfunction!(py_petname_resolve_did, m)?)?;
-    m.add_function(wrap_pyfunction!(py_petname_resolve_context, m)?)?;
-    m.add_function(wrap_pyfunction!(py_petname_get_for_did, m)?)?;
-    m.add_function(wrap_pyfunction!(py_petname_get_for_context, m)?)?;
-    // Handle registry operations (§22.3.1)
-    m.add_function(wrap_pyfunction!(py_handle_register, m)?)?;
-    m.add_function(wrap_pyfunction!(py_handle_lookup, m)?)?;
-    m.add_function(wrap_pyfunction!(py_handle_deregister, m)?)?;
-    // Scope registry operations (§22.3.5, ADR-043)
-    m.add_function(wrap_pyfunction!(py_scope_register, m)?)?;
-    m.add_function(wrap_pyfunction!(py_scope_lookup, m)?)?;
-    m.add_function(wrap_pyfunction!(py_scope_deregister, m)?)?;
-    // Address resolution (§22.8)
-    m.add_function(wrap_pyfunction!(py_address_resolve, m)?)?;
     Ok(())
 }
 
@@ -1221,6 +1222,10 @@ pub fn register_discovery(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    fn default_scp() -> crate::scp::PyScp {
+        crate::scp::PyScp::new()
+    }
 
     #[test]
     fn create_query_with_capabilities() {
@@ -1381,10 +1386,11 @@ mod tests {
     fn petname_set_and_resolve_did() {
         let owner = "did:dht:zTestOwner1";
         reset_petname_map_for(owner);
+        let scp = default_scp();
         let target = "did:dht:zAlice";
-        py_petname_set(owner, target, "alice").unwrap();
+        scp.petname_set(owner, target, "alice").unwrap();
 
-        let dids = py_petname_resolve_did(owner, "alice").unwrap();
+        let dids = scp.petname_resolve_did(owner, "alice").unwrap();
         assert_eq!(dids.len(), 1);
         assert_eq!(dids[0], target);
     }
@@ -1393,10 +1399,11 @@ mod tests {
     fn petname_get_for_did_returns_name() {
         let owner = "did:dht:zTestOwner2";
         reset_petname_map_for(owner);
+        let scp = default_scp();
         let target = "did:dht:zBob";
-        py_petname_set(owner, target, "bob").unwrap();
+        scp.petname_set(owner, target, "bob").unwrap();
 
-        let name = py_petname_get_for_did(owner, target).unwrap();
+        let name = scp.petname_get_for_did(owner, target).unwrap();
         assert_eq!(name, Some("bob".to_owned()));
     }
 
@@ -1404,9 +1411,11 @@ mod tests {
     fn petname_set_context_and_resolve() {
         let owner = "did:dht:zTestOwner3";
         reset_petname_map_for(owner);
-        py_petname_set_context(owner, "ctx-recipes", "recipes").unwrap();
+        let scp = default_scp();
+        scp.petname_set_context(owner, "ctx-recipes", "recipes")
+            .unwrap();
 
-        let ids = py_petname_resolve_context(owner, "recipes").unwrap();
+        let ids = scp.petname_resolve_context(owner, "recipes").unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(ids[0], "ctx-recipes");
     }
@@ -1415,16 +1424,18 @@ mod tests {
     fn petname_get_for_context_returns_name() {
         let owner = "did:dht:zTestOwner4";
         reset_petname_map_for(owner);
-        py_petname_set_context(owner, "ctx-work", "work").unwrap();
+        let scp = default_scp();
+        scp.petname_set_context(owner, "ctx-work", "work").unwrap();
 
-        let name = py_petname_get_for_context(owner, "ctx-work").unwrap();
+        let name = scp.petname_get_for_context(owner, "ctx-work").unwrap();
         assert_eq!(name, Some("work".to_owned()));
     }
 
     #[test]
     fn petname_empty_owner_errors() {
-        assert!(py_petname_set("", "did:dht:z1", "test").is_err());
-        assert!(py_petname_resolve_did("", "test").is_err());
+        let scp = default_scp();
+        assert!(scp.petname_set("", "did:dht:z1", "test").is_err());
+        assert!(scp.petname_resolve_did("", "test").is_err());
     }
 
     // -- Handle registry bridge tests ----------------------------------------
@@ -1433,14 +1444,16 @@ mod tests {
     fn handle_register_and_lookup() {
         let ctx = "ctx-handle-test-1";
         reset_handle_registry_for(ctx);
+        let scp = default_scp();
         let target_json = r#"{"type": "identity", "did": "did:dht:zAlice"}"#;
-        let result =
-            py_handle_register(ctx, "alice", target_json, "did:dht:zAlice", None, None).unwrap();
+        let result = scp
+            .handle_register(ctx, "alice", target_json, "did:dht:zAlice", None, None)
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["status"], "registered");
         assert!(parsed["entry_id"].as_str().is_some());
 
-        let lookup = py_handle_lookup(ctx, "alice", None).unwrap();
+        let lookup = scp.handle_lookup(ctx, "alice", None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&lookup).unwrap();
         assert_eq!(parsed["results"].as_array().unwrap().len(), 1);
     }
@@ -1449,11 +1462,15 @@ mod tests {
     fn handle_register_conflict() {
         let ctx = "ctx-handle-test-2";
         reset_handle_registry_for(ctx);
+        let scp = default_scp();
         let target1 = r#"{"type": "identity", "did": "did:dht:zAlice"}"#;
         let target2 = r#"{"type": "identity", "did": "did:dht:zBob"}"#;
-        py_handle_register(ctx, "alice", target1, "did:dht:zAlice", None, None).unwrap();
+        scp.handle_register(ctx, "alice", target1, "did:dht:zAlice", None, None)
+            .unwrap();
 
-        let result = py_handle_register(ctx, "alice", target2, "did:dht:zBob", None, None).unwrap();
+        let result = scp
+            .handle_register(ctx, "alice", target2, "did:dht:zBob", None, None)
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["status"], "conflict");
     }
@@ -1462,14 +1479,18 @@ mod tests {
     fn handle_deregister_removes_entry() {
         let ctx = "ctx-handle-test-3";
         reset_handle_registry_for(ctx);
+        let scp = default_scp();
         let target = r#"{"type": "identity", "did": "did:dht:zCharlie"}"#;
-        py_handle_register(ctx, "charlie", target, "did:dht:zCharlie", None, None).unwrap();
+        scp.handle_register(ctx, "charlie", target, "did:dht:zCharlie", None, None)
+            .unwrap();
 
-        let result = py_handle_deregister(ctx, "charlie", "did:dht:zCharlie").unwrap();
+        let result = scp
+            .handle_deregister(ctx, "charlie", "did:dht:zCharlie")
+            .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert!(parsed["removed"].as_bool().unwrap());
 
-        let lookup = py_handle_lookup(ctx, "charlie", None).unwrap();
+        let lookup = scp.handle_lookup(ctx, "charlie", None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&lookup).unwrap();
         assert!(parsed["results"].as_array().unwrap().is_empty());
     }
@@ -1478,21 +1499,27 @@ mod tests {
     fn handle_lookup_with_type_filter() {
         let ctx = "ctx-handle-test-4";
         reset_handle_registry_for(ctx);
+        let scp = default_scp();
         let target = r#"{"type": "context", "context_id": "ctx-abc", "relay_urls": ["wss://relay.example.com"]}"#;
-        py_handle_register(ctx, "recipes", target, "did:dht:zAdmin", None, None).unwrap();
+        scp.handle_register(ctx, "recipes", target, "did:dht:zAdmin", None, None)
+            .unwrap();
 
-        let identity_lookup = py_handle_lookup(ctx, "recipes", Some("identity")).unwrap();
+        let identity_lookup = scp.handle_lookup(ctx, "recipes", Some("identity")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&identity_lookup).unwrap();
         assert!(parsed["results"].as_array().unwrap().is_empty());
 
-        let context_lookup = py_handle_lookup(ctx, "recipes", Some("context")).unwrap();
+        let context_lookup = scp.handle_lookup(ctx, "recipes", Some("context")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&context_lookup).unwrap();
         assert_eq!(parsed["results"].as_array().unwrap().len(), 1);
     }
 
     #[test]
     fn handle_invalid_type_filter_errors() {
-        assert!(py_handle_lookup("ctx-any", "alice", Some("invalid")).is_err());
+        let scp = default_scp();
+        assert!(
+            scp.handle_lookup("ctx-any", "alice", Some("invalid"))
+                .is_err()
+        );
     }
 
     // -- Address resolution tests --------------------------------------------
@@ -1503,9 +1530,10 @@ mod tests {
         reset_petname_map_for(owner);
         // Initialize the tokio runtime required by PyO3 bridge functions
         crate::init_runtime().ok();
-        py_petname_set(owner, "did:dht:zAlice", "alice").unwrap();
+        let scp = default_scp();
+        scp.petname_set(owner, "did:dht:zAlice", "alice").unwrap();
 
-        let result = py_address_resolve(owner, "alice", None).unwrap();
+        let result = scp.address_resolve(owner, "alice", None).unwrap();
         let parsed: Vec<serde_json::Value> = serde_json::from_str(&result).unwrap();
         assert!(!parsed.is_empty());
         assert_eq!(parsed[0]["type"], "Identity");

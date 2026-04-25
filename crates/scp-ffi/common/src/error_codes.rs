@@ -103,6 +103,14 @@ pub const IDENT_1043: &str = "SCP-IDENT-1043";
 pub const IDENT_1044: &str = "SCP-IDENT-1044";
 /// Identity attestation list.
 pub const IDENT_1045: &str = "SCP-IDENT-1045";
+/// SCPID unbound closure invoked directly.
+///
+/// Construct an SCP-backed closure via `SCP.scpidSign` /
+/// `SCP.scpidChallenge` / `SCP.scpidVerify`. Only surfaced by the Swift
+/// SDK's `ScpId.unboundSign` / `unboundChallenge` / `unboundVerify`
+/// stubs when a caller invokes them directly instead of passing an
+/// `SCP`-bound closure.
+pub const IDENT_1046: &str = "SCP-IDENT-1046";
 
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)
@@ -504,7 +512,32 @@ pub const VALID_7005: &str = "SCP-VALID-7005";
 /// Validation type error.
 pub const VALID_7006: &str = "SCP-VALID-7006";
 /// Validation format error.
+///
+/// Used for malformed or wrong-shape byte input at the FFI boundary —
+/// e.g. a parity-harness `testing_seed` that is not exactly 32 bytes,
+/// or a `signed_at_override` `BigInt` that cannot be represented
+/// losslessly as a `u64`. Enum-like string mismatches (unknown custody
+/// type, unknown transport mode) use `VALID_7005` (invalid field
+/// value) instead.
 pub const VALID_7007: &str = "SCP-VALID-7007";
+/// Testing-only feature requires the `testing` feature flag.
+///
+/// Returned by FFI entry points when a caller supplies a parity-harness
+/// affordance (`testing_seed` on `identity_create`, `signed_at_override`
+/// on `scpid_sign`) in a build that was NOT compiled with the `testing`
+/// feature enabled. These are ADR-046 cross-bridge parity-harness
+/// inputs, not production APIs — production bundles reject them with
+/// this code.
+pub const VALID_7008: &str = "SCP-VALID-7008";
+/// Seed requires `InMemoryKeyCustody`.
+///
+/// Returned when a caller passes a deterministic parity-harness `seed`
+/// together with a custody type other than `"in_memory"`. Seeded
+/// determinism is only meaningful for the in-process `InMemoryKeyCustody`
+/// backend — platform/software/file custody all produce keys outside the
+/// seeded RNG, so accepting a seed with them would silently lie about
+/// reproducibility.
+pub const VALID_7009: &str = "SCP-VALID-7009";
 /// UCAN token validation error.
 pub const VALID_7010: &str = "SCP-VALID-7010";
 /// UCAN mint validation error.
@@ -647,6 +680,12 @@ pub const VALID_7133: &str = "SCP-VALID-7133";
 pub const VALID_7134: &str = "SCP-VALID-7134";
 /// Address resolution ambiguous error.
 pub const VALID_7135: &str = "SCP-VALID-7135";
+/// Recovery or custody-migration concurrency cap reached.
+///
+/// The NAPI bridge bounds concurrent `block_on` invocations to prevent libuv
+/// worker-pool exhaustion (RED-PR5-002 / BLACK-PR5-002). Caller should back
+/// off and retry.
+pub const VALID_7140: &str = "SCP-VALID-7140";
 /// Governance vote validation error.
 pub const VALID_7216: &str = "SCP-VALID-7216";
 /// Media validation error.

@@ -1300,10 +1300,11 @@ public func FfiConverterTypeIdentity_lower(_ value: Identity) -> UnsafeMutableRa
 /**
  * Opaque handle to a running SCP application node.
  *
- * Created by [`node_start_in_memory`] or [`node_start_local`]. The node
- * includes a running relay server, a generated DID identity, and (optionally)
- * persistent storage. The HTTP server is **not** started automatically --
- * only the relay is bound.
+ * Created by [`Scp::node_start_in_memory`](crate::scp::Scp::node_start_in_memory)
+ * or [`Scp::node_start_local`](crate::scp::Scp::node_start_local). The
+ * node includes a running relay server, a generated DID identity, and
+ * (optionally) persistent storage. The HTTP server is **not** started
+ * automatically -- only the relay is bound.
  */
 public protocol NodeHandleProtocol: AnyObject, Sendable {
     
@@ -1399,10 +1400,11 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
 /**
  * Opaque handle to a running SCP application node.
  *
- * Created by [`node_start_in_memory`] or [`node_start_local`]. The node
- * includes a running relay server, a generated DID identity, and (optionally)
- * persistent storage. The HTTP server is **not** started automatically --
- * only the relay is bound.
+ * Created by [`Scp::node_start_in_memory`](crate::scp::Scp::node_start_in_memory)
+ * or [`Scp::node_start_local`](crate::scp::Scp::node_start_local). The
+ * node includes a running relay server, a generated DID identity, and
+ * (optionally) persistent storage. The HTTP server is **not** started
+ * automatically -- only the relay is bound.
  */
 open class NodeHandle: NodeHandleProtocol, @unchecked Sendable {
     fileprivate let pointer: UnsafeMutableRawPointer!
@@ -1725,7 +1727,7 @@ public func FfiConverterTypeNodeHandle_lower(_ value: NodeHandle) -> UnsafeMutab
 /**
  * Opaque handle to a running SCP relay server.
  *
- * Created by [`relay_start_in_memory`] or [`relay_start_local`]. The relay
+ * Created by `relay_start_in_memory` or `relay_start_local`. The relay
  * accepts WebSocket connections at [`relay_url`](Self::relay_url)
  * and can be gracefully stopped via [`shutdown`](Self::shutdown).
  */
@@ -1765,7 +1767,7 @@ public protocol RelayHandleProtocol: AnyObject, Sendable {
 /**
  * Opaque handle to a running SCP relay server.
  *
- * Created by [`relay_start_in_memory`] or [`relay_start_local`]. The relay
+ * Created by `relay_start_in_memory` or `relay_start_local`. The relay
  * accepts WebSocket connections at [`relay_url`](Self::relay_url)
  * and can be gracefully stopped via [`shutdown`](Self::shutdown).
  */
@@ -1937,25 +1939,650 @@ public func FfiConverterTypeRelayHandle_lower(_ value: RelayHandle) -> UnsafeMut
  * The SCP instance — a caller-owned handle that wraps a
  * [`UniffiBridgeInstance`].
  *
- * Generated as `class SCP` in both Swift and Kotlin.
+ * Generated as `class SCP` in both Swift and Kotlin. Phase D (#1695,
+ * ADR-048) deleted the process-wide default instance: every caller now
+ * constructs an explicit `SCP()` and the handles it mints are rejected
+ * on any other instance via [`check-handle-affinity`][affinity].
+ *
+ * The native `shutdown` parameter is milliseconds (`u64`) — the SDK
+ * wrappers present it as seconds for consumer ergonomics.
+ *
+ * [affinity]: ../../../../scripts/check-handle-affinity.sh
  *
  * # Swift usage
  *
  * ```swift
  * let scp = SCP()                                // fresh in-memory instance
- * let shared = try SCP.defaultInstance()         // process-wide default
- * try await scp.shutdown(timeoutSecs: 5)         // graceful shutdown
+ * let identity = try await scp.identityCreate(custody: "in_memory")
+ * try await scp.shutdown(timeoutMillis: 5_000)   // graceful shutdown
  * ```
  *
  * # Kotlin usage
  *
  * ```kotlin
  * val scp = SCP()                                // fresh in-memory instance
- * val shared = SCP.defaultInstance()             // process-wide default
- * scp.shutdown(timeoutSecs = 5uL)                // suspend fun, graceful shutdown
+ * val identity = scp.identityCreate(custody = "in_memory")
+ * scp.shutdown(timeoutMillis = 5_000uL)          // suspend fun, graceful shutdown
  * ```
  */
 public protocol ScpProtocol: AnyObject, Sendable {
+    
+    /**
+     * Per-instance equivalent of the free-function `access_key_generate`.
+     *
+     * Routes through `&*self.inner`.
+     */
+    func accessKeyGenerate(contextId: String, memberDid: String, callerDid: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `access_key_restore`.
+     *
+     * Routes through `&*self.inner`.
+     */
+    func accessKeyRestore(contextId: String, memberDid: String, callerDid: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `access_key_revoke`.
+     *
+     * Routes through `&*self.inner`.
+     */
+    func accessKeyRevoke(contextId: String, memberDid: String, callerDid: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `add_checkpoint_cosignature`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func addCheckpointCosignature(handle: ContextHandle, checkpointJson: String, signerDid: String, signatureHex: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `address_resolve`.
+     */
+    func addressResolve(ownerDid: String, address: String, knownContextsJson: String?) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `aggregate_trust_input`.
+     *
+     * Routes through `&*self.inner` — trust data is populated against
+     * THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`),
+     * falling back to an ephemeral in-memory store when no repository
+     * is attached.
+     */
+    func aggregateTrustInput(contextId: String, subjectDid: String, eventsJson: String, merkleRootJson: String, consequenceRulesJson: String, thresholdRequirementsJson: String, attestorSetsJson: String, cachedAttestationsJson: String, challengeResultsJson: String) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `apply_pending_ceiling_modification`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func applyPendingCeilingModification(handle: ContextHandle, currentTimestamp: UInt64) async throws  -> Bool
+    
+    /**
+     * Per-instance equivalent of the free-function `bridge_create_shadow`.
+     *
+     * Mutates this instance's per-context bridge state. Rejects any
+     * cross-instance caller (the method takes `&self` — the `bi` threaded
+     * into `bridge_create_shadow_on` is always this instance's).
+     */
+    func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMode: String, contextId: String) throws  -> ShadowIdentityResult
+    
+    /**
+     * Per-instance equivalent of the free-function [`bridge_evaluate_trust`].
+     *
+     * Pure function — no per-instance state required. Exists for SDK
+     * API uniformity.
+     */
+    func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadowStatus: String) throws  -> UInt8
+    
+    /**
+     * Per-instance equivalent of the free-function `broadcast_admission`.
+     *
+     * Routes through `&*self.inner`. Returns `None` when the handle's
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func broadcastAdmission(handle: ContextHandle) async  -> String?
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_block_subscriber`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func broadcastBlockSubscriber(handle: ContextHandle, subscriberDid: String, blockerDid: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_handle_key_request`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, requesterDid: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_is_subscriber`.
+     *
+     * Routes through `&*self.inner`. Returns `false` when the handle's
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func broadcastIsSubscriber(handle: ContextHandle, did: String) async  -> Bool
+    
+    /**
+     * Per-instance equivalent of the free-function `broadcast_publish`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func broadcastPublish(handle: ContextHandle, identity: Identity, payload: Data) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_publish_asset`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func broadcastPublishAsset(handle: ContextHandle, identity: Identity, asset: AssetEntry, deployId: String?) async throws  -> PublishResult
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_publish_assets`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func broadcastPublishAssets(handle: ContextHandle, identity: Identity, assets: [AssetEntry], deployId: String?) async throws  -> BatchPublishResult
+    
+    /**
+     * Per-instance equivalent of the free-function `broadcast_subscribe`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func broadcastSubscribe(handle: ContextHandle, subscriberDid: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_subscriber_count`.
+     *
+     * Routes through `&*self.inner`. Returns `None` when the handle's
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func broadcastSubscriberCount(handle: ContextHandle) async  -> UInt64?
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_unblock_subscriber`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func broadcastUnblockSubscriber(handle: ContextHandle, subscriberDid: String, unblockerDid: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `broadcast_unsubscribe`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rotateKeys: Bool) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `configure_relay_transport`.
+     *
+     * Routes through `&*self.inner`. Installs a real `MlsCryptoProvider`
+     * and `RelayTransportProvider` on this instance's `ContextManager`.
+     */
+    func configureRelayTransport(relayUrl: String, localDid: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `context_close`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` /
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     *
+     * Authorization is enforced by the `ContextManager` (which delegates
+     * to `ttl::close_context` checking the `ContextClose` capability) —
+     * no bridge-layer auth check.
+     */
+    func contextClose(handle: ContextHandle, identity: Identity) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `context_create`.
+     *
+     * Creates a new SCP context under this instance. Routes through
+     * `&*self.inner` instead of the process-wide
+     * `DEFAULT_BRIDGE_INSTANCE` — the `ContextManager` initialization
+     * (`init_context_manager_with_did`), the per-context UCAN registry,
+     * and the returned handle's `instance_id` stamping are all scoped to
+     * this `SCP`. The context handle is rejected on any other `SCP`.
+     *
+     * See the documentation on the free `context_create` function for
+     * argument semantics and MLS group / event-log initialization
+     * details.
+     */
+    func contextCreate(identity: Identity, params: ContextParams) async throws  -> ContextHandle
+    
+    /**
+     * Per-instance equivalent of the free-function `context_drain_events`.
+     *
+     * Routes through `&*self.inner`. Returns an empty `Vec` when the
+     * handle's `instance_id` does not match this `SCP`'s.
+     */
+    func contextDrainEvents(handle: ContextHandle) async  -> [String]
+    
+    /**
+     * Per-instance equivalent of the free-function `context_export`.
+     */
+    func contextExport(handle: ContextHandle) async throws  -> Data
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `context_handle_ttl_expiry`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func contextHandleTtlExpiry(handle: ContextHandle) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `context_import`.
+     */
+    func contextImport(data: Data) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `context_is_member`.
+     *
+     * Routes through `&*self.inner`. Returns `false` when the handle's
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func contextIsMember(handle: ContextHandle, did: String) async  -> Bool
+    
+    /**
+     * Per-instance equivalent of the free-function `context_join`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` /
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     *
+     * See the documentation on the free `context_join` function for
+     * argument semantics and the spending-UCAN AND-composition path.
+     */
+    func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt: String?) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `context_leave`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` /
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func contextLeave(handle: ContextHandle, identity: Identity) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `context_member_count`.
+     *
+     * Routes through `&*self.inner`. Returns `None` when the handle's
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func contextMemberCount(handle: ContextHandle) async  -> UInt64?
+    
+    /**
+     * Per-instance equivalent of the free-function `context_member_dids`.
+     *
+     * Routes through `&*self.inner`. Returns an empty `Vec` when the
+     * handle's `instance_id` does not match this `SCP`'s.
+     */
+    func contextMemberDids(handle: ContextHandle) async  -> [String]
+    
+    /**
+     * Per-instance equivalent of the free-function `context_member_role`.
+     *
+     * Routes through `&*self.inner`. Returns `None` when the handle's
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func contextMemberRole(handle: ContextHandle, did: String) async  -> String?
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `context_propose_ttl_extension`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func contextProposeTtlExtension(handle: ContextHandle, memberDid: String, proposedSeconds: UInt64) async throws  -> Bool
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `context_reset_ttl_timer`.
+     *
+     * Routes through `&*self.inner`. Silently returns when the handle's
+     * `instance_id` does not match this `SCP`'s (matches the free-function
+     * fire-and-forget signature).
+     */
+    func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64) async 
+    
+    /**
+     * Per-instance equivalent of the free-function `context_send`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` /
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func contextSend(handle: ContextHandle, identity: Identity, payload: Data, spendingUcanJwt: String?) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `context_subscribe`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     *
+     * The current implementation is a stub that signals stream
+     * completion immediately — full transport wiring lands in a later
+     * slice. When background tasks are introduced, they will register
+     * into the per-instance `CoreFields` task set rather than a shared
+     * global registry.
+     */
+    func contextSubscribe(handle: ContextHandle, listener: MessageListener) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `create_governance_checkpoint`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func createGovernanceCheckpoint(handle: ContextHandle, checkpointSeq: UInt64, merkleRootHex: String, eventCount: UInt64, lastEventHashHex: String, stateSnapshotHashHex: String, creatorDid: String, creatorSignatureHex: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `economy_antispam_escalated_cost`.
+     */
+    func economyAntispamEscalatedCost(contextId: String, senderDid: String, now: UInt64, baseCost: UInt64, thresholdsJson: String, floor: UInt64?, cap: UInt64?) throws  -> UInt64
+    
+    /**
+     * Per-instance equivalent of the free-function `economy_antispam_record`.
+     */
+    func economyAntispamRecord(contextId: String, senderDid: String, timestamp: UInt64) throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `economy_antispam_velocity`.
+     */
+    func economyAntispamVelocity(contextId: String, senderDid: String, now: UInt64) throws  -> UInt64
+    
+    /**
+     * Per-instance equivalent of the free-function `economy_budget_grant`.
+     */
+    func economyBudgetGrant(contextId: String, did: String, amount: UInt64) throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `economy_budget_record_spend`.
+     */
+    func economyBudgetRecordSpend(contextId: String, did: String, amount: UInt64) throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `economy_budget_remaining`.
+     */
+    func economyBudgetRemaining(contextId: String, did: String) throws  -> UInt64
+    
+    /**
+     * Per-instance equivalent of the free-function `evaluate_invitation`.
+     */
+    func evaluateInvitation(paramsJson: String, inviterDid: String, identityDid: String, policyJson: String?, spendingJson: String?, trustedDids: [String]) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `event_log_checkpoint`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func eventLogCheckpoint(handle: ContextHandle, identity: Identity, epoch: UInt64) async throws  -> Checkpoint
+    
+    /**
+     * Per-instance equivalent of the free-function `event_log_query`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func eventLogQuery(handle: ContextHandle, filterJson: String?) async throws  -> [Event]
+    
+    /**
+     * Per-instance equivalent of the free-function `event_log_verify`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func eventLogVerify(handle: ContextHandle, claimJson: String) async throws  -> Proof
+    
+    /**
+     * Per-instance equivalent of the free-function `finalize_close`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func finalizeClose(handle: ContextHandle) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `get_economic_policy`.
+     */
+    func getEconomicPolicy(handle: ContextHandle) throws  -> String?
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_approve`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func governanceApprove(handle: ContextHandle, voterDid: String, proposalIdHex: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_execute`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func governanceExecute(handle: ContextHandle, proposalJson: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_get_proposal`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func governanceGetProposal(handle: ContextHandle, proposalIdHex: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_list_proposals`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func governanceListProposals(handle: ContextHandle) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_propose`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func governancePropose(handle: ContextHandle, proposerDid: String, actionJson: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_reject`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func governanceReject(handle: ContextHandle, voterDid: String, proposalIdHex: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_withdraw`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func governanceWithdraw(handle: ContextHandle, voterDid: String, proposalIdHex: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `handle_deregister`.
+     */
+    func handleDeregister(discoveryContextId: String, handle: String, did: String) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `handle_lookup`.
+     */
+    func handleLookup(discoveryContextId: String, handle: String, typeFilter: String?) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `handle_register`.
+     */
+    func handleRegister(discoveryContextId: String, handle: String, targetJson: String, registrantDid: String, description: String?, tags: [String]?) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_attest_device`.
+     *
+     * Rejects any `Identity` whose `instance_id` does not match this
+     * `SCP`'s — cross-instance handle misuse surfaces as
+     * `ScpError::Permission` with code `SCP-PERM-3030`.
+     */
+    func identityAttestDevice(identity: Identity) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_create`.
+     *
+     * Creates a new SCP identity under this instance. Routes through
+     * `&*self.inner` instead of the process-wide
+     * `DEFAULT_BRIDGE_INSTANCE` — every side-effect (DID resolver
+     * initialization, handle `instance_id` stamping) is scoped to this
+     * `SCP`.
+     *
+     * When `testing_seed` is supplied (32 bytes), the in-memory custody
+     * is backed by a deterministic RNG so subsequent `generate_keypair`
+     * calls produce byte-identical Ed25519 keys across bridges — the
+     * basis of the cross-bridge parity test (ADR-046). `testing_seed`
+     * is only valid for `"in_memory"` custody; other custody types
+     * reject it with `SCP-VALID-7009`.
+     */
+    func identityCreate(custody: String, testingSeed: Data?) async throws  -> Identity
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_create_link_attestation`.
+     *
+     * Signs the link attestation with the identity's active signing key
+     * and stores the entry in the per-instance link-attestation and
+     * custody registries on `&*self.inner`. Rejects any cross-instance
+     * `Identity` handle.
+     *
+     * See spec §3.5.1, §3.5.2.
+     */
+    func identityCreateLinkAttestation(identity: Identity, platform: String, handle: String, proof: String, verificationMethod: String, platformId: String?) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_create_with_agent_key`.
+     *
+     * Creates a new SCP identity with an agent signing key. Routes through
+     * `&*self.inner` so the returned `Identity`'s `instance_id` is stamped
+     * against this `SCP`.
+     */
+    func identityCreateWithAgentKey(custody: String) async throws  -> Identity
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_create_with_custody`.
+     *
+     * Creates a new SCP identity under this instance using an injected
+     * [`KeyCustodyProvider`](crate::KeyCustodyProvider). Routes through
+     * `&*self.inner` — the handle's `instance_id` is stamped against this
+     * `SCP` so cross-instance misuse is rejected.
+     *
+     * See SCP-214 acceptance criteria 2-3.
+     */
+    func identityCreateWithCustody(provider: KeyCustodyProvider) async throws  -> Identity
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_execute_custody_migration`.
+     */
+    func identityExecuteCustodyMigration(did: String, target: String, contextIds: [String]) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_execute_recovery`.
+     *
+     * Pure orchestration — takes no handles. Routes through `&self.inner`
+     * only to preserve API uniformity; the underlying recovery backend is
+     * a local stub pending SDK-layer wiring.
+     */
+    func identityExecuteRecovery(did: String, tier: String, contextIds: [String]) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_link_attestations`.
+     *
+     * Reads the link-attestation registry on `&*self.inner`.
+     *
+     * See spec §3.5.1.
+     */
+    func identityLinkAttestations(did: String) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_load`.
+     *
+     * Loads an external identity handle under this instance. Routes through
+     * `&*self.inner` — the returned handle's `instance_id` is stamped
+     * against this `SCP`. Key operations on the returned handle still
+     * require a `KeyCustodyProvider` callback to be wired.
+     */
+    func identityLoad(did: String) async throws  -> Identity
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_migrate`.
+     *
+     * Rejects any `Identity` whose `instance_id` does not match this
+     * `SCP`'s.
+     */
+    func identityMigrate(identity: Identity) async throws  -> Identity
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_remove_link_attestation`.
+     *
+     * Mutates the link-attestation registry on `&*self.inner`.
+     *
+     * See spec §3.5.1.
+     */
+    func identityRemoveLinkAttestation(did: String, attestationId: String)  -> Bool
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_resolve`.
+     *
+     * Resolves a DID to its document. DID resolution itself doesn't touch
+     * the instance — the method variant exists for API symmetry with the
+     * other `identity_*` operations.
+     */
+    func identityResolve(did: String) async throws  -> DidDocument
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_verify_device_attestation`.
+     *
+     * Verification itself is a pure function — taking `&self` keeps the
+     * method surface uniform.
+     */
+    func identityVerifyDeviceAttestation(did: String, tokenBase64: String) async throws  -> Bool
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_verify_link_attestation`.
+     *
+     * Signature verification is a pure function — taking `&self` keeps
+     * the method surface uniform.
+     *
+     * See spec §3.5.1.
+     */
+    func identityVerifyLinkAttestation(attestationJson: String, issuerPublicKeyHex: String) async throws  -> Bool
     
     /**
      * Returns the monotonic identifier for this instance.
@@ -1963,10 +2590,214 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func instanceId()  -> UInt64
     
     /**
+     * Per-instance equivalent of the free-function `is_local_did`.
+     *
+     * Routes through `&*self.inner`. Returns `false` if the DID fails
+     * validation or the instance's `ContextManager` cannot be
+     * initialized / looked up.
+     */
+    func isLocalDid(did: String) async  -> Bool
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_client_connect_sse`.
+     *
+     * Routes through the module-level MCP client registry.
+     */
+    func mcpClientConnectSse(url: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
+     *
+     * Routes through the module-level MCP client registry.
+     */
+    func mcpClientConnectStdio(command: [String]) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_client_disconnect`.
+     *
+     * Routes through the module-level MCP client registry.
+     */
+    func mcpClientDisconnect(handle: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_client_invoke`.
+     *
+     * Routes through the module-level MCP client registry.
+     */
+    func mcpClientInvoke(handle: String, toolName: String, inputJson: String, contextId: String, invokerDid: String) async throws  -> McpInvokeResult
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_client_list_tools`.
+     *
+     * Routes through the module-level MCP client registry.
+     */
+    func mcpClientListTools(handle: String) async throws  -> [McpToolInfo]
+    
+    /**
+     * Per-instance equivalent of the free-function [`mcp_configure_stdio_allowlist`].
+     *
+     * The stdio allowlist is process-wide (module-level state) — this
+     * method exists purely to give the SDK a uniform `scp.method(...)`
+     * surface.
+     */
+    func mcpConfigureStdioAllowlist(additionalBinaries: [String]) throws 
+    
+    /**
+     * Per-instance equivalent of the free-function [`mcp_disable_stdio_allowlist`].
+     *
+     * The stdio allowlist is process-wide (module-level state).
+     */
+    func mcpDisableStdioAllowlist() throws 
+    
+    /**
+     * Per-instance equivalent of the free-function [`mcp_get_stdio_allowlist`].
+     *
+     * The stdio allowlist is process-wide (module-level state).
+     */
+    func mcpGetStdioAllowlist() throws  -> McpAllowlistState
+    
+    /**
+     * Per-instance equivalent of the free-function [`mcp_reset_stdio_allowlist`].
+     *
+     * The stdio allowlist is process-wide (module-level state).
+     */
+    func mcpResetStdioAllowlist() throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_server_create`.
+     *
+     * Routes through `&*self.inner`. The MCP server registry is
+     * module-level (not per-instance) so the returned opaque handle
+     * string is globally unique; this method preserves that behaviour.
+     */
+    func mcpServerCreate(config: McpServerConfig) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_server_stop`.
+     *
+     * Routes through the module-level MCP server registry (the registry
+     * is not per-instance; the opaque handle string is globally unique).
+     */
+    func mcpServerStop(handle: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `migration_state`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func migrationState(handle: ContextHandle) async throws  -> String?
+    
+    /**
+     * Per-instance equivalent of the free-function `node_start_in_memory`.
+     *
+     * Starts an in-memory application node. If `identity` is supplied, it
+     * must have been minted by this `Scp` (cross-instance handles are
+     * rejected via the `CoreFields::check_handle` call).
+     */
+    func nodeStartInMemory(identity: Identity?) async throws  -> NodeHandle
+    
+    /**
+     * Per-instance equivalent of the free-function `node_start_local`.
+     *
+     * Starts a file-backed application node at `data_dir`. If `identity`
+     * is supplied, it must have been minted by this `Scp`.
+     */
+    func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?) async throws  -> NodeHandle
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_get_for_context`.
+     */
+    func petnameGetForContext(ownerDid: String, contextId: String) throws  -> String?
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_get_for_did`.
+     */
+    func petnameGetForDid(ownerDid: String, targetDid: String) throws  -> String?
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_remove`.
+     */
+    func petnameRemove(ownerDid: String, targetDid: String) throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_remove_context`.
+     */
+    func petnameRemoveContext(ownerDid: String, contextId: String) throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_resolve_context`.
+     */
+    func petnameResolveContext(ownerDid: String, name: String) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_resolve_did`.
+     */
+    func petnameResolveDid(ownerDid: String, name: String) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_set`.
+     */
+    func petnameSet(ownerDid: String, targetDid: String, name: String) throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_set_context`.
+     */
+    func petnameSetContext(ownerDid: String, contextId: String, name: String) throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `provenance_attach`.
+     *
+     * Appends `ProvenanceAttached` / `ProvenanceReceived` events to the
+     * source and target context event logs on this instance.
+     */
+    func provenanceAttach(sourceContextId: String, sourceType: String, memoryScopeStr: String, members: [String], targetContextId: String, actorDid: String, existingChainDepth: UInt8?) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `register_local_did`.
+     *
+     * Routes through `&*self.inner`. Initializes this instance's
+     * `ContextManager` if not yet attached (idempotent) and registers
+     * the DID on the per-instance local-DID set.
+     */
+    func registerLocalDid(did: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `relay_start_in_memory`.
+     *
+     * Starts a new in-memory relay server and returns a `RelayHandle`
+     * whose `instance_id` is stamped against this `Scp`. Phase D (#1695)
+     * replaces the old free function that looked up `DEFAULT_BRIDGE_INSTANCE`
+     * for the handle's `instance_id`.
+     */
+    func relayStartInMemory() async throws  -> RelayHandle
+    
+    /**
+     * Per-instance equivalent of the free-function `relay_start_local`.
+     *
+     * Starts a new redb-backed relay at `data_dir/blobs.redb`.
+     */
+    func relayStartLocal(dataDir: String) async throws  -> RelayHandle
+    
+    /**
+     * Per-instance equivalent of the free-function `restore_all_contexts`.
+     *
+     * Routes through `&*self.inner`.
+     */
+    func restoreAllContexts() async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `restore_context`.
+     *
+     * Routes through `&*self.inner`.
+     */
+    func restoreContext(contextId: String) async throws 
+    
+    /**
      * Resumes a suspended bridge instance.
      *
      * Clears the suspended flag, then runs any per-bridge async work chained
-     * by the [`BridgeInstanceCore::resume`] override (transport reconnect
+     * by the `BridgeInstanceCore::resume` override (transport reconnect
      * from pending relay URLs, persisted-context restoration).
      *
      * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin.
@@ -1977,6 +2808,52 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * shut down.
      */
     func resume() async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `scope_deregister`.
+     */
+    func scopeDeregister(scopeContextId: String, name: String, did: String) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `scope_lookup`.
+     */
+    func scopeLookup(scopeContextId: String, name: String) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `scope_register`.
+     */
+    func scopeRegister(scopeContextId: String, name: String, targetContextId: String, relayUrls: [String], registrantDid: String, description: String?, tags: [String]?) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `scpid_sign`.
+     *
+     * Signs an SCPID challenge with the identity's requested key. Rejects
+     * any `Identity` whose `instance_id` does not match this `Scp`'s.
+     *
+     * `signed_at_override` is a testing-only parameter for the ADR-046
+     * cross-bridge parity harness. Only accepted when scp-core is built
+     * with the `testing` feature; production builds reject any non-`None`
+     * value via `SCP-VALID-7008`.
+     */
+    func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String, signedAtOverride: UInt64?) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `scpid_verify`.
+     *
+     * Uses this `Scp`'s DID resolver (populated when the caller invokes
+     * `identity_create` / `identity_create_with_custody`). Phase D (#1695)
+     * replaces the old free function that consulted the process-wide
+     * `DEFAULT_BRIDGE_INSTANCE` DID resolver slot.
+     */
+    func scpidVerify(responseJson: String, challengeJson: String) throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `set_economic_policy`.
+     *
+     * Economic policy changes must go through governance — this method
+     * always returns an error to enforce that invariant.
+     */
+    func setEconomicPolicy(handle: ContextHandle, policyJson: String) throws 
     
     /**
      * Shuts down this bridge instance with a graceful deadline.
@@ -2005,27 +2882,270 @@ public protocol ScpProtocol: AnyObject, Sendable {
      */
     func suspend() throws 
     
+    /**
+     * Per-instance equivalent of the free-function [`sync_classify_offline`].
+     *
+     * Pure function — no per-instance state required.
+     */
+    func syncClassifyOffline(lastRelayContact: UInt64, now: UInt64)  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function [`sync_classify_offline_custom`].
+     *
+     * Pure function — no per-instance state required.
+     */
+    func syncClassifyOfflineCustom(lastRelayContact: UInt64, now: UInt64, tier1ThresholdSecs: UInt64, tier2ThresholdSecs: UInt64)  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function [`sync_get_policy`].
+     *
+     * Pure function — returns the default sync policy parameters.
+     */
+    func syncGetPolicy()  -> SyncPolicyResult
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `tombstone_migrated_context`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func tombstoneMigratedContext(handle: ContextHandle) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_interface_accept`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func toolInterfaceAccept(handle: ContextHandle, interfaceJson: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_interface_expose`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func toolInterfaceExpose(handle: ContextHandle, toolId: String, targetContextId: String, rateLimitJson: String?) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_interface_revoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func toolInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_invoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?, spendingUcanJwt: String?) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `tool_invoke_cross_context`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_register`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func toolRegister(handle: ContextHandle, definition: ToolDefinition) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_session_close`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func toolSessionClose(handle: ContextHandle, sessionId: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_session_create`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func toolSessionCreate(handle: ContextHandle, toolId: String, sourceContextId: String, ttlSeconds: UInt64?) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_session_invoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+    func toolSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?) async throws  -> String
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_verify`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func toolVerify(handle: ContextHandle, toolId: String) async throws  -> ToolVerificationResult
+    
+    /**
+     * Per-instance equivalent of the free-function `transport_connect`.
+     *
+     * Routes through `&*self.inner`. The returned `TransportManager`
+     * handle's `instance_id` is stamped against this `SCP`'s
+     * `UniffiBridgeInstance`, so it will be rejected by any other
+     * `SCP` instance.
+     */
+    func transportConnect(relayUrl: String) async throws  -> TransportManager
+    
+    /**
+     * Per-instance equivalent of the free-function `transport_disconnect`.
+     *
+     * Routes through `&*self.inner`. Rejects any `TransportManager`
+     * whose `instance_id` does not match this `SCP`'s.
+     */
+    func transportDisconnect(manager: TransportManager) async throws 
+    
+    /**
+     * Handleless transport-status probe — reports whether a
+     * `TransportManager` is currently installed on this `SCP`
+     * instance without requiring the caller to construct a
+     * [`TransportManager`] handle first.
+     *
+     * Mirrors `PyO3`'s `Scp::transport_status()`, NAPI's
+     * `Scp::transportStatus(undefined)`, and WASM's
+     * `transport_status()` so the cross-bridge parity harness
+     * (ADR-046) can compare the disconnected-state shape across all
+     * four bridges without needing a relay fixture for the `UniFFI`
+     * runners (ADR-048 §7a).
+     *
+     * Returns `connected = has_transport()`, and always `None` for
+     * both `relay_url` and `latency_ms` — matching the NAPI
+     * handleless probe's contract (the relay URL lives on the
+     * `TransportManager` handle, not on the bridge instance, so it
+     * is only observable via [`Self::transport_status`]). The
+     * disconnected shape — the only shape the parity harness
+     * exercises — is `(false, None, None)` across all four bridges.
+     *
+     * Since the result is stateless as far as the bridge is
+     * concerned (no cross-instance handle is passed in), there is no
+     * handle-affinity check to perform.
+     */
+    func transportManagerStatus() async throws  -> TransportStatus
+    
+    /**
+     * Per-instance equivalent of the free-function `transport_status`.
+     *
+     * Routes through `&*self.inner`. Rejects any `TransportManager`
+     * whose `instance_id` does not match this `SCP`'s.
+     */
+    func transportStatus(manager: TransportManager) async throws  -> TransportStatus
+    
+    /**
+     * Per-instance equivalent of the free-function [`trust_create_challenge`].
+     *
+     * Stateless helper — uses an ephemeral signing key per call.
+     */
+    func trustCreateChallenge(targetDid: String) throws  -> ChallengeResult
+    
+    /**
+     * Per-instance equivalent of the free-function `trust_query_score`.
+     *
+     * Trust event counts are queried from the module-level helper (a
+     * stateless `(0, 0)` stub today — see `runtime::query_trust_event_counts`).
+     * The method exists for SDK API uniformity.
+     */
+    func trustQueryScore(did: String, contextId: String) throws  -> TrustScoreResult
+    
+    /**
+     * Per-instance equivalent of the free-function [`trust_verify_attestation`].
+     *
+     * The underlying attestation verification is stateless — this method
+     * is a thin delegate for SDK API uniformity.
+     */
+    func trustVerifyAttestation(attestationJson: String) throws  -> AttestationVerificationResult
+    
+    /**
+     * Per-instance equivalent of the free-function [`trust_verify_response`].
+     *
+     * Stateless helper — uses an ephemeral verification signer per call.
+     */
+    func trustVerifyResponse(challengeJson: String, responseJson: String) throws  -> Bool
+    
+    /**
+     * Per-instance equivalent of the free-function `ucan_delegate`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String]) async throws  -> UcanToken
+    
+    /**
+     * Per-instance equivalent of the free-function `ucan_mint`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func ucanMint(handle: ContextHandle, memberDid: String, capabilities: [String], proofs: [String]?) async throws  -> UcanToken
+    
+    /**
+     * Per-instance equivalent of the free-function `ucan_revoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func ucanRevoke(handle: ContextHandle, token: String, revokerDid: String) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function `ucan_validate`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+    func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?) async throws 
+    
+    /**
+     * Per-instance equivalent of the free-function [`verify_participation_requirements`].
+     *
+     * Stateless helper that parses both JSON inputs and delegates to the
+     * scp-core verifier using the current system time.
+     */
+    func verifyParticipationRequirements(profileJson: String, requirementsJson: String) throws  -> Bool
+    
 }
 /**
  * The SCP instance — a caller-owned handle that wraps a
  * [`UniffiBridgeInstance`].
  *
- * Generated as `class SCP` in both Swift and Kotlin.
+ * Generated as `class SCP` in both Swift and Kotlin. Phase D (#1695,
+ * ADR-048) deleted the process-wide default instance: every caller now
+ * constructs an explicit `SCP()` and the handles it mints are rejected
+ * on any other instance via [`check-handle-affinity`][affinity].
+ *
+ * The native `shutdown` parameter is milliseconds (`u64`) — the SDK
+ * wrappers present it as seconds for consumer ergonomics.
+ *
+ * [affinity]: ../../../../scripts/check-handle-affinity.sh
  *
  * # Swift usage
  *
  * ```swift
  * let scp = SCP()                                // fresh in-memory instance
- * let shared = try SCP.defaultInstance()         // process-wide default
- * try await scp.shutdown(timeoutSecs: 5)         // graceful shutdown
+ * let identity = try await scp.identityCreate(custody: "in_memory")
+ * try await scp.shutdown(timeoutMillis: 5_000)   // graceful shutdown
  * ```
  *
  * # Kotlin usage
  *
  * ```kotlin
  * val scp = SCP()                                // fresh in-memory instance
- * val shared = SCP.defaultInstance()             // process-wide default
- * scp.shutdown(timeoutSecs = 5uL)                // suspend fun, graceful shutdown
+ * val identity = scp.identityCreate(custody = "in_memory")
+ * scp.shutdown(timeoutMillis = 5_000uL)          // suspend fun, graceful shutdown
  * ```
  */
 open class Scp: ScpProtocol, @unchecked Sendable {
@@ -2070,11 +3190,12 @@ open class Scp: ScpProtocol, @unchecked Sendable {
     /**
      * Constructs a fresh `SCP` instance with default in-memory state.
      *
-     * Unlike [`Self::default_instance`], this bypasses the process-global
-     * `DEFAULT_BRIDGE_INSTANCE` entirely — each call produces a brand-new
-     * instance with a fresh monotonic `instance_id`, a fresh
-     * `CancellationToken`, and an empty `JoinSet`. Handles issued against
-     * this instance are incompatible with any other instance.
+     * Each call produces a brand-new instance with a fresh monotonic
+     * `instance_id`, a fresh `CancellationToken`, and an empty
+     * `JoinSet`. Handles issued against this instance are incompatible
+     * with any other instance — the `CoreFields::check_handle` path
+     * surfaces the mismatch as `ScpError::Permission` with code
+     * `SCP-PERM-3030`.
      */
 public convenience init() {
     let pointer =
@@ -2093,25 +3214,6 @@ public convenience init() {
         try! rustCall { uniffi_scp_ffi_uniffi_fn_free_scp(pointer, $0) }
     }
 
-    
-    /**
-     * Returns an `SCP` wrapping the process-wide default instance.
-     *
-     * Multiple calls return distinct `SCP` objects, but each wraps the
-     * same underlying `Arc<UniffiBridgeInstance>` — their `instance_id`s
-     * match, and changes made through one are visible to the other.
-     *
-     * # Errors
-     *
-     * Returns `ScpError::Context` if the default instance is currently
-     * suspended or permanently shut down.
-     */
-public static func defaultInstance()throws  -> Scp  {
-    return try  FfiConverterTypeScp_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_constructor_scp_default_instance($0
-    )
-})
-}
     
     /**
      * Constructs an `SCP` instance with a persistence provider placeholder.
@@ -2153,6 +3255,1617 @@ public static func withStorage(config: StorageConfig)throws  -> Scp  {
 
     
     /**
+     * Per-instance equivalent of the free-function `access_key_generate`.
+     *
+     * Routes through `&*self.inner`.
+     */
+open func accessKeyGenerate(contextId: String, memberDid: String, callerDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_access_key_generate(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(memberDid),FfiConverterString.lower(callerDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `access_key_restore`.
+     *
+     * Routes through `&*self.inner`.
+     */
+open func accessKeyRestore(contextId: String, memberDid: String, callerDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_access_key_restore(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(memberDid),FfiConverterString.lower(callerDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `access_key_revoke`.
+     *
+     * Routes through `&*self.inner`.
+     */
+open func accessKeyRevoke(contextId: String, memberDid: String, callerDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_access_key_revoke(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(contextId),FfiConverterString.lower(memberDid),FfiConverterString.lower(callerDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `add_checkpoint_cosignature`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func addCheckpointCosignature(handle: ContextHandle, checkpointJson: String, signerDid: String, signatureHex: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_add_checkpoint_cosignature(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(checkpointJson),FfiConverterString.lower(signerDid),FfiConverterString.lower(signatureHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `address_resolve`.
+     */
+open func addressResolve(ownerDid: String, address: String, knownContextsJson: String?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_address_resolve(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(address),
+        FfiConverterOptionString.lower(knownContextsJson),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `aggregate_trust_input`.
+     *
+     * Routes through `&*self.inner` — trust data is populated against
+     * THIS instance's `ProtocolRepository` variant (in-memory or `SQLite`),
+     * falling back to an ephemeral in-memory store when no repository
+     * is attached.
+     */
+open func aggregateTrustInput(contextId: String, subjectDid: String, eventsJson: String, merkleRootJson: String, consequenceRulesJson: String, thresholdRequirementsJson: String, attestorSetsJson: String, cachedAttestationsJson: String, challengeResultsJson: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_aggregate_trust_input(self.uniffiClonePointer(),
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(subjectDid),
+        FfiConverterString.lower(eventsJson),
+        FfiConverterString.lower(merkleRootJson),
+        FfiConverterString.lower(consequenceRulesJson),
+        FfiConverterString.lower(thresholdRequirementsJson),
+        FfiConverterString.lower(attestorSetsJson),
+        FfiConverterString.lower(cachedAttestationsJson),
+        FfiConverterString.lower(challengeResultsJson),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `apply_pending_ceiling_modification`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func applyPendingCeilingModification(handle: ContextHandle, currentTimestamp: UInt64)async throws  -> Bool  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_apply_pending_ceiling_modification(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterUInt64.lower(currentTimestamp)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `bridge_create_shadow`.
+     *
+     * Mutates this instance's per-context bridge state. Rejects any
+     * cross-instance caller (the method takes `&self` — the `bi` threaded
+     * into `bridge_create_shadow_on` is always this instance's).
+     */
+open func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMode: String, contextId: String)throws  -> ShadowIdentityResult  {
+    return try  FfiConverterTypeShadowIdentityResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_create_shadow(self.uniffiClonePointer(),
+        FfiConverterString.lower(bridgeId),
+        FfiConverterString.lower(platformHandle),
+        FfiConverterString.lower(bridgeMode),
+        FfiConverterString.lower(contextId),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function [`bridge_evaluate_trust`].
+     *
+     * Pure function — no per-instance state required. Exists for SDK
+     * API uniformity.
+     */
+open func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadowStatus: String)throws  -> UInt8  {
+    return try  FfiConverterUInt8.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_evaluate_trust(self.uniffiClonePointer(),
+        FfiConverterBool.lower(isBridged),
+        FfiConverterBool.lower(isNativeTransport),
+        FfiConverterString.lower(shadowStatus),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `broadcast_admission`.
+     *
+     * Routes through `&*self.inner`. Returns `None` when the handle's
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func broadcastAdmission(handle: ContextHandle)async  -> String?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_admission(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_block_subscriber`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func broadcastBlockSubscriber(handle: ContextHandle, subscriberDid: String, blockerDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_block_subscriber(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid),FfiConverterString.lower(blockerDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_handle_key_request`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, requesterDid: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_handle_key_request(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(authorDid),FfiConverterString.lower(requesterDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_is_subscriber`.
+     *
+     * Routes through `&*self.inner`. Returns `false` when the handle's
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func broadcastIsSubscriber(handle: ContextHandle, did: String)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_is_subscriber(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `broadcast_publish`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func broadcastPublish(handle: ContextHandle, identity: Identity, payload: Data)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_publish(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterData.lower(payload)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_publish_asset`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func broadcastPublishAsset(handle: ContextHandle, identity: Identity, asset: AssetEntry, deployId: String?)async throws  -> PublishResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_publish_asset(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterTypeAssetEntry_lower(asset),FfiConverterOptionString.lower(deployId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypePublishResult_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_publish_assets`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func broadcastPublishAssets(handle: ContextHandle, identity: Identity, assets: [AssetEntry], deployId: String?)async throws  -> BatchPublishResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_publish_assets(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterSequenceTypeAssetEntry.lower(assets),FfiConverterOptionString.lower(deployId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeBatchPublishResult_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `broadcast_subscribe`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func broadcastSubscribe(handle: ContextHandle, subscriberDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_subscribe(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_subscriber_count`.
+     *
+     * Routes through `&*self.inner`. Returns `None` when the handle's
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func broadcastSubscriberCount(handle: ContextHandle)async  -> UInt64?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_subscriber_count(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `broadcast_unblock_subscriber`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func broadcastUnblockSubscriber(handle: ContextHandle, subscriberDid: String, unblockerDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_unblock_subscriber(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid),FfiConverterString.lower(unblockerDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `broadcast_unsubscribe`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rotateKeys: Bool)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_broadcast_unsubscribe(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid),FfiConverterBool.lower(rotateKeys)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `configure_relay_transport`.
+     *
+     * Routes through `&*self.inner`. Installs a real `MlsCryptoProvider`
+     * and `RelayTransportProvider` on this instance's `ContextManager`.
+     */
+open func configureRelayTransport(relayUrl: String, localDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_configure_relay_transport(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(relayUrl),FfiConverterString.lower(localDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `context_close`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` /
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     *
+     * Authorization is enforced by the `ContextManager` (which delegates
+     * to `ttl::close_context` checking the `ContextClose` capability) —
+     * no bridge-layer auth check.
+     */
+open func contextClose(handle: ContextHandle, identity: Identity)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_close(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `context_create`.
+     *
+     * Creates a new SCP context under this instance. Routes through
+     * `&*self.inner` instead of the process-wide
+     * `DEFAULT_BRIDGE_INSTANCE` — the `ContextManager` initialization
+     * (`init_context_manager_with_did`), the per-context UCAN registry,
+     * and the returned handle's `instance_id` stamping are all scoped to
+     * this `SCP`. The context handle is rejected on any other `SCP`.
+     *
+     * See the documentation on the free `context_create` function for
+     * argument semantics and MLS group / event-log initialization
+     * details.
+     */
+open func contextCreate(identity: Identity, params: ContextParams)async throws  -> ContextHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_create(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(identity),FfiConverterTypeContextParams_lower(params)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeContextHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `context_drain_events`.
+     *
+     * Routes through `&*self.inner`. Returns an empty `Vec` when the
+     * handle's `instance_id` does not match this `SCP`'s.
+     */
+open func contextDrainEvents(handle: ContextHandle)async  -> [String]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_drain_events(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `context_export`.
+     */
+open func contextExport(handle: ContextHandle)async throws  -> Data  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_export(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterData.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `context_handle_ttl_expiry`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func contextHandleTtlExpiry(handle: ContextHandle)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_handle_ttl_expiry(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `context_import`.
+     */
+open func contextImport(data: Data)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_import(
+                    self.uniffiClonePointer(),
+                    FfiConverterData.lower(data)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `context_is_member`.
+     *
+     * Routes through `&*self.inner`. Returns `false` when the handle's
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func contextIsMember(handle: ContextHandle, did: String)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_is_member(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `context_join`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` /
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     *
+     * See the documentation on the free `context_join` function for
+     * argument semantics and the spending-UCAN AND-composition path.
+     */
+open func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt: String?)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_join(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterOptionString.lower(spendingUcanJwt)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `context_leave`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` /
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func contextLeave(handle: ContextHandle, identity: Identity)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_leave(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `context_member_count`.
+     *
+     * Routes through `&*self.inner`. Returns `None` when the handle's
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func contextMemberCount(handle: ContextHandle)async  -> UInt64?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_member_count(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionUInt64.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `context_member_dids`.
+     *
+     * Routes through `&*self.inner`. Returns an empty `Vec` when the
+     * handle's `instance_id` does not match this `SCP`'s.
+     */
+open func contextMemberDids(handle: ContextHandle)async  -> [String]  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_member_dids(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceString.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `context_member_role`.
+     *
+     * Routes through `&*self.inner`. Returns `None` when the handle's
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func contextMemberRole(handle: ContextHandle, did: String)async  -> String?  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_member_role(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `context_propose_ttl_extension`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func contextProposeTtlExtension(handle: ContextHandle, memberDid: String, proposedSeconds: UInt64)async throws  -> Bool  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_propose_ttl_extension(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(memberDid),FfiConverterUInt64.lower(proposedSeconds)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `context_reset_ttl_timer`.
+     *
+     * Routes through `&*self.inner`. Silently returns when the handle's
+     * `instance_id` does not match this `SCP`'s (matches the free-function
+     * fire-and-forget signature).
+     */
+open func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64)async   {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_reset_ttl_timer(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterUInt64.lower(newSeconds)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `context_send`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` /
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func contextSend(handle: ContextHandle, identity: Identity, payload: Data, spendingUcanJwt: String?)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_send(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterData.lower(payload),FfiConverterOptionString.lower(spendingUcanJwt)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `context_subscribe`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     *
+     * The current implementation is a stub that signals stream
+     * completion immediately — full transport wiring lands in a later
+     * slice. When background tasks are introduced, they will register
+     * into the per-instance `CoreFields` task set rather than a shared
+     * global registry.
+     */
+open func contextSubscribe(handle: ContextHandle, listener: MessageListener)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_context_subscribe(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterCallbackInterfaceMessageListener_lower(listener)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `create_governance_checkpoint`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func createGovernanceCheckpoint(handle: ContextHandle, checkpointSeq: UInt64, merkleRootHex: String, eventCount: UInt64, lastEventHashHex: String, stateSnapshotHashHex: String, creatorDid: String, creatorSignatureHex: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_create_governance_checkpoint(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterUInt64.lower(checkpointSeq),FfiConverterString.lower(merkleRootHex),FfiConverterUInt64.lower(eventCount),FfiConverterString.lower(lastEventHashHex),FfiConverterString.lower(stateSnapshotHashHex),FfiConverterString.lower(creatorDid),FfiConverterString.lower(creatorSignatureHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `economy_antispam_escalated_cost`.
+     */
+open func economyAntispamEscalatedCost(contextId: String, senderDid: String, now: UInt64, baseCost: UInt64, thresholdsJson: String, floor: UInt64?, cap: UInt64?)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_economy_antispam_escalated_cost(self.uniffiClonePointer(),
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(senderDid),
+        FfiConverterUInt64.lower(now),
+        FfiConverterUInt64.lower(baseCost),
+        FfiConverterString.lower(thresholdsJson),
+        FfiConverterOptionUInt64.lower(floor),
+        FfiConverterOptionUInt64.lower(cap),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `economy_antispam_record`.
+     */
+open func economyAntispamRecord(contextId: String, senderDid: String, timestamp: UInt64)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_economy_antispam_record(self.uniffiClonePointer(),
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(senderDid),
+        FfiConverterUInt64.lower(timestamp),$0
+    )
+}
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `economy_antispam_velocity`.
+     */
+open func economyAntispamVelocity(contextId: String, senderDid: String, now: UInt64)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_economy_antispam_velocity(self.uniffiClonePointer(),
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(senderDid),
+        FfiConverterUInt64.lower(now),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `economy_budget_grant`.
+     */
+open func economyBudgetGrant(contextId: String, did: String, amount: UInt64)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_economy_budget_grant(self.uniffiClonePointer(),
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(did),
+        FfiConverterUInt64.lower(amount),$0
+    )
+}
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `economy_budget_record_spend`.
+     */
+open func economyBudgetRecordSpend(contextId: String, did: String, amount: UInt64)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_economy_budget_record_spend(self.uniffiClonePointer(),
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(did),
+        FfiConverterUInt64.lower(amount),$0
+    )
+}
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `economy_budget_remaining`.
+     */
+open func economyBudgetRemaining(contextId: String, did: String)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_economy_budget_remaining(self.uniffiClonePointer(),
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(did),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `evaluate_invitation`.
+     */
+open func evaluateInvitation(paramsJson: String, inviterDid: String, identityDid: String, policyJson: String?, spendingJson: String?, trustedDids: [String])throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_evaluate_invitation(self.uniffiClonePointer(),
+        FfiConverterString.lower(paramsJson),
+        FfiConverterString.lower(inviterDid),
+        FfiConverterString.lower(identityDid),
+        FfiConverterOptionString.lower(policyJson),
+        FfiConverterOptionString.lower(spendingJson),
+        FfiConverterSequenceString.lower(trustedDids),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `event_log_checkpoint`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func eventLogCheckpoint(handle: ContextHandle, identity: Identity, epoch: UInt64)async throws  -> Checkpoint  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_event_log_checkpoint(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterUInt64.lower(epoch)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeCheckpoint_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `event_log_query`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func eventLogQuery(handle: ContextHandle, filterJson: String?)async throws  -> [Event]  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_event_log_query(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterOptionString.lower(filterJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeEvent.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `event_log_verify`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func eventLogVerify(handle: ContextHandle, claimJson: String)async throws  -> Proof  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_event_log_verify(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(claimJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeProof_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `finalize_close`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func finalizeClose(handle: ContextHandle)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_finalize_close(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `get_economic_policy`.
+     */
+open func getEconomicPolicy(handle: ContextHandle)throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_get_economic_policy(self.uniffiClonePointer(),
+        FfiConverterTypeContextHandle_lower(handle),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_approve`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func governanceApprove(handle: ContextHandle, voterDid: String, proposalIdHex: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_governance_approve(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(voterDid),FfiConverterString.lower(proposalIdHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_execute`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func governanceExecute(handle: ContextHandle, proposalJson: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_governance_execute(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(proposalJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_get_proposal`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func governanceGetProposal(handle: ContextHandle, proposalIdHex: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_governance_get_proposal(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(proposalIdHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_list_proposals`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func governanceListProposals(handle: ContextHandle)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_governance_list_proposals(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_propose`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func governancePropose(handle: ContextHandle, proposerDid: String, actionJson: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_governance_propose(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(proposerDid),FfiConverterString.lower(actionJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_reject`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func governanceReject(handle: ContextHandle, voterDid: String, proposalIdHex: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_governance_reject(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(voterDid),FfiConverterString.lower(proposalIdHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `governance_withdraw`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func governanceWithdraw(handle: ContextHandle, voterDid: String, proposalIdHex: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_governance_withdraw(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(voterDid),FfiConverterString.lower(proposalIdHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `handle_deregister`.
+     */
+open func handleDeregister(discoveryContextId: String, handle: String, did: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_handle_deregister(self.uniffiClonePointer(),
+        FfiConverterString.lower(discoveryContextId),
+        FfiConverterString.lower(handle),
+        FfiConverterString.lower(did),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `handle_lookup`.
+     */
+open func handleLookup(discoveryContextId: String, handle: String, typeFilter: String?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_handle_lookup(self.uniffiClonePointer(),
+        FfiConverterString.lower(discoveryContextId),
+        FfiConverterString.lower(handle),
+        FfiConverterOptionString.lower(typeFilter),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `handle_register`.
+     */
+open func handleRegister(discoveryContextId: String, handle: String, targetJson: String, registrantDid: String, description: String?, tags: [String]?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_handle_register(self.uniffiClonePointer(),
+        FfiConverterString.lower(discoveryContextId),
+        FfiConverterString.lower(handle),
+        FfiConverterString.lower(targetJson),
+        FfiConverterString.lower(registrantDid),
+        FfiConverterOptionString.lower(description),
+        FfiConverterOptionSequenceString.lower(tags),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_attest_device`.
+     *
+     * Rejects any `Identity` whose `instance_id` does not match this
+     * `SCP`'s — cross-instance handle misuse surfaces as
+     * `ScpError::Permission` with code `SCP-PERM-3030`.
+     */
+open func identityAttestDevice(identity: Identity)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_attest_device(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(identity)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_create`.
+     *
+     * Creates a new SCP identity under this instance. Routes through
+     * `&*self.inner` instead of the process-wide
+     * `DEFAULT_BRIDGE_INSTANCE` — every side-effect (DID resolver
+     * initialization, handle `instance_id` stamping) is scoped to this
+     * `SCP`.
+     *
+     * When `testing_seed` is supplied (32 bytes), the in-memory custody
+     * is backed by a deterministic RNG so subsequent `generate_keypair`
+     * calls produce byte-identical Ed25519 keys across bridges — the
+     * basis of the cross-bridge parity test (ADR-046). `testing_seed`
+     * is only valid for `"in_memory"` custody; other custody types
+     * reject it with `SCP-VALID-7009`.
+     */
+open func identityCreate(custody: String, testingSeed: Data?)async throws  -> Identity  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_create(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(custody),FfiConverterOptionData.lower(testingSeed)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_create_link_attestation`.
+     *
+     * Signs the link attestation with the identity's active signing key
+     * and stores the entry in the per-instance link-attestation and
+     * custody registries on `&*self.inner`. Rejects any cross-instance
+     * `Identity` handle.
+     *
+     * See spec §3.5.1, §3.5.2.
+     */
+open func identityCreateLinkAttestation(identity: Identity, platform: String, handle: String, proof: String, verificationMethod: String, platformId: String?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_create_link_attestation(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(platform),FfiConverterString.lower(handle),FfiConverterString.lower(proof),FfiConverterString.lower(verificationMethod),FfiConverterOptionString.lower(platformId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_create_with_agent_key`.
+     *
+     * Creates a new SCP identity with an agent signing key. Routes through
+     * `&*self.inner` so the returned `Identity`'s `instance_id` is stamped
+     * against this `SCP`.
+     */
+open func identityCreateWithAgentKey(custody: String)async throws  -> Identity  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_create_with_agent_key(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(custody)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_create_with_custody`.
+     *
+     * Creates a new SCP identity under this instance using an injected
+     * [`KeyCustodyProvider`](crate::KeyCustodyProvider). Routes through
+     * `&*self.inner` — the handle's `instance_id` is stamped against this
+     * `SCP` so cross-instance misuse is rejected.
+     *
+     * See SCP-214 acceptance criteria 2-3.
+     */
+open func identityCreateWithCustody(provider: KeyCustodyProvider)async throws  -> Identity  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_create_with_custody(
+                    self.uniffiClonePointer(),
+                    FfiConverterCallbackInterfaceKeyCustodyProvider_lower(provider)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_execute_custody_migration`.
+     */
+open func identityExecuteCustodyMigration(did: String, target: String, contextIds: [String])throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_identity_execute_custody_migration(self.uniffiClonePointer(),
+        FfiConverterString.lower(did),
+        FfiConverterString.lower(target),
+        FfiConverterSequenceString.lower(contextIds),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_execute_recovery`.
+     *
+     * Pure orchestration — takes no handles. Routes through `&self.inner`
+     * only to preserve API uniformity; the underlying recovery backend is
+     * a local stub pending SDK-layer wiring.
+     */
+open func identityExecuteRecovery(did: String, tier: String, contextIds: [String])throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_identity_execute_recovery(self.uniffiClonePointer(),
+        FfiConverterString.lower(did),
+        FfiConverterString.lower(tier),
+        FfiConverterSequenceString.lower(contextIds),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_link_attestations`.
+     *
+     * Reads the link-attestation registry on `&*self.inner`.
+     *
+     * See spec §3.5.1.
+     */
+open func identityLinkAttestations(did: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_identity_link_attestations(self.uniffiClonePointer(),
+        FfiConverterString.lower(did),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_load`.
+     *
+     * Loads an external identity handle under this instance. Routes through
+     * `&*self.inner` — the returned handle's `instance_id` is stamped
+     * against this `SCP`. Key operations on the returned handle still
+     * require a `KeyCustodyProvider` callback to be wired.
+     */
+open func identityLoad(did: String)async throws  -> Identity  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_load(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_migrate`.
+     *
+     * Rejects any `Identity` whose `instance_id` does not match this
+     * `SCP`'s.
+     */
+open func identityMigrate(identity: Identity)async throws  -> Identity  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_migrate(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeIdentity_lower(identity)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeIdentity_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_remove_link_attestation`.
+     *
+     * Mutates the link-attestation registry on `&*self.inner`.
+     *
+     * See spec §3.5.1.
+     */
+open func identityRemoveLinkAttestation(did: String, attestationId: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_scp_identity_remove_link_attestation(self.uniffiClonePointer(),
+        FfiConverterString.lower(did),
+        FfiConverterString.lower(attestationId),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `identity_resolve`.
+     *
+     * Resolves a DID to its document. DID resolution itself doesn't touch
+     * the instance — the method variant exists for API symmetry with the
+     * other `identity_*` operations.
+     */
+open func identityResolve(did: String)async throws  -> DidDocument  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_resolve(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeDIDDocument_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_verify_device_attestation`.
+     *
+     * Verification itself is a pure function — taking `&self` keeps the
+     * method surface uniform.
+     */
+open func identityVerifyDeviceAttestation(did: String, tokenBase64: String)async throws  -> Bool  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_verify_device_attestation(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(did),FfiConverterString.lower(tokenBase64)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `identity_verify_link_attestation`.
+     *
+     * Signature verification is a pure function — taking `&self` keeps
+     * the method surface uniform.
+     *
+     * See spec §3.5.1.
+     */
+open func identityVerifyLinkAttestation(attestationJson: String, issuerPublicKeyHex: String)async throws  -> Bool  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_identity_verify_link_attestation(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(attestationJson),FfiConverterString.lower(issuerPublicKeyHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
      * Returns the monotonic identifier for this instance.
      */
 open func instanceId() -> UInt64  {
@@ -2163,10 +4876,539 @@ open func instanceId() -> UInt64  {
 }
     
     /**
+     * Per-instance equivalent of the free-function `is_local_did`.
+     *
+     * Routes through `&*self.inner`. Returns `false` if the DID fails
+     * validation or the instance's `ContextManager` cannot be
+     * initialized / looked up.
+     */
+open func isLocalDid(did: String)async  -> Bool  {
+    return
+        try!  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_is_local_did(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: nil
+            
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_client_connect_sse`.
+     *
+     * Routes through the module-level MCP client registry.
+     */
+open func mcpClientConnectSse(url: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_mcp_client_connect_sse(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(url)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_client_connect_stdio`.
+     *
+     * Routes through the module-level MCP client registry.
+     */
+open func mcpClientConnectStdio(command: [String])async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_mcp_client_connect_stdio(
+                    self.uniffiClonePointer(),
+                    FfiConverterSequenceString.lower(command)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_client_disconnect`.
+     *
+     * Routes through the module-level MCP client registry.
+     */
+open func mcpClientDisconnect(handle: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_mcp_client_disconnect(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_client_invoke`.
+     *
+     * Routes through the module-level MCP client registry.
+     */
+open func mcpClientInvoke(handle: String, toolName: String, inputJson: String, contextId: String, invokerDid: String)async throws  -> McpInvokeResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_mcp_client_invoke(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(handle),FfiConverterString.lower(toolName),FfiConverterString.lower(inputJson),FfiConverterString.lower(contextId),FfiConverterString.lower(invokerDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeMcpInvokeResult_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_client_list_tools`.
+     *
+     * Routes through the module-level MCP client registry.
+     */
+open func mcpClientListTools(handle: String)async throws  -> [McpToolInfo]  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_mcp_client_list_tools(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterSequenceTypeMcpToolInfo.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function [`mcp_configure_stdio_allowlist`].
+     *
+     * The stdio allowlist is process-wide (module-level state) — this
+     * method exists purely to give the SDK a uniform `scp.method(...)`
+     * surface.
+     */
+open func mcpConfigureStdioAllowlist(additionalBinaries: [String])throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_mcp_configure_stdio_allowlist(self.uniffiClonePointer(),
+        FfiConverterSequenceString.lower(additionalBinaries),$0
+    )
+}
+}
+    
+    /**
+     * Per-instance equivalent of the free-function [`mcp_disable_stdio_allowlist`].
+     *
+     * The stdio allowlist is process-wide (module-level state).
+     */
+open func mcpDisableStdioAllowlist()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_mcp_disable_stdio_allowlist(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+    /**
+     * Per-instance equivalent of the free-function [`mcp_get_stdio_allowlist`].
+     *
+     * The stdio allowlist is process-wide (module-level state).
+     */
+open func mcpGetStdioAllowlist()throws  -> McpAllowlistState  {
+    return try  FfiConverterTypeMcpAllowlistState_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_mcp_get_stdio_allowlist(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function [`mcp_reset_stdio_allowlist`].
+     *
+     * The stdio allowlist is process-wide (module-level state).
+     */
+open func mcpResetStdioAllowlist()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_mcp_reset_stdio_allowlist(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_server_create`.
+     *
+     * Routes through `&*self.inner`. The MCP server registry is
+     * module-level (not per-instance) so the returned opaque handle
+     * string is globally unique; this method preserves that behaviour.
+     */
+open func mcpServerCreate(config: McpServerConfig)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_mcp_server_create(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeMcpServerConfig_lower(config)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `mcp_server_stop`.
+     *
+     * Routes through the module-level MCP server registry (the registry
+     * is not per-instance; the opaque handle string is globally unique).
+     */
+open func mcpServerStop(handle: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_mcp_server_stop(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `migration_state`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func migrationState(handle: ContextHandle)async throws  -> String?  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_migration_state(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterOptionString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `node_start_in_memory`.
+     *
+     * Starts an in-memory application node. If `identity` is supplied, it
+     * must have been minted by this `Scp` (cross-instance handles are
+     * rejected via the `CoreFields::check_handle` call).
+     */
+open func nodeStartInMemory(identity: Identity?)async throws  -> NodeHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_node_start_in_memory(
+                    self.uniffiClonePointer(),
+                    FfiConverterOptionTypeIdentity.lower(identity)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeNodeHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `node_start_local`.
+     *
+     * Starts a file-backed application node at `data_dir`. If `identity`
+     * is supplied, it must have been minted by this `Scp`.
+     */
+open func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?)async throws  -> NodeHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_node_start_local(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(dataDir),FfiConverterOptionTypeIdentity.lower(identity),FfiConverterOptionString.lower(passphrase)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeNodeHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_get_for_context`.
+     */
+open func petnameGetForContext(ownerDid: String, contextId: String)throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_get_for_context(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(contextId),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_get_for_did`.
+     */
+open func petnameGetForDid(ownerDid: String, targetDid: String)throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_get_for_did(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(targetDid),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_remove`.
+     */
+open func petnameRemove(ownerDid: String, targetDid: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_remove(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(targetDid),$0
+    )
+}
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_remove_context`.
+     */
+open func petnameRemoveContext(ownerDid: String, contextId: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_remove_context(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(contextId),$0
+    )
+}
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_resolve_context`.
+     */
+open func petnameResolveContext(ownerDid: String, name: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_resolve_context(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(name),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_resolve_did`.
+     */
+open func petnameResolveDid(ownerDid: String, name: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_resolve_did(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(name),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_set`.
+     */
+open func petnameSet(ownerDid: String, targetDid: String, name: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_set(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(targetDid),
+        FfiConverterString.lower(name),$0
+    )
+}
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `petname_set_context`.
+     */
+open func petnameSetContext(ownerDid: String, contextId: String, name: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_petname_set_context(self.uniffiClonePointer(),
+        FfiConverterString.lower(ownerDid),
+        FfiConverterString.lower(contextId),
+        FfiConverterString.lower(name),$0
+    )
+}
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `provenance_attach`.
+     *
+     * Appends `ProvenanceAttached` / `ProvenanceReceived` events to the
+     * source and target context event logs on this instance.
+     */
+open func provenanceAttach(sourceContextId: String, sourceType: String, memoryScopeStr: String, members: [String], targetContextId: String, actorDid: String, existingChainDepth: UInt8?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_provenance_attach(self.uniffiClonePointer(),
+        FfiConverterString.lower(sourceContextId),
+        FfiConverterString.lower(sourceType),
+        FfiConverterString.lower(memoryScopeStr),
+        FfiConverterSequenceString.lower(members),
+        FfiConverterString.lower(targetContextId),
+        FfiConverterString.lower(actorDid),
+        FfiConverterOptionUInt8.lower(existingChainDepth),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `register_local_did`.
+     *
+     * Routes through `&*self.inner`. Initializes this instance's
+     * `ContextManager` if not yet attached (idempotent) and registers
+     * the DID on the per-instance local-DID set.
+     */
+open func registerLocalDid(did: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_register_local_did(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `relay_start_in_memory`.
+     *
+     * Starts a new in-memory relay server and returns a `RelayHandle`
+     * whose `instance_id` is stamped against this `Scp`. Phase D (#1695)
+     * replaces the old free function that looked up `DEFAULT_BRIDGE_INSTANCE`
+     * for the handle's `instance_id`.
+     */
+open func relayStartInMemory()async throws  -> RelayHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_relay_start_in_memory(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeRelayHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `relay_start_local`.
+     *
+     * Starts a new redb-backed relay at `data_dir/blobs.redb`.
+     */
+open func relayStartLocal(dataDir: String)async throws  -> RelayHandle  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_relay_start_local(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(dataDir)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeRelayHandle_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `restore_all_contexts`.
+     *
+     * Routes through `&*self.inner`.
+     */
+open func restoreAllContexts()async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_restore_all_contexts(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `restore_context`.
+     *
+     * Routes through `&*self.inner`.
+     */
+open func restoreContext(contextId: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_restore_context(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(contextId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
      * Resumes a suspended bridge instance.
      *
      * Clears the suspended flag, then runs any per-bridge async work chained
-     * by the [`BridgeInstanceCore::resume`] override (transport reconnect
+     * by the `BridgeInstanceCore::resume` override (transport reconnect
      * from pending relay URLs, persisted-context restoration).
      *
      * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin.
@@ -2191,6 +5433,101 @@ open func resume()async throws   {
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `scope_deregister`.
+     */
+open func scopeDeregister(scopeContextId: String, name: String, did: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_scope_deregister(self.uniffiClonePointer(),
+        FfiConverterString.lower(scopeContextId),
+        FfiConverterString.lower(name),
+        FfiConverterString.lower(did),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `scope_lookup`.
+     */
+open func scopeLookup(scopeContextId: String, name: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_scope_lookup(self.uniffiClonePointer(),
+        FfiConverterString.lower(scopeContextId),
+        FfiConverterString.lower(name),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `scope_register`.
+     */
+open func scopeRegister(scopeContextId: String, name: String, targetContextId: String, relayUrls: [String], registrantDid: String, description: String?, tags: [String]?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_scope_register(self.uniffiClonePointer(),
+        FfiConverterString.lower(scopeContextId),
+        FfiConverterString.lower(name),
+        FfiConverterString.lower(targetContextId),
+        FfiConverterSequenceString.lower(relayUrls),
+        FfiConverterString.lower(registrantDid),
+        FfiConverterOptionString.lower(description),
+        FfiConverterOptionSequenceString.lower(tags),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `scpid_sign`.
+     *
+     * Signs an SCPID challenge with the identity's requested key. Rejects
+     * any `Identity` whose `instance_id` does not match this `Scp`'s.
+     *
+     * `signed_at_override` is a testing-only parameter for the ADR-046
+     * cross-bridge parity harness. Only accepted when scp-core is built
+     * with the `testing` feature; production builds reject any non-`None`
+     * value via `SCP-VALID-7008`.
+     */
+open func scpidSign(identity: Identity, signingKeyId: String, challengeJson: String, signedAtOverride: UInt64?)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_scpid_sign(self.uniffiClonePointer(),
+        FfiConverterTypeIdentity_lower(identity),
+        FfiConverterString.lower(signingKeyId),
+        FfiConverterString.lower(challengeJson),
+        FfiConverterOptionUInt64.lower(signedAtOverride),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `scpid_verify`.
+     *
+     * Uses this `Scp`'s DID resolver (populated when the caller invokes
+     * `identity_create` / `identity_create_with_custody`). Phase D (#1695)
+     * replaces the old free function that consulted the process-wide
+     * `DEFAULT_BRIDGE_INSTANCE` DID resolver slot.
+     */
+open func scpidVerify(responseJson: String, challengeJson: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_scpid_verify(self.uniffiClonePointer(),
+        FfiConverterString.lower(responseJson),
+        FfiConverterString.lower(challengeJson),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `set_economic_policy`.
+     *
+     * Economic policy changes must go through governance — this method
+     * always returns an error to enforce that invariant.
+     */
+open func setEconomicPolicy(handle: ContextHandle, policyJson: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_set_economic_policy(self.uniffiClonePointer(),
+        FfiConverterTypeContextHandle_lower(handle),
+        FfiConverterString.lower(policyJson),$0
+    )
+}
 }
     
     /**
@@ -2237,6 +5574,580 @@ open func suspend()throws   {try rustCallWithError(FfiConverterTypeScpError_lift
     uniffi_scp_ffi_uniffi_fn_method_scp_suspend(self.uniffiClonePointer(),$0
     )
 }
+}
+    
+    /**
+     * Per-instance equivalent of the free-function [`sync_classify_offline`].
+     *
+     * Pure function — no per-instance state required.
+     */
+open func syncClassifyOffline(lastRelayContact: UInt64, now: UInt64) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_scp_sync_classify_offline(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(lastRelayContact),
+        FfiConverterUInt64.lower(now),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function [`sync_classify_offline_custom`].
+     *
+     * Pure function — no per-instance state required.
+     */
+open func syncClassifyOfflineCustom(lastRelayContact: UInt64, now: UInt64, tier1ThresholdSecs: UInt64, tier2ThresholdSecs: UInt64) -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_scp_sync_classify_offline_custom(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(lastRelayContact),
+        FfiConverterUInt64.lower(now),
+        FfiConverterUInt64.lower(tier1ThresholdSecs),
+        FfiConverterUInt64.lower(tier2ThresholdSecs),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function [`sync_get_policy`].
+     *
+     * Pure function — returns the default sync policy parameters.
+     */
+open func syncGetPolicy() -> SyncPolicyResult  {
+    return try!  FfiConverterTypeSyncPolicyResult_lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_scp_sync_get_policy(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `tombstone_migrated_context`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func tombstoneMigratedContext(handle: ContextHandle)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_tombstone_migrated_context(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_interface_accept`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func toolInterfaceAccept(handle: ContextHandle, interfaceJson: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_tool_interface_accept(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(interfaceJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_interface_expose`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func toolInterfaceExpose(handle: ContextHandle, toolId: String, targetContextId: String, rateLimitJson: String?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_tool_interface_expose(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(targetContextId),FfiConverterOptionString.lower(rateLimitJson)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_interface_revoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func toolInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_tool_interface_revoke(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(interfaceIdHex)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_invoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?, spendingUcanJwt: String?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_tool_invoke(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterOptionString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens),FfiConverterOptionString.lower(spendingUcanJwt)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function
+     * `tool_invoke_cross_context`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_tool_invoke_cross_context(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(toolId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterUInt8.lower(chainDepth),FfiConverterOptionSequenceString.lower(proofTokens)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_register`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func toolRegister(handle: ContextHandle, definition: ToolDefinition)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_tool_register(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeToolDefinition_lower(definition)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_session_close`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func toolSessionClose(handle: ContextHandle, sessionId: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_tool_session_close(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_session_create`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func toolSessionCreate(handle: ContextHandle, toolId: String, sourceContextId: String, ttlSeconds: UInt64?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_tool_session_create(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(sourceContextId),FfiConverterOptionUInt64.lower(ttlSeconds)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_session_invoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` or
+     * `Identity` whose `instance_id` does not match this `SCP`'s.
+     */
+open func toolSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_tool_session_invoke(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `tool_verify`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func toolVerify(handle: ContextHandle, toolId: String)async throws  -> ToolVerificationResult  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_tool_verify(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeToolVerificationResult_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `transport_connect`.
+     *
+     * Routes through `&*self.inner`. The returned `TransportManager`
+     * handle's `instance_id` is stamped against this `SCP`'s
+     * `UniffiBridgeInstance`, so it will be rejected by any other
+     * `SCP` instance.
+     */
+open func transportConnect(relayUrl: String)async throws  -> TransportManager  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_transport_connect(
+                    self.uniffiClonePointer(),
+                    FfiConverterString.lower(relayUrl)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeTransportManager_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `transport_disconnect`.
+     *
+     * Routes through `&*self.inner`. Rejects any `TransportManager`
+     * whose `instance_id` does not match this `SCP`'s.
+     */
+open func transportDisconnect(manager: TransportManager)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_transport_disconnect(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeTransportManager_lower(manager)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Handleless transport-status probe — reports whether a
+     * `TransportManager` is currently installed on this `SCP`
+     * instance without requiring the caller to construct a
+     * [`TransportManager`] handle first.
+     *
+     * Mirrors `PyO3`'s `Scp::transport_status()`, NAPI's
+     * `Scp::transportStatus(undefined)`, and WASM's
+     * `transport_status()` so the cross-bridge parity harness
+     * (ADR-046) can compare the disconnected-state shape across all
+     * four bridges without needing a relay fixture for the `UniFFI`
+     * runners (ADR-048 §7a).
+     *
+     * Returns `connected = has_transport()`, and always `None` for
+     * both `relay_url` and `latency_ms` — matching the NAPI
+     * handleless probe's contract (the relay URL lives on the
+     * `TransportManager` handle, not on the bridge instance, so it
+     * is only observable via [`Self::transport_status`]). The
+     * disconnected shape — the only shape the parity harness
+     * exercises — is `(false, None, None)` across all four bridges.
+     *
+     * Since the result is stateless as far as the bridge is
+     * concerned (no cross-instance handle is passed in), there is no
+     * handle-affinity check to perform.
+     */
+open func transportManagerStatus()async throws  -> TransportStatus  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_transport_manager_status(
+                    self.uniffiClonePointer()
+                    
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeTransportStatus_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `transport_status`.
+     *
+     * Routes through `&*self.inner`. Rejects any `TransportManager`
+     * whose `instance_id` does not match this `SCP`'s.
+     */
+open func transportStatus(manager: TransportManager)async throws  -> TransportStatus  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_transport_status(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeTransportManager_lower(manager)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeTransportStatus_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function [`trust_create_challenge`].
+     *
+     * Stateless helper — uses an ephemeral signing key per call.
+     */
+open func trustCreateChallenge(targetDid: String)throws  -> ChallengeResult  {
+    return try  FfiConverterTypeChallengeResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_trust_create_challenge(self.uniffiClonePointer(),
+        FfiConverterString.lower(targetDid),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `trust_query_score`.
+     *
+     * Trust event counts are queried from the module-level helper (a
+     * stateless `(0, 0)` stub today — see `runtime::query_trust_event_counts`).
+     * The method exists for SDK API uniformity.
+     */
+open func trustQueryScore(did: String, contextId: String)throws  -> TrustScoreResult  {
+    return try  FfiConverterTypeTrustScoreResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_trust_query_score(self.uniffiClonePointer(),
+        FfiConverterString.lower(did),
+        FfiConverterString.lower(contextId),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function [`trust_verify_attestation`].
+     *
+     * The underlying attestation verification is stateless — this method
+     * is a thin delegate for SDK API uniformity.
+     */
+open func trustVerifyAttestation(attestationJson: String)throws  -> AttestationVerificationResult  {
+    return try  FfiConverterTypeAttestationVerificationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_trust_verify_attestation(self.uniffiClonePointer(),
+        FfiConverterString.lower(attestationJson),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function [`trust_verify_response`].
+     *
+     * Stateless helper — uses an ephemeral verification signer per call.
+     */
+open func trustVerifyResponse(challengeJson: String, responseJson: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_trust_verify_response(self.uniffiClonePointer(),
+        FfiConverterString.lower(challengeJson),
+        FfiConverterString.lower(responseJson),$0
+    )
+})
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `ucan_delegate`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String])async throws  -> UcanToken  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_ucan_delegate(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(delegatorDid),FfiConverterString.lower(delegateeDid),FfiConverterString.lower(parentToken),FfiConverterSequenceString.lower(capabilities)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeUcanToken_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `ucan_mint`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func ucanMint(handle: ContextHandle, memberDid: String, capabilities: [String], proofs: [String]?)async throws  -> UcanToken  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_ucan_mint(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(memberDid),FfiConverterSequenceString.lower(capabilities),FfiConverterOptionSequenceString.lower(proofs)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
+            liftFunc: FfiConverterTypeUcanToken_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `ucan_revoke`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func ucanRevoke(handle: ContextHandle, token: String, revokerDid: String)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_ucan_revoke(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(token),FfiConverterString.lower(revokerDid)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function `ucan_validate`.
+     *
+     * Routes through `&*self.inner`. Rejects any `ContextHandle` whose
+     * `instance_id` does not match this `SCP`'s.
+     */
+open func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?)async throws   {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_method_scp_ucan_validate(
+                    self.uniffiClonePointer(),
+                    FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(token),FfiConverterString.lower(capability),FfiConverterOptionString.lower(presentingAgentDid),FfiConverterOptionSequenceString.lower(proofTokens)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
+            liftFunc: { $0 },
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+    
+    /**
+     * Per-instance equivalent of the free-function [`verify_participation_requirements`].
+     *
+     * Stateless helper that parses both JSON inputs and delegates to the
+     * scp-core verifier using the current system time.
+     */
+open func verifyParticipationRequirements(profileJson: String, requirementsJson: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_method_scp_verify_participation_requirements(self.uniffiClonePointer(),
+        FfiConverterString.lower(profileJson),
+        FfiConverterString.lower(requirementsJson),$0
+    )
+})
 }
     
 
@@ -6780,7 +10691,7 @@ public enum CustodyMethod {
     /**
      * Identity loaded by DID string without local key material.
      *
-     * Used by [`identity_load`] to represent an identity whose keys are
+     * Used by `identity_load` to represent an identity whose keys are
      * managed externally (e.g., via an injected `KeyCustodyProvider`).
      */
     case external
@@ -8262,7 +12173,7 @@ public func FfiConverterCallbackInterfaceKeyCustodyProvider_lower(_ v: KeyCustod
  * The Swift SDK wraps this in `AsyncStream<Message>` via
  * `AsyncStream.Continuation`. The Kotlin SDK wraps it in `Flow<Message>`
  * via `callbackFlow`. Implemented by Swift/Kotlin code and passed to
- * [`context_subscribe`].
+ * `context_subscribe`.
  *
  * # SAFETY: Thread execution context
  *
@@ -9250,30 +13161,6 @@ fileprivate struct FfiConverterOptionTypeIdentity: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
-fileprivate struct FfiConverterOptionTypeTransportManager: FfiConverterRustBuffer {
-    typealias SwiftType = TransportManager?
-
-    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
-        guard let value = value else {
-            writeInt(&buf, Int8(0))
-            return
-        }
-        writeInt(&buf, Int8(1))
-        FfiConverterTypeTransportManager.write(value, into: &buf)
-    }
-
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
-        switch try readInt(&buf) as Int8 {
-        case 0: return nil
-        case 1: return try FfiConverterTypeTransportManager.read(from: &buf)
-        default: throw UniffiInternalError.unexpectedOptionalTag
-        }
-    }
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
 fileprivate struct FfiConverterOptionTypeDataProvenance: FfiConverterRustBuffer {
     typealias SwiftType = DataProvenance?
 
@@ -9646,207 +13533,6 @@ public func uniffiForeignFutureHandleCountScp() -> Int {
     UNIFFI_FOREIGN_FUTURE_HANDLE_MAP.count
 }
 /**
- * Generates and stores a per-member access key for explicit lifecycle
- * management.
- *
- * Delegates to [`ContextManager::generate_context_access_key`].
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not registered, the
- * member is not found, or the caller lacks admin capability.
- */
-public func accessKeyGenerate(contextId: String, memberDid: String, callerDid: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_access_key_generate(FfiConverterString.lower(contextId),FfiConverterString.lower(memberDid),FfiConverterString.lower(callerDid)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Restores a member's access key by generating a new key at the next
- * epoch.
- *
- * Delegates to [`ContextManager::restore_context_access_key`].
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not registered, the
- * member is not found, or the caller lacks admin capability.
- */
-public func accessKeyRestore(contextId: String, memberDid: String, callerDid: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_access_key_restore(FfiConverterString.lower(contextId),FfiConverterString.lower(memberDid),FfiConverterString.lower(callerDid)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Revokes (removes) a member's access key from the context's access key
- * store.
- *
- * Delegates to [`ContextManager::revoke_context_access_key`].
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not registered, no
- * access key exists for the member, or the caller lacks admin capability.
- */
-public func accessKeyRevoke(contextId: String, memberDid: String, callerDid: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_access_key_revoke(FfiConverterString.lower(contextId),FfiConverterString.lower(memberDid),FfiConverterString.lower(callerDid)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Adds a cosignature to an existing governance checkpoint (ADR-031 §9).
- *
- * # Returns
- *
- * JSON string with `{ "attestation_status": string, "checkpoint": object }`.
- *
- * # Errors
- *
- * Returns `ScpError::Context` (SCP-CTX-2063) if cosignature validation fails.
- */
-public func addCheckpointCosignature(handle: ContextHandle, checkpointJson: String, signerDid: String, signatureHex: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_add_checkpoint_cosignature(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(checkpointJson),FfiConverterString.lower(signerDid),FfiConverterString.lower(signatureHex)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Resolves a human-readable address via multi-path resolution.
- * Returns a JSON array of `AddressResolution` objects.
- */
-public func addressResolve(ownerDid: String, address: String, knownContextsJson: String?)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_address_resolve(
-        FfiConverterString.lower(ownerDid),
-        FfiConverterString.lower(address),
-        FfiConverterOptionString.lower(knownContextsJson),$0
-    )
-})
-}
-/**
- * Aggregates all trust engine layers into a single `TrustInput` for
- * agent-level evaluation.
- *
- * Uses the global `ProtocolRepository` for persistent trust data when
- * initialized (trust data survives across calls); falls back to an
- * ephemeral in-memory store otherwise. See issue #502.
- *
- * See ADR-017 acceptance criterion 9, spec §7.3.
- */
-public func aggregateTrustInput(contextId: String, subjectDid: String, eventsJson: String, merkleRootJson: String, consequenceRulesJson: String, thresholdRequirementsJson: String, attestorSetsJson: String, cachedAttestationsJson: String, challengeResultsJson: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_aggregate_trust_input(
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(subjectDid),
-        FfiConverterString.lower(eventsJson),
-        FfiConverterString.lower(merkleRootJson),
-        FfiConverterString.lower(consequenceRulesJson),
-        FfiConverterString.lower(thresholdRequirementsJson),
-        FfiConverterString.lower(attestorSetsJson),
-        FfiConverterString.lower(cachedAttestationsJson),
-        FfiConverterString.lower(challengeResultsJson),$0
-    )
-})
-}
-/**
- * Applies a pending ceiling modification if the notification period has elapsed.
- *
- * Returns `true` if applied, `false` if no pending modification or not yet effective.
- *
- * # Errors
- *
- * Returns `ScpError::Context` (SCP-CTX-2060) if the operation fails.
- */
-public func applyPendingCeilingModification(handle: ContextHandle, currentTimestamp: UInt64)async throws  -> Bool  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_apply_pending_ceiling_modification(FfiConverterTypeContextHandle_lower(handle),FfiConverterUInt64.lower(currentTimestamp)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
-            liftFunc: FfiConverterBool.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Creates a shadow identity for an external platform participant.
- *
- * Shadow identities represent non-SCP participants in a bridged context.
- * They carry provenance metadata indicating they are not native SCP
- * identities.
- *
- * Uses the persistent per-context `ShadowRegistry` and `SenderKeyStore`
- * from the process-global bridge state registry, ensuring that shadow
- * identity state and sender keys survive across function calls.
- *
- * # Arguments
- *
- * * `bridge_id` — The bridge connector ID that owns this shadow.
- * * `platform_handle` — External platform handle (e.g., `"@user#1234"`).
- * * `bridge_mode` — Bridge mode: `"relay"`, `"puppet"`, `"api"`, or
- * `"cooperative"`.
- * * `context_id` — Context the shadow is being created in.
- *
- * # Returns
- *
- * A `ShadowIdentityResult` with the shadow identity details.
- *
- * # Errors
- *
- * Returns `ScpError::Validation` if `bridge_mode` is not recognized, or
- * `ScpError::Context` if shadow creation fails.
- *
- * See spec section 12 (Bridge System) and ADR-023.
- */
-public func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMode: String, contextId: String)throws  -> ShadowIdentityResult  {
-    return try  FfiConverterTypeShadowIdentityResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_bridge_create_shadow(
-        FfiConverterString.lower(bridgeId),
-        FfiConverterString.lower(platformHandle),
-        FfiConverterString.lower(bridgeMode),
-        FfiConverterString.lower(contextId),$0
-    )
-})
-}
-/**
  * Evaluates the trust level for an action based on bridge provenance.
  *
  * Returns an integer (0-3) representing the trust tier.
@@ -9915,389 +13601,6 @@ public func bridgeRegister(contextId: String, operatorDid: String, governanceDid
 })
 }
 /**
- * Returns the broadcast admission policy for a context.
- *
- * Returns `Ok(Some(policy))` with the policy as a string (`"Open"` or
- * `"Gated"`), `Ok(None)` if the context is not a broadcast context, and
- * `Err(ScpError)` for handle-affinity or bridge-not-initialized errors.
- */
-public func broadcastAdmission(handle: ContextHandle)async throws  -> String?  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_broadcast_admission(FfiConverterTypeContextHandle_lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterOptionString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Blocks a subscriber's read access in a broadcast context.
- *
- * The subscriber is removed from the registry and added to all authors'
- * block lists; all author keys are rotated.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the operation fails.
- */
-public func broadcastBlockSubscriber(handle: ContextHandle, subscriberDid: String, blockerDid: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_broadcast_block_subscriber(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid),FfiConverterString.lower(blockerDid)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Handles a broadcast key request from a subscriber.
- *
- * Validates the author DID is locally controlled and processes the key
- * distribution request.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the operation fails.
- */
-public func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, requesterDid: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_broadcast_handle_key_request(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(authorDid),FfiConverterString.lower(requesterDid)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Returns `true` if the given DID is a broadcast subscriber.
- *
- * Returns `Err(ScpError)` if the handle is foreign or the bridge is not
- * initialized; do not silently collapse those conditions into `false`.
- */
-public func broadcastIsSubscriber(handle: ContextHandle, did: String)async throws  -> Bool  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_broadcast_is_subscriber(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(did)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
-            liftFunc: FfiConverterBool.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Publishes a message to a broadcast context.
- *
- * The payload is encrypted with the author's broadcast key. The author's
- * identity must have been previously created via `identity_create` so
- * that the key custody provider and signing key handle are available.
- *
- * # Arguments
- *
- * * `handle` — The context to publish to.
- * * `identity` — The identity of the author publishing the message.
- * * `payload` — The raw message payload bytes to encrypt and publish.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not active, not broadcast,
- * or the sender is not an author.
- * Returns `ScpError::Crypto` if custody signing fails.
- * Returns `ScpError::Permission` if no custody provider is available.
- */
-public func broadcastPublish(handle: ContextHandle, identity: Identity, payload: Data)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_broadcast_publish(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterData.lower(payload)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Publishes a single asset to a broadcast context as structured content (SCP-290).
- *
- * Constructs a `BroadcastContent` from the asset entry, computes an `ETag`,
- * and publishes via `ContextManager::publish_broadcast_content`.
- *
- * # Arguments
- *
- * * `handle` — The context to publish to.
- * * `identity` — The identity of the author publishing the asset.
- * * `asset` — The asset entry containing path, `content_type`, and body.
- * * `deploy_id` — Optional deploy ID to group assets into atomic deploys.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if validation or publish fails.
- * Returns `ScpError::Permission` if no custody provider is available.
- */
-public func broadcastPublishAsset(handle: ContextHandle, identity: Identity, asset: AssetEntry, deployId: String?)async throws  -> PublishResult  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_broadcast_publish_asset(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterTypeAssetEntry_lower(asset),FfiConverterOptionString.lower(deployId)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypePublishResult_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Publishes multiple assets to a broadcast context as structured content (SCP-290).
- *
- * All assets are published with the same `deploy_id` (auto-generated if not
- * provided). Returns a list of `{ blob_id, etag }` results.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if any asset fails validation or publish.
- * Returns `ScpError::Permission` if no custody provider is available.
- */
-public func broadcastPublishAssets(handle: ContextHandle, identity: Identity, assets: [AssetEntry], deployId: String?)async throws  -> BatchPublishResult  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_broadcast_publish_assets(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterSequenceTypeAssetEntry.lower(assets),FfiConverterOptionString.lower(deployId)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeBatchPublishResult_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Subscribes a DID to a broadcast context.
- *
- * For open broadcast contexts, any DID can subscribe. For gated contexts,
- * a valid `messagesRead` UCAN is required (passed as `ucan_token` JSON).
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not active, not a
- * broadcast context, or if subscription fails.
- */
-public func broadcastSubscribe(handle: ContextHandle, subscriberDid: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_broadcast_subscribe(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Returns the number of broadcast subscribers for a context.
- *
- * Returns `Ok(None)` if the context is not a broadcast context. Returns
- * `Err(ScpError)` if the handle is foreign or the bridge is not
- * initialized — callers must not silently collapse these into a
- * missing-context signal (PR #1690 retro: commit 14's hard-error
- * contract).
- */
-public func broadcastSubscriberCount(handle: ContextHandle)async throws  -> UInt64?  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_broadcast_subscriber_count(FfiConverterTypeContextHandle_lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterOptionUInt64.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Unblocks a previously blocked subscriber in a broadcast context (§9.16.8).
- *
- * Forward-only: the unblocked subscriber can request the current key on
- * next pull but cannot decrypt content from the block period.
- *
- * # Errors
- *
- * - [`ScpError::Context`] with `SCP-CTX-2037` if the tokio task fails.
- * - [`ScpError::Context`] if the subscriber is not blocked or the
- * author is not registered.
- */
-public func broadcastUnblockSubscriber(handle: ContextHandle, subscriberDid: String, unblockerDid: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_broadcast_unblock_subscriber(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid),FfiConverterString.lower(unblockerDid)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Unsubscribes a DID from a broadcast context.
- *
- * When `rotate_keys` is `true`, all authors rotate their broadcast keys
- * for forward secrecy.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not active or not broadcast.
- */
-public func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, rotateKeys: Bool)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_broadcast_unsubscribe(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(subscriberDid),FfiConverterBool.lower(rotateKeys)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Pre-configures the [`ContextManager`] with [`RelayTransportProvider`].
- *
- * **Must be called before any `identityCreate` → `contextCreate` sequence.**
- * Once the `ContextManager` is initialized (by whichever call arrives first),
- * the transport provider is locked in for the lifetime of the process.
- *
- * Unlike the default transport (`NotConfiguredTransportProvider`), this creates a
- * **real** relay connection and wraps it in `RelayTransportProvider`. This means
- * `contextSend` will publish encrypted payloads through the relay, enabling
- * full end-to-end send → relay → subscribe → receive tests.
- *
- * The `relay_url` must point to a running relay. A separate
- * `transportConnect` call is still needed for `contextSubscribe` (which
- * uses the `TransportManager` for its subscription stream).
- *
- * # Arguments
- *
- * * `relay_url` — The URL of the relay to connect to.
- * * `local_did` — The DID for MLS credential identity. Pass any valid
- * `did:dht:` string (typically the DID of the first identity you plan
- * to create).
- *
- * # Errors
- *
- * - Returns an error if `relay_url` fails URL validation.
- * - Returns an error if `local_did` fails DID format validation.
- * - Returns an error if the relay connection fails.
- */
-public func configureRelayTransport(relayUrl: String, localDid: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_configure_relay_transport(FfiConverterString.lower(relayUrl),FfiConverterString.lower(localDid)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Closes an SCP context.
- *
- * Initiates the cooperative closing window: notifies members, generates
- * summaries (if `memory_scope` == Summary), and destroys keys per memory scope.
- *
- * # Arguments
- *
- * * `handle` — The context to close.
- * * `identity` — The identity initiating the close (must have close capability).
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not in active state or
- * the caller lacks the close capability.
- */
-public func contextClose(handle: ContextHandle, identity: Identity)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_close(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Creates a new SCP context.
- *
- * # Arguments
- *
- * * `identity` — The identity of the context creator.
- * * `params` — Context creation parameters (governs ceiling, governance,
- * memory scope, and TTL; used in full scp-core wiring).
- *
- * # Returns
- *
- * A `ContextHandle` in the active state.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if context creation fails (validation,
- * MLS group formation, or event log initialization).
- */
-public func contextCreate(identity: Identity, params: ContextParams)async throws  -> ContextHandle  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_create(FfiConverterTypeIdentity_lower(identity),FfiConverterTypeContextParams_lower(params)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeContextHandle_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
  * Discovers contexts from a DID string or `scp://` URI.
  *
  * Detects whether the query is a DID or an `scp://` URI and delegates to
@@ -10325,375 +13628,6 @@ public func contextDiscover(query: String)async throws  -> String  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_func_context_discover(FfiConverterString.lower(query)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Drains all pending events from the context's receive buffer.
- *
- * Returns a list of event descriptions as JSON strings. Returns empty
- * if the context is not registered.
- */
-public func contextDrainEvents(handle: ContextHandle)async  -> [String]  {
-    return
-        try!  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_drain_events(FfiConverterTypeContextHandle_lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterSequenceString.lift,
-            errorHandler: nil
-            
-        )
-}
-/**
- * Exports a context's full state as serialized `MessagePack` bytes.
- *
- * Returns the serialized bytes of a `StoredValue<ContextExport>` envelope
- * (§17.5), suitable for backup, migration, or transfer to another node.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context does not exist, export fails,
- * or serialization fails.
- */
-public func contextExport(handle: ContextHandle)async throws  -> Data  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_export(FfiConverterTypeContextHandle_lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterData.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Handles TTL expiry for a context.
- *
- * Transitions from `Active` to `Expired`, destroys keys per memory scope.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not active.
- */
-public func contextHandleTtlExpiry(handle: ContextHandle)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_handle_ttl_expiry(FfiConverterTypeContextHandle_lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Imports a context from serialized `MessagePack` bytes.
- *
- * The bytes must be a `StoredValue<ContextExport>` envelope (§17.5), as
- * produced by [`context_export`].
- *
- * Returns the context ID of the imported context.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if deserialization, validation, or import
- * fails.
- */
-public func contextImport(data: Data)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_import(FfiConverterData.lower(data)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Returns `true` if the given DID is a member of the context.
- *
- * Returns `Err(ScpError)` for handle-affinity or bridge-not-initialized
- * errors — callers must not silently collapse those into `false`.
- */
-public func contextIsMember(handle: ContextHandle, did: String)async throws  -> Bool  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_is_member(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(did)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
-            liftFunc: FfiConverterBool.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Joins an existing SCP context.
- *
- * # Arguments
- *
- * * `handle` — The context to join.
- * * `identity` — The identity joining the context.
- * * `spending_ucan_jwt` — Optional encoded UCAN JWT authorising the join
- * cost. Forwarded to the manager for AND-composition with the context's
- * per-join economic policy (spec §19, ADR-033).
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not in active state or
- * if the join operation fails (key package, MLS add, event log). Returns
- * `ScpError::Context` with code `SCP-ECON-12061` if `spending_ucan_jwt` is
- * not a valid UCAN JWT.
- */
-public func contextJoin(handle: ContextHandle, identity: Identity, spendingUcanJwt: String?)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_join(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterOptionString.lower(spendingUcanJwt)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Leaves an SCP context.
- *
- * # Arguments
- *
- * * `handle` — The context to leave.
- * * `identity` — The identity leaving the context.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not in active state or
- * if the leave operation fails (MLS remove, sender key update, event log).
- */
-public func contextLeave(handle: ContextHandle, identity: Identity)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_leave(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Returns the current member count for a context.
- *
- * Returns `Ok(None)` if the context is not registered; `Err(ScpError)`
- * for handle-affinity or bridge-not-initialized errors — these are
- * programmer / lifecycle bugs, not a missing-context signal.
- */
-public func contextMemberCount(handle: ContextHandle)async throws  -> UInt64?  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_member_count(FfiConverterTypeContextHandle_lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterOptionUInt64.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Returns all member DIDs for a context.
- *
- * Returns `Err(ScpError)` for handle-affinity or bridge-not-initialized
- * errors — callers must not silently collapse those into an empty list,
- * which would look like "context has no members" to the caller.
- */
-public func contextMemberDids(handle: ContextHandle)async throws  -> [String]  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_member_dids(FfiConverterTypeContextHandle_lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterSequenceString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Returns the role assignment for a specific member as a JSON string.
- *
- * Returns `Ok(None)` if the member is not found or the context is not
- * registered; `Err(ScpError)` for handle-affinity or bridge-not-
- * initialized errors.
- */
-public func contextMemberRole(handle: ContextHandle, did: String)async throws  -> String?  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_member_role(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(did)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterOptionString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Proposes a TTL extension. Records consent from the given member.
- *
- * Returns `true` if all members have consented (unanimous approval).
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not registered or the
- * member is not found.
- */
-public func contextProposeTtlExtension(handle: ContextHandle, memberDid: String, proposedSeconds: UInt64)async throws  -> Bool  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_propose_ttl_extension(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(memberDid),FfiConverterUInt64.lower(proposedSeconds)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
-            liftFunc: FfiConverterBool.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Resets the TTL timer after a successful unanimous extension.
- *
- * Cancels the old timer and spawns a new one with the given duration.
- */
-public func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64)async   {
-    return
-        try!  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_reset_ttl_timer(FfiConverterTypeContextHandle_lower(handle),FfiConverterUInt64.lower(newSeconds)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: nil
-            
-        )
-}
-/**
- * Sends a message to an SCP context.
- *
- * The payload is encrypted via the context's MLS group key (or sender key
- * for broadcast contexts) before transmission.
- *
- * # Arguments
- *
- * * `handle` — The context to send to.
- * * `identity` — The identity of the sender.
- * * `payload` — The raw message payload bytes to send.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not active.
- * Returns `ScpError::Crypto` if encryption fails.
- * Returns `ScpError::Transport` if delivery fails.
- */
-public func contextSend(handle: ContextHandle, identity: Identity, payload: Data, spendingUcanJwt: String?)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_send(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterData.lower(payload),FfiConverterOptionString.lower(spendingUcanJwt)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Subscribes to incoming messages for a context via a callback listener.
- *
- * The Swift SDK wrapper converts this callback to `AsyncStream<Message>`;
- * the Kotlin SDK wrapper converts it to `Flow<Message>` via `callbackFlow`.
- *
- * # Arguments
- *
- * * `handle` — The context to subscribe to.
- * * `listener` — A `MessageListener` callback implementation (passed as Box
- * per `UniFFI` callback interface convention).
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not in active state.
- */
-public func contextSubscribe(handle: ContextHandle, listener: MessageListener)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_context_subscribe(FfiConverterTypeContextHandle_lower(handle),FfiConverterCallbackInterfaceMessageListener_lower(listener)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Creates a governance checkpoint for a context (ADR-031 §9).
- *
- * # Returns
- *
- * JSON string with the full `ContextCheckpoint` object.
- *
- * # Errors
- *
- * Returns `ScpError::Context` (SCP-CTX-2066) if checkpoint creation fails.
- */
-public func createGovernanceCheckpoint(handle: ContextHandle, checkpointSeq: UInt64, merkleRootHex: String, eventCount: UInt64, lastEventHashHex: String, stateSnapshotHashHex: String, creatorDid: String, creatorSignatureHex: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_create_governance_checkpoint(FfiConverterTypeContextHandle_lower(handle),FfiConverterUInt64.lower(checkpointSeq),FfiConverterString.lower(merkleRootHex),FfiConverterUInt64.lower(eventCount),FfiConverterString.lower(lastEventHashHex),FfiConverterString.lower(stateSnapshotHashHex),FfiConverterString.lower(creatorDid),FfiConverterString.lower(creatorSignatureHex)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
@@ -10740,84 +13674,12 @@ public func discoveryParseAddress(address: String)throws  -> String  {
 })
 }
 /**
- * Computes escalated cost for a sender based on antispam velocity.
- */
-public func economyAntispamEscalatedCost(contextId: String, senderDid: String, now: UInt64, baseCost: UInt64, thresholdsJson: String, floor: UInt64?, cap: UInt64?)throws  -> UInt64  {
-    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_economy_antispam_escalated_cost(
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(senderDid),
-        FfiConverterUInt64.lower(now),
-        FfiConverterUInt64.lower(baseCost),
-        FfiConverterString.lower(thresholdsJson),
-        FfiConverterOptionUInt64.lower(floor),
-        FfiConverterOptionUInt64.lower(cap),$0
-    )
-})
-}
-/**
- * Records a message for antispam velocity tracking.
- */
-public func economyAntispamRecord(contextId: String, senderDid: String, timestamp: UInt64)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_economy_antispam_record(
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(senderDid),
-        FfiConverterUInt64.lower(timestamp),$0
-    )
-}
-}
-/**
- * Queries sender velocity (messages within sliding window).
- */
-public func economyAntispamVelocity(contextId: String, senderDid: String, now: UInt64)throws  -> UInt64  {
-    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_economy_antispam_velocity(
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(senderDid),
-        FfiConverterUInt64.lower(now),$0
-    )
-})
-}
-/**
  * Returns `true` if auto-accept is blocked by economic policy.
  */
 public func economyAutoAcceptBlocked(policyJson: String)throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_func_economy_auto_accept_blocked(
         FfiConverterString.lower(policyJson),$0
-    )
-})
-}
-/**
- * Grants spending budget to a member.
- */
-public func economyBudgetGrant(contextId: String, did: String, amount: UInt64)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_economy_budget_grant(
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(did),
-        FfiConverterUInt64.lower(amount),$0
-    )
-}
-}
-/**
- * Records a spend against a member's budget.
- */
-public func economyBudgetRecordSpend(contextId: String, did: String, amount: UInt64)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_economy_budget_record_spend(
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(did),
-        FfiConverterUInt64.lower(amount),$0
-    )
-}
-}
-/**
- * Queries the remaining budget for a member in a context.
- */
-public func economyBudgetRemaining(contextId: String, did: String)throws  -> UInt64  {
-    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_economy_budget_remaining(
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(did),$0
     )
 })
 }
@@ -10879,35 +13741,6 @@ public func economyValidatePolicyChange(currentPolicyJson: String, proposedPolic
 })
 }
 /**
- * Evaluates a context invitation through the sequential pipeline.
- *
- * Runs the 4-step evaluation pipeline from `scp-core`:
- * 1. Template validation (rejects template spoofing).
- * 2. Economic policy check (rejects insufficient spending capability).
- * 3. Auto-accept evaluation (trust, TTL cap, rate limit).
- * 4. Falls through to prompt-agent if no auto-accept matches.
- *
- * Returns `"auto_accept"` or `"prompt_agent"`.
- *
- * # Errors
- *
- * Returns `ScpError::Validation` if JSON parsing fails.
- * Returns `ScpError::Context` if pipeline produces a rejection error
- * (template spoofing, economic policy failure).
- */
-public func evaluateInvitation(paramsJson: String, inviterDid: String, identityDid: String, policyJson: String?, spendingJson: String?, trustedDids: [String])throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_evaluate_invitation(
-        FfiConverterString.lower(paramsJson),
-        FfiConverterString.lower(inviterDid),
-        FfiConverterString.lower(identityDid),
-        FfiConverterOptionString.lower(policyJson),
-        FfiConverterOptionString.lower(spendingJson),
-        FfiConverterSequenceString.lower(trustedDids),$0
-    )
-})
-}
-/**
  * Evaluates the provenance quality tier for data with the given parameters.
  *
  * Returns an integer (0-3) representing the quality tier:
@@ -10932,890 +13765,6 @@ public func evaluateProvenanceQuality(sourceContext: String?, sourceType: String
         FfiConverterSequenceString.lower(counterparties),$0
     )
 })
-}
-/**
- * Generates a signed consistency checkpoint from the current event log state.
- *
- * Creates a snapshot of the event log's Merkle root and event count, signs it
- * with the caller's identity key, and returns the checkpoint. Checkpoints
- * enable equivocation detection: members exchange signed Merkle roots and
- * compare them to detect relay misbehavior.
- *
- * # Arguments
- *
- * * `handle` — The context whose event log to checkpoint.
- * * `identity` — The identity generating the checkpoint (used for signing).
- * * `epoch` — The current MLS epoch (pass 0 for Broadcast contexts).
- *
- * # Returns
- *
- * A [`Checkpoint`] containing the signed checkpoint data.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not found in the UCAN
- * registry. Returns `ScpError::Permission` if key custody is not available.
- *
- * See ADR-011 acceptance criterion 8 and ADR-030.
- */
-public func eventLogCheckpoint(handle: ContextHandle, identity: Identity, epoch: UInt64)async throws  -> Checkpoint  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_event_log_checkpoint(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeIdentity_lower(identity),FfiConverterUInt64.lower(epoch)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeCheckpoint_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Queries the context event log with optional filter criteria.
- *
- * # Arguments
- *
- * * `handle` — The context whose event log to query.
- * * `filter_json` — Optional JSON string with filter parameters:
- * `event_type`, `actor_did`, `after_sequence`, `before_sequence`,
- * `after_timestamp`, `before_timestamp`, `limit`.
- * Pass `None` to return all events.
- *
- * # Returns
- *
- * A list of `Event` records matching the filter.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not active or the query fails.
- */
-public func eventLogQuery(handle: ContextHandle, filterJson: String?)async throws  -> [Event]  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_event_log_query(FfiConverterTypeContextHandle_lower(handle),FfiConverterOptionString.lower(filterJson)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterSequenceTypeEvent.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Verifies a claim against the context event log (Merkle proof).
- *
- * Generates and verifies an inclusion or absence proof for the given claim.
- *
- * # Arguments
- *
- * * `handle` — The context whose event log to verify against.
- * * `claim_json` — JSON string describing the claim:
- * - `"type"`: `"inclusion"` or `"absence"`
- * - `"leaf_index"` (for inclusion): event position
- * - `"event_hash"` (for absence): hex-encoded hash to prove absent
- *
- * # Returns
- *
- * A `Proof` record with the verification result and Merkle proof details.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the context is not active or the
- * verification fails (empty log, invalid index, etc.).
- */
-public func eventLogVerify(handle: ContextHandle, claimJson: String)async throws  -> Proof  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_event_log_verify(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(claimJson)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeProof_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Finalizes the cooperative close flow for a context in `Closing` state.
- *
- * Transitions to `Closed`, destroys keys per memory scope, records
- * `ContextClosed` event, and deletes persisted state.
- *
- * # Errors
- *
- * Returns `ScpError::Context` (SCP-CTX-2061) if the context is not
- * in `Closing` state or finalization fails.
- */
-public func finalizeClose(handle: ContextHandle)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_finalize_close(FfiConverterTypeContextHandle_lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Returns the economic policy for a context as a JSON string, or `None`.
- */
-public func getEconomicPolicy(handle: ContextHandle)throws  -> String?  {
-    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_get_economic_policy(
-        FfiConverterTypeContextHandle_lower(handle),$0
-    )
-})
-}
-/**
- * Casts an approval vote on a pending governance proposal.
- *
- * Delegates to `ContextManager::approve_governance_proposal`.
- *
- * # Errors
- *
- * Returns `ScpError::Context` (SCP-CTX-2042) if the vote fails.
- */
-public func governanceApprove(handle: ContextHandle, voterDid: String, proposalIdHex: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_governance_approve(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(voterDid),FfiConverterString.lower(proposalIdHex)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Executes an approved governance action on a context.
- *
- * The `proposal_json` must be a JSON-serialized `GovernanceProposal` with
- * status `Approved`. All 24 governance action variants (ADR-031) are
- * supported.
- *
- * # Arguments
- *
- * * `handle` — The context handle.
- * * `proposal_json` — JSON-serialized `GovernanceProposal`.
- *
- * # Errors
- *
- * Returns `ScpError::Permission` if the proposal is not approved, targets
- * the wrong context, or has already been executed (replay protection).
- * Returns `ScpError::Context` for any other governance execution failure.
- */
-public func governanceExecute(handle: ContextHandle, proposalJson: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_governance_execute(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(proposalJson)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Retrieves a single governance proposal by hex-encoded ID.
- *
- * # Errors
- *
- * Returns `ScpError::Context` (SCP-CTX-2045) if the proposal is not found.
- */
-public func governanceGetProposal(handle: ContextHandle, proposalIdHex: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_governance_get_proposal(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(proposalIdHex)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Lists all governance proposals for a context.
- *
- * Returns a JSON array of proposals.
- *
- * # Errors
- *
- * Returns `ScpError::Context` (SCP-CTX-2046) if listing fails.
- */
-public func governanceListProposals(handle: ContextHandle)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_governance_list_proposals(FfiConverterTypeContextHandle_lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Proposes a governance action for voting.
- *
- * Delegates to `ContextManager::propose_governance_action_checked`.
- * For `SingleAdmin` contexts, the proposal is auto-approved and executed.
- * For multi-admin models (Threshold, Majority, Unanimity), the proposal
- * enters `Pending` status.
- *
- * # Arguments
- *
- * * `handle` — The context handle.
- * * `proposer_did` — DID of the proposer.
- * * `action_json` — JSON-serialized `GovernanceAction`.
- *
- * # Returns
- *
- * JSON string: `{ "proposal_id": hex, "status": string, "execution_result": string | null }`.
- *
- * # Errors
- *
- * Returns `ScpError::Context` (SCP-CTX-2041) if the proposal fails.
- */
-public func governancePropose(handle: ContextHandle, proposerDid: String, actionJson: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_governance_propose(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(proposerDid),FfiConverterString.lower(actionJson)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Casts a rejection vote on a pending governance proposal.
- *
- * Delegates to `ContextManager::reject_governance_proposal`.
- *
- * # Errors
- *
- * Returns `ScpError::Context` (SCP-CTX-2043) if the vote fails.
- */
-public func governanceReject(handle: ContextHandle, voterDid: String, proposalIdHex: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_governance_reject(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(voterDid),FfiConverterString.lower(proposalIdHex)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Withdraws a previously cast vote on a pending governance proposal.
- *
- * Delegates to `ContextManager::withdraw_governance_vote`. No signing
- * key is required.
- *
- * # Errors
- *
- * Returns `ScpError::Context` (SCP-CTX-2044) if the withdrawal fails.
- */
-public func governanceWithdraw(handle: ContextHandle, voterDid: String, proposalIdHex: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_governance_withdraw(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(voterDid),FfiConverterString.lower(proposalIdHex)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Deregisters a handle from a context with discovery tools. Returns JSON result.
- */
-public func handleDeregister(discoveryContextId: String, handle: String, did: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_handle_deregister(
-        FfiConverterString.lower(discoveryContextId),
-        FfiConverterString.lower(handle),
-        FfiConverterString.lower(did),$0
-    )
-})
-}
-/**
- * Looks up a handle in a context with discovery tools. Returns JSON result.
- */
-public func handleLookup(discoveryContextId: String, handle: String, typeFilter: String?)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_handle_lookup(
-        FfiConverterString.lower(discoveryContextId),
-        FfiConverterString.lower(handle),
-        FfiConverterOptionString.lower(typeFilter),$0
-    )
-})
-}
-/**
- * Registers a handle in a context with discovery tools. Returns JSON result.
- */
-public func handleRegister(discoveryContextId: String, handle: String, targetJson: String, registrantDid: String, description: String?, tags: [String]?)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_handle_register(
-        FfiConverterString.lower(discoveryContextId),
-        FfiConverterString.lower(handle),
-        FfiConverterString.lower(targetJson),
-        FfiConverterString.lower(registrantDid),
-        FfiConverterOptionString.lower(description),
-        FfiConverterOptionSequenceString.lower(tags),$0
-    )
-})
-}
-/**
- * Generates a device attestation token for an identity.
- *
- * Uses `InMemoryDeviceAttestation` to produce a synthetic attestation token,
- * then attaches it to the identity's DID document.
- *
- * # Arguments
- *
- * * `identity` — The identity to attest (must have been created with
- * `identity_create`, not `identity_load`).
- *
- * # Returns
- *
- * The attestation token as a base64-encoded string.
- *
- * # Errors
- *
- * Returns `ScpError::Identity` if the identity was externally loaded (no
- * retained crypto state) or if attestation generation fails.
- *
- * See §9.3, issue #362, #419.
- */
-public func identityAttestDevice(identity: Identity)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_identity_attest_device(FfiConverterTypeIdentity_lower(identity)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * # In-memory custody (feature-gated)
- *
- * When `custody` is `"in_memory"` and the `allow_in_memory_custody` feature
- * is enabled, this function creates a real `did:dht` identity using
- * [`scp_identity::DidDht`] backed by `InMemoryKeyCustody`. The
- * returned DID is self-certifying and has the `did:dht:z` prefix.
- *
- * `"in_memory"` custody stores key material in unprotected heap memory.
- * It is suitable for testing and development but NOT for production use
- * on mobile devices — use `"platform"` (Secure Enclave / Android Keystore)
- * in production. See GitHub issue #88 and ADR-006.
- */
-public func identityCreate(custody: String, seed: Data?)async throws  -> Identity  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_identity_create(FfiConverterString.lower(custody),FfiConverterOptionData.lower(seed)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeIdentity_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Creates a new SCP identity with an agent signing key.
- *
- * Same as `identity_create` but also generates an `#agent` verification
- * method keypair in the DID document (ADR-039). The returned `Identity`
- * has `has_agent_key() == true`.
- *
- * Only available with `"in_memory"` custody when the
- * `allow_in_memory_custody` feature is enabled. Production mobile builds
- * must use `identity_create_with_custody` + `add_agent_key`.
- *
- * # Arguments
- *
- * * `custody` — Custody method string (`"in_memory"`).
- *
- * # Errors
- *
- * Returns `ScpError::Identity` if the custody method is unsupported or
- * key generation/DHT publish fails.
- *
- * See ADR-039 acceptance criterion 4 and SCP-AB-016.
- */
-public func identityCreateWithAgentKey(custody: String)async throws  -> Identity  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_identity_create_with_agent_key(FfiConverterString.lower(custody)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeIdentity_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Creates a new SCP identity using an injected platform custody provider.
- *
- * This is the production-grade identity creation path for mobile platforms.
- * The `provider` callback handles all cryptographic operations (signing,
- * key generation, pseudonym derivation) inside the platform's TEE (Secure
- * Enclave on iOS, Android Keystore on Android). Private key material never
- * crosses the FFI boundary (ADR-006).
- *
- * # Arguments
- *
- * * `provider` — A [`KeyCustodyProvider`](crate::KeyCustodyProvider) callback
- * implementation injected from Swift or Kotlin.
- *
- * # Returns
- *
- * An `Identity` handle with `custody_type` set to `"platform"`.
- *
- * # Errors
- *
- * Returns `ScpError::Identity` if DID creation or DHT publish fails.
- *
- * See SCP-214 acceptance criteria 2-3.
- */
-public func identityCreateWithCustody(provider: KeyCustodyProvider)async throws  -> Identity  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_identity_create_with_custody(FfiConverterCallbackInterfaceKeyCustodyProvider_lower(provider)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeIdentity_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Executes the custody migration protocol for the given DID.
- *
- * Returns a JSON string with the migration result.
- *
- * See spec §3.2.1.
- */
-public func identityExecuteCustodyMigration(did: String, target: String, contextIds: [String])throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_identity_execute_custody_migration(
-        FfiConverterString.lower(did),
-        FfiConverterString.lower(target),
-        FfiConverterSequenceString.lower(contextIds),$0
-    )
-})
-}
-/**
- * Executes the compromise recovery protocol for the given DID.
- *
- * Returns a JSON string with the recovery result.
- *
- * See spec §9.12 and PR #1080.
- */
-public func identityExecuteRecovery(did: String, tier: String, contextIds: [String])throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_identity_execute_recovery(
-        FfiConverterString.lower(did),
-        FfiConverterString.lower(tier),
-        FfiConverterSequenceString.lower(contextIds),$0
-    )
-})
-}
-/**
- * Lists all identity link attestations for an identity.
- *
- * See spec §3.5.1.
- */
-public func identityLinkAttestations(did: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_identity_link_attestations(
-        FfiConverterString.lower(did),$0
-    )
-})
-}
-/**
- * Loads an existing identity from storage by its DID.
- *
- * # Arguments
- *
- * * `did` — The DID string to load (e.g., `"did:dht:z6Mk..."`).
- *
- * # Returns
- *
- * An `Identity` handle for the loaded DID.
- *
- * # Errors
- *
- * Returns `ScpError::Identity` if the DID format is unsupported or the
- * identity cannot be loaded from storage.
- */
-public func identityLoad(did: String)async throws  -> Identity  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_identity_load(FfiConverterString.lower(did)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeIdentity_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Migrates an identity to a new DID (Layer 2 DID rotation).
- *
- * Generates a new keypair, creates a new DID, and links the old DID to
- * the new one via `alsoKnownAs` in the old DID document.
- *
- * # Arguments
- *
- * * `identity` — The identity to migrate. Must have retained crypto state
- * (created via `identity_create` or `identity_create_with_agent_key`,
- * not via `identity_load`).
- *
- * # Returns
- *
- * A new `Identity` handle with the migrated DID.
- *
- * # Errors
- *
- * Returns `ScpError::Identity` if the identity has no retained crypto
- * state, key generation fails, or DHT publish fails.
- *
- * See ADR-003 acceptance criterion 4b.
- */
-public func identityMigrate(identity: Identity)async throws  -> Identity  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_identity_migrate(FfiConverterTypeIdentity_lower(identity)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeIdentity_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Resolves a DID to its document.
- *
- * # Arguments
- *
- * * `did` — The DID string to resolve (e.g., `"did:dht:z6Mk..."`).
- *
- * # Returns
- *
- * A `DIDDocument` record with the resolved document fields.
- *
- * # Errors
- *
- * Returns `ScpError::Identity` if the DID cannot be resolved (not found
- * on DHT, invalid format, verification failure).
- */
-public func identityResolve(did: String)async throws  -> DidDocument  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_identity_resolve(FfiConverterString.lower(did)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeDIDDocument_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Verifies a device attestation token.
- *
- * Uses `InMemoryDeviceAttestation` to check the token format.
- *
- * # Arguments
- *
- * * `did` — The DID string (unused in verification but kept for API
- * consistency).
- * * `token_base64` — The base64-encoded attestation token to verify.
- *
- * # Returns
- *
- * `true` if the token is valid, `false` otherwise.
- *
- * # Errors
- *
- * Returns `ScpError::Identity` if base64 decoding fails or if verification
- * encounters an error.
- *
- * See §9.3, issue #362, #419.
- */
-public func identityVerifyDeviceAttestation(did: String, tokenBase64: String)async throws  -> Bool  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_identity_verify_device_attestation(FfiConverterString.lower(did),FfiConverterString.lower(tokenBase64)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
-            liftFunc: FfiConverterBool.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Verifies the Ed25519 signature on an identity link attestation.
- *
- * The issuer's public key cannot be reliably extracted from the DID string
- * because attestations are signed with `#active` or `#agent` keys
- * (spec §3.5.2), not the `#0` identity key embedded in the DID.
- *
- * See spec §3.5.1.
- */
-public func identityVerifyLinkAttestation(attestationJson: String, issuerPublicKeyHex: String)async throws  -> Bool  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_identity_verify_link_attestation(FfiConverterString.lower(attestationJson),FfiConverterString.lower(issuerPublicKeyHex)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
-            liftFunc: FfiConverterBool.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Returns `true` if the given DID is registered as locally controlled.
- *
- * Ensures the `ContextManager` is initialized (idempotent) since local DID
- * queries are valid before any context exists.
- */
-public func isLocalDid(did: String)async  -> Bool  {
-    return
-        try!  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_is_local_did(FfiConverterString.lower(did)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
-            liftFunc: FfiConverterBool.lift,
-            errorHandler: nil
-            
-        )
-}
-/**
- * Connects to an external MCP server via SSE transport.
- *
- * # Arguments
- *
- * * `url` — The URL of the SSE endpoint.
- *
- * # Returns
- *
- * An opaque client handle string.
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if the connection or MCP handshake fails.
- */
-public func mcpClientConnectSse(url: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_mcp_client_connect_sse(FfiConverterString.lower(url)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Connects to an external MCP server via stdio transport.
- *
- * Spawns the given command as a subprocess, communicates via line-delimited
- * JSON over stdin/stdout, and performs the MCP initialize handshake.
- *
- * # Arguments
- *
- * * `command` — The command and arguments to spawn (e.g.,
- * `["uvx", "some-mcp-server"]`).
- *
- * # Returns
- *
- * An opaque client handle string.
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if the subprocess fails to start or the
- * MCP initialize handshake fails.
- */
-public func mcpClientConnectStdio(command: [String])async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_mcp_client_connect_stdio(FfiConverterSequenceString.lower(command)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Disconnects from an external MCP server.
- *
- * Removes the client from the registry and drops the transport connection.
- * For stdio clients, the subprocess is killed via `McpStdioTransport::drop`.
- *
- * # Arguments
- *
- * * `handle` — The client handle returned by `mcp_client_connect_*`.
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if the handle is not found.
- */
-public func mcpClientDisconnect(handle: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_mcp_client_disconnect(FfiConverterString.lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Invokes an external MCP tool with SCP provenance wrapping.
- *
- * Sends a `tools/call` JSON-RPC request to the external MCP server and
- * wraps the result with provenance metadata.
- *
- * # Arguments
- *
- * * `handle` — The client handle returned by `mcp_client_connect_*`.
- * * `tool_name` — The name of the external tool to invoke.
- * * `input_json` — Tool input parameters as a JSON string.
- * * `context_id` — The SCP context ID for provenance tracking.
- * * `invoker_did` — The DID of the invoking identity.
- *
- * # Returns
- *
- * An `McpInvokeResult` with content, error flag, and provenance metadata.
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if the client is not connected or the
- * invocation fails. Returns `ScpError::Validation` if input JSON is
- * malformed.
- */
-public func mcpClientInvoke(handle: String, toolName: String, inputJson: String, contextId: String, invokerDid: String)async throws  -> McpInvokeResult  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_mcp_client_invoke(FfiConverterString.lower(handle),FfiConverterString.lower(toolName),FfiConverterString.lower(inputJson),FfiConverterString.lower(contextId),FfiConverterString.lower(invokerDid)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeMcpInvokeResult_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Lists available tools from an external MCP server.
- *
- * Sends a `tools/list` JSON-RPC request to the connected MCP server and
- * returns the tool definitions.
- *
- * # Arguments
- *
- * * `handle` — The client handle returned by `mcp_client_connect_*`.
- *
- * # Returns
- *
- * A list of `McpToolInfo` records describing the available tools.
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if the client is not connected or the
- * request fails.
- */
-public func mcpClientListTools(handle: String)async throws  -> [McpToolInfo]  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_mcp_client_list_tools(FfiConverterString.lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterSequenceTypeMcpToolInfo.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
 }
 /**
  * Configures the MCP stdio subprocess allowlist.
@@ -11884,67 +13833,6 @@ public func mcpResetStdioAllowlist()throws   {try rustCallWithError(FfiConverter
     uniffi_scp_ffi_uniffi_fn_func_mcp_reset_stdio_allowlist($0
     )
 }
-}
-/**
- * Starts an MCP server exposing SCP context tools.
- *
- * Creates an MCP server backed by a `McpUniFfiBridgeProvider`. For `"stdio"`
- * transport, the server processes JSON-RPC messages via a tokio task. For
- * `"sse"` transport, the server binds an HTTP server on a random port.
- *
- * # Arguments
- *
- * * `config` — Server configuration (identity DID, context IDs, transport).
- *
- * # Returns
- *
- * An opaque server handle string for use with `mcp_server_stop`.
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if the server fails to start.
- *
- * See ADR-015: MCP server with context namespace mapping.
- */
-public func mcpServerCreate(config: McpServerConfig)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_mcp_server_create(FfiConverterTypeMcpServerConfig_lower(config)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Stops a running MCP server.
- *
- * # Arguments
- *
- * * `handle` — The server handle returned by `mcp_server_create`.
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if the handle is not found or server
- * is already stopped.
- */
-public func mcpServerStop(handle: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_mcp_server_stop(FfiConverterString.lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
 }
 /**
  * Activates a media session (transitions from Initiating to Active).
@@ -12133,194 +14021,6 @@ public func metadataRecordToJson(contextId: String, sequence: UInt64, signerDid:
 })
 }
 /**
- * Returns the migration state for a context, if any (§5.11A).
- *
- * Returns a JSON string with migration state fields, or `None` if the
- * context is not migrating.
- */
-public func migrationState(handle: ContextHandle)async throws  -> String?  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_migration_state(FfiConverterTypeContextHandle_lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterOptionString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Starts a full application node with in-memory storage.
- *
- * When `identity` is provided, the node uses the pre-existing identity
- * instead of generating a fresh one. This enables identity portability —
- * the same DID persists across node restarts and can be shared between
- * SDK and node instances.
- *
- * Auto-wires in-memory key custody, in-memory storage, in-memory DHT client,
- * self-signed TLS, and a relay on an OS-assigned port.
- *
- * # Swift
- *
- * ```swift
- * let identity = try await identityCreate(custody: "in_memory")
- * let node = try await nodeStartInMemory(identity: identity)
- * print(node.relayUrl()) // "ws://127.0.0.1:PORT/scp/v1"
- * print(node.did())      // same DID as identity.did()
- * node.shutdown()
- * ```
- */
-public func nodeStartInMemory(identity: Identity?)async throws  -> NodeHandle  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_node_start_in_memory(FfiConverterOptionTypeIdentity.lower(identity)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeNodeHandle_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Starts a full application node with file-backed storage.
- *
- * When `identity` is provided, the node uses the pre-existing identity.
- * When `None`, the node creates or reloads a persistent identity via
- * `FileKeyCustody`. The `passphrase` parameter is required in this mode.
- *
- * Opens (or creates) persistent storage at `<data_dir>/storage/` and a redb
- * blob database at `<data_dir>/blobs.redb`.
- */
-public func nodeStartLocal(dataDir: String, identity: Identity?, passphrase: String?)async throws  -> NodeHandle  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_node_start_local(FfiConverterString.lower(dataDir),FfiConverterOptionTypeIdentity.lower(identity),FfiConverterOptionString.lower(passphrase)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeNodeHandle_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Gets the petname for a context.
- */
-public func petnameGetForContext(ownerDid: String, contextId: String)throws  -> String?  {
-    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_petname_get_for_context(
-        FfiConverterString.lower(ownerDid),
-        FfiConverterString.lower(contextId),$0
-    )
-})
-}
-/**
- * Gets the petname for a DID.
- */
-public func petnameGetForDid(ownerDid: String, targetDid: String)throws  -> String?  {
-    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_petname_get_for_did(
-        FfiConverterString.lower(ownerDid),
-        FfiConverterString.lower(targetDid),$0
-    )
-})
-}
-/**
- * Removes a petname from a DID.
- */
-public func petnameRemove(ownerDid: String, targetDid: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_petname_remove(
-        FfiConverterString.lower(ownerDid),
-        FfiConverterString.lower(targetDid),$0
-    )
-}
-}
-/**
- * Removes a petname from a context.
- */
-public func petnameRemoveContext(ownerDid: String, contextId: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_petname_remove_context(
-        FfiConverterString.lower(ownerDid),
-        FfiConverterString.lower(contextId),$0
-    )
-}
-}
-/**
- * Resolves a petname to context IDs. Returns a JSON array of strings.
- */
-public func petnameResolveContext(ownerDid: String, name: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_petname_resolve_context(
-        FfiConverterString.lower(ownerDid),
-        FfiConverterString.lower(name),$0
-    )
-})
-}
-/**
- * Resolves a petname to DIDs. Returns a JSON array of DID strings.
- */
-public func petnameResolveDid(ownerDid: String, name: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_petname_resolve_did(
-        FfiConverterString.lower(ownerDid),
-        FfiConverterString.lower(name),$0
-    )
-})
-}
-/**
- * Sets a petname for a DID.
- */
-public func petnameSet(ownerDid: String, targetDid: String, name: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_petname_set(
-        FfiConverterString.lower(ownerDid),
-        FfiConverterString.lower(targetDid),
-        FfiConverterString.lower(name),$0
-    )
-}
-}
-/**
- * Sets a petname for a context.
- */
-public func petnameSetContext(ownerDid: String, contextId: String, name: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_petname_set_context(
-        FfiConverterString.lower(ownerDid),
-        FfiConverterString.lower(contextId),
-        FfiConverterString.lower(name),$0
-    )
-}
-}
-/**
- * Attaches provenance metadata when data crosses a context boundary.
- *
- * Records dual events in the event log: `ProvenanceAttached` in the source
- * context and `ProvenanceReceived` in the target context (issue #586).
- *
- * Returns a JSON string with the attached provenance record.
- *
- * See ADR-019 acceptance criteria 2-3, 6.
- */
-public func provenanceAttach(sourceContextId: String, sourceType: String, memoryScopeStr: String, members: [String], targetContextId: String, actorDid: String, existingChainDepth: UInt8?)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_provenance_attach(
-        FfiConverterString.lower(sourceContextId),
-        FfiConverterString.lower(sourceType),
-        FfiConverterString.lower(memoryScopeStr),
-        FfiConverterSequenceString.lower(members),
-        FfiConverterString.lower(targetContextId),
-        FfiConverterString.lower(actorDid),
-        FfiConverterOptionUInt8.lower(existingChainDepth),$0
-    )
-})
-}
-/**
  * Checks whether the provenance chain depth is within the allowed limit.
  */
 public func provenanceCheckChainDepth(chainDepth: UInt8, maxDepth: UInt8?) -> Bool  {
@@ -12392,118 +14092,6 @@ public func provenanceUpdateSourceType(provenanceJson: String, newState: String)
 })
 }
 /**
- * Registers a DID as locally controlled by this node/SDK.
- *
- * Used for defense-in-depth validation in broadcast key request handling.
- * Ensures the `ContextManager` is initialized (idempotent) since local DID
- * registration is valid before any context exists.
- */
-public func registerLocalDid(did: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_register_local_did(FfiConverterString.lower(did)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Starts a relay with in-memory blob storage on an OS-assigned port.
- *
- * Returns a [`RelayHandle`] whose `relay_url()` method returns the
- * WebSocket URL for clients.
- *
- * # Swift
- *
- * ```swift
- * let relay = try await relayStartInMemory()
- * print(relay.relayUrl()) // "ws://127.0.0.1:PORT/scp/v1"
- * relay.shutdown()
- * ```
- */
-public func relayStartInMemory()async throws  -> RelayHandle  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_relay_start_in_memory(
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeRelayHandle_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Starts a relay with redb-backed blob storage on an OS-assigned port.
- *
- * Opens (or creates) a redb database at `<data_dir>/blobs.redb`.
- */
-public func relayStartLocal(dataDir: String)async throws  -> RelayHandle  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_relay_start_local(FfiConverterString.lower(dataDir)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeRelayHandle_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Restores all persisted contexts from storage.
- *
- * Returns a JSON array of restored context ID strings.
- *
- * # Errors
- *
- * Returns `ScpError::Context` (SCP-CTX-2065) if restoration fails.
- */
-public func restoreAllContexts()async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_restore_all_contexts(
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Restores a single persisted context from storage.
- *
- * # Errors
- *
- * Returns `ScpError::Context` (SCP-CTX-2064) if restoration fails.
- */
-public func restoreContext(contextId: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_restore_context(FfiConverterString.lower(contextId)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
  * Checks whether a given capability is allowed for an app binding.
  */
 public func sandboxCheckCapability(grantedCapabilities: [String], requiredCapability: String) -> Bool  {
@@ -12531,157 +14119,6 @@ public func sandboxValidateDeclaration(declarationJson: String, ceilingCapabilit
 })
 }
 /**
- * Deregisters a scope name from a scope registry. Returns JSON result.
- */
-public func scopeDeregister(scopeContextId: String, name: String, did: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_scope_deregister(
-        FfiConverterString.lower(scopeContextId),
-        FfiConverterString.lower(name),
-        FfiConverterString.lower(did),$0
-    )
-})
-}
-/**
- * Looks up a scope name in a scope registry. Returns JSON result.
- */
-public func scopeLookup(scopeContextId: String, name: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_scope_lookup(
-        FfiConverterString.lower(scopeContextId),
-        FfiConverterString.lower(name),$0
-    )
-})
-}
-/**
- * Registers a scope name in a scope registry. Returns JSON result.
- */
-public func scopeRegister(scopeContextId: String, name: String, targetContextId: String, relayUrls: [String], registrantDid: String, description: String?, tags: [String]?)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_scope_register(
-        FfiConverterString.lower(scopeContextId),
-        FfiConverterString.lower(name),
-        FfiConverterString.lower(targetContextId),
-        FfiConverterSequenceString.lower(relayUrls),
-        FfiConverterString.lower(registrantDid),
-        FfiConverterOptionString.lower(description),
-        FfiConverterOptionSequenceString.lower(tags),$0
-    )
-})
-}
-/**
- * Resumes a suspended bridge instance.
- *
- * Clears the suspended flag so bridge operations can proceed. The caller
- * must re-establish the relay connection via `transportConnect()` — resume
- * does not reconnect automatically.
- *
- * No-op if the instance is not initialized.
- *
- * # Errors
- *
- * Returns `ScpError::Context` if the instance has been permanently shut down.
- */
-public func scpResume()async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_scp_resume(
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Waits for all outstanding FFI handles to be released, then shuts down.
- *
- * Call this from Swift/Kotlin before your process exits or before tearing
- * down the SCP library. It blocks (asynchronously) until either:
- *
- * - All opaque handle objects (`Identity`, `ContextHandle`, `UcanToken`,
- * `TransportManager`) have been garbage-collected / freed, **or**
- * - The `timeout_millis` deadline has elapsed.
- *
- * After this call returns, the tokio runtime may be dropped safely — no
- * outstanding FFI handles remain that could attempt to call into it.
- *
- * The unit is **milliseconds** — unified across all Rust bridges so the
- * Swift, Kotlin, and TypeScript SDKs can share a single conversion
- * surface (the SDK wrappers multiply by 1000 before crossing FFI). The
- * default is 5000 ms (per ADR-021 acceptance criterion 1). Pass `0` to
- * return immediately without waiting.
- *
- * # Thread safety
- *
- * This function is safe to call from any thread. It polls `HANDLE_COUNT`
- * in 10 ms intervals on the tokio runtime (via `tokio::time::sleep`) so
- * the worker is not blocked — critical for mobile apps that run this on
- * the main event loop.
- *
- * **Bug fix (PR 1 post-review):** the previous implementation polled
- * with `std::thread::sleep`, which blocks the current tokio worker.
- * Mobile apps invoking `scpShutdown` from the foreground ran the risk
- * of a frozen UI while tasks drained. The new implementation yields
- * via `tokio::time::sleep` as every other async bridge function does.
- *
- * # Example (Swift)
- *
- * ```swift
- * // Call before application exit:
- * try await scpShutdown(timeoutMillis: 5_000)
- * ```
- */
-public func scpShutdown(timeoutMillis: UInt64)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_scp_shutdown(FfiConverterUInt64.lower(timeoutMillis)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Suspends the bridge instance for mobile app backgrounding.
- *
- * Disconnects transport (clears the relay connection) and marks the instance
- * as suspended. Context state is preserved — the instance remains alive but
- * inactive. Transport-dependent operations will fail until [`scp_resume`]
- * is called.
- *
- * After suspension, callers should call `scpResume()` to re-activate, then
- * re-establish the relay connection via `transportConnect()`.
- *
- * No-op if the instance is already shut down or not initialized.
- *
- * # Example (Swift)
- *
- * ```swift
- * // When the app enters background:
- * scpSuspend()
- * // When returning to foreground:
- * try await scpResume()
- * try await transportConnect(relayUrl: savedUrl)
- * ```
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if transport cleanup fails.
- */
-public func scpSuspend()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_scp_suspend($0
-    )
-}
-}
-/**
  * Generates an SCPID challenge for the given audience (§3.11.8).
  *
  * Returns the challenge as a JSON string containing `protocol`, `nonce`,
@@ -12704,56 +14141,6 @@ public func scpidChallenge(audience: String, ttlSeconds: UInt64)throws  -> Strin
         FfiConverterUInt64.lower(ttlSeconds),$0
     )
 })
-}
-/**
- * Verifies a signed SCPID response against the original challenge (§3.11.4).
- *
- * Resolves the signer's DID document via the global production DID resolver
- * (initialized during `identityCreate`), then runs the 11-step verification
- * pipeline from `scp-core`. Returns the `ScpIdAuthentication` result as a
- * JSON string on success.
- *
- * # Arguments
- *
- * * `response_json` — JSON string of the signed response (from `scpid_sign`).
- * * `challenge_json` — JSON string of the original challenge (from `scpid_challenge`).
- *
- * # Errors
- *
- * Returns `ScpError::Identity` if the DID resolver is not initialized
- * (no identity created yet).
- * Returns `ScpError::Validation` if either JSON string is malformed.
- * Returns `ScpError::Identity` if DID resolution fails, the signature is
- * invalid, the challenge has expired, or any other verification step fails.
- */
-public func scpidVerify(responseJson: String, challengeJson: String)throws  -> String  {
-    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_scpid_verify(
-        FfiConverterString.lower(responseJson),
-        FfiConverterString.lower(challengeJson),$0
-    )
-})
-}
-/**
- * Sets the economic policy for a context (§19.3).
- *
- * Rejects direct economic policy mutation — use governance flow instead
- * (§19.3, #728).
- *
- * Economic policy changes MUST go through the governance proposal flow
- * (`SetEconomicPolicy` action) to ensure event logging and the mandatory
- * 24-hour notification period. Direct setters bypass these controls.
- *
- * # Errors
- *
- * Always returns `ScpError::Permission` directing the caller to use governance.
- */
-public func setEconomicPolicy(handle: ContextHandle, policyJson: String)throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_set_economic_policy(
-        FfiConverterTypeContextHandle_lower(handle),
-        FfiConverterString.lower(policyJson),$0
-    )
-}
 }
 /**
  * Classifies an offline duration into the appropriate recovery tier.
@@ -12808,473 +14195,6 @@ public func templateGetParams(templateId: String)throws  -> String  {
 })
 }
 /**
- * Tombstones a migrated context after its grace period has expired (§5.11A.5).
- *
- * Transitions the context from `MigratingOut` to `Tombstoned`.
- *
- * # Errors
- *
- * Returns `ScpError::Context` (SCP-CTX-2050) if the context is not migrating
- * or the grace period has not expired.
- */
-public func tombstoneMigratedContext(handle: ContextHandle)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tombstone_migrated_context(FfiConverterTypeContextHandle_lower(handle)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Accepts a cross-context tool interface (§6.2.0.1 step 4).
- *
- * Sets `approved_by_target = true` on the interface. Both approvals must be
- * `true` before calls are permitted.
- *
- * # Arguments
- *
- * * `handle` — The target context handle (the one accepting).
- * * `interface_json` — The `ToolInterface` JSON string to accept.
- *
- * # Returns
- *
- * The updated `ToolInterface` JSON string with `approved_by_target = true`.
- *
- * # Errors
- *
- * Returns `ScpError::Tool` if the caller is not an admin or the target context
- * does not match.
- */
-public func toolInterfaceAccept(handle: ContextHandle, interfaceJson: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_interface_accept(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(interfaceJson)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Exposes a tool interface for cross-context sharing (§6.2.0.1 step 1).
- *
- * The caller (admin of the source context) proposes sharing a specific tool
- * with a target context. Returns the `ToolInterface` as a JSON string with
- * `approved_by_source = true` and `approved_by_target = false`.
- *
- * # Arguments
- *
- * * `handle` — The source context handle.
- * * `tool_id` — The ID of the tool to expose.
- * * `target_context_id` — The target context to expose the tool to.
- * * `rate_limit_json` — Optional per-interface rate limit as a JSON string.
- *
- * # Returns
- *
- * A JSON string of the created `ToolInterface`.
- *
- * # Errors
- *
- * Returns `ScpError::Tool` if the caller is not an admin or the tool is not found.
- */
-public func toolInterfaceExpose(handle: ContextHandle, toolId: String, targetContextId: String, rateLimitJson: String?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_interface_expose(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(targetContextId),FfiConverterOptionString.lower(rateLimitJson)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Revokes a cross-context tool interface (§6.2.0.1 step 5).
- *
- * Either context may revoke unilaterally. Returns an `InterfaceRevoked` event
- * as a JSON string.
- *
- * # Arguments
- *
- * * `handle` — The revoking context handle.
- * * `interface_id_hex` — The 32-byte interface/offer ID as a hex string.
- *
- * # Returns
- *
- * A JSON string of the `InterfaceRevoked` event.
- *
- * # Errors
- *
- * Returns `ScpError::Validation` if `interface_id_hex` is not valid hex or
- * not 32 bytes.
- */
-public func toolInterfaceRevoke(handle: ContextHandle, interfaceIdHex: String)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_interface_revoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(interfaceIdHex)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Invokes a tool within an SCP context, fully wired through the
- * `ContextManager::invoke_tool_with_economy` pipeline.
- *
- * This is the SINGLE entry point for tool invocation through the
- * `UniFFI` bridge (Swift + Kotlin). Per-invocation pricing, spending
- * UCAN AND-composition (§19.5), per-DID velocity tracking, escalation
- * (§19.7), budget enforcement, payment escrow, the Matrix-style hard
- * rate limit, and `ToolEconomyTicket` rollback are all enforced inside
- * the runtime wrapper. The `UniFFI` bridge no longer reimplements any
- * of those concerns.
- *
- * # Arguments
- *
- * * `handle` — The context containing the tool.
- * * `tool_id` — The ID of the tool to invoke.
- * * `input_json` — Tool input parameters as a JSON string.
- * * `identity` — The identity of the invoker (used for capability checking).
- * * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
- * Must contain `tool_invoke:{tool_id}` or `tool_invoke:*` capability.
- * The full 11-step ADR-016 validation pipeline is executed before
- * tool dispatch. See spec §6.2, §8, ADR-016, and issue #319.
- * * `proof_tokens` — Optional list of encoded parent UCAN tokens for
- * delegation chain traversal (ADR-016 step 3).
- * * `spending_ucan_jwt` — Optional JWT-encoded spending UCAN
- * (`SpendingCapability`) for paid tool invocations. Required when an
- * `EconomicPolicy` priced the tool above zero (§19.5
- * AND-composition). May be `nil`/`null` for free tools.
- *
- * # Returns
- *
- * The tool output as a JSON string.
- *
- * # Errors
- *
- * - `ScpError::Tool` (tool-invocation error range) — tool not found, schema
- * mismatch, execution failure.
- * - `ScpError::Permission` (`SCP-PERM-3001`) — invalid, expired,
- * revoked, or capability-deficient UCAN token.
- * - `ScpError::Context` (`SCP-ECON-12090`) — hard rate limit exceeded.
- * - `ScpError::Context` (`SCP-ECON-12010`) — per-DID budget exceeded.
- * - `ScpError::Context` (`SCP-ECON-12061`) — invalid spending UCAN.
- */
-public func toolInvoke(handle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String?, proofTokens: [String]?, spendingUcanJwt: String?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_invoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterOptionString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens),FfiConverterOptionString.lower(spendingUcanJwt)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Invokes a tool across context boundaries.
- *
- * Validates UCAN authorization against the target context and chain depth
- * per spec section 6.2 (max 3 hops).
- *
- * # Arguments
- *
- * * `source_handle` — The calling context.
- * * `target_handle` — The context containing the tool.
- * * `tool_id` — The tool to invoke.
- * * `input_json` — Tool input as a JSON string.
- * * `identity` — The invoker's identity.
- * * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
- * Validated against the TARGET context's ceiling using the full 11-step
- * ADR-016 pipeline.
- * * `chain_depth` — Current chain depth (0 for first hop).
- * * `proof_tokens` — Optional list of encoded parent UCAN tokens for
- * delegation chain traversal.
- *
- * # Errors
- *
- * Returns `ScpError::Permission` if the UCAN token is invalid, expired,
- * revoked, or lacks the required tool invocation capability.
- * Returns `ScpError::Tool` if chain depth exceeded or contexts not active.
- */
-public func toolInvokeCrossContext(sourceHandle: ContextHandle, targetHandle: ContextHandle, toolId: String, inputJson: String, identity: Identity, ucanToken: String, chainDepth: UInt8, proofTokens: [String]?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_invoke_cross_context(FfiConverterTypeContextHandle_lower(sourceHandle),FfiConverterTypeContextHandle_lower(targetHandle),FfiConverterString.lower(toolId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterUInt8.lower(chainDepth),FfiConverterOptionSequenceString.lower(proofTokens)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Registers a tool in an SCP context.
- *
- * # Arguments
- *
- * * `handle` — The context to register the tool in.
- * * `definition` — Tool definition including name, schema, and test vectors.
- *
- * # Returns
- *
- * The tool ID string assigned to the registered tool.
- *
- * # Errors
- *
- * Returns `ScpError::Tool` if the context is not active, registration
- * fails (permission denied, schema invalid, duplicate name, etc.).
- */
-public func toolRegister(handle: ContextHandle, definition: ToolDefinition)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_register(FfiConverterTypeContextHandle_lower(handle),FfiConverterTypeToolDefinition_lower(definition)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Closes a stateful tool session.
- *
- * Removes the session from the store, releasing the caller's session slot.
- */
-public func toolSessionClose(handle: ContextHandle, sessionId: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_session_close(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Creates a stateful tool session.
- *
- * Sessions enable multi-turn workflows with TTL and per-caller caps
- * (default: 1000 concurrent sessions per caller, per spec §6.2.1 and ADR-043).
- *
- * # Returns
- *
- * The session ID (UUID string).
- */
-public func toolSessionCreate(handle: ContextHandle, toolId: String, sourceContextId: String, ttlSeconds: UInt64?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_session_create(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId),FfiConverterString.lower(sourceContextId),FfiConverterOptionUInt64.lower(ttlSeconds)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Invokes a tool within an active session.
- *
- * Each call is individually governed: the invoker must present a valid
- * UCAN token. Session state is carried forward and the call count is
- * incremented on success.
- *
- * # Arguments
- *
- * * `handle` — The context containing the tool session.
- * * `session_id` — The session to invoke within.
- * * `input_json` — Tool input parameters as a JSON string.
- * * `identity` — The identity of the invoker.
- * * `ucan_token` — JWT-encoded UCAN token authorizing the invocation.
- * Validated using the full 11-step ADR-016 pipeline.
- * * `proof_tokens` — Optional list of encoded parent UCAN tokens for
- * delegation chain traversal.
- *
- * # Returns
- *
- * The tool output as a JSON string.
- */
-public func toolSessionInvoke(handle: ContextHandle, sessionId: String, inputJson: String, identity: Identity, ucanToken: String, proofTokens: [String]?)async throws  -> String  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_session_invoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(sessionId),FfiConverterString.lower(inputJson),FfiConverterTypeIdentity_lower(identity),FfiConverterString.lower(ucanToken),FfiConverterOptionSequenceString.lower(proofTokens)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterString.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Verifies a tool against its registered test vectors.
- *
- * # Arguments
- *
- * * `handle` — The context containing the tool.
- * * `tool_id` — The ID of the tool to verify.
- *
- * # Returns
- *
- * A `ToolVerificationResult` with pass/fail status and failure messages.
- *
- * # Errors
- *
- * Returns `ScpError::Tool` if the tool is not found in the context.
- */
-public func toolVerify(handle: ContextHandle, toolId: String)async throws  -> ToolVerificationResult  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_tool_verify(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(toolId)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeToolVerificationResult_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Connects to an SCP relay.
- *
- * Establishes a WebSocket connection to the specified relay URL using
- * `NativeRelayAdapter::connect_sourced` with `Explicit` source.
- * Remote hosts require `wss://`; plaintext `ws://` is permitted for
- * loopback addresses (`127.0.0.1`, `[::1]`, `localhost`) since
- * loopback traffic cannot be intercepted.
- *
- * # Arguments
- *
- * * `relay_url` — The URL of the SCP relay (e.g., `"wss://relay.example.com"`
- * or `"ws://127.0.0.1:9000/scp/v1"` for local development).
- *
- * # Returns
- *
- * A `TransportManager` handle for the established connection.
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if the URL scheme is not permitted
- * (remote hosts require `wss://`) or if the WebSocket connection
- * cannot be established (unreachable relay, protocol mismatch,
- * timeout, authentication failure).
- */
-public func transportConnect(relayUrl: String)async throws  -> TransportManager  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_transport_connect(FfiConverterString.lower(relayUrl)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeTransportManager_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Disconnects from the current SCP relay.
- *
- * Replaces the inner `TransportManager` with an empty builder, releasing
- * all adapter connections. After this call, the `TransportManager` reports
- * `connected: false` and `adapter_count() == 0`.
- *
- * This is idempotent — calling it when already disconnected is a no-op.
- *
- * # Arguments
- *
- * * `manager` — The `TransportManager` returned by `transport_connect`.
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if the internal lock is poisoned.
- */
-public func transportDisconnect(manager: TransportManager)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_transport_disconnect(FfiConverterTypeTransportManager_lower(manager)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Returns the current transport connection status.
- *
- * When `manager` is provided, reflects the actual connection state of that
- * handle: `connected` is `true` only if the underlying relay adapter is
- * still held by the manager.
- *
- * When `manager` is `None`, returns a stateless snapshot derived from the
- * process-wide `BridgeInstance` transport state. This mirrors the `PyO3` /
- * WASM bridges, which expose a handleless probe: callers can observe the
- * default disconnected shape (`connected: false`, `relay_url: None`,
- * `latency_ms: None`) before ever calling `transport_connect`, without
- * needing to construct a `TransportManager` handle.
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if querying the transport status fails.
- */
-public func transportStatus(manager: TransportManager?)async throws  -> TransportStatus  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_transport_status(FfiConverterOptionTypeTransportManager.lower(manager)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeTransportStatus_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
  * Creates a challenge request for capability verification.
  *
  * See ADR-017 Layer 3 (Challenge-Response).
@@ -13283,19 +14203,6 @@ public func trustCreateChallenge(targetDid: String)throws  -> ChallengeResult  {
     return try  FfiConverterTypeChallengeResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_func_trust_create_challenge(
         FfiConverterString.lower(targetDid),$0
-    )
-})
-}
-/**
- * Queries participation-based trust data for a DID within a context.
- *
- * See ADR-017 Layer 2 (Participation).
- */
-public func trustQueryScore(did: String, contextId: String)throws  -> TrustScoreResult  {
-    return try  FfiConverterTypeTrustScoreResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_trust_query_score(
-        FfiConverterString.lower(did),
-        FfiConverterString.lower(contextId),$0
     )
 })
 }
@@ -13324,185 +14231,6 @@ public func trustVerifyResponse(challengeJson: String, responseJson: String)thro
         FfiConverterString.lower(responseJson),$0
     )
 })
-}
-/**
- * Delegates a UCAN token to another member.
- *
- * Creates a delegated UCAN from an existing parent token, signed with the
- * delegator's Ed25519 key via the retained [`KeyCustody`] provider.
- * Delegation enforces attenuation (capabilities can only narrow, never widen).
- *
- * # Arguments
- *
- * * `handle` — The context the token belongs to.
- * * `delegator_did` — The DID of the entity delegating (must match parent
- * token's audience).
- * * `delegatee_did` — The DID of the entity receiving the delegation.
- * * `parent_token` — The encoded parent UCAN token (JWT format).
- * * `capabilities` — List of capability URI strings to delegate (must be
- * subset of parent's capabilities).
- *
- * # Returns
- *
- * A `UcanToken` handle with the delegated token's metadata.
- *
- * # Errors
- *
- * Returns `ScpError::Validation` if `delegator_did` or `delegatee_did` is
- * not a valid DID string (empty, exceeds 512 bytes, missing
- * `did:{method}:{id}` structure, method not lowercase alphanumeric, or
- * contains control characters), if `parent_token` is empty or contains
- * control characters, or if any capability URI in `capabilities` is empty
- * or contains control characters.
- *
- * Returns `ScpError::Permission` if delegation fails: delegator not matching
- * parent audience, capabilities wider than parent, signing failure, etc.
- *
- * See ADR-016 criterion 4.
- */
-public func ucanDelegate(handle: ContextHandle, delegatorDid: String, delegateeDid: String, parentToken: String, capabilities: [String])async throws  -> UcanToken  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_ucan_delegate(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(delegatorDid),FfiConverterString.lower(delegateeDid),FfiConverterString.lower(parentToken),FfiConverterSequenceString.lower(capabilities)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeUcanToken_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Mints a new UCAN token for a context member with real Ed25519 signing.
- *
- * Uses the context creator's key custody and active signing key
- * (retained on the context handle during `context_create`) to produce a
- * properly signed UCAN token via `scp_core::crypto::ucan::mint::mint_ucan`.
- *
- * When the `allow_in_memory_custody` feature is enabled, uses the
- * `InMemoryKeyCustody` retained on the context handle. When disabled,
- * UCAN minting requires a wired `KeyCustodyProvider` (not yet
- * implemented — returns an error).
- *
- * # Arguments
- *
- * * `handle` — The context to mint the token for (must have key custody
- * from `context_create` with an `in_memory` identity, or a wired
- * `KeyCustodyProvider`).
- * * `member_did` — The DID of the member receiving the token.
- * * `capabilities` — List of capability strings to grant (e.g.,
- * `"messages:write"`). Scoped to the context automatically.
- *
- * # Returns
- *
- * A `UcanToken` handle with the minted token's metadata and a real
- * Ed25519 signature.
- *
- * # Errors
- *
- * Returns `ScpError::Validation` if `member_did` is not a valid DID string
- * (empty, exceeds 512 bytes, missing `did:{method}:{id}` structure, method
- * not lowercase alphanumeric, or contains control characters).
- *
- * Returns `ScpError::Permission` if the context does not have key custody
- * (created from an `identity_load` handle without key material) or if
- * signing fails.
- */
-public func ucanMint(handle: ContextHandle, memberDid: String, capabilities: [String], proofs: [String]?)async throws  -> UcanToken  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_ucan_mint(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(memberDid),FfiConverterSequenceString.lower(capabilities),FfiConverterOptionSequenceString.lower(proofs)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_pointer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_pointer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_pointer,
-            liftFunc: FfiConverterTypeUcanToken_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Revokes a UCAN token using the full revocation pipeline.
- *
- * Performs the complete UCAN revocation flow from ADR-016:
- *
- * 1. **Authorization** -- Verifies the revoker is the token's issuer or the
- * context creator.
- * 2. **Local revocation** -- Adds the token CID to the context's
- * `RevocationList` (fail-closed via `RevocationPending` state).
- * 3. **Distribution** -- Logs the revocation for transport-layer broadcast.
- * 4. **Event logging** -- Appends a `TokenRevoked` event to the context's
- * Merkle event log.
- *
- * # Arguments
- *
- * * `handle` — The context the token belongs to.
- * * `token` — The full encoded JWT string of the token to revoke.
- * * `revoker_did` — The DID of the entity requesting the revocation. Must
- * be either the token's issuer or the context creator.
- *
- * # Errors
- *
- * Returns `ScpError::Permission` if revocation fails (revoker not authorized,
- * token malformed, event log append failure).
- *
- * Closes #499.
- */
-public func ucanRevoke(handle: ContextHandle, token: String, revokerDid: String)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_ucan_revoke(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(token),FfiConverterString.lower(revokerDid)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-/**
- * Validates a UCAN token for a required capability.
- *
- * Performs full validation: signature verification, time bounds checking,
- * delegation chain traversal, attenuation enforcement, nonce replay
- * detection, and capability matching.
- *
- * # Arguments
- *
- * * `handle` — The context the token is presented in.
- * * `token` — The encoded UCAN token string (JWT format).
- * * `capability` — The required capability URI (e.g.,
- * `"scp:ctx:abc123/messages:write"`).
- * * `presenting_agent_did` — Optional DID of the agent presenting the
- * token. Falls back to the token's audience field if `None`. Required
- * for ADR-016 step 5 (audience verification).
- * * `proof_tokens` — Optional list of encoded UCAN proof tokens for
- * delegation chain traversal (ADR-016 step 3).
- *
- * # Errors
- *
- * Returns `ScpError::Permission` if validation fails (malformed token,
- * invalid signature, expired, insufficient capabilities, revoked,
- * broken delegation chain).
- */
-public func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?)async throws   {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_func_ucan_validate(FfiConverterTypeContextHandle_lower(handle),FfiConverterString.lower(token),FfiConverterString.lower(capability),FfiConverterOptionString.lower(presentingAgentDid),FfiConverterOptionSequenceString.lower(proofTokens)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_void,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_void,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_void,
-            liftFunc: { $0 },
-            errorHandler: FfiConverterTypeScpError_lift
-        )
 }
 /**
  * Validates that a `ContextParams` JSON matches its template definition.
@@ -13565,124 +14293,13 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_access_key_generate() != 33152) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_access_key_restore() != 51777) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_access_key_revoke() != 45262) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_add_checkpoint_cosignature() != 55596) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_address_resolve() != 37580) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_aggregate_trust_input() != 34335) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_apply_pending_ceiling_modification() != 30477) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_bridge_create_shadow() != 23486) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_bridge_evaluate_trust() != 16710) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_bridge_register() != 24353) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_admission() != 44476) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_block_subscriber() != 14388) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_handle_key_request() != 49269) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_is_subscriber() != 30801) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_publish() != 54635) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_publish_asset() != 6271) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_publish_assets() != 6886) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_subscribe() != 51819) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_subscriber_count() != 62075) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_unblock_subscriber() != 7203) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_unsubscribe() != 49698) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_configure_relay_transport() != 38447) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_close() != 27411) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_create() != 28748) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_discover() != 49364) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_drain_events() != 18382) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_export() != 47555) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_handle_ttl_expiry() != 13868) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_import() != 61429) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_is_member() != 30898) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_join() != 30234) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_leave() != 33485) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_count() != 63824) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_dids() != 45966) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_role() != 28300) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_propose_ttl_extension() != 19380) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_reset_ttl_timer() != 64326) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_send() != 2368) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_subscribe() != 40434) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_create_governance_checkpoint() != 59622) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_discovery_create_query() != 11036) {
@@ -13694,25 +14311,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_discovery_parse_address() != 10962) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_economy_antispam_escalated_cost() != 13986) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_economy_antispam_record() != 53427) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_economy_antispam_velocity() != 49197) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_economy_auto_accept_blocked() != 190) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_economy_budget_grant() != 9813) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_economy_budget_record_spend() != 16330) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_economy_budget_remaining() != 24556) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_economy_check_policy_lock() != 11946) {
@@ -13730,109 +14329,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_economy_validate_policy_change() != 55104) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_evaluate_invitation() != 24065) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_evaluate_provenance_quality() != 60373) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_event_log_checkpoint() != 26287) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_event_log_query() != 3128) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_event_log_verify() != 52809) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_finalize_close() != 9016) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_get_economic_policy() != 48515) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_governance_approve() != 41357) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_governance_execute() != 62327) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_governance_get_proposal() != 12966) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_governance_list_proposals() != 8689) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_governance_propose() != 59163) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_governance_reject() != 9993) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_governance_withdraw() != 27430) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_handle_deregister() != 16565) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_handle_lookup() != 21005) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_handle_register() != 10372) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_attest_device() != 31559) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create() != 24164) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create_with_agent_key() != 42821) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_create_with_custody() != 22246) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_execute_custody_migration() != 41183) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_execute_recovery() != 56864) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_link_attestations() != 36081) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_load() != 36247) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_migrate() != 37096) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_resolve() != 4675) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_verify_device_attestation() != 63128) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_identity_verify_link_attestation() != 34981) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_is_local_did() != 41848) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_mcp_client_connect_sse() != 62485) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_mcp_client_connect_stdio() != 14500) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_mcp_client_disconnect() != 20983) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_mcp_client_invoke() != 33699) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_mcp_client_list_tools() != 63936) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_mcp_configure_stdio_allowlist() != 2409) {
@@ -13845,12 +14342,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_mcp_reset_stdio_allowlist() != 47824) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_mcp_server_create() != 25236) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_mcp_server_stop() != 4619) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_media_activate_session() != 44695) {
@@ -13892,42 +14383,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_metadata_record_to_json() != 58960) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_migration_state() != 55501) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_node_start_in_memory() != 46028) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_node_start_local() != 1895) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_petname_get_for_context() != 17935) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_petname_get_for_did() != 33171) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_petname_remove() != 40370) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_petname_remove_context() != 44518) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_petname_resolve_context() != 15380) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_petname_resolve_did() != 58642) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_petname_set() != 6017) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_petname_set_context() != 17277) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_provenance_attach() != 49300) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_provenance_check_chain_depth() != 15774) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13940,52 +14395,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_provenance_update_source_type() != 33504) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_register_local_did() != 129) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_relay_start_in_memory() != 43291) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_relay_start_local() != 47076) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_restore_all_contexts() != 3679) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_restore_context() != 17499) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_sandbox_check_capability() != 25855) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_sandbox_validate_declaration() != 13375) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scope_deregister() != 12310) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scope_lookup() != 16082) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scope_register() != 44834) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scp_resume() != 60140) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scp_shutdown() != 29393) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scp_suspend() != 8123) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_scpid_challenge() != 19241) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_scpid_verify() != 37844) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_set_economic_policy() != 56871) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_sync_classify_offline() != 59370) {
@@ -14000,70 +14416,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_template_get_params() != 28014) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tombstone_migrated_context() != 35616) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_interface_accept() != 52020) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_interface_expose() != 47674) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_interface_revoke() != 31068) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke() != 24933) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_invoke_cross_context() != 26371) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_register() != 20572) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_session_close() != 13245) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_session_create() != 26995) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_session_invoke() != 57907) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tool_verify() != 15916) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_transport_connect() != 52412) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_transport_disconnect() != 43896) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_transport_status() != 14919) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_create_challenge() != 37813) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_trust_query_score() != 29292) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_verify_attestation() != 50772) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_verify_response() != 47639) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_ucan_delegate() != 65101) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_ucan_mint() != 41420) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_ucan_revoke() != 55572) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_ucan_validate() != 61065) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_validate_against_template() != 37474) {
@@ -14168,16 +14527,424 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_relayhandle_shutdown() != 3484) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_access_key_generate() != 37675) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_access_key_restore() != 26636) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_access_key_revoke() != 26727) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_add_checkpoint_cosignature() != 48565) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_address_resolve() != 64098) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_aggregate_trust_input() != 37504) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_apply_pending_ceiling_modification() != 41792) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_create_shadow() != 8590) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_evaluate_trust() != 11772) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_admission() != 47745) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_block_subscriber() != 22466) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_handle_key_request() != 345) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_is_subscriber() != 4444) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_publish() != 24392) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_publish_asset() != 47050) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_publish_assets() != 39568) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_subscribe() != 57536) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_subscriber_count() != 53302) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unblock_subscriber() != 50779) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_unsubscribe() != 16701) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_configure_relay_transport() != 42668) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_close() != 41503) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_create() != 337) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_drain_events() != 50890) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_export() != 18548) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_handle_ttl_expiry() != 26613) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_import() != 9378) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_is_member() != 22393) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_join() != 13120) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_leave() != 21568) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_member_count() != 64151) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_member_dids() != 36615) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_member_role() != 16382) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_propose_ttl_extension() != 10308) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_reset_ttl_timer() != 12217) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_send() != 57249) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_subscribe() != 23938) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_create_governance_checkpoint() != 55112) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_antispam_escalated_cost() != 52575) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_antispam_record() != 61762) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_antispam_velocity() != 33490) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_budget_grant() != 43838) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_budget_record_spend() != 43139) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_economy_budget_remaining() != 32105) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_evaluate_invitation() != 59132) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_checkpoint() != 31004) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_query() != 26119) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_event_log_verify() != 36287) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_finalize_close() != 12188) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_get_economic_policy() != 8617) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_approve() != 14937) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_execute() != 38425) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_get_proposal() != 65469) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_list_proposals() != 5473) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_propose() != 46255) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_reject() != 58576) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_governance_withdraw() != 31863) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_handle_deregister() != 11124) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_handle_lookup() != 49510) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_handle_register() != 61984) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_attest_device() != 36607) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create() != 25630) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_link_attestation() != 29874) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_with_agent_key() != 20413) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_create_with_custody() != 35310) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_execute_custody_migration() != 23068) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_execute_recovery() != 41947) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_link_attestations() != 36734) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_load() != 9295) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_migrate() != 35072) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_link_attestation() != 51771) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_resolve() != 31124) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_verify_device_attestation() != 26963) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_verify_link_attestation() != 21755) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_instance_id() != 43175) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_resume() != 62509) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_is_local_did() != 10856) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_sse() != 44028) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_connect_stdio() != 2953) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_disconnect() != 63976) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_invoke() != 30137) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_list_tools() != 53196) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_configure_stdio_allowlist() != 12983) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_disable_stdio_allowlist() != 51720) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_get_stdio_allowlist() != 35396) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_reset_stdio_allowlist() != 41096) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_create() != 11371) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_stop() != 46867) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_migration_state() != 34622) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_in_memory() != 58945) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_node_start_local() != 59051) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_get_for_context() != 8149) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_get_for_did() != 18828) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_remove() != 53564) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_remove_context() != 52731) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_resolve_context() != 41910) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_resolve_did() != 32984) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_set() != 49588) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_petname_set_context() != 31078) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_provenance_attach() != 3158) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_register_local_did() != 49984) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_relay_start_in_memory() != 14458) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_relay_start_local() != 7556) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_restore_all_contexts() != 43499) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_restore_context() != 6223) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_resume() != 24128) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_scope_deregister() != 49133) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_scope_lookup() != 25010) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_scope_register() != 1713) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_scpid_sign() != 46660) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_scpid_verify() != 7728) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_set_economic_policy() != 12223) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 65387) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_suspend() != 57088) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_sync_classify_offline() != 16755) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_sync_classify_offline_custom() != 29264) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_sync_get_policy() != 7910) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tombstone_migrated_context() != 15228) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_interface_accept() != 29084) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_interface_expose() != 35947) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_interface_revoke() != 43274) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke() != 31430) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_invoke_cross_context() != 47346) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_register() != 65327) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_session_close() != 64711) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_session_create() != 1081) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_session_invoke() != 26287) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_tool_verify() != 10586) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_connect() != 45064) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_disconnect() != 45973) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_manager_status() != 45644) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_transport_status() != 20055) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 25481) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_query_score() != 20746) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_attestation() != 36949) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 16753) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_delegate() != 51192) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_mint() != 2465) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_revoke() != 34885) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_validate() != 38327) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_verify_participation_requirements() != 3735) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_adapter_count() != 31835) {
@@ -14225,10 +14992,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_token_id() != 51675) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_default_instance() != 7542) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_new() != 42429) {
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_new() != 52341) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_persistence() != 28565) {

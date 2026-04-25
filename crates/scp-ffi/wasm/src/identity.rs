@@ -993,6 +993,71 @@ impl WasmDIDDocument {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
+/// Narrows a caller-supplied `testing_seed` byte vector to a
+/// zeroize-wrapped `[u8; 32]` and zeroizes the source `Vec<u8>`
+/// before it drops.
+///
+/// The caller-supplied `testing_seed` parameter is a parity-harness
+/// affordance (ADR-046), not a production API — mirrors how the
+/// other three bridges gate `signed_at_override` behind `testing`.
+/// Production WASM bundles reject any non-None seed with
+/// `SCP-VALID-7008`; the testing build consumes the 32 bytes to drive
+/// `StdRng::from_seed` in `identity_create`. A length mismatch
+/// surfaces as `SCP-VALID-7007`.
+///
+/// Wrapping the narrowed array in `Zeroizing` ensures the seed bytes
+/// are wiped when dropped — they feed `StdRng::from_seed` below and
+/// produce the Ed25519 `#0`/`#active` private keys.
+///
+/// The function takes ownership of the source `Vec<u8>` and zeroes
+/// its heap buffer before it drops. Leaving the source un-zeroed
+/// means the original 32 seed bytes linger in the allocator's
+/// freelist until overwritten, and — because WASM linear memory is
+/// same-origin-readable from JS — any same-origin script can recover
+/// them until the memory is reused (bug-catcher + security round 2).
+/// JS callers are separately responsible for zeroing their own
+/// `Uint8Array` after calling, but this bridge should not amplify
+/// their exposure.
+fn narrow_testing_seed(
+    testing_seed: Option<Vec<u8>>,
+) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, JsValue> {
+    let Some(mut source) = testing_seed else {
+        return Ok(None);
+    };
+
+    #[cfg(feature = "testing")]
+    {
+        let narrowed = scp_ffi_common::validate::expect_fixed_bytes::<32>(&source, "testing_seed")
+            .map_err(|message| {
+                ScpWasmError::Validation {
+                    message,
+                    code: codes::VALID_7007.to_owned(),
+                }
+                .into_js()
+            })?;
+        use zeroize::Zeroize;
+        source.zeroize();
+        Ok(Some(zeroize::Zeroizing::new(narrowed)))
+    }
+
+    #[cfg(not(feature = "testing"))]
+    {
+        // Wipe the source even on the rejection path — the caller
+        // supplied bytes, we must not let them linger regardless of
+        // whether we accept them.
+        use zeroize::Zeroize;
+        source.zeroize();
+        Err(ScpWasmError::Validation {
+            message: "`testing_seed` parameter requires the `testing` feature — not available \
+                      in production WASM builds"
+                .to_owned(),
+            code: codes::VALID_7008.to_owned(),
+        }
+        .into_js()
+        .into())
+    }
+}
+
 /// Creates a new SCP identity.
 ///
 /// Generates an Ed25519 keypair using the browser's cryptographic random
@@ -1004,6 +1069,12 @@ impl WasmDIDDocument {
 ///
 /// * `custody` — The custody type string. Must be `"js_custody"` or
 ///   `"in_memory"` for browser targets.
+/// * `testing_seed` — Parity-harness affordance (ADR-046). Consumed and
+///   zeroed inside the bridge. **JS caller responsibility:** WASM
+///   linear memory is same-origin-readable from JS, so the caller's
+///   source `Uint8Array` must also be zeroed after this call returns
+///   — the bridge cannot reach through the `wasm-bindgen` boundary
+///   to wipe the JS-side buffer.
 ///
 /// # Returns
 ///
@@ -1016,7 +1087,7 @@ impl WasmDIDDocument {
 ///
 /// See ADR-022 acceptance criterion 1.
 #[wasm_bindgen]
-pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
+pub fn identity_create(custody: String, testing_seed: Option<Vec<u8>>) -> Promise {
     future_to_promise(async move {
         if custody != "js_custody" && custody != "in_memory" {
             return Err(ScpWasmError::Identity {
@@ -1030,37 +1101,13 @@ pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
             .into());
         }
 
-        // The caller-supplied `seed` parameter is a parity-harness
-        // affordance (ADR-046), not a production API — mirrors how the
-        // other three bridges gate `signed_at_override` behind
-        // `testing`. Production WASM bundles reject any non-None seed
-        // with SCP-VALID-7007; the testing build consumes the 32 bytes
-        // to drive `StdRng::from_seed` below. Note this is independent
-        // of the spec §3.2.1 two-key model, which stays unconditional:
-        // the no-seed path still derives a distinct `#active` key from
-        // `OsRng` in every build.
-        let seed_bytes: Option<[u8; 32]> = match seed.as_deref() {
-            None => None,
-            #[cfg(feature = "testing")]
-            Some(bytes) => Some(<[u8; 32]>::try_from(bytes).map_err(|_| {
-                ScpWasmError::Validation {
-                    message: format!("seed must be exactly 32 bytes, got {}", bytes.len()),
-                    code: codes::VALID_7007.to_owned(),
-                }
-                .into_js()
-            })?),
-            #[cfg(not(feature = "testing"))]
-            Some(_) => {
-                return Err(ScpWasmError::Validation {
-                    message: "`seed` parameter requires the `testing` feature — not available \
-                              in production WASM builds"
-                        .to_owned(),
-                    code: codes::VALID_7007.to_owned(),
-                }
-                .into_js()
-                .into());
-            }
-        };
+        // Narrow + zeroize-wrap `testing_seed` — gated by the `testing`
+        // feature. `narrow_testing_seed` takes ownership of the source
+        // `Vec<u8>` and zeroes its heap buffer before it drops, since
+        // WASM linear memory is same-origin-readable by JS and freed
+        // bytes stay observable until the allocator reuses them.
+        let testing_seed_bytes: Option<zeroize::Zeroizing<[u8; 32]>> =
+            narrow_testing_seed(testing_seed)?;
 
         // Per spec §3.2.1, every SCP identity has two distinct Ed25519
         // keys: `#0` (the identity key, DID-deriving, never rotates) and
@@ -1086,27 +1133,33 @@ pub fn identity_create(custody: String, seed: Option<Vec<u8>>) -> Promise {
         let (signing_key, active_signing_key_bytes): (
             ed25519_dalek::SigningKey,
             zeroize::Zeroizing<[u8; 32]>,
-        ) = seed_bytes.map_or_else(random_two_key, |s| {
-            use rand::{RngCore, SeedableRng};
-            let mut rng = rand::rngs::StdRng::from_seed(s);
-            let mut identity_key_bytes = zeroize::Zeroizing::new([0u8; 32]);
-            rng.fill_bytes(identity_key_bytes.as_mut());
-            let identity_key = ed25519_dalek::SigningKey::from_bytes(&identity_key_bytes);
-            // Consume the next 32 bytes for the distinct #active key.
-            let mut active_bytes = zeroize::Zeroizing::new([0u8; 32]);
-            rng.fill_bytes(active_bytes.as_mut());
-            (identity_key, active_bytes)
-        });
+        ) = testing_seed_bytes
+            .as_ref()
+            .map_or_else(random_two_key, |s| {
+                use rand::{RngCore, SeedableRng};
+                // Deref through `Zeroizing<[u8; 32]>` — one unavoidable
+                // by-value Copy goes into `StdRng::from_seed`, which
+                // discards it after consuming the seed. The outer
+                // wrapper is wiped at end-of-scope.
+                let mut rng = rand::rngs::StdRng::from_seed(**s);
+                let mut identity_key_bytes = zeroize::Zeroizing::new([0u8; 32]);
+                rng.fill_bytes(identity_key_bytes.as_mut());
+                let identity_key = ed25519_dalek::SigningKey::from_bytes(&identity_key_bytes);
+                // Consume the next 32 bytes for the distinct #active key.
+                let mut active_bytes = zeroize::Zeroizing::new([0u8; 32]);
+                rng.fill_bytes(active_bytes.as_mut());
+                (identity_key, active_bytes)
+            });
         #[cfg(not(feature = "testing"))]
         let (signing_key, active_signing_key_bytes): (
             ed25519_dalek::SigningKey,
             zeroize::Zeroizing<[u8; 32]>,
         ) = {
-            // `seed_bytes` is guaranteed `None` here — the testing-gate
-            // match above returns early for any `Some(_)` on non-testing
-            // builds. Silence the unused binding without disturbing the
-            // shared control flow.
-            let _ = seed_bytes;
+            // `testing_seed_bytes` is guaranteed `None` here — the
+            // testing-gate match above returns early for any `Some(_)` on
+            // non-testing builds. Silence the unused binding without
+            // disturbing the shared control flow.
+            let _ = testing_seed_bytes;
             random_two_key()
         };
         let verifying_key = signing_key.verifying_key();

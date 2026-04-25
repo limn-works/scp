@@ -184,20 +184,6 @@ jobs:
       - uses: actions/checkout@v5
       - run: bash scripts/check-no-fallback-registry.sh
 
-  # ── Test-fixture hygiene (ADR-048, #1549 Phase 4) ───────────────────────
-  # Enforces the per-test `SCP` fixture invariant: SDK tests must not
-  # route through the process-wide default bridge instance unless they
-  # carry a deliberate, reviewed `SCP-DEFAULT-INSTANCE-OK:` opt-in tag.
-  # See .docs/migration/phase-4.md § "Per-test SCP fixture" and
-  # ADR-048 §Decision 3 for the rationale and migration recipe.
-  default-in-tests:
-    needs: check-draft
-    name: FFI / no-default-in-tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - run: bash scripts/check-no-default-in-tests.sh
-
   handle-affinity:
     needs: check-draft
     name: FFI / handle-affinity check
@@ -205,6 +191,53 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: bash scripts/check-handle-affinity.sh
+
+  # ── Mutable shared process-global enforcement (ADR-048, #1549 Phase 4) ──
+  # Forward-prevention gates that forbid the DEFAULT_BRIDGE_INSTANCE pattern
+  # from creeping back in any language. Every new piece of per-system state
+  # must live on the bridge instance or the language SDK class — not in a
+  # module-level `static` / `let` / `var` / `static var` declaration.
+  #
+  # One job per language to keep failure attribution obvious.
+  no-mutable-globals-rust:
+    needs: check-draft
+    name: enforcement / no-mutable-globals (rust workspace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash scripts/check-no-mutable-globals.sh
+
+  no-mutable-globals-python:
+    needs: check-draft
+    name: enforcement / no-mutable-module-globals (python sdk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python3.12 scripts/check-no-mutable-module-globals.py
+
+  no-mutable-globals-ts:
+    needs: check-draft
+    name: enforcement / no-mutable-globals (typescript sdk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash scripts/check-no-ts-mutable-globals.sh
+
+  no-mutable-globals-kotlin:
+    needs: check-draft
+    name: enforcement / no-mutable-globals (kotlin sdk)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - run: bash scripts/check-no-kotlin-mutable-globals.sh
+
+  # Swift `no_static_var` / `no_static_lazy_var` custom rules live inside
+  # `bindings/swift/.swiftlint.yml` and are enforced by the existing
+  # `swift` job's `swiftlint --strict` step (see the Swift build matrix).
+  # This block is documentation — the gate runs elsewhere.
 
   wasm-protocol:
     needs: check-draft
@@ -775,10 +808,22 @@ jobs:
         # honored. `installDist` lays out a runnable bin script that
         # the Python harness launches directly — NOT via `gradle run`,
         # which would wire the Gradle daemon into the stdio pipe.
+        #
+        # `-Pscp.uniffi.extraFeatures=testing` threads the `testing`
+        # cargo feature through scp-kt's `generateUniffiBindings` task
+        # (see build.gradle.kts). Without it, the task's invocation of
+        # `generate-uniffi-kotlin.sh --features=allow_in_memory_custody`
+        # would re-run `cargo build -p scp-ffi-uniffi` without
+        # `testing`, overwriting the dylib we just built (line above)
+        # with both features. The parity harness drives
+        # `signed_at_override`, which is `#[cfg(feature = "testing")]`-
+        # gated — so the overwritten dylib rejects the parameter and
+        # the Kotlin job fails.
         run: |
           bindings/kotlin/gradlew \
             -p bindings/python/tests/bridge_parity/helpers/kotlin_bridge_runner \
-            installDist --no-daemon
+            installDist --no-daemon \
+            -Pscp.uniffi.extraFeatures=testing
       - name: Run parity tests (UniFFI Kotlin only)
         env:
           # JNA loads the UniFFI cdylib via the system library path.
@@ -853,8 +898,11 @@ jobs:
       - protocol-deps
       - bridge-globals
       - fallback-registry
-      - default-in-tests
       - handle-affinity
+      - no-mutable-globals-rust
+      - no-mutable-globals-python
+      - no-mutable-globals-ts
+      - no-mutable-globals-kotlin
       - wasm-protocol
       - rust-fmt
       - rust-clippy
@@ -886,8 +934,11 @@ jobs:
             "${{ needs.protocol-deps.result }}" \
             "${{ needs.bridge-globals.result }}" \
             "${{ needs.fallback-registry.result }}" \
-            "${{ needs.default-in-tests.result }}" \
             "${{ needs.handle-affinity.result }}" \
+            "${{ needs.no-mutable-globals-rust.result }}" \
+            "${{ needs.no-mutable-globals-python.result }}" \
+            "${{ needs.no-mutable-globals-ts.result }}" \
+            "${{ needs.no-mutable-globals-kotlin.result }}" \
             "${{ needs.wasm-protocol.result }}" \
             "${{ needs.rust-fmt.result }}" \
             "${{ needs.rust-clippy.result }}" \

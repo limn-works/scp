@@ -12,16 +12,18 @@
 #   crates/scp-ffi/common/src/ (shared bridge-runtime helpers)
 # must either
 #   (a) be on the explicit allowlist of process-global statics that the plan
-#       deliberately retained (DEFAULT_BRIDGE_INSTANCE, RUNTIME, HANDLE_COUNT,
+#       deliberately retained (RUNTIME, HANDLE_COUNT,
 #       SHARED_DHT_CLIENT, INSTANCE_ID_COUNTER, or a `std::sync::Once` init
 #       guard used for one-time setup like `tracing_subscriber::init`), OR
 #   (b) be grandfathered against the ratchet baseline in
 #       `ratchet/once-lock-count.json`.
 #
-# Case (b) lets the existing `EMPTY_*` fallback registries stay put for the
-# duration of the Phase 4 remainder: each one will be deleted in a subsequent
-# PR and the ratchet count will drop with it. The gate fails if the count
-# goes **up** — i.e. a new module-level static was added.
+# Case (b) previously covered the `EMPTY_*` fallback registries that existed
+# while the default-instance façade was live. Phase 4 PR 4 (#1549) deleted
+# `DEFAULT_BRIDGE_INSTANCE` along with every `EMPTY_*` registry, so the
+# ratchet now floors at zero in every bridge (see
+# `ratchet/once-lock-count.json`). The gate fails if the count goes **up** —
+# i.e. a new module-level static was added.
 #
 # Function-local `static` declarations are scanned too when their type matches
 # a process-global *sharing* primitive:
@@ -111,8 +113,12 @@ fi
 # Allowlist of module-level static NAMES that the plan deliberately retains
 # as process-global. Any other module-level static is counted against the
 # ratchet.
+#
+# `DEFAULT_BRIDGE_INSTANCE` was removed from this allowlist in Phase 4 PR 4
+# (2026-04-19) — the OnceLock itself was deleted alongside the free-function
+# façade in that PR, so any new occurrence is a regression, not a permitted
+# global.
 ALLOWLIST=(
-    DEFAULT_BRIDGE_INSTANCE
     RUNTIME
     HANDLE_COUNT
     SHARED_DHT_CLIENT

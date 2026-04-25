@@ -718,10 +718,11 @@ pub async fn resolve_broadcast_key(
         (Some(key_hex), Some(did)) => {
             let key_hex = Zeroizing::new(key_hex);
             let key_vec = Zeroizing::new(hex::decode(&*key_hex)?);
-            let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-                <[u8; 32]>::try_from(key_vec.as_slice())
-                    .map_err(|_| BroadcastKeyError::InvalidKeyLength)?,
-            );
+            let key_bytes = crate::validate::expect_fixed_bytes_zeroized::<32>(
+                key_vec.as_slice(),
+                "broadcast_key",
+            )
+            .map_err(|_| BroadcastKeyError::InvalidKeyLength)?;
             // Explicit key path always uses epoch 0. For rotated keys,
             // use auto-resolve (omit both params).
             Ok(ResolvedBroadcastKey {

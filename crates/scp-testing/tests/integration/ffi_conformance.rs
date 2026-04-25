@@ -47,6 +47,11 @@ const PYO3_TRUST: &str = include_str!("../../../../crates/scp-ffi/src/trust.rs")
 const PYO3_MCP: &str = include_str!("../../../../crates/scp-ffi/src/mcp.rs");
 const PYO3_ECONOMY: &str = include_str!("../../../../crates/scp-ffi/src/economy.rs");
 const PYO3_MEDIA: &str = include_str!("../../../../crates/scp-ffi/src/media.rs");
+// Phase 4 PR 4 migrated `fn py_foo(...)` free functions to
+// `#[pymethods] impl PyScp { pub fn foo(&self, ...) }` methods. The per-category
+// files above still contain these methods on PyScp; `scp.rs` holds the
+// lifecycle surface (new / with_storage / suspend / resume / shutdown).
+const PYO3_SCP: &str = include_str!("../../../../crates/scp-ffi/src/scp.rs");
 
 // UniFFI bridge (single file)
 const UNIFFI_BRIDGE: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
@@ -67,6 +72,10 @@ const NAPI_TRUST: &str = include_str!("../../../../crates/scp-ffi/napi/src/trust
 const NAPI_MCP: &str = include_str!("../../../../crates/scp-ffi/napi/src/mcp.rs");
 const NAPI_ECONOMY: &str = include_str!("../../../../crates/scp-ffi/napi/src/economy.rs");
 const NAPI_MEDIA: &str = include_str!("../../../../crates/scp-ffi/napi/src/media.rs");
+// Phase 4 PR 4 migrated `fn napi_foo(...)` free functions to `impl Scp { pub async fn foo(&self, ...) }`
+// methods in `scp.rs`. The per-category source files retain helpers and types,
+// but the canonical bridge surface now lives on the `Scp` struct.
+const NAPI_SCP: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp.rs");
 
 // WASM bridge sources
 const WASM_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/wasm/src/identity.rs");
@@ -511,6 +520,7 @@ fn pyo3_sources() -> Vec<&'static str> {
         PYO3_MCP,
         PYO3_ECONOMY,
         PYO3_MEDIA,
+        PYO3_SCP,
     ]
 }
 
@@ -530,6 +540,7 @@ fn napi_sources() -> Vec<&'static str> {
         NAPI_MCP,
         NAPI_ECONOMY,
         NAPI_MEDIA,
+        NAPI_SCP,
     ]
 }
 
@@ -900,16 +911,22 @@ fn uniffi_source_contains_export_markers() {
     );
 }
 
-/// Verifies NAPI source files actually contain `#[napi]` markers.
+/// Verifies NAPI source files actually contain napi-rs export markers.
+///
+/// Phase 4 PR 4 migrated free-function napi exports into `impl Scp { ... }`
+/// methods; most of those methods carry `#[napi(js_name = "...")]` instead
+/// of the bare `#[napi]` attribute. Accept both forms by counting the
+/// shared `#[napi` prefix (which covers `#[napi]`, `#[napi(...)]`,
+/// `#[napi(object)]`, etc.).
 #[test]
 fn napi_sources_contain_napi_markers() {
     let sources = napi_sources();
-    let marker_count: usize = sources.iter().map(|s| s.matches("#[napi]").count()).sum();
+    let marker_count: usize = sources.iter().map(|s| s.matches("#[napi").count()).sum();
 
-    eprintln!("NAPI #[napi] count: {marker_count}");
+    eprintln!("NAPI #[napi...] count: {marker_count}");
     assert!(
         marker_count >= 30,
-        "Expected at least 30 #[napi] markers, found {marker_count}"
+        "Expected at least 30 #[napi...] markers, found {marker_count}"
     );
 }
 

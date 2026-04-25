@@ -380,6 +380,26 @@ pub struct CoreFields {
     /// `cancel.cancelled()` alongside their usual work.
     cancel: CancellationToken,
 
+    /// Cancellation signal scoped to the **current reconnect generation**
+    /// — fired on [`suspend`] and [`shutdown`] so any in-flight
+    /// [`reconnect_transport_if_pending`] dial can drop its
+    /// half-connected socket instead of completing against a torn-down
+    /// instance (#1696).
+    ///
+    /// Rotated (old one cancelled, fresh one installed) on each
+    /// `suspend()`. [`reconnect_transport_if_pending`] clones the token
+    /// once at entry and races each `NativeRelayAdapter::connect_sourced`
+    /// against `token.cancelled()`. If suspend fires mid-dial, the
+    /// `.await` resolves with the cancellation branch and the pending
+    /// adapter future is dropped — the TCP/TLS socket teardown happens
+    /// inside the adapter's own state machine rather than leaking out as
+    /// an unowned `NativeRelayAdapter`.
+    ///
+    /// Wrapped in `Mutex` (not `RwLock`) because writes dominate the
+    /// access pattern during `suspend()` and reads are cheap (a
+    /// single `clone()` at the top of `reconnect_transport_if_pending`).
+    reconnect_cancel: Mutex<CancellationToken>,
+
     /// In-flight async tasks owned by this instance. Accessed from async
     /// contexts, so wrapped in [`tokio::sync::Mutex`] rather than
     /// [`std::sync::Mutex`] (guards cross `.await` points during shutdown
@@ -451,6 +471,7 @@ impl CoreFields {
             relay_urls: Mutex::new(HashSet::new()),
             instance_id: next_instance_id(),
             cancel: CancellationToken::new(),
+            reconnect_cancel: Mutex::new(CancellationToken::new()),
             tasks: AsyncMutex::new(JoinSet::new()),
             petname_maps: Mutex::new(HashMap::new()),
             handle_registries: Mutex::new(HashMap::new()),
@@ -529,6 +550,7 @@ impl CoreFields {
             relay_urls: Mutex::new(HashSet::new()),
             instance_id: next_instance_id(),
             cancel: CancellationToken::new(),
+            reconnect_cancel: Mutex::new(CancellationToken::new()),
             tasks: AsyncMutex::new(JoinSet::new()),
             petname_maps: Mutex::new(HashMap::new()),
             handle_registries: Mutex::new(HashMap::new()),
@@ -573,6 +595,58 @@ impl CoreFields {
     /// ```
     pub async fn task_handle(&self) -> tokio::sync::MutexGuard<'_, JoinSet<()>> {
         self.tasks.lock().await
+    }
+
+    /// Emergency, non-blocking task cancellation for use from `Drop`.
+    ///
+    /// Drop must never block or `.await`, so the graceful
+    /// [`shutdown_core_async`] path is unavailable. This helper does the
+    /// minimum safe cleanup:
+    ///
+    /// 1. Fires [`CancellationToken::cancel`] so any task `select!`ing on
+    ///    `cancel_token()` exits cooperatively.
+    /// 2. Attempts `JoinSet::abort_all` via a non-blocking `try_lock`. If
+    ///    the lock is contended (some caller is mid-shutdown holding the
+    ///    `JoinSet`), the abort is skipped — that caller will abort
+    ///    anything outstanding itself, so there is nothing to do here.
+    ///
+    /// This is intentionally a best-effort emergency path. Callers that
+    /// need deterministic, awaited shutdown MUST still call
+    /// [`BridgeInstanceCore::shutdown`] with a timeout; `Drop` only catches
+    /// the case where a caller dropped the bridge without ever awaiting
+    /// `shutdown(timeout)` and would otherwise leak subscriptions, timers,
+    /// and their captured `Arc<BridgeInstance>` references forever.
+    ///
+    /// # Cancellation propagation
+    ///
+    /// Tasks that hold a cloned `Arc<BridgeInstanceCore>` (or a concrete
+    /// `Arc<NapiBridgeInstance>`, etc.) via capture will NOT be freed by
+    /// token cancellation alone — the capture itself is what keeps the
+    /// `Arc` live. They must honour the token by dropping their state
+    /// once cancellation fires. `JoinSet::abort_all` is the hard guarantee:
+    /// it cancels the task at the next `.await` point regardless of
+    /// cooperation, which drops the captured `Arc` and permits the
+    /// instance's final `Drop` to complete. Missing the lock here means
+    /// we fall back to cooperative-only cancellation, which is strictly
+    /// better than doing nothing.
+    ///
+    /// See ADR-048 (multi-instance SCP) for the full lifecycle contract.
+    pub fn emergency_cancel_tasks(&self) {
+        // Step 1: cooperative signal. Cheap, always safe.
+        self.cancel.cancel();
+        // Also cancel the reconnect-generation token so any in-flight
+        // dial drops its half-open socket instead of completing against
+        // a torn-down instance (mirrors the sync `shutdown()` path).
+        if let Ok(guard) = self.reconnect_cancel.lock() {
+            guard.cancel();
+        }
+        // Step 2: hard signal. `try_lock` is non-blocking — if another
+        // caller holds the JoinSet mid-shutdown, skip the abort rather
+        // than risk deadlocking `Drop`. `abort_all` itself is a no-op
+        // when the set is empty or every task has already finished.
+        if let Ok(mut set) = self.tasks.try_lock() {
+            set.abort_all();
+        }
     }
 
     /// Checks that the supplied handle was issued by this instance.
@@ -821,6 +895,13 @@ impl CoreFields {
         // Set flag FIRST to prevent new operations from starting between
         // flag check and transport teardown.
         self.suspended.store(true, Ordering::SeqCst);
+        // #1696: cancel the current reconnect-generation token so any
+        // in-flight `reconnect_transport_if_pending` dial wakes on the
+        // cancellation branch and drops its half-connected adapter
+        // instead of completing against a torn-down instance. Rotate to
+        // a fresh token so a later `resume()` gets a clean cancellation
+        // scope rather than inheriting the already-cancelled one.
+        self.rotate_reconnect_cancel();
         // Flush all context snapshots before disconnecting transport.
         // Best-effort: errors are logged inside flush_all_contexts_sync and do
         // not prevent suspension from completing. Skipped if the
@@ -837,6 +918,40 @@ impl CoreFields {
         }
         tracing::debug!("bridge instance suspended");
         Ok(())
+    }
+
+    /// Cancels the current reconnect-generation token and installs a
+    /// fresh one in its place (#1696).
+    ///
+    /// Lock is held only briefly — the cancellation itself is
+    /// non-blocking (`CancellationToken::cancel()` is a relaxed
+    /// `AtomicUsize` flip plus waker notification) and `take` +
+    /// assignment are cheap.
+    fn rotate_reconnect_cancel(&self) {
+        let Ok(mut guard) = self.reconnect_cancel.lock() else {
+            // Poisoned mutex — the previous holder panicked. Log and
+            // move on; the stale token will still be cancelled (we can
+            // still signal cancellation through a poisoned lock via
+            // `PoisonError::into_inner`), but rotation is best-effort.
+            tracing::warn!(
+                "reconnect_cancel mutex poisoned — the stale token will remain; \
+                 a subsequent resume() will fire against it"
+            );
+            return;
+        };
+        let old = std::mem::replace(&mut *guard, CancellationToken::new());
+        old.cancel();
+    }
+
+    /// Returns a clone of the current reconnect-generation cancellation
+    /// token (#1696). Callers select on this alongside their dial future
+    /// so `suspend()` / `shutdown()` can drop half-connected sockets.
+    #[must_use]
+    pub fn reconnect_cancel_token(&self) -> CancellationToken {
+        self.reconnect_cancel.lock().map_or_else(
+            |poisoned| poisoned.into_inner().clone(),
+            |guard| guard.clone(),
+        )
     }
 
     /// Resumes a suspended bridge instance.
@@ -907,6 +1022,13 @@ impl CoreFields {
         // are not drained here — the sync variant cannot await. Callers
         // that need a bounded wait use `shutdown_core_async`.
         self.cancel.cancel();
+        // #1696: also cancel any in-flight reconnect dial so its socket
+        // teardown fires before the instance is considered dropped.
+        // Rotation is unnecessary during shutdown (no resume will
+        // follow), so a plain cancel is enough.
+        if let Ok(guard) = self.reconnect_cancel.lock() {
+            guard.cancel();
+        }
         self.blocking_run_shutdown_side_effects();
     }
 
@@ -1111,6 +1233,17 @@ impl CoreFields {
     /// that failed plus a redacted reason. Shutdown state short-circuits
     /// with [`LifecycleError::AlreadyShutDown`] rather than attempting
     /// reconnects against a torn-down instance.
+    ///
+    /// When reconnect was cancelled by a concurrent `suspend()` /
+    /// `shutdown()`, the `reason` field explicitly states "suspended
+    /// during reconnect" (empty `url`) so callers can distinguish a
+    /// suspend race from a dial / TLS / handshake failure. Non-cancel
+    /// failures carry the underlying connect error verbatim.
+    // Line-count waiver: dial spawn + cancel-aware collect + deterministic
+    // install phase form a single atomic operation. Splitting it across
+    // helpers (simplifier #1) lost the linear reading of the suspend/cancel
+    // invariants — keep it inline instead.
+    #[allow(clippy::too_many_lines)]
     pub async fn reconnect_transport_if_pending(&self) -> Result<(), LifecycleError> {
         if self.is_shutdown() {
             return Err(LifecycleError::AlreadyShutDown);
@@ -1119,6 +1252,14 @@ impl CoreFields {
         if urls.is_empty() {
             return Ok(());
         }
+        // #1696: snapshot the current reconnect-generation cancellation
+        // token once, at entry, and race every dial against it. If
+        // `suspend()` fires mid-dial, `token.cancelled()` wakes and we
+        // abort the whole reconnect — any in-flight
+        // `NativeRelayAdapter::connect_sourced` future is dropped, so
+        // its socket teardown happens before we return instead of
+        // leaking an unowned adapter.
+        let cancel = self.reconnect_cancel_token();
         let profile = scp_transport::profile::TransportProfile::platform_default();
         // Build ONE TransportManager and register every successful adapter
         // in it. `TransportManager::new(adapter)` creates a manager with a
@@ -1164,25 +1305,78 @@ impl CoreFields {
                 (url_for_task, outcome)
             });
         }
-        // Collect every result. Sort by URL before registering adapters so
-        // the adapter ordering inside `TransportManager` is deterministic
-        // regardless of network-timing jitter across the spawned tasks.
+        // Collect every result, racing against the reconnect-generation
+        // cancel token. If `suspend()` / `shutdown()` fires while dials are
+        // outstanding, abort the whole set so in-flight
+        // `NativeRelayAdapter::connect_sourced` futures are dropped and
+        // their partial sockets torn down (#1696) rather than ending up
+        // as unowned `NativeRelayAdapter` instances.
         let mut results: Vec<(String, Result<_, _>)> = Vec::new();
-        while let Some(joined) = join_set.join_next().await {
-            match joined {
-                Ok(pair) => results.push(pair),
-                Err(join_err) => {
-                    tracing::warn!(
-                        error = %join_err,
-                        "reconnect_transport_if_pending: spawned task panicked — \
-                         ignoring this URL for this reconnect cycle"
+        // Track the first panic so callers don't see a silent success when
+        // every spawned dial task panicked (leaving `results` empty).
+        // Without this, the install phase below would return `Ok(())`
+        // despite no adapters being installed — a split-brain where
+        // `resume()` reports success but transport is broken.
+        let mut first_panic_failure: Option<LifecycleError> = None;
+        // Separate boolean so the partial-success log emission downstream
+        // can flag `panicked = true` without having to parse
+        // `first_failure`'s reason string. Used for log-based alerting
+        // (bug-catcher L1): a panic inside a `tokio::spawn` is a defect,
+        // not an expected dial failure, and should page.
+        let mut any_task_panicked = false;
+        loop {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    tracing::debug!(
+                        "reconnect_transport_if_pending: cancelled mid-dial — aborting in-flight connects"
                     );
+                    join_set.abort_all();
+                    while join_set.join_next().await.is_some() {}
+                    return Err(LifecycleError::ReconnectFailed {
+                        url: String::new(),
+                        reason:
+                            "reconnect suspended during reconnect — caller invoked suspend()/shutdown() while dials were in flight"
+                                .to_owned(),
+                    });
+                }
+                next = join_set.join_next() => {
+                    match next {
+                        None => break,
+                        Some(Ok(pair)) => results.push(pair),
+                        Some(Err(join_err)) => {
+                            any_task_panicked = true;
+                            tracing::warn!(
+                                error = %join_err,
+                                "reconnect_transport_if_pending: spawned task panicked — \
+                                 ignoring this URL for this reconnect cycle"
+                            );
+                            if first_panic_failure.is_none() {
+                                first_panic_failure = Some(LifecycleError::ReconnectFailed {
+                                    url: String::new(),
+                                    reason: format!(
+                                        "spawned reconnect task panicked: {join_err}"
+                                    ),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
+        // --- install phase (re-inlined from the previous
+        // `install_reconnected_adapters` helper so the suspend/cancel
+        // invariants read linearly alongside the dial phase) ---
+        //
+        // Sort by URL before registering adapters so the adapter ordering
+        // inside `TransportManager` is deterministic regardless of
+        // network-timing jitter across the spawned tasks.
         results.sort_by(|a, b| a.0.cmp(&b.0));
         let mut manager = scp_transport::TransportManager::builder();
-        let mut first_failure: Option<LifecycleError> = None;
+        // Seed `first_failure` with any panic the outer loop captured so
+        // a silent-success path can't swallow the case where every
+        // spawned task panicked (empty `results`, no per-URL failure).
+        let mut first_failure: Option<LifecycleError> = first_panic_failure;
         let mut connected_count = 0_usize;
         for (url, outcome) in results {
             match outcome {
@@ -1208,23 +1402,90 @@ impl CoreFields {
                 }
             }
         }
+        // #1696: one more cancellation check between the dial loop and
+        // `set_transport`. If suspend fired *after* the last successful
+        // dial but *before* we install the manager, installing it now
+        // would immediately fail the suspended-state guard — but more
+        // importantly, the adapters we just connected belong to a
+        // cancelled generation and should be dropped rather than
+        // installed.
+        if cancel.is_cancelled() {
+            tracing::debug!(
+                "reconnect_transport_if_pending: cancelled before set_transport — dropping {connected_count} connected adapter(s)"
+            );
+            // `manager` (and its adapters) are dropped at the end of
+            // this block. Each adapter's Drop fires `cover_traffic_cancel`
+            // and `heartbeat_cancel`, and the relay client's background
+            // tasks exit — so the socket closes cleanly rather than
+            // leaking.
+            drop(manager);
+            return Err(LifecycleError::ReconnectFailed {
+                url: String::new(),
+                reason:
+                    "reconnect suspended during reconnect — caller invoked suspend()/shutdown() before install"
+                        .to_owned(),
+            });
+        }
         // Only install the manager if at least one adapter is registered —
         // installing an empty manager would make later relay operations fail
         // with a confusing "no adapters" error instead of the clearer
         // "reconnect failed" we surface below.
-        if connected_count > 0
-            && let Err(e) = self.set_transport(Arc::new(manager))
-        {
-            tracing::warn!(
-                error = %e,
-                "reconnect_transport_if_pending: set_transport failed after successful reconnects"
-            );
-            if first_failure.is_none() {
-                first_failure = Some(LifecycleError::ReconnectFailed {
-                    url: String::new(),
-                    reason: e.to_string(),
-                });
+        let install_failed = if connected_count > 0 {
+            if let Err(e) = self.set_transport(Arc::new(manager)) {
+                tracing::warn!(
+                    error = %e,
+                    "reconnect_transport_if_pending: set_transport failed after successful reconnects"
+                );
+                if first_failure.is_none() {
+                    first_failure = Some(LifecycleError::ReconnectFailed {
+                        url: String::new(),
+                        reason: e.to_string(),
+                    });
+                }
+                true
+            } else {
+                false
             }
+        } else {
+            // No adapters connected — nothing installed, no install failure
+            // to distinguish from dial/panic failures.
+            false
+        };
+        // If at least one adapter actually landed in the transport manager,
+        // report success: the caller would otherwise see `Err` but observe
+        // a working transport, and a retry would duplicate the already-open
+        // sockets. A panic inside a spawned reconnect task is a real defect
+        // (uncaught `unwrap`, assertion failure, OOM) and is promoted to
+        // `tracing::error!` with a structured `panicked` field so log-based
+        // alerting can page on it. Plain per-URL dial failures (network
+        // refused, timeout) stay at `tracing::warn!` — those are routine
+        // and recoverable on the next reconnect cycle. If `set_transport`
+        // itself failed, we keep the error so the caller can distinguish
+        // "nothing landed" from "transport live with some losses".
+        if connected_count > 0 && !install_failed {
+            if let Some(err) = first_failure.as_ref() {
+                if any_task_panicked {
+                    tracing::error!(
+                        error = %err,
+                        connected_count,
+                        panicked = true,
+                        "reconnect_transport_if_pending: partial success — transport installed \
+                         with {connected_count} adapter(s); at least one reconnect task \
+                         PANICKED — investigate the backtrace, the bridge is usable but a \
+                         reconnect path is throwing"
+                    );
+                } else {
+                    tracing::warn!(
+                        error = %err,
+                        connected_count,
+                        panicked = false,
+                        "reconnect_transport_if_pending: partial success — transport installed \
+                         with {connected_count} adapter(s); some dials failed but the bridge \
+                         is usable"
+                    );
+                }
+            }
+            return Ok(());
         }
         first_failure.map_or(Ok(()), Err)
     }
@@ -1714,6 +1975,12 @@ impl CoreFields {
 
         // Signal cooperating tasks to exit. Cheap and idempotent.
         self.cancel.cancel();
+        // #1696: cancel any in-flight reconnect dial so its socket
+        // teardown fires before shutdown completes. Matches the sync
+        // `shutdown()` path.
+        if let Ok(guard) = self.reconnect_cancel.lock() {
+            guard.cancel();
+        }
 
         let start = std::time::Instant::now();
         let outcome = drain_under_deadline(&self.tasks, timeout, start).await;
@@ -3364,6 +3631,121 @@ mod tests {
         assert!(
             matches!(result, Err(LifecycleError::AlreadyShutDown)),
             "shutdown must short-circuit with AlreadyShutDown, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn suspend_cancels_in_flight_reconnect_dial() {
+        // #1696 regression: a `suspend()` firing while
+        // `reconnect_transport_if_pending` is mid-dial must cancel the
+        // reconnect so the half-connected adapter is dropped before
+        // `NativeRelayAdapter` construction completes — preventing the
+        // socket leak that motivated #1696. We can't directly observe
+        // an OS-level socket handle in a unit test, but we can prove
+        // the cancellation path fires and aborts the loop: the dial
+        // target is unreachable so the future is "in-flight" until
+        // connect timeout, giving us a window to cancel.
+        use std::time::Duration;
+
+        let instance =
+            std::sync::Arc::new(CoreFields::with_context_manager(test_context_manager()));
+        // Reserved TEST-NET-1 address (RFC 5737) with a closed port —
+        // `connect_sourced` stalls until the profile's handshake timeout.
+        let unreachable = "ws://192.0.2.1:1/".to_owned();
+        instance.add_relay_url(unreachable.clone());
+
+        let instance_clone = std::sync::Arc::clone(&instance);
+        let reconnect_handle =
+            tokio::spawn(async move { instance_clone.reconnect_transport_if_pending().await });
+
+        // Give the reconnect a moment to enter the dial. Spawn order
+        // does not guarantee the future has polled through `.await`
+        // yet, so sleep a short tick before firing suspend.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Fire suspend — rotates the reconnect-cancel token and
+        // cancels the in-flight dial.
+        instance.suspend().unwrap();
+
+        // The reconnect must wake on cancellation promptly — with a
+        // generous upper bound to tolerate slow CI runners. The
+        // production handshake timeout would be on the order of
+        // seconds, so anything inside ~1s proves the cancellation
+        // actually fired rather than the dial naturally timing out.
+        let reconnect_result = tokio::time::timeout(Duration::from_secs(2), reconnect_handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            matches!(
+                reconnect_result,
+                Err(LifecycleError::ReconnectFailed { .. })
+            ),
+            "cancelled reconnect must surface as ReconnectFailed, got {reconnect_result:?}"
+        );
+        assert!(
+            !instance.has_transport(),
+            "suspend must leave transport cleared after the cancelled reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_in_flight_reconnect_dial() {
+        // #1696: `shutdown()` must also cancel a pending reconnect.
+        // Same dynamics as the suspend variant — uses the same TEST-NET-1
+        // unreachable target to keep the dial in-flight.
+        use std::time::Duration;
+
+        let instance =
+            std::sync::Arc::new(CoreFields::with_context_manager(test_context_manager()));
+        let unreachable = "ws://192.0.2.1:1/".to_owned();
+        instance.add_relay_url(unreachable);
+
+        let instance_clone = std::sync::Arc::clone(&instance);
+        let reconnect_handle =
+            tokio::spawn(async move { instance_clone.reconnect_transport_if_pending().await });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        instance.shutdown();
+
+        let reconnect_result = tokio::time::timeout(Duration::from_secs(2), reconnect_handle)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            matches!(
+                reconnect_result,
+                Err(LifecycleError::ReconnectFailed { .. })
+            ),
+            "cancelled reconnect must surface as ReconnectFailed, got {reconnect_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn suspend_rotates_reconnect_cancel_token() {
+        // #1696: the reconnect-cancel token must be rotated on every
+        // suspend so subsequent resume cycles get a fresh cancellation
+        // scope rather than inheriting an already-cancelled one. Without
+        // rotation, every reconnect after the first suspend would short-
+        // circuit on the cancellation branch.
+        let instance = CoreFields::with_context_manager(test_context_manager());
+        let token_before = instance.reconnect_cancel_token();
+        assert!(!token_before.is_cancelled());
+
+        instance.suspend().unwrap();
+
+        // Old token must be cancelled — any in-flight reconnect sees it.
+        assert!(
+            token_before.is_cancelled(),
+            "suspend must cancel the previous reconnect token"
+        );
+        // New token must be fresh — future reconnects aren't pre-cancelled.
+        let token_after = instance.reconnect_cancel_token();
+        assert!(
+            !token_after.is_cancelled(),
+            "suspend must install a fresh reconnect-cancel token"
         );
     }
 

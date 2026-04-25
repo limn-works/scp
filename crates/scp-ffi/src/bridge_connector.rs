@@ -1,35 +1,46 @@
 //! `PyO3` bridge functions for the bridge connector module.
 //!
-//! Exposes SCP bridge connector operations to Python:
+//! Exposes SCP bridge connector operations to Python. Stateful operations are
+//! methods on the `SCP` class; pure helpers remain as free `#[pyfunction]` exports.
+//!
+//! Pure helpers (no bridge state):
 //!
 //! - [`py_bridge_register`] -- Register a bridge connector with a context.
 //! - [`py_bridge_evaluate_trust`] -- Evaluate trust level for a bridge action.
-//! - [`py_bridge_create_shadow`] -- Create a shadow identity.
 //! - [`py_bridge_claim_shadow`] -- Claim a shadow identity via identity attestation.
 //! - [`py_bridge_seal_shadow_envelope`] -- Seal a sender-key-encrypted envelope.
 //! - [`py_bridge_open_shadow_envelope`] -- Open a sender-key-encrypted envelope.
 //! - [`py_bridge_derive_credential_key`] -- Derive a per-bridge credential encryption key.
 //! - [`py_bridge_generate_credential_key`] -- Generate a random bridge credential key.
-//! - [`py_bridge_credential_provision`] -- Provision (store) an encrypted credential.
-//! - [`py_bridge_credential_retrieve`] -- Retrieve and decrypt a credential.
-//! - [`py_bridge_credential_rotate`] -- Rotate (replace) a credential.
-//! - [`py_bridge_credential_revoke`] -- Revoke all credentials for a bridge.
-//! - [`py_bridge_credential_list`] -- List credential types for a bridge.
-//! - [`py_bridge_credential_store_key`] -- Store a bridge credential key.
-//! - [`py_bridge_credential_get_key`] -- Retrieve a bridge credential key.
-//! - [`py_bridge_credential_delete_key`] -- Delete a bridge credential key.
 //! - [`py_bridge_oauth_generate_pkce`] -- Generate a PKCE S256 challenge pair.
 //! - [`py_bridge_oauth_build_auth_url`] -- Build an OAuth 2.0 authorization URL.
 //! - [`py_bridge_oauth_scopes_for_mode`] -- Get recommended scopes for a bridge mode.
+//!
+//! `SCP` methods (bridge-state accessors):
+//!
+//! - `PyScp::bridge_create_shadow` -- Create a shadow identity (uses `bridge_state`).
+//! - `PyScp::bridge_credential_provision` -- Provision (store) an encrypted credential.
+//! - `PyScp::bridge_credential_retrieve` -- Retrieve and decrypt a credential.
+//! - `PyScp::bridge_credential_rotate` -- Rotate (replace) a credential.
+//! - `PyScp::bridge_credential_revoke` -- Revoke all credentials for a bridge.
+//! - `PyScp::bridge_credential_list` -- List credential types for a bridge.
+//! - `PyScp::bridge_credential_store_key` -- Store a bridge credential key.
+//! - `PyScp::bridge_credential_get_key` -- Retrieve a bridge credential key.
+//! - `PyScp::bridge_credential_delete_key` -- Delete a bridge credential key.
+//!
+//! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
+//! methods in Phase 4 PR 4 sub-slice E (#1549).
 //!
 //! See spec section 12 (Bridge System), section 12.11 (Credential Lifecycle),
 //! and ADR-023.
 
 use scp_ffi_common::error_codes as codes;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+
+use crate::runtime::PyBridgeInstance;
 
 use scp_core::bridge::claiming::{ClaimRequest, claim_shadow};
 use scp_core::bridge::credentials::{
@@ -60,31 +71,21 @@ use zeroize::Zeroizing;
 use crate::error::ScpPyError;
 
 // ---------------------------------------------------------------------------
-// Credential store — resolved via default PyBridgeInstance (commit 5)
+// Credential store — resolved via explicit PyBridgeInstance
 // ---------------------------------------------------------------------------
 
-/// Fallback empty credential store for when the default `PyBridgeInstance`
-/// has not been initialized yet. Mirrors the `EMPTY_FFI_BRIDGE_STATE`
-/// fallback pattern.
-static EMPTY_CREDENTIAL_STORE: OnceLock<Arc<InMemoryCredentialStore>> = OnceLock::new();
-
-/// Returns a reference to the default bridge instance's credential store.
+/// Returns a reference to the given bridge instance's credential store.
 ///
 /// Migrated from a process-global `OnceLock<InMemoryCredentialStore>` onto
 /// the typed `credential_store` field on
 /// [`crate::runtime::PyBridgeInstance`] in #1549 Phase 4 PR 2 commit 5.
-/// Falls back to a fresh empty store when the default instance has not been
-/// initialized yet.
 ///
 /// The returned [`Arc<InMemoryCredentialStore>`] is the same instance the
 /// `PyBridgeInstance` holds — `InMemoryCredentialStore` is thread-safe via
 /// internal `tokio::sync::RwLock`. Production deployments should replace
 /// this with a `Storage`-backed implementation when it lands (spec §12.11.2).
-fn credential_store() -> &'static Arc<InMemoryCredentialStore> {
-    crate::runtime::bridge_instance_raw().map_or_else(
-        || EMPTY_CREDENTIAL_STORE.get_or_init(|| Arc::new(InMemoryCredentialStore::new())),
-        |bi| bi.credential_store(),
-    )
+const fn credential_store_for(bi: &PyBridgeInstance) -> &Arc<InMemoryCredentialStore> {
+    bi.credential_store()
 }
 
 // ---------------------------------------------------------------------------
@@ -166,10 +167,11 @@ pub fn py_bridge_register(
 
     let parsed_platform_key = platform_key
         .map(|k| {
-            <[u8; 32]>::try_from(k.as_slice()).map_err(|_| ScpPyError::ValidationError {
-                message: format!("platform_key must be exactly 32 bytes, got {}", k.len()),
-                code: codes::VALID_7052.to_string(),
-            })
+            scp_ffi_common::validate::expect_fixed_bytes::<32>(k.as_slice(), "platform_key")
+                .map_err(|msg| ScpPyError::ValidationError {
+                    message: msg,
+                    code: codes::VALID_7052.to_string(),
+                })
         })
         .transpose()?;
 
@@ -319,10 +321,8 @@ pub fn py_bridge_evaluate_trust(
 /// # Errors
 ///
 /// Raises `ValidationError` if `bridge_mode` is invalid or shadow creation fails.
-#[pyfunction]
-#[pyo3(name = "bridge_create_shadow")]
-#[pyo3(signature = (bridge_id, platform_handle, bridge_mode, context_id="ctx-shadow"))]
-pub fn py_bridge_create_shadow(
+fn bridge_create_shadow_impl(
+    bi: &PyBridgeInstance,
     py: Python<'_>,
     bridge_id: &str,
     platform_handle: &str,
@@ -342,7 +342,6 @@ pub fn py_bridge_create_shadow(
         timestamp: 0,
     };
 
-    let bi = crate::runtime::bridge_instance()?;
     let mut entry = bi
         .core
         .bridge_state()
@@ -566,20 +565,18 @@ pub fn py_bridge_seal_shadow_envelope(
 
     let mode = parse_bridge_mode(bridge_mode)?;
 
-    // Wrap raw key material in Zeroizing to prevent lingering in freed heap
-    // memory after the Vec is dropped (defense-in-depth for FFI boundary).
+    // Narrow-and-zeroize the raw key material via the shared helper. The
+    // returned `Zeroizing<[u8; 32]>` is overwritten on drop (zeroize
+    // defense-in-depth for FFI boundary — ADR-006 / §5.12.3.1).
     let sender_key_bytes = Zeroizing::new(sender_key_bytes);
-    let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-        <[u8; 32]>::try_from(sender_key_bytes.as_slice()).map_err(|_| {
-            ScpPyError::ValidationError {
-                message: format!(
-                    "sender_key_bytes must be exactly 32 bytes, got {}",
-                    sender_key_bytes.len()
-                ),
-                code: codes::VALID_7054.to_string(),
-            }
-        })?,
-    );
+    let key_bytes = scp_ffi_common::validate::expect_fixed_bytes_zeroized::<32>(
+        sender_key_bytes.as_slice(),
+        "sender_key_bytes",
+    )
+    .map_err(|msg| ScpPyError::ValidationError {
+        message: msg,
+        code: codes::VALID_7054.to_string(),
+    })?;
     let sender_key = SenderKey::from_bytes(*key_bytes);
 
     let status = match provenance_status.as_deref() {
@@ -687,20 +684,18 @@ pub fn py_bridge_open_shadow_envelope(
             code: codes::VALID_7056.to_string(),
         })?;
 
-    // Wrap raw key material in Zeroizing to prevent lingering in freed heap
-    // memory after the Vec is dropped (defense-in-depth for FFI boundary).
+    // Narrow-and-zeroize the raw key material via the shared helper. The
+    // returned `Zeroizing<[u8; 32]>` is overwritten on drop (zeroize
+    // defense-in-depth for FFI boundary — ADR-006 / §5.12.3.1).
     let sender_key_bytes = Zeroizing::new(sender_key_bytes);
-    let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-        <[u8; 32]>::try_from(sender_key_bytes.as_slice()).map_err(|_| {
-            ScpPyError::ValidationError {
-                message: format!(
-                    "sender_key_bytes must be exactly 32 bytes, got {}",
-                    sender_key_bytes.len()
-                ),
-                code: codes::VALID_7054.to_string(),
-            }
-        })?,
-    );
+    let key_bytes = scp_ffi_common::validate::expect_fixed_bytes_zeroized::<32>(
+        sender_key_bytes.as_slice(),
+        "sender_key_bytes",
+    )
+    .map_err(|msg| ScpPyError::ValidationError {
+        message: msg,
+        code: codes::VALID_7054.to_string(),
+    })?;
     let sender_key = SenderKey::from_bytes(*key_bytes);
 
     // Evaluate bridge provenance trust level before decryption (§12.5).
@@ -756,17 +751,14 @@ pub fn py_bridge_derive_credential_key(
     bridge_id: &str,
 ) -> PyResult<Vec<u8>> {
     let bridge_credential_key = Zeroizing::new(bridge_credential_key);
-    let key_bytes: Zeroizing<[u8; 32]> = Zeroizing::new(
-        <[u8; 32]>::try_from(bridge_credential_key.as_slice()).map_err(|_| {
-            ScpPyError::ValidationError {
-                message: format!(
-                    "bridge_credential_key must be exactly 32 bytes, got {}",
-                    bridge_credential_key.len()
-                ),
-                code: codes::VALID_7057.to_string(),
-            }
-        })?,
-    );
+    let key_bytes = scp_ffi_common::validate::expect_fixed_bytes_zeroized::<32>(
+        bridge_credential_key.as_slice(),
+        "bridge_credential_key",
+    )
+    .map_err(|msg| ScpPyError::ValidationError {
+        message: msg,
+        code: codes::VALID_7057.to_string(),
+    })?;
 
     let derived =
         derive_credential_key(&key_bytes, bridge_id).map_err(|e| ScpPyError::CryptoError {
@@ -828,23 +820,22 @@ pub fn py_bridge_generate_credential_key() -> Vec<u8> {
 /// Raises `ContextError` if a credential of the same type already exists
 /// (use rotate to replace).
 /// Raises `CryptoError` if encryption fails.
-#[pyfunction]
-#[pyo3(name = "bridge_credential_provision")]
-pub fn py_bridge_credential_provision(
+fn bridge_credential_provision_impl(
+    bi: &PyBridgeInstance,
     py: Python<'_>,
     bridge_id: &str,
     credential_type: &str,
-    plaintext: Vec<u8>,
-    bridge_credential_key: Vec<u8>,
+    plaintext: &[u8],
+    bridge_credential_key: &[u8],
 ) -> PyResult<Py<PyDict>> {
     let ct = parse_credential_type(credential_type)?;
-    let key_bytes = parse_credential_key_bytes(&bridge_credential_key)?;
+    let key_bytes = parse_credential_key_bytes(bridge_credential_key)?;
 
     let rt = crate::runtime()?;
-    let store = credential_store();
+    let store = credential_store_for(bi);
 
     let credential = rt
-        .block_on(store.provision(bridge_id, ct, &plaintext, &key_bytes))
+        .block_on(store.provision(bridge_id, ct, plaintext, &key_bytes))
         .map_err(|e| ScpPyError::ContextError {
             message: format!("credential provision failed: {e}"),
             code: codes::CTX_2105.to_string(),
@@ -874,18 +865,17 @@ pub fn py_bridge_credential_provision(
 /// Raises `ContextError` if the credential is not found or the bridge is
 /// suspended.
 /// Raises `CryptoError` if decryption fails.
-#[pyfunction]
-#[pyo3(name = "bridge_credential_retrieve")]
-pub fn py_bridge_credential_retrieve(
+fn bridge_credential_retrieve_impl(
+    bi: &PyBridgeInstance,
     bridge_id: &str,
     credential_type: &str,
-    bridge_credential_key: Vec<u8>,
+    bridge_credential_key: &[u8],
 ) -> PyResult<Vec<u8>> {
     let ct = parse_credential_type(credential_type)?;
-    let key_bytes = parse_credential_key_bytes(&bridge_credential_key)?;
+    let key_bytes = parse_credential_key_bytes(bridge_credential_key)?;
 
     let rt = crate::runtime()?;
-    let store = credential_store();
+    let store = credential_store_for(bi);
 
     let plaintext = rt
         .block_on(store.retrieve(bridge_id, &ct, &key_bytes))
@@ -915,23 +905,22 @@ pub fn py_bridge_credential_retrieve(
 /// # Errors
 ///
 /// Raises `ContextError` if the credential is not found.
-#[pyfunction]
-#[pyo3(name = "bridge_credential_rotate")]
-pub fn py_bridge_credential_rotate(
+fn bridge_credential_rotate_impl(
+    bi: &PyBridgeInstance,
     py: Python<'_>,
     bridge_id: &str,
     credential_type: &str,
-    new_plaintext: Vec<u8>,
-    bridge_credential_key: Vec<u8>,
+    new_plaintext: &[u8],
+    bridge_credential_key: &[u8],
 ) -> PyResult<Py<PyDict>> {
     let ct = parse_credential_type(credential_type)?;
-    let key_bytes = parse_credential_key_bytes(&bridge_credential_key)?;
+    let key_bytes = parse_credential_key_bytes(bridge_credential_key)?;
 
     let rt = crate::runtime()?;
-    let store = credential_store();
+    let store = credential_store_for(bi);
 
     let credential = rt
-        .block_on(store.rotate(bridge_id, &ct, &new_plaintext, &key_bytes))
+        .block_on(store.rotate(bridge_id, &ct, new_plaintext, &key_bytes))
         .map_err(|e| ScpPyError::ContextError {
             message: format!("credential rotate failed: {e}"),
             code: codes::CTX_2107.to_string(),
@@ -956,11 +945,9 @@ pub fn py_bridge_credential_rotate(
 /// # Errors
 ///
 /// Raises `ContextError` if the storage backend fails.
-#[pyfunction]
-#[pyo3(name = "bridge_credential_revoke")]
-pub fn py_bridge_credential_revoke(bridge_id: &str) -> PyResult<()> {
+fn bridge_credential_revoke_impl(bi: &PyBridgeInstance, bridge_id: &str) -> PyResult<()> {
     let rt = crate::runtime()?;
-    let store = credential_store();
+    let store = credential_store_for(bi);
 
     rt.block_on(store.revoke(bridge_id))
         .map_err(|e| ScpPyError::ContextError {
@@ -984,11 +971,13 @@ pub fn py_bridge_credential_revoke(bridge_id: &str) -> PyResult<()> {
 /// # Errors
 ///
 /// Raises `ContextError` if the storage backend fails.
-#[pyfunction]
-#[pyo3(name = "bridge_credential_list")]
-pub fn py_bridge_credential_list(py: Python<'_>, bridge_id: &str) -> PyResult<Py<PyList>> {
+fn bridge_credential_list_impl(
+    bi: &PyBridgeInstance,
+    py: Python<'_>,
+    bridge_id: &str,
+) -> PyResult<Py<PyList>> {
     let rt = crate::runtime()?;
-    let store = credential_store();
+    let store = credential_store_for(bi);
 
     let types = rt
         .block_on(store.list(bridge_id))
@@ -1021,15 +1010,17 @@ pub fn py_bridge_credential_list(py: Python<'_>, bridge_id: &str) -> PyResult<Py
 ///
 /// Raises `ContextError` if storage fails.
 /// Raises `ValidationError` if `key` is not 32 bytes.
-#[pyfunction]
-#[pyo3(name = "bridge_credential_store_key")]
-pub fn py_bridge_credential_store_key(bridge_id: &str, key: Vec<u8>) -> PyResult<()> {
-    let key_bytes = parse_credential_key_bytes(&key)?;
+fn bridge_credential_store_key_impl(
+    bi: &PyBridgeInstance,
+    bridge_id: &str,
+    key: &[u8],
+) -> PyResult<()> {
+    let key_bytes = parse_credential_key_bytes(key)?;
 
     let rt = crate::runtime()?;
-    let store = credential_store();
+    let store = credential_store_for(bi);
 
-    rt.block_on(store.store_bridge_credential_key(bridge_id, Zeroizing::new(key_bytes)))
+    rt.block_on(store.store_bridge_credential_key(bridge_id, key_bytes))
         .map_err(|e| ScpPyError::ContextError {
             message: format!("credential key store failed: {e}"),
             code: codes::CTX_2111.to_string(),
@@ -1051,11 +1042,9 @@ pub fn py_bridge_credential_store_key(bridge_id: &str, key: Vec<u8>) -> PyResult
 /// # Errors
 ///
 /// Raises `ContextError` if the key is not found.
-#[pyfunction]
-#[pyo3(name = "bridge_credential_get_key")]
-pub fn py_bridge_credential_get_key(bridge_id: &str) -> PyResult<Vec<u8>> {
+fn bridge_credential_get_key_impl(bi: &PyBridgeInstance, bridge_id: &str) -> PyResult<Vec<u8>> {
     let rt = crate::runtime()?;
-    let store = credential_store();
+    let store = credential_store_for(bi);
 
     let key = rt
         .block_on(store.get_bridge_credential_key(bridge_id))
@@ -1078,11 +1067,9 @@ pub fn py_bridge_credential_get_key(bridge_id: &str) -> PyResult<Vec<u8>> {
 /// # Errors
 ///
 /// Raises `ContextError` if storage fails.
-#[pyfunction]
-#[pyo3(name = "bridge_credential_delete_key")]
-pub fn py_bridge_credential_delete_key(bridge_id: &str) -> PyResult<()> {
+fn bridge_credential_delete_key_impl(bi: &PyBridgeInstance, bridge_id: &str) -> PyResult<()> {
     let rt = crate::runtime()?;
-    let store = credential_store();
+    let store = credential_store_for(bi);
 
     rt.block_on(store.delete_bridge_credential_key(bridge_id))
         .map_err(|e| ScpPyError::ContextError {
@@ -1239,17 +1226,15 @@ fn parse_credential_type(s: &str) -> PyResult<CredentialType> {
     }
 }
 
-fn parse_credential_key_bytes(key: &[u8]) -> PyResult<[u8; 32]> {
-    <[u8; 32]>::try_from(key).map_err(|_| {
-        ScpPyError::ValidationError {
-            message: format!(
-                "bridge_credential_key must be exactly 32 bytes, got {}",
-                key.len()
-            ),
-            code: codes::VALID_7057.to_string(),
-        }
-        .into()
-    })
+fn parse_credential_key_bytes(key: &[u8]) -> PyResult<Zeroizing<[u8; 32]>> {
+    scp_ffi_common::validate::expect_fixed_bytes_zeroized::<32>(key, "bridge_credential_key")
+        .map_err(|msg| {
+            ScpPyError::ValidationError {
+                message: msg,
+                code: codes::VALID_7057.to_string(),
+            }
+            .into()
+        })
 }
 
 fn parse_shadow_status(s: &str) -> PyResult<ShadowProvenanceStatus> {
@@ -1265,37 +1250,177 @@ fn parse_shadow_status(s: &str) -> PyResult<ShadowProvenanceStatus> {
 }
 
 // ---------------------------------------------------------------------------
+// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
+// ---------------------------------------------------------------------------
+
+#[pymethods]
+impl crate::scp::PyScp {
+    /// Creates a shadow identity for a bridge.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if `bridge_mode` is invalid or shadow creation fails.
+    #[pyo3(name = "bridge_create_shadow", signature = (bridge_id, platform_handle, bridge_mode, context_id="ctx-shadow"))]
+    pub fn bridge_create_shadow(
+        &self,
+        py: Python<'_>,
+        bridge_id: &str,
+        platform_handle: &str,
+        bridge_mode: &str,
+        context_id: &str,
+    ) -> PyResult<Py<PyDict>> {
+        let bi = &*self.inner;
+        bridge_create_shadow_impl(bi, py, bridge_id, platform_handle, bridge_mode, context_id)
+    }
+
+    /// Provisions (stores) an encrypted credential for a bridge.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` on storage/encryption failure.
+    /// Raises `ValidationError` if `credential_type` or key length is invalid.
+    #[pyo3(name = "bridge_credential_provision")]
+    pub fn bridge_credential_provision(
+        &self,
+        py: Python<'_>,
+        bridge_id: &str,
+        credential_type: &str,
+        plaintext: Vec<u8>,
+        bridge_credential_key: Vec<u8>,
+    ) -> PyResult<Py<PyDict>> {
+        let bi = &*self.inner;
+        bridge_credential_provision_impl(
+            bi,
+            py,
+            bridge_id,
+            credential_type,
+            &plaintext,
+            &bridge_credential_key,
+        )
+    }
+
+    /// Retrieves and decrypts a credential for a bridge instance.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if the credential is not found or decryption fails.
+    #[pyo3(name = "bridge_credential_retrieve")]
+    pub fn bridge_credential_retrieve(
+        &self,
+        bridge_id: &str,
+        credential_type: &str,
+        bridge_credential_key: Vec<u8>,
+    ) -> PyResult<Vec<u8>> {
+        let bi = &*self.inner;
+        bridge_credential_retrieve_impl(bi, bridge_id, credential_type, &bridge_credential_key)
+    }
+
+    /// Rotates (replaces) a credential for a bridge instance.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if the credential is not found.
+    #[pyo3(name = "bridge_credential_rotate")]
+    pub fn bridge_credential_rotate(
+        &self,
+        py: Python<'_>,
+        bridge_id: &str,
+        credential_type: &str,
+        new_plaintext: Vec<u8>,
+        bridge_credential_key: Vec<u8>,
+    ) -> PyResult<Py<PyDict>> {
+        let bi = &*self.inner;
+        bridge_credential_rotate_impl(
+            bi,
+            py,
+            bridge_id,
+            credential_type,
+            &new_plaintext,
+            &bridge_credential_key,
+        )
+    }
+
+    /// Revokes all credentials for a bridge instance.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if the storage backend fails.
+    #[pyo3(name = "bridge_credential_revoke")]
+    pub fn bridge_credential_revoke(&self, bridge_id: &str) -> PyResult<()> {
+        let bi = &*self.inner;
+        bridge_credential_revoke_impl(bi, bridge_id)
+    }
+
+    /// Lists all credential types stored for a bridge instance.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if the storage backend fails.
+    #[pyo3(name = "bridge_credential_list")]
+    pub fn bridge_credential_list(&self, py: Python<'_>, bridge_id: &str) -> PyResult<Py<PyList>> {
+        let bi = &*self.inner;
+        bridge_credential_list_impl(bi, py, bridge_id)
+    }
+
+    /// Stores a bridge credential key in the custody boundary.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if storage fails.
+    /// Raises `ValidationError` if `key` is not 32 bytes.
+    #[pyo3(name = "bridge_credential_store_key")]
+    pub fn bridge_credential_store_key(&self, bridge_id: &str, key: Vec<u8>) -> PyResult<()> {
+        let bi = &*self.inner;
+        bridge_credential_store_key_impl(bi, bridge_id, &key)
+    }
+
+    /// Retrieves a bridge credential key from the custody boundary.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if the key is not found.
+    #[pyo3(name = "bridge_credential_get_key")]
+    pub fn bridge_credential_get_key(&self, bridge_id: &str) -> PyResult<Vec<u8>> {
+        let bi = &*self.inner;
+        bridge_credential_get_key_impl(bi, bridge_id)
+    }
+
+    /// Deletes and zeroizes a bridge credential key.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if storage fails.
+    #[pyo3(name = "bridge_credential_delete_key")]
+    pub fn bridge_credential_delete_key(&self, bridge_id: &str) -> PyResult<()> {
+        let bi = &*self.inner;
+        bridge_credential_delete_key_impl(bi, bridge_id)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
-/// Registers bridge connector bridge functions on the `_scp_core` module.
+/// Registers bridge connector free functions on the `_scp_core` module.
+///
+/// Post-migration (Phase 4 PR 4 sub-slice E), stateful credential and shadow
+/// store operations are exposed as methods on `SCP`. Only pure helpers
+/// (registration, trust evaluation, shadow claiming, envelope seal/open,
+/// credential key derivation/generation, OAuth helpers) remain as free
+/// `#[pyfunction]` exports.
 ///
 /// # Errors
 ///
 /// Returns `PyErr` if registration fails.
 pub fn register_bridge_connector(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Registration, trust, shadow creation (existing).
+    // Pure helpers only — stateful operations live on `SCP`.
     m.add_function(wrap_pyfunction!(py_bridge_register, m)?)?;
     m.add_function(wrap_pyfunction!(py_bridge_evaluate_trust, m)?)?;
-    m.add_function(wrap_pyfunction!(py_bridge_create_shadow, m)?)?;
-    // Shadow claiming (§12, ADR-023).
     m.add_function(wrap_pyfunction!(py_bridge_claim_shadow, m)?)?;
-    // Bridge envelope sealing/opening (§12.6.1).
     m.add_function(wrap_pyfunction!(py_bridge_seal_shadow_envelope, m)?)?;
     m.add_function(wrap_pyfunction!(py_bridge_open_shadow_envelope, m)?)?;
-    // Credential key derivation (§12.11.1).
     m.add_function(wrap_pyfunction!(py_bridge_derive_credential_key, m)?)?;
     m.add_function(wrap_pyfunction!(py_bridge_generate_credential_key, m)?)?;
-    // Credential store operations (§12.11).
-    m.add_function(wrap_pyfunction!(py_bridge_credential_provision, m)?)?;
-    m.add_function(wrap_pyfunction!(py_bridge_credential_retrieve, m)?)?;
-    m.add_function(wrap_pyfunction!(py_bridge_credential_rotate, m)?)?;
-    m.add_function(wrap_pyfunction!(py_bridge_credential_revoke, m)?)?;
-    m.add_function(wrap_pyfunction!(py_bridge_credential_list, m)?)?;
-    m.add_function(wrap_pyfunction!(py_bridge_credential_store_key, m)?)?;
-    m.add_function(wrap_pyfunction!(py_bridge_credential_get_key, m)?)?;
-    m.add_function(wrap_pyfunction!(py_bridge_credential_delete_key, m)?)?;
-    // OAuth flow (§12.11.3).
     m.add_function(wrap_pyfunction!(py_bridge_oauth_generate_pkce, m)?)?;
     m.add_function(wrap_pyfunction!(py_bridge_oauth_build_auth_url, m)?)?;
     m.add_function(wrap_pyfunction!(py_bridge_oauth_scopes_for_mode, m)?)?;
@@ -1311,6 +1436,10 @@ pub fn register_bridge_connector(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
     use scp_core::bridge::provenance::BridgeTrustLevel;
+
+    fn default_scp() -> crate::scp::PyScp {
+        crate::scp::PyScp::new()
+    }
 
     #[test]
     fn parse_bridge_mode_valid() {
@@ -1512,7 +1641,8 @@ mod tests {
         let key = [42u8; 32];
         let result = parse_credential_key_bytes(&key);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), key);
+        // Deref through Zeroizing to compare against the plain array.
+        assert_eq!(*result.unwrap(), key);
     }
 
     #[test]
@@ -1576,11 +1706,12 @@ mod tests {
         crate::init_runtime().ok();
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
+            let scp = default_scp();
             let bridge_id = "bridge-cred-test-001";
             let key = py_bridge_generate_credential_key();
 
             // Provision.
-            let result = py_bridge_credential_provision(
+            let result = scp.bridge_credential_provision(
                 py,
                 bridge_id,
                 "ApiKey",
@@ -1590,7 +1721,9 @@ mod tests {
             assert!(result.is_ok(), "provision should succeed");
 
             // Retrieve.
-            let plaintext = py_bridge_credential_retrieve(bridge_id, "ApiKey", key).unwrap();
+            let plaintext = scp
+                .bridge_credential_retrieve(bridge_id, "ApiKey", key)
+                .unwrap();
             assert_eq!(plaintext, b"my-secret-api-key");
         });
     }
@@ -1600,11 +1733,12 @@ mod tests {
         crate::init_runtime().ok();
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
+            let scp = default_scp();
             let bridge_id = "bridge-cred-test-002";
             let key = py_bridge_generate_credential_key();
 
             // Provision.
-            py_bridge_credential_provision(
+            scp.bridge_credential_provision(
                 py,
                 bridge_id,
                 "OAuthAccessToken",
@@ -1614,7 +1748,7 @@ mod tests {
             .unwrap();
 
             // Rotate.
-            let result = py_bridge_credential_rotate(
+            let result = scp.bridge_credential_rotate(
                 py,
                 bridge_id,
                 "OAuthAccessToken",
@@ -1624,8 +1758,9 @@ mod tests {
             assert!(result.is_ok());
 
             // Retrieve should return new value.
-            let plaintext =
-                py_bridge_credential_retrieve(bridge_id, "OAuthAccessToken", key).unwrap();
+            let plaintext = scp
+                .bridge_credential_retrieve(bridge_id, "OAuthAccessToken", key)
+                .unwrap();
             assert_eq!(plaintext, b"new-token");
         });
     }
@@ -1635,10 +1770,11 @@ mod tests {
         crate::init_runtime().ok();
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
+            let scp = default_scp();
             let bridge_id = "bridge-cred-test-003";
             let key = py_bridge_generate_credential_key();
 
-            py_bridge_credential_provision(
+            scp.bridge_credential_provision(
                 py,
                 bridge_id,
                 "ApiKey",
@@ -1647,7 +1783,7 @@ mod tests {
             )
             .unwrap();
 
-            py_bridge_credential_provision(
+            scp.bridge_credential_provision(
                 py,
                 bridge_id,
                 "WebhookSecret",
@@ -1656,7 +1792,7 @@ mod tests {
             )
             .unwrap();
 
-            let list = py_bridge_credential_list(py, bridge_id).unwrap();
+            let list = scp.bridge_credential_list(py, bridge_id).unwrap();
             let list_ref = list.bind(py);
             assert_eq!(list_ref.len(), 2);
         });
@@ -1667,10 +1803,11 @@ mod tests {
         crate::init_runtime().ok();
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
+            let scp = default_scp();
             let bridge_id = "bridge-cred-test-004";
             let key = py_bridge_generate_credential_key();
 
-            py_bridge_credential_provision(
+            scp.bridge_credential_provision(
                 py,
                 bridge_id,
                 "ApiKey",
@@ -1679,10 +1816,10 @@ mod tests {
             )
             .unwrap();
 
-            py_bridge_credential_revoke(bridge_id).unwrap();
+            scp.bridge_credential_revoke(bridge_id).unwrap();
 
             // Retrieve should fail.
-            let result = py_bridge_credential_retrieve(bridge_id, "ApiKey", key);
+            let result = scp.bridge_credential_retrieve(bridge_id, "ApiKey", key);
             assert!(result.is_err());
         });
     }
@@ -1690,25 +1827,28 @@ mod tests {
     #[test]
     fn credential_store_and_get_key_roundtrip() {
         crate::init_runtime().ok();
+        let scp = default_scp();
         let bridge_id = "bridge-cred-test-005";
         let key = py_bridge_generate_credential_key();
 
-        py_bridge_credential_store_key(bridge_id, key.clone()).unwrap();
+        scp.bridge_credential_store_key(bridge_id, key.clone())
+            .unwrap();
 
-        let retrieved = py_bridge_credential_get_key(bridge_id).unwrap();
+        let retrieved = scp.bridge_credential_get_key(bridge_id).unwrap();
         assert_eq!(retrieved, key);
     }
 
     #[test]
     fn credential_delete_key_removes_it() {
         crate::init_runtime().ok();
+        let scp = default_scp();
         let bridge_id = "bridge-cred-test-006";
         let key = py_bridge_generate_credential_key();
 
-        py_bridge_credential_store_key(bridge_id, key).unwrap();
-        py_bridge_credential_delete_key(bridge_id).unwrap();
+        scp.bridge_credential_store_key(bridge_id, key).unwrap();
+        scp.bridge_credential_delete_key(bridge_id).unwrap();
 
-        let result = py_bridge_credential_get_key(bridge_id);
+        let result = scp.bridge_credential_get_key(bridge_id);
         assert!(result.is_err());
     }
 

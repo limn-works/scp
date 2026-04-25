@@ -5,12 +5,13 @@
 //! [`UniffiBridgeInstance`] — which in turn owns the `ContextManager`,
 //! transport, and bridge-specific registries.
 //!
-//! PR 1 introduces the type and its constructors plus the lifecycle
-//! methods. Later PRs migrate the free-function façade onto methods on
-//! this class; until then free functions continue to operate on the
-//! default instance (`DEFAULT_BRIDGE_INSTANCE` in [`crate::runtime`]).
+//! Phase D (#1695) deleted the process-wide `DEFAULT_BRIDGE_INSTANCE`
+//! that the pre-façade free functions shared; every entry point now
+//! flows through an `Scp`, which mints handles stamped with its own
+//! `instance_id` and rejects cross-instance handle misuse via the
+//! inline `CoreFields::check_handle` call.
 //!
-//! See #1549 Phase 4 remainder plan (PR 1) and ADR-048.
+//! See #1549 Phase 4 remainder plan and ADR-048.
 
 use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
 use scp_ffi_common::error_codes as codes;
@@ -18,28 +19,36 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::bridge::ScpError;
-use crate::runtime::{StorageConfig, UniffiBridgeInstance, default_bridge_instance};
+use crate::runtime::{StorageConfig, UniffiBridgeInstance};
 use crate::{decrement_handle_count, increment_handle_count};
 
 /// The SCP instance — a caller-owned handle that wraps a
 /// [`UniffiBridgeInstance`].
 ///
-/// Generated as `class SCP` in both Swift and Kotlin.
+/// Generated as `class SCP` in both Swift and Kotlin. Phase D (#1695,
+/// ADR-048) deleted the process-wide default instance: every caller now
+/// constructs an explicit `SCP()` and the handles it mints are rejected
+/// on any other instance via [`check-handle-affinity`][affinity].
+///
+/// The native `shutdown` parameter is milliseconds (`u64`) — the SDK
+/// wrappers present it as seconds for consumer ergonomics.
+///
+/// [affinity]: ../../../../scripts/check-handle-affinity.sh
 ///
 /// # Swift usage
 ///
 /// ```swift
 /// let scp = SCP()                                // fresh in-memory instance
-/// let shared = try SCP.defaultInstance()         // process-wide default
-/// try await scp.shutdown(timeoutSecs: 5)         // graceful shutdown
+/// let identity = try await scp.identityCreate(custody: "in_memory")
+/// try await scp.shutdown(timeoutMillis: 5_000)   // graceful shutdown
 /// ```
 ///
 /// # Kotlin usage
 ///
 /// ```kotlin
 /// val scp = SCP()                                // fresh in-memory instance
-/// val shared = SCP.defaultInstance()             // process-wide default
-/// scp.shutdown(timeoutSecs = 5uL)                // suspend fun, graceful shutdown
+/// val identity = scp.identityCreate(custody = "in_memory")
+/// scp.shutdown(timeoutMillis = 5_000uL)          // suspend fun, graceful shutdown
 /// ```
 #[derive(uniffi::Object)]
 pub struct Scp {
@@ -51,11 +60,12 @@ pub struct Scp {
 impl Scp {
     /// Constructs a fresh `SCP` instance with default in-memory state.
     ///
-    /// Unlike [`Self::default_instance`], this bypasses the process-global
-    /// `DEFAULT_BRIDGE_INSTANCE` entirely — each call produces a brand-new
-    /// instance with a fresh monotonic `instance_id`, a fresh
-    /// `CancellationToken`, and an empty `JoinSet`. Handles issued against
-    /// this instance are incompatible with any other instance.
+    /// Each call produces a brand-new instance with a fresh monotonic
+    /// `instance_id`, a fresh `CancellationToken`, and an empty
+    /// `JoinSet`. Handles issued against this instance are incompatible
+    /// with any other instance — the `CoreFields::check_handle` path
+    /// surfaces the mismatch as `ScpError::Permission` with code
+    /// `SCP-PERM-3030`.
     #[uniffi::constructor]
     #[must_use]
     pub fn new() -> Arc<Self> {
@@ -107,23 +117,6 @@ impl Scp {
         })
     }
 
-    /// Returns an `SCP` wrapping the process-wide default instance.
-    ///
-    /// Multiple calls return distinct `SCP` objects, but each wraps the
-    /// same underlying `Arc<UniffiBridgeInstance>` — their `instance_id`s
-    /// match, and changes made through one are visible to the other.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ScpError::Context` if the default instance is currently
-    /// suspended or permanently shut down.
-    #[uniffi::constructor]
-    pub fn default_instance() -> Result<Arc<Self>, ScpError> {
-        let inner = default_bridge_instance()?;
-        increment_handle_count();
-        Ok(Arc::new(Self { inner }))
-    }
-
     /// Returns the monotonic identifier for this instance.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
@@ -149,7 +142,7 @@ impl Scp {
     /// Resumes a suspended bridge instance.
     ///
     /// Clears the suspended flag, then runs any per-bridge async work chained
-    /// by the [`BridgeInstanceCore::resume`] override (transport reconnect
+    /// by the `BridgeInstanceCore::resume` override (transport reconnect
     /// from pending relay URLs, persisted-context restoration).
     ///
     /// `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin.

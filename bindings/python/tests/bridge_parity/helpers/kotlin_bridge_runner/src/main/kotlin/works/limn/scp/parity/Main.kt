@@ -14,6 +14,12 @@
  * Response: `{id, ok: true, result: {...}}` on success or
  *           `{id, ok: false, error: {type, code, message}}` on failure.
  *
+ * ADR-048 / #1549 Phase 4 PR 4: every UniFFI bridge operation is now a
+ * per-instance method on the `uniffi.scp.Scp` opaque class. Each op
+ * constructs a fresh `Scp` via `Scp().use { ... }` so handles stay
+ * scoped to the call and the native resource is released even on
+ * exception. No free-function façade remains.
+ *
  * Transport errors that prevent parsing or emitting a frame are logged
  * to stderr as JSON events (`event: bridge_parity_runner_*`) and cause
  * the runner to exit non-zero; they are NOT surfaced as bridge-level
@@ -144,11 +150,6 @@ private class RunnerProtocolError(message: String) : RuntimeException(message)
 
 // ---------------------------------------------------------------------------
 // Request / response types
-//
-// bridgeMode is camelCase on the wire (mirrors node_bridge_runner.ts) —
-// the field rename avoids collision with the TS DOM `RequestMode` type
-// on that side. Kotlin doesn't care, but keeping the exact same wire
-// format is the whole point of the runner.
 // ---------------------------------------------------------------------------
 
 @Serializable
@@ -160,8 +161,6 @@ private data class RawRequest(
 )
 
 private fun okResponse(id: Int, result: JsonObject): String {
-    // Build the response manually to match the Bun runner's exact shape:
-    // {"id": N, "ok": true, "result": {...}}.
     val obj = buildJsonObject {
         put("id", JsonPrimitive(id))
         put("ok", JsonPrimitive(true))
@@ -186,19 +185,15 @@ private fun errResponse(id: Int, type: String, code: String, message: String): S
     return JSON.encodeToString(JsonElement.serializer(), obj)
 }
 
-// Extract an SCP-{CATEGORY}-{NNNN} code from an error message. Matches
-// the Bun runner's regex — kept in lockstep so bridge-side errors
-// surface the same code field to the harness.
 private val SCP_CODE_REGEX = Regex("""SCP-[A-Z]+-\d+""")
 
 private fun extractScpCode(message: String): String =
     SCP_CODE_REGEX.find(message)?.value ?: "UNKNOWN"
 
 // ---------------------------------------------------------------------------
-// Op implementations — consume UniFFI-generated `uniffi.scp.*` directly.
-// Parity is what we want to test, so we do NOT go through the scp-kt
-// SDK wrappers (which would add a layer of semantic sugar that could
-// diverge from the other runners).
+// Op implementations — construct a fresh `uniffi.scp.Scp` per op and
+// dispatch per-instance methods on it (ADR-048). Parity is what we want
+// to test, so we do NOT go through the scp-kt SDK wrappers.
 // ---------------------------------------------------------------------------
 
 private fun buildContextParams(
@@ -232,15 +227,10 @@ private fun ceilingFromArgs(
 
 /**
  * Decode a 64-char hex string into a 32-byte `ByteArray` seed for
- * `uniffi.scp.identityCreate(custody, seed)`. Matches
+ * `scp.identityCreate(custody, testingSeed)`. Matches
  * `node_bridge_runner.ts::seedFromHex` — the parity harness passes a
  * `seed_hex` arg so every bridge derives byte-identical key material
- * from the same 32 bytes (ADR-046 / `seed_operations.py::PARITY_SEED_HEX`).
- *
- * Throws `IllegalArgumentException` on malformed input: wrong length,
- * odd digit count, or non-hex characters. The main dispatch loop
- * surfaces these as JSON-RPC error responses with the runner's default
- * error mapping (type = "IllegalArgumentException", code = UNKNOWN).
+ * from the same 32 bytes (ADR-046).
  */
 private fun seedFromHex(hex: String): ByteArray {
     require(hex.length == 64) {
@@ -258,98 +248,90 @@ private fun seedFromHex(hex: String): ByteArray {
     return bytes
 }
 
-private suspend fun opIdentityCreate(args: JsonObject): JsonObject {
-    val custody = args["custody"]?.jsonPrimitive?.content ?: "in_memory"
-    // Pass the optional 32-byte seed through so PyO3/NAPI/UniFFI/WASM
-    // produce byte-identical DIDs under the shared `PARITY_SEED_HEX`.
-    // When absent, UniFFI's `Option<ByteArray>` parameter takes `null`
-    // and the bridge falls back to OS entropy.
-    val seed = args["seed_hex"]?.jsonPrimitive?.content?.let { seedFromHex(it) }
-    val identity = uniffi.scp.identityCreate(custody, seed)
-    return buildJsonObject {
-        put("did", JsonPrimitive(identity.did()))
-        put("custody", JsonPrimitive(custody))
-        // `verifyingKey()` returns hex; the parity harness's
-        // `bytes_from_hex` FieldSpec canonicalises hex → base64 in the
-        // normaliser before comparison, so we emit raw hex here (same
-        // shape PyO3 / NAPI / WASM produce).
-        val verifyingKeyHex = identity.verifyingKey()
-        if (verifyingKeyHex != null) {
-            put("verifying_key", JsonPrimitive(verifyingKeyHex))
+private suspend fun opIdentityCreate(args: JsonObject): JsonObject =
+    uniffi.scp.Scp().use { scp ->
+        val custody = args["custody"]?.jsonPrimitive?.content ?: "in_memory"
+        val seed = args["seed_hex"]?.jsonPrimitive?.content?.let { seedFromHex(it) }
+        val identity = scp.identityCreate(custody, seed)
+        buildJsonObject {
+            put("did", JsonPrimitive(identity.did()))
+            put("custody", JsonPrimitive(custody))
+            val verifyingKeyHex = identity.verifyingKey()
+            if (verifyingKeyHex != null) {
+                put("verifying_key", JsonPrimitive(verifyingKeyHex))
+            }
         }
     }
-}
 
-private suspend fun opContextCreate(args: JsonObject): JsonObject {
-    val paramsArg = args["params"]?.jsonObject ?: buildJsonObject { }
-    val mode = paramsArg["mode"]?.jsonPrimitive?.content ?: "encrypted"
-    val identity = uniffi.scp.identityCreate("in_memory", null)
-    val handle = uniffi.scp.contextCreate(identity, buildContextParams())
-    return buildJsonObject {
-        put("context_id", JsonPrimitive(handle.contextId()))
-        put("creator_did", JsonPrimitive(identity.did()))
-        put("mode", JsonPrimitive(mode))
+private suspend fun opContextCreate(args: JsonObject): JsonObject =
+    uniffi.scp.Scp().use { scp ->
+        val paramsArg = args["params"]?.jsonObject ?: buildJsonObject { }
+        val mode = paramsArg["mode"]?.jsonPrimitive?.content ?: "encrypted"
+        val identity = scp.identityCreate("in_memory", null)
+        val handle = scp.contextCreate(identity, buildContextParams())
+        buildJsonObject {
+            put("context_id", JsonPrimitive(handle.contextId()))
+            put("creator_did", JsonPrimitive(identity.did()))
+            put("mode", JsonPrimitive(mode))
+        }
     }
-}
 
 @Suppress("UnusedParameter")
-private suspend fun opInvalidCapability(args: JsonObject): JsonObject {
-    // Same malformed-challenge path as the other runners: the challenge
-    // JSON fails shape validation at SCP-IDENT-1038 before any DID
-    // lookup happens. `scpidSign` takes an Identity object (not a DID
-    // string) in the Kotlin/Swift bridges, so we create a real identity
-    // and send it the bad challenge.
-    val badChallenge =
-        """{"protocol":"scpid/1","nonce":"00","audience":"x","issued_at":0,"expires_at":0}"""
-    return try {
-        val identity = uniffi.scp.identityCreate("in_memory", null)
-        uniffi.scp.scpidSign(identity, "#active", badChallenge, null)
-        buildJsonObject {
-            put(
-                "error",
-                buildJsonObject {
-                    put("type", JsonPrimitive("none"))
-                    put("code", JsonPrimitive("NONE"))
-                    put("message", JsonPrimitive("no error raised"))
-                }
-            )
-        }
-    } catch (e: Throwable) {
-        val message = e.message ?: e.toString()
-        buildJsonObject {
-            put(
-                "error",
-                buildJsonObject {
-                    put("type", JsonPrimitive(e::class.simpleName ?: "Exception"))
-                    put("code", JsonPrimitive(extractScpCode(message)))
-                    put("message", JsonPrimitive(message))
-                }
-            )
+private suspend fun opInvalidCapability(args: JsonObject): JsonObject =
+    uniffi.scp.Scp().use { scp ->
+        // UniFFI `scpidSign` takes an opaque `Identity` handle (not a DID
+        // string), so feed a real identity a malformed challenge: shape
+        // validation rejects with SCP-IDENT-1038 before any DID lookup.
+        // Matches the other runners.
+        val badChallenge =
+            """{"protocol":"scpid/1","nonce":"00","audience":"x","issued_at":0,"expires_at":0}"""
+        try {
+            val identity = scp.identityCreate("in_memory", null)
+            scp.scpidSign(identity, "#active", badChallenge, null)
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive("none"))
+                        put("code", JsonPrimitive("NONE"))
+                        put("message", JsonPrimitive("no error raised"))
+                    }
+                )
+            }
+        } catch (e: Throwable) {
+            val message = e.message ?: e.toString()
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive(e::class.simpleName ?: "Exception"))
+                        put("code", JsonPrimitive(extractScpCode(message)))
+                        put("message", JsonPrimitive(message))
+                    }
+                )
+            }
         }
     }
-}
 
 @Suppress("UnusedParameter")
-private suspend fun opEventLogAppend(args: JsonObject): JsonObject {
-    val identity = uniffi.scp.identityCreate("in_memory", null)
-    val handle = uniffi.scp.contextCreate(identity, buildContextParams())
-    val events = uniffi.scp.eventLogQuery(handle, null)
-    val first = events.firstOrNull()
-    return buildJsonObject {
-        if (first == null) {
-            put("event_count", JsonPrimitive(0))
-            put("first_event_type", JsonPrimitive(""))
-            put("first_sequence", JsonPrimitive(0))
-        } else {
-            put("event_count", JsonPrimitive(events.size))
-            put("first_event_type", JsonPrimitive(first.eventType))
-            // UniFFI generates `sequence: ULong`; JSON has no unsigned
-            // integer type, so we marshal as Long. Parity values are
-            // well below Long.MAX_VALUE.
-            put("first_sequence", JsonPrimitive(first.sequence.toLong()))
+private suspend fun opEventLogAppend(args: JsonObject): JsonObject =
+    uniffi.scp.Scp().use { scp ->
+        val identity = scp.identityCreate("in_memory", null)
+        val handle = scp.contextCreate(identity, buildContextParams())
+        val events = scp.eventLogQuery(handle, null)
+        val first = events.firstOrNull()
+        buildJsonObject {
+            if (first == null) {
+                put("event_count", JsonPrimitive(0))
+                put("first_event_type", JsonPrimitive(""))
+                put("first_sequence", JsonPrimitive(0))
+            } else {
+                put("event_count", JsonPrimitive(events.size))
+                put("first_event_type", JsonPrimitive(first.eventType))
+                put("first_sequence", JsonPrimitive(first.sequence.toLong()))
+            }
         }
     }
-}
 
 // -- ops 6-10 ------------------------------------------------------------
 
@@ -362,175 +344,174 @@ private val PARITY_TOOL_CEILING = listOf(
 )
 
 @Suppress("UnusedParameter")
-private suspend fun opToolRegister(args: JsonObject): JsonObject {
-    val ceiling = ceilingFromArgs(args, PARITY_TOOL_CEILING)
-    val identity = uniffi.scp.identityCreate("in_memory", null)
-    val handle = uniffi.scp.contextCreate(identity, buildContextParams(ceiling))
-    // Two-field schemas on both sides to satisfy
-    // `validate_specificity_floor` (MIN_SCHEMA_FIELDS = 2). Matches the
-    // PyO3 and Node fixtures so tool_id parity holds across every bridge.
-    val inputSchema =
-        """{"type":"object","properties":{"x":{"type":"integer"},"label":{"type":"string"}}}"""
-    val outputSchema =
-        """{"type":"object","properties":{"y":{"type":"integer"},"status":{"type":"string"}}}"""
-    val toolId = uniffi.scp.toolRegister(
-        handle,
-        uniffi.scp.ToolDefinition(
-            name = PARITY_TOOL_NAME,
-            description = "parity harness probe tool",
-            inputSchemaJson = inputSchema,
-            outputSchemaJson = outputSchema,
-            operatorDid = identity.did(),
-            testVectorsJson = null,
-            implementationHash = null,
-            cost = null
-        )
-    )
-    return buildJsonObject { put("tool_id", JsonPrimitive(toolId)) }
-}
-
-private suspend fun opUcanMint(args: JsonObject): JsonObject {
-    val memberDid = args["member_did"]?.jsonPrimitive?.content
-        ?: "did:dht:zparitymemberparitymemberparitymemberparitymember"
-    val capabilities = (args["capabilities"] as? kotlinx.serialization.json.JsonArray)
-        ?.map { it.jsonPrimitive.content }
-        ?: listOf("messages:read")
-    val ceiling = ceilingFromArgs(args, listOf("messages:read", "messages:write"))
-    val identity = uniffi.scp.identityCreate("in_memory", null)
-    val handle = uniffi.scp.contextCreate(identity, buildContextParams(ceiling))
-    val token = uniffi.scp.ucanMint(handle, memberDid, capabilities, null)
-    return buildJsonObject {
-        put("issuer", JsonPrimitive(token.issuer()))
-        put("audience", JsonPrimitive(token.audience()))
-        put("capability_count", JsonPrimitive(token.capabilities().size))
-    }
-}
-
-private suspend fun opUcanValidateMalformed(args: JsonObject): JsonObject {
-    // UniFFI wraps parse_ucan errors with SCP-PERM-3002 (diverges from
-    // PyO3/NAPI SCP-PERM-3001). The seed_operations.py OpSpec xfails
-    // uniffi-kotlin for this op until the codes are aligned upstream.
-    val ceiling = ceilingFromArgs(args, listOf("messages:read", "messages:write"))
-    val identity = uniffi.scp.identityCreate("in_memory", null)
-    val handle = uniffi.scp.contextCreate(identity, buildContextParams(ceiling))
-    return try {
-        uniffi.scp.ucanValidate(
+private suspend fun opToolRegister(args: JsonObject): JsonObject =
+    uniffi.scp.Scp().use { scp ->
+        val ceiling = ceilingFromArgs(args, PARITY_TOOL_CEILING)
+        val identity = scp.identityCreate("in_memory", null)
+        val handle = scp.contextCreate(identity, buildContextParams(ceiling))
+        val inputSchema =
+            """{"type":"object","properties":{"x":{"type":"integer"},"label":{"type":"string"}}}"""
+        val outputSchema =
+            """{"type":"object","properties":{"y":{"type":"integer"},"status":{"type":"string"}}}"""
+        val toolId = scp.toolRegister(
             handle,
-            "not.a.jwt",
-            "scp:ctx:any/messages:read",
-            null,
-            null
+            uniffi.scp.ToolDefinition(
+                name = PARITY_TOOL_NAME,
+                description = "parity harness probe tool",
+                inputSchemaJson = inputSchema,
+                outputSchemaJson = outputSchema,
+                operatorDid = identity.did(),
+                testVectorsJson = null,
+                implementationHash = null,
+                cost = null
+            )
         )
+        buildJsonObject { put("tool_id", JsonPrimitive(toolId)) }
+    }
+
+private suspend fun opUcanMint(args: JsonObject): JsonObject =
+    uniffi.scp.Scp().use { scp ->
+        val memberDid = args["member_did"]?.jsonPrimitive?.content
+            ?: "did:dht:zparitymemberparitymemberparitymemberparitymember"
+        val capabilities = (args["capabilities"] as? kotlinx.serialization.json.JsonArray)
+            ?.map { it.jsonPrimitive.content }
+            ?: listOf("messages:read")
+        val ceiling = ceilingFromArgs(args, listOf("messages:read", "messages:write"))
+        val identity = scp.identityCreate("in_memory", null)
+        val handle = scp.contextCreate(identity, buildContextParams(ceiling))
+        val token = scp.ucanMint(handle, memberDid, capabilities, null)
         buildJsonObject {
-            put(
-                "error",
-                buildJsonObject {
-                    put("type", JsonPrimitive("none"))
-                    put("code", JsonPrimitive("NONE"))
-                }
-            )
-        }
-    } catch (e: Throwable) {
-        val message = e.message ?: e.toString()
-        buildJsonObject {
-            put(
-                "error",
-                buildJsonObject {
-                    put("type", JsonPrimitive(e::class.simpleName ?: "Exception"))
-                    put("code", JsonPrimitive(extractScpCode(message)))
-                }
-            )
+            put("issuer", JsonPrimitive(token.issuer()))
+            put("audience", JsonPrimitive(token.audience()))
+            put("capability_count", JsonPrimitive(token.capabilities().size))
         }
     }
-}
+
+private suspend fun opUcanValidateMalformed(args: JsonObject): JsonObject =
+    uniffi.scp.Scp().use { scp ->
+        // UniFFI wraps parse_ucan errors with SCP-PERM-3002 (diverges from
+        // PyO3/NAPI SCP-PERM-3001). The seed_operations.py OpSpec xfails
+        // uniffi-kotlin for this op until the codes are aligned upstream.
+        val ceiling = ceilingFromArgs(args, listOf("messages:read", "messages:write"))
+        val identity = scp.identityCreate("in_memory", null)
+        val handle = scp.contextCreate(identity, buildContextParams(ceiling))
+        try {
+            scp.ucanValidate(
+                handle,
+                "not.a.jwt",
+                "scp:ctx:any/messages:read",
+                null,
+                null
+            )
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive("none"))
+                        put("code", JsonPrimitive("NONE"))
+                    }
+                )
+            }
+        } catch (e: Throwable) {
+            val message = e.message ?: e.toString()
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive(e::class.simpleName ?: "Exception"))
+                        put("code", JsonPrimitive(extractScpCode(message)))
+                    }
+                )
+            }
+        }
+    }
 
 @Suppress("UnusedParameter")
-private suspend fun opTransportStatus(args: JsonObject): JsonObject {
-    // UniFFI's `transport_status` now accepts an Optional<TransportManager>;
-    // when absent, it returns the stateless BridgeInstance-level snapshot —
-    // the same shape exposed by PyO3 and WASM. The parity harness always
-    // exercises the handleless probe (no transport_connect, no relay
-    // fixture), so every bridge reports `connected: false` here.
-    val status = uniffi.scp.transportStatus(null)
-    return buildJsonObject {
-        put("connected", JsonPrimitive(status.connected))
-        put(
-            "relay_url",
-            status.relayUrl?.let { JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull
-        )
-        put(
-            "latency_ms",
-            status.latencyMs?.let { JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull
-        )
+private suspend fun opTransportStatus(args: JsonObject): JsonObject =
+    // ADR-048 §7a: UniFFI now exposes a handleless `transportManagerStatus()`
+    // alongside the handle-taking `transportStatus(manager)`, matching the
+    // PyO3 / NAPI / WASM probe contract. The parity harness drives the
+    // handleless path so no relay fixture is needed on the UniFFI runners.
+    uniffi.scp.Scp().use { scp ->
+        val status = scp.transportManagerStatus()
+        buildJsonObject {
+            put("connected", JsonPrimitive(status.connected))
+            put(
+                "relay_url",
+                status.relayUrl?.let { JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull
+            )
+            put(
+                "latency_ms",
+                status.latencyMs?.let { JsonPrimitive(it) } ?: kotlinx.serialization.json.JsonNull
+            )
+        }
     }
-}
 
 // Shape-valid `did:dht:z…` DID guaranteed NOT to be in any bridge's
-// identity registry. Mirrors
-// `seed_operations.py::FAKE_UNREGISTERED_DID` and
-// `node_bridge_runner.ts::FAKE_UNREGISTERED_DID` — MUST match byte-for-byte
-// so the parity harness lines every bridge up against the same input.
+// identity registry. Mirrors `seed_operations.py::FAKE_UNREGISTERED_DID`.
 private const val FAKE_UNREGISTERED_DID =
     "did:dht:znever1never1never1never1never1never1never1never1never1never1neva"
 
 @Suppress("UnusedParameter")
-private suspend fun opUnregisteredDidRejected(args: JsonObject): JsonObject {
-    // UniFFI `scpidSign` takes an opaque `Identity` handle, not a DID
-    // string, so it never performs the bridge-local registry lookup
-    // the PyO3/NAPI/WASM bridges use to detect an unregistered DID.
-    // Instead, we exercise the SAME error code via `identityResolve`:
-    // the fake DID's 64-char zbase32 suffix decodes to 40 bytes, which
-    // fails `DidDht::extract_public_key`'s 32-byte check locally (no
-    // DHT round-trip). That `IdentityError::InvalidDidFormat` is
-    // surfaced by the bridge's blanket `From<IdentityError>` mapping
-    // (crates/scp-ffi/uniffi/src/bridge.rs) as SCP-IDENT-1001 — the
-    // same code the other bridges emit on registry miss. See the
-    // docstring block on `OP_UNREGISTERED_DID_REJECTED` in
-    // `seed_operations.py` for the full rationale.
-    return try {
-        uniffi.scp.identityResolve(FAKE_UNREGISTERED_DID)
-        buildJsonObject {
-            put(
-                "error",
-                buildJsonObject {
-                    put("type", JsonPrimitive("none"))
-                    put("code", JsonPrimitive("NONE"))
-                }
-            )
-        }
-    } catch (e: Throwable) {
-        val message = e.message ?: e.toString()
-        buildJsonObject {
-            put(
-                "error",
-                buildJsonObject {
-                    put("type", JsonPrimitive(e::class.simpleName ?: "Exception"))
-                    put("code", JsonPrimitive(extractScpCode(message)))
-                }
-            )
+private suspend fun opUnregisteredDidRejected(args: JsonObject): JsonObject =
+    uniffi.scp.Scp().use { scp ->
+        // UniFFI `scpidSign` takes an opaque `Identity` handle rather
+        // than a DID string, so the bridge-local registry lookup path
+        // the PyO3/NAPI/WASM bridges exercise is not reachable. Instead,
+        // we exercise the SAME error code via `identityResolve` on the
+        // fake DID: its 64-char zbase32 suffix decodes to 40 bytes (not
+        // the 32 required by did:dht), so `DidDht::extract_public_key`
+        // returns `IdentityError::InvalidDidFormat` locally (no DHT
+        // round-trip). The bridge's blanket `From<IdentityError>`
+        // mapping surfaces it as SCP-IDENT-1001 — the committed code
+        // every bridge agrees on.
+        try {
+            scp.identityResolve(FAKE_UNREGISTERED_DID)
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive("none"))
+                        put("code", JsonPrimitive("NONE"))
+                    }
+                )
+            }
+        } catch (e: Throwable) {
+            val message = e.message ?: e.toString()
+            buildJsonObject {
+                put(
+                    "error",
+                    buildJsonObject {
+                        put("type", JsonPrimitive(e::class.simpleName ?: "Exception"))
+                        put("code", JsonPrimitive(extractScpCode(message)))
+                    }
+                )
+            }
         }
     }
-}
 
 @Suppress("UnusedParameter")
-private suspend fun opEventLogQueryFiltered(args: JsonObject): JsonObject {
-    val filter = args["filter"]?.jsonObject ?: buildJsonObject {
-        put("event_type", JsonPrimitive("ContextCreated"))
+private suspend fun opEventLogQueryFiltered(args: JsonObject): JsonObject =
+    uniffi.scp.Scp().use { scp ->
+        val filter = args["filter"]?.jsonObject ?: buildJsonObject {
+            put("event_type", JsonPrimitive("ContextCreated"))
+        }
+        val identity = scp.identityCreate("in_memory", null)
+        val handle = scp.contextCreate(identity, buildContextParams())
+        val events = scp.eventLogQuery(
+            handle,
+            JSON.encodeToString(JsonElement.serializer(), filter)
+        )
+        val first = events.firstOrNull()
+        buildJsonObject {
+            put("event_count", JsonPrimitive(events.size))
+            put("first_event_type", JsonPrimitive(first?.eventType ?: ""))
+        }
     }
-    val identity = uniffi.scp.identityCreate("in_memory", null)
-    val handle = uniffi.scp.contextCreate(identity, buildContextParams())
-    val events = uniffi.scp.eventLogQuery(handle, JSON.encodeToString(JsonElement.serializer(), filter))
-    val first = events.firstOrNull()
-    return buildJsonObject {
-        put("event_count", JsonPrimitive(events.size))
-        put("first_event_type", JsonPrimitive(first?.eventType ?: ""))
-    }
-}
 
 // Fixed 32-byte nonce used when `signed_at_override` pins the SCPID
 // response. Must match
-// `bindings/python/tests/bridge_parity/seed_operations.py::PARITY_NONCE_HEX`
-// and `node_bridge_runner.ts::PARITY_NONCE_HEX`.
+// `bindings/python/tests/bridge_parity/seed_operations.py::PARITY_NONCE_HEX`.
 private const val PARITY_NONCE_HEX =
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
@@ -540,12 +521,9 @@ private const val PARITY_NONCE_HEX =
 private const val PARITY_CHALLENGE_EXPIRES_AT_MS = 9_999_999_999_000L
 
 /**
- * When `signed_at_override` is supplied, the challenge must match the
- * pinned fixture used by the Python harness and the scp-runtime
- * golden-value test. REPLACE the bridge-issued challenge with the
- * pinned one so every bridge feeds `scpid_sign` the same canonical
- * hash inputs. `expires_at` is set far in the future so wall-clock
- * expiry can't trip the bridge-side expiry check. Mirrors
+ * When `signed_at_override` is supplied, REPLACE the bridge-issued
+ * challenge with a pinned fixture so every bridge feeds `scpidSign` the
+ * same canonical hash inputs. Mirrors
  * `node_bridge_runner.ts::patchChallengeForOverride`.
  */
 private fun patchChallengeForOverride(
@@ -563,40 +541,35 @@ private fun patchChallengeForOverride(
     return JSON.encodeToString(JsonElement.serializer(), pinned)
 }
 
-private suspend fun opSignMessage(args: JsonObject): JsonObject {
-    val audience = args["audience"]?.jsonPrimitive?.content
-        ?: "https://parity-test.example.com"
-    val ttl = args["ttl_seconds"]?.jsonPrimitive?.longOrNull?.toULong() ?: 60uL
-    // Seed the identity so `#active` derives from the same bytes used by
-    // PyO3/NAPI/WASM, giving byte-identical Ed25519 signatures when
-    // combined with `signed_at_override`. Mirrors `opSignMessage` in
-    // `node_bridge_runner.ts`.
-    val seed = args["seed_hex"]?.jsonPrimitive?.content?.let { seedFromHex(it) }
-    // Optional `signed_at_override` (ms since epoch). When present,
-    // UniFFI's `scpidSign(…, signedAtOverride: ULong?)` pins the
-    // `signed_at` field in the canonical hash so signatures match
-    // across bridges. We also rewrite the challenge to match.
-    val signedAtOverride = args["signed_at_override"]?.jsonPrimitive?.longOrNull
-    val identity = uniffi.scp.identityCreate("in_memory", seed)
-    val challenge = uniffi.scp.scpidChallenge(audience, ttl)
-    val patched = patchChallengeForOverride(challenge, signedAtOverride)
-    val responseJson = uniffi.scp.scpidSign(
-        identity,
-        "#active",
-        patched,
-        signedAtOverride?.toULong()
-    )
-    val parsed = JSON.parseToJsonElement(responseJson).jsonObject
-    return buildJsonObject {
-        put("protocol", JsonPrimitive(parsed["protocol"]?.jsonPrimitive?.content ?: ""))
-        put("did", JsonPrimitive(parsed["did"]?.jsonPrimitive?.content ?: ""))
-        put(
-            "signing_key_id",
-            JsonPrimitive(parsed["signing_key_id"]?.jsonPrimitive?.content ?: "")
+private suspend fun opSignMessage(args: JsonObject): JsonObject =
+    uniffi.scp.Scp().use { scp ->
+        val audience = args["audience"]?.jsonPrimitive?.content
+            ?: "https://parity-test.example.com"
+        val ttl = args["ttl_seconds"]?.jsonPrimitive?.longOrNull?.toULong() ?: 60uL
+        val seed = args["seed_hex"]?.jsonPrimitive?.content?.let { seedFromHex(it) }
+        val signedAtOverride = args["signed_at_override"]?.jsonPrimitive?.longOrNull
+        val identity = scp.identityCreate("in_memory", seed)
+        // `scpidChallenge` is a stateless helper — remains a free function
+        // in `uniffi.scp`.
+        val challenge = uniffi.scp.scpidChallenge(audience, ttl)
+        val patched = patchChallengeForOverride(challenge, signedAtOverride)
+        val responseJson = scp.scpidSign(
+            identity,
+            "#active",
+            patched,
+            signedAtOverride?.toULong()
         )
-        put("signature", JsonPrimitive(parsed["signature"]?.jsonPrimitive?.content ?: ""))
+        val parsed = JSON.parseToJsonElement(responseJson).jsonObject
+        buildJsonObject {
+            put("protocol", JsonPrimitive(parsed["protocol"]?.jsonPrimitive?.content ?: ""))
+            put("did", JsonPrimitive(parsed["did"]?.jsonPrimitive?.content ?: ""))
+            put(
+                "signing_key_id",
+                JsonPrimitive(parsed["signing_key_id"]?.jsonPrimitive?.content ?: "")
+            )
+            put("signature", JsonPrimitive(parsed["signature"]?.jsonPrimitive?.content ?: ""))
+        }
     }
-}
 
 private suspend fun dispatch(req: RawRequest): String {
     return try {
@@ -637,8 +610,6 @@ private suspend fun dispatch(req: RawRequest): String {
 
 fun main() {
     // Emit a startup diagnostic in the same shape as the Bun runner.
-    // Parallel to bridge_parity_runner_loaded — lets operators confirm
-    // the runner is up before the first RPC.
     eprint("""{"event":"bridge_parity_runner_loaded","runner":"kotlin","bridge":"uniffi-kotlin"}""")
 
     val input = BufferedInputStream(System.`in`)
@@ -667,10 +638,8 @@ fun main() {
                     return@runBlocking
                 }
                 "reset" -> {
-                    // UniFFI Kotlin bindings hold their own module-global
-                    // state (ContextManager, identity registry). Nothing
-                    // runner-local to clear — return success so the
-                    // harness's per-test reset protocol is honored.
+                    // Per-op `Scp()` instances mean there are no module-level
+                    // runner caches to clear. Respond ok for harness parity.
                     writeFrame(output, okResponse(req.id, buildJsonObject { }))
                     continue
                 }

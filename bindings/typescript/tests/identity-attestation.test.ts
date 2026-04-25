@@ -3,19 +3,34 @@
  *
  * Covers:
  * - IdentityAttestation construction and serialization
- * - Identity attestation methods throw when bridge functions unavailable
  * - _fromRecord / _fromJson / _toBridgeRecord round-trip
+ *
+ * After Phase 4 PR 4 (#1549, ADR-048) Agent B1, `IdentityAttestation`
+ * and `RevocationStatus` are pure value types with no `SCP` backing —
+ * the old `(data, scp)` constructor signature collapsed to `(data,
+ * rawJson?)`. All bridge-touching verification lives on `SCP`.
  */
 
-import { describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { ValidationError } from "../src/errors";
 import { IdentityAttestation, RevocationStatus } from "../src/identity";
+import { SCP } from "../src/scp";
 
 // ---------------------------------------------------------------------------
 // IdentityAttestation class tests
 // ---------------------------------------------------------------------------
 
 describe("IdentityAttestation", () => {
+  let scp: SCP;
+
+  beforeEach(() => {
+    scp = new SCP();
+  });
+
+  afterEach(async () => {
+    await scp.shutdown(1);
+  });
+
   const sampleData = {
     id: "abc123",
     platform: "github.com",
@@ -129,6 +144,13 @@ describe("IdentityAttestation", () => {
     expect(roundtrip.verifiedAt).toBe(att.verifiedAt);
     expect(roundtrip.revocationStatus.status).toBe(att.revocationStatus.status);
     expect(roundtrip.platformId).toBe(att.platformId);
+  });
+
+  it("SCP instance constructs and shuts down cleanly alongside attestations", () => {
+    // Confirms the test-scoped SCP plumbing from beforeEach/afterEach
+    // still exercises an SCP instance — attestations themselves are
+    // now pure value types and no longer hold an SCP reference.
+    expect(typeof scp.instanceId).toBe("string");
   });
 
   it("RevocationStatus.active() creates active status", () => {

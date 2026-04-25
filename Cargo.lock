@@ -2719,6 +2719,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inventory"
+version = "0.3.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "009ae045c87e7082cb72dab0ccd01ae075dd00141ddc108f43a0ea150a9e7227"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4258,6 +4267,7 @@ checksum = "e5203598f366b11a02b13aa20cab591229ff0a89fd121a308a5df751d5fc9219"
 dependencies = [
  "cfg-if",
  "indoc",
+ "inventory",
  "libc",
  "memoffset",
  "once_cell",
@@ -5098,6 +5108,7 @@ dependencies = [
  "tempfile",
  "tls_codec",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
  "z-base-32",
@@ -5113,6 +5124,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "hex",
  "rand 0.8.5",
+ "rand_core 0.6.4",
  "scp-core",
  "scp-event-log",
  "scp-identity",
@@ -5201,10 +5213,12 @@ dependencies = [
  "scp-transport",
  "serde_json",
  "sha2 0.10.9",
+ "syn",
  "tempfile",
  "thiserror 2.0.18",
  "tls_codec",
  "tokio",
+ "tokio-util",
  "tracing",
  "uniffi",
  "uuid",

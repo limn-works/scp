@@ -1,22 +1,12 @@
 //! napi-rs bridge for provenance operations.
 //!
-//! Exposes SCP provenance quality evaluation and privacy operations to
-//! Node.js/Bun:
-//!
-//! - [`evaluate_provenance_quality`] -- Evaluate the provenance quality tier.
-//! - [`provenance_attach`] -- Attach provenance metadata at cross-context
-//!   boundaries.
-//! - [`provenance_check_chain_depth`] -- Check whether a provenance chain
-//!   depth is within the allowed limit.
-//! - [`provenance_redact_counterparties`] -- Remove counterparty DIDs (§24.3.5).
-//! - [`provenance_pseudonymize_counterparties`] -- Replace DIDs with
-//!   pseudonyms (§24.3.5).
-//! - [`provenance_update_source_type`] -- Update source type for state
-//!   changes (ADR-019 AC5).
+//! Per-bridge-instance (`_on`) implementations consumed by the corresponding
+//! methods on [`crate::scp::Scp`]. Phase D (#1695) deleted the
+//! free-function wrappers that routed through the process-global default
+//! bridge instance.
 //!
 //! See spec section 24 (Provenance System) and ADR-019.
 
-use napi_derive::napi;
 use scp_ffi_common::error_codes as codes;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
@@ -30,18 +20,17 @@ use scp_core::provenance::evaluate::{SourceContextState, evaluate_quality, updat
 use scp_core::provenance::{DataProvenance, DiscoveryMethod, SourceType};
 
 use crate::error::ScpNapiError;
+use crate::runtime::NapiBridgeInstance;
 
 // ---------------------------------------------------------------------------
-// Bridge functions
+// Per-bridge-instance implementations
 // ---------------------------------------------------------------------------
 
-/// Evaluates the provenance quality tier for a given data provenance record.
-///
-/// Returns an integer (0-3) representing the quality tier.
-#[napi]
+/// Per-bridge-instance implementation of `evaluate_provenance_quality`.
 #[allow(clippy::unused_async)]
 #[allow(clippy::needless_pass_by_value)]
-pub async fn evaluate_provenance_quality(
+pub(crate) async fn evaluate_provenance_quality_on(
+    _bi: &NapiBridgeInstance,
     source_context: Option<String>,
     source_type: String,
     context_state: String,
@@ -74,16 +63,11 @@ pub async fn evaluate_provenance_quality(
     Ok(quality as u32)
 }
 
-/// Attaches provenance metadata when data crosses a context boundary.
-///
-/// Records dual events in the event log: `ProvenanceAttached` in the source
-/// context and `ProvenanceReceived` in the target context (issue #586).
-///
-/// Returns a JSON string with the attached provenance record.
-#[napi]
+/// Per-bridge-instance implementation of [`provenance_attach`].
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)] // napi-rs requires explicit params
-pub fn provenance_attach(
+pub(crate) fn provenance_attach_on(
+    bi: &NapiBridgeInstance,
     source_context_id: String,
     source_type: String,
     memory_scope: String,
@@ -156,6 +140,7 @@ pub fn provenance_attach(
     // Best-effort: log warning if context not found (provenance_attach
     // can be called without a runtime context, e.g. in unit tests).
     if let Err(e) = append_provenance_event(
+        bi,
         &source_context_id,
         &actor_did,
         scp_event_log::EventType::ProvenanceAttached,
@@ -170,6 +155,7 @@ pub fn provenance_attach(
 
     // Record ProvenanceReceived in the target context event log.
     if let Err(e) = append_provenance_event(
+        bi,
         &target_context_id,
         &actor_did,
         scp_event_log::EventType::ProvenanceReceived,
@@ -215,11 +201,9 @@ pub fn provenance_attach(
     })
 }
 
-/// Checks whether the provenance chain depth is within the allowed limit.
-///
-/// Returns `true` if within limit, `false` otherwise.
-#[napi]
-pub fn provenance_check_chain_depth(
+/// Per-bridge-instance implementation of `provenance_check_chain_depth`.
+pub(crate) fn provenance_check_chain_depth_on(
+    _bi: &NapiBridgeInstance,
     chain_depth: u32,
     max_depth: Option<u32>,
 ) -> napi::Result<bool> {
@@ -251,13 +235,12 @@ pub fn provenance_check_chain_depth(
     Ok(check_chain_depth(&prov, max).is_ok())
 }
 
-/// Redacts counterparties from a provenance record (§24.3.5).
-///
-/// Accepts a JSON-serialized provenance record, removes all counterparty DIDs,
-/// and returns the modified record as a JSON string.
-#[napi]
+/// Per-bridge-instance implementation of `provenance_redact_counterparties`.
 #[allow(clippy::needless_pass_by_value)]
-pub fn provenance_redact_counterparties(provenance_json: String) -> napi::Result<String> {
+pub(crate) fn provenance_redact_counterparties_on(
+    _bi: &NapiBridgeInstance,
+    provenance_json: String,
+) -> napi::Result<String> {
     let mut prov: DataProvenance = serde_json::from_str(&provenance_json).map_err(|e| {
         napi::Error::from(ScpNapiError::Validation {
             message: format!("invalid provenance JSON: {e}"),
@@ -275,14 +258,10 @@ pub fn provenance_redact_counterparties(provenance_json: String) -> napi::Result
     })
 }
 
-/// Pseudonymizes counterparties in a provenance record (§24.3.5).
-///
-/// Accepts a JSON-serialized provenance record and a hex-encoded pseudonym key.
-/// Replaces real counterparty DIDs with deterministic context-scoped pseudonyms.
-/// Returns the modified record as a JSON string.
-#[napi]
+/// Per-bridge-instance implementation of `provenance_pseudonymize_counterparties`.
 #[allow(clippy::needless_pass_by_value)]
-pub fn provenance_pseudonymize_counterparties(
+pub(crate) fn provenance_pseudonymize_counterparties_on(
+    _bi: &NapiBridgeInstance,
     provenance_json: String,
     pseudonym_key_hex: String,
 ) -> napi::Result<String> {
@@ -310,14 +289,10 @@ pub fn provenance_pseudonymize_counterparties(
     })
 }
 
-/// Updates the source type of a provenance record to reflect a new context
-/// state (ADR-019 AC5).
-///
-/// Accepts a JSON-serialized provenance record and a context state string.
-/// Returns the modified record as a JSON string.
-#[napi]
+/// Per-bridge-instance implementation of `provenance_update_source_type`.
 #[allow(clippy::needless_pass_by_value)]
-pub fn provenance_update_source_type(
+pub(crate) fn provenance_update_source_type_on(
+    _bi: &NapiBridgeInstance,
     provenance_json: String,
     new_state: String,
 ) -> napi::Result<String> {
@@ -349,6 +324,7 @@ pub fn provenance_update_source_type(
 ///
 /// Follows the unsigned-event pattern used by `ToolInvoked` in the MCP bridge.
 fn append_provenance_event(
+    bi: &NapiBridgeInstance,
     context_id: &str,
     actor_did: &str,
     event_type: scp_event_log::EventType,
@@ -359,7 +335,7 @@ fn append_provenance_event(
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
 
-    crate::runtime::with_context(context_id, |state| {
+    crate::runtime::with_context(bi, context_id, |state| {
         let sequence = scp_event_log::tree::event_count(&state.core.event_log);
         let prev_hash = if state.core.event_log.leaves().is_empty() {
             scp_event_log::tree::GENESIS_PREV_HASH
@@ -526,23 +502,31 @@ fn parse_counterparty_policy(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::runtime::NapiBridgeInstance;
+
+    fn test_bi() -> NapiBridgeInstance {
+        NapiBridgeInstance::new_napi()
+    }
 
     #[test]
     fn check_chain_depth_within_limit() {
-        assert!(provenance_check_chain_depth(0, None).unwrap());
-        assert!(provenance_check_chain_depth(8, None).unwrap()); // default is 8 (ADR-043)
+        let bi = test_bi();
+        assert!(provenance_check_chain_depth_on(&bi, 0, None).unwrap());
+        assert!(provenance_check_chain_depth_on(&bi, 8, None).unwrap()); // default is 8 (ADR-043)
     }
 
     #[test]
     fn check_chain_depth_exceeds_limit() {
-        assert!(!provenance_check_chain_depth(9, None).unwrap()); // 9 > default 8
-        assert!(!provenance_check_chain_depth(2, Some(1)).unwrap());
+        let bi = test_bi();
+        assert!(!provenance_check_chain_depth_on(&bi, 9, None).unwrap()); // 9 > default 8
+        assert!(!provenance_check_chain_depth_on(&bi, 2, Some(1)).unwrap());
     }
 
     #[test]
     fn check_chain_depth_rejects_out_of_u8_range() {
-        assert!(provenance_check_chain_depth(256, None).is_err());
-        assert!(provenance_check_chain_depth(0, Some(256)).is_err());
+        let bi = test_bi();
+        assert!(provenance_check_chain_depth_on(&bi, 256, None).is_err());
+        assert!(provenance_check_chain_depth_on(&bi, 0, Some(256)).is_err());
     }
 
     #[test]
@@ -575,6 +559,7 @@ mod tests {
 
     #[test]
     fn redact_counterparties_removes_dids() {
+        let bi = test_bi();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -589,7 +574,7 @@ mod tests {
             "payment_adapter": null,
             "payment_receipt_id": null
         });
-        let result = provenance_redact_counterparties(prov_json.to_string()).unwrap();
+        let result = provenance_redact_counterparties_on(&bi, prov_json.to_string()).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["counterparties"], serde_json::json!([]));
         assert_eq!(parsed["source_context"], "ctx-test");
@@ -597,6 +582,7 @@ mod tests {
 
     #[test]
     fn pseudonymize_counterparties_deterministic() {
+        let bi = test_bi();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -613,9 +599,10 @@ mod tests {
         });
         let key_hex = hex::encode(b"test-key");
         let result1 =
-            provenance_pseudonymize_counterparties(prov_json.to_string(), key_hex.clone()).unwrap();
+            provenance_pseudonymize_counterparties_on(&bi, prov_json.to_string(), key_hex.clone())
+                .unwrap();
         let result2 =
-            provenance_pseudonymize_counterparties(prov_json.to_string(), key_hex).unwrap();
+            provenance_pseudonymize_counterparties_on(&bi, prov_json.to_string(), key_hex).unwrap();
         assert_eq!(result1, result2);
 
         let parsed: serde_json::Value = serde_json::from_str(&result1).unwrap();
@@ -626,6 +613,7 @@ mod tests {
 
     #[test]
     fn update_source_type_changes_type() {
+        let bi = test_bi();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -640,20 +628,25 @@ mod tests {
             "payment_adapter": null,
             "payment_receipt_id": null
         });
-        let result =
-            provenance_update_source_type(prov_json.to_string(), "closed_ephemeral".to_owned())
-                .unwrap();
+        let result = provenance_update_source_type_on(
+            &bi,
+            prov_json.to_string(),
+            "closed_ephemeral".to_owned(),
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["source_type"], "Ephemeral");
     }
 
     #[test]
     fn redact_counterparties_invalid_json_fails() {
-        assert!(provenance_redact_counterparties("not json".to_owned()).is_err());
+        let bi = test_bi();
+        assert!(provenance_redact_counterparties_on(&bi, "not json".to_owned()).is_err());
     }
 
     #[test]
     fn pseudonymize_counterparties_invalid_hex_fails() {
+        let bi = test_bi();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -669,13 +662,18 @@ mod tests {
             "payment_receipt_id": null
         });
         assert!(
-            provenance_pseudonymize_counterparties(prov_json.to_string(), "not-hex-zz".to_owned())
-                .is_err()
+            provenance_pseudonymize_counterparties_on(
+                &bi,
+                prov_json.to_string(),
+                "not-hex-zz".to_owned()
+            )
+            .is_err()
         );
     }
 
     #[test]
     fn update_source_type_invalid_state_fails() {
+        let bi = test_bi();
         let prov_json = serde_json::json!({
             "source_context": "ctx-test",
             "source_type": "Persistent",
@@ -691,7 +689,8 @@ mod tests {
             "payment_receipt_id": null
         });
         assert!(
-            provenance_update_source_type(prov_json.to_string(), "invalid".to_owned()).is_err()
+            provenance_update_source_type_on(&bi, prov_json.to_string(), "invalid".to_owned())
+                .is_err()
         );
     }
 }

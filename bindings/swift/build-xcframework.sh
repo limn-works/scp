@@ -162,9 +162,11 @@ fi
 # ---------------------------------------------------------------------------
 
 log "Generating Swift bindings and C header via uniffi-bindgen"
+# shellcheck disable=SC2086
 cargo run \
     -p scp-ffi-uniffi \
     --bin uniffi-bindgen \
+    $EXTRA_FEATURES \
     -- generate \
     --library "$HOST_DYLIB" \
     --language swift \

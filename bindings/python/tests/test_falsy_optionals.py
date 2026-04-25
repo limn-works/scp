@@ -22,7 +22,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -143,59 +143,69 @@ def _make_mock_ucan_bridge() -> MagicMock:
 
 
 class TestUcanMintProofsFalsy:
-    """H14: scp_sdk.ucan.mint must distinguish empty proofs from None.
+    """H14: :meth:`SCP.ucan_mint` must distinguish empty proofs from ``None``.
 
-    These tests are `async def` so pytest-asyncio (auto mode) drives them
-    on its own event loop. Do NOT use `asyncio.run()` here -- it would
-    close the running loop and break sibling tests that rely on the
-    default loop existing (e.g. test_identity_attestation.py).
+    Phase 4 PR 5 Agent B+C (#1549) moved the ``mint`` free function from
+    :mod:`scp_sdk.ucan` onto :meth:`SCP.ucan_mint`. The SDK must still
+    forward an empty list verbatim so the bridge sees ``[]`` (declares
+    "no proofs") rather than ``None`` (declares "proofs not specified").
+
+    These tests are ``async def`` so pytest-asyncio (auto mode) drives
+    them on its own event loop. Do NOT use ``asyncio.run()`` here — it
+    would close the running loop and break sibling tests.
     """
 
     async def test_empty_proofs_passes_empty_list(self) -> None:
-        from scp_sdk.ucan import mint
+        from scp_sdk.scp import SCP
 
         bridge = _make_mock_ucan_bridge()
-        with patch("scp_sdk.ucan._scp_core", bridge):
-            # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.ucan._scp_core
-            await mint(
-                audience="did:dht:zBob",
-                capabilities=["messages:read"],
-                context="ctx-1",
-                proofs=[],
-            )
+        scp = MagicMock()
+        scp._native = bridge
+
+        await SCP.ucan_mint(
+            scp,
+            "ctx-1",
+            "did:dht:zBob",
+            ["messages:read"],
+            [],
+        )
 
         # Positional args to ucan_mint: context, audience, capabilities, proofs
         call_args = bridge.ucan_mint.call_args[0]
         assert call_args[3] == [], f"empty proofs must be passed as `[]`, got {call_args[3]!r}"
 
     async def test_none_proofs_passes_none(self) -> None:
-        from scp_sdk.ucan import mint
+        from scp_sdk.scp import SCP
 
         bridge = _make_mock_ucan_bridge()
-        with patch("scp_sdk.ucan._scp_core", bridge):
-            # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.ucan._scp_core
-            await mint(
-                audience="did:dht:zBob",
-                capabilities=["messages:read"],
-                context="ctx-1",
-                proofs=None,
-            )
+        scp = MagicMock()
+        scp._native = bridge
+
+        await SCP.ucan_mint(
+            scp,
+            "ctx-1",
+            "did:dht:zBob",
+            ["messages:read"],
+            None,
+        )
 
         call_args = bridge.ucan_mint.call_args[0]
         assert call_args[3] is None
 
     async def test_populated_proofs_passes_list(self) -> None:
-        from scp_sdk.ucan import mint
+        from scp_sdk.scp import SCP
 
         bridge = _make_mock_ucan_bridge()
-        with patch("scp_sdk.ucan._scp_core", bridge):
-            # SCP-DEFAULT-INSTANCE-OK: mocked via @patch on scp_sdk.ucan._scp_core
-            await mint(
-                audience="did:dht:zBob",
-                capabilities=["messages:read"],
-                context="ctx-1",
-                proofs=["parent-token-cid-1", "parent-token-cid-2"],
-            )
+        scp = MagicMock()
+        scp._native = bridge
+
+        await SCP.ucan_mint(
+            scp,
+            "ctx-1",
+            "did:dht:zBob",
+            ["messages:read"],
+            ["parent-token-cid-1", "parent-token-cid-2"],
+        )
 
         call_args = bridge.ucan_mint.call_args[0]
         assert call_args[3] == ["parent-token-cid-1", "parent-token-cid-2"]

@@ -2,20 +2,27 @@
 //
 // Covers:
 //   - SCP.withSqlite convenience companion (PR 3 StorageConfig::Sqlite)
-//   - suspend / resume / shutdown routing through CoroutineBridge
+//   - suspendInstance / resume / shutdown routing through CoroutineBridge
 //   - ffiCallSuspend wiring for UniFFI-generated `suspend fun` bindings
+//
+// Each test gets a fresh `SCP` via `@BeforeEach` and a deterministic
+// shutdown via `@AfterEach`, so tests don't leak runtime state across the
+// suite. After Phase 4 PR 4 (demolition) there is no `SCP.default()` —
+// every caller must construct `SCP()` explicitly.
 //
 // All tests require the compiled UniFFI cdylib; if the native library is not
 // loadable the suite skips via JUnit 5 assumptions, matching RealFFITest.
 //
-// Provenance: #1549 Phase 4 PR 3 (Kotlin slice). ADR-048.
+// Provenance: #1549 Phase 4 PR 3 / PR 4 (Kotlin slice). ADR-048.
 
 package works.limn.scp
 
 import java.nio.file.Files
+import kotlin.test.assertNotEquals
+import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
-import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.AfterEach
@@ -25,8 +32,6 @@ import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import works.limn.scp.bridge.CoroutineBridge
 import works.limn.scp.conformance.ConformanceStubBindings
-import kotlin.test.assertNotEquals
-import kotlin.test.assertTrue
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class ScpClassTest {
@@ -54,7 +59,7 @@ class ScpClassTest {
         }
     }
 
-    private val createdInstances = mutableListOf<SCP>()
+    private lateinit var scp: SCP
 
     private fun bridge(): CoroutineBridge =
         CoroutineBridge(
@@ -64,20 +69,18 @@ class ScpClassTest {
         )
 
     @BeforeEach
-    fun requireNative() {
+    fun setUp() {
         assumeTrue(nativeAvailable, skipReason)
+        scp = SCP()
     }
 
     @AfterEach
-    fun cleanup() {
-        // Drain any SCP instances the test created. A second shutdown is a
-        // no-op at the SDK surface (AlreadyShutDown is swallowed), so this
-        // is safe even if the test already called shutdown() explicitly.
-        val bridge = bridge()
-        for (scp in createdInstances) {
-            runBlocking { scp.shutdown(bridge, 1.seconds) }
-        }
-        createdInstances.clear()
+    fun tearDown() {
+        if (!this::scp.isInitialized) return
+        // A second shutdown is a no-op at the SDK surface (AlreadyShutDown
+        // is swallowed), so this is safe even if the test already called
+        // shutdown() explicitly.
+        runBlocking { scp.shutdown(bridge(), 1.seconds) }
     }
 
     // ── withSqlite ────────────────────────────────────────────────
@@ -89,12 +92,12 @@ class ScpClassTest {
             dir.deleteOnExit()
             val key = ByteArray(32) { it.toByte() }
 
-            val scp = SCP.withSqlite(dir, key)
-            createdInstances += scp
+            val instance = SCP.withSqlite(dir, key)
 
             // The instance id is a monotonic counter; a fresh instance must
             // not collide with the reserved UNSET_INSTANCE_ID (0).
-            assertNotEquals(0UL, scp.instanceId, "instanceId must not be UNSET")
+            assertNotEquals(0UL, instance.instanceId, "instanceId must not be UNSET")
+            instance.shutdown(bridge(), 1.seconds)
         }
 
     @Test
@@ -108,42 +111,34 @@ class ScpClassTest {
 
             val a = SCP.withSqlite(dirA, key)
             val b = SCP.withSqlite(dirB, key)
-            createdInstances += a
-            createdInstances += b
 
             assertNotEquals(
                 a.instanceId,
                 b.instanceId,
                 "each SCP.withSqlite(...) must produce an independent UniffiBridgeInstance",
             )
+            a.shutdown(bridge(), 1.seconds)
+            b.shutdown(bridge(), 1.seconds)
         }
 
-    // ── resume routed through ffiCallSuspend ──────────────────────
+    // ── Lifecycle routed through CoroutineBridge ──────────────────
 
     @Test
     fun `resume invokes the async FFI path without blocking`() =
         runTest {
-            val scp = SCP()
-            createdInstances += scp
-            val bridge = bridge()
-
             // resume() is async in PR 3B. If the SDK routed it through
             // ffiCall (non-suspend) this would either fail to compile or
             // blow up at runtime; reaching `assertTrue(true)` means the
             // suspend path executed end-to-end.
-            scp.resume(bridge)
+            scp.resume(bridge())
             assertTrue(true)
         }
 
     @Test
-    fun `suspend-then-resume round-trips via CoroutineBridge`() =
+    fun `suspendInstance-then-resume round-trips via CoroutineBridge`() =
         runTest {
-            val scp = SCP()
-            createdInstances += scp
-            val bridge = bridge()
-
-            scp.suspend(bridge)
-            scp.resume(bridge)
+            scp.suspendInstance(bridge())
+            scp.resume(bridge())
             assertTrue(true)
         }
 
@@ -152,14 +147,22 @@ class ScpClassTest {
     @Test
     fun `shutdown twice is idempotent`() =
         runTest {
-            val scp = SCP()
-            createdInstances += scp
-            val bridge = bridge()
-
-            scp.shutdown(bridge, 1.seconds)
+            scp.shutdown(bridge(), 1.seconds)
             // Second shutdown must not throw — the SDK swallows
             // AlreadyShutDown at the wrapper layer.
-            scp.shutdown(bridge, 1.seconds)
+            scp.shutdown(bridge(), 1.seconds)
             assertTrue(true)
+        }
+
+    @Test
+    fun `fresh SCP instances have distinct ids`() =
+        runTest {
+            val second = SCP()
+            assertNotEquals(
+                scp.instanceId,
+                second.instanceId,
+                "SCP() must allocate fresh instances, not reuse a cached handle",
+            )
+            second.shutdown(bridge(), 1.seconds)
         }
 }

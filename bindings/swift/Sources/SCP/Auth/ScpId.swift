@@ -6,7 +6,14 @@
 // The bridge functions exchange JSON strings; this wrapper layer
 // deserializes them into typed Swift structs for ergonomic consumption.
 //
-// Provenance: spec section 3.11 (SCPID), ADR-039 (Shared-DID Agent Binding)
+// Phase 4 PR 4 (ADR-048 demolition, #1549) moved `scpidSign` and
+// `scpidVerify` from free UniFFI functions onto the `Scp` opaque class.
+// `ScpId.sign(...)` and `ScpId.verify(...)` therefore require an
+// explicit ``SCP`` parameter; `ScpId.challenge(...)` remains a free
+// function since it does not depend on any per-bridge state.
+//
+// Provenance: spec section 3.11 (SCPID), ADR-039 (Shared-DID Agent Binding),
+//             ADR-048 (Multi-instance SCP)
 
 import Foundation
 
@@ -15,9 +22,9 @@ import Foundation
 /// SCPID challenge issued by a relying party (spec section 3.11.2).
 ///
 /// Contains a CSPRNG nonce, audience binding, and validity window.
-/// Produced by ``ScpId/challenge(audience:ttl:challengeFn:)`` and consumed
-/// by ``ScpId/sign(identity:signingKeyId:challenge:signFn:)`` and
-/// ``ScpId/verify(response:challenge:verifyFn:)``.
+/// Produced by ``ScpId/challenge(audience:ttl:)`` and consumed
+/// by ``ScpId/sign(scp:identity:signingKeyId:challenge:)`` and
+/// ``ScpId/verify(scp:response:challenge:)``.
 public nonisolated struct ScpIdChallenge: Sendable {
     /// Protocol identifier and version (always `"scpid/1.0"`).
     public let protocolVersion: String
@@ -35,8 +42,8 @@ public nonisolated struct ScpIdChallenge: Sendable {
     public let expiresAt: UInt64
 
     /// The raw JSON string returned by the bridge. Preserved for passing
-    /// to ``ScpId/sign(identity:signingKeyId:challenge:signFn:)`` and
-    /// ``ScpId/verify(response:challenge:verifyFn:)`` without re-serialization.
+    /// to ``ScpId/sign(scp:identity:signingKeyId:challenge:)`` and
+    /// ``ScpId/verify(scp:response:challenge:)`` without re-serialization.
     public let json: String
 }
 
@@ -67,13 +74,13 @@ public nonisolated struct ScpIdResponse: Sendable {
     public let signature: String
 
     /// The raw JSON string returned by the bridge. Preserved for passing
-    /// to ``ScpId/verify(response:challenge:verifyFn:)`` without re-serialization.
+    /// to ``ScpId/verify(scp:response:challenge:)`` without re-serialization.
     public let json: String
 }
 
 /// Result of a successful SCPID verification (spec section 3.11.4).
 ///
-/// Returned by ``ScpId/verify(response:challenge:verifyFn:)`` when all
+/// Returned by ``ScpId/verify(scp:response:challenge:)`` when all
 /// verification steps pass.
 public nonisolated struct ScpIdAuthentication: Sendable {
     /// The authenticated DID.
@@ -137,13 +144,13 @@ private struct AuthenticationWire: Decodable {
     }
 }
 
-// MARK: - Bridge Function Types
+// MARK: - Public API
 
 /// Namespace for SCPID authentication operations (spec section 3.11).
 ///
 /// Uses the caseless-enum namespace pattern consistent with the Swift SDK.
-/// All functions delegate to UniFFI bridge functions and parse their JSON
-/// results into typed Swift structs.
+/// All operations delegate to UniFFI bridge functions/methods and parse
+/// their JSON results into typed Swift structs.
 public enum ScpId {
     /// Bridge function type for generating an SCPID challenge.
     public typealias ChallengeFn = @Sendable (
@@ -164,30 +171,44 @@ public enum ScpId {
         _ challengeJson: String
     ) throws -> String
 
-    /// Default challenge function — delegates to UniFFI
-    /// ``scpidChallenge(audience:ttlSeconds:)``.
-    public static let defaultChallenge: ChallengeFn = { audience, ttlSeconds in
-        try scpidChallenge(audience: audience, ttlSeconds: ttlSeconds)
-    }
-
-    /// Default sign function — delegates to UniFFI
-    /// ``scpidSign(identity:signingKeyId:challengeJson:signedAtOverride:)``.
-    /// The `signedAtOverride` argument is a testing-feature parity affordance
-    /// (ADR-046) rejected on production builds; the SDK wrapper always passes
-    /// `nil` so `signed_at` reflects the real wall clock.
-    public static let defaultSign: SignFn = { identity, signingKeyId, challengeJson in
-        try scpidSign(
-            identity: identity,
-            signingKeyId: signingKeyId,
-            challengeJson: challengeJson,
-            signedAtOverride: nil
+    /// Unbound challenge function — placeholder; callers must supply an
+    /// `SCP`-bound closure via the SDK wrapper because the free
+    /// `scpidChallenge` UniFFI export was removed in Phase 4 PR 5
+    /// (ADR-048) and replaced with `Scp::scpid_challenge` (per-instance)
+    /// so all SCPID operations route through the caller's own `SCP`
+    /// rather than a process-global default.
+    public static let unboundChallenge: ChallengeFn = { _, _ in
+        throw ScpError.Identity(
+            msg: "scpidChallenge is unbound — pass an SCP-bound closure (see SCP.scpidChallenge)",
+            code: "SCP-IDENT-1046"
         )
     }
 
-    /// Default verify function — delegates to UniFFI
-    /// ``scpidVerify(responseJson:challengeJson:)``.
-    public static let defaultVerify: VerifyFn = { responseJson, challengeJson in
-        try scpidVerify(responseJson: responseJson, challengeJson: challengeJson)
+    /// Unbound sign function — placeholder; callers must supply an
+    /// `SCP`-bound closure via the SDK wrapper because the free
+    /// `scpidSign` UniFFI export was removed in Phase 4 PR 5 (ADR-048)
+    /// and replaced with `Scp::scpid_sign` (per-instance) so signing
+    /// routes through the caller's own `SCP` identity registry rather
+    /// than a process-global default.
+    public static let unboundSign: SignFn = { _, _, _ in
+        throw ScpError.Identity(
+            msg: "scpidSign is unbound — pass an SCP-bound closure (see SCP.scpidSign)",
+            code: "SCP-IDENT-1046"
+        )
+    }
+
+    /// Unbound verify function — placeholder; callers must supply an
+    /// `SCP`-bound closure via the SDK wrapper because the free
+    /// `scpidVerify` UniFFI export was removed in Phase 4 PR 5
+    /// (ADR-048) and replaced with `Scp::scpid_verify` (per-instance)
+    /// so the DID resolver used for signature verification is routed
+    /// through the caller's own `SCP` rather than a process-global
+    /// default.
+    public static let unboundVerify: VerifyFn = { _, _ in
+        throw ScpError.Identity(
+            msg: "scpidVerify is unbound — pass an SCP-bound closure (see SCP.scpidVerify)",
+            code: "SCP-IDENT-1046"
+        )
     }
 
     // MARK: - Public API
@@ -197,11 +218,14 @@ public enum ScpId {
     /// Creates a challenge with a 32-byte CSPRNG nonce, audience binding,
     /// and validity window based on the TTL.
     ///
+    /// This operation does not depend on any per-``SCP`` bridge state —
+    /// the UniFFI bridge exposes it as a free function backed by an
+    /// `OsRng` in Rust.
+    ///
     /// - Parameters:
     ///   - audience: URI identifying the relying party.
     ///   - ttl: Time-to-live for the challenge. Defaults to 300 seconds.
     ///     Must be between 1 and 300 seconds.
-    ///   - challengeFn: Bridge function override for testing.
     /// - Returns: An ``ScpIdChallenge`` with the challenge fields.
     /// - Throws: ``ScpError`` if the audience is empty or TTL is out of range.
     ///
@@ -210,8 +234,7 @@ public enum ScpId {
     /// - Spec section 3.11.2 (Challenge Generation)
     public static func challenge(
         audience: String,
-        ttl: TimeInterval = 300,
-        challengeFn: ChallengeFn = defaultChallenge
+        ttl: TimeInterval = 300
     ) throws -> ScpIdChallenge {
         guard ttl.isFinite, ttl >= 1, ttl <= 300 else {
             throw ScpError.Validation(
@@ -220,7 +243,7 @@ public enum ScpId {
             )
         }
         let ttlSeconds = UInt64(ttl.rounded(.up))
-        let json = try challengeFn(audience, ttlSeconds)
+        let json = try scpidChallenge(audience: audience, ttlSeconds: ttlSeconds)
         let wire = try JSONDecoder().decode(ChallengeWire.self, from: Data(json.utf8))
         return ScpIdChallenge(
             protocolVersion: wire.protocolVersion,
@@ -238,10 +261,10 @@ public enum ScpId {
     /// identity, and produces a signed SCPID response.
     ///
     /// - Parameters:
+    ///   - scp: The SDK-level ``SCP`` instance that minted ``identity``.
     ///   - identity: The identity to sign with.
     ///   - signingKeyId: Which key to sign with: `"#active"` or `"#agent"`.
-    ///   - challenge: The challenge to sign (from ``challenge(audience:ttl:challengeFn:)``).
-    ///   - signFn: Bridge function override for testing.
+    ///   - challenge: The challenge to sign (from ``challenge(audience:ttl:)``).
     /// - Returns: An ``ScpIdResponse`` with the signed response fields.
     /// - Throws: ``ScpError`` if the identity lacks the requested key or signing fails.
     ///
@@ -249,13 +272,16 @@ public enum ScpId {
     ///
     /// - Spec section 3.11.3 (Response Signing)
     /// - ADR-039 (Shared-DID Agent Binding)
+    /// - ADR-048 (Multi-instance SCP)
     public static func sign(
+        scp: SCP,
         identity: Identity,
         signingKeyId: String,
-        challenge: ScpIdChallenge,
-        signFn: SignFn = defaultSign
+        challenge: ScpIdChallenge
     ) throws -> ScpIdResponse {
-        let json = try signFn(identity, signingKeyId, challenge.json)
+        let json = try scp.scpidSign(
+            identity: identity, signingKeyId: signingKeyId, challengeJson: challenge.json
+        )
         let wire = try JSONDecoder().decode(ResponseWire.self, from: Data(json.utf8))
         return ScpIdResponse(
             protocolVersion: wire.protocolVersion,
@@ -272,13 +298,13 @@ public enum ScpId {
     /// Verifies a signed SCPID response against the original challenge (spec section 3.11.4).
     ///
     /// Resolves the signer's DID document and runs the 11-step verification
-    /// pipeline. A DID resolver must be initialized (via identity creation)
-    /// before calling this method.
+    /// pipeline. A DID resolver must be initialized (via identity creation on
+    /// the same ``SCP``) before calling this method.
     ///
     /// - Parameters:
+    ///   - scp: The SDK-level ``SCP`` instance used to resolve the signer's DID.
     ///   - response: The signed response to verify.
     ///   - challenge: The original challenge that was signed.
-    ///   - verifyFn: Bridge function override for testing.
     /// - Returns: An ``ScpIdAuthentication`` with the verified identity fields.
     /// - Throws: ``ScpError`` if verification fails (expired, signature invalid,
     ///   DID resolution failed, etc.).
@@ -286,12 +312,13 @@ public enum ScpId {
     /// ## Provenance
     ///
     /// - Spec section 3.11.4 (Verification Pipeline)
+    /// - ADR-048 (Multi-instance SCP)
     public static func verify(
+        scp: SCP,
         response: ScpIdResponse,
-        challenge: ScpIdChallenge,
-        verifyFn: VerifyFn = defaultVerify
+        challenge: ScpIdChallenge
     ) throws -> ScpIdAuthentication {
-        let json = try verifyFn(response.json, challenge.json)
+        let json = try scp.scpidVerify(responseJson: response.json, challengeJson: challenge.json)
         let wire = try JSONDecoder().decode(AuthenticationWire.self, from: Data(json.utf8))
         return ScpIdAuthentication(
             did: wire.did,

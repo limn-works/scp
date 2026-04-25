@@ -769,6 +769,48 @@ pub fn validate_attestation_fields(
 }
 
 // ---------------------------------------------------------------------------
+// Fixed-length byte narrowing
+// ---------------------------------------------------------------------------
+
+/// Narrows a byte slice to a fixed-length `[u8; N]` array, returning a
+/// human-readable message on length mismatch.
+///
+/// All four FFI bridges narrow caller-supplied `Vec<u8>` / `Buffer` /
+/// `Uint8Array` parameters to fixed-length arrays (most commonly the
+/// 32-byte `testing_seed`). This helper centralizes the `TryFrom` +
+/// length-mismatch-message pattern so bridges agree on wording — each
+/// bridge wraps the returned `String` in its own error type with the
+/// appropriate `SCP-VALID-XXXX` code.
+///
+/// # Errors
+///
+/// Returns `Err` with a message of the form `"{field} must be exactly
+/// {N} bytes, got {actual}"` when `bytes.len() != N`.
+pub fn expect_fixed_bytes<const N: usize>(bytes: &[u8], field: &str) -> Result<[u8; N], String> {
+    <[u8; N]>::try_from(bytes)
+        .map_err(|_| format!("{field} must be exactly {N} bytes, got {}", bytes.len()))
+}
+
+/// Narrows a byte slice to a zeroize-wrapped `Zeroizing<[u8; N]>`.
+///
+/// Same contract as [`expect_fixed_bytes`], but the returned array is
+/// wrapped in `zeroize::Zeroizing` so it is overwritten when dropped.
+/// Use for private-key material (sender keys, bridge credential keys,
+/// any 32-byte Ed25519/X25519 seed): the common shape is `raw Vec<u8>
+/// → narrow → Zeroizing<[u8; 32]>` and this helper eliminates the
+/// repeated `Zeroizing::new(expect_fixed_bytes::<32>(...))` dance.
+///
+/// # Errors
+///
+/// Same as [`expect_fixed_bytes`] — length-mismatch string.
+pub fn expect_fixed_bytes_zeroized<const N: usize>(
+    bytes: &[u8],
+    field: &str,
+) -> Result<zeroize::Zeroizing<[u8; N]>, String> {
+    expect_fixed_bytes::<N>(bytes, field).map(zeroize::Zeroizing::new)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1537,5 +1579,71 @@ mod tests {
         };
         let err = validate_governance_action_strings(&action).unwrap_err();
         assert!(err.message.contains("HTML-special character"));
+    }
+
+    // -- Fixed-length byte narrowing --
+
+    #[test]
+    fn expect_fixed_bytes_accepts_exact_length() {
+        let bytes = [0_u8; 32];
+        let arr: [u8; 32] = expect_fixed_bytes(&bytes, "testing_seed").unwrap();
+        assert_eq!(arr, [0_u8; 32]);
+    }
+
+    #[test]
+    fn expect_fixed_bytes_rejects_short_slice() {
+        let bytes = [0_u8; 31];
+        let err = expect_fixed_bytes::<32>(&bytes, "testing_seed").unwrap_err();
+        assert_eq!(err, "testing_seed must be exactly 32 bytes, got 31");
+    }
+
+    #[test]
+    fn expect_fixed_bytes_rejects_long_slice() {
+        let bytes = [0_u8; 33];
+        let err = expect_fixed_bytes::<32>(&bytes, "testing_seed").unwrap_err();
+        assert_eq!(err, "testing_seed must be exactly 32 bytes, got 33");
+    }
+
+    #[test]
+    fn expect_fixed_bytes_rejects_empty_slice() {
+        let bytes: [u8; 0] = [];
+        let err = expect_fixed_bytes::<32>(&bytes, "testing_seed").unwrap_err();
+        assert_eq!(err, "testing_seed must be exactly 32 bytes, got 0");
+    }
+
+    #[test]
+    fn expect_fixed_bytes_uses_provided_field_name() {
+        let bytes = [0_u8; 10];
+        let err = expect_fixed_bytes::<32>(&bytes, "session_key").unwrap_err();
+        assert!(err.starts_with("session_key must be exactly 32 bytes"));
+    }
+
+    // -- Zeroize-wrapped narrowing --
+
+    #[test]
+    fn expect_fixed_bytes_zeroized_accepts_exact_length() {
+        let bytes = [7_u8; 32];
+        let wrapped: zeroize::Zeroizing<[u8; 32]> =
+            expect_fixed_bytes_zeroized(&bytes, "sender_key").unwrap();
+        // Deref through Zeroizing to compare array contents.
+        assert_eq!(*wrapped, [7_u8; 32]);
+    }
+
+    #[test]
+    fn expect_fixed_bytes_zeroized_rejects_wrong_length() {
+        let bytes = [0_u8; 31];
+        let err = expect_fixed_bytes_zeroized::<32>(&bytes, "sender_key").unwrap_err();
+        assert_eq!(err, "sender_key must be exactly 32 bytes, got 31");
+    }
+
+    /// Confirms that `Zeroizing<[u8; N]>` carries the `ZeroizeOnDrop`
+    /// marker trait — this is the whole point of the helper. If the
+    /// zeroize crate ever drops this impl, the helper loses its
+    /// security guarantee and the migration sites should be revisited.
+    #[test]
+    fn zeroizing_fixed_array_is_zeroize_on_drop() {
+        fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
+        assert_zeroize_on_drop::<zeroize::Zeroizing<[u8; 32]>>();
+        assert_zeroize_on_drop::<zeroize::Zeroizing<[u8; 64]>>();
     }
 }

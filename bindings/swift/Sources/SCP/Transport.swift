@@ -55,134 +55,25 @@ public nonisolated struct TransportConfig: Sendable {
     }
 }
 
-// MARK: - TransportBridge
+// MARK: - SCP transport convenience
 
-/// Namespace for UniFFI bridge function references used by transport operations.
-/// Each typealias maps 1:1 to a UniFFI-generated async function. Closures are
-/// injected for testability; defaults call through to ScpBindings.
-///
-/// See ADR-026 for the flat delegation pattern and ADR-005 for transport spec.
-public enum TransportBridge {
-    /// Connect to a relay. Maps to ``transportConnect`` in ScpBindings.
-    public typealias ConnectFn = @Sendable (
-        _ relayUrl: String
-    ) async throws -> TransportManager
-
-    /// Query transport status. Maps to ``transportStatus`` in ScpBindings.
-    public typealias StatusFn = @Sendable (
-        _ manager: TransportManager
-    ) async throws -> TransportStatus
-
-    /// Disconnect from a relay. Maps to ``transportDisconnect`` in ScpBindings.
-    public typealias DisconnectFn = @Sendable (
-        _ manager: TransportManager
-    ) async throws -> Void
-
-    /// Default connect function that delegates to the UniFFI-generated binding.
-    public static let defaultConnect: ConnectFn = { relayUrl in
-        try await transportConnect(relayUrl: relayUrl)
+public extension SCP {
+    /// Connects the transport layer using a ``TransportConfig``.
+    ///
+    /// Takes the first relay URL from the configuration and forwards to
+    /// ``SCP/transportConnect(relayUrl:)``. If the configuration has no
+    /// URLs, throws ``ScpError/Transport``.
+    ///
+    /// - Parameter config: Transport configuration with relay URLs.
+    /// - Returns: A ``TransportManager`` handle for the established connection.
+    /// - Throws: ``ScpError/Transport`` if no URLs or connection fails.
+    func connectTransport(config: TransportConfig) async throws -> TransportManager {
+        guard let firstUrl = config.relayUrls.first else {
+            throw ScpError.Transport(
+                msg: "No relay URLs provided in transport configuration",
+                code: "SCP-TRANS-5001"
+            )
+        }
+        return try await transportConnect(relayUrl: firstUrl)
     }
-
-    /// Default status function that delegates to the UniFFI-generated binding.
-    public static let defaultStatus: StatusFn = { manager in
-        try await transportStatus(manager: manager)
-    }
-
-    /// Default disconnect function that delegates to the UniFFI-generated binding.
-    public static let defaultDisconnect: DisconnectFn = { manager in
-        try await transportDisconnect(manager: manager)
-    }
-}
-
-// MARK: - Transport Functions
-
-/// Connects the transport layer with the given configuration.
-///
-/// Delegates to the UniFFI ``transportConnect`` bridge function for each
-/// relay URL in the configuration. The first successful connection is used.
-///
-/// - Parameters:
-///   - config: Transport configuration with relay URLs and/or bootstrap domain.
-///   - connectFn: Bridge function override for testing.
-/// - Returns: A ``TransportManager`` handle for the established connection.
-/// - Throws: ``ScpError/Transport(msg:code:)`` if all connections fail.
-///
-/// ## Provenance
-///
-/// - ADR-032 (Transport) in `.docs/adrs/phase-2.md`
-/// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
-/// - Story SCP-221
-@available(
-    *,
-    deprecated,
-    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
-)
-public func connectTransport(
-    config: TransportConfig,
-    connectFn: TransportBridge.ConnectFn = TransportBridge.defaultConnect
-) async throws -> TransportManager {
-    guard let firstUrl = config.relayUrls.first else {
-        throw ScpError.Transport(
-            msg: "No relay URLs provided in transport configuration",
-            code: "SCP-TRANS-5001"
-        )
-    }
-    return try await connectFn(firstUrl)
-}
-
-/// Queries the current transport connection status.
-///
-/// Delegates to the UniFFI ``transportStatus`` bridge function.
-///
-/// - Parameters:
-///   - manager: The transport manager to query.
-///   - statusFn: Bridge function override for testing.
-/// - Returns: The current ``TransportStatus``.
-/// - Throws: ``ScpError/Transport(msg:code:)`` if the status query fails.
-///
-/// ## Provenance
-///
-/// - ADR-032 (Transport) in `.docs/adrs/phase-2.md`
-/// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
-/// - Story SCP-221
-@available(
-    *,
-    deprecated,
-    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
-)
-public func queryTransportStatus(
-    manager: TransportManager,
-    statusFn: TransportBridge.StatusFn = TransportBridge.defaultStatus
-) async throws -> TransportStatus {
-    try await statusFn(manager)
-}
-
-/// Disconnects the transport layer from the current relay.
-///
-/// Delegates to the UniFFI ``transportDisconnect`` bridge function, which
-/// clears the relay adapter from the ``TransportManager`` and releases the
-/// WebSocket connection.
-///
-/// This is idempotent -- calling it when already disconnected is a no-op.
-///
-/// - Parameters:
-///   - manager: The transport manager to disconnect.
-///   - disconnectFn: Bridge function override for testing.
-/// - Throws: ``ScpError/Transport(msg:code:)`` if the disconnect fails.
-///
-/// ## Provenance
-///
-/// - ADR-032 (Transport) in `.docs/adrs/phase-2.md`
-/// - ADR-026 (Swift SDK) in `.docs/adrs/phase-5.md`
-/// - GitHub issue #590
-@available(
-    *,
-    deprecated,
-    message: "Operates on the default SCP instance. Construct an explicit `SCP` and call its methods instead. Removal target: two release cycles after Phase 4 merge (ADR-048)."
-)
-public func disconnectTransport(
-    manager: TransportManager,
-    disconnectFn: TransportBridge.DisconnectFn = TransportBridge.defaultDisconnect
-) async throws {
-    try await disconnectFn(manager)
 }

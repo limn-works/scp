@@ -54,7 +54,7 @@
 //!
 //! SCP opaque handle objects (`Identity`, `ContextHandle`, `UcanToken`,
 //! `TransportManager`) track their lifetime via a global reference counter,
-//! `HANDLE_COUNT`. Call [`scp_shutdown`] before dropping the tokio runtime
+//! `HANDLE_COUNT`. Call `scp_shutdown` before dropping the tokio runtime
 //! to ensure all outstanding FFI handles are released first (see ADR-021
 //! acceptance criterion 1 and sdk-common.md §FFI Async Bridging Risks #4).
 
@@ -76,39 +76,15 @@ pub mod scp;
 #[cfg(feature = "server")]
 pub mod server;
 
-// Handle-affinity macro for every `#[uniffi::export]` entry that accepts a
-// handle with a stored `instance_id`.
-//
-// Resolves `bridge_instance_for_affinity` internally and checks each
-// `$handle.instance_id()` against the core's. Round 5 simplifier review
-// dropped the explicit `$core` parameter after confirming all 175 call
-// sites across the three bridges passed the same
-// `bridge_instance_for_affinity()?` value. If a future per-instance
-// `Scp::method` needs to target `&self.inner.core`, add a second macro
-// arm rather than re-expanding the default one.
-//
-// `$handle` must carry an inherent `instance_id(&self) -> u64` method.
-//
-// Usage:
-//
-// ```ignore
-// uniffi_check_handle!(handle);
-// uniffi_check_handle!(identity, context_handle);
-// ```
-#[macro_export]
-macro_rules! uniffi_check_handle {
-    ($($handle:expr),+ $(,)?) => {{
-        // `CoreFields` has an inherent `check_handle` method, so the
-        // trait need not be in scope. Mirrors the PyO3 bridge's
-        // `pyscp_check_handle!` pattern.
-        let __core = $crate::runtime::bridge_instance_for_affinity()?;
-        $(
-            __core
-                .check_handle($handle.instance_id())
-                .map_err($crate::ScpError::from)?;
-        )+
-    }};
-}
+// Phase D (#1695): `uniffi_check_handle!` macro deleted along with
+// `DEFAULT_BRIDGE_INSTANCE` and `bridge_instance_for_affinity`. Every call
+// site has been migrated to an `Scp` method that performs the check
+// inline with `self.inner.core.check_handle(handle.instance_id())`, so
+// the affinity compare routes against the caller's own bridge instance
+// instead of a shared default. There are no remaining callers of the
+// macro in the bridge surface; a handle passed to a method on a different
+// `Scp` will surface the same `SCP-PERM-3030` `HandleAffinityError`
+// through that inline check.
 
 // Re-export all bridge public items so UniFFI can find them at the crate root.
 pub use bridge::{
@@ -140,80 +116,28 @@ pub use bridge::{
     UcanTokenData,
     // Free functions — bridge connector (#370)
     bridge_evaluate_trust,
-    broadcast_admission,
-    broadcast_block_subscriber,
-    broadcast_handle_key_request,
-    broadcast_is_subscriber,
-    broadcast_publish,
     // Free functions — broadcast (#387)
-    broadcast_subscribe,
-    broadcast_subscriber_count,
-    broadcast_unblock_subscriber,
-    broadcast_unsubscribe,
     // Free functions — transport
-    configure_relay_transport,
     // Free functions — context lifecycle
-    context_close,
-    context_create,
-    context_drain_events,
     // Free functions — TTL (#387)
-    context_handle_ttl_expiry,
-    context_is_member,
-    context_join,
-    context_leave,
     // Free functions — membership queries (#387)
-    context_member_count,
-    context_member_dids,
-    context_member_role,
-    context_propose_ttl_extension,
-    context_reset_ttl_timer,
-    context_send,
-    context_subscribe,
     // Free functions — discovery (#370)
     discovery_create_query,
     discovery_normalize_address,
     discovery_parse_address,
-    evaluate_invitation,
     evaluate_provenance_quality,
     // Free functions — event log
-    event_log_query,
-    event_log_verify,
-    governance_approve,
     // Free functions — governance (#387)
-    governance_execute,
     // Free functions — governance proposal lifecycle (#621)
-    governance_get_proposal,
-    governance_list_proposals,
-    governance_propose,
-    governance_reject,
-    governance_withdraw,
     // Free functions — identity
-    identity_create,
-    identity_create_with_custody,
-    identity_execute_custody_migration,
-    identity_execute_recovery,
-    identity_link_attestations,
-    identity_load,
-    identity_migrate,
-    identity_resolve,
-    is_local_did,
     // Free functions — MCP (#591)
-    mcp_client_connect_sse,
-    mcp_client_connect_stdio,
-    mcp_client_disconnect,
-    mcp_client_invoke,
-    mcp_client_list_tools,
     mcp_configure_stdio_allowlist,
     mcp_disable_stdio_allowlist,
     mcp_get_stdio_allowlist,
     mcp_reset_stdio_allowlist,
-    mcp_server_create,
-    mcp_server_stop,
     // Free functions — provenance (#370)
-    provenance_attach,
     provenance_check_chain_depth,
     // Free functions — local DID management (#387)
-    register_local_did,
     // Free functions — app sandboxing (#595)
     sandbox_check_capability,
     sandbox_validate_declaration,
@@ -223,33 +147,23 @@ pub use bridge::{
     sync_classify_offline,
     sync_classify_offline_custom,
     // Free functions — tools
-    tool_invoke,
-    tool_invoke_cross_context,
-    tool_register,
-    tool_session_close,
-    tool_session_create,
-    tool_session_invoke,
-    tool_verify,
-    transport_connect,
-    transport_disconnect,
-    transport_status,
     // Free functions — UCAN
-    ucan_mint,
-    ucan_revoke,
-    ucan_validate,
 };
-// Feature-gated re-exports — only available with allow_in_memory_custody.
-#[cfg(feature = "allow_in_memory_custody")]
-pub use bridge::{identity_create_link_attestation, identity_remove_link_attestation, scpid_sign};
-// Re-export shutdown function defined in this module.
-// (scp_shutdown is defined here and exported via #[uniffi::export] above.)
+// Phase D (#1695): `scpid_sign` free-function re-export deleted — use
+// `Scp::scpid_sign` instead. The method performs the Identity
+// handle-affinity check against the caller's `Scp` (the deleted free
+// function read `DEFAULT_BRIDGE_INSTANCE` for that check).
 
 // Server startup re-exports — only available with the `server` feature.
+//
+// Phase D (#1695): the `relay_start_in_memory` / `relay_start_local` /
+// `node_start_in_memory` / `node_start_local` free functions have been
+// deleted — every startup path now goes through
+// `Scp::relay_start_in_memory`, `Scp::relay_start_local`,
+// `Scp::node_start_in_memory`, and `Scp::node_start_local` so the returned
+// handles' `instance_id` stamps against the caller's `Scp`.
 #[cfg(feature = "server")]
-pub use server::{
-    NodeHandle, RelayHandle, node_start_in_memory, node_start_local, relay_start_in_memory,
-    relay_start_local,
-};
+pub use server::{NodeHandle, RelayHandle};
 
 // `SCP` — caller-owned bridge instance, exposed to Swift and Kotlin.
 pub use runtime::StorageConfig;
@@ -323,140 +237,11 @@ pub(crate) fn decrement_handle_count() {
         .ok();
 }
 
-/// Waits for all outstanding FFI handles to be released, then shuts down.
-///
-/// Call this from Swift/Kotlin before your process exits or before tearing
-/// down the SCP library. It blocks (asynchronously) until either:
-///
-/// - All opaque handle objects (`Identity`, `ContextHandle`, `UcanToken`,
-///   `TransportManager`) have been garbage-collected / freed, **or**
-/// - The `timeout_millis` deadline has elapsed.
-///
-/// After this call returns, the tokio runtime may be dropped safely — no
-/// outstanding FFI handles remain that could attempt to call into it.
-///
-/// The unit is **milliseconds** — unified across all Rust bridges so the
-/// Swift, Kotlin, and TypeScript SDKs can share a single conversion
-/// surface (the SDK wrappers multiply by 1000 before crossing FFI). The
-/// default is 5000 ms (per ADR-021 acceptance criterion 1). Pass `0` to
-/// return immediately without waiting.
-///
-/// # Thread safety
-///
-/// This function is safe to call from any thread. It polls `HANDLE_COUNT`
-/// in 10 ms intervals on the tokio runtime (via `tokio::time::sleep`) so
-/// the worker is not blocked — critical for mobile apps that run this on
-/// the main event loop.
-///
-/// **Bug fix (PR 1 post-review):** the previous implementation polled
-/// with `std::thread::sleep`, which blocks the current tokio worker.
-/// Mobile apps invoking `scpShutdown` from the foreground ran the risk
-/// of a frozen UI while tasks drained. The new implementation yields
-/// via `tokio::time::sleep` as every other async bridge function does.
-///
-/// # Example (Swift)
-///
-/// ```swift
-/// // Call before application exit:
-/// try await scpShutdown(timeoutMillis: 5_000)
-/// ```
-#[uniffi::export(async_runtime = "tokio")]
-pub async fn scp_shutdown(timeout_millis: u64) -> Result<(), bridge::ScpError> {
-    // Shut down the default UniffiBridgeInstance first (clears registries,
-    // runs hooks, disconnects transport). Best-effort: if the instance was
-    // never initialized or is already shut down, this is treated as a
-    // harmless lifecycle observation.
-    //
-    // Skip in test builds: shutdown permanently poisons the OnceLock-based
-    // default instance, destroying contexts from concurrently-running tests.
-    #[cfg(not(test))]
-    {
-        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
-        if let Some(bi) = runtime::default_bridge_instance_raw() {
-            match bi
-                .shutdown(std::time::Duration::from_millis(timeout_millis))
-                .await
-            {
-                Ok(_) => {}
-                // AlreadyShutDown is idempotent at the public surface.
-                Err(_already) => {}
-            }
-        }
-    }
-
-    if timeout_millis > 0 {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_millis);
-        while HANDLE_COUNT.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
-            // Yield via the tokio timer — `std::thread::sleep` would park
-            // the current tokio worker and freeze the bridge (mobile apps
-            // that call this from the main runtime would appear frozen).
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-    }
-    // The tokio runtime (`RUNTIME`) is a static and will be dropped on
-    // process exit. This function ensures language-side cleanup completes
-    // before that point.
-    Ok(())
-}
-
-/// Suspends the bridge instance for mobile app backgrounding.
-///
-/// Disconnects transport (clears the relay connection) and marks the instance
-/// as suspended. Context state is preserved — the instance remains alive but
-/// inactive. Transport-dependent operations will fail until [`scp_resume`]
-/// is called.
-///
-/// After suspension, callers should call `scpResume()` to re-activate, then
-/// re-establish the relay connection via `transportConnect()`.
-///
-/// No-op if the instance is already shut down or not initialized.
-///
-/// # Example (Swift)
-///
-/// ```swift
-/// // When the app enters background:
-/// scpSuspend()
-/// // When returning to foreground:
-/// try await scpResume()
-/// try await transportConnect(relayUrl: savedUrl)
-/// ```
-///
-/// # Errors
-///
-/// Returns `ScpError::Transport` if transport cleanup fails.
-#[uniffi::export]
-pub fn scp_suspend() -> Result<(), bridge::ScpError> {
-    if let Some(bi) = runtime::default_bridge_instance_raw() {
-        bi.core.suspend().map_err(|e| bridge::ScpError::Transport {
-            msg: format!("suspend failed: {e}"),
-            code: codes::TRANS_5001.to_owned(),
-        })?;
-    }
-    Ok(())
-}
-
-/// Resumes a suspended bridge instance.
-///
-/// Clears the suspended flag so bridge operations can proceed. The caller
-/// must re-establish the relay connection via `transportConnect()` — resume
-/// does not reconnect automatically.
-///
-/// No-op if the instance is not initialized.
-///
-/// # Errors
-///
-/// Returns `ScpError::Context` if the instance has been permanently shut down.
-#[uniffi::export]
-pub async fn scp_resume() -> Result<(), bridge::ScpError> {
-    if let Some(bi) = runtime::default_bridge_instance_raw() {
-        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
-        bi.resume().await.map_err(|e| bridge::ScpError::Context {
-            msg: format!("resume failed: {e}"),
-            code: codes::CTX_2000.to_owned(),
-        })?;
-    }
-    Ok(())
-}
+// Phase D (#1695): `scp_shutdown` free function deleted. The old
+// process-wide shutdown helper (and its drain-on-HANDLE_COUNT rationale)
+// is replaced by the per-instance `SCP.shutdown(timeout_millis)` method
+// on the caller-owned `Scp` handle, which drives its own
+// `UniffiBridgeInstance::shutdown` without touching shared global state.
 
 /// Returns a handle to the shared tokio runtime, initializing it on first call.
 ///
@@ -504,7 +289,7 @@ pub(crate) fn runtime() -> &'static tokio::runtime::Runtime {
 /// The Swift SDK wraps this in `AsyncStream<Message>` via
 /// `AsyncStream.Continuation`. The Kotlin SDK wraps it in `Flow<Message>`
 /// via `callbackFlow`. Implemented by Swift/Kotlin code and passed to
-/// [`context_subscribe`].
+/// `context_subscribe`.
 ///
 /// # SAFETY: Thread execution context
 ///
@@ -748,6 +533,12 @@ mod tests {
     use super::*;
     use scp_ffi_common::error_codes as codes;
 
+    /// Returns a fresh `Scp` instance for tests. Phase 4 PR 4 demolition
+    /// (#1549) deleted the free-function façade.
+    fn scp_test() -> std::sync::Arc<crate::scp::Scp> {
+        crate::scp::Scp::new()
+    }
+
     #[test]
     fn runtime_is_lazy_initialized_on_first_call() {
         // First call to runtime() should initialize it.
@@ -850,7 +641,7 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     fn identity_create_in_memory_produces_did_dht_prefix() {
         let rt = runtime();
-        let result = rt.block_on(identity_create("in_memory".to_owned(), None));
+        let result = rt.block_on(scp_test().identity_create("in_memory".to_owned(), None));
         let identity = result.expect("identity_create should succeed for in_memory custody");
         assert!(
             identity.did().starts_with("did:dht:"),
@@ -868,7 +659,7 @@ mod tests {
     #[cfg(not(feature = "allow_in_memory_custody"))]
     fn identity_create_in_memory_rejected_without_feature() {
         let rt = runtime();
-        let result = rt.block_on(identity_create("in_memory".to_owned(), None));
+        let result = rt.block_on(scp_test().identity_create("in_memory".to_owned(), None));
         match result {
             Err(ScpError::Identity { code, .. }) => {
                 assert_eq!(
@@ -897,10 +688,11 @@ mod tests {
     #[cfg(feature = "allow_in_memory_custody")]
     fn context_create_returns_active_context() {
         let rt = runtime();
+        let scp = scp_test();
 
         // First create an identity to pass as the context creator.
         let identity = rt
-            .block_on(identity_create("in_memory".to_owned(), None))
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
             .expect("identity_create failed");
 
         let params = bridge::ContextParams {
@@ -921,7 +713,7 @@ mod tests {
         };
 
         let handle = rt
-            .block_on(context_create(identity, params))
+            .block_on(scp.context_create(identity, params))
             .expect("context_create should succeed");
 
         assert_eq!(
@@ -960,9 +752,10 @@ mod tests {
         }
 
         let rt = runtime();
+        let scp = scp_test();
 
         let identity = rt
-            .block_on(identity_create("in_memory".to_owned(), None))
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
             .expect("identity_create failed");
 
         let params = bridge::ContextParams {
@@ -983,7 +776,7 @@ mod tests {
         };
 
         let handle = rt
-            .block_on(context_create(identity, params))
+            .block_on(scp.context_create(identity, params))
             .expect("context_create failed");
 
         let completed = Arc::new(AtomicBool::new(false));
@@ -991,7 +784,7 @@ mod tests {
             completed: Arc::clone(&completed),
         });
 
-        rt.block_on(context_subscribe(handle, listener))
+        rt.block_on(scp.context_subscribe(handle, listener))
             .expect("context_subscribe should succeed");
 
         assert!(
@@ -1018,7 +811,7 @@ mod tests {
         // create/drop is guaranteed regardless of concurrent test activity.
         let before_create = HANDLE_COUNT.load(Ordering::SeqCst);
         let id = rt
-            .block_on(identity_create("in_memory".to_owned(), None))
+            .block_on(scp_test().identity_create("in_memory".to_owned(), None))
             .expect("identity_create failed");
         let after_create = HANDLE_COUNT.load(Ordering::SeqCst);
 
@@ -1038,15 +831,10 @@ mod tests {
         );
     }
 
-    /// Verifies that `scp_shutdown(0)` returns immediately (no waiting).
-    #[test]
-    fn scp_shutdown_zero_timeout_returns_immediately() {
-        // Should return without hanging even if handles are live.
-        let rt = runtime();
-        rt.block_on(async {
-            let _ = scp_shutdown(0).await;
-        });
-    }
+    // Phase D (#1695): `scp_shutdown` free function deleted; the zero-timeout
+    // fast-path test no longer applies. SCP instances are shut down via
+    // `SCP.shutdown(timeout_millis)` and tests for that path live in the
+    // per-instance lifecycle tests.
 
     // -----------------------------------------------------------------------
     // Cross-platform pseudonym derivation (SCP-214 criterion 16)

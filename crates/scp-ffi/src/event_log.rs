@@ -1,13 +1,16 @@
 //! `PyO3` bridge functions for event log queries, verification, and checkpoints.
 //!
-//! Exposes SCP event log operations to Python:
+//! Exposes SCP event log operations to Python as methods on the `SCP` class:
 //!
-//! - [`py_event_log_query`] -- Query the context event log with optional
+//! - `PyScp::event_log_query` -- Query the context event log with optional
 //!   filters.
-//! - [`py_event_log_verify`] -- Verify a claim against the event log
+//! - `PyScp::event_log_verify` -- Verify a claim against the event log
 //!   (inclusion/absence proofs).
-//! - [`py_event_log_checkpoint`] -- Generate a signed consistency checkpoint
+//! - `PyScp::event_log_checkpoint` -- Generate a signed consistency checkpoint
 //!   from the current event log state.
+//!
+//! All free `#[pyfunction]` exports were migrated to `#[pymethods] impl PyScp`
+//! methods in Phase 4 PR 4 sub-slice E (#1549).
 //!
 //! # Types
 //!
@@ -28,6 +31,7 @@ use scp_platform::traits::Storage;
 use scp_primitives::Clock;
 
 use crate::error::ScpPyError;
+use crate::runtime::PyBridgeInstance;
 use crate::types::{encode_hex, json_to_py_dict};
 use crate::validate;
 
@@ -85,7 +89,7 @@ impl PyEvent {
 
 /// A verification proof from the event log, exposed to Python.
 ///
-/// Returned by [`py_event_log_verify`]. Contains the verification result,
+/// Returned by `PyScp::event_log_verify`. Contains the verification result,
 /// the type of proof (inclusion or absence), and proof details as a
 /// JSON-compatible Python object.
 ///
@@ -174,10 +178,10 @@ impl PyCheckpoint {
 }
 
 // ---------------------------------------------------------------------------
-// Bridge functions
+// Bridge helpers (per-bridge implementations used by PyScp methods)
 // ---------------------------------------------------------------------------
 
-/// Queries the context event log.
+/// Queries the context event log on a specific bridge instance.
 ///
 /// Returns actual event data from the `ProtocolRepository` when available,
 /// falling back to a `LogSummary` metadata event when storage is not
@@ -216,12 +220,13 @@ impl PyCheckpoint {
 /// the bridge-local per-context `EventLog` (e.g. UCAN revocation writes,
 /// tests that bypass the manager).
 fn query_manager_entries(
+    bi: &PyBridgeInstance,
     py: Python<'_>,
     context_id: &str,
     query_filter: &scp_core::store::event_log::EventQueryFilter,
 ) -> PyResult<Option<Vec<PyEvent>>> {
     let ctx_id_bytes = scp_core::context::context_id_bytes(context_id);
-    let Some(entries) = crate::runtime::context_manager()
+    let Some(entries) = crate::runtime::context_manager(bi)
         .ok()
         .and_then(|mgr| mgr.event_log_entries(&ctx_id_bytes).ok().flatten())
     else {
@@ -231,13 +236,21 @@ fn query_manager_entries(
         return Ok(None);
     }
 
-    let mut py_events = Vec::new();
-    for (idx, entry) in entries.iter().enumerate() {
-        if let Some(ref et) = query_filter.event_type
-            && entry.event != *et
-        {
-            continue;
-        }
+    // Canonical filter — pinned across PyO3/NAPI/UniFFI by
+    // `scp_ffi_common::event_log::filter_manager_entries` so the three
+    // bridges cannot drift. Each bridge still owns its payload/timestamp
+    // mapping below; the helper only encodes the filter contract.
+    let filter = scp_ffi_common::event_log::EventLogFilter {
+        after_sequence: query_filter.sequence_start,
+        before_sequence: query_filter.sequence_end,
+        event_type: query_filter.event_type.as_deref(),
+        actor_did: query_filter.actor_did.as_deref(),
+        limit: query_filter.limit,
+    };
+    let filtered = scp_ffi_common::event_log::filter_manager_entries(&entries, &filter);
+
+    let mut py_events = Vec::with_capacity(filtered.len());
+    for (seq, entry) in filtered {
         #[allow(clippy::cast_precision_loss)]
         let timestamp = entry.timestamp as f64;
         let payload_json = serde_json::json!({
@@ -246,25 +259,18 @@ fn query_manager_entries(
         let payload = json_to_py_dict(py, &payload_json)?;
         py_events.push(PyEvent {
             event_type: entry.event.clone(),
-            // `EventLogEntry` does not carry actor DID.
-            actor_did: String::new(),
+            actor_did: entry.actor_did.clone(),
             timestamp,
             payload,
-            sequence: idx as u64,
+            sequence: seq,
         });
-        if let Some(limit) = query_filter.limit
-            && py_events.len() >= limit
-        {
-            break;
-        }
     }
     Ok(Some(py_events))
 }
 
 /// See GitHub issue #303.
-#[pyfunction]
-#[pyo3(name = "event_log_query", signature = (context_id, filter=None))]
-pub fn py_event_log_query(
+fn event_log_query_impl(
+    bi: &PyBridgeInstance,
     py: Python<'_>,
     context_id: &str,
     filter: Option<&Bound<'_, PyDict>>,
@@ -281,14 +287,14 @@ pub fn py_event_log_query(
     // Mirrors the NAPI bridge. Aligned across PyO3/NAPI/WASM/UniFFI —
     // pinned by the cross-bridge parity harness's `OP_EVENT_LOG_APPEND`
     // and `OP_EVENT_LOG_FILTERED` (ADR-046).
-    if let Some(events) = query_manager_entries(py, context_id, &query_filter)? {
+    if let Some(events) = query_manager_entries(bi, py, context_id, &query_filter)? {
         return Ok(events);
     }
 
-    // Fallback: look up the context's bridge-local event log from the runtime
+    // Fallback: look up this bridge's per-context event log from the runtime
     // registry. This path is used by legacy tests and callers that write
     // directly to the per-context `EventLog` (e.g. UCAN revocation).
-    let (event_count, merkle_root_hex) = crate::runtime::with_context(context_id, |rt| {
+    let (event_count, merkle_root_hex) = crate::runtime::with_context(bi, context_id, |rt| {
         let count = scp_event_log::tree::event_count(&rt.event_log);
         let root = scp_event_log::tree::root(&rt.event_log);
         Ok((count, encode_hex(&root)))
@@ -304,7 +310,7 @@ pub fn py_event_log_query(
     // Arc<EncryptingAdapter<InMemoryStorage>> and ProtocolRepository requires
     // an owned Storage impl. The key convention matches ProtocolRepository's
     // event_data key format (GitHub issue #303).
-    if let Ok(storage) = crate::runtime::get_storage() {
+    if let Ok(storage) = crate::runtime::get_storage(bi) {
         let rt = crate::runtime()?;
         let prefix = format!("context/{context_id}/event_data/");
         let keys_result = rt.block_on(storage.list_keys(&prefix));
@@ -491,11 +497,10 @@ fn parse_event_query_filter(
 /// Raises `ContextError` if the context is not connected to the runtime
 /// or if the verification fails (empty log, invalid index, etc.).
 ///
-/// See ADR-013 §7: `py_event_log_verify(handle, claim) -> PyProof`.
-#[pyfunction]
-#[pyo3(name = "event_log_verify")]
+/// See ADR-013 §7.
 #[allow(clippy::too_many_lines)] // Proof generation with match arms is inherently verbose.
-pub fn py_event_log_verify(
+fn event_log_verify_impl(
+    bi: &PyBridgeInstance,
     py: Python<'_>,
     context_id: &str,
     claim: &Bound<'_, PyDict>,
@@ -523,7 +528,7 @@ pub fn py_event_log_verify(
                 })?;
 
             // Generate and verify the inclusion proof via scp-core.
-            let proof_result = crate::runtime::with_context(context_id, |rt| {
+            let proof_result = crate::runtime::with_context(bi, context_id, |rt| {
                 let proof = scp_event_log::proof::prove_inclusion(&rt.event_log, leaf_index)
                     .map_err(|e| ScpPyError::context(format!("inclusion proof failed: {e}")))?;
                 let verified = scp_event_log::proof::verify_inclusion(&proof);
@@ -577,7 +582,7 @@ pub fn py_event_log_verify(
 
             // Generate the absence proof via scp-core.
             let proof_result =
-                crate::runtime::with_context(context_id, |rt| {
+                crate::runtime::with_context(bi, context_id, |rt| {
                     let proof = scp_event_log::proof::prove_absence(&rt.event_log, &event_hash)
                         .map_err(|e| ScpPyError::context(format!("absence proof failed: {e}")))?;
 
@@ -656,9 +661,8 @@ pub fn py_event_log_verify(
 /// found in the registry.
 ///
 /// See ADR-011 acceptance criterion 8 and ADR-030.
-#[pyfunction]
-#[pyo3(name = "event_log_checkpoint")]
-pub fn py_event_log_checkpoint(
+fn event_log_checkpoint_impl(
+    bi: &PyBridgeInstance,
     context_id: &str,
     identity_did: &str,
     epoch: u64,
@@ -672,8 +676,8 @@ pub fn py_event_log_checkpoint(
 
     let sender_did = scp_identity::DID(identity_did_owned.clone());
 
-    let checkpoint = crate::runtime::with_identity(&identity_did_owned, |entry| {
-        crate::runtime::with_context(&context_id_owned, |ctx_rt| {
+    let checkpoint = crate::runtime::with_identity(bi, &identity_did_owned, |entry| {
+        crate::runtime::with_context(bi, &context_id_owned, |ctx_rt| {
             let result = rt.block_on(async {
                 let signer = scp_core::event_log::KeyCustodySigner {
                     custody: entry.custody.as_ref(),
@@ -717,22 +721,142 @@ fn decode_hex_hash(hex_str: &str) -> Result<[u8; 32], String> {
 }
 
 // ---------------------------------------------------------------------------
+// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
+// ---------------------------------------------------------------------------
+
+#[pymethods]
+impl crate::scp::PyScp {
+    /// Queries the context event log.
+    ///
+    /// Returns actual event data from the `ProtocolRepository` when available,
+    /// falling back to a `LogSummary` metadata event when storage is not
+    /// initialized or no event payloads have been persisted.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The ID of the context whose event log to query.
+    /// * `filter` -- An optional Python dict with filter parameters:
+    ///   - `"event_type"` (str): Filter by event type name.
+    ///   - `"actor_did"` (str): Filter by actor DID.
+    ///   - `"after_sequence"` (int): Only events after this sequence number.
+    ///   - `"before_sequence"` (int): Only events before this sequence number.
+    ///   - `"after_timestamp"` (float): Only events after this timestamp.
+    ///   - `"before_timestamp"` (float): Only events before this timestamp.
+    ///   - `"limit"` (int): Maximum number of events to return.
+    ///
+    /// # Returns
+    ///
+    /// A list of [`PyEvent`] objects.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if the context is not connected to the runtime
+    /// or if the query fails.
+    ///
+    /// See ADR-013 §7 and GitHub issue #303.
+    #[pyo3(name = "event_log_query", signature = (context_id, filter=None))]
+    pub fn event_log_query(
+        &self,
+        py: Python<'_>,
+        context_id: &str,
+        filter: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Vec<PyEvent>> {
+        let bi = &*self.inner;
+        event_log_query_impl(bi, py, context_id, filter)
+    }
+
+    /// Verifies a claim against the context event log.
+    ///
+    /// Generates and verifies a Merkle proof for the given claim. Supports
+    /// both inclusion proofs (proving an event IS in the log) and absence
+    /// proofs (proving an event is NOT in the log).
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The ID of the context whose event log to verify
+    ///   against.
+    /// * `claim` -- A Python dict describing the claim to verify:
+    ///   - `"type"` (str): `"inclusion"` or `"absence"`.
+    ///   - `"leaf_index"` (int): For inclusion proofs, the event's position.
+    ///   - `"event_hash"` (str): For absence proofs, the hex-encoded hash
+    ///     of the event to prove absent.
+    ///
+    /// # Returns
+    ///
+    /// A [`PyProof`] with the verification result, proof type, and details.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if the context is not connected to the runtime
+    /// or if the verification fails (empty log, invalid index, etc.).
+    ///
+    /// See ADR-013 §7.
+    #[pyo3(name = "event_log_verify")]
+    pub fn event_log_verify(
+        &self,
+        py: Python<'_>,
+        context_id: &str,
+        claim: &Bound<'_, PyDict>,
+    ) -> PyResult<PyProof> {
+        let bi = &*self.inner;
+        event_log_verify_impl(bi, py, context_id, claim)
+    }
+
+    /// Generates a signed consistency checkpoint from the current event log state.
+    ///
+    /// Creates a snapshot of the event log's Merkle root and event count, signs it
+    /// with the caller's identity key, and returns the checkpoint. Checkpoints
+    /// enable equivocation detection: members exchange signed Merkle roots and
+    /// compare them to detect relay misbehavior.
+    ///
+    /// # Arguments
+    ///
+    /// * `context_id` -- The ID of the context whose event log to checkpoint.
+    /// * `identity_did` -- The DID of the identity generating the checkpoint
+    ///   (used for signing).
+    /// * `epoch` -- The current MLS epoch (pass 0 for Broadcast contexts).
+    ///
+    /// # Returns
+    ///
+    /// A [`PyCheckpoint`] containing the signed checkpoint data.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ContextError` if the context is not connected to the runtime
+    /// or if signing fails. Raises `IdentityError` if the identity is not
+    /// found in the registry.
+    ///
+    /// See ADR-011 acceptance criterion 8 and ADR-030.
+    #[pyo3(name = "event_log_checkpoint")]
+    pub fn event_log_checkpoint(
+        &self,
+        context_id: &str,
+        identity_did: &str,
+        epoch: u64,
+    ) -> PyResult<PyCheckpoint> {
+        let bi = &*self.inner;
+        event_log_checkpoint_impl(bi, context_id, identity_did, epoch)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
-/// Registers event log bridge functions and classes on the `_scp_core` module.
+/// Registers event log bridge classes on the `_scp_core` module.
+///
+/// Post-migration (Phase 4 PR 4 sub-slice E), event log operations are
+/// exposed as methods on `SCP`. Only the opaque result classes require
+/// registration here.
 ///
 /// Called from [`crate::_scp_core`] during module initialization.
 ///
 /// # Errors
 ///
-/// Returns `PyErr` if registration of functions or classes fails.
+/// Returns `PyErr` if registration of classes fails.
 pub fn register_event_log(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyEvent>()?;
     m.add_class::<PyProof>()?;
     m.add_class::<PyCheckpoint>()?;
-    m.add_function(wrap_pyfunction!(py_event_log_query, m)?)?;
-    m.add_function(wrap_pyfunction!(py_event_log_verify, m)?)?;
-    m.add_function(wrap_pyfunction!(py_event_log_checkpoint, m)?)?;
     Ok(())
 }

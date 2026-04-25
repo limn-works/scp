@@ -95,7 +95,13 @@ _ALLOWED_ENV_KEYS: tuple[str, ...] = (
     # JVM — needs JAVA_HOME for the JDK, plus library path for JNA to
     # find the UniFFI cdylib. LD_LIBRARY_PATH for Linux,
     # DYLD_LIBRARY_PATH / DYLD_FALLBACK_LIBRARY_PATH for macOS.
+    # JAVA_OPTS carries extra JVM flags (e.g. `-Djna.library.path`) so
+    # the Kotlin runner can point JNA at the in-tree UniFFI cdylib when
+    # the platform-specific variables don't apply (macOS tightened DYLD
+    # env propagation under SIP — child processes of a non-entitled
+    # binary don't always see parent DYLD_* values).
     "JAVA_HOME",
+    "JAVA_OPTS",
     "LD_LIBRARY_PATH",
     "DYLD_LIBRARY_PATH",
     "DYLD_FALLBACK_LIBRARY_PATH",
@@ -306,10 +312,27 @@ def kotlin_runner() -> Iterator[RunnerClient]:
             "or run installDist under helpers/kotlin_bridge_runner/."
         )
 
+    # JNA needs a path to the UniFFI cdylib. On macOS, DYLD_* env vars
+    # are stripped from child processes of non-entitled binaries (SIP),
+    # so we also inject `-Djna.library.path` via JAVA_OPTS. The default
+    # points at the repo's `target/release` which is where
+    # `cargo build -p scp-ffi-uniffi` puts the dylib; any existing
+    # JAVA_OPTS in the caller's environment is preserved alongside.
+    target_dir = _REPO_ROOT / "target" / "release"
+    jna_opt = f"-Djna.library.path={target_dir}"
+    kotlin_env = _sanitized_env()
+    existing_opts = kotlin_env.get("JAVA_OPTS", "")
+    if "-Djna.library.path" in existing_opts:
+        kotlin_env["JAVA_OPTS"] = existing_opts
+    elif existing_opts:
+        kotlin_env["JAVA_OPTS"] = f"{existing_opts} {jna_opt}"
+    else:
+        kotlin_env["JAVA_OPTS"] = jna_opt
+
     proc = _popen_runner(
         [str(binary)],
         cwd=KOTLIN_RUNNER_DIR,
-        env=_sanitized_env(),
+        env=kotlin_env,
     )
     client = RunnerClient(proc=proc)
     try:

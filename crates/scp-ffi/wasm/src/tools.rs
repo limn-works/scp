@@ -188,16 +188,18 @@ fn parse_provenance_fields(def: &serde_json::Value) -> Result<ProvenanceFields, 
                 }
                 .into_js()
             })?;
-            <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
-                ScpWasmError::Validation {
-                    message: format!(
-                        "invalid 'implementationHash': must be exactly 32 bytes, got {}",
-                        bytes.len()
-                    ),
-                    code: codes::VALID_7038.to_owned(),
-                }
-                .into_js()
-            })?
+            scp_ffi_common::validate::expect_fixed_bytes::<32>(bytes.as_slice(), "").map_err(
+                |_| {
+                    ScpWasmError::Validation {
+                        message: format!(
+                            "invalid 'implementationHash': must be exactly 32 bytes, got {}",
+                            bytes.len()
+                        ),
+                        code: codes::VALID_7038.to_owned(),
+                    }
+                    .into_js()
+                },
+            )?
         }
     };
 

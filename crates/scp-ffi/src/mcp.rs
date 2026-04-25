@@ -2,19 +2,19 @@
 //!
 //! Exposes SCP MCP operations to Python:
 //!
-//! - [`py_mcp_serve`] -- Start an MCP server exposing SCP context tools.
-//! - [`py_mcp_server_stop`] -- Stop a running MCP server.
-//! - [`py_mcp_server_wait`] -- Block until the MCP server exits.
-//! - [`py_mcp_server_info`] -- Return metadata about a running MCP server.
-//! - [`py_mcp_client_connect_stdio`] -- Connect to an external MCP server via
+//! - `py_mcp_serve` -- Start an MCP server exposing SCP context tools.
+//! - `py_mcp_server_stop` -- Stop a running MCP server.
+//! - `py_mcp_server_wait` -- Block until the MCP server exits.
+//! - `py_mcp_server_info` -- Return metadata about a running MCP server.
+//! - `py_mcp_client_connect_stdio` -- Connect to an external MCP server via
 //!   stdio.
-//! - [`py_mcp_client_connect_sse`] -- Connect to an external MCP server via
+//! - `py_mcp_client_connect_sse` -- Connect to an external MCP server via
 //!   SSE.
-//! - [`py_mcp_client_disconnect`] -- Disconnect from an external MCP server.
-//! - [`py_mcp_client_info`] -- Return metadata about an active MCP client.
-//! - [`py_mcp_client_list_tools`] -- List tools from an external MCP server.
-//! - [`py_mcp_client_invoke`] -- Invoke an external MCP tool with provenance.
-//! - [`py_mcp_load_contexts`] -- Load active contexts for a DID from a relay.
+//! - `py_mcp_client_disconnect` -- Disconnect from an external MCP server.
+//! - `py_mcp_client_info` -- Return metadata about an active MCP client.
+//! - `py_mcp_client_list_tools` -- List tools from an external MCP server.
+//! - `py_mcp_client_invoke` -- Invoke an external MCP tool with provenance.
+//! - `py_mcp_load_contexts` -- Load active contexts for a DID from a relay.
 //!
 //! The MCP bridge uses opaque string handles to track server and client
 //! instances. Handles are stored in a global registry (similar to the
@@ -40,7 +40,7 @@
 use scp_ffi_common::error_codes as codes;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 use pyo3::prelude::*;
@@ -581,6 +581,28 @@ const FFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::tools::DEFAULT_TIMEOUT_MS as
 /// Bridges the MCP server's context/tool queries to the live runtime state
 /// managed by `crates/scp-ffi/src/runtime.rs`.
 struct FfiBridgeProvider {
+    /// Weak reference to the bridge instance whose runtime registry this
+    /// provider reads.
+    ///
+    /// # Why `Weak` and not `Arc` (#1549 round-2 bug-catcher)
+    ///
+    /// The provider is installed in an [`McpServer`] that lives inside a
+    /// background task spawned on the shared tokio runtime
+    /// (`RUNTIME.spawn(...)`). That task is NOT enrolled in the per-instance
+    /// [`JoinSet`](scp_ffi_common::bridge_instance::CoreFields::task_handle)
+    /// aborted by `emergency_cancel_tasks`, so it survives
+    /// [`crate::runtime::PyBridgeInstance::drop`] unless the caller
+    /// explicitly sends a shutdown via
+    /// [`crate::scp::PyScp::py_mcp_server_stop`].
+    ///
+    /// If this field were `Arc<PyBridgeInstance>`, the server task would
+    /// keep the instance alive forever when the caller forgets to
+    /// `shutdown`. With `Weak`, callers that drop their last strong
+    /// reference release `ContextManager`, identity registry, relay
+    /// connection, and the rest of `BridgeInstance`'s state. Provider
+    /// methods upgrade per call; once `None` is returned, they emit a
+    /// stable error so the MCP server can propagate it to the peer.
+    bi: std::sync::Weak<crate::runtime::PyBridgeInstance>,
     /// The agent's DID.
     agent_did: String,
     /// The context IDs this provider serves.
@@ -608,6 +630,19 @@ struct FfiBridgeProvider {
     agent_proof_tokens: Option<Vec<String>>,
 }
 
+impl FfiBridgeProvider {
+    /// Upgrades the stored [`Weak`] to a live [`Arc<PyBridgeInstance>`].
+    ///
+    /// Returns an error string if the bridge instance has been dropped.
+    /// Callers MUST drop the returned `Arc` before the next `.await` so
+    /// they do not pin the instance alive across suspension points.
+    fn upgrade_bi(&self) -> Result<std::sync::Arc<crate::runtime::PyBridgeInstance>, String> {
+        self.bi.upgrade().ok_or_else(|| {
+            "bridge instance has been dropped — MCP provider cannot service request".to_owned()
+        })
+    }
+}
+
 impl ContextProvider for FfiBridgeProvider {
     fn active_context_ids(&self) -> Vec<String> {
         self.context_ids.clone()
@@ -615,7 +650,10 @@ impl ContextProvider for FfiBridgeProvider {
 
     fn agent_role(&self, context_id: &str) -> Option<String> {
         // Look up the agent's role assignment in the context's role state.
-        crate::runtime::with_context(context_id, |rt| {
+        // Silently returns None if the bridge has been dropped — matches the
+        // "unknown context" fallback semantics of this trait method.
+        let bi = self.upgrade_bi().ok()?;
+        crate::runtime::with_context(&bi, context_id, |rt| {
             let role = rt
                 .role_state
                 .assignments
@@ -632,7 +670,12 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     fn context_tools(&self, context_id: &str) -> Vec<ContextToolInfo> {
-        crate::runtime::with_context(context_id, |rt| {
+        // Returns empty if the bridge has been dropped — matches the
+        // "unknown context" fallback semantics of this trait method.
+        let Ok(bi) = self.upgrade_bi() else {
+            return Vec::new();
+        };
+        crate::runtime::with_context(&bi, context_id, |rt| {
             let tools = rt
                 .tool_registry
                 .registrations()
@@ -650,6 +693,11 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), String> {
+        // Upgrade the bridge instance handle up-front so every check below
+        // sees a stable `&PyBridgeInstance`. If the instance has been
+        // dropped, fail fast with a deterministic error rather than
+        // silently accepting the capability.
+        let bi = self.upgrade_bi()?;
         // Primary check: UCAN token validation via the full 11-step ADR-016
         // pipeline. Verifies the token grants tool_invoke:{tool_name} or
         // tool_invoke:* for this context.
@@ -660,8 +708,8 @@ impl ContextProvider for FfiBridgeProvider {
                 crate::ucan::build_proof_resolver_from_tokens(self.agent_proof_tokens.as_deref())
                     .map_err(|e| format!("failed to build proof resolver: {e}"))?;
 
-            crate::runtime::with_context(context_id, |rt| {
-                let production_resolver = crate::runtime::did_resolver();
+            crate::runtime::with_context(&bi, context_id, |rt| {
+                let production_resolver = crate::runtime::did_resolver(&bi);
                 let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
                     production_resolver.map(std::convert::AsRef::as_ref),
                 );
@@ -714,7 +762,7 @@ impl ContextProvider for FfiBridgeProvider {
 
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        crate::runtime::with_context(context_id, |rt| {
+        crate::runtime::with_context(&bi, context_id, |rt| {
             if scp_core::context::tools::invoke::has_tool_invoke_capability(
                 &rt.role_state,
                 &self.agent_did,
@@ -795,6 +843,12 @@ impl ContextProvider for FfiBridgeProvider {
         let agent_did = self.agent_did.clone();
         let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);
 
+        // Upgrade the bridge instance handle up-front. `invoke_tool` is a
+        // sync trait method, so the `Arc` we hold here has a well-defined
+        // lifetime bounded by this function's return — it cannot survive
+        // across an `await` and pin the instance alive (#1549 round-2).
+        let bi = self.upgrade_bi()?;
+
         // Consume a hard-rate-limit token BEFORE dispatching the MCP
         // tool invocation. This path — reachable from external MCP
         // clients — does not go through
@@ -817,7 +871,7 @@ impl ContextProvider for FfiBridgeProvider {
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let manager = crate::runtime::context_manager().map_err(|e| format!("{e}"))?;
+        let manager = crate::runtime::context_manager(&bi).map_err(|e| format!("{e}"))?;
         if !manager.try_consume_hard_rate_limit_from_any_context(
             context_id,
             &invoker_did_typed,
@@ -840,7 +894,7 @@ impl ContextProvider for FfiBridgeProvider {
         // the DashMap shard lock. The lock is released when with_context
         // returns. Also compute input hash before dispatch (arguments may
         // be consumed by the handler).
-        let (dispatch, input_hash) = crate::runtime::with_context(context_id, |rt| {
+        let (dispatch, input_hash) = crate::runtime::with_context(&bi, context_id, |rt| {
             let registration = rt.tool_registry.get(tool_name).ok_or_else(|| {
                 ScpPyError::context(format!(
                     "tool '{tool_name}' not found in context '{context_id}'"
@@ -966,7 +1020,7 @@ impl ContextProvider for FfiBridgeProvider {
         // Re-acquire the DashMap lock briefly to append the event.
         // Returns (sequence, serialized_event_bytes) on success for
         // ProtocolRepository persistence (GitHub issue #303).
-        let append_result = crate::runtime::with_context(context_id, |rt| {
+        let append_result = crate::runtime::with_context(&bi, context_id, |rt| {
             let sequence = scp_event_log::tree::event_count(&rt.event_log);
             let prev_hash = if rt.event_log.leaves().is_empty() {
                 scp_event_log::tree::GENESIS_PREV_HASH
@@ -1009,7 +1063,7 @@ impl ContextProvider for FfiBridgeProvider {
                 // is Arc<EncryptingAdapter<InMemoryStorage>> and ProtocolRepository
                 // requires an owned Storage impl. The key convention matches
                 // ProtocolRepository's event_data_key format.
-                if let Ok(storage) = crate::runtime::get_storage()
+                if let Ok(storage) = crate::runtime::get_storage(&bi)
                     && let Ok(rt) = crate::runtime()
                 {
                     let key = format!("context/{context_id}/event_data/{sequence:020}");
@@ -1037,7 +1091,12 @@ impl ContextProvider for FfiBridgeProvider {
     }
 
     fn context_members(&self, context_id: &str) -> Vec<MemberInfo> {
-        crate::runtime::with_context(context_id, |rt| {
+        // Returns empty if the bridge has been dropped — matches the
+        // "unknown context" fallback semantics of this trait method.
+        let Ok(bi) = self.upgrade_bi() else {
+            return Vec::new();
+        };
+        crate::runtime::with_context(&bi, context_id, |rt| {
             let members = rt
                 .role_state
                 .members
@@ -1062,7 +1121,11 @@ impl ContextProvider for FfiBridgeProvider {
     fn context_events(&self, context_id: &str) -> serde_json::Value {
         // The EventLog stores Merkle tree hashes, not event payloads.
         // Return the event count and Merkle root as metadata.
-        crate::runtime::with_context(context_id, |rt| {
+        // Falls back to zero-count JSON if the bridge has been dropped.
+        let Ok(bi) = self.upgrade_bi() else {
+            return serde_json::json!({ "event_count": 0 });
+        };
+        crate::runtime::with_context(&bi, context_id, |rt| {
             let leaf_count = rt.event_log.leaves().len();
             let root = scp_event_log::tree::root(&rt.event_log);
             Ok(serde_json::json!({
@@ -1118,33 +1181,19 @@ pub(crate) struct McpClientState {
     client: Arc<Mutex<McpClient<ClientTransport, SystemTimestamp>>>,
 }
 
-/// Fallback empty MCP server registry for when the default
-/// `PyBridgeInstance` has not been initialized yet. Mirrors the
-/// `EMPTY_FFI_BRIDGE_STATE` / `EMPTY_IDENTITY_REGISTRY` fallback pattern.
-static EMPTY_SERVER_REGISTRY: OnceLock<DashMap<String, McpServerState>> = OnceLock::new();
+// Phase D (#1695): `server_registry()` / `client_registry()` default-bridge
+// shims and their `EMPTY_*_REGISTRY` fallback statics have been deleted.
+// Callers must use the per-instance `server_registry_of(bi)` /
+// `client_registry_of(bi)` accessors.
 
-/// Fallback empty MCP client registry.
-static EMPTY_CLIENT_REGISTRY: OnceLock<DashMap<String, McpClientState>> = OnceLock::new();
-
-/// Returns a reference to the default bridge instance's MCP server registry.
-///
-/// Migrated from a process-global `OnceLock<DashMap<...>>` singleton onto the
-/// typed `mcp_server_registry` field on [`crate::runtime::PyBridgeInstance`]
-/// in #1549 Phase 4 PR 2 commit 4. Falls back to an empty registry when the
-/// default instance has not been initialized yet.
-fn server_registry() -> &'static DashMap<String, McpServerState> {
-    crate::runtime::bridge_instance_raw().map_or_else(
-        || EMPTY_SERVER_REGISTRY.get_or_init(DashMap::new),
-        |bi| bi.mcp_server_registry().as_ref(),
-    )
+/// Returns a reference to the given bridge instance's MCP server registry.
+fn server_registry_of(bi: &crate::runtime::PyBridgeInstance) -> &DashMap<String, McpServerState> {
+    bi.mcp_server_registry().as_ref()
 }
 
-/// Returns a reference to the default bridge instance's MCP client registry.
-fn client_registry() -> &'static DashMap<String, McpClientState> {
-    crate::runtime::bridge_instance_raw().map_or_else(
-        || EMPTY_CLIENT_REGISTRY.get_or_init(DashMap::new),
-        |bi| bi.mcp_client_registry().as_ref(),
-    )
+/// Returns a reference to the given bridge instance's MCP client registry.
+fn client_registry_of(bi: &crate::runtime::PyBridgeInstance) -> &DashMap<String, McpClientState> {
+    bi.mcp_client_registry().as_ref()
 }
 
 /// Generates a unique, unpredictable handle ID.
@@ -1183,61 +1232,93 @@ fn generate_handle_id(prefix: &str) -> String {
 /// Raises `TransportError` if the server fails to start.
 ///
 /// See ADR-015: MCP server with context namespace mapping.
-#[pyfunction]
-#[pyo3(name = "py_mcp_serve")]
-#[pyo3(signature = (identity_did, context_ids, transport, ucan_token=None))]
-#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
-#[allow(clippy::too_many_lines)] // MCP server startup with stdio/SSE transport dispatch is inherently verbose.
-pub fn py_mcp_serve(
-    identity_did: &str,
-    context_ids: Vec<String>,
-    transport: &str,
-    ucan_token: Option<String>,
-) -> PyResult<String> {
-    validate::validate_did(identity_did)?;
-    validate::validate_transport_mode(transport)?;
-    for ctx_id in &context_ids {
-        validate::validate_context_id(ctx_id)?;
-    }
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "py_mcp_serve", signature = (identity_did, context_ids, transport, ucan_token=None))]
+    #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for method arguments.
+    #[allow(clippy::too_many_lines)] // MCP server startup with stdio/SSE transport dispatch is inherently verbose.
+    pub fn py_mcp_serve(
+        &self,
+        identity_did: &str,
+        context_ids: Vec<String>,
+        transport: &str,
+        ucan_token: Option<String>,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        let bi_arc = Arc::clone(&self.inner);
+        validate::validate_did(identity_did)?;
+        validate::validate_transport_mode(transport)?;
+        for ctx_id in &context_ids {
+            validate::validate_context_id(ctx_id)?;
+        }
 
-    // Validate that all context IDs are registered in the runtime.
-    for ctx_id in &context_ids {
-        crate::runtime::with_context(ctx_id, |_rt| Ok(()))
-            .map_err(|e| ScpPyError::transport(format!("cannot serve context '{ctx_id}': {e}")))?;
-    }
+        // Validate that all context IDs are registered in the runtime.
+        for ctx_id in &context_ids {
+            crate::runtime::with_context(bi, ctx_id, |_rt| Ok(())).map_err(|e| {
+                ScpPyError::transport(format!("cannot serve context '{ctx_id}': {e}"))
+            })?;
+        }
 
-    // Create the FfiBridgeProvider and McpServer.
-    let provider = FfiBridgeProvider {
-        agent_did: identity_did.to_owned(),
-        context_ids: context_ids.clone(),
-        tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
-        agent_ucan_token: ucan_token.clone(),
+        // Create the FfiBridgeProvider and McpServer.
+        //
+        // #1549 round-2: hold the bridge instance as a `Weak`, not an
+        // `Arc`. The MCP server task is spawned on the shared tokio
+        // runtime (`rt.spawn(...)`) and is NOT enrolled in the
+        // per-instance `JoinSet`, so an `Arc` would leak the
+        // `PyBridgeInstance` (and with it `ContextManager`, identity
+        // registry, relay connection) for the remainder of the process
+        // when the caller drops `PyScp` without calling
+        // `py_mcp_server_stop`. The task body additionally selects on
+        // the instance's `cancel_token` so `emergency_cancel_tasks()`
+        // from `Drop` can wake it between requests.
+        let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi_arc),
+            agent_did: identity_did.to_owned(),
+            context_ids: context_ids.clone(),
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: ucan_token.clone(),
 
-        agent_proof_tokens: None,
-    };
-    let server = McpServer::new(provider);
-    let server = Arc::new(Mutex::new(server));
+            agent_proof_tokens: None,
+        };
+        let server = McpServer::new(provider);
+        let server = Arc::new(Mutex::new(server));
 
-    // Create a shutdown channel.
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        // Create a shutdown channel.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-    // Start the transport task on the tokio runtime.
-    let rt = crate::runtime()?;
-    let server_clone = Arc::clone(&server);
-    let transport_mode = transport.to_owned();
-    let sse_agent_did = identity_did.to_owned();
-    let sse_context_ids = context_ids.clone();
-    let sse_ucan_token = ucan_token;
+        // Start the transport task on the tokio runtime.
+        let rt = crate::runtime()?;
+        let server_clone = Arc::clone(&server);
+        let transport_mode = transport.to_owned();
+        let sse_agent_did = identity_did.to_owned();
+        let sse_context_ids = context_ids.clone();
+        let sse_ucan_token = ucan_token;
+        // `sse_bi` is a `Weak` reference so the SSE server task cannot
+        // pin `PyBridgeInstance` alive. Same rationale as `provider.bi`.
+        let sse_bi: std::sync::Weak<crate::runtime::PyBridgeInstance> = Arc::downgrade(&bi_arc);
+        // Capture the cancel token so the server task exits when the
+        // instance is dropped, even if the caller never calls
+        // `py_mcp_server_stop`. Cloning a `CancellationToken` does not
+        // extend the instance's lifetime.
+        let cancel_token = bi_arc.core.cancel_token();
 
-    let task_handle = rt.spawn(async move {
-        match transport_mode.as_str() {
-            "stdio" => {
+        let task_handle = rt.spawn(async move {
+            match transport_mode.as_str() {
+                "stdio" => {
                 // Run the MCP server over stdio. The `run_stdio` function
                 // processes stdin/stdout until EOF. We also listen for the
-                // shutdown signal.
+                // shutdown signal AND the bridge instance's cancel token
+                // so `emergency_cancel_tasks()` from the instance's
+                // `Drop` impl can terminate this task even when the
+                // caller never invoked `py_mcp_server_stop`.
                 tokio::select! {
                     _ = shutdown_rx => {
                         // Shutdown signal received -- exit cleanly.
+                    }
+                    () = cancel_token.cancelled() => {
+                        tracing::debug!(
+                            "MCP stdio server task exiting — bridge instance cancelled"
+                        );
                     }
                     () = async {
                         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
@@ -1306,59 +1387,71 @@ pub fn py_mcp_serve(
                     } => {}
                 }
             }
-            "sse" => {
-                // For SSE, run_sse takes ownership of the McpServer and
-                // binds to a configurable address. We create a dedicated
-                // server instance using the captured identity and context
-                // IDs (avoids re-extracting from the mutex which would
-                // create a stale-data race window).
-                let provider = FfiBridgeProvider {
-                    agent_did: sse_agent_did,
-                    context_ids: sse_context_ids,
-                    tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
-                    agent_ucan_token: sse_ucan_token,
+                "sse" => {
+                    // For SSE, run_sse takes ownership of the McpServer and
+                    // binds to a configurable address. We create a dedicated
+                    // server instance using the captured identity and context
+                    // IDs (avoids re-extracting from the mutex which would
+                    // create a stale-data race window).
+                    let provider = FfiBridgeProvider {
+                        bi: sse_bi,
+                        agent_did: sse_agent_did,
+                        context_ids: sse_context_ids,
+                        tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+                        agent_ucan_token: sse_ucan_token,
 
-                    agent_proof_tokens: None,
-                };
-                let sse_server = McpServer::new(provider);
-                let config =
-                    scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from(([127, 0, 0, 1], 0)));
+                        agent_proof_tokens: None,
+                    };
+                    let sse_server = McpServer::new(provider);
+                    let config = scp_mcp::sse::SseConfig::new(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        0,
+                    )));
 
-                // Create a ShutdownHandle for the SSE server. Wire the
-                // oneshot shutdown_rx so that when py_mcp_server_stop sends
-                // the signal, the SSE server also receives it via the
-                // ShutdownHandle's CancellationToken.
-                let sse_shutdown = scp_mcp::sse::ShutdownHandle::new();
-                let sse_shutdown_trigger = sse_shutdown.clone();
-                tokio::spawn(async move {
-                    let _ = shutdown_rx.await;
-                    sse_shutdown_trigger.shutdown();
-                });
+                    // Create a ShutdownHandle for the SSE server. Wire both
+                    // the oneshot shutdown_rx (py_mcp_server_stop) AND the
+                    // bridge instance's cancel_token (emergency_cancel_tasks
+                    // from Drop) so either signal tears down the SSE server.
+                    // Without the cancel_token branch, a caller that drops
+                    // `PyScp` without calling `py_mcp_server_stop` would
+                    // leave this task running indefinitely and pin
+                    // `PyBridgeInstance` state alive via the
+                    // `McpServer`-held resources (#1549 round-2).
+                    let sse_shutdown = scp_mcp::sse::ShutdownHandle::new();
+                    let sse_shutdown_trigger = sse_shutdown.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = shutdown_rx => {}
+                            () = cancel_token.cancelled() => {}
+                        }
+                        sse_shutdown_trigger.shutdown();
+                    });
 
-                let result = scp_mcp::sse::run_sse(sse_server, config, sse_shutdown).await;
-                if let Err(e) = result {
-                    tracing::error!("MCP SSE server error: {e}");
+                    let result = scp_mcp::sse::run_sse(sse_server, config, sse_shutdown).await;
+                    if let Err(e) = result {
+                        tracing::error!("MCP SSE server error: {e}");
+                    }
                 }
+                _ => {} // Already validated above.
             }
-            _ => {} // Already validated above.
-        }
-    });
+        });
 
-    // Create the server state and register it.
-    let handle = generate_handle_id("mcp-server");
-    let state = McpServerState {
-        identity_did: identity_did.to_owned(),
-        context_ids,
-        transport: transport.to_owned(),
-        stopped: false,
-        server,
-        shutdown_tx: Some(shutdown_tx),
-        task_handle: Some(task_handle),
-    };
+        // Create the server state and register it.
+        let handle = generate_handle_id("mcp-server");
+        let state = McpServerState {
+            identity_did: identity_did.to_owned(),
+            context_ids,
+            transport: transport.to_owned(),
+            stopped: false,
+            server,
+            shutdown_tx: Some(shutdown_tx),
+            task_handle: Some(task_handle),
+        };
 
-    server_registry().insert(handle.clone(), state);
+        server_registry_of(bi).insert(handle.clone(), state);
 
-    Ok(handle)
+        Ok(handle)
+    }
 }
 
 /// Stops a running MCP server.
@@ -1374,35 +1467,38 @@ pub fn py_mcp_serve(
 /// # Errors
 ///
 /// Raises `TransportError` if the server is not found or already stopped.
-#[pyfunction]
-#[pyo3(name = "py_mcp_server_stop")]
-pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
-    validate::validate_mcp_handle(handle)?;
-    let mut entry = server_registry()
-        .get_mut(handle)
-        .ok_or_else(|| ScpPyError::transport(format!("MCP server handle '{handle}' not found")))?;
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "py_mcp_server_stop")]
+    pub fn py_mcp_server_stop(&self, handle: &str) -> PyResult<()> {
+        let bi = &*self.inner;
+        validate::validate_mcp_handle(handle)?;
+        let mut entry = server_registry_of(bi).get_mut(handle).ok_or_else(|| {
+            ScpPyError::transport(format!("MCP server handle '{handle}' not found"))
+        })?;
 
-    if entry.stopped {
-        return Err(
-            ScpPyError::transport(format!("MCP server '{handle}' is already stopped")).into(),
-        );
+        if entry.stopped {
+            return Err(
+                ScpPyError::transport(format!("MCP server '{handle}' is already stopped")).into(),
+            );
+        }
+
+        entry.stopped = true;
+
+        // Send the shutdown signal. Dropping the sender signals the receiver.
+        if let Some(tx) = entry.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        drop(entry);
+
+        Ok(())
     }
-
-    entry.stopped = true;
-
-    // Send the shutdown signal. Dropping the sender signals the receiver.
-    if let Some(tx) = entry.shutdown_tx.take() {
-        let _ = tx.send(());
-    }
-    drop(entry);
-
-    Ok(())
 }
 
 /// Blocks until the MCP server exits.
 ///
 /// For stdio transport, waits until stdin is closed (EOF) or the server is
-/// stopped via [`py_mcp_server_stop`]. For SSE transport, waits until the
+/// stopped via `py_mcp_server_stop`. For SSE transport, waits until the
 /// HTTP server is terminated.
 ///
 /// # Arguments
@@ -1412,34 +1508,37 @@ pub fn py_mcp_server_stop(handle: &str) -> PyResult<()> {
 /// # Errors
 ///
 /// Raises `TransportError` if the server handle is not found.
-#[pyfunction]
-#[pyo3(name = "py_mcp_server_wait")]
-pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
-    validate::validate_mcp_handle(handle)?;
-    // Extract the task handle if available.
-    let task_handle = {
-        let mut entry = server_registry().get_mut(handle).ok_or_else(|| {
-            ScpPyError::transport(format!("MCP server handle '{handle}' not found"))
-        })?;
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "py_mcp_server_wait")]
+    pub fn py_mcp_server_wait(&self, py: Python<'_>, handle: &str) -> PyResult<()> {
+        let bi = &*self.inner;
+        validate::validate_mcp_handle(handle)?;
+        // Extract the task handle if available.
+        let task_handle = {
+            let mut entry = server_registry_of(bi).get_mut(handle).ok_or_else(|| {
+                ScpPyError::transport(format!("MCP server handle '{handle}' not found"))
+            })?;
 
-        if entry.stopped && entry.task_handle.is_none() {
-            return Ok(());
+            if entry.stopped && entry.task_handle.is_none() {
+                return Ok(());
+            }
+
+            entry.task_handle.take()
+        };
+
+        // Block on the task handle if we have one.
+        if let Some(task) = task_handle {
+            let rt = crate::runtime()?;
+            py.allow_threads(|| {
+                rt.block_on(async {
+                    let _ = task.await;
+                });
+            });
         }
 
-        entry.task_handle.take()
-    };
-
-    // Block on the task handle if we have one.
-    if let Some(task) = task_handle {
-        let rt = crate::runtime()?;
-        py.allow_threads(|| {
-            rt.block_on(async {
-                let _ = task.await;
-            });
-        });
+        Ok(())
     }
-
-    Ok(())
 }
 
 /// Returns metadata about a running MCP server.
@@ -1455,21 +1554,24 @@ pub fn py_mcp_server_wait(py: Python<'_>, handle: &str) -> PyResult<()> {
 /// # Errors
 ///
 /// Raises `TransportError` if the server handle is not found.
-#[pyfunction]
-#[pyo3(name = "py_mcp_server_info")]
-pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
-    validate::validate_mcp_handle(handle)?;
-    let entry = server_registry()
-        .get(handle)
-        .ok_or_else(|| ScpPyError::transport(format!("MCP server handle '{handle}' not found")))?;
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "py_mcp_server_info")]
+    pub fn py_mcp_server_info(&self, py: Python<'_>, handle: &str) -> PyResult<PyObject> {
+        let bi = &*self.inner;
+        validate::validate_mcp_handle(handle)?;
+        let entry = server_registry_of(bi).get(handle).ok_or_else(|| {
+            ScpPyError::transport(format!("MCP server handle '{handle}' not found"))
+        })?;
 
-    let dict = PyDict::new(py);
-    dict.set_item("identity_did", &entry.identity_did)?;
-    dict.set_item("context_ids", &entry.context_ids)?;
-    dict.set_item("transport", &entry.transport)?;
-    dict.set_item("stopped", entry.stopped)?;
-    drop(entry);
-    Ok(dict.into())
+        let dict = PyDict::new(py);
+        dict.set_item("identity_did", &entry.identity_did)?;
+        dict.set_item("context_ids", &entry.context_ids)?;
+        dict.set_item("transport", &entry.transport)?;
+        dict.set_item("stopped", entry.stopped)?;
+        drop(entry);
+        Ok(dict.into())
+    }
 }
 
 /// Returns metadata about an active MCP client connection.
@@ -1485,20 +1587,23 @@ pub fn py_mcp_server_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
 /// # Errors
 ///
 /// Raises `TransportError` if the client handle is not found.
-#[pyfunction]
-#[pyo3(name = "py_mcp_client_info")]
-pub fn py_mcp_client_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
-    validate::validate_mcp_handle(handle)?;
-    let entry = client_registry()
-        .get(handle)
-        .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))?;
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "py_mcp_client_info")]
+    pub fn py_mcp_client_info(&self, py: Python<'_>, handle: &str) -> PyResult<PyObject> {
+        let bi = &*self.inner;
+        validate::validate_mcp_handle(handle)?;
+        let entry = client_registry_of(bi).get(handle).ok_or_else(|| {
+            ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
+        })?;
 
-    let dict = PyDict::new(py);
-    dict.set_item("transport", &entry.transport)?;
-    dict.set_item("command", &entry.command)?;
-    dict.set_item("url", &entry.url)?;
-    drop(entry);
-    Ok(dict.into())
+        let dict = PyDict::new(py);
+        dict.set_item("transport", &entry.transport)?;
+        dict.set_item("command", &entry.command)?;
+        dict.set_item("url", &entry.url)?;
+        drop(entry);
+        Ok(dict.into())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1524,36 +1629,41 @@ pub fn py_mcp_client_info(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
 ///
 /// Raises `TransportError` if the subprocess fails to start or the
 /// MCP initialize handshake fails.
-#[pyfunction]
-#[pyo3(name = "py_mcp_client_connect_stdio")]
-#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
-pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
-    if command.is_empty() {
-        return Err(ScpPyError::validation("command must be a non-empty list".to_owned()).into());
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "py_mcp_client_connect_stdio")]
+    #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for method arguments.
+    pub fn py_mcp_client_connect_stdio(&self, command: Vec<String>) -> PyResult<String> {
+        let bi = &*self.inner;
+        if command.is_empty() {
+            return Err(
+                ScpPyError::validation("command must be a non-empty list".to_owned()).into(),
+            );
+        }
+
+        // Spawn the subprocess and create the transport.
+        let transport = StdioClientTransport::spawn(&command)
+            .map_err(|e| ScpPyError::transport(format!("failed to connect stdio client: {e}")))?;
+
+        // Create the MCP client and perform the initialize handshake.
+        let mut client = McpClient::new(ClientTransport::Stdio(transport));
+        client
+            .initialize()
+            .map_err(|e| ScpPyError::transport(format!("MCP initialize handshake failed: {e}")))?;
+
+        let handle = generate_handle_id("mcp-client");
+        let state = McpClientState {
+            transport: "stdio".to_owned(),
+            command: Some(command),
+            url: None,
+
+            client: Arc::new(Mutex::new(client)),
+        };
+
+        client_registry_of(bi).insert(handle.clone(), state);
+
+        Ok(handle)
     }
-
-    // Spawn the subprocess and create the transport.
-    let transport = StdioClientTransport::spawn(&command)
-        .map_err(|e| ScpPyError::transport(format!("failed to connect stdio client: {e}")))?;
-
-    // Create the MCP client and perform the initialize handshake.
-    let mut client = McpClient::new(ClientTransport::Stdio(transport));
-    client
-        .initialize()
-        .map_err(|e| ScpPyError::transport(format!("MCP initialize handshake failed: {e}")))?;
-
-    let handle = generate_handle_id("mcp-client");
-    let state = McpClientState {
-        transport: "stdio".to_owned(),
-        command: Some(command),
-        url: None,
-
-        client: Arc::new(Mutex::new(client)),
-    };
-
-    client_registry().insert(handle.clone(), state);
-
-    Ok(handle)
 }
 
 /// Connects to an external MCP server via SSE transport.
@@ -1573,33 +1683,36 @@ pub fn py_mcp_client_connect_stdio(command: Vec<String>) -> PyResult<String> {
 /// # Errors
 ///
 /// Raises `TransportError` if the connection or MCP handshake fails.
-#[pyfunction]
-#[pyo3(name = "py_mcp_client_connect_sse")]
-pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
-    validate::validate_relay_url(url)?;
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "py_mcp_client_connect_sse")]
+    pub fn py_mcp_client_connect_sse(&self, url: &str) -> PyResult<String> {
+        let bi = &*self.inner;
+        validate::validate_relay_url(url)?;
 
-    // Connect to the SSE endpoint.
-    let transport = SseClientTransport::connect(url)
-        .map_err(|e| ScpPyError::transport(format!("failed to connect SSE client: {e}")))?;
+        // Connect to the SSE endpoint.
+        let transport = SseClientTransport::connect(url)
+            .map_err(|e| ScpPyError::transport(format!("failed to connect SSE client: {e}")))?;
 
-    // Create the MCP client and perform the initialize handshake.
-    let mut client = McpClient::new(ClientTransport::Sse(transport));
-    client
-        .initialize()
-        .map_err(|e| ScpPyError::transport(format!("MCP initialize handshake failed: {e}")))?;
+        // Create the MCP client and perform the initialize handshake.
+        let mut client = McpClient::new(ClientTransport::Sse(transport));
+        client
+            .initialize()
+            .map_err(|e| ScpPyError::transport(format!("MCP initialize handshake failed: {e}")))?;
 
-    let handle = generate_handle_id("mcp-client");
-    let state = McpClientState {
-        transport: "sse".to_owned(),
-        command: None,
-        url: Some(url.to_owned()),
+        let handle = generate_handle_id("mcp-client");
+        let state = McpClientState {
+            transport: "sse".to_owned(),
+            command: None,
+            url: Some(url.to_owned()),
 
-        client: Arc::new(Mutex::new(client)),
-    };
+            client: Arc::new(Mutex::new(client)),
+        };
 
-    client_registry().insert(handle.clone(), state);
+        client_registry_of(bi).insert(handle.clone(), state);
 
-    Ok(handle)
+        Ok(handle)
+    }
 }
 
 /// Disconnects from an external MCP server.
@@ -1616,21 +1729,24 @@ pub fn py_mcp_client_connect_sse(url: &str) -> PyResult<String> {
 ///
 /// Raises `TransportError` if the client handle is not found (e.g. already
 /// disconnected or never connected).
-#[pyfunction]
-#[pyo3(name = "py_mcp_client_disconnect")]
-pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
-    validate::validate_mcp_handle(handle)?;
-    let (_, state) = client_registry()
-        .remove(handle)
-        .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))?;
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "py_mcp_client_disconnect")]
+    pub fn py_mcp_client_disconnect(&self, handle: &str) -> PyResult<()> {
+        let bi = &*self.inner;
+        validate::validate_mcp_handle(handle)?;
+        let (_, state) = client_registry_of(bi).remove(handle).ok_or_else(|| {
+            ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
+        })?;
 
-    // Dropping `state` drops the Arc<Mutex<McpClient>>, which drops the
-    // McpClient, which drops the ClientTransport. For stdio transports,
-    // the Drop impl on StdioClientTransport kills and waits on the
-    // subprocess, preventing resource leaks.
-    drop(state);
+        // Dropping `state` drops the Arc<Mutex<McpClient>>, which drops the
+        // McpClient, which drops the ClientTransport. For stdio transports,
+        // the Drop impl on StdioClientTransport kills and waits on the
+        // subprocess, preventing resource leaks.
+        drop(state);
 
-    Ok(())
+        Ok(())
+    }
 }
 
 /// Lists available tools from an external MCP server.
@@ -1651,40 +1767,43 @@ pub fn py_mcp_client_disconnect(handle: &str) -> PyResult<()> {
 ///
 /// Raises `TransportError` if the client is not connected or the request
 /// fails.
-#[pyfunction]
-#[pyo3(name = "py_mcp_client_list_tools")]
-pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObject> {
-    validate::validate_mcp_handle(handle)?;
-    let entry = client_registry()
-        .get(handle)
-        .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))?;
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "py_mcp_client_list_tools")]
+    pub fn py_mcp_client_list_tools(&self, py: Python<'_>, handle: &str) -> PyResult<PyObject> {
+        let bi = &*self.inner;
+        validate::validate_mcp_handle(handle)?;
+        let entry = client_registry_of(bi).get(handle).ok_or_else(|| {
+            ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
+        })?;
 
-    // Send the real tools/list request via the MCP client.
-    let client = Arc::clone(&entry.client);
-    drop(entry); // Release the DashMap guard before blocking.
+        // Send the real tools/list request via the MCP client.
+        let client = Arc::clone(&entry.client);
+        drop(entry); // Release the DashMap guard before blocking.
 
-    let tools = {
-        let client_guard = client
-            .lock()
-            .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
-        client_guard
-            .list_tools()
-            .map_err(|e| ScpPyError::transport(format!("tools/list failed: {e}")))?
-    };
+        let tools = {
+            let client_guard = client
+                .lock()
+                .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
+            client_guard
+                .list_tools()
+                .map_err(|e| ScpPyError::transport(format!("tools/list failed: {e}")))?
+        };
 
-    // Convert tool definitions to JSON array for Python.
-    let tools_json: Vec<serde_json::Value> = tools
-        .iter()
-        .map(|t| {
-            serde_json::json!({
-                "name": t.name,
-                "description": t.description,
-                "inputSchema": t.input_schema,
+        // Convert tool definitions to JSON array for Python.
+        let tools_json: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "inputSchema": t.input_schema,
+                })
             })
-        })
-        .collect();
+            .collect();
 
-    json_to_py_dict(py, &serde_json::Value::Array(tools_json))
+        json_to_py_dict(py, &serde_json::Value::Array(tools_json))
+    }
 }
 
 /// Invokes an external MCP tool with SCP provenance wrapping.
@@ -1709,59 +1828,63 @@ pub fn py_mcp_client_list_tools(py: Python<'_>, handle: &str) -> PyResult<PyObje
 ///
 /// Raises `TransportError` if the client is not connected or the
 /// invocation fails.
-#[pyfunction]
-#[pyo3(name = "py_mcp_client_invoke")]
-pub fn py_mcp_client_invoke(
-    py: Python<'_>,
-    handle: &str,
-    tool_name: &str,
-    input: &Bound<'_, PyDict>,
-    context_id: &str,
-    identity_did: &str,
-) -> PyResult<PyObject> {
-    validate::validate_mcp_handle(handle)?;
-    validate::validate_tool_name(tool_name)?;
-    validate::validate_context_id(context_id)?;
-    validate::validate_did(identity_did)?;
-    let entry = client_registry()
-        .get(handle)
-        .ok_or_else(|| ScpPyError::transport(format!("MCP client handle '{handle}' not found")))?;
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "py_mcp_client_invoke")]
+    pub fn py_mcp_client_invoke(
+        &self,
+        py: Python<'_>,
+        handle: &str,
+        tool_name: &str,
+        input: &Bound<'_, PyDict>,
+        context_id: &str,
+        identity_did: &str,
+    ) -> PyResult<PyObject> {
+        let bi = &*self.inner;
+        validate::validate_mcp_handle(handle)?;
+        validate::validate_tool_name(tool_name)?;
+        validate::validate_context_id(context_id)?;
+        validate::validate_did(identity_did)?;
+        let entry = client_registry_of(bi).get(handle).ok_or_else(|| {
+            ScpPyError::transport(format!("MCP client handle '{handle}' not found"))
+        })?;
 
-    let client = Arc::clone(&entry.client);
-    drop(entry); // Release the DashMap guard before Python object access.
+        let client = Arc::clone(&entry.client);
+        drop(entry); // Release the DashMap guard before Python object access.
 
-    // Convert input to JSON.
-    let input_json = py_dict_to_json(input)?;
+        // Convert input to JSON.
+        let input_json = py_dict_to_json(input)?;
 
-    // Send the real tools/call request via the MCP client.
-    let result = {
-        let client_guard = client
-            .lock()
-            .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
-        client_guard
-            .invoke(tool_name, input_json, context_id, identity_did)
-            .map_err(|e| ScpPyError::transport(format!("tools/call failed: {e}")))?
-    };
+        // Send the real tools/call request via the MCP client.
+        let result = {
+            let client_guard = client
+                .lock()
+                .map_err(|e| ScpPyError::transport(format!("client lock poisoned: {e}")))?;
+            client_guard
+                .invoke(tool_name, input_json, context_id, identity_did)
+                .map_err(|e| ScpPyError::transport(format!("tools/call failed: {e}")))?
+        };
 
-    // Convert the McpToolResult to a Python dict.
-    let content_json: Vec<serde_json::Value> = result
-        .content
-        .iter()
-        .map(|c| serde_json::to_value(c).unwrap_or(serde_json::Value::Null))
-        .collect();
+        // Convert the McpToolResult to a Python dict.
+        let content_json: Vec<serde_json::Value> = result
+            .content
+            .iter()
+            .map(|c| serde_json::to_value(c).unwrap_or(serde_json::Value::Null))
+            .collect();
 
-    let result_json = serde_json::json!({
-        "content": content_json,
-        "is_error": result.is_error,
-        "provenance": {
-            "source": result.provenance.source,
-            "invoked_by": result.provenance.invoked_by,
-            "context": result.provenance.context,
-            "timestamp": result.provenance.timestamp,
-        },
-    });
+        let result_json = serde_json::json!({
+            "content": content_json,
+            "is_error": result.is_error,
+            "provenance": {
+                "source": result.provenance.source,
+                "invoked_by": result.provenance.invoked_by,
+                "context": result.provenance.context,
+                "timestamp": result.provenance.timestamp,
+            },
+        });
 
-    json_to_py_dict(py, &result_json)
+        json_to_py_dict(py, &result_json)
+    }
 }
 
 /// Loads active contexts for a DID, combining local registry and relay discovery.
@@ -1799,75 +1922,79 @@ pub fn py_mcp_client_invoke(
 /// failures are handled by falling back to local-only).
 ///
 /// See SCP-213, ADR-015 in `.docs/adrs/phase-3.md`.
-#[pyfunction]
-#[pyo3(name = "py_mcp_load_contexts")]
-pub fn py_mcp_load_contexts(
-    py: Python<'_>,
-    identity_did: &str,
-    _relay_url: &str,
-) -> PyResult<Vec<PyObject>> {
-    validate::validate_did(identity_did)?;
-    // Step 1: Collect contexts from the local runtime registry.
-    let local_context_ids = crate::runtime::context_ids_for_member(identity_did);
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "py_mcp_load_contexts")]
+    pub fn py_mcp_load_contexts(
+        &self,
+        py: Python<'_>,
+        identity_did: &str,
+        _relay_url: &str,
+    ) -> PyResult<Vec<PyObject>> {
+        let bi = &*self.inner;
+        validate::validate_did(identity_did)?;
+        // Step 1: Collect contexts from the local runtime registry.
+        let local_context_ids = crate::runtime::context_ids_for_member(bi, identity_did);
 
-    // Step 2: Collect contexts from the known-contexts registry.
-    let known = crate::runtime::known_contexts_for_member(identity_did);
+        // Step 2: Collect contexts from the known-contexts registry.
+        let known = crate::runtime::known_contexts_for_member_on(bi, identity_did);
 
-    // Step 3: Probe relay for known routing IDs (if connected).
-    let relay_active_set = probe_relay_for_known_contexts(&known);
+        // Step 3: Probe relay for known routing IDs (if connected).
+        let relay_active_set = probe_relay_for_known_contexts(bi, &known);
 
-    // Step 4: Build deduplicated result set.
-    let mut seen = std::collections::HashSet::new();
-    let mut results = Vec::new();
+        // Step 4: Build deduplicated result set.
+        let mut seen = std::collections::HashSet::new();
+        let mut results = Vec::new();
 
-    // Add local contexts first.
-    for ctx_id in &local_context_ids {
-        seen.insert(ctx_id.clone());
-        let dict = PyDict::new(py);
-        dict.set_item("context_id", ctx_id)?;
+        // Add local contexts first.
+        for ctx_id in &local_context_ids {
+            seen.insert(ctx_id.clone());
+            let dict = PyDict::new(py);
+            dict.set_item("context_id", ctx_id)?;
 
-        let relay_active = relay_active_set.contains(ctx_id);
-        if relay_active {
-            dict.set_item("source", "local+relay")?;
-        } else {
-            dict.set_item("source", "local")?;
+            let relay_active = relay_active_set.contains(ctx_id);
+            if relay_active {
+                dict.set_item("source", "local+relay")?;
+            } else {
+                dict.set_item("source", "local")?;
+            }
+            dict.set_item("relay_active", relay_active)?;
+
+            // Enrich with creator DID and member count from runtime state.
+            if let Ok(info) = crate::runtime::with_context(bi, ctx_id, |rt| {
+                Ok((
+                    rt.creator_did.clone(),
+                    rt.role_state.members.len(),
+                    rt.tool_registry.len(),
+                ))
+            }) {
+                dict.set_item("creator_did", info.0)?;
+                dict.set_item("member_count", info.1)?;
+                dict.set_item("tool_count", info.2)?;
+            }
+
+            results.push(dict.into());
         }
-        dict.set_item("relay_active", relay_active)?;
 
-        // Enrich with creator DID and member count from runtime state.
-        if let Ok(info) = crate::runtime::with_context(ctx_id, |rt| {
-            Ok((
-                rt.creator_did.clone(),
-                rt.role_state.members.len(),
-                rt.tool_registry.len(),
-            ))
-        }) {
-            dict.set_item("creator_did", info.0)?;
-            dict.set_item("member_count", info.1)?;
-            dict.set_item("tool_count", info.2)?;
+        // Add relay-only contexts (known but not in local registry).
+        for (ctx_id, known_ctx) in &known {
+            if seen.contains(ctx_id) {
+                continue;
+            }
+            seen.insert(ctx_id.clone());
+            let dict = PyDict::new(py);
+            dict.set_item("context_id", ctx_id)?;
+
+            let relay_active = relay_active_set.contains(ctx_id);
+            dict.set_item("source", "relay")?;
+            dict.set_item("relay_active", relay_active)?;
+            dict.set_item("relay_url", &known_ctx.relay_url)?;
+
+            results.push(dict.into());
         }
 
-        results.push(dict.into());
+        Ok(results)
     }
-
-    // Add relay-only contexts (known but not in local registry).
-    for (ctx_id, known_ctx) in &known {
-        if seen.contains(ctx_id) {
-            continue;
-        }
-        seen.insert(ctx_id.clone());
-        let dict = PyDict::new(py);
-        dict.set_item("context_id", ctx_id)?;
-
-        let relay_active = relay_active_set.contains(ctx_id);
-        dict.set_item("source", "relay")?;
-        dict.set_item("relay_active", relay_active)?;
-        dict.set_item("relay_url", &known_ctx.relay_url)?;
-
-        results.push(dict.into());
-    }
-
-    Ok(results)
 }
 
 /// Probes the relay for activity on known context routing IDs.
@@ -1879,6 +2006,7 @@ pub fn py_mcp_load_contexts(
 /// Falls back to an empty set if no relay connection is available or if
 /// queries fail (graceful degradation).
 fn probe_relay_for_known_contexts(
+    bi: &crate::runtime::PyBridgeInstance,
     known: &[(String, crate::runtime::KnownContext)],
 ) -> std::collections::HashSet<String> {
     use scp_transport::traits::RoutingId;
@@ -1890,7 +2018,7 @@ fn probe_relay_for_known_contexts(
     }
 
     // Check if a transport manager is available. If not, return empty set.
-    if !crate::runtime::has_transport_manager() {
+    if !crate::runtime::has_transport_manager(bi) {
         return active;
     }
 
@@ -1904,7 +2032,7 @@ fn probe_relay_for_known_contexts(
     // first adapter (Phase 1 single-adapter mode).
     for (ctx_id, known_ctx) in known {
         let routing_id = RoutingId::new(known_ctx.routing_id);
-        let query_result = crate::runtime::with_transport_manager(|manager| {
+        let query_result = crate::runtime::with_transport_manager(bi, |manager| {
             rt.block_on(manager.query(&routing_id, None)).map_err(|e| {
                 crate::error::ScpPyError::transport(format!("relay probe failed: {e}"))
             })
@@ -2054,48 +2182,52 @@ pub fn py_mcp_get_stdio_allowlist(py: Python<'_>) -> PyResult<PyObject> {
 /// Raises `ContextError` if the context or tool is not found.
 ///
 /// See SCP-212 and ADR-010 for the handler registration design.
-#[pyfunction]
-#[pyo3(name = "mcp_register_tool_handler")]
-#[allow(clippy::needless_pass_by_value)] // PyObject must be owned to clone_ref into the closure.
-pub fn py_register_tool_handler(
-    py: Python<'_>,
-    context_id: &str,
-    tool_name: &str,
-    handler: PyObject,
-) -> PyResult<()> {
-    validate::validate_context_id(context_id)?;
-    validate::validate_tool_name(tool_name)?;
-    // Verify the handler is callable before storing it.
-    if !handler.bind(py).is_callable() {
-        return Err(ScpPyError::validation("handler must be callable".to_owned()).into());
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "mcp_register_tool_handler")]
+    #[allow(clippy::needless_pass_by_value)] // PyObject must be owned to clone_ref into the closure.
+    pub fn py_register_tool_handler(
+        &self,
+        py: Python<'_>,
+        context_id: &str,
+        tool_name: &str,
+        handler: PyObject,
+    ) -> PyResult<()> {
+        let bi = &*self.inner;
+        validate::validate_context_id(context_id)?;
+        validate::validate_tool_name(tool_name)?;
+        // Verify the handler is callable before storing it.
+        if !handler.bind(py).is_callable() {
+            return Err(ScpPyError::validation("handler must be callable".to_owned()).into());
+        }
+
+        // Wrap the Python callable in a Rust closure that acquires the GIL,
+        // converts JSON -> Python dict, calls the handler, and converts back.
+        let handler_ref = handler.clone_ref(py);
+        let rust_handler: crate::runtime::ToolHandler =
+            std::sync::Arc::new(move |input: serde_json::Value| {
+                Python::with_gil(|py| {
+                    // Convert serde_json::Value -> Python dict.
+                    let py_input = crate::types::json_to_py_dict(py, &input)
+                        .map_err(|e| format!("failed to convert input to Python dict: {e}"))?;
+
+                    // Call the Python handler.
+                    let py_result = handler_ref
+                        .call1(py, (py_input,))
+                        .map_err(|e| format!("Python handler raised an exception: {e}"))?;
+
+                    // Convert Python result back to serde_json::Value.
+                    let result_dict = py_result
+                        .downcast_bound::<PyDict>(py)
+                        .map_err(|_| "tool handler must return a dict".to_owned())?;
+                    crate::types::py_dict_to_json(result_dict)
+                        .map_err(|e| format!("failed to convert handler output to JSON: {e}"))
+                })
+            });
+
+        crate::runtime::register_tool_handler(bi, context_id, tool_name, rust_handler)?;
+        Ok(())
     }
-
-    // Wrap the Python callable in a Rust closure that acquires the GIL,
-    // converts JSON -> Python dict, calls the handler, and converts back.
-    let handler_ref = handler.clone_ref(py);
-    let rust_handler: crate::runtime::ToolHandler =
-        std::sync::Arc::new(move |input: serde_json::Value| {
-            Python::with_gil(|py| {
-                // Convert serde_json::Value -> Python dict.
-                let py_input = crate::types::json_to_py_dict(py, &input)
-                    .map_err(|e| format!("failed to convert input to Python dict: {e}"))?;
-
-                // Call the Python handler.
-                let py_result = handler_ref
-                    .call1(py, (py_input,))
-                    .map_err(|e| format!("Python handler raised an exception: {e}"))?;
-
-                // Convert Python result back to serde_json::Value.
-                let result_dict = py_result
-                    .downcast_bound::<PyDict>(py)
-                    .map_err(|_| "tool handler must return a dict".to_owned())?;
-                crate::types::py_dict_to_json(result_dict)
-                    .map_err(|e| format!("failed to convert handler output to JSON: {e}"))
-            })
-        });
-
-    crate::runtime::register_tool_handler(context_id, tool_name, rust_handler)?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2116,14 +2248,16 @@ struct McpRegistryStats {
     clients: usize,
 }
 
-/// Returns MCP registry entry counts.
-fn mcp_registry_stats() -> McpRegistryStats {
-    let servers = server_registry().len();
-    let stopped_servers = server_registry()
+/// Returns MCP registry entry counts for the given bridge instance
+/// (Phase 4 PR 4 sub-slice D).
+fn mcp_registry_stats_for(bi: &crate::runtime::PyBridgeInstance) -> McpRegistryStats {
+    let registry = server_registry_of(bi);
+    let servers = registry.len();
+    let stopped_servers = registry
         .iter()
         .filter(|entry| entry.value().stopped)
         .count();
-    let clients = client_registry().len();
+    let clients = client_registry_of(bi).len();
     McpRegistryStats {
         servers,
         stopped_servers,
@@ -2131,22 +2265,19 @@ fn mcp_registry_stats() -> McpRegistryStats {
     }
 }
 
-/// Removes stopped MCP server entries from the registry.
-///
-/// Returns the number of entries removed. Stopped servers (where
-/// `py_mcp_server_stop` was called but the entry was not removed) are
-/// cleaned up to prevent indefinite accumulation in long-running
-/// processes.
-fn cleanup_stopped_servers() -> usize {
+/// Removes stopped MCP server entries from the given bridge instance's
+/// registry.
+fn cleanup_stopped_servers_for(bi: &crate::runtime::PyBridgeInstance) -> usize {
+    let registry = server_registry_of(bi);
     let mut removed = 0;
-    let keys_to_remove: Vec<String> = server_registry()
+    let keys_to_remove: Vec<String> = registry
         .iter()
         .filter(|entry| entry.value().stopped)
         .map(|entry| entry.key().clone())
         .collect();
 
     for key in keys_to_remove {
-        if server_registry().remove(&key).is_some() {
+        if registry.remove(&key).is_some() {
             removed += 1;
         }
     }
@@ -2168,21 +2299,24 @@ fn cleanup_stopped_servers() -> usize {
 /// # Errors
 ///
 /// Raises `PyErr` if building the result dict fails.
-#[pyfunction]
-#[pyo3(name = "py_registry_stats")]
-pub fn py_registry_stats(py: Python<'_>) -> PyResult<PyObject> {
-    let core_stats = crate::runtime::registry_stats();
-    let mcp_stats = mcp_registry_stats();
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "py_registry_stats")]
+    pub fn py_registry_stats(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let bi = &*self.inner;
+        let core_stats = crate::runtime::registry_stats(bi);
+        let mcp_stats = mcp_registry_stats_for(bi);
 
-    let dict = PyDict::new(py);
-    dict.set_item("contexts", core_stats.contexts)?;
-    dict.set_item("known_contexts", core_stats.known_contexts)?;
-    dict.set_item("identities", core_stats.identities)?;
-    dict.set_item("relay_connected", core_stats.relay_connected)?;
-    dict.set_item("mcp_servers", mcp_stats.servers)?;
-    dict.set_item("mcp_servers_stopped", mcp_stats.stopped_servers)?;
-    dict.set_item("mcp_clients", mcp_stats.clients)?;
-    Ok(dict.into())
+        let dict = PyDict::new(py);
+        dict.set_item("contexts", core_stats.contexts)?;
+        dict.set_item("known_contexts", core_stats.known_contexts)?;
+        dict.set_item("identities", core_stats.identities)?;
+        dict.set_item("relay_connected", core_stats.relay_connected)?;
+        dict.set_item("mcp_servers", mcp_stats.servers)?;
+        dict.set_item("mcp_servers_stopped", mcp_stats.stopped_servers)?;
+        dict.set_item("mcp_clients", mcp_stats.clients)?;
+        Ok(dict.into())
+    }
 }
 
 /// Removes stale entries from all FFI registries.
@@ -2199,14 +2333,17 @@ pub fn py_registry_stats(py: Python<'_>) -> PyResult<PyObject> {
 /// # Errors
 ///
 /// Raises `TransportError` on internal errors.
-#[pyfunction]
-#[pyo3(name = "py_registry_cleanup")]
-pub fn py_registry_cleanup(py: Python<'_>) -> PyResult<PyObject> {
-    let servers_removed = cleanup_stopped_servers();
+#[pymethods]
+impl crate::scp::PyScp {
+    #[pyo3(name = "py_registry_cleanup")]
+    pub fn py_registry_cleanup(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let bi = &*self.inner;
+        let servers_removed = cleanup_stopped_servers_for(bi);
 
-    let dict = PyDict::new(py);
-    dict.set_item("mcp_servers_removed", servers_removed)?;
-    Ok(dict.into())
+        let dict = PyDict::new(py);
+        dict.set_item("mcp_servers_removed", servers_removed)?;
+        Ok(dict.into())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2221,24 +2358,13 @@ pub fn py_registry_cleanup(py: Python<'_>) -> PyResult<PyObject> {
 ///
 /// Returns `PyErr` if registration of functions fails.
 pub fn register_mcp(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(py_mcp_serve, m)?)?;
-    m.add_function(wrap_pyfunction!(py_mcp_server_stop, m)?)?;
-    m.add_function(wrap_pyfunction!(py_mcp_server_wait, m)?)?;
-    m.add_function(wrap_pyfunction!(py_mcp_server_info, m)?)?;
-    m.add_function(wrap_pyfunction!(py_mcp_client_connect_stdio, m)?)?;
-    m.add_function(wrap_pyfunction!(py_mcp_client_connect_sse, m)?)?;
-    m.add_function(wrap_pyfunction!(py_mcp_client_disconnect, m)?)?;
-    m.add_function(wrap_pyfunction!(py_mcp_client_info, m)?)?;
-    m.add_function(wrap_pyfunction!(py_mcp_client_list_tools, m)?)?;
-    m.add_function(wrap_pyfunction!(py_mcp_client_invoke, m)?)?;
-    m.add_function(wrap_pyfunction!(py_mcp_load_contexts, m)?)?;
+    // Stateful MCP operations are exposed as methods on `SCP`
+    // (Phase 4 PR 4 sub-slice D, #1549). Only pure allowlist helpers
+    // (module-global config in scp-mcp) remain as free pyfunctions.
     m.add_function(wrap_pyfunction!(py_mcp_configure_stdio_allowlist, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_disable_stdio_allowlist, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_reset_stdio_allowlist, m)?)?;
     m.add_function(wrap_pyfunction!(py_mcp_get_stdio_allowlist, m)?)?;
-    m.add_function(wrap_pyfunction!(py_register_tool_handler, m)?)?;
-    m.add_function(wrap_pyfunction!(py_registry_stats, m)?)?;
-    m.add_function(wrap_pyfunction!(py_registry_cleanup, m)?)?;
     Ok(())
 }
 
@@ -2250,6 +2376,12 @@ pub fn register_mcp(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    /// Test helper: constructs a fresh bridge instance.
+    /// Phase D (#1695) deleted the process-global default.
+    fn __bi() -> std::sync::Arc<crate::runtime::PyBridgeInstance> {
+        std::sync::Arc::new(crate::runtime::PyBridgeInstance::new_py())
+    }
 
     // -----------------------------------------------------------------------
     // URL parsing
@@ -2332,7 +2464,11 @@ mod tests {
 
     #[test]
     fn ffi_bridge_provider_active_context_ids() {
+        // Hold the Arc alive for the duration of the test so the Weak
+        // inside the provider upgrades successfully (#1549 round-2).
+        let bi = __bi();
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec!["ctx-1".to_owned(), "ctx-2".to_owned()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2348,7 +2484,9 @@ mod tests {
 
     #[test]
     fn ffi_bridge_provider_agent_did() {
+        let bi = __bi();
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec![],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2361,7 +2499,9 @@ mod tests {
 
     #[test]
     fn ffi_bridge_provider_context_tools_empty_for_unknown_context() {
+        let bi = __bi();
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec!["nonexistent".to_owned()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2380,13 +2520,20 @@ mod tests {
 
     /// Registers a context in the runtime registry and optionally adds a tool.
     /// Returns a unique context ID to avoid collisions with parallel tests.
-    fn setup_test_context(creator_did: &str, with_tool: bool) -> String {
+    ///
+    /// Callers must pass the same `bi` they use for subsequent registry lookups;
+    /// each `PyBridgeInstance` has its own `instance_id` and context registry.
+    fn setup_test_context(
+        bi: &crate::runtime::PyBridgeInstance,
+        creator_did: &str,
+        with_tool: bool,
+    ) -> String {
         // Use a unique context ID to avoid collisions across parallel tests.
         let ctx_id = crate::types::generate_random_id("test-mcp");
-        crate::runtime::register_context(&ctx_id, creator_did, &[]).unwrap();
+        crate::runtime::register_context(bi, &ctx_id, creator_did, &[]).unwrap();
 
         if with_tool {
-            crate::runtime::with_context(&ctx_id, |rt| {
+            crate::runtime::with_context(bi, &ctx_id, |rt| {
                 let registration = scp_core::context::tools::ToolRegistration {
                     tool_id: "calculator".to_owned(),
                     name: "Calculator".to_owned(),
@@ -2436,9 +2583,11 @@ mod tests {
     #[test]
     fn ffi_bridge_provider_validate_capability_rejects_missing_ucan() {
         let creator = "did:dht:z6MkCreatorValCap";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2458,7 +2607,7 @@ mod tests {
             "error should mention UCAN requirement: {err}"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2469,11 +2618,12 @@ mod tests {
     #[test]
     fn ffi_bridge_provider_validate_capability_rejects_unauthorized() {
         let creator = "did:dht:z6MkCreatorValCapReject";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Add a member with no ToolInvoke capability.
         let member = "did:dht:z6MkMemberNoInvoke";
-        crate::runtime::with_context(&ctx_id, |rt| {
+        crate::runtime::with_context(&bi, &ctx_id, |rt| {
             rt.role_state.members.insert(member.to_owned());
             let mut caps = std::collections::HashSet::new();
             caps.insert(scp_core::context::roles::Capability::MessagesRead);
@@ -2485,6 +2635,7 @@ mod tests {
         .unwrap();
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: member.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2503,7 +2654,7 @@ mod tests {
             "error should mention UCAN requirement: {err}"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2513,9 +2664,11 @@ mod tests {
     #[test]
     fn ffi_bridge_provider_invoke_tool_echo_fallback_without_handler() {
         let creator = "did:dht:z6MkCreatorInvokeTool";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2538,7 +2691,7 @@ mod tests {
         assert_eq!(output["input_valid"], true);
         assert_eq!(output["validated_input"], input);
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2549,16 +2702,18 @@ mod tests {
     #[test]
     fn invoke_tool_echo_mode_appends_tool_invoked_event() {
         let creator = "did:dht:z6MkCreatorEventLog";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Verify the event log is initially empty.
-        let initial_count = crate::runtime::with_context(&ctx_id, |rt| {
+        let initial_count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
         assert_eq!(initial_count, 0, "event log should start empty");
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2573,7 +2728,7 @@ mod tests {
         assert!(result.is_ok(), "invoke_tool should succeed: {result:?}");
 
         // Verify the event log now has one event.
-        let after_count = crate::runtime::with_context(&ctx_id, |rt| {
+        let after_count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
@@ -2587,7 +2742,7 @@ mod tests {
             provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 5, "b": 6}));
         assert!(result2.is_ok());
 
-        let final_count = crate::runtime::with_context(&ctx_id, |rt| {
+        let final_count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
@@ -2596,13 +2751,14 @@ mod tests {
             "event log should have 2 events after two invocations"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn invoke_tool_with_handler_appends_tool_invoked_event() {
         let creator = "did:dht:z6MkCreatorHandlerEventLog";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a handler.
         let handler: crate::runtime::ToolHandler =
@@ -2611,9 +2767,10 @@ mod tests {
                 let b = input["b"].as_f64().unwrap_or(0.0);
                 Ok(serde_json::json!({"result": a + b}))
             });
-        crate::runtime::register_tool_handler(&ctx_id, "calculator", handler).unwrap();
+        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", handler).unwrap();
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2628,14 +2785,14 @@ mod tests {
         assert_eq!(result.unwrap(), serde_json::json!({"result": 30.0}));
 
         // Verify event was logged.
-        let count = crate::runtime::with_context(&ctx_id, |rt| {
+        let count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
         assert_eq!(count, 1, "handler path should also append to event log");
 
         // Verify the merkle root is non-zero (tree was actually built).
-        let root = crate::runtime::with_context(&ctx_id, |rt| {
+        let root = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             Ok(scp_event_log::tree::root(&rt.event_log))
         })
         .unwrap();
@@ -2644,15 +2801,17 @@ mod tests {
             "merkle root should be non-zero after appending an event"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn invoke_tool_error_does_not_append_event() {
         let creator = "did:dht:z6MkCreatorNoEventOnErr";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2667,7 +2826,7 @@ mod tests {
         assert!(result.is_err(), "invalid input should be rejected");
 
         // Event log should still be empty (no event appended on error).
-        let count = crate::runtime::with_context(&ctx_id, |rt| {
+        let count = crate::runtime::with_context(&bi, &ctx_id, |rt| {
             Ok(scp_event_log::tree::event_count(&rt.event_log))
         })
         .unwrap();
@@ -2676,7 +2835,7 @@ mod tests {
             "event log should remain empty when invocation fails"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2686,9 +2845,11 @@ mod tests {
     #[test]
     fn ffi_bridge_provider_invoke_tool_validates_schema() {
         let creator = "did:dht:z6MkCreatorSchemaVal";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2720,7 +2881,7 @@ mod tests {
             provider.invoke_tool(&ctx_id, "calculator", serde_json::json!({"a": 1, "b": 2}));
         assert!(result.is_ok(), "valid input should succeed: {result:?}");
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2730,9 +2891,11 @@ mod tests {
     #[test]
     fn ffi_bridge_provider_invoke_tool_rejects_unknown_tool() {
         let creator = "did:dht:z6MkCreatorUnknownTool";
-        let ctx_id = setup_test_context(creator, false);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, false);
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2749,7 +2912,7 @@ mod tests {
             "error should mention tool not found: {err}"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2759,24 +2922,25 @@ mod tests {
     #[test]
     fn load_contexts_returns_local_contexts() {
         let creator = "did:dht:z6MkCreatorLoadCtx";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Since py_mcp_load_contexts requires Python, we test the underlying
         // runtime function directly.
-        let ids = crate::runtime::context_ids_for_member(creator);
+        let ids = crate::runtime::context_ids_for_member(&bi, creator);
         assert!(
             ids.contains(&ctx_id),
             "creator should be a member of the context"
         );
 
         // Non-member should not see the context.
-        let other_ids = crate::runtime::context_ids_for_member("did:dht:z6MkNobody");
+        let other_ids = crate::runtime::context_ids_for_member(&bi, "did:dht:z6MkNobody");
         assert!(
             !other_ids.contains(&ctx_id),
             "non-member should not see the context"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -2786,7 +2950,7 @@ mod tests {
     #[test]
     fn known_context_registration_and_lookup() {
         // BridgeInstance must exist for known-context registration.
-        crate::runtime::init_context_manager_for_test();
+        crate::runtime::init_context_manager_for_test(&__bi());
 
         let creator = "did:dht:z6MkCreatorKnownCtx";
         let ctx_id = crate::types::generate_random_id("known-ctx");
@@ -2799,25 +2963,27 @@ mod tests {
             last_seen: 1_700_000_000,
         };
 
-        crate::runtime::register_known_context(&ctx_id, known);
+        let bi = __bi();
+        crate::runtime::register_known_context_on(&bi, &ctx_id, known);
 
         // Should be discoverable by member DID.
-        let found = crate::runtime::known_contexts_for_member(creator);
+        let found = crate::runtime::known_contexts_for_member_on(&bi, creator);
         assert!(
             found.iter().any(|(id, _)| id == &ctx_id),
             "known context should be found by member DID"
         );
 
         // Should not be found for a different DID.
-        let not_found = crate::runtime::known_contexts_for_member("did:dht:z6MkSomeoneElse");
+        let not_found =
+            crate::runtime::known_contexts_for_member_on(&bi, "did:dht:z6MkSomeoneElse");
         assert!(
             !not_found.iter().any(|(id, _)| id == &ctx_id),
             "known context should not be found for a different DID"
         );
 
         // Cleanup: remove_context also removes from known-contexts.
-        crate::runtime::remove_context(&ctx_id);
-        let after_remove = crate::runtime::known_contexts_for_member(creator);
+        crate::runtime::remove_context(&bi, &ctx_id);
+        let after_remove = crate::runtime::known_contexts_for_member_on(&bi, creator);
         assert!(
             !after_remove.iter().any(|(id, _)| id == &ctx_id),
             "known context should be removed after remove_context"
@@ -2837,7 +3003,7 @@ mod tests {
             },
         )];
 
-        let active = probe_relay_for_known_contexts(&known);
+        let active = probe_relay_for_known_contexts(&__bi(), &known);
         assert!(
             active.is_empty(),
             "should return empty set when no relay is connected"
@@ -2847,13 +3013,15 @@ mod tests {
     #[test]
     fn probe_relay_with_empty_known_returns_empty() {
         let known: Vec<(String, crate::runtime::KnownContext)> = vec![];
-        let active = probe_relay_for_known_contexts(&known);
+        let active = probe_relay_for_known_contexts(&__bi(), &known);
         assert!(active.is_empty(), "should return empty set for empty input");
     }
 
     #[test]
     fn ffi_bridge_provider_subscribe_resource_accepts() {
+        let bi = __bi();
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: "did:dht:z6MkTest".to_owned(),
             context_ids: vec![],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2871,7 +3039,8 @@ mod tests {
     #[test]
     fn register_tool_handler_and_invoke_dispatches_through_handler() {
         let creator = "did:dht:z6MkCreatorHandler";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a Rust handler that adds two numbers (simulates a Python handler).
         let handler: crate::runtime::ToolHandler =
@@ -2887,9 +3056,10 @@ mod tests {
                 Ok(serde_json::json!({"result": a + b}))
             });
 
-        crate::runtime::register_tool_handler(&ctx_id, "calculator", handler).unwrap();
+        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", handler).unwrap();
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2915,18 +3085,19 @@ mod tests {
             "handler output should not contain echo-mode 'status' field"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn register_tool_handler_rejects_unregistered_tool() {
         let creator = "did:dht:z6MkCreatorHandlerReject";
-        let ctx_id = setup_test_context(creator, false); // No tool registered.
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, false); // No tool registered.
 
         let handler: crate::runtime::ToolHandler =
             std::sync::Arc::new(|_input| Ok(serde_json::json!({})));
 
-        let result = crate::runtime::register_tool_handler(&ctx_id, "nonexistent", handler);
+        let result = crate::runtime::register_tool_handler(&bi, &ctx_id, "nonexistent", handler);
         assert!(
             result.is_err(),
             "should reject handler for unregistered tool"
@@ -2937,22 +3108,24 @@ mod tests {
             "error should mention tool not found: {err}"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn invoke_tool_with_handler_validates_output_schema() {
         let creator = "did:dht:z6MkCreatorOutVal";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a handler that returns a string instead of an object
         // (violates the output schema which requires an object).
         let bad_handler: crate::runtime::ToolHandler =
             std::sync::Arc::new(|_input| Ok(serde_json::json!("not an object")));
 
-        crate::runtime::register_tool_handler(&ctx_id, "calculator", bad_handler).unwrap();
+        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", bad_handler).unwrap();
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -2973,21 +3146,23 @@ mod tests {
             "error should mention output validation: {err}"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn invoke_tool_handler_error_is_propagated() {
         let creator = "did:dht:z6MkCreatorHandlerErr";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a handler that always fails.
         let failing_handler: crate::runtime::ToolHandler =
             std::sync::Arc::new(|_input| Err("computation exploded".to_owned()));
 
-        crate::runtime::register_tool_handler(&ctx_id, "calculator", failing_handler).unwrap();
+        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", failing_handler).unwrap();
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -3005,7 +3180,7 @@ mod tests {
             "error should contain handler error message: {err}"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     // -----------------------------------------------------------------------
@@ -3015,7 +3190,8 @@ mod tests {
     #[test]
     fn invoke_tool_handler_timeout_produces_clear_error() {
         let creator = "did:dht:z6MkCreatorTimeout";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a handler that blocks for 5 seconds (will be timed out).
         let blocking_handler: crate::runtime::ToolHandler = std::sync::Arc::new(|_input| {
@@ -3023,9 +3199,11 @@ mod tests {
             Ok(serde_json::json!({"result": 42}))
         });
 
-        crate::runtime::register_tool_handler(&ctx_id, "calculator", blocking_handler).unwrap();
+        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", blocking_handler)
+            .unwrap();
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: 50, // 50ms — will expire before the 5s sleep.
@@ -3047,13 +3225,14 @@ mod tests {
             "error should include the timeout duration: {err}"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn invoke_tool_handler_completes_within_timeout_succeeds() {
         let creator = "did:dht:z6MkCreatorTimeoutOk";
-        let ctx_id = setup_test_context(creator, true);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, true);
 
         // Register a fast handler.
         let fast_handler: crate::runtime::ToolHandler =
@@ -3069,9 +3248,10 @@ mod tests {
                 Ok(serde_json::json!({"result": a + b}))
             });
 
-        crate::runtime::register_tool_handler(&ctx_id, "calculator", fast_handler).unwrap();
+        crate::runtime::register_tool_handler(&bi, &ctx_id, "calculator", fast_handler).unwrap();
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: 5_000, // 5 seconds — plenty for an instant handler.
@@ -3093,7 +3273,7 @@ mod tests {
             "handler output should be correct"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
@@ -3137,8 +3317,8 @@ mod tests {
 
     #[test]
     fn mcp_registry_stats_returns_consistent_counts() {
-        crate::runtime::init_context_manager_for_test();
-        let stats = mcp_registry_stats();
+        crate::runtime::init_context_manager_for_test(&__bi());
+        let stats = mcp_registry_stats_for(&__bi());
         // Cannot assert exact values due to parallel tests, but structural
         // invariants must hold: stopped_servers can never exceed total servers.
         assert!(
@@ -3154,10 +3334,12 @@ mod tests {
     #[test]
     fn cleanup_stopped_servers_removes_stopped_entries() {
         let creator = "did:dht:z6MkCreatorCleanup";
-        let ctx_id = setup_test_context(creator, false);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, false);
 
         // Create a minimal server entry directly in the registry.
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -3169,7 +3351,7 @@ mod tests {
         let server = Arc::new(Mutex::new(server));
         let handle = generate_handle_id("mcp-server");
 
-        server_registry().insert(
+        server_registry_of(&bi).insert(
             handle.clone(),
             McpServerState {
                 identity_did: creator.to_owned(),
@@ -3184,28 +3366,30 @@ mod tests {
 
         // Verify our entry is present before cleanup.
         assert!(
-            server_registry().contains_key(&handle),
+            server_registry_of(&bi).contains_key(&handle),
             "stopped server handle should be present before cleanup"
         );
 
-        cleanup_stopped_servers();
+        cleanup_stopped_servers_for(&bi);
 
         // The specific handle should be gone. We check by key rather than
         // by count because parallel tests may insert/remove other entries.
         assert!(
-            !server_registry().contains_key(&handle),
+            !server_registry_of(&bi).contains_key(&handle),
             "stopped server handle should be removed after cleanup"
         );
 
-        crate::runtime::remove_context(&ctx_id);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn cleanup_stopped_servers_leaves_running_entries() {
         let creator = "did:dht:z6MkCreatorCleanupRunning";
-        let ctx_id = setup_test_context(creator, false);
+        let bi = __bi();
+        let ctx_id = setup_test_context(&bi, creator, false);
 
         let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
             agent_did: creator.to_owned(),
             context_ids: vec![ctx_id.clone()],
             tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
@@ -3217,7 +3401,7 @@ mod tests {
         let server = Arc::new(Mutex::new(server));
         let handle = generate_handle_id("mcp-server");
 
-        server_registry().insert(
+        server_registry_of(&bi).insert(
             handle.clone(),
             McpServerState {
                 identity_did: creator.to_owned(),
@@ -3230,27 +3414,122 @@ mod tests {
             },
         );
 
-        cleanup_stopped_servers();
+        cleanup_stopped_servers_for(&bi);
 
         // Running server should still be present.
         assert!(
-            server_registry().contains_key(&handle),
+            server_registry_of(&bi).contains_key(&handle),
             "running server handle should NOT be removed"
         );
 
         // Cleanup: remove manually.
-        server_registry().remove(&handle);
-        crate::runtime::remove_context(&ctx_id);
+        server_registry_of(&bi).remove(&handle);
+        crate::runtime::remove_context(&bi, &ctx_id);
     }
 
     #[test]
     fn core_registry_stats_includes_all_fields() {
-        crate::runtime::init_context_manager_for_test();
-        let stats = crate::runtime::registry_stats();
+        crate::runtime::init_context_manager_for_test(&__bi());
+        let stats = crate::runtime::registry_stats(&__bi());
         // Just verify the struct has the expected fields and doesn't panic.
         let _ = stats.contexts;
         let _ = stats.known_contexts;
         let _ = stats.identities;
         let _ = stats.relay_connected;
+    }
+
+    // -----------------------------------------------------------------------
+    // #1549 round-2 regression: FfiBridgeProvider must hold a `Weak`, not
+    // an `Arc`, so the MCP server task cannot pin `PyBridgeInstance` alive
+    // past the caller's last `Arc` drop.
+    //
+    // A direct unit assertion: the field type itself is `Weak`. When the
+    // only strong reference is dropped, the provider's methods must not
+    // panic, must return safe defaults for the "optional" methods, and
+    // must return a clear error for the "required" methods.
+    // -----------------------------------------------------------------------
+
+    /// Struct-level proof: the `bi` field is `Weak<PyBridgeInstance>`.
+    /// If someone reverts the type to `Arc`, this test stops compiling.
+    #[test]
+    fn ffi_bridge_provider_field_is_weak_not_arc() {
+        let bi = __bi();
+        let provider = FfiBridgeProvider {
+            bi: Arc::downgrade(&bi),
+            agent_did: "did:dht:z6MkTypeProof".to_owned(),
+            context_ids: vec![],
+            tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+            agent_ucan_token: None,
+            agent_proof_tokens: None,
+        };
+        // Compile-time assertion: the field is a `Weak`, so upgrade()
+        // returns `Option`. If the field regresses to `Arc`, this line
+        // fails to type-check.
+        let _opt: Option<Arc<crate::runtime::PyBridgeInstance>> = provider.bi.upgrade();
+    }
+
+    /// Provider methods that degrade gracefully return safe defaults
+    /// when the bridge instance has been dropped.
+    #[test]
+    fn ffi_bridge_provider_returns_safe_defaults_when_bridge_dropped() {
+        let provider = {
+            // Construct the provider against a short-lived Arc, then drop
+            // the Arc so the provider's `Weak` can no longer upgrade.
+            let bi = __bi();
+            let p = FfiBridgeProvider {
+                bi: Arc::downgrade(&bi),
+                agent_did: "did:dht:z6MkDropped".to_owned(),
+                context_ids: vec!["ctx-dropped".to_owned()],
+                tool_timeout_ms: FFI_TOOL_TIMEOUT_MS,
+                agent_ucan_token: None,
+                agent_proof_tokens: None,
+            };
+            drop(bi);
+            p
+        };
+
+        // upgrade_bi itself returns Err.
+        assert!(
+            provider.upgrade_bi().is_err(),
+            "upgrade_bi must fail when the bridge has been dropped"
+        );
+
+        // agent_role: returns None.
+        assert!(provider.agent_role("ctx-dropped").is_none());
+
+        // context_tools: returns empty.
+        assert!(provider.context_tools("ctx-dropped").is_empty());
+
+        // context_members: returns empty.
+        assert!(provider.context_members("ctx-dropped").is_empty());
+
+        // context_events: returns zero-count JSON fallback.
+        let events = provider.context_events("ctx-dropped");
+        assert_eq!(
+            events,
+            serde_json::json!({ "event_count": 0 }),
+            "context_events must emit the zero-count fallback"
+        );
+
+        // validate_capability: returns Err.
+        let vc = provider.validate_capability("ctx-dropped", "anytool");
+        assert!(
+            vc.is_err(),
+            "validate_capability must reject when bridge is dropped"
+        );
+        assert!(
+            vc.unwrap_err().contains("bridge instance has been dropped"),
+            "error must mention the dropped bridge"
+        );
+
+        // subscribe_resource is a no-op that does not touch `bi`; still Ok.
+        assert!(provider.subscribe_resource("scp://x").is_ok());
+
+        // active_context_ids & agent_did don't touch the weak at all.
+        assert_eq!(
+            provider.active_context_ids(),
+            vec!["ctx-dropped".to_owned()]
+        );
+        assert_eq!(provider.agent_did(), "did:dht:z6MkDropped");
     }
 }

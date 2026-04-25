@@ -1,24 +1,21 @@
 //! `#[pyclass]` wrapper exposing [`PyBridgeInstance`] to Python as `SCP`.
 //!
-//! The `SCP` class is the Python SDK's user-facing entry point for the
-//! multi-instance refactor (#1549 Phase 4 PR 1). Each `SCP` instance owns
-//! its own [`PyBridgeInstance`] with a unique monotonic `instance_id`, so
-//! handles issued by one instance are rejected by others via
+//! The `SCP` class is the Python SDK's sole user-facing entry point.
+//! Each `SCP` instance owns its own [`PyBridgeInstance`] with a unique
+//! monotonic `instance_id`, so handles issued by one instance are
+//! rejected by others via
 //! [`scp_ffi_common::bridge_instance::HandleAffinityError`].
 //!
 //! ```python
 //! from scp_sdk import SCP
 //!
-//! scp = SCP()                       # fresh instance
-//! default = SCP.default_instance()  # shared process-global instance
-//! assert scp.instance_id != default.instance_id
-//! scp.shutdown(1.0)                 # graceful shutdown, 1 second deadline
+//! scp = SCP()          # fresh instance — no shared process-global state
+//! scp.shutdown(1000)   # graceful shutdown (milliseconds)
 //! ```
 //!
-//! The flat bridge functions (`py_identity_create`, `py_context_create`, ...)
-//! still operate on the default instance (see
-//! [`crate::runtime::default_bridge_instance`]); migration to per-instance
-//! methods on `SCP` happens incrementally in later commits of this PR.
+//! Phase D (#1695) deleted the default-instance infrastructure: there is
+//! no longer a `DEFAULT_BRIDGE_INSTANCE` static or `default_instance()`
+//! factory. Every operation routes through an explicit `SCP` instance.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,10 +25,7 @@ use pyo3::types::PyDict;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore;
 
 use crate::error::ScpPyError;
-use crate::runtime::{
-    DEFAULT_BRIDGE_INSTANCE, PyBridgeInstance, StorageConfig, default_bridge_instance,
-    ensure_bridge_instance,
-};
+use crate::runtime::{PyBridgeInstance, StorageConfig};
 
 /// Python-facing `SCP` instance.
 ///
@@ -48,11 +42,14 @@ pub struct PyScp {
 impl PyScp {
     /// Constructs a new `SCP` instance with its own `PyBridgeInstance`.
     ///
-    /// Unlike [`PyScp::default_instance`], this bypasses the process-global
-    /// `DEFAULT_BRIDGE_INSTANCE` entirely — each call produces a brand-new
-    /// instance with a fresh monotonic `instance_id`, a fresh
-    /// `CancellationToken`, and an empty `JoinSet`. Handles issued against
-    /// this instance are incompatible with any other instance.
+    /// Each call produces a brand-new instance with a fresh monotonic
+    /// `instance_id`, a fresh `CancellationToken`, and an empty
+    /// `JoinSet`. Handles issued against this instance are incompatible
+    /// with any other instance — the affinity check at every FFI entry
+    /// point surfaces a mismatch as `PermissionError` (`SCP-PERM-3030`).
+    /// Phase D (#1695, ADR-048) deleted the prior `default_instance()`
+    /// factory and `DEFAULT_BRIDGE_INSTANCE` static; there is no
+    /// process-global bridge anymore.
     #[new]
     #[must_use]
     pub fn new() -> Self {
@@ -154,22 +151,6 @@ impl PyScp {
         Ok(Self {
             inner: Arc::new(PyBridgeInstance::new_py()),
         })
-    }
-
-    /// Returns an `SCP` handle for the process-global default
-    /// [`PyBridgeInstance`].
-    ///
-    /// Repeated calls return the same underlying `Arc<PyBridgeInstance>` —
-    /// each `SCP` wrapper is a fresh Python object, but `instance_id`
-    /// remains identical across calls.
-    ///
-    /// # Errors
-    ///
-    /// Raises `ContextError` if the default instance is currently suspended.
-    #[staticmethod]
-    pub fn default_instance() -> PyResult<Self> {
-        let inner = default_bridge_instance()?;
-        Ok(Self { inner })
     }
 
     /// Returns the monotonic identifier for this instance.
@@ -277,10 +258,29 @@ impl Default for PyScp {
     }
 }
 
-/// Initialises the default `PyBridgeInstance` so that the flat bridge
-/// functions can use it. Exposed for module init in `lib.rs`.
-#[must_use]
-pub fn ensure_default_initialized() -> Option<&'static Arc<PyBridgeInstance>> {
-    ensure_bridge_instance();
-    DEFAULT_BRIDGE_INSTANCE.get()
+// Non-pyo3 impl block — exposes internals for Rust consumers (integration
+// tests and downstream bridge glue). Items here do NOT become Python
+// attributes because they're not annotated with `#[pymethods]`.
+impl PyScp {
+    /// Returns a shared reference to this instance's `PyBridgeInstance`.
+    ///
+    /// Useful for Rust-side code (integration tests, crate-internal glue)
+    /// that needs to pass the same `PyBridgeInstance` to `runtime::*`
+    /// helpers that this `PyScp` services. Python code should never see
+    /// this — it is not `#[pymethods]`.
+    #[must_use]
+    pub const fn bridge_instance(&self) -> &Arc<PyBridgeInstance> {
+        &self.inner
+    }
+
+    /// Constructs a `PyScp` that wraps an existing `PyBridgeInstance`.
+    ///
+    /// Used by integration tests that need the same `PyBridgeInstance`
+    /// for both `runtime::*` helpers (which take `&PyBridgeInstance`) and
+    /// `PyScp::*` methods (which route through `self.inner`). Production
+    /// code should use [`PyScp::new`] or [`PyScp::with_storage`] instead.
+    #[must_use]
+    pub const fn from_bridge_instance(inner: Arc<PyBridgeInstance>) -> Self {
+        Self { inner }
+    }
 }

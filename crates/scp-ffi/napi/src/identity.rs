@@ -3,11 +3,11 @@
 //! Exposes [`NapiIdentity`] as an opaque JS class and bridge functions for
 //! the identity lifecycle:
 //!
-//! - [`identity_create`] — Creates a new DID identity (returns `Promise<NapiIdentity>`).
-//! - [`identity_create_with_agent_key`] — Creates a new DID identity with an
+//! - `identity_create` — Creates a new DID identity (returns `Promise<NapiIdentity>`).
+//! - `identity_create_with_agent_key` — Creates a new DID identity with an
 //!   agent signing key.
-//! - [`identity_load`] — Loads an existing identity by DID string.
-//! - [`identity_resolve`] — Resolves a DID to its document.
+//! - `identity_load` — Loads an existing identity by DID string.
+//! - `identity_resolve` — Resolves a DID to its document.
 //!
 //! Identity migration (spec §9.12):
 //!
@@ -40,11 +40,13 @@ use std::sync::Arc;
 
 use napi::Error as NapiError;
 use napi_derive::napi;
+#[cfg(all(test, feature = "allow_in_memory_custody"))]
+use scp_identity::DidMethod;
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_identity::{DhtClient, IdentityError};
 use scp_identity::{
-    DidCache, DidDht, DidDocument, DidMethod, DualLayerResolver, InMemoryDhtClient,
-    NoOpRelayQuerier, ScpIdentity,
+    DidCache, DidDht, DidDocument, DualLayerResolver, InMemoryDhtClient, NoOpRelayQuerier,
+    ScpIdentity,
 };
 #[cfg(feature = "allow_in_memory_custody")]
 use scp_platform::testing::InMemoryKeyCustody;
@@ -54,53 +56,73 @@ use scp_primitives::Clock;
 #[cfg(feature = "allow_in_memory_custody")]
 use std::fmt;
 
-use crate::error::{ScpNapiError, validate_custody_type};
+use crate::error::ScpNapiError;
 use crate::{decrement_handle_count, increment_handle_count};
 
-#[cfg(feature = "allow_in_memory_custody")]
-use scp_ffi_common::validate::MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID;
-
-/// Ensures the global production DID resolver is initialized (idempotent). #311
+/// Ensures the production DID resolver is initialized on the given bridge
+/// instance (idempotent). #311
 ///
-/// The `InMemoryDhtClient` created here is stored in a shared global so that
-/// `identity_create` can publish newly created DID documents to it. This
-/// allows UCAN validation (which resolves the issuer DID) to find the
-/// document without a real network DHT (#1144).
+/// The `InMemoryDhtClient` created here is stored in a process-wide
+/// `SHARED_DHT_CLIENT` (#1144) so every `SCP` instance in the same process
+/// reads/writes the same test DHT — cross-identity flows (Alice publishes,
+/// Bob resolves in the same process) depend on a single shared DHT. The
+/// per-instance part is only the `DualLayerResolver` slot on
+/// [`crate::runtime::NapiBridgeInstance::core`].
 ///
-/// Uses `std::sync::Once` to guard the entire initialization block atomically.
-/// Without this, two separate `OnceLock::set` calls (`SHARED_DHT_CLIENT` and
+/// Uses `std::sync::Once` to guard the initial `SHARED_DHT_CLIENT` +
+/// `DualLayerResolver` construction atomically. Without this, two separate
+/// `OnceLock::set` calls (`SHARED_DHT_CLIENT` and
 /// `BridgeInstance::did_resolver`) could race under concurrent access: thread A
 /// creates `InMemoryDhtClient` X and sets `SHARED_DHT_CLIENT`, then thread B
 /// creates `InMemoryDhtClient` Y, fails to set `SHARED_DHT_CLIENT` (already set
 /// to X), but builds a `DualLayerResolver` around Y and stores it in
 /// `BridgeInstance` — the resolver and the shared DHT client would reference
 /// different instances.
-fn ensure_did_resolver_initialized() {
-    static INIT: std::sync::Once = std::sync::Once::new();
+///
+/// Subsequent calls on the same bridge instance are no-ops: once a resolver is
+/// attached (via [`crate::runtime::init_did_resolver`]) the helper short-
+/// circuits. For a fresh `SCP` instance that hasn't yet acquired a resolver,
+/// this reuses the process-wide `SHARED_DHT_CLIENT` (if already set) to build
+/// the instance-local `DualLayerResolver`.
+pub(crate) fn ensure_did_resolver_initialized_on(bi: &crate::runtime::NapiBridgeInstance) {
+    if crate::runtime::did_resolver(bi).is_some() {
+        return;
+    }
 
-    INIT.call_once(|| {
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return; // No runtime available; skip initialization.
-        };
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return; // No runtime available; skip initialization.
+    };
 
-        let dht_client = Arc::new(InMemoryDhtClient::new());
-        // Store the DHT client so identity_create can publish documents to it.
-        crate::runtime::init_shared_dht_client(Arc::clone(&dht_client));
+    // Reuse the process-wide `SHARED_DHT_CLIENT` when already set so Alice
+    // (on `SCP` A) publishes to the same DHT Bob (on `SCP` B) reads from.
+    // The client is `init`'d at most once per process regardless of how many
+    // `SCP` instances exist.
+    let dht_client = crate::runtime::shared_dht_client().map_or_else(
+        || {
+            let client = Arc::new(InMemoryDhtClient::new());
+            crate::runtime::init_shared_dht_client(Arc::clone(&client));
+            client
+        },
+        Arc::clone,
+    );
 
-        let relay_querier = Arc::new(NoOpRelayQuerier);
-        let cache = Arc::new(DidCache::new());
-        let bootstrap_relays = Vec::new();
+    let relay_querier = Arc::new(NoOpRelayQuerier);
+    let cache = Arc::new(DidCache::new());
+    let bootstrap_relays = Vec::new();
 
-        let resolver = Arc::new(DualLayerResolver::new(
-            relay_querier,
-            dht_client,
-            cache,
-            bootstrap_relays,
-        ));
+    let resolver = Arc::new(DualLayerResolver::new(
+        relay_querier,
+        dht_client,
+        cache,
+        bootstrap_relays,
+    ));
 
-        crate::runtime::init_did_resolver(resolver, handle);
-    });
+    crate::runtime::init_did_resolver(bi, resolver, handle);
 }
+
+// Phase D (#1695): `ensure_did_resolver_initialized` default-bridge wrapper
+// deleted. All callers pass `&NapiBridgeInstance` and invoke
+// `ensure_did_resolver_initialized_on(bi)` directly.
 
 /// Publishes a newly created DID document to the shared `InMemoryDhtClient`.
 ///
@@ -115,7 +137,7 @@ fn ensure_did_resolver_initialized() {
 ///
 /// See issue #1144.
 #[cfg(feature = "allow_in_memory_custody")]
-async fn publish_to_shared_dht(
+pub(crate) async fn publish_to_shared_dht_for(
     identity: &ScpIdentity,
     document: &DidDocument,
     custody: &OpaqueInMemoryKeyCustody,
@@ -229,7 +251,6 @@ fn make_dht_with_signer(
 // ---------------------------------------------------------------------------
 
 /// Inner state for a [`NapiIdentity`] handle.
-#[derive(Debug)]
 pub(crate) struct NapiIdentityInner {
     /// The DID string (e.g., `"did:dht:z6Mk..."`).
     pub(crate) did: String,
@@ -250,10 +271,17 @@ pub(crate) struct NapiIdentityInner {
     /// Used by agent key operations to read/modify the document. `None` for
     /// externally loaded identities.
     pub(crate) document: Option<DidDocument>,
+    /// The `NapiBridgeInstance` that minted this identity.
+    ///
+    /// Retained so mutable identity methods (rotateKey, addAgentKey,
+    /// rotateAgentKey, removeAgentKey, migrate) can register the derived
+    /// identity state on the correct bridge registry without depending on
+    /// the process-global default bridge. Phase D (#1695).
+    pub(crate) bi: Arc<crate::runtime::NapiBridgeInstance>,
     /// Hex-encoded Ed25519 verifying-key bytes for the identity key
     /// (VM `#0`, the key that derives the DID). 64 hex chars = 32 raw
-    /// bytes. Populated for identities created via
-    /// [`identity_create`]; `None` for externally loaded identities.
+    /// bytes. Populated for identities created via `Scp::identity_create`;
+    /// `None` for externally loaded identities.
     ///
     /// Uses `identity_key` (not `#active`) because the WASM bridge has a
     /// simplified single-key model; exposing the identity key gives
@@ -398,8 +426,10 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("rotateKey")?;
 
+            let bi = &self.inner.bi;
+
             // Read attestations BEFORE async operation (entry guaranteed to exist).
-            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -415,6 +445,7 @@ impl NapiIdentity {
 
             // Update the identity registry with the rotated key handles.
             crate::runtime::register_identity(
+                bi,
                 &new_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -431,8 +462,9 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
+                    bi: Arc::clone(&self.inner.bi),
                     verifying_key_hex,
-                    instance_id: crate::runtime::default_instance_id()?,
+                    instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -471,8 +503,10 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("addAgentKey")?;
 
+            let bi = &self.inner.bi;
+
             // Read attestations BEFORE async operation (entry guaranteed to exist).
-            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -489,6 +523,7 @@ impl NapiIdentity {
             // Update the identity registry with the new key state so that
             // bridge functions (ucan_delegate, etc.) see the updated identity.
             crate::runtime::register_identity(
+                bi,
                 &new_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -505,8 +540,9 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
+                    bi: Arc::clone(&self.inner.bi),
                     verifying_key_hex,
-                    instance_id: crate::runtime::default_instance_id()?,
+                    instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -546,8 +582,10 @@ impl NapiIdentity {
             let (scp_identity, custody, document) =
                 self.extract_in_memory_state("rotateAgentKey")?;
 
+            let bi = &self.inner.bi;
+
             // Read attestations BEFORE async operation (entry guaranteed to exist).
-            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -563,6 +601,7 @@ impl NapiIdentity {
 
             // Update the identity registry with the rotated key state.
             crate::runtime::register_identity(
+                bi,
                 &new_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -579,8 +618,9 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
+                    bi: Arc::clone(&self.inner.bi),
                     verifying_key_hex,
-                    instance_id: crate::runtime::default_instance_id()?,
+                    instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -620,8 +660,10 @@ impl NapiIdentity {
             let (scp_identity, custody, document) =
                 self.extract_in_memory_state("removeAgentKey")?;
 
+            let bi = &self.inner.bi;
+
             // Read attestations BEFORE async operation (entry guaranteed to exist).
-            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -637,6 +679,7 @@ impl NapiIdentity {
 
             // Update the identity registry with the post-removal key state.
             crate::runtime::register_identity(
+                bi,
                 &new_identity.did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -653,8 +696,9 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
+                    bi: Arc::clone(&self.inner.bi),
                     verifying_key_hex,
-                    instance_id: crate::runtime::default_instance_id()?,
+                    instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -704,8 +748,10 @@ impl NapiIdentity {
         {
             let (scp_identity, custody, document) = self.extract_in_memory_state("migrate")?;
 
+            let bi = &self.inner.bi;
+
             // Read attestations BEFORE async operation (entry guaranteed to exist now).
-            let existing_attestations = crate::runtime::with_identity(&self.inner.did, |e| {
+            let existing_attestations = crate::runtime::with_identity(bi, &self.inner.did, |e| {
                 Ok(e.identity_link_attestations.clone())
             })
             .unwrap_or_default();
@@ -749,8 +795,9 @@ impl NapiIdentity {
                 identity_verifying_key_hex(&custody, &new_identity.identity_key).await;
 
             // Remove the old identity and register the new one.
-            crate::runtime::remove_identity(&self.inner.did);
+            crate::runtime::remove_identity(bi, &self.inner.did);
             crate::runtime::register_identity(
+                bi,
                 &new_did,
                 crate::runtime::NapiIdentityEntry {
                     identity: new_identity.clone(),
@@ -767,8 +814,9 @@ impl NapiIdentity {
                     scp_identity: Some(new_identity),
                     in_memory_custody: self.inner.in_memory_custody.clone(),
                     document: Some(new_document),
+                    bi: Arc::clone(&self.inner.bi),
                     verifying_key_hex,
-                    instance_id: crate::runtime::default_instance_id()?,
+                    instance_id: self.inner.bi.instance_id(),
                 }),
             };
             increment_handle_count();
@@ -787,7 +835,7 @@ impl NapiIdentity {
 /// WASM bridge has only one key per identity, so byte-exact cross-bridge
 /// parity requires every bridge to expose the DID-deriving identity key.
 #[cfg(feature = "allow_in_memory_custody")]
-async fn identity_verifying_key_hex(
+pub(crate) async fn identity_verifying_key_hex(
     custody: &Arc<OpaqueInMemoryKeyCustody>,
     handle: &scp_platform::traits::KeyHandle,
 ) -> Option<String> {
@@ -951,1010 +999,17 @@ pub struct NapiDIDDocument {
 // ---------------------------------------------------------------------------
 // Bridge functions
 // ---------------------------------------------------------------------------
-
-/// Creates a new DID identity with the specified custody method.
-///
-/// For `"in_memory"` custody, this function calls `scp-core` directly using
-/// `InMemoryKeyCustody` to generate a real `did:dht` identity on the tokio
-/// runtime. The key material is retained inside the returned [`NapiIdentity`]
-/// handle.
-///
-/// For `"platform"` and `"software"` custody types, this function returns an
-/// error until the `KeyCustodyProvider` callback interface is wired to `scp-core`.
-///
-/// # Arguments
-///
-/// * `custody` — The custody type string: `"in_memory"`, `"platform"`, or
-///   `"software"`.
-///
-/// # Returns
-///
-/// A `Promise<NapiIdentity>` resolving to the new identity handle.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-VALID-7007` if `custody` is not a recognized value.
-/// - Rejects with `SCP-IDENT-1003` for `"platform"` or `"software"` custody
-///   (not yet wired).
-/// - Rejects with `SCP-IDENT-1001` if key generation or DID creation fails.
-///
-/// # Security
-///
-/// `"in_memory"` stores key material in unprotected heap memory. Suitable for
-/// testing, CLI, and desktop builds. NOT suitable for production mobile use —
-/// use `"platform"` custody on iOS/Android.
-#[napi]
-#[allow(clippy::unused_async)] // napi requires async for Promise return type
-pub async fn identity_create(
-    custody: String,
-    seed: Option<napi::bindgen_prelude::Buffer>,
-) -> napi::Result<NapiIdentity> {
-    validate_custody_type(&custody).map_err(NapiError::from)?;
-
-    // Ensure the BridgeInstance exists BEFORE the DID resolver is
-    // initialized — the DID resolver is stored inside the BridgeInstance and
-    // cannot be registered otherwise. The real ContextManager is attached
-    // later (by init_context_manager) once the identity has been created.
-    // Per spec §12.2.3 the BridgeInstance container carries no DID; the
-    // DID lives inside the MlsCryptoProvider owned by the ContextManager.
-    crate::runtime::ensure_bridge_instance();
-
-    // Ensure the global DID resolver is initialized (idempotent). #311
-    ensure_did_resolver_initialized();
-
-    // Validate the optional 32-byte seed at the FFI boundary. A seed is
-    // only meaningful for the in_memory custody path (ADR-046); any
-    // other custody with `seed=Some(...)` is a validation error.
-    let seed_bytes = match seed.as_ref() {
-        None => None,
-        Some(buf) => {
-            let slice: &[u8] = buf.as_ref();
-            Some(<[u8; 32]>::try_from(slice).map_err(|_| {
-                NapiError::from(ScpNapiError::Validation {
-                    message: format!("seed must be exactly 32 bytes, got {}", slice.len()),
-                    code: codes::VALID_7007.to_owned(),
-                })
-            })?)
-        }
-    };
-
-    match custody.as_str() {
-        #[cfg(feature = "allow_in_memory_custody")]
-        "in_memory" => {
-            // Wire to scp-core using InMemoryKeyCustody.
-            //
-            // Both `scp_identity` and `key_custody` must be retained in the
-            // handle. `ScpIdentity` holds `KeyHandle`s that are indices into
-            // `key_custody`'s internal store. Dropping `key_custody` destroys
-            // all private key material and renders those handles dangling.
-            //
-            // When `seed` is supplied, the custody is backed by a
-            // deterministic RNG (`StdRng::from_seed`), making subsequent
-            // `generate_keypair` calls produce byte-identical Ed25519 keys
-            // across bridges — the basis of the cross-bridge parity test.
-            let in_memory = seed_bytes
-                .map_or_else(InMemoryKeyCustody::new, InMemoryKeyCustody::from_seed_bytes);
-            let key_custody = Arc::new(OpaqueInMemoryKeyCustody(in_memory));
-            let dht = DidDht::new();
-            let (scp_identity, document) = dht
-                .create(&key_custody.0)
-                .await
-                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-            // Snapshot the identity-key (`#0`) verifying-key bytes for
-            // parity testing. Using `identity_key` (not `active_signing_key`)
-            // guarantees byte-exact parity with the WASM bridge, which has
-            // a single-key model (see NapiIdentityInner docs).
-            let pk = key_custody
-                .0
-                .public_key(&scp_identity.identity_key)
-                .await
-                .map_err(|e| {
-                    NapiError::from(ScpNapiError::Identity {
-                        message: format!(
-                            "failed to read active signing key after identity create: {e}"
-                        ),
-                        code: codes::IDENT_1001.to_owned(),
-                    })
-                })?;
-            let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
-
-            // Register identity in the global registry so that bridge functions
-            // like `ucan_delegate` can look up this identity's key material by
-            // DID (matching the PyO3 bridge's identity registry pattern).
-            crate::runtime::register_identity(
-                &scp_identity.did,
-                crate::runtime::NapiIdentityEntry {
-                    identity: scp_identity.clone(),
-                    custody: Arc::clone(&key_custody),
-                    document: document.clone(),
-                    identity_link_attestations: Vec::new(),
-                },
-            );
-
-            // Publish the DID document to the shared InMemoryDhtClient so
-            // that the DualLayerResolver can find it during UCAN validation.
-            // Best-effort: errors are logged, not propagated (#1144).
-            publish_to_shared_dht(&scp_identity, &document, &key_custody).await;
-
-            let handle = NapiIdentity {
-                inner: Arc::new(NapiIdentityInner {
-                    did: scp_identity.did.clone(),
-                    custody_type: "in_memory".to_owned(),
-                    scp_identity: Some(scp_identity),
-                    in_memory_custody: Some(key_custody),
-                    document: Some(document),
-                    verifying_key_hex,
-                    instance_id: crate::runtime::default_instance_id()?,
-                }),
-            };
-            increment_handle_count();
-            Ok(handle)
-        }
-        #[cfg(not(feature = "allow_in_memory_custody"))]
-        "in_memory" => Err(ScpNapiError::Identity {
-            message:
-                "in_memory custody is not available in this build -- enable allow_in_memory_custody"
-                    .to_owned(),
-            code: codes::IDENT_1008.to_owned(),
-        }
-        .into()),
-        "platform" | "software" => {
-            if seed_bytes.is_some() {
-                return Err(NapiError::from(ScpNapiError::Validation {
-                    message: "`seed` parameter is only valid for custody=\"in_memory\"".to_owned(),
-                    code: codes::VALID_7007.to_owned(),
-                }));
-            }
-            Err(ScpNapiError::Identity {
-                message: format!(
-                    "custody type {custody:?} requires a wired platform \
-                     KeyCustodyProvider — use the KeyCustodyProvider callback \
-                     interface to inject Secure Enclave (iOS) or Android \
-                     Keystore (Android) backed custody"
-                ),
-                code: codes::IDENT_1003.to_owned(),
-            }
-            .into())
-        }
-        _ => Err(ScpNapiError::Identity {
-            code: codes::IDENT_1005.to_owned(),
-            message: format!(
-                "internal: unexpected custody type {custody:?} passed validate_custody_type — \
-                 this is a bug in the bridge layer"
-            ),
-        }
-        .into()),
-    }
-}
-
-/// Creates a new DID identity with an agent signing key.
-///
-/// Like [`identity_create`], but the resulting identity also has an `#agent`
-/// verification method in its DID document.
-///
-/// # Arguments
-///
-/// * `custody` — The custody type string: `"in_memory"`, `"platform"`, or
-///   `"software"`.
-///
-/// # Returns
-///
-/// A `Promise<NapiIdentity>` resolving to the new identity handle with
-/// `hasAgentKey === true`.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-VALID-7007` if `custody` is not a recognized value.
-/// - Rejects with `SCP-IDENT-1003` for `"platform"` or `"software"` custody.
-/// - Rejects with `SCP-IDENT-1001` if key generation or DID creation fails.
-///
-/// See ADR-039 acceptance criterion 4 and SCP-AB-016.
-#[napi(js_name = "identityCreateWithAgentKey")]
-#[allow(clippy::unused_async)] // napi requires async for Promise return type
-pub async fn identity_create_with_agent_key(custody: String) -> napi::Result<NapiIdentity> {
-    validate_custody_type(&custody).map_err(NapiError::from)?;
-
-    // Ensure the BridgeInstance exists BEFORE the DID resolver is
-    // initialized. See `identity_create` for the full rationale.
-    crate::runtime::ensure_bridge_instance();
-
-    // Ensure the global DID resolver is initialized (idempotent). #311
-    ensure_did_resolver_initialized();
-
-    match custody.as_str() {
-        #[cfg(feature = "allow_in_memory_custody")]
-        "in_memory" => {
-            let key_custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
-            let dht = DidDht::new();
-            let (scp_identity, document) = dht
-                .create_with_agent_key(&key_custody.0)
-                .await
-                .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-            let verifying_key_hex =
-                identity_verifying_key_hex(&key_custody, &scp_identity.identity_key).await;
-
-            // Register identity in the global registry (same as identity_create).
-            crate::runtime::register_identity(
-                &scp_identity.did,
-                crate::runtime::NapiIdentityEntry {
-                    identity: scp_identity.clone(),
-                    custody: Arc::clone(&key_custody),
-                    document: document.clone(),
-                    identity_link_attestations: Vec::new(),
-                },
-            );
-
-            // Publish the DID document to the shared InMemoryDhtClient (#1144).
-            publish_to_shared_dht(&scp_identity, &document, &key_custody).await;
-
-            let handle = NapiIdentity {
-                inner: Arc::new(NapiIdentityInner {
-                    did: scp_identity.did.clone(),
-                    custody_type: "in_memory".to_owned(),
-                    scp_identity: Some(scp_identity),
-                    in_memory_custody: Some(key_custody),
-                    document: Some(document),
-                    verifying_key_hex,
-                    instance_id: crate::runtime::default_instance_id()?,
-                }),
-            };
-            increment_handle_count();
-            Ok(handle)
-        }
-        #[cfg(not(feature = "allow_in_memory_custody"))]
-        "in_memory" => Err(ScpNapiError::Identity {
-            message:
-                "in_memory custody is not available in this build -- enable allow_in_memory_custody"
-                    .to_owned(),
-            code: codes::IDENT_1008.to_owned(),
-        }
-        .into()),
-        "platform" | "software" => Err(ScpNapiError::Identity {
-            message: format!(
-                "custody type {custody:?} requires a wired platform \
-                 KeyCustodyProvider — use the KeyCustodyProvider callback \
-                 interface to inject Secure Enclave (iOS) or Android \
-                 Keystore (Android) backed custody"
-            ),
-            code: codes::IDENT_1003.to_owned(),
-        }
-        .into()),
-        _ => Err(ScpNapiError::Identity {
-            code: codes::IDENT_1005.to_owned(),
-            message: format!(
-                "internal: unexpected custody type {custody:?} passed validate_custody_type — \
-                 this is a bug in the bridge layer"
-            ),
-        }
-        .into()),
-    }
-}
-
-/// Loads an existing identity from a DID string.
-///
-/// First checks the local identity registry (populated by `identity_create`).
-/// If found, returns a handle backed by the registry's retained key material
-/// and DID document. Falls back to DHT resolution when the DID is not in
-/// the local registry.
-///
-/// # Arguments
-///
-/// * `did` — The DID string to load (e.g., `"did:dht:z6Mk..."`).
-///
-/// # Returns
-///
-/// A `Promise<NapiIdentity>` resolving to the identity handle.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-IDENT-1004` if the DID method is not `"did:dht:"`.
-/// - Rejects with `SCP-IDENT-1001` if the DID is not in the local registry
-///   AND cannot be resolved from the DHT.
-///
-/// See #1144 (C6).
-#[napi]
-pub async fn identity_load(did: String) -> napi::Result<NapiIdentity> {
-    if !did.starts_with("did:dht:") {
-        return Err(ScpNapiError::Identity {
-            message: format!("unsupported DID method: {did} — only did:dht is supported"),
-            code: codes::IDENT_1004.to_owned(),
-        }
-        .into());
-    }
-
-    // Try the local identity registry first (populated by identity_create).
-    // This avoids a DHT round-trip for identities created in this process.
-    #[cfg(feature = "allow_in_memory_custody")]
-    {
-        let local_result = crate::runtime::with_identity(&did, |entry| {
-            Ok((
-                entry.identity.clone(),
-                std::sync::Arc::clone(&entry.custody),
-                entry.document.clone(),
-            ))
-        });
-
-        if let Ok((identity, custody, document)) = local_result {
-            let verifying_key_hex =
-                identity_verifying_key_hex(&custody, &identity.identity_key).await;
-            let handle = NapiIdentity {
-                inner: Arc::new(NapiIdentityInner {
-                    did,
-                    custody_type: "in_memory".to_owned(),
-                    scp_identity: Some(identity),
-                    in_memory_custody: Some(custody),
-                    document: Some(document),
-                    verifying_key_hex,
-                    instance_id: crate::runtime::default_instance_id()?,
-                }),
-            };
-            increment_handle_count();
-            return Ok(handle);
-        }
-    }
-
-    // Fall back to DHT resolution for identities not in the local registry.
-    let dht = DidDht::new();
-    let document = dht
-        .resolve(&did)
-        .await
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-    let handle = NapiIdentity {
-        inner: Arc::new(NapiIdentityInner {
-            did,
-            custody_type: "external".to_owned(),
-            scp_identity: None,
-            #[cfg(feature = "allow_in_memory_custody")]
-            in_memory_custody: None,
-            document: Some(document),
-            // External DIDs loaded via DHT have no local custody — the
-            // verifying key is inside the DID document, not a cached hex
-            // string. Parity-test consumers only need `verifying_key` for
-            // locally-created identities anyway.
-            verifying_key_hex: None,
-            instance_id: crate::runtime::default_instance_id()?,
-        }),
-    };
-    increment_handle_count();
-    Ok(handle)
-}
-
-/// Resolves a DID to its DID Document.
-///
-/// First checks the local identity registry for a cached document. Falls back
-/// to DHT resolution when the DID is not in the local registry.
-///
-/// # Arguments
-///
-/// * `did` — The DID string to resolve (e.g., `"did:dht:z6Mk..."`).
-///
-/// # Returns
-///
-/// A `Promise<NapiDIDDocument>` resolving to the DID document fields.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-IDENT-1004` if the DID format is invalid.
-/// - Rejects with `SCP-IDENT-1001` if the DID is not in the local registry
-///   AND cannot be resolved from the DHT.
-///
-/// See #1144 (C6).
-#[napi]
-pub async fn identity_resolve(did: String) -> napi::Result<NapiDIDDocument> {
-    if !did.starts_with("did:dht:") {
-        return Err(ScpNapiError::Identity {
-            message: format!("unsupported DID method: {did} — only did:dht is supported"),
-            code: codes::IDENT_1004.to_owned(),
-        }
-        .into());
-    }
-
-    // Try the local identity registry first (populated by identity_create).
-    #[cfg(feature = "allow_in_memory_custody")]
-    let local_doc = crate::runtime::with_identity(&did, |entry| Ok(entry.document.clone())).ok();
-    #[cfg(not(feature = "allow_in_memory_custody"))]
-    let local_doc: Option<DidDocument> = None;
-
-    let document = if let Some(doc) = local_doc {
-        doc
-    } else {
-        let dht = DidDht::new();
-        dht.resolve(&did)
-            .await
-            .map_err(|e| NapiError::from(ScpNapiError::from(e)))?
-    };
-
-    let has_agent_key = document.has_agent_key();
-    let agent_public_key = document
-        .agent_verification_method()
-        .map(|vm| vm.public_key_multibase.clone());
-
-    let verification_methods = document
-        .verification_method
-        .iter()
-        .map(|vm| NapiVerificationMethod {
-            id: vm.id.clone(),
-            method_type: vm.method_type.clone(),
-            controller: vm.controller.clone(),
-            public_key_multibase: vm.public_key_multibase.clone(),
-        })
-        .collect();
-
-    Ok(NapiDIDDocument {
-        id: document.id.clone(),
-        verification_methods,
-        authentication: document.authentication.clone(),
-        assertion_methods: document.assertion_method.clone(),
-        also_known_as: document.also_known_as.clone(),
-        service_endpoints: document
-            .service
-            .iter()
-            .map(|s| s.service_endpoint.clone())
-            .collect(),
-        has_agent_key,
-        agent_public_key,
-    })
-}
-
-/// Removes an identity from the global identity registry.
-///
-/// Drops the retained key material (`InMemoryKeyCustody`) and `ScpIdentity`
-/// for the specified DID. This is the NAPI equivalent of the `PyO3` bridge's
-/// `remove_identity` function.
-///
-/// Call this during DID migration (to clean up the old DID) or when an
-/// identity is no longer needed. Prevents memory leaks of private key
-/// material in long-running processes.
-///
-/// Idempotent: succeeds silently if the DID is not in the registry.
-///
-/// # Arguments
-///
-/// * `did` — The DID string to remove from the registry.
-#[cfg(feature = "allow_in_memory_custody")]
-#[napi(js_name = "identityRemove")]
-#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub fn identity_remove(did: String) {
-    crate::runtime::remove_identity(&did);
-}
-
-/// Removes an identity from the global identity registry if present.
-///
-/// Returns `true` if the identity was found and removed, `false` if the DID
-/// was not in the registry. Useful for conditional cleanup where callers need
-/// to know whether the identity existed.
-///
-/// # Arguments
-///
-/// * `did` — The DID string to remove from the registry.
-///
-/// # Returns
-///
-/// `true` if the identity was present and removed, `false` otherwise.
-#[cfg(feature = "allow_in_memory_custody")]
-#[napi(js_name = "identityRemoveIfPresent")]
-#[must_use]
-#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub fn identity_remove_if_present(did: String) -> bool {
-    crate::runtime::remove_identity_if_present(&did)
-}
-
-// ---------------------------------------------------------------------------
-// Device attestation bridge (#362)
-// ---------------------------------------------------------------------------
-
-/// Generates a device attestation token for an identity.
-///
-/// Uses [`InMemoryDeviceAttestation`] to produce a synthetic attestation token,
-/// then attaches it to the identity's DID document.
-///
-/// # Arguments
-///
-/// * `did` -- The DID string of the identity to attest (used for API
-///   consistency; the attestation is generated locally).
-///
-/// # Returns
-///
-/// The attestation token as a base64-encoded string.
-///
-/// # Errors
-///
-/// Rejects if the identity was not created with `identityCreate` (no retained
-/// crypto state) or if attestation generation fails.
-///
-/// See §9.3, issue #362.
-#[cfg(feature = "allow_in_memory_custody")]
-#[napi(js_name = "identityAttestDevice")]
-pub async fn identity_attest_device(did: String) -> napi::Result<String> {
-    use scp_platform::testing::InMemoryDeviceAttestation;
-    use scp_platform::traits::DeviceAttestation;
-
-    let attestation = InMemoryDeviceAttestation::new();
-    let token = attestation.attest().await.map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("device attestation failed: {e}"),
-            code: codes::IDENT_1010.to_owned(),
-        })
-    })?;
-
-    use base64::Engine;
-    let encoded = base64::engine::general_purpose::STANDARD.encode(token.as_bytes());
-
-    // Attach the attestation to the DID document if the identity was created
-    // locally. This is a best-effort operation — if the identity was loaded
-    // externally, we still return the token.
-    let _ = did; // API consistency — the attestation is device-local.
-
-    Ok(encoded)
-}
-
-/// Verifies a device attestation token.
-///
-/// Uses [`InMemoryDeviceAttestation`] to check the token format.
-///
-/// # Arguments
-///
-/// * `did` -- The DID string (unused in verification but kept for API
-///   consistency).
-/// * `token_base64` -- The base64-encoded attestation token to verify.
-///
-/// # Returns
-///
-/// `true` if the token is valid, `false` otherwise.
-///
-/// # Errors
-///
-/// Rejects if base64 decoding fails or if verification encounters an error.
-///
-/// See §9.3, issue #362.
-#[cfg(feature = "allow_in_memory_custody")]
-#[napi(js_name = "identityVerifyDeviceAttestation")]
-pub async fn identity_verify_device_attestation(
-    did: String,
-    token_base64: String,
-) -> napi::Result<bool> {
-    use base64::Engine;
-    use scp_platform::testing::InMemoryDeviceAttestation;
-    use scp_platform::traits::DeviceAttestation;
-
-    let _ = did; // API consistency.
-
-    let token_bytes = base64::engine::general_purpose::STANDARD
-        .decode(&token_base64)
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("invalid base64 attestation token: {e}"),
-                code: codes::IDENT_1011.to_owned(),
-            })
-        })?;
-
-    let token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
-    let attestation = InMemoryDeviceAttestation::new();
-
-    attestation.verify(&token).await.map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("device attestation verification failed: {e}"),
-            code: codes::IDENT_1012.to_owned(),
-        })
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Identity link attestation bridge (§3.5.1, §3.5.2)
-// ---------------------------------------------------------------------------
-
-/// Creates an identity link attestation for an external platform identity.
-///
-/// See spec §3.5.1, §3.5.2.
-#[cfg(feature = "allow_in_memory_custody")]
-#[napi(js_name = "identityCreateLinkAttestation")]
-#[allow(clippy::unused_async)]
-pub async fn identity_create_link_attestation(
-    did: String,
-    platform: String,
-    handle: String,
-    proof: String,
-    verification_method: String,
-    platform_id: Option<String>,
-) -> napi::Result<String> {
-    use scp_platform::traits::KeyCustody;
-
-    // Validate attestation input field sizes.
-    scp_ffi_common::validate::validate_attestation_fields(&platform, &handle, &proof)
-        .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
-
-    // Phase 1: read custody + key handle (under DashMap lock, then drop).
-    let (custody, key_handle) = crate::runtime::with_identity(&did, |entry| {
-        Ok((
-            Arc::clone(&entry.custody),
-            entry.identity.active_signing_key,
-        ))
-    })?;
-
-    // Build unsigned attestation using shared pipeline.
-    let built = scp_ffi_common::attestation::build_unsigned_attestation(
-        &did,
-        platform,
-        handle,
-        proof,
-        &verification_method,
-        platform_id,
-    )
-    .map_err(|e| {
-        let code = match &e {
-            scp_ffi_common::attestation::AttestationBuildError::InvalidMethod(_)
-            | scp_ffi_common::attestation::AttestationBuildError::ClockError => codes::IDENT_1040,
-            _ => codes::IDENT_1041,
-        };
-        NapiError::from(ScpNapiError::Identity {
-            message: e.to_string(),
-            code: code.to_owned(),
-        })
-    })?;
-
-    let mut attestation = built.attestation;
-
-    // Phase 2: sign (no DashMap lock held — safe to block_in_place).
-    let rt = tokio::runtime::Handle::try_current().map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("no tokio runtime: {e}"),
-            code: codes::IDENT_1041.to_owned(),
-        })
-    })?;
-
-    let sig = tokio::task::block_in_place(|| {
-        rt.block_on(custody.0.sign(&key_handle, &built.canonical_bytes))
-    })
-    .map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("Ed25519 signing failed: {e}"),
-            code: codes::IDENT_1041.to_owned(),
-        })
-    })?;
-    attestation.signature = sig.as_bytes().to_vec();
-
-    // Phase 3: store attestation (re-acquire DashMap lock, TOCTOU guard).
-    crate::runtime::with_identity_mut(&did, |entry| {
-        // Verify the active signing key has not been rotated between Phase 1 and Phase 3.
-        if entry.identity.active_signing_key != key_handle {
-            return Err(ScpNapiError::Identity {
-                message: "active signing key was rotated during attestation creation — \
-                         please retry"
-                    .to_owned(),
-                code: codes::IDENT_1041.to_owned(),
-            });
-        }
-
-        if entry.identity_link_attestations.len() >= MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID {
-            return Err(ScpNapiError::Identity {
-                message: format!(
-                    "DID has reached the per-identity attestation limit \
-                     ({MAX_IDENTITY_LINK_ATTESTATIONS_PER_DID}) — cannot store additional attestations"
-                ),
-                code: codes::VALID_7403.to_owned(),
-            });
-        }
-        entry.identity_link_attestations.push(attestation.clone());
-        Ok(())
-    })
-    .map_err(NapiError::from)?;
-
-    serde_json::to_string(&attestation).map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("failed to serialize attestation: {e}"),
-            code: codes::IDENT_1042.to_owned(),
-        })
-    })
-}
-
-/// Lists all identity link attestations for an identity.
-///
-/// See spec §3.5.1.
-#[cfg(feature = "allow_in_memory_custody")]
-#[napi(js_name = "identityLinkAttestations")]
-pub fn identity_link_attestations(did: String) -> napi::Result<String> {
-    crate::runtime::with_identity(&did, |entry| {
-        serde_json::to_string(&entry.identity_link_attestations).map_err(|e| {
-            ScpNapiError::Identity {
-                message: format!("failed to serialize attestations: {e}"),
-                code: codes::IDENT_1043.to_owned(),
-            }
-        })
-    })
-    .map_err(NapiError::from)
-}
-
-/// Removes an identity link attestation by its ID.
-///
-/// Returns `true` if the attestation was found and removed.
-///
-/// See spec §3.5.1.
-#[cfg(feature = "allow_in_memory_custody")]
-#[napi(js_name = "identityRemoveLinkAttestation")]
-pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> napi::Result<bool> {
-    crate::runtime::with_identity_mut(&did, |entry| {
-        let before = entry.identity_link_attestations.len();
-        entry
-            .identity_link_attestations
-            .retain(|a| a.id != attestation_id);
-        Ok(entry.identity_link_attestations.len() < before)
-    })
-    .map_err(NapiError::from)
-}
-
-/// Verifies the Ed25519 signature on an identity link attestation.
-///
-/// The issuer's public key cannot be reliably extracted from the DID string
-/// because attestations are signed with `#active` or `#agent` keys
-/// (spec §3.5.2), not the `#0` identity key embedded in the DID.
-///
-/// See spec §3.5.1.
-#[napi(js_name = "identityVerifyLinkAttestation")]
-#[allow(clippy::unused_async)]
-pub async fn identity_verify_link_attestation(
-    attestation_json: String,
-    issuer_public_key_hex: String,
-) -> napi::Result<bool> {
-    use scp_core::identity::attestation::IdentityLinkAttestation;
-
-    let attestation: IdentityLinkAttestation =
-        serde_json::from_str(&attestation_json).map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("failed to parse attestation JSON: {e}"),
-                code: codes::IDENT_1044.to_owned(),
-            })
-        })?;
-
-    let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("invalid issuer_public_key_hex: {e}"),
-            code: codes::IDENT_1044.to_owned(),
-        })
-    })?;
-    Ok(attestation.verify_signature(&pub_bytes).is_ok())
-}
-
-// ---------------------------------------------------------------------------
-// Compromise recovery — FFI exposure for CompromiseRecoveryOrchestrator
-// ---------------------------------------------------------------------------
-
-/// Executes the compromise recovery protocol for the given DID.
-///
-/// Returns a JSON string with the recovery result.
-///
-/// See spec §9.12 and PR #1080.
-#[napi]
-pub fn identity_execute_recovery(
-    did: String,
-    tier: String,
-    context_ids: Vec<String>,
-) -> napi::Result<String> {
-    use std::collections::HashSet;
-
-    use scp_core::identity::recovery::{
-        CompromiseRecoveryOrchestrator, CompromiseTier, KeyRotationOutcome, PskRotationParams,
-        RecoveryBackend, RecoveryStepError, active_key_rotation_outcome,
-        agent_key_rotation_outcome,
-    };
-    use scp_ffi_common::validate::validate_did;
-    use scp_identity::DID;
-
-    validate_did(&did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let did_val = DID::from(did.as_str());
-
-    let compromise_tier = match tier.as_str() {
-        "agent" => CompromiseTier::Agent,
-        "active_signing" => CompromiseTier::ActiveSigning,
-        "identity_key" => CompromiseTier::IdentityKey,
-        other => {
-            return Err(NapiError::from(ScpNapiError::Identity {
-                message: format!(
-                    "invalid compromise tier: {other}; expected 'agent', 'active_signing', or 'identity_key'"
-                ),
-                code: codes::IDENT_1020.to_owned(),
-            }));
-        }
-    };
-
-    let now_ms = scp_primitives::SystemClock.now_millis();
-
-    let key_rotation = match compromise_tier {
-        CompromiseTier::Agent => agent_key_rotation_outcome(&did_val, now_ms),
-        CompromiseTier::ActiveSigning => active_key_rotation_outcome(&did_val, now_ms),
-        CompromiseTier::IdentityKey => scp_core::identity::recovery::identity_key_rotation_outcome(
-            &did_val,
-            did_val.clone(),
-            now_ms,
-        ),
-    };
-
-    struct NapiRecoveryBackend;
-    impl RecoveryBackend for NapiRecoveryBackend {
-        fn mls_update(
-            &self,
-            _context_id: &str,
-            _key_rotation: &KeyRotationOutcome,
-        ) -> Result<(), RecoveryStepError> {
-            Ok(())
-        }
-        fn revoke_ucans(
-            &self,
-            _context_id: &str,
-            _key_rotation: &KeyRotationOutcome,
-        ) -> Result<(), RecoveryStepError> {
-            Ok(())
-        }
-        fn rotate_key_packages(
-            &self,
-            _context_id: &str,
-            _key_rotation: &KeyRotationOutcome,
-        ) -> Result<(), RecoveryStepError> {
-            Ok(())
-        }
-        fn notify_contacts(
-            &self,
-            _did: &DID,
-            _tier: CompromiseTier,
-            _key_rotation: &KeyRotationOutcome,
-            _contacts: &HashSet<DID>,
-        ) -> bool {
-            true
-        }
-        fn rotate_psk(&self, _params: &PskRotationParams) -> bool {
-            true
-        }
-    }
-
-    let orchestrator = CompromiseRecoveryOrchestrator::new(did_val, context_ids);
-    let contacts = HashSet::new();
-    let backend = NapiRecoveryBackend;
-
-    let handle = tokio::runtime::Handle::try_current().map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("tokio runtime not available: {e}"),
-            code: codes::IDENT_1027.to_owned(),
-        })
-    })?;
-
-    let result = handle
-        .block_on(orchestrator.execute_recovery(
-            compromise_tier,
-            &key_rotation,
-            &contacts,
-            None,
-            &backend,
-            &scp_primitives::SystemClock,
-        ))
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("recovery failed: {e}"),
-                code: codes::IDENT_1022.to_owned(),
-            })
-        })?;
-
-    serde_json::to_string(&result).map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("failed to serialize recovery result: {e}"),
-            code: codes::IDENT_1023.to_owned(),
-        })
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Custody migration — FFI exposure for CustodyMigrationOrchestrator
-// ---------------------------------------------------------------------------
-
-/// Executes the custody migration protocol for the given DID.
-///
-/// Returns a JSON string with the migration result.
-///
-/// See spec §3.2.1.
-#[napi]
-pub fn identity_execute_custody_migration(
-    did: String,
-    target: String,
-    context_ids: Vec<String>,
-) -> napi::Result<String> {
-    use scp_core::identity::custody_migration::{
-        CustodyMigrationBackend, CustodyMigrationOrchestrator, CustodyMigrationRequest,
-        CustodyMigrationTarget,
-    };
-    use scp_ffi_common::validate::validate_did;
-    use scp_identity::DID;
-
-    validate_did(&did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
-    let did_val = DID::from(did.as_str());
-
-    let migration_target = match target.as_str() {
-        "platform_managed" => CustodyMigrationTarget::PlatformManaged,
-        "hardware" => CustodyMigrationTarget::Hardware,
-        "software" => CustodyMigrationTarget::Software,
-        "in_memory" => CustodyMigrationTarget::InMemory,
-        other => {
-            return Err(NapiError::from(ScpNapiError::Identity {
-                message: format!(
-                    "invalid custody migration target: {other}; expected 'platform_managed', 'hardware', 'software', or 'in_memory'"
-                ),
-                code: codes::IDENT_1024.to_owned(),
-            }));
-        }
-    };
-
-    // Error-returning backend — custody migration requires a real backend
-    // provided via the SDK layer. This placeholder ensures callers get an
-    // actionable error instead of silently succeeding with fake keys.
-    struct NotConfiguredMigrationBackend;
-    impl CustodyMigrationBackend for NotConfiguredMigrationBackend {
-        fn generate_key(&self, _target: CustodyMigrationTarget) -> Result<Vec<u8>, String> {
-            Err(
-                "custody migration backend not configured — provide a real backend via SDK layer"
-                    .to_owned(),
-            )
-        }
-        fn authorize(&self, _request: &CustodyMigrationRequest) -> Result<(), String> {
-            Err(
-                "custody migration backend not configured — provide a real backend via SDK layer"
-                    .to_owned(),
-            )
-        }
-        fn rotate_did_document(
-            &self,
-            _did: &DID,
-            _request: &CustodyMigrationRequest,
-            _context_ids: &[String],
-        ) -> Result<(Vec<String>, Vec<String>), String> {
-            Err(
-                "custody migration backend not configured — provide a real backend via SDK layer"
-                    .to_owned(),
-            )
-        }
-        fn reissue_credentials(
-            &self,
-            _did: &DID,
-            _request: &CustodyMigrationRequest,
-        ) -> Result<(), String> {
-            Err(
-                "custody migration backend not configured — provide a real backend via SDK layer"
-                    .to_owned(),
-            )
-        }
-        fn destroy_old_key(&self, _did: &DID) -> Result<(), String> {
-            Err(
-                "custody migration backend not configured — provide a real backend via SDK layer"
-                    .to_owned(),
-            )
-        }
-    }
-
-    let orchestrator = CustodyMigrationOrchestrator::new(did_val, migration_target, context_ids);
-    let backend = NotConfiguredMigrationBackend;
-
-    let handle = tokio::runtime::Handle::try_current().map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("tokio runtime not available: {e}"),
-            code: codes::IDENT_1028.to_owned(),
-        })
-    })?;
-
-    let result = handle
-        .block_on(orchestrator.execute(&backend, &scp_primitives::SystemClock))
-        .map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("custody migration failed: {e}"),
-                code: codes::IDENT_1025.to_owned(),
-            })
-        })?;
-
-    serde_json::to_string(&result).map_err(|e| {
-        NapiError::from(ScpNapiError::Identity {
-            message: format!("failed to serialize custody migration result: {e}"),
-            code: codes::IDENT_1026.to_owned(),
-        })
-    })
-}
+//
+// Phase D (#1695): the `identity_remove` and `identity_remove_if_present`
+// free-function exports moved onto `Scp` (see `scp.rs`). The underlying
+// runtime helpers (`remove_identity` / `remove_identity_if_present`) still
+// exist in `runtime.rs` but are now called via the `Scp` methods which pass
+// `&self.inner` explicitly.
+
+// Phase D (#1695): device attestation, identity link attestation, and
+// compromise recovery free-function façade exports were deleted. Their
+// `Scp` methods in `scp.rs` are now the only entry points — bridge state
+// flows through `&self.inner` rather than the process-global default.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1968,7 +1023,8 @@ mod tests {
     use scp_ffi_common::error_codes as codes;
 
     /// Creates a test `NapiIdentity` with in-memory custody, returning the
-    /// identity and its initial active signing key's public key (multibase).
+    /// identity (stamped with a dedicated `NapiBridgeInstance`) and its
+    /// initial active signing key's public key (multibase).
     async fn create_test_identity() -> (NapiIdentity, String) {
         let key_custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
         let dht = DidDht::new();
@@ -1986,8 +1042,23 @@ mod tests {
             .public_key_multibase
             .clone();
 
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        // Register the identity on the bridge so rotate_key / agent-key
+        // methods can look it up via `with_identity`.
+        crate::runtime::register_identity(
+            &bi,
+            &scp_identity.did,
+            crate::runtime::NapiIdentityEntry {
+                identity: scp_identity.clone(),
+                custody: Arc::clone(&key_custody),
+                document: document.clone(),
+                identity_link_attestations: Vec::new(),
+            },
+        );
+        let instance_id = bi.instance_id();
         let verifying_key_hex =
             identity_verifying_key_hex(&key_custody, &scp_identity.identity_key).await;
+
         let handle = NapiIdentity {
             inner: Arc::new(NapiIdentityInner {
                 did: scp_identity.did.clone(),
@@ -1995,8 +1066,9 @@ mod tests {
                 scp_identity: Some(scp_identity),
                 in_memory_custody: Some(key_custody),
                 document: Some(document),
+                bi,
                 verifying_key_hex,
-                instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+                instance_id,
             }),
         };
         increment_handle_count();
@@ -2132,6 +1204,8 @@ mod tests {
 
         // Construct a NapiIdentity with no scp_identity and no in_memory_custody,
         // simulating an externally loaded identity with no retained key material.
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let instance_id = bi.instance_id();
         let identity = NapiIdentity {
             inner: Arc::new(NapiIdentityInner {
                 did: "did:dht:z6MkTest".to_owned(),
@@ -2139,8 +1213,9 @@ mod tests {
                 scp_identity: None,
                 in_memory_custody: None,
                 document: None,
+                bi,
                 verifying_key_hex: None,
-                instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+                instance_id,
             }),
         };
         increment_handle_count();
@@ -2385,9 +1460,14 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let (identity, _) = rt.block_on(create_test_identity());
         let old_did = identity.did();
+        // `create_test_identity` stamped the handle with its own bridge;
+        // reuse that bridge so registry writes land on the same instance
+        // the migrate() method will consult via `self.inner.bi`.
+        let bi = Arc::clone(&identity.inner.bi);
 
         // Register the identity in the runtime (simulating what identity_create does).
         crate::runtime::register_identity(
+            &bi,
             &old_did,
             crate::runtime::NapiIdentityEntry {
                 identity: identity.inner.scp_identity.clone().expect("scp_identity"),
@@ -2407,14 +1487,14 @@ mod tests {
             .expect("migrate must succeed");
 
         // Old DID should be removed from the registry.
-        let old_lookup = crate::runtime::with_identity(&old_did, |_| Ok(()));
+        let old_lookup = crate::runtime::with_identity(&bi, &old_did, |_| Ok(()));
         assert!(
             old_lookup.is_err(),
             "old DID must be removed from identity registry after migration"
         );
 
         // New DID should be in the registry.
-        let new_lookup = crate::runtime::with_identity(&migrated.did(), |_| Ok(()));
+        let new_lookup = crate::runtime::with_identity(&bi, &migrated.did(), |_| Ok(()));
         assert!(
             new_lookup.is_ok(),
             "new DID must be registered in identity registry after migration"
@@ -2425,6 +1505,8 @@ mod tests {
     fn migrate_errors_without_retained_crypto_state() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
+        let bi = Arc::new(crate::runtime::NapiBridgeInstance::new_napi());
+        let instance_id = bi.instance_id();
         let identity = NapiIdentity {
             inner: Arc::new(NapiIdentityInner {
                 did: "did:dht:z6MkTest".to_owned(),
@@ -2432,8 +1514,9 @@ mod tests {
                 scp_identity: None,
                 in_memory_custody: None,
                 document: None,
+                bi,
                 verifying_key_hex: None,
-                instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+                instance_id,
             }),
         };
         increment_handle_count();

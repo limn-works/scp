@@ -1,27 +1,26 @@
 // PersistenceTest.kt — SDK-layer smoke test for SQLite-backed persistence.
 //
-// #1549 Phase 4 PR 3. Verifies that the Kotlin SDK wrapper surface:
+// #1549 Phase 4 PR 3 + PR 4. Verifies that the Kotlin SDK wrapper surface:
 //
 // 1. Accepts `SCP.withSqlite(dir, key)` and forwards to UniFFI
 //    `Scp.withStorage(StorageConfig.Sqlite(path, key))` without raising.
 // 2. Creates the SQLCipher database file at `{dir}/scp.db` as a side
 //    effect of construction — see
 //    `crates/scp-ffi/uniffi/src/runtime.rs::with_storage_uniffi`.
-// 3. Drives the full `suspend() → resume() → shutdown()` lifecycle on
-//    a SQLite-backed instance without error. All three are `suspend`
+// 3. Drives the full `suspendInstance() → resume() → shutdown()` lifecycle
+//    on a SQLite-backed instance without error. All three are `suspend`
 //    functions in the Kotlin SDK, routed through `CoroutineBridge`.
 // 4. Is reconstructible against the SAME SQLite directory + key — the
 //    reopened instance must open the encrypted database again without
 //    re-deriving a fresh key.
 //
-// The wrapper surface is all this smoke test is responsible for. The
-// end-to-end `identityCreate → contextCreate → contextSend → suspend
+// Each test gets its own tmp dir + `SCP.withSqlite(...)` instance and
+// tears it down deterministically via `@AfterEach` so tests don't leak
+// runtime state across the suite.
+//
+// The end-to-end `identityCreate → contextCreate → contextSend → suspend
 // → restore` path is exercised at the Rust integration layer
-// (`crates/scp-testing/tests/integration/persistence_sdk.rs`) because
-// the Kotlin `SCP` class does not yet surface context methods — the
-// free-function façade routes to the process-global default instance,
-// not to a caller-owned `SCP` handle, and that migration is in #1549
-// PR 4+.
+// (`crates/scp-testing/tests/integration/persistence_sdk.rs`).
 //
 // The suite skips (via JUnit 5 `assumeTrue`) when the UniFFI cdylib
 // is not loadable, matching the pattern in `ScpClassTest` and
@@ -29,11 +28,14 @@
 
 package works.limn.scp
 
+import java.io.File
 import java.nio.file.Files
 import kotlin.io.path.exists
 import kotlin.io.path.pathString
+import kotlin.test.assertFailsWith
 import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
+import uniffi.scp.ScpException
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -72,12 +74,12 @@ class PersistenceTest {
         }
     }
 
-    private val createdInstances = mutableListOf<SCP>()
-
     /// Stable 32-byte SQLCipher key. The specific value does not matter;
     /// only that the same key is reused across the two constructions
     /// that simulate process restart.
     private val sqliteKey: ByteArray = ByteArray(32) { 0x42 }
+
+    private val createdInstances = mutableListOf<SCP>()
 
     private fun bridge(): CoroutineBridge =
         CoroutineBridge(
@@ -92,12 +94,18 @@ class PersistenceTest {
     }
 
     @AfterEach
-    fun cleanup() {
-        val bridge = bridge()
+    fun tearDown() {
+        val b = bridge()
         for (scp in createdInstances) {
-            runBlocking { scp.shutdown(bridge, 1.seconds) }
+            runBlocking { scp.shutdown(b, 1.seconds) }
         }
         createdInstances.clear()
+    }
+
+    private fun makeSqliteScp(dir: File): SCP {
+        val scp = SCP.withSqlite(dir, sqliteKey)
+        createdInstances += scp
+        return scp
     }
 
     @Test
@@ -111,8 +119,7 @@ class PersistenceTest {
                 "scp.db must not exist before SCP.withSqlite at ${dbPath.pathString}",
             )
 
-            val scp = SCP.withSqlite(dir.toFile(), sqliteKey)
-            createdInstances += scp
+            val scp = makeSqliteScp(dir.toFile())
 
             assertTrue(
                 dbPath.exists(),
@@ -122,17 +129,14 @@ class PersistenceTest {
         }
 
     @Test
-    fun `withSqlite roundtrips suspend then resume via CoroutineBridge`() =
+    fun `withSqlite roundtrips suspendInstance then resume via CoroutineBridge`() =
         runTest {
             val dir = Files.createTempDirectory("scp-kotlin-persist-lifecycle-")
             dir.toFile().deleteOnExit()
-            val bridge = bridge()
+            val scp = makeSqliteScp(dir.toFile())
 
-            val scp = SCP.withSqlite(dir.toFile(), sqliteKey)
-            createdInstances += scp
-
-            scp.suspend(bridge)
-            scp.resume(bridge)
+            scp.suspendInstance(bridge())
+            scp.resume(bridge())
             // Reaching here means both suspend and resume completed
             // without raising — the SQLite-backed path composes with
             // the async resume wiring introduced in #1549 PR 3.
@@ -145,13 +149,18 @@ class PersistenceTest {
             val dir = Files.createTempDirectory("scp-kotlin-persist-reopen-")
             dir.toFile().deleteOnExit()
 
-            val scp1 = SCP.withSqlite(dir.toFile(), sqliteKey)
+            val scp1 = makeSqliteScp(dir.toFile())
             val id1 = scp1.instanceId
-            createdInstances += scp1
+            // Post-9fa80e13c: SqliteStorage::new propagates open failures
+            // instead of falling back to in-memory, so the first instance
+            // must release the DB before a second open can succeed. This
+            // matches the Swift `testSqliteReopenWithSamePathAndKeySucceeds`
+            // shape.
+            scp1.shutdown(bridge(), 1.seconds)
+            createdInstances.remove(scp1)
 
-            val scp2 = SCP.withSqlite(dir.toFile(), sqliteKey)
+            val scp2 = makeSqliteScp(dir.toFile())
             val id2 = scp2.instanceId
-            createdInstances += scp2
 
             assertNotEquals(
                 id1,
@@ -167,19 +176,25 @@ class PersistenceTest {
             dir.toFile().deleteOnExit()
 
             // First open with the correct key — creates the encrypted DB.
-            val scp1 = SCP.withSqlite(dir.toFile(), sqliteKey)
-            createdInstances += scp1
+            val scp1 = makeSqliteScp(dir.toFile())
+            scp1.shutdown(bridge(), 1.seconds)
+            createdInstances.remove(scp1)
 
-            // Second open with a wrong key. The UniFFI bridge currently
-            // logs the error and falls back to an in-memory-only
-            // instance — construction therefore succeeds, and the test
-            // guards against corruption of the original DB file.
+            // Second open with a wrong key MUST throw — `SqliteStorage::new`
+            // fails at the `PRAGMA key` / WAL-mode step because `SQLCipher`
+            // rejects the key as "file is not a database". The UniFFI
+            // bridge propagates that through `ScpException.Validation`.
+            // Main's 9fa80e13c replaced the former silent fallback to
+            // in-memory (split-brain where writes silently vanished) with
+            // hard-error propagation.
             val wrongKey = ByteArray(32) { 0x11 }
-            val scp2 = SCP.withSqlite(dir.toFile(), wrongKey)
-            createdInstances += scp2
+            assertFailsWith<ScpException.Validation> {
+                SCP.withSqlite(dir.toFile(), wrongKey)
+            }
 
-            // Third open with the correct key — must still succeed.
-            val scp3 = SCP.withSqlite(dir.toFile(), sqliteKey)
-            createdInstances += scp3
+            // Third open with the correct key — must still succeed, proving
+            // the failed mismatched-key attempt did not corrupt or truncate
+            // the encrypted database file.
+            makeSqliteScp(dir.toFile())
         }
 }

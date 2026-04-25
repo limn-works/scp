@@ -714,11 +714,21 @@ fn wasm_send_message_inspects_spending_ucan_and_economic_policy() {
 // function would fail the test.
 // ---------------------------------------------------------------------------
 
+// Phase 4 PR 4 (#1549 façade deletion) renamed the PyO3 free function
+// `py_tool_invoke` → `#[pymethods] impl PyScp { pub fn tool_invoke(&self, ...) }`
+// delegating to the private `tool_invoke_impl` free function that
+// carries the real wiring. The assertion targets `tool_invoke_impl` —
+// the implementation body — so a refactor cannot silently regress to a
+// bypass path even if the public method signature is preserved.
 #[test]
 fn c4_pyo3_tool_invoke_routes_through_invoke_tool_with_economy() {
     assert!(
-        fn_body_contains(PYO3_TOOLS_SRC, "py_tool_invoke", "invoke_tool_with_economy"),
-        "PyO3 py_tool_invoke must call ContextManager::invoke_tool_with_economy \
+        fn_body_contains(
+            PYO3_TOOLS_SRC,
+            "tool_invoke_impl",
+            "invoke_tool_with_economy"
+        ),
+        "PyO3 tool_invoke_impl must call ContextManager::invoke_tool_with_economy \
          (PR #1606 / C4). Calling try_consume_hard_rate_limit_blocking against \
          a bridge-owned registry instead disables per-invocation pricing, \
          spending UCAN, velocity tracking, and budget enforcement for Python \
@@ -731,26 +741,31 @@ fn c4_pyo3_tool_invoke_accepts_spending_ucan() {
     // The bridge MUST accept the spending UCAN parameter — the
     // runtime's `invoke_tool_with_economy` requires it for §19.5
     // AND-composition on paid actions.
-    let body =
-        extract_fn_body(PYO3_TOOLS_SRC, "py_tool_invoke").expect("py_tool_invoke body must exist");
+    let body = extract_fn_body(PYO3_TOOLS_SRC, "tool_invoke_impl")
+        .expect("tool_invoke_impl body must exist");
     assert!(
         body.contains("spending_ucan"),
-        "PyO3 py_tool_invoke must accept and forward a spending UCAN argument \
+        "PyO3 tool_invoke_impl must accept and forward a spending UCAN argument \
          (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
         body.contains("parse_ucan"),
-        "PyO3 py_tool_invoke must parse the spending UCAN JWT into a UcanToken \
+        "PyO3 tool_invoke_impl must parse the spending UCAN JWT into a UcanToken \
          before passing it to invoke_tool_with_economy."
     );
 }
 
+// Phase 4 PR 4 moved the NAPI free-function export into
+// `impl Scp { pub async fn tool_invoke(&self, ...) }` that delegates to
+// `tool_invoke_on` in `tools.rs`. The wiring (spending_ucan_jwt parse +
+// `invoke_tool_with_economy` call) lives on the `tool_invoke_on` helper,
+// so that is the function we assert against.
 #[test]
 fn c4_napi_tool_invoke_routes_through_invoke_tool_with_economy() {
     assert!(
-        fn_body_contains(NAPI_TOOLS_SRC, "tool_invoke", "invoke_tool_with_economy"),
-        "NAPI tool_invoke must call ContextManager::invoke_tool_with_economy \
+        fn_body_contains(NAPI_TOOLS_SRC, "tool_invoke_on", "invoke_tool_with_economy"),
+        "NAPI tool_invoke_on must call ContextManager::invoke_tool_with_economy \
          (PR #1606 / C4). The previous bypass path called \
          try_consume_hard_rate_limit against the bridge-owned tool registry, \
          disabling per-invocation pricing, spending UCAN, velocity tracking, \
@@ -760,17 +775,17 @@ fn c4_napi_tool_invoke_routes_through_invoke_tool_with_economy() {
 
 #[test]
 fn c4_napi_tool_invoke_accepts_spending_ucan() {
-    let body =
-        extract_fn_body(NAPI_TOOLS_SRC, "tool_invoke").expect("NAPI tool_invoke body must exist");
+    let body = extract_fn_body(NAPI_TOOLS_SRC, "tool_invoke_on")
+        .expect("NAPI tool_invoke_on body must exist");
     assert!(
         body.contains("spending_ucan_jwt"),
-        "NAPI tool_invoke must accept and forward a spending_ucan_jwt argument \
+        "NAPI tool_invoke_on must accept and forward a spending_ucan_jwt argument \
          (PR #1606 / C4). Without it, paid tool invocations skip the §19.5 \
          AND-composition check."
     );
     assert!(
         body.contains("parse_ucan"),
-        "NAPI tool_invoke must parse the spending UCAN JWT into a UcanToken \
+        "NAPI tool_invoke_on must parse the spending UCAN JWT into a UcanToken \
          before passing it to invoke_tool_with_economy."
     );
 }

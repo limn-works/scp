@@ -33,19 +33,35 @@ const PY_TRUST: &str = include_str!("../../../../bindings/python/scp_sdk/trust.p
 const PY_SYNC: &str = include_str!("../../../../bindings/python/scp_sdk/sync.py");
 const PY_BRIDGE: &str = include_str!("../../../../bindings/python/scp_sdk/bridge.py");
 const PY_GOVERNANCE: &str = include_str!("../../../../bindings/python/scp_sdk/governance.py");
+// Phase 4 PR 5 (#1549) migrated most per-module Python wrappers onto the
+// `SCP` class in `scp.py`. Include that file so the coverage matrix sees
+// the consolidated surface.
+const PY_SCP: &str = include_str!("../../../../bindings/python/scp_sdk/scp.py");
 
 // TypeScript SDK files
 const TS_IDENTITY: &str = include_str!("../../../../bindings/typescript/src/identity.ts");
 const TS_CONTEXT: &str = include_str!("../../../../bindings/typescript/src/context.ts");
 const TS_TOOLS: &str = include_str!("../../../../bindings/typescript/src/tools.ts");
-const TS_UCAN: &str = include_str!("../../../../bindings/typescript/src/ucan.ts");
-const TS_EVENT_LOG: &str = include_str!("../../../../bindings/typescript/src/event-log.ts");
-const TS_TRANSPORT: &str = include_str!("../../../../bindings/typescript/src/transport.ts");
+// ucan.ts, event-log.ts, transport.ts — DELETED in #1549 Phase 4 PR 5.
+// Namespace classes collapsed to handle-only types (kept in context.ts /
+// identity.ts / scp.ts); every operation on those domains is now a method
+// on `SCP`. The unified SCP surface lives in scp.ts below.
+const TS_SCP: &str = include_str!("../../../../bindings/typescript/src/scp.ts");
 const TS_DISCOVERY: &str = include_str!("../../../../bindings/typescript/src/discovery.ts");
 const TS_PROVENANCE: &str = include_str!("../../../../bindings/typescript/src/provenance.ts");
 const TS_TRUST: &str = include_str!("../../../../bindings/typescript/src/trust.ts");
 const TS_SYNC: &str = include_str!("../../../../bindings/typescript/src/sync.ts");
 const TS_BRIDGE: &str = include_str!("../../../../bindings/typescript/src/bridge.ts");
+// The TypeScript `Bridge` interface — the low-level adapter contract that
+// the SDK's native + WASM backends implement and that SCP class methods
+// delegate to. Analogous to Swift's `ScpBindings.swift` (UniFFI-generated)
+// and Kotlin's `CoroutineBridge.kt`. Some NAPI-exposed operations
+// (`identityAddAgentKey`, `identityRotateAgentKey`,
+// `identityRemoveAgentKey`, `identityMigrate`) are currently reachable
+// only via the Bridge interface rather than as SCP class methods — the
+// coverage matrix must see them there to mirror the Swift/Kotlin pattern.
+const TS_BRIDGE_INTERNAL: &str =
+    include_str!("../../../../bindings/typescript/src/internal/bridge.ts");
 
 // Swift SDK files
 const SWIFT_IDENTITY: &str = include_str!("../../../../bindings/swift/Sources/SCP/Identity.swift");
@@ -60,10 +76,23 @@ const SWIFT_DISCOVERY: &str =
 const SWIFT_PROVENANCE: &str =
     include_str!("../../../../bindings/swift/Sources/SCP/Provenance.swift");
 const SWIFT_TRUST: &str = include_str!("../../../../bindings/swift/Sources/SCP/Trust.swift");
-const SWIFT_SYNC: &str = include_str!("../../../../bindings/swift/Sources/SCP/Sync.swift");
-const SWIFT_BRIDGE: &str = include_str!("../../../../bindings/swift/Sources/SCP/Bridge.swift");
+// Sync.swift and Bridge.swift deleted in PR 4 Phase C (#1549 façade deletion) —
+// their functionality is exposed as methods on the SCP class directly.
 const SWIFT_GOVERNANCE: &str =
     include_str!("../../../../bindings/swift/Sources/SCP/Governance.swift");
+// Phase 4 PR 4 migrated many per-module Swift wrappers into methods on the
+// `SCP` class in `Scp.swift` (e.g. `ucanValidate`, `transportStatus`,
+// `syncClassifyOffline`, `identityMigrate`, `bridgeEvaluateTrust`). This
+// file is now the canonical wrapper surface alongside the per-module
+// files above, so include it for the SDK wrapper coverage matrix.
+const SWIFT_SCP: &str = include_str!("../../../../bindings/swift/Sources/SCP/Scp.swift");
+// UniFFI-generated bindings. Exposes the raw bridge functions
+// (`bridgeRegister`, `bridgeCreateShadow`, `evaluateProvenanceQuality`,
+// etc.) that the hand-written wrappers delegate to. Some operations are
+// currently invoked only via the generated free functions — include this
+// file so the coverage matrix sees them.
+const SWIFT_BINDINGS: &str =
+    include_str!("../../../../bindings/swift/Sources/SCP/Internal/ScpBindings.swift");
 
 // Kotlin SDK files
 const KT_IDENTITY: &str =
@@ -114,6 +143,7 @@ fn py_all() -> String {
         PY_SYNC,
         PY_BRIDGE,
         PY_GOVERNANCE,
+        PY_SCP,
     ]
     .join("\n")
 }
@@ -123,14 +153,13 @@ fn ts_all() -> String {
         TS_IDENTITY,
         TS_CONTEXT,
         TS_TOOLS,
-        TS_UCAN,
-        TS_EVENT_LOG,
-        TS_TRANSPORT,
+        TS_SCP,
         TS_DISCOVERY,
         TS_PROVENANCE,
         TS_TRUST,
         TS_SYNC,
         TS_BRIDGE,
+        TS_BRIDGE_INTERNAL,
     ]
     .join("\n")
 }
@@ -146,9 +175,9 @@ fn swift_all() -> String {
         SWIFT_DISCOVERY,
         SWIFT_PROVENANCE,
         SWIFT_TRUST,
-        SWIFT_SYNC,
-        SWIFT_BRIDGE,
         SWIFT_GOVERNANCE,
+        SWIFT_SCP,
+        SWIFT_BINDINGS,
     ]
     .join("\n")
 }
@@ -174,10 +203,19 @@ fn has_any_pattern(source: &str, patterns: &[&str]) -> bool {
 fn expected_operations() -> Vec<ExpectedOp> {
     vec![
         // --- Identity ---
+        // Phase 4 PR 5 (#1549) moved the per-module Python SDK free
+        // functions (`async def create(...)` in `identity.py`) onto the
+        // `SCP` class as `async def identity_create(...)` in `scp.py`.
+        // Both spellings are accepted so the matrix tolerates the
+        // transition and any residual legacy wrappers.
         ExpectedOp {
             category: "Identity",
             name: "create",
-            py_patterns: &["async def create(", "py_identity_create"],
+            py_patterns: &[
+                "async def create(",
+                "async def identity_create(",
+                "py_identity_create",
+            ],
             ts_patterns: &["static async create(", "identityCreate"],
             swift_patterns: &["func createIdentity(", "identityCreate"],
             kt_patterns: &["fun identityCreate(", "fun create("],
@@ -185,7 +223,11 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Identity",
             name: "load",
-            py_patterns: &["async def load(", "py_identity_load"],
+            py_patterns: &[
+                "async def load(",
+                "async def identity_load(",
+                "py_identity_load",
+            ],
             ts_patterns: &["static async load(", "identityLoad"],
             swift_patterns: &["func loadIdentity(", "identityLoad"],
             kt_patterns: &["fun identityLoad(", "fun load("],
@@ -193,7 +235,11 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Identity",
             name: "resolve",
-            py_patterns: &["async def resolve(", "py_identity_resolve"],
+            py_patterns: &[
+                "async def resolve(",
+                "async def identity_resolve(",
+                "py_identity_resolve",
+            ],
             ts_patterns: &["static async resolve(", "identityResolve"],
             swift_patterns: &["func resolveIdentity(", "identityResolve"],
             kt_patterns: &["fun identityResolve(", "fun resolve("],
@@ -201,7 +247,11 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Identity",
             name: "rotate_key",
-            py_patterns: &["async def rotate_key(", "py_identity_rotate_key"],
+            py_patterns: &[
+                "async def rotate_key(",
+                "async def identity_rotate_key(",
+                "py_identity_rotate_key",
+            ],
             ts_patterns: &["async rotateKey(", "identityRotateKey"],
             swift_patterns: &["rotateKey()", "rotate_key"],
             kt_patterns: &["rotateKey", "rotate_key"],
@@ -209,7 +259,11 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Identity",
             name: "add_agent_key",
-            py_patterns: &["async def add_agent_key(", "py_identity_add_agent_key"],
+            py_patterns: &[
+                "async def add_agent_key(",
+                "async def identity_add_agent_key(",
+                "py_identity_add_agent_key",
+            ],
             ts_patterns: &["async addAgentKey(", "identityAddAgentKey"],
             swift_patterns: &["func addAgentKeyToIdentity(", "addAgentKey"],
             kt_patterns: &["fun addAgentKey(", "identityAddAgentKey"],
@@ -219,6 +273,7 @@ fn expected_operations() -> Vec<ExpectedOp> {
             name: "rotate_agent_key",
             py_patterns: &[
                 "async def rotate_agent_key(",
+                "async def identity_rotate_agent_key(",
                 "py_identity_rotate_agent_key",
             ],
             ts_patterns: &["async rotateAgentKey(", "identityRotateAgentKey"],
@@ -230,6 +285,7 @@ fn expected_operations() -> Vec<ExpectedOp> {
             name: "remove_agent_key",
             py_patterns: &[
                 "async def remove_agent_key(",
+                "async def identity_remove_agent_key(",
                 "py_identity_remove_agent_key",
             ],
             ts_patterns: &["async removeAgentKey(", "identityRemoveAgentKey"],
@@ -239,7 +295,11 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Identity",
             name: "migrate",
-            py_patterns: &["async def migrate(", "py_identity_migrate"],
+            py_patterns: &[
+                "async def migrate(",
+                "async def identity_migrate(",
+                "py_identity_migrate",
+            ],
             ts_patterns: &["async migrate(", "identityMigrate"],
             // Swift: rotate_key is the layer-1 equivalent; migrate may not be separately exposed
             swift_patterns: &["migrate", "identityMigrate"],
@@ -248,16 +308,29 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Identity",
             name: "attest_device",
-            py_patterns: &["async def attest_device(", "py_identity_attest_device"],
+            py_patterns: &[
+                "async def attest_device(",
+                "async def identity_attest_device(",
+                "py_identity_attest_device",
+            ],
             ts_patterns: &["async attestDevice(", "identityAttestDevice"],
             swift_patterns: &["func identityAttestDevice(", "attestDevice"],
             kt_patterns: &["fun attestDevice(", "identityAttestDevice"],
         },
         // --- Context ---
+        // Phase 4 PR 5 (#1549) consolidated the Python per-module wrappers
+        // (`async def create(...)` in `context.py`) onto the `SCP` class
+        // as `async def context_create(...)` in `scp.py`. On the TypeScript
+        // SCP class, `receive` is exposed as `contextSubscribe()` — both
+        // spellings are accepted.
         ExpectedOp {
             category: "Context",
             name: "create",
-            py_patterns: &["async def create(", "py_context_create"],
+            py_patterns: &[
+                "async def create(",
+                "async def context_create(",
+                "py_context_create",
+            ],
             ts_patterns: &["static async create(", "contextCreate"],
             swift_patterns: &["ContextBridge", "CreateFn"],
             kt_patterns: &["fun contextCreate("],
@@ -265,7 +338,11 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Context",
             name: "join",
-            py_patterns: &["async def join(", "py_context_join"],
+            py_patterns: &[
+                "async def join(",
+                "async def context_join(",
+                "py_context_join",
+            ],
             ts_patterns: &["async join(", "contextJoin"],
             swift_patterns: &["func joinContext(", "JoinFn"],
             kt_patterns: &["fun contextJoin("],
@@ -273,7 +350,11 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Context",
             name: "leave",
-            py_patterns: &["async def leave(", "py_context_leave"],
+            py_patterns: &[
+                "async def leave(",
+                "async def context_leave(",
+                "py_context_leave",
+            ],
             ts_patterns: &["async leave(", "contextLeave"],
             swift_patterns: &["func leave(", "LeaveFn"],
             kt_patterns: &["fun contextLeave("],
@@ -281,7 +362,11 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Context",
             name: "close",
-            py_patterns: &["async def close(", "py_context_close"],
+            py_patterns: &[
+                "async def close(",
+                "async def context_close(",
+                "py_context_close",
+            ],
             ts_patterns: &["async close(", "contextClose"],
             swift_patterns: &["func close(", "CloseFn"],
             kt_patterns: &["fun contextClose("],
@@ -289,7 +374,11 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Context",
             name: "send",
-            py_patterns: &["async def send(", "py_context_send"],
+            py_patterns: &[
+                "async def send(",
+                "async def context_send(",
+                "py_context_send",
+            ],
             ts_patterns: &["async send(", "contextSend"],
             swift_patterns: &["func send(", "SendFn"],
             kt_patterns: &["fun contextSend("],
@@ -297,8 +386,14 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Context",
             name: "receive",
-            py_patterns: &["async def receive(", "py_context_receive"],
-            ts_patterns: &["async *receive(", "receive("],
+            py_patterns: &[
+                "async def receive(",
+                "async def context_receive(",
+                "py_context_receive",
+            ],
+            // On the TS SCP class the op is spelled `contextSubscribe(`
+            // (see `bindings/typescript/src/scp.ts` §Context domain).
+            ts_patterns: &["async *receive(", "receive(", "contextSubscribe("],
             swift_patterns: &["SubscribeFn", "subscribe"],
             kt_patterns: &["fun contextSubscribe(", "subscribe"],
         },
@@ -328,12 +423,20 @@ fn expected_operations() -> Vec<ExpectedOp> {
             kt_patterns: &["fun toolVerify("],
         },
         // --- UCAN ---
+        // Phase 4 PR 4 moved the UCAN wrappers from free-function form
+        // (`validateUcanToken` / `mintUcanToken` / `revokeUcanToken`) into
+        // methods on the `SCP` class (`ucanValidate` / `ucanMint` /
+        // `ucanRevoke`). Both spellings are accepted.
         ExpectedOp {
             category: "UCAN",
             name: "validate",
             py_patterns: &["async def validate(", "ucan_validate"],
             ts_patterns: &["validateUcan(", "ucanValidate"],
-            swift_patterns: &["func validateUcanToken(", "func validate("],
+            swift_patterns: &[
+                "func validateUcanToken(",
+                "func validate(",
+                "func ucanValidate(",
+            ],
             kt_patterns: &["fun ucanValidate("],
         },
         ExpectedOp {
@@ -341,7 +444,7 @@ fn expected_operations() -> Vec<ExpectedOp> {
             name: "mint",
             py_patterns: &["async def mint(", "ucan_mint"],
             ts_patterns: &["mintUcan(", "ucanMint"],
-            swift_patterns: &["func mintUcanToken(", "func mint("],
+            swift_patterns: &["func mintUcanToken(", "func mint(", "func ucanMint("],
             kt_patterns: &["fun ucanMint("],
         },
         ExpectedOp {
@@ -349,7 +452,7 @@ fn expected_operations() -> Vec<ExpectedOp> {
             name: "revoke",
             py_patterns: &["async def revoke(", "ucan_revoke"],
             ts_patterns: &["revokeUcan(", "ucanRevoke"],
-            swift_patterns: &["func revokeUcanToken(", "func revoke("],
+            swift_patterns: &["func revokeUcanToken(", "func revoke(", "func ucanRevoke("],
             kt_patterns: &["fun ucanRevoke("],
         },
         // --- Event Log ---
@@ -439,10 +542,18 @@ fn expected_operations() -> Vec<ExpectedOp> {
             kt_patterns: &["SyncPolicy", "getPolicy"],
         },
         // --- Membership ---
+        // Phase 4 PR 5 (#1549) moved membership helpers from `context.py`
+        // onto the `SCP` class as `async def context_member_count(...)`,
+        // `context_is_member(...)`, `context_member_dids(...)`,
+        // `context_member_role(...)`. Accept both spellings.
         ExpectedOp {
             category: "Membership",
             name: "member_count",
-            py_patterns: &["async def member_count(", "py_context_member_count"],
+            py_patterns: &[
+                "async def member_count(",
+                "async def context_member_count(",
+                "py_context_member_count",
+            ],
             ts_patterns: &["async memberCount(", "contextMemberCount"],
             swift_patterns: &["memberCount", "contextMemberCount"],
             kt_patterns: &["fun contextMemberCount("],
@@ -450,7 +561,11 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Membership",
             name: "is_member",
-            py_patterns: &["async def is_member(", "py_context_is_member"],
+            py_patterns: &[
+                "async def is_member(",
+                "async def context_is_member(",
+                "py_context_is_member",
+            ],
             ts_patterns: &["async isMember(", "contextIsMember"],
             swift_patterns: &["isMember", "contextIsMember"],
             kt_patterns: &["fun contextIsMember("],
@@ -458,7 +573,11 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Membership",
             name: "member_dids",
-            py_patterns: &["async def member_dids(", "py_context_member_dids"],
+            py_patterns: &[
+                "async def member_dids(",
+                "async def context_member_dids(",
+                "py_context_member_dids",
+            ],
             ts_patterns: &["async memberDids(", "contextMemberDids"],
             swift_patterns: &["memberDids", "contextMemberDids"],
             kt_patterns: &["fun contextMemberDids("],
@@ -466,20 +585,35 @@ fn expected_operations() -> Vec<ExpectedOp> {
         ExpectedOp {
             category: "Membership",
             name: "member_role",
-            py_patterns: &["async def member_role(", "py_context_member_role"],
+            py_patterns: &[
+                "async def member_role(",
+                "async def context_member_role(",
+                "py_context_member_role",
+            ],
             ts_patterns: &["async memberRole(", "contextMemberRole"],
             swift_patterns: &["memberRole", "contextMemberRole"],
             kt_patterns: &["fun contextMemberRole("],
         },
         // --- Governance ---
+        // Phase 4 PR 5 (#1549) moved Python `execute_governance_action`
+        // onto the `SCP` class as `async def governance_execute(...)` in
+        // `scp.py`. On the TS `SCP` class the op is spelled
+        // `contextExecuteGovernanceAction(` (camel-cased, so the legacy
+        // `executeGovernanceAction(` pattern with lowercase `e` never
+        // matches as a substring of the new name).
         ExpectedOp {
             category: "Governance",
             name: "execute",
             py_patterns: &[
                 "async def execute_governance_action(",
+                "async def governance_execute(",
                 "py_governance_execute",
             ],
-            ts_patterns: &["executeGovernanceAction(", "governanceExecute"],
+            ts_patterns: &[
+                "executeGovernanceAction(",
+                "contextExecuteGovernanceAction(",
+                "governanceExecute",
+            ],
             swift_patterns: &["Governance", "governance"],
             kt_patterns: &["fun governanceExecute("],
         },
@@ -525,7 +659,9 @@ fn expected_operations() -> Vec<ExpectedOp> {
             name: "evaluate_trust",
             py_patterns: &["evaluate_trust", "bridge_evaluate_trust"],
             ts_patterns: &["evaluateBridgeTrust(", "bridgeEvaluateTrust"],
-            swift_patterns: &["func evaluateBridgeTrust("],
+            // Phase 4 PR 4 renamed `evaluateBridgeTrust` → `bridgeEvaluateTrust`
+            // on the `SCP` class in Scp.swift. Accept both.
+            swift_patterns: &["func evaluateBridgeTrust(", "func bridgeEvaluateTrust("],
             kt_patterns: &["fun bridgeEvaluateTrust("],
         },
         ExpectedOp {
@@ -637,38 +773,92 @@ fn print_matrix(results: &[OpResult]) -> (usize, usize, usize, usize, usize) {
 
 #[test]
 fn python_sdk_identity_wrappers() {
+    // Phase 4 PR 5 (#1549) migrated the Python per-module free
+    // functions (`async def create(...)` on `identity.py`) onto the
+    // `SCP` class as `async def identity_create(...)` in `scp.py`.
+    // Accept both spellings so legacy transitional code still passes.
     let src = py_all();
     assert!(
-        src.contains("async def create(") || src.contains("py_identity_create"),
+        src.contains("async def create(")
+            || src.contains("async def identity_create(")
+            || src.contains("py_identity_create"),
         "Python SDK missing identity create wrapper"
     );
     assert!(
-        src.contains("async def load(") || src.contains("py_identity_load"),
+        src.contains("async def load(")
+            || src.contains("async def identity_load(")
+            || src.contains("py_identity_load"),
         "Python SDK missing identity load wrapper"
     );
     assert!(
-        src.contains("async def resolve(") || src.contains("py_identity_resolve"),
+        src.contains("async def resolve(")
+            || src.contains("async def identity_resolve(")
+            || src.contains("py_identity_resolve"),
         "Python SDK missing identity resolve wrapper"
     );
     assert!(
-        src.contains("async def rotate_key(") || src.contains("py_identity_rotate_key"),
+        src.contains("async def rotate_key(")
+            || src.contains("async def identity_rotate_key(")
+            || src.contains("py_identity_rotate_key"),
         "Python SDK missing identity rotate_key wrapper"
     );
 }
 
 #[test]
 fn python_sdk_context_wrappers() {
+    // Phase 4 PR 5 (#1549) moved context lifecycle helpers from
+    // `context.py` free functions onto the `SCP` class in `scp.py`
+    // (e.g. `async def context_create(...)`). Accept both spellings.
     let src = py_all();
     for (name, patterns) in [
         (
             "create",
-            &["async def create(", "py_context_create"] as &[&str],
+            &[
+                "async def create(",
+                "async def context_create(",
+                "py_context_create",
+            ] as &[&str],
         ),
-        ("join", &["async def join(", "py_context_join"]),
-        ("leave", &["async def leave(", "py_context_leave"]),
-        ("close", &["async def close(", "py_context_close"]),
-        ("send", &["async def send(", "py_context_send"]),
-        ("receive", &["async def receive(", "py_context_receive"]),
+        (
+            "join",
+            &[
+                "async def join(",
+                "async def context_join(",
+                "py_context_join",
+            ],
+        ),
+        (
+            "leave",
+            &[
+                "async def leave(",
+                "async def context_leave(",
+                "py_context_leave",
+            ],
+        ),
+        (
+            "close",
+            &[
+                "async def close(",
+                "async def context_close(",
+                "py_context_close",
+            ],
+        ),
+        (
+            "send",
+            &[
+                "async def send(",
+                "async def context_send(",
+                "py_context_send",
+            ],
+        ),
+        (
+            "receive",
+            &[
+                "async def receive(",
+                "async def context_receive(",
+                "py_context_receive",
+            ],
+        ),
     ] {
         assert!(
             has_any_pattern(&src, patterns),
@@ -679,23 +869,42 @@ fn python_sdk_context_wrappers() {
 
 #[test]
 fn python_sdk_membership_wrappers() {
+    // Phase 4 PR 5 (#1549) moved membership helpers from `context.py`
+    // free functions onto the `SCP` class in `scp.py` (e.g. `async def
+    // context_member_count(...)`). Accept both spellings.
     let src = py_all();
     for (name, patterns) in [
         (
             "member_count",
-            &["async def member_count(", "py_context_member_count"] as &[&str],
+            &[
+                "async def member_count(",
+                "async def context_member_count(",
+                "py_context_member_count",
+            ] as &[&str],
         ),
         (
             "is_member",
-            &["async def is_member(", "py_context_is_member"],
+            &[
+                "async def is_member(",
+                "async def context_is_member(",
+                "py_context_is_member",
+            ],
         ),
         (
             "member_dids",
-            &["async def member_dids(", "py_context_member_dids"],
+            &[
+                "async def member_dids(",
+                "async def context_member_dids(",
+                "py_context_member_dids",
+            ],
         ),
         (
             "member_role",
-            &["async def member_role(", "py_context_member_role"],
+            &[
+                "async def member_role(",
+                "async def context_member_role(",
+                "py_context_member_role",
+            ],
         ),
     ] {
         assert!(
@@ -707,9 +916,12 @@ fn python_sdk_membership_wrappers() {
 
 #[test]
 fn python_sdk_governance_wrappers() {
+    // Phase 4 PR 5 (#1549) renamed `execute_governance_action` →
+    // `governance_execute` on the `SCP` class in `scp.py`. Accept both.
     let src = py_all();
     assert!(
         src.contains("async def execute_governance_action(")
+            || src.contains("async def governance_execute(")
             || src.contains("py_governance_execute"),
         "Python SDK missing governance execute wrapper"
     );
@@ -881,9 +1093,16 @@ fn typescript_sdk_broadcast_wrappers() {
 
 #[test]
 fn typescript_sdk_governance_wrappers() {
+    // Phase 4 PR 5 (#1549) placed governance execute on the `SCP` class
+    // as `async contextExecuteGovernanceAction(...)`. The pre-collapse
+    // spelling `executeGovernanceAction(` (lowercase `e`) doesn't appear
+    // as a substring of the new name because the `E` is capitalized
+    // after `context`, so we accept the fully-qualified name explicitly.
     let src = ts_all();
     assert!(
-        src.contains("executeGovernanceAction(") || src.contains("governanceExecute"),
+        src.contains("executeGovernanceAction(")
+            || src.contains("contextExecuteGovernanceAction(")
+            || src.contains("governanceExecute"),
         "TypeScript SDK missing governance execute wrapper"
     );
 }
@@ -925,16 +1144,26 @@ fn swift_sdk_context_wrappers() {
 #[test]
 fn swift_sdk_ucan_wrappers() {
     let src = swift_all();
+    // Phase 4 PR 4 moved UCAN wrappers onto the `SCP` class
+    // (`ucanValidate` / `ucanMint` / `ucanRevoke`). Accept the new method
+    // names alongside the legacy `validateUcanToken` / `mintUcanToken` /
+    // `revokeUcanToken` free-function spellings.
     assert!(
-        src.contains("func validateUcanToken(") || src.contains("func validate("),
+        src.contains("func validateUcanToken(")
+            || src.contains("func validate(")
+            || src.contains("func ucanValidate("),
         "Swift SDK missing UCAN validate wrapper"
     );
     assert!(
-        src.contains("func mintUcanToken(") || src.contains("func mint("),
+        src.contains("func mintUcanToken(")
+            || src.contains("func mint(")
+            || src.contains("func ucanMint("),
         "Swift SDK missing UCAN mint wrapper"
     );
     assert!(
-        src.contains("func revokeUcanToken(") || src.contains("func revoke("),
+        src.contains("func revokeUcanToken(")
+            || src.contains("func revoke(")
+            || src.contains("func ucanRevoke("),
         "Swift SDK missing UCAN revoke wrapper"
     );
 }
@@ -964,12 +1193,16 @@ fn swift_sdk_transport_wrappers() {
 #[test]
 fn swift_sdk_bridge_wrappers() {
     let src = swift_all();
+    // Phase 4 PR 4 renamed `evaluateBridgeTrust` → `bridgeEvaluateTrust`
+    // on the `SCP` class in Scp.swift. `bridgeRegister` and
+    // `bridgeCreateShadow` come from the UniFFI-generated bindings in
+    // `Internal/ScpBindings.swift`, which is now included in `swift_all()`.
     assert!(
         src.contains("func bridgeRegister("),
         "Swift SDK missing bridge register wrapper"
     );
     assert!(
-        src.contains("func evaluateBridgeTrust("),
+        src.contains("func evaluateBridgeTrust(") || src.contains("func bridgeEvaluateTrust("),
         "Swift SDK missing bridge evaluate_trust wrapper"
     );
     assert!(
@@ -1197,9 +1430,7 @@ fn all_sdk_source_files_are_non_empty() {
         ("TypeScript identity.ts", TS_IDENTITY),
         ("TypeScript context.ts", TS_CONTEXT),
         ("TypeScript tools.ts", TS_TOOLS),
-        ("TypeScript ucan.ts", TS_UCAN),
-        ("TypeScript event-log.ts", TS_EVENT_LOG),
-        ("TypeScript transport.ts", TS_TRANSPORT),
+        ("TypeScript scp.ts", TS_SCP),
         ("TypeScript discovery.ts", TS_DISCOVERY),
         ("TypeScript provenance.ts", TS_PROVENANCE),
         ("TypeScript trust.ts", TS_TRUST),
@@ -1214,8 +1445,6 @@ fn all_sdk_source_files_are_non_empty() {
         ("Swift Discovery.swift", SWIFT_DISCOVERY),
         ("Swift Provenance.swift", SWIFT_PROVENANCE),
         ("Swift Trust.swift", SWIFT_TRUST),
-        ("Swift Sync.swift", SWIFT_SYNC),
-        ("Swift Bridge.swift", SWIFT_BRIDGE),
         ("Swift Governance.swift", SWIFT_GOVERNANCE),
         ("Kotlin Identity.kt", KT_IDENTITY),
         ("Kotlin BridgeConnector.kt", KT_BRIDGE_CONNECTOR),

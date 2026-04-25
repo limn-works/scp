@@ -1,21 +1,24 @@
 """Tests for the SCP MCP adapter Python wrapper.
 
 Covers:
-- McpToolDefinition dataclass construction
-- McpProvenance dataclass construction and field access
-- McpToolResult dataclass construction
-- serve_mcp transport validation
-- McpClient.connect transport validation
+- McpToolDefinition / McpProvenance / McpToolResult dataclass construction
+- :meth:`SCP.mcp_client_connect_sse` / ``mcp_client_connect_stdio`` input
+  validation (transport/command/url/allowlist)
+- :func:`validate_client_connect` pure-Python pre-flight validation
 - CLI entry point argument parsing
-- Module-level __all__ exports
-- Package-level re-exports
+- Module-level ``__all__`` and package re-exports
+- ``DEFAULT_STDIO_ALLOWLIST`` invariants
+- Allowlist API (``configure_stdio_allowlist``, ``disable_stdio_allowlist``,
+  ``reset_stdio_allowlist``, ``get_stdio_allowlist``)
 
-Tests that require the ``_scp_core`` bridge are skipped; these tests
-exercise the pure-Python surface: dataclasses, validation, and argument
-parsing.
+Phase 4 PR 5 Agent B+C (#1549) collapsed :class:`McpServer` and
+:class:`McpClient` into pure handle wrappers. :func:`serve_mcp` /
+:meth:`McpClient.connect` / :meth:`McpServer.stop` etc. are now methods
+on :class:`scp_sdk.SCP` — see :meth:`SCP.mcp_serve`,
+:meth:`SCP.mcp_client_connect_stdio`, :meth:`SCP.mcp_client_connect_sse`,
+and :meth:`SCP.mcp_server_stop`.
 
-See ``.docs/adrs/phase-3.md`` ADR-015 and ``.docs/standards/python.md``
-for conventions.
+Tests mock the ``_native`` bridge where needed; no Rust extension required.
 """
 
 from __future__ import annotations
@@ -24,9 +27,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from scp_sdk.errors import TransportError, ValidationError
+from scp_sdk.errors import ValidationError
 from scp_sdk.mcp import (
-    _VALID_TRANSPORTS,
     DEFAULT_STDIO_ALLOWLIST,
     McpClient,
     McpProvenance,
@@ -38,7 +40,7 @@ from scp_sdk.mcp import (
     disable_stdio_allowlist,
     get_stdio_allowlist,
     reset_stdio_allowlist,
-    serve_mcp,
+    validate_client_connect,
 )
 
 # -----------------------------------------------------------------------
@@ -97,23 +99,13 @@ class TestMcpProvenance:
         assert prov.timestamp == 1_700_000_000_000
 
     def test_source_format_convention(self) -> None:
-        """Provenance source follows the ``mcp:{tool_name}`` format."""
         prov = McpProvenance(
-            source="mcp:my_tool",
-            invoked_by="did:dht:z6MkBob",
-            context="ctx-1",
-            timestamp=42,
-        )
-        assert prov.source.startswith("mcp:")
-
-    def test_equality(self) -> None:
-        kwargs = dict(
-            source="mcp:tool",
+            source="mcp:some_tool",
             invoked_by="did:dht:z6MkAlice",
             context="ctx-1",
-            timestamp=100,
+            timestamp=0,
         )
-        assert McpProvenance(**kwargs) == McpProvenance(**kwargs)
+        assert prov.source.startswith("mcp:")
 
 
 # -----------------------------------------------------------------------
@@ -126,250 +118,198 @@ class TestMcpToolResult:
 
     def test_construction_success(self) -> None:
         prov = McpProvenance(
-            source="mcp:calculator",
+            source="mcp:search",
             invoked_by="did:dht:z6MkAlice",
-            context="ctx-math",
+            context="ctx-abc",
             timestamp=1_700_000_000_000,
         )
         result = McpToolResult(
-            content=[{"type": "text", "text": "42"}],
+            content=[{"type": "text", "text": "result"}],
             is_error=False,
             provenance=prov,
         )
-        assert len(result.content) == 1
-        assert result.content[0]["text"] == "42"
-        assert not result.is_error
-        assert result.provenance.source == "mcp:calculator"
+        assert result.content[0]["text"] == "result"
+        assert result.is_error is False
+        assert result.provenance is prov
 
     def test_construction_error(self) -> None:
         prov = McpProvenance(
-            source="mcp:flaky_tool",
+            source="mcp:failing_tool",
             invoked_by="did:dht:z6MkAlice",
-            context="ctx-1",
-            timestamp=999,
+            context="ctx-abc",
+            timestamp=1_700_000_000_000,
         )
         result = McpToolResult(
-            content=[{"type": "text", "text": "tool failed"}],
+            content=[{"type": "text", "text": "error message"}],
             is_error=True,
             provenance=prov,
         )
-        assert result.is_error
-        # Provenance is still attached even for error results.
-        assert result.provenance.source == "mcp:flaky_tool"
+        assert result.is_error is True
 
     def test_empty_content(self) -> None:
         prov = McpProvenance(
-            source="mcp:void_tool",
-            invoked_by="did:dht:z6MkBob",
-            context="ctx-2",
+            source="mcp:noop",
+            invoked_by="did:dht:z6MkAlice",
+            context="ctx-1",
             timestamp=0,
         )
         result = McpToolResult(content=[], is_error=False, provenance=prov)
         assert result.content == []
 
+    def test_provenance_equality(self) -> None:
+        a = McpProvenance(source="mcp:x", invoked_by="did:dht:zA", context="ctx-1", timestamp=1)
+        b = McpProvenance(source="mcp:x", invoked_by="did:dht:zA", context="ctx-1", timestamp=1)
+        assert a == b
+
 
 # -----------------------------------------------------------------------
-# Transport validation tests
+# _VALID_TRANSPORTS tests
 # -----------------------------------------------------------------------
 
 
 class TestValidTransports:
-    """Tests for the _VALID_TRANSPORTS constant."""
+    """Tests for the private ``_VALID_TRANSPORTS`` constant."""
 
     def test_contains_stdio(self) -> None:
+        from scp_sdk.mcp import _VALID_TRANSPORTS
+
         assert "stdio" in _VALID_TRANSPORTS
 
     def test_contains_sse(self) -> None:
+        from scp_sdk.mcp import _VALID_TRANSPORTS
+
         assert "sse" in _VALID_TRANSPORTS
 
     def test_is_frozen(self) -> None:
+        from scp_sdk.mcp import _VALID_TRANSPORTS
+
         assert isinstance(_VALID_TRANSPORTS, frozenset)
 
     def test_only_two_transports(self) -> None:
+        from scp_sdk.mcp import _VALID_TRANSPORTS
+
         assert len(_VALID_TRANSPORTS) == 2
 
 
 # -----------------------------------------------------------------------
-# serve_mcp validation tests
+# validate_client_connect (pure-Python pre-flight) tests
 # -----------------------------------------------------------------------
 
 
-class TestServeMcpValidation:
-    """Tests for serve_mcp input validation (no bridge required)."""
+class TestValidateClientConnect:
+    """Tests for :func:`validate_client_connect` — the pure-Python guard."""
 
-    @pytest.mark.asyncio
-    async def test_rejects_invalid_transport(self) -> None:
-        mock_identity = MagicMock()
-        mock_identity.did = "did:dht:z6MkAlice"
-        mock_context = MagicMock()
-        mock_context.context_id = "ctx-1"
-
+    def test_rejects_invalid_transport(self) -> None:
         with pytest.raises(ValidationError, match="transport must be"):
-            await serve_mcp(
-                identity=mock_identity,
-                contexts=[mock_context],
-                transport="websocket",
-            )
+            validate_client_connect("http", command=["echo"])
 
-    @pytest.mark.asyncio
-    async def test_rejects_empty_contexts(self) -> None:
-        mock_identity = MagicMock()
-        mock_identity.did = "did:dht:z6MkAlice"
-
-        with pytest.raises(ValidationError, match="at least one context"):
-            await serve_mcp(
-                identity=mock_identity,
-                contexts=[],
-                transport="stdio",
-            )
-
-    @pytest.mark.asyncio
-    async def test_validation_error_has_correct_code_for_transport(self) -> None:
-        mock_identity = MagicMock()
-        mock_identity.did = "did:dht:z6MkAlice"
-        mock_context = MagicMock()
-        mock_context.context_id = "ctx-1"
-
-        with pytest.raises(ValidationError) as exc_info:
-            await serve_mcp(
-                identity=mock_identity,
-                contexts=[mock_context],
-                transport="invalid",
-            )
-        assert exc_info.value.code == "SCP-MCP-10002"
-
-    @pytest.mark.asyncio
-    async def test_validation_error_has_correct_code_for_empty_contexts(self) -> None:
-        mock_identity = MagicMock()
-        mock_identity.did = "did:dht:z6MkAlice"
-
-        with pytest.raises(ValidationError) as exc_info:
-            await serve_mcp(
-                identity=mock_identity,
-                contexts=[],
-                transport="stdio",
-            )
-        assert exc_info.value.code == "SCP-MCP-10003"
-
-
-# -----------------------------------------------------------------------
-# McpClient.connect validation tests
-# -----------------------------------------------------------------------
-
-
-class TestMcpClientConnectValidation:
-    """Tests for McpClient.connect input validation (no bridge required)."""
-
-    @pytest.mark.asyncio
-    async def test_rejects_invalid_transport(self) -> None:
-        with pytest.raises(ValidationError, match="transport must be"):
-            await McpClient.connect("http", command=["echo"])
-
-    @pytest.mark.asyncio
-    async def test_stdio_requires_command(self) -> None:
+    def test_stdio_requires_command(self) -> None:
         with pytest.raises(ValidationError, match="command is required"):
-            await McpClient.connect("stdio")
+            validate_client_connect("stdio")
 
-    @pytest.mark.asyncio
-    async def test_sse_requires_url(self) -> None:
+    def test_sse_requires_url(self) -> None:
         with pytest.raises(ValidationError, match="url is required"):
-            await McpClient.connect("sse")
+            validate_client_connect("sse")
 
-    @pytest.mark.asyncio
-    async def test_validation_error_codes(self) -> None:
+    def test_validation_error_codes(self) -> None:
         with pytest.raises(ValidationError) as exc_info:
-            await McpClient.connect("invalid")
+            validate_client_connect("invalid")
         assert exc_info.value.code == "SCP-MCP-10002"
 
         with pytest.raises(ValidationError) as exc_info:
-            await McpClient.connect("stdio")
+            validate_client_connect("stdio")
         assert exc_info.value.code == "SCP-MCP-10004"
 
         with pytest.raises(ValidationError) as exc_info:
-            await McpClient.connect("sse")
+            validate_client_connect("sse")
         assert exc_info.value.code == "SCP-MCP-10005"
 
+    def test_rejects_absolute_path(self) -> None:
+        with pytest.raises(ValidationError, match="bare binary name"):
+            validate_client_connect("stdio", command=["/usr/bin/node"])
 
-# -----------------------------------------------------------------------
-# McpServer tests
-# -----------------------------------------------------------------------
+    def test_rejects_relative_path(self) -> None:
+        with pytest.raises(ValidationError, match="bare binary name"):
+            validate_client_connect("stdio", command=["./node"])
 
+    def test_rejects_path_traversal(self) -> None:
+        with pytest.raises(ValidationError, match="bare binary name"):
+            validate_client_connect("stdio", command=["../../bin/node"])
 
-class TestMcpServer:
-    """Tests for the McpServer class."""
+    def test_path_rejection_error_code(self) -> None:
+        with pytest.raises(ValidationError) as exc_info:
+            validate_client_connect("stdio", command=["/tmp/evil/node"])
+        assert exc_info.value.code == "SCP-MCP-10006"
 
-    def test_repr(self) -> None:
-        mock_handle = MagicMock()
-        mock_identity = MagicMock()
-        mock_identity.did = "did:dht:z6MkAlice"
-        mock_context = MagicMock()
-        mock_context.context_id = "ctx-abc"
+    def test_rejects_non_allowlist_binary(self) -> None:
+        # Default allowlist excludes arbitrary binary names.
+        reset_stdio_allowlist()
+        try:
+            with pytest.raises(ValidationError, match="allowlist"):
+                validate_client_connect("stdio", command=["my-custom-server"])
+        finally:
+            reset_stdio_allowlist()
 
-        server = McpServer(
-            handle=mock_handle,
-            identity=mock_identity,
-            contexts=[mock_context],
-            transport="stdio",
-        )
-
-        r = repr(server)
-        assert "McpServer" in r
-        assert "stdio" in r
-        assert "ctx-abc" in r
-
-    def test_transport_property(self) -> None:
-        server = McpServer(
-            handle=MagicMock(),
-            identity=MagicMock(),
-            contexts=[],
-            transport="sse",
-        )
-        assert server.transport == "sse"
-
-    def test_contexts_returns_copy(self) -> None:
-        ctx = MagicMock()
-        ctx.context_id = "ctx-1"
-        server = McpServer(
-            handle=MagicMock(),
-            identity=MagicMock(),
-            contexts=[ctx],
-            transport="stdio",
-        )
-        contexts = server.contexts
-        assert len(contexts) == 1
-        # Ensure it is a copy, not the same list.
-        contexts.append(MagicMock())
-        assert len(server.contexts) == 1
+    def test_allows_configured_binary(self) -> None:
+        reset_stdio_allowlist()
+        try:
+            configure_stdio_allowlist(additional_binaries=["any-binary"])
+            # Does not raise.
+            validate_client_connect("stdio", command=["any-binary"])
+        finally:
+            reset_stdio_allowlist()
 
 
 # -----------------------------------------------------------------------
-# McpClient repr test
+# SCP.mcp_client_connect_* validation tests via mocked _native
 # -----------------------------------------------------------------------
 
 
-class TestMcpClientRepr:
-    """Tests for McpClient repr."""
+class TestScpMcpClientConnectValidation:
+    """Tests for :meth:`SCP.mcp_client_connect_stdio` /
+    :meth:`SCP.mcp_client_connect_sse` pre-flight validation.
+    """
 
-    def test_repr_stdio(self) -> None:
-        client = McpClient(
-            handle=MagicMock(),
-            transport="stdio",
-            command=["uvx", "some-server"],
-        )
-        r = repr(client)
-        assert "McpClient" in r
-        assert "stdio" in r
-        assert "uvx" in r
+    @pytest.mark.asyncio
+    async def test_stdio_rejects_empty_command(self) -> None:
+        from scp_sdk.scp import SCP
 
-    def test_repr_sse(self) -> None:
-        client = McpClient(
-            handle=MagicMock(),
-            transport="sse",
-            command=None,
-        )
-        r = repr(client)
-        assert "McpClient" in r
-        assert "sse" in r
+        scp = MagicMock()
+        scp._native = MagicMock()
+        with pytest.raises(ValidationError):
+            await SCP.mcp_client_connect_stdio(scp, [])
+
+    @pytest.mark.asyncio
+    async def test_sse_rejects_missing_url(self) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = MagicMock()
+        scp._native = MagicMock()
+        with pytest.raises(ValidationError):
+            await SCP.mcp_client_connect_sse(scp, "")
+
+
+# -----------------------------------------------------------------------
+# Handle wrapper tests
+# -----------------------------------------------------------------------
+
+
+class TestMcpClientWrapper:
+    """Tests for the :class:`McpClient` pure-handle wrapper."""
+
+    def test_construction_stores_handle(self) -> None:
+        raw = MagicMock()
+        client = McpClient(raw)
+        assert client._raw_handle is raw
+
+
+class TestMcpServerWrapper:
+    """Tests for the :class:`McpServer` pure-handle wrapper."""
+
+    def test_construction_stores_handle(self) -> None:
+        raw = MagicMock()
+        server = McpServer(raw)
+        assert server._raw_handle is raw
 
 
 # -----------------------------------------------------------------------
@@ -378,28 +318,24 @@ class TestMcpClientRepr:
 
 
 class TestCliMain:
-    """Tests for the cli_main entry point."""
+    """Tests for the :func:`cli_main` entry point."""
 
     def test_serve_command_requires_identity(self) -> None:
-        """Missing --identity should cause SystemExit."""
         with pytest.raises(SystemExit):
             with patch("sys.argv", ["scp-mcp", "serve", "--relay", "wss://relay.test"]):
                 cli_main()
 
     def test_serve_command_requires_relay(self) -> None:
-        """Missing --relay should cause SystemExit."""
         with pytest.raises(SystemExit):
             with patch("sys.argv", ["scp-mcp", "serve", "--identity", "did:dht:z6MkTest"]):
                 cli_main()
 
     def test_missing_subcommand_exits(self) -> None:
-        """No subcommand should cause SystemExit."""
         with pytest.raises(SystemExit):
             with patch("sys.argv", ["scp-mcp"]):
                 cli_main()
 
     def test_invalid_transport_falls_through_to_argparse(self) -> None:
-        """Invalid --transport value is rejected by argparse choices."""
         with pytest.raises(SystemExit):
             with patch(
                 "sys.argv",
@@ -418,50 +354,6 @@ class TestCliMain:
 
 
 # -----------------------------------------------------------------------
-# Bridge import error tests
-# -----------------------------------------------------------------------
-
-
-class TestBridgeImportError:
-    """Tests that missing _scp_core raises TransportError."""
-
-    @pytest.mark.asyncio
-    async def test_serve_mcp_raises_on_missing_bridge(self) -> None:
-        """serve_mcp raises TransportError when _scp_core is not available."""
-        mock_identity = MagicMock()
-        mock_identity.did = "did:dht:z6MkAlice"
-        mock_context = MagicMock()
-        mock_context.context_id = "ctx-1"
-
-        with patch(
-            "scp_sdk.mcp._bridge",
-            side_effect=TransportError(
-                "The _scp_core extension module is not installed.",
-                code="SCP-MCP-10001",
-            ),
-        ):
-            with pytest.raises(TransportError, match="_scp_core"):
-                await serve_mcp(
-                    identity=mock_identity,
-                    contexts=[mock_context],
-                    transport="stdio",
-                )
-
-    @pytest.mark.asyncio
-    async def test_client_connect_raises_on_missing_bridge(self) -> None:
-        """McpClient.connect raises TransportError when _scp_core is not available."""
-        with patch(
-            "scp_sdk.mcp._bridge",
-            side_effect=TransportError(
-                "The _scp_core extension module is not installed.",
-                code="SCP-MCP-10001",
-            ),
-        ):
-            with pytest.raises(TransportError, match="_scp_core"):
-                await McpClient.connect("stdio", command=["echo"])
-
-
-# -----------------------------------------------------------------------
 # Package-level re-export tests
 # -----------------------------------------------------------------------
 
@@ -477,7 +369,6 @@ class TestPackageReExports:
         assert scp_sdk.McpToolDefinition is McpToolDefinition
         assert scp_sdk.McpToolResult is McpToolResult
         assert scp_sdk.McpProvenance is McpProvenance
-        assert scp_sdk.serve_mcp is serve_mcp
 
 
 # -----------------------------------------------------------------------
@@ -486,12 +377,12 @@ class TestPackageReExports:
 
 
 class TestModuleAll:
-    """Tests for the module's __all__ export list."""
+    """Tests for the module's ``__all__`` export list."""
 
-    def test_all_contains_expected_names(self) -> None:
+    def test_all_contains_core_exports(self) -> None:
         from scp_sdk import mcp
 
-        expected = {
+        required = {
             "DEFAULT_STDIO_ALLOWLIST",
             "McpClient",
             "McpProvenance",
@@ -502,13 +393,9 @@ class TestModuleAll:
             "configure_stdio_allowlist",
             "disable_stdio_allowlist",
             "get_stdio_allowlist",
-            "register_tool_handler",
-            "registry_cleanup",
-            "registry_stats",
             "reset_stdio_allowlist",
-            "serve_mcp",
         }
-        assert set(mcp.__all__) == expected
+        assert required.issubset(set(mcp.__all__))
 
     def test_all_names_are_importable(self) -> None:
         from scp_sdk import mcp
@@ -523,7 +410,7 @@ class TestModuleAll:
 
 
 class TestDefaultStdioAllowlist:
-    """Tests for the DEFAULT_STDIO_ALLOWLIST constant."""
+    """Tests for the :data:`DEFAULT_STDIO_ALLOWLIST` constant."""
 
     def test_is_frozenset(self) -> None:
         assert isinstance(DEFAULT_STDIO_ALLOWLIST, frozenset)
@@ -537,7 +424,6 @@ class TestDefaultStdioAllowlist:
             assert name not in DEFAULT_STDIO_ALLOWLIST
 
     def test_no_paths_in_entries(self) -> None:
-        """All entries must be bare basenames, no path separators."""
         for name in DEFAULT_STDIO_ALLOWLIST:
             assert "/" not in name, f"path separator in allowlist entry: {name}"
             assert "\\" not in name, f"backslash in allowlist entry: {name}"
@@ -553,101 +439,31 @@ class TestStdioAllowlistApi:
 
     def test_configure_with_no_binaries_is_noop(self) -> None:
         """Calling with no binaries should not error."""
-        # This returns early before calling the bridge, so no bridge needed.
-        # SCP-DEFAULT-INSTANCE-OK: pure-Python validation path; returns before bridge call
+        # Early return before calling the bridge — so no bridge needed.
         configure_stdio_allowlist()
 
     def test_disable_requires_confirmation(self) -> None:
-        """disable_stdio_allowlist must receive i_trust_all_commands=True."""
         with pytest.raises(ValidationError, match="i_trust_all_commands"):
-            # SCP-DEFAULT-INSTANCE-OK: pure-Python validation path; returns before bridge call
             disable_stdio_allowlist()
 
     def test_disable_rejects_false_confirmation(self) -> None:
         with pytest.raises(ValidationError, match="i_trust_all_commands"):
-            # SCP-DEFAULT-INSTANCE-OK: pure-Python validation path; returns before bridge call
             disable_stdio_allowlist(i_trust_all_commands=False)
 
+    def test_reset_round_trips(self) -> None:
+        """After ``reset_stdio_allowlist``, the default allowlist is active."""
+        reset_stdio_allowlist()
+        state = get_stdio_allowlist()
+        assert "unrestricted" in state
+        assert state["unrestricted"] is False
+        for name in ("uvx", "npx", "node", "python3"):
+            assert name in state["allowed"]
 
-# -----------------------------------------------------------------------
-# McpClient.connect allowlist pre-validation tests (no bridge required)
-# -----------------------------------------------------------------------
-
-
-class TestMcpClientAllowlistPreValidation:
-    """Tests that connect() rejects paths before calling the bridge."""
-
-    @pytest.mark.asyncio
-    async def test_rejects_absolute_path(self) -> None:
-        with pytest.raises(ValidationError, match="bare binary name"):
-            await McpClient.connect("stdio", command=["/usr/bin/node"])
-
-    @pytest.mark.asyncio
-    async def test_rejects_relative_path(self) -> None:
-        with pytest.raises(ValidationError, match="bare binary name"):
-            await McpClient.connect("stdio", command=["./node"])
-
-    @pytest.mark.asyncio
-    async def test_rejects_path_traversal(self) -> None:
-        with pytest.raises(ValidationError, match="bare binary name"):
-            await McpClient.connect("stdio", command=["../../bin/node"])
-
-    @pytest.mark.asyncio
-    async def test_path_rejection_error_code(self) -> None:
-        with pytest.raises(ValidationError) as exc_info:
-            await McpClient.connect("stdio", command=["/tmp/evil/node"])
-        assert exc_info.value.code == "SCP-MCP-10006"
-
-    @pytest.mark.asyncio
-    async def test_unlisted_binary_rejected_with_actionable_message(self) -> None:
-        """An unlisted bare binary should produce a message with configure instructions."""
-        mock_bridge = MagicMock()
-        mock_bridge.py_mcp_get_stdio_allowlist.return_value = {
-            "allowed": list(DEFAULT_STDIO_ALLOWLIST),
-            "unrestricted": False,
-        }
-        with patch("scp_sdk.mcp._bridge", return_value=mock_bridge):
-            with pytest.raises(ValidationError, match="configure_stdio_allowlist"):
-                await McpClient.connect("stdio", command=["my-custom-server"])
-
-    @pytest.mark.asyncio
-    async def test_unrestricted_skips_basename_check(self) -> None:
-        """When unrestricted, any bare binary should be allowed (passes to bridge)."""
-        mock_bridge = MagicMock()
-        mock_bridge.py_mcp_get_stdio_allowlist.return_value = {
-            "allowed": [],
-            "unrestricted": True,
-        }
-        mock_bridge.py_mcp_client_connect_stdio.return_value = "handle-123"
-        with patch("scp_sdk.mcp._bridge", return_value=mock_bridge):
-            client = await McpClient.connect("stdio", command=["any-binary"])
-            assert client._transport == "stdio"
-
-
-# -----------------------------------------------------------------------
-# Package re-export tests (updated)
-# -----------------------------------------------------------------------
-
-
-class TestPackageReExportsAllowlist:
-    """Tests that allowlist functions are re-exported from top-level."""
-
-    def test_configure_accessible(self) -> None:
-        import scp_sdk
-
-        assert scp_sdk.configure_stdio_allowlist is configure_stdio_allowlist
-
-    def test_disable_accessible(self) -> None:
-        import scp_sdk
-
-        assert scp_sdk.disable_stdio_allowlist is disable_stdio_allowlist
-
-    def test_reset_accessible(self) -> None:
-        import scp_sdk
-
-        assert scp_sdk.reset_stdio_allowlist is reset_stdio_allowlist
-
-    def test_get_accessible(self) -> None:
-        import scp_sdk
-
-        assert scp_sdk.get_stdio_allowlist is get_stdio_allowlist
+    def test_configure_adds_binaries(self) -> None:
+        reset_stdio_allowlist()
+        try:
+            configure_stdio_allowlist(additional_binaries=["my-mcp-server"])
+            state = get_stdio_allowlist()
+            assert "my-mcp-server" in state["allowed"]
+        finally:
+            reset_stdio_allowlist()

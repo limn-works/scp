@@ -189,10 +189,13 @@ pub fn transport_disconnect() -> Promise {
 #[wasm_bindgen]
 pub fn transport_status() -> WasmTransportStatus {
     // Default disconnected status — the TypeScript SDK wrapper provides
-    // the live state from the browser WebSocket.
+    // the live state from the browser WebSocket. The shared helper
+    // pins the `(false, None, None)` shape so this bridge cannot drift
+    // from the UniFFI/NAPI handleless probes (ADR-048 §7a).
+    let (connected, relay_url, latency_ms) = scp_ffi_common::handleless_transport_status(false);
     WasmTransportStatus {
-        connected: false,
-        relay_url: None,
-        latency_ms: None,
+        connected,
+        relay_url,
+        latency_ms,
     }
 }

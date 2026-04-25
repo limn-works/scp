@@ -20,10 +20,12 @@
  * end-to-end `identity_create → context_create → context_send → suspend
  * → restore` path is exercised at the Rust integration layer
  * (`crates/scp-testing/tests/integration/persistence_sdk.rs`) because
- * the TypeScript `SCP` class does not yet surface context methods — the
- * free-function façade (`contextCreate`, etc.) routes to the
- * process-global default instance, not to a caller-owned `SCP` handle,
- * and that migration is in #1549 PR 4+.
+ * the TypeScript `SCP` class does not yet surface context methods.
+ * Phase 4 PR 4 (#1549, ADR-048) deleted the free-function façade
+ * (`contextCreate`, etc.) along with the process-wide default bridge
+ * it routed through; the remaining SDK wiring to expose those
+ * operations on the caller-owned `SCP` handle is tracked as follow-up
+ * work.
  *
  * Skipped at file level when the native NAPI addon is unavailable
  * (browser runtime, missing platform binary).

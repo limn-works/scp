@@ -2,10 +2,10 @@
 //!
 //! Exposes UCAN token management to JavaScript:
 //!
-//! - [`ucan_validate`] — Validate a UCAN token for a required capability.
-//! - [`ucan_mint`] — Mint a new UCAN token for a context member with real
+//! - `ucan_validate` — Validate a UCAN token for a required capability.
+//! - `ucan_mint` — Mint a new UCAN token for a context member with real
 //!   Ed25519 signing via `InMemoryKeyCustody`.
-//! - [`ucan_revoke`] — Revoke a UCAN token.
+//! - `ucan_revoke` — Revoke a UCAN token.
 //!
 //! # Validation pipeline
 //!
@@ -51,6 +51,7 @@ use crate::decrement_handle_count;
 use crate::error::ScpNapiError;
 #[cfg(feature = "allow_in_memory_custody")]
 use crate::increment_handle_count;
+use crate::runtime::NapiBridgeInstance;
 
 // ---------------------------------------------------------------------------
 // NapiUcanTokenData — UCAN token metadata record
@@ -194,49 +195,24 @@ impl Drop for NapiUcanToken {
 // Bridge functions
 // ---------------------------------------------------------------------------
 
-/// Validates a UCAN token for a required capability.
-///
-/// Delegates to `scp_core::crypto::ucan::validate::validate_ucan` for
-/// complete UCAN validation including Ed25519 signature verification, proof
-/// chain traversal, delegation depth enforcement, audience/issuer chain
-/// validation, scope attenuation, nonce uniqueness, revocation checking,
-/// and expiry verification.
-///
-/// # Arguments
-///
-/// * `handle` — The context the token is presented in.
-/// * `token` — The encoded UCAN token string (JWT format).
-/// * `capability` — The required capability URI
-///   (e.g., `"scp:ctx:abc123/messages:write"`).
-/// * `presenting_agent_did` — Optional. The DID of the agent presenting
-///   the token. If not provided, the token's `aud` field is used (the
-///   presenting agent is assumed to be the token's audience).
-/// * `proof_tokens` — Optional. List of encoded parent UCAN token strings
-///   for delegation chain verification. Required when validating delegated
-///   tokens with non-empty proof chains.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-PERM-3001` if validation fails (malformed token,
-///   invalid signature, expired, insufficient capabilities, revoked,
-///   broken delegation chain).
-#[napi]
+/// Per-bridge-instance implementation of [`ucan_validate`].
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Option<Vec>
-pub async fn ucan_validate(
+pub(crate) async fn ucan_validate_on(
+    bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     token: String,
     capability: String,
     presenting_agent_did: Option<String>,
     proof_tokens: Option<Vec<String>>,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(&bi.core, handle);
     validate_ucan_token(&token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_capability_uri(&capability).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
 
     // Ensure the context's persistent runtime state (RevocationList, NonceTracker)
     // is registered. Uses the same registry as event_log and ucan_revoke.
-    crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     // Step 1: Parse the UCAN token using scp-core's parser.
     let parsed_token = parse_ucan(&token).map_err(ScpNapiError::from)?;
@@ -267,10 +243,10 @@ pub async fn ucan_validate(
     // and nonce tracker from the runtime registry. This ensures:
     // - Revoked tokens are rejected across calls (persistent RevocationList).
     // - Replayed nonces are detected across calls (persistent NonceTracker).
-    crate::runtime::with_context(&context_id, |rt| {
+    crate::runtime::with_context(bi, &context_id, |rt| {
         // Build validation context using persistent runtime state.
         // Use production DID resolver when available (#311), fallback to string-only.
-        let production_resolver = crate::runtime::did_resolver();
+        let production_resolver = crate::runtime::did_resolver(bi);
         let did_resolver =
             DispatchDidResolver::new(production_resolver.map(std::convert::AsRef::as_ref));
         let revocation_checker = BridgeRevocationChecker {
@@ -302,42 +278,17 @@ pub async fn ucan_validate(
     Ok(())
 }
 
-/// Mints a new UCAN token for a context member with real Ed25519 signing.
-///
-/// Uses the context creator's `InMemoryKeyCustody` and active signing key
-/// (retained on the context handle during `context_create`) to produce a
-/// properly signed UCAN token via `scp_core::crypto::ucan::mint::mint_ucan`.
-///
-/// # Arguments
-///
-/// * `handle` — The context to mint the token for (must have key custody
-///   from `context_create` with an `in_memory` identity).
-/// * `member_did` — The DID of the member receiving the token.
-/// * `capabilities` — List of capability strings to grant (e.g.,
-///   `"messages:write"`). Scoped to the context automatically.
-///
-/// # Returns
-///
-/// A `Promise<NapiUcanToken>` with the minted token's metadata and a real
-/// Ed25519 signature.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-VALID-7000` if `member_did` fails [`validate_did`]
-///   (empty, malformed `did:{method}:{id}` format, or control characters).
-/// - Rejects with `SCP-PERM-3023` if the context does not have key custody
-///   (created from an `identity_load` handle without key material).
-/// - Rejects with `SCP-PERM-3023` if signing or token construction fails.
-#[napi]
+/// Per-bridge-instance implementation of [`ucan_mint`].
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec/Option<Vec>
 #[allow(clippy::unused_async)] // napi requires async for Promise return type
-pub async fn ucan_mint(
+pub(crate) async fn ucan_mint_on(
+    bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     member_did: String,
     capabilities: Vec<String>,
     proofs: Option<Vec<String>>,
 ) -> napi::Result<NapiUcanToken> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(&bi.core, handle);
     validate_did(&member_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     if let Some(ref tokens) = proofs {
         for t in tokens {
@@ -348,7 +299,7 @@ pub async fn ucan_mint(
     // In-memory custody is only available when `allow_in_memory_custody` is enabled.
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
-        let _ = (&handle, &member_did, &capabilities, &proofs);
+        let _ = (bi, &handle, &member_did, &capabilities, &proofs);
         Err(napi::Error::from(ScpNapiError::Permission {
             message: "UCAN minting requires key custody -- the in_memory custody path                       is not available in this build. Enable allow_in_memory_custody                       for dev/desktop use.".to_owned(),
             code: codes::PERM_3023.to_owned(),
@@ -434,55 +385,23 @@ pub async fn ucan_mint(
         Ok(NapiUcanToken {
             data,
             encoded: token.encoded,
-            instance_id: crate::runtime::default_instance_id()?,
+            instance_id: bi.instance_id(),
         })
     }
 }
 
-/// Delegates a UCAN token to another member.
-///
-/// Creates a delegated UCAN from an existing parent token, signed with the
-/// delegator's Ed25519 key via the retained `InMemoryKeyCustody`.
-/// Delegation enforces attenuation (capabilities can only narrow, never widen).
-///
-/// # Arguments
-///
-/// * `handle` — The context the token belongs to.
-/// * `delegator_did` — The DID of the entity delegating (must match parent
-///   token's audience).
-/// * `delegatee_did` — The DID of the entity receiving the delegation.
-/// * `parent_token` — The encoded parent UCAN token (JWT format).
-/// * `capabilities` — List of capability URI strings to delegate (must be
-///   subset of parent's capabilities).
-///
-/// # Returns
-///
-/// A `Promise<NapiUcanToken>` with the delegated token's metadata.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-VALID-7000` if `delegator_did` or `delegatee_did`
-///   fails [`validate_did`] (empty, malformed `did:{method}:{id}` format,
-///   or control characters).
-/// - Rejects with `SCP-VALID-7000` if `parent_token` fails
-///   [`validate_ucan_token`] (empty, too long, or control characters).
-/// - Rejects with `SCP-VALID-7000` if any capability URI fails
-///   [`validate_capability_uri`] (empty, too long, or control characters).
-/// - Rejects with `SCP-PERM-3023` if the context does not have key custody.
-/// - Rejects with `SCP-PERM-3023` if delegation fails.
-///
-/// See ADR-016 criterion 4.
-#[napi]
+/// Per-bridge-instance implementation of [`ucan_delegate`].
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String/Vec
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-pub async fn ucan_delegate(
+pub(crate) async fn ucan_delegate_on(
+    bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     delegator_did: String,
     delegatee_did: String,
     parent_token: String,
     capabilities: Vec<String>,
 ) -> napi::Result<NapiUcanToken> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(&bi.core, handle);
     validate_did(&delegator_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_did(&delegatee_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
     validate_ucan_token(&parent_token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -493,6 +412,7 @@ pub async fn ucan_delegate(
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
         let _ = (
+            bi,
             &handle,
             &delegator_did,
             &delegatee_did,
@@ -576,7 +496,7 @@ pub async fn ucan_delegate(
         // Ed25519 key, NOT the context creator's key. The previous code used
         // `handle.signing_key` (the context creator's key), which would produce
         // tokens with invalid signatures when the delegator is not the creator.
-        let token = crate::runtime::with_identity(&delegator_did, |entry| {
+        let token = crate::runtime::with_identity(bi, &delegator_did, |entry| {
             let params = DelegateParams {
                 parent_token: &parsed_parent,
                 delegator_did: &delegator_did,
@@ -617,56 +537,31 @@ pub async fn ucan_delegate(
         Ok(NapiUcanToken {
             data,
             encoded: token.encoded,
-            instance_id: crate::runtime::default_instance_id()?,
+            instance_id: bi.instance_id(),
         })
     }
 }
 
-/// Revokes a UCAN token using the full revocation pipeline.
-///
-/// Performs the complete UCAN revocation flow from ADR-016:
-///
-/// 1. **Authorization** -- Verifies the revoker is the token's issuer or the
-///    context creator.
-/// 2. **Local revocation** -- Adds the token CID to the context's
-///    `RevocationList` (fail-closed via `RevocationPending` state).
-/// 3. **Distribution** -- Logs the revocation for transport-layer broadcast.
-/// 4. **Event logging** -- Appends a `TokenRevoked` event to the context's
-///    Merkle event log.
-///
-/// # Arguments
-///
-/// * `handle` — The context the token belongs to.
-/// * `token` — The full encoded JWT string of the token to revoke.
-/// * `revoker_did` — The DID of the entity requesting the revocation. Must
-///   be either the token's issuer or the context creator.
-///
-/// # Errors
-///
-/// - Rejects with `SCP-CTX-2023` if the context runtime is not initialized.
-/// - Rejects with `SCP-PERM-3001` if the token cannot be parsed.
-/// - Rejects with `SCP-PERM-3001` if the revoker is unauthorized.
-///
-/// Closes #499.
-#[napi]
+/// Per-bridge-instance implementation of [`ucan_revoke`].
 #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
 #[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String
-pub async fn ucan_revoke(
+pub(crate) async fn ucan_revoke_on(
+    bi: &NapiBridgeInstance,
     handle: &NapiContextHandle,
     token: String,
     revoker_did: String,
 ) -> napi::Result<()> {
-    crate::napi_check_handle!(handle);
+    crate::napi_check_handle!(&bi.core, handle);
     validate_ucan_token(&token).map_err(ScpNapiError::from)?;
     validate_did(&revoker_did).map_err(ScpNapiError::from)?;
 
-    crate::runtime::ensure_registered(handle).map_err(napi::Error::from)?;
+    crate::runtime::ensure_registered(bi, handle).map_err(napi::Error::from)?;
 
     // Parse the token to extract the issuer DID for authorization.
     let parsed = parse_ucan(&token).map_err(ScpNapiError::from)?;
 
     let context_id = handle.context_id();
-    crate::runtime::with_context(&context_id, |rt| {
+    crate::runtime::with_context(bi, &context_id, |rt| {
         use std::cell::RefCell;
 
         let authorizer = BridgeRevocationAuthorizer {
@@ -949,21 +844,22 @@ mod tests {
     fn revocation_persists_across_with_context_calls() {
         use crate::runtime;
 
+        let bi = runtime::NapiBridgeInstance::new_napi();
         // Use a unique context ID per test to avoid cross-test interference.
         let context_id = format!("ctx-revoke-persist-{}", uuid::Uuid::new_v4());
 
         // Manually register a context in the runtime registry.
-        runtime::register_test_context(&context_id, "did:dht:zCreator");
+        runtime::register_test_context(&bi, &context_id, "did:dht:zCreator");
 
         // First call: revoke a CID.
-        runtime::with_context(&context_id, |rt| {
+        runtime::with_context(&bi, &context_id, |rt| {
             rt.core.revocation_list.revoke("revoked-cid-123".to_owned());
             Ok(())
         })
         .unwrap();
 
         // Second call: verify the revocation persists.
-        let is_revoked = runtime::with_context(&context_id, |rt| {
+        let is_revoked = runtime::with_context(&bi, &context_id, |rt| {
             Ok(rt.core.revocation_list.is_revoked("revoked-cid-123"))
         })
         .unwrap();
@@ -974,7 +870,7 @@ mod tests {
         );
 
         // Unrevoked CIDs should not be affected.
-        let other_revoked = runtime::with_context(&context_id, |rt| {
+        let other_revoked = runtime::with_context(&bi, &context_id, |rt| {
             Ok(rt.core.revocation_list.is_revoked("other-cid-456"))
         })
         .unwrap();
@@ -993,8 +889,9 @@ mod tests {
     fn nonce_replay_detected_across_with_context_calls() {
         use crate::runtime;
 
+        let bi = runtime::NapiBridgeInstance::new_napi();
         let context_id = format!("ctx-nonce-persist-{}", uuid::Uuid::new_v4());
-        runtime::register_test_context(&context_id, "did:dht:zCreator");
+        runtime::register_test_context(&bi, &context_id, "did:dht:zCreator");
 
         let now_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1005,7 +902,7 @@ mod tests {
         let expiry = now_secs + 3600;
 
         // First call: record the nonce — should succeed.
-        let first_result = runtime::with_context(&context_id, |rt| {
+        let first_result = runtime::with_context(&bi, &context_id, |rt| {
             rt.core
                 .nonce_tracker
                 .check_and_record(&nonce, expiry)
@@ -1017,7 +914,7 @@ mod tests {
         assert!(first_result.is_ok(), "first nonce use should succeed");
 
         // Second call: replay the same nonce — should fail.
-        let second_result = runtime::with_context(&context_id, |rt| {
+        let second_result = runtime::with_context(&bi, &context_id, |rt| {
             rt.core
                 .nonce_tracker
                 .check_and_record(&nonce, expiry)
@@ -1033,7 +930,7 @@ mod tests {
 
         // A different nonce should succeed.
         let different_nonce = format!("{}-bbccddee22334455bbccddee22334455", now_millis + 1);
-        let third_result = runtime::with_context(&context_id, |rt| {
+        let third_result = runtime::with_context(&bi, &context_id, |rt| {
             rt.core
                 .nonce_tracker
                 .check_and_record(&different_nonce, expiry)
@@ -1054,9 +951,10 @@ mod tests {
         use crate::runtime;
         use std::cell::RefCell;
 
+        let bi = runtime::NapiBridgeInstance::new_napi();
         let context_id = format!("ctx-revoke-wire-{}", uuid::Uuid::new_v4());
         let creator_did = "did:dht:zCreator";
-        runtime::register_test_context(&context_id, creator_did);
+        runtime::register_test_context(&bi, &context_id, creator_did);
 
         // Build a deterministic token string for revocation.
         let test_token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
@@ -1068,7 +966,7 @@ mod tests {
         let issuer_did = parsed.payload.iss;
 
         // Simulate the full revocation pipeline via revoke_ucan.
-        runtime::with_context(&context_id, |rt| {
+        runtime::with_context(&bi, &context_id, |rt| {
             let authorizer = BridgeRevocationAuthorizer {
                 issuer_did: issuer_did.clone(),
                 creator_did: rt.core.creator_did.clone(),
@@ -1095,7 +993,7 @@ mod tests {
 
         // Verify revocation is detected by the checker.
         let token_cid = scp_core::crypto::ucan::revoke::compute_revocation_cid(test_token);
-        let checker_says_revoked = runtime::with_context(&context_id, |rt| {
+        let checker_says_revoked = runtime::with_context(&bi, &context_id, |rt| {
             let checker = BridgeRevocationChecker {
                 revocation_list: &rt.core.revocation_list,
             };
@@ -1109,7 +1007,7 @@ mod tests {
         );
 
         // Verify a TokenRevoked event was appended to the event log.
-        let event_count = runtime::with_context(&context_id, |rt| {
+        let event_count = runtime::with_context(&bi, &context_id, |rt| {
             Ok(scp_event_log::tree::event_count(&rt.core.event_log))
         })
         .unwrap();
@@ -1124,9 +1022,10 @@ mod tests {
         use crate::runtime;
         use std::cell::RefCell;
 
+        let bi = runtime::NapiBridgeInstance::new_napi();
         let context_id = format!("ctx-revoke-unauth-{}", uuid::Uuid::new_v4());
         let creator_did = "did:dht:zCreator";
-        runtime::register_test_context(&context_id, creator_did);
+        runtime::register_test_context(&bi, &context_id, creator_did);
 
         let test_token = "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCIsInVjdiI6IjAuMTAuMCJ9.\
             eyJpc3MiOiJkaWQ6ZGh0OnpDcmVhdG9yIiwiYXVkIjoiZGlkOmRodDp6TWVtYmVyIiwiZXhwIjo5OTk5OTk5OTk5LCJubmMiOiIxNjk5OTk5MDAwMDAwLWFhYmJjY2RkMTEyMjMzNDQiLCJhdHQiOltdLCJwcmYiOltdfQ.\
@@ -1137,7 +1036,7 @@ mod tests {
         let issuer_did = parsed.payload.iss;
 
         // Attempt revocation by an unauthorized DID (not issuer, not creator).
-        let result = runtime::with_context(&context_id, |rt| {
+        let result = runtime::with_context(&bi, &context_id, |rt| {
             let authorizer = BridgeRevocationAuthorizer {
                 issuer_did: issuer_did.clone(),
                 creator_did: rt.core.creator_did.clone(),
@@ -1210,8 +1109,11 @@ mod tests {
         let did_a = identity_a.did.clone();
         let did_b = identity_b.did.clone();
 
+        let bi = runtime::NapiBridgeInstance::new_napi();
+
         // Register both in the global identity registry.
         runtime::register_identity(
+            &bi,
             &did_a,
             runtime::NapiIdentityEntry {
                 identity: identity_a,
@@ -1221,6 +1123,7 @@ mod tests {
             },
         );
         runtime::register_identity(
+            &bi,
             &did_b,
             runtime::NapiIdentityEntry {
                 identity: identity_b,
@@ -1232,7 +1135,7 @@ mod tests {
 
         // Look up identity A — must get A's DID, not B's.
         let looked_up_did_a =
-            runtime::with_identity(&did_a, |entry| Ok(entry.identity.did.clone())).unwrap();
+            runtime::with_identity(&bi, &did_a, |entry| Ok(entry.identity.did.clone())).unwrap();
         assert_eq!(
             looked_up_did_a, did_a,
             "registry must return identity A's DID for A's DID"
@@ -1240,7 +1143,7 @@ mod tests {
 
         // Look up identity B — must get B's DID, not A's.
         let looked_up_did_b =
-            runtime::with_identity(&did_b, |entry| Ok(entry.identity.did.clone())).unwrap();
+            runtime::with_identity(&bi, &did_b, |entry| Ok(entry.identity.did.clone())).unwrap();
         assert_eq!(
             looked_up_did_b, did_b,
             "registry must return identity B's DID for B's DID"
@@ -1249,11 +1152,19 @@ mod tests {
         // Cross-check: the custody Arc pointers must be different,
         // confirming different key material is returned for each DID.
         let custody_ptr_a =
-            runtime::with_identity(&did_a, |entry| Ok(Arc::as_ptr(&entry.custody) as usize))
-                .unwrap();
+            runtime::with_identity(
+                &bi,
+                &did_a,
+                |entry| Ok(Arc::as_ptr(&entry.custody) as usize),
+            )
+            .unwrap();
         let custody_ptr_b =
-            runtime::with_identity(&did_b, |entry| Ok(Arc::as_ptr(&entry.custody) as usize))
-                .unwrap();
+            runtime::with_identity(
+                &bi,
+                &did_b,
+                |entry| Ok(Arc::as_ptr(&entry.custody) as usize),
+            )
+            .unwrap();
         assert_ne!(
             custody_ptr_a, custody_ptr_b,
             "different identities in the registry must have different custody providers — \
@@ -1261,8 +1172,8 @@ mod tests {
         );
 
         // Clean up: remove both identities from the registry.
-        runtime::remove_identity(&did_a);
-        runtime::remove_identity(&did_b);
+        runtime::remove_identity(&bi, &did_a);
+        runtime::remove_identity(&bi, &did_b);
     }
 
     #[cfg(feature = "allow_in_memory_custody")]
@@ -1286,8 +1197,11 @@ mod tests {
         let (identity, doc) = rt.block_on(dht.create(&custody.0)).unwrap();
         let did = identity.did.clone();
 
+        let bi = runtime::NapiBridgeInstance::new_napi();
+
         // Register the identity.
         runtime::register_identity(
+            &bi,
             &did,
             runtime::NapiIdentityEntry {
                 identity,
@@ -1299,16 +1213,16 @@ mod tests {
 
         // Verify it is present.
         assert!(
-            runtime::with_identity(&did, |_| Ok(())).is_ok(),
+            runtime::with_identity(&bi, &did, |_| Ok(())).is_ok(),
             "identity should be found after registration"
         );
 
         // Remove it.
-        runtime::remove_identity(&did);
+        runtime::remove_identity(&bi, &did);
 
         // Verify it is gone.
         assert!(
-            runtime::with_identity(&did, |_| Ok(())).is_err(),
+            runtime::with_identity(&bi, &did, |_| Ok(())).is_err(),
             "identity should not be found after remove_identity"
         );
     }
@@ -1334,8 +1248,11 @@ mod tests {
         let (identity, doc) = rt.block_on(dht.create(&custody.0)).unwrap();
         let did = identity.did.clone();
 
+        let bi = runtime::NapiBridgeInstance::new_napi();
+
         // Register the identity.
         runtime::register_identity(
+            &bi,
             &did,
             runtime::NapiIdentityEntry {
                 identity,
@@ -1347,13 +1264,13 @@ mod tests {
 
         // First removal should return true.
         assert!(
-            runtime::remove_identity_if_present(&did),
+            runtime::remove_identity_if_present(&bi, &did),
             "remove_identity_if_present should return true for present identity"
         );
 
         // Second removal should return false.
         assert!(
-            !runtime::remove_identity_if_present(&did),
+            !runtime::remove_identity_if_present(&bi, &did),
             "remove_identity_if_present should return false for absent identity"
         );
     }

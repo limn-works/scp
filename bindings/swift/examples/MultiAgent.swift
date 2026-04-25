@@ -1,8 +1,8 @@
 // Multi-agent coordination: multiple agents collaborating in a shared context.
 //
-// Demonstrates identity creation via `createIdentity()`, context creation,
-// UCAN minting via `mintUcanToken()`, message sending, and message receiving
-// using the SCP Swift SDK wrapper API.
+// Demonstrates the SCP Swift SDK `SCP` class: shared instance across
+// agents, identity creation, UCAN minting, message sending, and message
+// receiving.
 
 import Foundation
 import SCP
@@ -10,22 +10,21 @@ import SCP
 @main
 struct MultiAgent {
     static func runAgent(
+        scp: SCP,
         name: String,
         identity: Identity,
         handle: ContextHandle
     ) async throws {
-        // Agent joins the existing context
-        try await contextJoin(handle: handle, identity: identity)
+        try await scp.contextJoin(handle: handle, identity: identity, spendingUcanJwt: nil)
         print("[\(name)] Joined context \(handle.contextId())")
 
-        // Send a message via the bridge function
-        try await contextSend(
+        try await scp.contextSend(
             handle: handle,
             identity: identity,
-            payload: Data("[\(name)] reporting in".utf8)
+            payload: Data("[\(name)] reporting in".utf8),
+            spendingUcanJwt: nil
         )
 
-        // Subscribe to messages
         let (stream, continuation) = AsyncStream<Message>.makeStream()
         final class Listener: MessageListener, @unchecked Sendable {
             let continuation: AsyncStream<Message>.Continuation
@@ -45,7 +44,7 @@ struct MultiAgent {
                 continuation.finish()
             }
         }
-        try await contextSubscribe(handle: handle, listener: Listener(continuation))
+        try await scp.contextSubscribe(handle: handle, listener: Listener(continuation))
 
         var count = 0
         for await msg in stream {
@@ -57,17 +56,18 @@ struct MultiAgent {
             if count >= 2 { break }
         }
 
-        try await contextLeave(handle: handle, identity: identity)
+        try await scp.contextLeave(handle: handle, identity: identity)
         print("[\(name)] Left context")
     }
 
     static func main() async throws {
-        // Create identities for coordinator and two agents
-        let coordinator = try await createIdentity(custody: "in_memory")
-        let agentA = try await createIdentity(custody: "in_memory")
-        let agentB = try await createIdentity(custody: "in_memory")
+        let scp = SCP()
+        defer { Task { try? await scp.shutdown(timeout: 5) } }
 
-        // Coordinator creates the context
+        let coordinator = try await scp.identityCreate(custody: "in_memory")
+        let agentA = try await scp.identityCreate(custody: "in_memory")
+        let agentB = try await scp.identityCreate(custody: "in_memory")
+
         let params = ContextParams(
             mode: .encrypted,
             ceiling: [
@@ -89,26 +89,26 @@ struct MultiAgent {
             sessionCap: nil,
             economicPolicy: nil
         )
-        let handle = try await contextCreate(identity: coordinator, params: params)
+        let handle = try await scp.contextCreate(identity: coordinator, params: params)
         print("Context created: \(handle.contextId())")
 
-        // Mint UCANs for each agent via the SDK wrapper function
-        _ = try await mintUcanToken(
+        _ = try await scp.ucanMint(
             handle: handle,
             memberDid: agentA.did(),
-            capabilities: ["messages:write", "messages:read"]
+            capabilities: ["messages:write", "messages:read"],
+            proofs: nil
         )
-        _ = try await mintUcanToken(
+        _ = try await scp.ucanMint(
             handle: handle,
             memberDid: agentB.did(),
-            capabilities: ["messages:write", "messages:read"]
+            capabilities: ["messages:write", "messages:read"],
+            proofs: nil
         )
 
-        // Run agents concurrently
-        async let taskA: Void = runAgent(name: "Agent-A", identity: agentA, handle: handle)
-        async let taskB: Void = runAgent(name: "Agent-B", identity: agentB, handle: handle)
+        async let taskA: Void = runAgent(scp: scp, name: "Agent-A", identity: agentA, handle: handle)
+        async let taskB: Void = runAgent(scp: scp, name: "Agent-B", identity: agentB, handle: handle)
         _ = try await (taskA, taskB)
 
-        try await contextClose(handle: handle, identity: coordinator)
+        try await scp.contextClose(handle: handle, identity: coordinator)
     }
 }

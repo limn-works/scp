@@ -11,15 +11,22 @@ See spec section 12 (Bridge System) and ADR-023.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import ScpError
 from scp_sdk.types import BridgeMode, ShadowStatus
 
+if TYPE_CHECKING:
+    pass
+
 
 def _bridge() -> Any:
-    """Return the ``_scp_core`` extension module, imported lazily."""
+    """Return the ``_scp_core`` extension module, imported lazily.
+
+    Used for the pure-function bridge operations (``bridge_register``,
+    ``bridge_evaluate_trust``) that do not require an :class:`SCP`
+    instance. See :func:`create_shadow` for the stateful variant.
+    """
     try:
         import _scp_core  # type: ignore[import-not-found]
 
@@ -32,7 +39,6 @@ def _bridge() -> Any:
         ) from exc
 
 
-@deprecated_default_instance
 def register(
     context_id: str,
     operator_did: str,
@@ -72,7 +78,6 @@ def register(
     )
 
 
-@deprecated_default_instance
 def evaluate_trust(
     *,
     is_bridged: bool = False,
@@ -107,39 +112,7 @@ def evaluate_trust(
     return bridge.bridge_evaluate_trust(is_bridged, is_native_transport, status_str)
 
 
-@deprecated_default_instance
-def create_shadow(
-    bridge_id: str,
-    platform_handle: str,
-    bridge_mode: BridgeMode | str,
-    context_id: str = "ctx-shadow",
-) -> dict[str, Any]:
-    """Create a shadow identity for an external platform participant.
-
-    Args:
-        bridge_id: The bridge connector ID that owns this shadow.
-        platform_handle: External platform handle (e.g., ``"@user#1234"``).
-        bridge_mode: Bridge mode.  Accepts a
-            :class:`~scp_sdk.types.BridgeMode` enum member or a raw
-            string (``"relay"``, ``"puppet"``, ``"api"``, or
-            ``"cooperative"``).
-        context_id: Context the shadow is being created in.
-
-    Returns:
-        A dict with ``shadow_id``, ``platform_handle``, ``bridge_id``,
-        ``attributed_role``, ``provenance_status``.
-
-    Raises:
-        ValidationError: If *bridge_mode* is invalid.
-        ContextError: If shadow creation fails.
-    """
-    bridge = _bridge()
-    mode_str = bridge_mode.value if isinstance(bridge_mode, BridgeMode) else bridge_mode
-    return dict(bridge.bridge_create_shadow(bridge_id, platform_handle, mode_str, context_id))
-
-
 __all__ = [
-    "create_shadow",
     "evaluate_trust",
     "register",
 ]

@@ -7,8 +7,8 @@
 //! - [`NodeHandle`] -- opaque handle to a running application node (wraps
 //!   both `InMemoryStorage` and `FilesystemStorage` variants via an internal
 //!   enum).
-//! - [`relay_start_in_memory`] / [`relay_start_local`] -- relay startup.
-//! - [`node_start_in_memory`] / [`node_start_local`] -- node startup.
+//! - `relay_start_in_memory` / `relay_start_local` -- relay startup.
+//! - `node_start_in_memory` / `node_start_local` -- node startup.
 //!
 //! Gated behind the `server` feature on `scp-ffi-common`. Not available for
 //! WASM (ADR-034).
@@ -128,7 +128,12 @@ impl From<BroadcastKeyError> for ScpError {
 ///
 /// Best-effort: logs a warning if the relay connection fails rather than
 /// blocking node startup.
-async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zeroizing<String>) {
+async fn auto_wire_context_manager(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    did: &str,
+    relay_url: &str,
+    bridge_token: Zeroizing<String>,
+) {
     let sourced = SourcedRelayUrl {
         url: relay_url.to_owned(),
         source: RelayUrlSource::Explicit,
@@ -142,7 +147,7 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
     .await
     {
         Ok(adapter) => {
-            crate::runtime::init_context_manager_with_relay_transport(did, adapter);
+            bi.init_context_manager_with_relay_transport(did, adapter);
         }
         Err(e) => {
             tracing::warn!(
@@ -156,11 +161,11 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
             // DID, matching PyO3/NAPI behavior. (The bridge no longer has a
             // DID-less stub crypto path — see commit 4 of the phase 4
             // persistence refactor.)
-            crate::runtime::init_context_manager_with_did(did);
+            bi.init_context_manager_with_did(did);
         }
     }
     // Always register the node's DID as a local DID for defense-in-depth.
-    if let Ok(mgr) = crate::runtime::context_manager() {
+    if let Ok(mgr) = bi.context_manager_expect() {
         mgr.register_local_did(did.to_owned().into()).await;
     }
 }
@@ -171,7 +176,7 @@ async fn auto_wire_context_manager(did: &str, relay_url: &str, bridge_token: Zer
 
 /// Opaque handle to a running SCP relay server.
 ///
-/// Created by [`relay_start_in_memory`] or [`relay_start_local`]. The relay
+/// Created by `relay_start_in_memory` or `relay_start_local`. The relay
 /// accepts WebSocket connections at [`relay_url`](Self::relay_url)
 /// and can be gracefully stopped via [`shutdown`](Self::shutdown).
 #[derive(uniffi::Object)]
@@ -236,17 +241,25 @@ impl Drop for RelayHandle {
 
 /// Opaque handle to a running SCP application node.
 ///
-/// Created by [`node_start_in_memory`] or [`node_start_local`]. The node
-/// includes a running relay server, a generated DID identity, and (optionally)
-/// persistent storage. The HTTP server is **not** started automatically --
-/// only the relay is bound.
+/// Created by [`Scp::node_start_in_memory`](crate::scp::Scp::node_start_in_memory)
+/// or [`Scp::node_start_local`](crate::scp::Scp::node_start_local). The
+/// node includes a running relay server, a generated DID identity, and
+/// (optionally) persistent storage. The HTTP server is **not** started
+/// automatically -- only the relay is bound.
 #[derive(uniffi::Object)]
 pub struct NodeHandle {
     inner: RunningNode,
+    /// Owning `UniffiBridgeInstance` — the handle reaches back into its
+    /// instance's `ContextManager` for broadcast-key lookup during HTTP
+    /// projection. Phase D (#1695) replaced `crate::runtime::context_manager()`
+    /// free-function lookup with this Arc affinity.
+    pub(crate) bi: Arc<crate::runtime::UniffiBridgeInstance>,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
-    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
-    /// every `#[uniffi::export]` entry that accepts a `NodeHandle`.
+    /// Consumed at every `#[uniffi::export]` entry that accepts a
+    /// `NodeHandle` (e.g. `commit_deploy`, `rollback_deploy`,
+    /// `enable_site_projection`) via a direct
+    /// `self.bi.core.check_handle(...)` comparison.
     pub(crate) instance_id: u64,
 }
 
@@ -326,7 +339,7 @@ impl NodeHandle {
 
         // Resolve broadcast key: explicit, auto-lookup, or auto with explicit author.
         // Delegates to the shared resolver in scp-ffi-common (same logic as PyO3/NAPI).
-        let mgr = crate::runtime::context_manager()?;
+        let mgr = self.bi.context_manager_expect()?;
         let resolved = server::resolve_broadcast_key(
             broadcast_key_hex,
             author_did,
@@ -470,22 +483,16 @@ impl Drop for NodeHandle {
 // Free functions -- relay startup
 // ---------------------------------------------------------------------------
 
-/// Starts a relay with in-memory blob storage on an OS-assigned port.
-///
-/// Returns a [`RelayHandle`] whose `relay_url()` method returns the
-/// WebSocket URL for clients.
-///
-/// # Swift
-///
-/// ```swift
-/// let relay = try await relayStartInMemory()
-/// print(relay.relayUrl()) // "ws://127.0.0.1:PORT/scp/v1"
-/// relay.shutdown()
-/// ```
-#[uniffi::export]
-pub async fn relay_start_in_memory() -> Result<Arc<RelayHandle>, ScpError> {
+/// Per-instance helper used by [`crate::Scp::relay_start_in_memory`] on the
+/// caller-owned `Scp`. Replaces the deleted `relay_start_in_memory` free
+/// function (Phase D, #1695) — relay handles must be stamped against a
+/// concrete instance so their `instance_id` can participate in the
+/// handle-affinity check.
+pub(crate) async fn relay_start_in_memory_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+) -> Result<Arc<RelayHandle>, ScpError> {
     let relay = server::start_relay_in_memory().await?;
-    let instance_id = crate::runtime::default_instance_id()?;
+    let instance_id = bi.core.instance_id();
     increment_handle_count();
     Ok(Arc::new(RelayHandle {
         inner: relay,
@@ -493,13 +500,14 @@ pub async fn relay_start_in_memory() -> Result<Arc<RelayHandle>, ScpError> {
     }))
 }
 
-/// Starts a relay with redb-backed blob storage on an OS-assigned port.
-///
-/// Opens (or creates) a redb database at `<data_dir>/blobs.redb`.
-#[uniffi::export]
-pub async fn relay_start_local(data_dir: String) -> Result<Arc<RelayHandle>, ScpError> {
+/// Per-instance helper used by [`crate::Scp::relay_start_local`] on the
+/// caller-owned `Scp`.
+pub(crate) async fn relay_start_local_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
+    data_dir: String,
+) -> Result<Arc<RelayHandle>, ScpError> {
     let relay = server::start_relay_local(std::path::Path::new(&data_dir)).await?;
-    let instance_id = crate::runtime::default_instance_id()?;
+    let instance_id = bi.core.instance_id();
     increment_handle_count();
     Ok(Arc::new(RelayHandle {
         inner: relay,
@@ -609,31 +617,20 @@ fn build_node_identity_from_uniffi(_id: &Identity) -> Result<server::NodeIdentit
     })
 }
 
-/// Starts a full application node with in-memory storage.
-///
-/// When `identity` is provided, the node uses the pre-existing identity
-/// instead of generating a fresh one. This enables identity portability —
-/// the same DID persists across node restarts and can be shared between
-/// SDK and node instances.
-///
-/// Auto-wires in-memory key custody, in-memory storage, in-memory DHT client,
-/// self-signed TLS, and a relay on an OS-assigned port.
-///
-/// # Swift
-///
-/// ```swift
-/// let identity = try await identityCreate(custody: "in_memory")
-/// let node = try await nodeStartInMemory(identity: identity)
-/// print(node.relayUrl()) // "ws://127.0.0.1:PORT/scp/v1"
-/// print(node.did())      // same DID as identity.did()
-/// node.shutdown()
-/// ```
-#[uniffi::export]
-pub async fn node_start_in_memory(
+/// Per-instance helper used by [`crate::Scp::node_start_in_memory`] on the
+/// caller-owned `Scp`. Replaces the deleted `node_start_in_memory` free
+/// function (Phase D, #1695).
+pub(crate) async fn node_start_in_memory_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     identity: Option<Arc<Identity>>,
 ) -> Result<Arc<NodeHandle>, ScpError> {
+    // Handle-affinity check moved from `uniffi_check_handle!` macro expansion
+    // (which read `DEFAULT_BRIDGE_INSTANCE`) to a direct `CoreFields::check_handle`
+    // against the caller's own `bi`. Mirrors `identity_attest_device` etc.
     if let Some(ref id) = identity {
-        crate::uniffi_check_handle!(id);
+        bi.core
+            .check_handle(id.instance_id())
+            .map_err(ScpError::from)?;
     }
     let node_identity = match identity {
         Some(ref id) => Some(build_node_identity_from_uniffi(id)?),
@@ -651,32 +648,29 @@ pub async fn node_start_in_memory(
     let did = node.identity().did().to_owned();
     let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
     let bridge_token = node.bridge_token_hex();
-    auto_wire_context_manager(&did, &relay_url, bridge_token).await;
+    auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
 
-    let instance_id = crate::runtime::default_instance_id()?;
+    let instance_id = bi.core.instance_id();
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
         inner: RunningNode::InMemory(node),
+        bi: Arc::clone(bi),
         instance_id,
     }))
 }
 
-/// Starts a full application node with file-backed storage.
-///
-/// When `identity` is provided, the node uses the pre-existing identity.
-/// When `None`, the node creates or reloads a persistent identity via
-/// `FileKeyCustody`. The `passphrase` parameter is required in this mode.
-///
-/// Opens (or creates) persistent storage at `<data_dir>/storage/` and a redb
-/// blob database at `<data_dir>/blobs.redb`.
-#[uniffi::export]
-pub async fn node_start_local(
+/// Per-instance helper used by [`crate::Scp::node_start_local`] on the
+/// caller-owned `Scp`.
+pub(crate) async fn node_start_local_on(
+    bi: &Arc<crate::runtime::UniffiBridgeInstance>,
     data_dir: String,
     identity: Option<Arc<Identity>>,
     passphrase: Option<String>,
 ) -> Result<Arc<NodeHandle>, ScpError> {
     if let Some(ref id) = identity {
-        crate::uniffi_check_handle!(id);
+        bi.core
+            .check_handle(id.instance_id())
+            .map_err(ScpError::from)?;
     }
     let node_identity = match identity {
         Some(ref id) => Some(build_node_identity_from_uniffi(id)?),
@@ -695,12 +689,13 @@ pub async fn node_start_local(
     let did = node.identity().did().to_owned();
     let relay_url = format!("ws://127.0.0.1:{}/scp/v1", node.relay().bound_addr().port());
     let bridge_token = node.bridge_token_hex();
-    auto_wire_context_manager(&did, &relay_url, bridge_token).await;
+    auto_wire_context_manager(bi, &did, &relay_url, bridge_token).await;
 
-    let instance_id = crate::runtime::default_instance_id()?;
+    let instance_id = bi.core.instance_id();
     increment_handle_count();
     Ok(Arc::new(NodeHandle {
         inner: RunningNode::Filesystem(node),
+        bi: Arc::clone(bi),
         instance_id,
     }))
 }
@@ -721,7 +716,8 @@ mod tests {
 
     #[test]
     fn relay_in_memory_starts_and_returns_url() {
-        let relay = rt().block_on(relay_start_in_memory()).unwrap();
+        let scp = crate::scp::Scp::new();
+        let relay = rt().block_on(scp.relay_start_in_memory()).unwrap();
         assert!(relay.relay_url().starts_with("ws://127.0.0.1:"));
         assert!(relay.relay_url().ends_with("/scp/v1"));
         assert!(relay.relay_port() > 0);
@@ -734,8 +730,9 @@ mod tests {
     fn relay_local_starts_and_returns_url() {
         let tmp =
             std::env::temp_dir().join(format!("scp-uniffi-relay-test-{}", std::process::id()));
+        let scp = crate::scp::Scp::new();
         let relay = rt()
-            .block_on(relay_start_local(tmp.to_string_lossy().into_owned()))
+            .block_on(scp.relay_start_local(tmp.to_string_lossy().into_owned()))
             .unwrap();
         assert!(relay.relay_url().starts_with("ws://127.0.0.1:"));
         assert!(relay.relay_port() > 0);
@@ -745,7 +742,8 @@ mod tests {
 
     #[test]
     fn node_in_memory_starts_and_returns_did() {
-        let node = rt().block_on(node_start_in_memory(None)).unwrap();
+        let scp = crate::scp::Scp::new();
+        let node = rt().block_on(scp.node_start_in_memory(None)).unwrap();
         let url = node.relay_url();
         assert!(
             url.starts_with("ws://") || url.starts_with("wss://"),
@@ -762,8 +760,9 @@ mod tests {
     #[test]
     fn node_local_starts_and_returns_did() {
         let tmp = std::env::temp_dir().join(format!("scp-uniffi-node-test-{}", std::process::id()));
+        let scp = crate::scp::Scp::new();
         let node = rt()
-            .block_on(node_start_local(
+            .block_on(scp.node_start_local(
                 tmp.to_string_lossy().into_owned(),
                 None,
                 Some("test-passphrase".to_owned()),
@@ -783,14 +782,16 @@ mod tests {
 
     #[test]
     fn relay_shutdown_is_idempotent() {
-        let relay = rt().block_on(relay_start_in_memory()).unwrap();
+        let scp = crate::scp::Scp::new();
+        let relay = rt().block_on(scp.relay_start_in_memory()).unwrap();
         relay.shutdown();
         relay.shutdown();
     }
 
     #[test]
     fn node_shutdown_is_idempotent() {
-        let node = rt().block_on(node_start_in_memory(None)).unwrap();
+        let scp = crate::scp::Scp::new();
+        let node = rt().block_on(scp.node_start_in_memory(None)).unwrap();
         node.shutdown();
         node.shutdown();
     }
@@ -852,14 +853,15 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn node_in_memory_with_identity_uses_provided_did() {
-        use crate::bridge::identity_create;
-
+        let scp = crate::scp::Scp::new();
         let identity = rt()
-            .block_on(identity_create("in_memory".to_owned(), None))
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
             .unwrap();
         let expected_did = identity.did();
 
-        let node = rt().block_on(node_start_in_memory(Some(identity))).unwrap();
+        let node = rt()
+            .block_on(scp.node_start_in_memory(Some(identity)))
+            .unwrap();
 
         assert_eq!(
             node.did(),
@@ -879,10 +881,9 @@ mod tests {
     #[test]
     #[cfg(feature = "allow_in_memory_custody")]
     fn node_local_with_identity_uses_provided_did() {
-        use crate::bridge::identity_create;
-
+        let scp = crate::scp::Scp::new();
         let identity = rt()
-            .block_on(identity_create("in_memory".to_owned(), None))
+            .block_on(scp.identity_create("in_memory".to_owned(), None))
             .unwrap();
         let expected_did = identity.did();
 
@@ -890,7 +891,7 @@ mod tests {
             std::env::temp_dir().join(format!("scp-uniffi-node-id-test-{}", std::process::id()));
         // No passphrase needed when passing a pre-existing identity.
         let node = rt()
-            .block_on(node_start_local(
+            .block_on(scp.node_start_local(
                 tmp.to_string_lossy().into_owned(),
                 Some(identity),
                 None,

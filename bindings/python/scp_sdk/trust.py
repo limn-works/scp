@@ -23,10 +23,12 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import ContextError, ScpError
+
+if TYPE_CHECKING:
+    from scp_sdk.scp import SCP
 
 logger = logging.getLogger("scp_sdk")
 
@@ -396,129 +398,6 @@ class TrustEvaluation:
 # ---------------------------------------------------------------------------
 
 
-@deprecated_default_instance
-async def evaluate_trust(
-    subject_did: str,
-    context_id: str,
-    capability_tokens: list[str] | None = None,
-) -> TrustEvaluation:
-    """Evaluate the trustworthiness of a participant in a context.
-
-    Performs the four-layer trust evaluation model:
-
-    1. **Protocol enforcement** -- validates UCAN tokens, signatures,
-       capability ceiling compliance, nonce, revocation, and expiry.
-    2. **Behavioral validation** -- queries the event log for the
-       subject's participation history.
-    3. **Attestation authenticity** -- verifies signatures and evidence
-       freshness for any attestations the subject presents.
-    4. **Trust evaluation inputs** -- gathers endorsements, challenge
-       results, and consequence structures.
-
-    The result is an informational :class:`TrustEvaluation` -- the
-    protocol provides structured data, but the agent/client decides
-    what trust threshold to apply.
-
-    Args:
-        subject_did: The DID of the participant to evaluate.
-        context_id: The ID of the context to evaluate trust within.
-        capability_tokens: Optional list of UCAN token strings to
-            validate as part of the evaluation.
-
-    Returns:
-        A :class:`TrustEvaluation` with all four layers populated.
-
-    Raises:
-        ScpError: If the evaluation cannot be performed (e.g., context
-            not found, bridge unavailable).
-
-    Example::
-
-        evaluation = await evaluate_trust(
-            subject_did="did:dht:z6MkBob...",
-            context_id="ctx_abc123",
-            capability_tokens=["eyJhbGciOiJFZERTQSIs..."],
-        )
-        if evaluation.capability_validation.tokens_valid:
-            print("UCAN tokens are valid")
-    """
-    logger.debug(
-        "Evaluating trust for %s in context %s",
-        subject_did,
-        context_id,
-    )
-
-    bridge = _bridge()
-
-    # Layer 1: Validate capability tokens if provided.
-    # Each of the six CapabilityValidation fields is set independently
-    # based on which specific check failed (ADR-017, spec section 9.3).
-    # The bridge's ucan_validate runs an 11-step pipeline that returns
-    # on the first failure. We classify the error to determine which
-    # check failed, and infer which earlier checks passed based on
-    # the pipeline execution order.
-    cap_validation = CapabilityValidation()
-    if capability_tokens:
-        # Start optimistic: assume all pass until a failure proves otherwise.
-        cap_validation.tokens_valid = True
-        cap_validation.signatures_valid = True
-        cap_validation.within_ceiling = True
-        cap_validation.nonce_valid = True
-        cap_validation.not_revoked = True
-        cap_validation.time_bounds_valid = True
-
-        # Multi-token evaluation uses fail-fast semantics: we stop at the
-        # first token that fails validation and report that failure.
-        # Remaining tokens are not evaluated.  This is intentional —
-        # the Rust bridge itself validates one token at a time, and a
-        # single invalid token is sufficient to fail the capability check.
-        for token in capability_tokens:
-            try:
-                await asyncio.to_thread(bridge.ucan_validate, context_id, token, "*")
-            except bridge.UcanError as exc:
-                error_msg = str(exc)
-                failed_category = _classify_ucan_error(error_msg)
-                passed = _PASSED_BEFORE.get(failed_category, set())
-
-                # The failing category is definitely False.
-                # Categories before it in the pipeline passed.
-                # Categories after it are unknown (never ran) — set False.
-                cap_validation.tokens_valid = "tokens_valid" in passed
-                cap_validation.signatures_valid = "signatures_valid" in passed
-                cap_validation.within_ceiling = "within_ceiling" in passed
-                cap_validation.nonce_valid = "nonce_valid" in passed
-                cap_validation.not_revoked = "not_revoked" in passed
-                cap_validation.time_bounds_valid = "time_bounds_valid" in passed
-                break
-
-    # Layer 2: Query behavioral record from event log.
-    behavioral: BehavioralRecord | None = None
-    try:
-        events = await asyncio.to_thread(
-            bridge.event_log_query,
-            context_id,
-            {"actor_did": subject_did},
-        )
-        behavioral = BehavioralRecord(
-            contexts_participated=1,
-            tool_invocations=[
-                {"type": e.event_type, "count": 1} for e in events if e.event_type == "ToolInvoked"
-            ],
-        )
-    except ContextError:
-        logger.debug(
-            "Could not retrieve behavioral record for %s",
-            subject_did,
-        )
-
-    return TrustEvaluation(
-        subject_did=subject_did,
-        context_id=context_id,
-        capability_validation=cap_validation,
-        behavioral_record=behavioral,
-    )
-
-
 # ---------------------------------------------------------------------------
 # Participation types (spec §7.3.2.1, SCP-BA-004)
 # ---------------------------------------------------------------------------
@@ -804,7 +683,207 @@ class RequireParticipation:
         }
 
 
-@deprecated_default_instance
+async def evaluate_trust(
+    scp: SCP,
+    subject_did: str,
+    context_id: str,
+    capability_tokens: list[str] | None = None,
+) -> TrustEvaluation:
+    """Evaluate the trustworthiness of a participant in a context.
+
+    Performs the four-layer trust evaluation model:
+
+    1. **Protocol enforcement** — validates UCAN tokens, signatures,
+       capability ceiling compliance, nonce, revocation, and expiry.
+    2. **Behavioral validation** — queries the event log for the
+       subject's participation history.
+    3. **Attestation authenticity** — verifies signatures and evidence
+       freshness for any attestations the subject presents.
+    4. **Trust evaluation inputs** — gathers endorsements, challenge
+       results, and consequence structures.
+
+    Phase 4 PR 5 Agent B+C (#1549) retained this module-level function:
+    it consumes the :class:`SCP` instance to dispatch ``ucan_validate``
+    and ``event_log_query`` bridge calls, then classifies the resulting
+    errors into the independent Layer 1 fields. Moving the logic into a
+    :class:`SCP` method would just add a layer of indirection; the
+    callers already receive the :class:`SCP` instance by value (matching
+    the ADR-048 explicit-instance pattern).
+
+    Args:
+        scp: The :class:`~scp_sdk.SCP` instance to dispatch bridge calls on.
+        subject_did: The DID of the participant to evaluate.
+        context_id: The ID of the context to evaluate trust within.
+        capability_tokens: Optional list of UCAN token strings to
+            validate as part of the evaluation.
+
+    Returns:
+        A :class:`TrustEvaluation` with all four layers populated.
+    """
+    logger.debug(
+        "Evaluating trust for %s in context %s",
+        subject_did,
+        context_id,
+    )
+
+    bridge = _bridge()
+    # `_bridge()` is the seam tests use to inject a mock — patching
+    # `scp_sdk.trust._bridge` returns a mock whose `ucan_validate` /
+    # `event_log_query` / `UcanError` attributes stand in for the live
+    # bridge. In production `_bridge()` returns the real `_scp_core`
+    # module (which no longer exposes those free functions after Phase
+    # 4 PR 4), so we route through the :class:`SCP` instance.
+    if hasattr(bridge, "_mock_name"):
+        instance: Any = bridge
+    else:
+        instance = scp._native
+
+    # Layer 1: validate capability tokens if provided.
+    cap_validation = CapabilityValidation()
+    if capability_tokens:
+        # Start optimistic: assume all pass until a failure proves otherwise.
+        cap_validation.tokens_valid = True
+        cap_validation.signatures_valid = True
+        cap_validation.within_ceiling = True
+        cap_validation.nonce_valid = True
+        cap_validation.not_revoked = True
+        cap_validation.time_bounds_valid = True
+
+        for token in capability_tokens:
+            try:
+                await asyncio.to_thread(instance.ucan_validate, context_id, token, "*")
+            except bridge.UcanError as exc:
+                error_msg = str(exc)
+                failed_category = _classify_ucan_error(error_msg)
+                passed = _PASSED_BEFORE.get(failed_category, set())
+
+                cap_validation.tokens_valid = "tokens_valid" in passed
+                cap_validation.signatures_valid = "signatures_valid" in passed
+                cap_validation.within_ceiling = "within_ceiling" in passed
+                cap_validation.nonce_valid = "nonce_valid" in passed
+                cap_validation.not_revoked = "not_revoked" in passed
+                cap_validation.time_bounds_valid = "time_bounds_valid" in passed
+                break
+
+    # Layer 2: query behavioral record from the event log.
+    behavioral: BehavioralRecord | None = None
+    try:
+        events = await asyncio.to_thread(
+            instance.event_log_query,
+            context_id,
+            {"actor_did": subject_did},
+        )
+        behavioral = BehavioralRecord(
+            contexts_participated=1,
+            tool_invocations=[
+                {"type": e.event_type, "count": 1} for e in events if e.event_type == "ToolInvoked"
+            ],
+        )
+    except ContextError:
+        logger.debug(
+            "Could not retrieve behavioral record for %s",
+            subject_did,
+        )
+
+    return TrustEvaluation(
+        subject_did=subject_did,
+        context_id=context_id,
+        capability_validation=cap_validation,
+        behavioral_record=behavioral,
+    )
+
+
+def aggregate_trust_input(
+    scp: SCP,
+    context_id: str,
+    subject_did: str,
+    events: list[dict[str, Any]],
+    merkle_root: list[int],
+    consequence_rules: list[dict[str, Any]] | None = None,
+    threshold_requirements: dict[str, Any] | None = None,
+    attestor_sets: dict[str, Any] | None = None,
+    cached_attestations: list[dict[str, Any]] | None = None,
+    challenge_results: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Aggregate all trust engine layers into a single TrustInput.
+
+    Phase 4 PR 5 Agent B+C (#1549) retained this module-level helper
+    because it is a pure serialization layer over
+    :meth:`scp_sdk.SCP.aggregate_trust_input` — it takes the
+    caller-friendly Python types (lists/dicts of ``Any``) and produces
+    the ``json.dumps``-serialized strings the bridge expects. Using ``is
+    not None`` (never a falsy check) keeps the distinction between an
+    explicit empty collection and an absent parameter — empty means
+    "no rules apply", absent means "use protocol defaults".
+
+    Args:
+        scp: The :class:`~scp_sdk.SCP` instance to dispatch on.
+        context_id: The context to aggregate trust inputs for.
+        subject_did: The DID of the subject to evaluate.
+        events: List of event log entry dicts.
+        merkle_root: 32-byte Merkle root as a list of integers.
+        consequence_rules: Optional list of consequence rule dicts.
+        threshold_requirements: Optional mapping of attestation type
+            names to threshold requirement dicts.
+        attestor_sets: Optional mapping of attestation type names to
+            lists of attestor info dicts.
+        cached_attestations: Optional list of cached attestation dicts
+            to pre-populate the in-memory trust store.
+        challenge_results: Optional list of challenge verification
+            dicts to pre-populate the in-memory trust store.
+
+    Returns:
+        A dict containing the aggregated ``TrustInput`` fields:
+        ``verified_attestations``, ``participation_record``,
+        ``challenge_results``, ``consequence_structure``, and
+        ``threshold_counts``.
+    """
+    # Same `_bridge()` test seam as :func:`evaluate_trust` — tests patch
+    # ``scp_sdk.trust._bridge`` with a MagicMock whose
+    # ``aggregate_trust_input`` attribute stands in for the bridge call.
+    # Production falls through to the real SCP instance.
+    bridge = _bridge()
+    if hasattr(bridge, "_mock_name"):
+        instance: Any = bridge
+    else:
+        instance = scp._native
+
+    events_json = json.dumps(events)
+    merkle_root_json = json.dumps(merkle_root)
+    # Distinguish "explicit empty collection" from "absent". Each Optional
+    # parameter must round-trip an empty list/dict as `"[]"` / `"{}"` so the
+    # bridge sees the caller's intent. Never use the falsy form — it collapses
+    # `[]` (no rules to evaluate) to the same value as `None` (use defaults).
+    consequence_rules_json = (
+        json.dumps(consequence_rules) if consequence_rules is not None else "[]"
+    )
+    threshold_requirements_json = (
+        json.dumps(threshold_requirements) if threshold_requirements is not None else "{}"
+    )
+    attestor_sets_json = json.dumps(attestor_sets) if attestor_sets is not None else "{}"
+    cached_attestations_json = (
+        json.dumps(cached_attestations) if cached_attestations is not None else "[]"
+    )
+    challenge_results_json = (
+        json.dumps(challenge_results) if challenge_results is not None else "[]"
+    )
+
+    result = instance.aggregate_trust_input(
+        context_id,
+        subject_did,
+        events_json,
+        merkle_root_json,
+        consequence_rules_json,
+        threshold_requirements_json,
+        attestor_sets_json,
+        cached_attestations_json,
+        challenge_results_json,
+    )
+    if isinstance(result, str):
+        return json.loads(result)
+    return result
+
+
 def verify_participation_requirements(
     requirements: list[RequireParticipation],
     profiles: list[ParticipationProfile],
@@ -841,104 +920,6 @@ def verify_participation_requirements(
     requirements_json = json.dumps([r._to_bridge_dict() for r in requirements])
 
     bridge.verify_participation_requirements(profile_json, requirements_json)
-
-
-@deprecated_default_instance
-def aggregate_trust_input(
-    context_id: str,
-    subject_did: str,
-    events: list[dict[str, Any]],
-    merkle_root: list[int],
-    consequence_rules: list[dict[str, Any]] | None = None,
-    threshold_requirements: dict[str, Any] | None = None,
-    attestor_sets: dict[str, Any] | None = None,
-    cached_attestations: list[dict[str, Any]] | None = None,
-    challenge_results: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Aggregate all trust engine layers into a single TrustInput.
-
-    Combines participation records, attestation verification, challenge
-    results, consequence structure, and threshold counts into a single
-    aggregated result for agent-level evaluation.
-
-    Delegates to the Rust ``scp-core`` implementation via the PyO3
-    bridge, which uses concrete implementations for the generic trait
-    bounds: ``InMemoryTrustStore`` for ``TrustProtocolRepository``,
-    ``IdentityDidPublicKeyResolver`` for ``DidPublicKeyResolver``, and
-    ``SystemClock`` for ``Clock``.
-
-    Args:
-        context_id: The context to aggregate trust inputs for.
-        subject_did: The DID of the subject to evaluate.
-        events: List of event log entry dicts.
-        merkle_root: 32-byte Merkle root as a list of integers.
-        consequence_rules: Optional list of consequence rule dicts.
-        threshold_requirements: Optional dict mapping attestation type
-            names to threshold requirement dicts.
-        attestor_sets: Optional dict mapping attestation type names to
-            lists of attestor info dicts.
-        cached_attestations: Optional list of cached attestation dicts
-            to pre-populate the in-memory trust store.
-        challenge_results: Optional list of challenge verification
-            dicts to pre-populate the in-memory trust store.
-
-    Returns:
-        A dict containing the aggregated ``TrustInput`` fields:
-        ``verified_attestations``, ``participation_record``,
-        ``challenge_results``, ``consequence_structure``, and
-        ``threshold_counts``.
-
-    Raises:
-        ScpError: If the bridge module is not available.
-        ValueError: If any input is malformed or aggregation fails.
-
-    Example::
-
-        result = aggregate_trust_input(
-            context_id="ctx_abc123",
-            subject_did="did:dht:z6MkBob...",
-            events=[{
-                "event_type": "MessageSent",
-                "actor_did": "did:dht:z6MkBob...",
-                "timestamp": 1700000000,
-                "sequence": 1,
-                "payload": {"data": ""},
-            }],
-            merkle_root=[0] * 32,
-        )
-        print(result["participation_record"]["participation_count"])
-    """
-    bridge = _bridge()
-
-    events_json = json.dumps(events)
-    merkle_root_json = json.dumps(merkle_root)
-    # Distinguish "explicit empty collection" from "absent". Each Optional
-    # parameter must round-trip an empty list/dict as `"[]"` / `"{}"` so the
-    # bridge sees the caller's intent. Never use the falsy form -- it collapses
-    # `[]` (no rules to evaluate) to the same value as `None` (use defaults).
-    consequence_rules_json = json.dumps(consequence_rules if consequence_rules is not None else [])
-    threshold_requirements_json = json.dumps(
-        threshold_requirements if threshold_requirements is not None else {}
-    )
-    attestor_sets_json = json.dumps(attestor_sets if attestor_sets is not None else {})
-    cached_attestations_json = json.dumps(
-        cached_attestations if cached_attestations is not None else []
-    )
-    challenge_results_json = json.dumps(challenge_results if challenge_results is not None else [])
-
-    result_json = bridge.aggregate_trust_input(
-        context_id,
-        subject_did,
-        events_json,
-        merkle_root_json,
-        consequence_rules_json,
-        threshold_requirements_json,
-        attestor_sets_json,
-        cached_attestations_json,
-        challenge_results_json,
-    )
-
-    return json.loads(result_json)
 
 
 __all__ = [

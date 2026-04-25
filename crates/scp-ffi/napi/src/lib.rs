@@ -50,7 +50,7 @@
 //! opaque types (`NapiIdentity`, `NapiContextHandle`, `NapiUcanToken`,
 //! `NapiTransportManager`) decrement it in their `Drop` impl.
 //!
-//! [`scp_shutdown`] waits (with a configurable timeout, default 5 seconds)
+//! `scp_shutdown` waits (with a configurable timeout, default 5 seconds)
 //! for `HANDLE_COUNT` to reach zero before allowing the tokio runtime to
 //! be dropped. See `sdk-common.md` "FFI Async Bridging Risks" rule 4.
 //!
@@ -59,7 +59,7 @@
 //! Unlike the WASM bridge (which cannot depend on `scp-core` due to tokio's
 //! multi-thread runtime constraint on `wasm32-unknown-unknown`), this bridge
 //! calls `scp-core` directly. The `"in_memory"` custody path in
-//! [`identity_create`](identity::identity_create) uses a real
+//! [`Scp::identity_create`](crate::scp::Scp::identity_create) uses a real
 //! `InMemoryKeyCustody` to
 //! generate a live `did:dht` identity.
 //!
@@ -83,8 +83,11 @@ use napi_derive::napi;
 /// [`pyscp_check_handle!`](../../scp_ffi/macro.pyscp_check_handle.html)
 /// for cross-bridge symmetry.
 ///
-/// Resolves [`bridge_instance_for_affinity`](crate::runtime::bridge_instance_for_affinity)
-/// internally and checks each `$handle.instance_id` against the core's.
+/// The caller passes a [`CoreFields`](crate::runtime::CoreFields) reference
+/// as the first argument (typically `&self.inner.core` on an `Scp` method,
+/// or `&bi.core` where `bi` is a `&NapiBridgeInstance` already in scope).
+/// The macro then checks that each supplied `$handle.instance_id()`
+/// matches the core's `instance_id`.
 ///
 /// `$handle` must carry an inherent `instance_id(&self) -> u64` method
 /// (`HandleInstance` in the runtime module).
@@ -92,27 +95,25 @@ use napi_derive::napi;
 /// Raises [`crate::error::ScpNapiError::Permission`] with error code
 /// `SCP-PERM-3030` on mismatch.
 ///
-/// Round 5 simplifier review dropped the explicit `$core` parameter
-/// after confirming all 175 call sites across the three bridges passed
-/// the same `bridge_instance_for_affinity()?` value. If a future
-/// per-instance `Scp::method` needs to target `&self.inner.core`, add a
-/// second macro arm rather than re-expanding the default one.
+/// Sub-slice A of #1549 Phase 4 PR 4 reintroduced the explicit `$core`
+/// parameter so per-`NapiBridgeInstance` call paths can flow their own
+/// core through without routing via the process-global default.
+/// Sub-slices B-E update every call site.
+///
+/// The affinity check is never blocked by transient lifecycle state
+/// (e.g., a suspended bridge) because it is a pure `u64` comparison that
+/// does not touch transport or `ContextManager` state.
 ///
 /// Usage:
 ///
 /// ```ignore
-/// napi_check_handle!(handle);
-/// napi_check_handle!(identity, context_handle);
+/// napi_check_handle!(&scp.inner.core, handle);
+/// napi_check_handle!(&bi.core, identity, context_handle);
 /// ```
 #[macro_export]
 macro_rules! napi_check_handle {
-    ($($handle:expr),+ $(,)?) => {{
-        // Method resolution on `check_handle` auto-derefs through `&T`,
-        // `&Arc<T>`, `Arc<T>`, and `CoreFields` directly. `CoreFields`
-        // has an inherent `check_handle` method, so the trait need not
-        // be in scope. Mirrors the PyO3 bridge's `pyscp_check_handle!`
-        // pattern.
-        let __core = $crate::runtime::bridge_instance_for_affinity()?;
+    ($core:expr, $($handle:expr),+ $(,)?) => {{
+        let __core: &$crate::runtime::CoreFields = $core;
         $(
             __core
                 .check_handle($crate::runtime::HandleInstance::instance_id($handle))
@@ -247,157 +248,11 @@ pub fn scp_version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()
 }
 
-/// Shuts down the default bridge instance gracefully.
-///
-/// Awaits in-flight tasks up to `timeout_millis` **milliseconds**, aborts
-/// any remaining tasks when the deadline expires, then clears registries,
-/// disconnects transport, and runs shutdown hooks. Finally waits up to the
-/// same deadline for outstanding opaque FFI handles
-/// (`NapiIdentity`, `NapiContextHandle`, `NapiUcanToken`,
-/// `NapiTransportManager`, …) to be released.
-///
-/// The unit is **milliseconds** — unified across all Rust bridges so the
-/// Python, TypeScript, Swift, and Kotlin SDKs can share a single
-/// conversion surface (`timeout_secs: number` in the SDK wrapper is
-/// multiplied by 1000 before crossing FFI). The NAPI `u32` millis range
-/// is 2^32 ms ≈ 49.7 days, which is far beyond any realistic shutdown
-/// budget.
-///
-/// Returns a `Promise<void>` — call `await scpShutdown(5000)` from JS.
-/// Pass `0` to skip both graceful drain and handle-release polling.
-///
-/// **Breaking change (Phase 4 PR 1 / AC5)**: the signature moved from
-/// sync `void` to async `Promise<void>`, and the unit changed from
-/// **seconds** (`u32`) to **milliseconds** (`u32`) to unify the Rust
-/// bridge signatures. Callers migrating away from the free-function
-/// façade should switch to `scp.shutdown(5000)` on an owned `SCP`
-/// instance.
-///
-/// # JS usage
-///
-/// ```js
-/// process.on('beforeExit', async () => {
-///   await scpShutdown(5_000); // wait up to 5 seconds (5,000 ms)
-/// });
-/// ```
-#[napi]
-pub async fn scp_shutdown(timeout_millis: u32) -> napi::Result<()> {
-    let timeout = Duration::from_millis(u64::from(timeout_millis));
-
-    // In test builds we intentionally skip shutting down the default
-    // bridge instance — the `OnceLock` is process-global and one shutdown
-    // would poison state shared by every other test in the same binary.
-    #[cfg(not(test))]
-    if let Some(bi) = runtime::default_bridge_instance_raw() {
-        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
-        // Wrap in catch_unwind: during process teardown (e.g., bun test
-        // exit), MLS or tokio state may already be partially dropped,
-        // causing panics in destroy_mls_group or task abort. A panic here
-        // would abort the process with "failed to initiate panic"
-        // (double-panic).
-        let bi_for_catch = std::sync::Arc::clone(bi);
-        let fut = bi_for_catch.shutdown(timeout);
-        match std::panic::AssertUnwindSafe(fut).catch_unwind_await().await {
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                tracing::debug!("bridge shutdown returned: {e}");
-            }
-            Err(_) => {
-                tracing::error!("NapiBridgeInstance shutdown panicked — cleanup may be incomplete");
-            }
-        }
-    }
-
-    if timeout_millis == 0 {
-        return Ok(());
-    }
-    let deadline = std::time::Instant::now() + timeout;
-    while HANDLE_COUNT.load(Ordering::Relaxed) > 0 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    Ok(())
-}
-
-/// Helper trait to support `catch_unwind` on async futures.
-///
-/// `std::panic::catch_unwind` is sync-only; wrapping a future in
-/// `AssertUnwindSafe` still yields a sync `catch_unwind` guard around the
-/// `Future` polls. We use `futures::FutureExt::catch_unwind` instead for
-/// the async path (already pulled in via workspace `futures`).
-#[cfg(not(test))]
-trait CatchUnwindAwait: core::future::Future + Sized {
-    async fn catch_unwind_await(self) -> Result<Self::Output, Box<dyn std::any::Any + Send>>;
-}
-
-#[cfg(not(test))]
-impl<F> CatchUnwindAwait for std::panic::AssertUnwindSafe<F>
-where
-    F: core::future::Future,
-{
-    async fn catch_unwind_await(self) -> Result<Self::Output, Box<dyn std::any::Any + Send>> {
-        use futures::FutureExt;
-        self.catch_unwind().await
-    }
-}
-
-/// Suspends the bridge instance for mobile app backgrounding.
-///
-/// Disconnects transport (clears the relay connection) and marks the instance
-/// as suspended. Context state is preserved — the instance remains alive but
-/// inactive. Transport-dependent operations will fail until [`scp_resume`]
-/// is called.
-///
-/// After suspension, callers should call `scpResume()` to re-activate, then
-/// re-establish the relay connection via `transportConnect()`.
-///
-/// No-op if the instance is already shut down or not initialized.
-///
-/// # JS usage
-///
-/// ```js
-/// // When the app goes to background:
-/// scpSuspend();
-/// // When returning to foreground:
-/// scpResume();
-/// await transportConnect(relayUrl);
-/// ```
-#[napi]
-pub fn scp_suspend() -> napi::Result<()> {
-    if let Some(bi) = runtime::default_bridge_instance_raw() {
-        bi.core.suspend().map_err(|e| {
-            napi::Error::from(crate::error::ScpNapiError::Transport {
-                message: format!("suspend failed: {e}"),
-                code: scp_ffi_common::error_codes::TRANS_5001.to_owned(),
-            })
-        })?;
-    }
-    Ok(())
-}
-
-/// Resumes a suspended bridge instance.
-///
-/// Clears the suspended flag so bridge operations can proceed. The caller
-/// must re-establish the relay connection via `transportConnect()` — resume
-/// does not reconnect automatically.
-///
-/// No-op if the instance is not initialized.
-///
-/// # Errors
-///
-/// Throws `ScpContextError` if the instance has been permanently shut down.
-#[napi]
-pub async fn scp_resume() -> napi::Result<()> {
-    if let Some(bi) = runtime::default_bridge_instance_raw() {
-        use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
-        bi.resume().await.map_err(|e| {
-            napi::Error::from(crate::error::ScpNapiError::Context {
-                message: format!("resume failed: {e}"),
-                code: scp_ffi_common::error_codes::CTX_2000.to_owned(),
-            })
-        })?;
-    }
-    Ok(())
-}
+// Phase D (#1695): the `scp_shutdown` free function has been deleted.
+// Per-instance shutdown goes through `SCP.shutdown(timeout_millis)` on a
+// caller-owned `Scp` instance. The timeout unit is milliseconds (`u64`
+// `BigInt` on the wire); pass `0n` to skip both graceful drain and
+// handle-release polling.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -425,11 +280,8 @@ mod tests {
         assert!(!v.is_empty(), "version string must not be empty");
     }
 
-    #[tokio::test]
-    async fn scp_shutdown_zero_timeout_returns_immediately() {
-        // Must return without hanging even if handles are live.
-        scp_shutdown(0).await.expect("scp_shutdown(0) must succeed");
-    }
+    // Phase D (#1695): `scp_shutdown` free function deleted; fast-path
+    // test covered by `SCP.shutdown(0)` via per-instance lifecycle tests.
 
     #[test]
     fn handle_count_increments_and_decrements() {
@@ -481,11 +333,11 @@ mod tests {
     //
     // Since #1549 Phase 4 PR 2 commit 11 the roundtrip exercises a fresh
     // `Scp::new()` instance rather than the free `scp_suspend` / `scp_resume`
-    // functions that mutate the process-global `DEFAULT_BRIDGE_INSTANCE`.
+    // functions that mutate the process-global the legacy default bridge.
     // That design eliminates the need for the old
     // `bridge_lifecycle_serial()` async mutex that previously had to guard
     // EVERY test in this binary that called `context_manager()` /
-    // `bridge_instance()`.
+    // the legacy bridge accessor.
     //
     // Construction pattern:
     //
@@ -496,7 +348,7 @@ mod tests {
     // Each `Scp` owns an isolated `Arc<NapiBridgeInstance>`. Two tests
     // running in parallel — even two roundtrips — cannot observe each
     // other's `suspended` flag. Other tests in the binary continue to use
-    // `DEFAULT_BRIDGE_INSTANCE` via `init_context_manager_for_test()`, and
+    // the legacy default bridge via `init_context_manager_for_test()`, and
     // because this test never touches the default they cannot race.
     // -----------------------------------------------------------------------
 
@@ -535,14 +387,10 @@ mod tests {
         scp.resume().await.expect("double resume must succeed");
         assert!(!scp.inner.core.is_suspended());
 
-        // Case 3: the default instance is unaffected — no free-function
-        // mutation leaked onto it.
-        if let Some(default_bi) = crate::runtime::default_bridge_instance_raw() {
-            assert!(
-                !default_bi.core.is_suspended(),
-                "default bridge instance must not be suspended after a scoped Scp roundtrip"
-            );
-        }
+        // Case 3: Phase D (#1695) — the legacy default bridge is gone, so
+        // there is no "default instance" to check against. Every caller
+        // owns its own NapiBridgeInstance; suspension on one cannot leak
+        // into another by construction.
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -550,11 +398,20 @@ mod tests {
         // Shutting down a caller-owned `Scp` with a zero-millisecond
         // deadline must return without hanging even if handles are live,
         // mirroring `scp_shutdown_zero_timeout_returns_immediately` but
-        // against an isolated `NapiBridgeInstance`. The default instance
-        // is untouched.
+        // against an isolated `NapiBridgeInstance`. Phase 4 PR 4
+        // (#1549) deleted the process-wide default bridge — every
+        // `Scp::new()` owns its own `NapiBridgeInstance`, so this test
+        // cannot affect any other instance's state.
+        //
+        // #1692: `Scp::shutdown` takes `napi::bindgen_prelude::BigInt`
+        // (u64 on the wire). Build a zero-valued BigInt directly for
+        // the test — in production callers pass a JS `bigint` literal.
         let scp = crate::scp::Scp::new().expect("Scp::new must succeed");
-        scp.shutdown(0)
-            .await
-            .expect("Scp::shutdown(0) must succeed");
+        scp.shutdown(napi::bindgen_prelude::BigInt {
+            sign_bit: false,
+            words: vec![0],
+        })
+        .await
+        .expect("Scp::shutdown(0) must succeed");
     }
 }

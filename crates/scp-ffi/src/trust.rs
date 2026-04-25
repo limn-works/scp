@@ -1,16 +1,27 @@
 //! `PyO3` bridge functions for the SCP trust engine.
 //!
-//! Exposes trust engine operations to Python:
+//! Exposes trust engine operations to Python. Stateful operations are methods
+//! on the `SCP` class; pure helpers remain as free `#[pyfunction]` exports.
 //!
-//! - [`py_trust_query_score`] — Query participation-based trust data for a DID.
+//! Pure helpers (no bridge state):
+//!
 //! - [`py_trust_verify_attestation`] — Verify an attestation's signature and
 //!   validity.
 //! - [`py_trust_create_challenge`] — Create a challenge request for capability
 //!   verification.
 //! - [`py_trust_verify_response`] — Verify a challenge response.
-//! - [`py_aggregate_trust_input`] — Aggregate all trust engine layers into a
-//!   single [`TrustInput`](scp_core::trust::TrustInput) for agent-level
+//! - [`py_verify_participation_requirements`] — Verify participation profiles
+//!   against admission requirements.
+//!
+//! `SCP` methods (bridge-state accessors):
+//!
+//! - `PyScp::trust_query_score` — Query participation-based trust data for a DID.
+//! - `PyScp::aggregate_trust_input` — Aggregate all trust engine layers into
+//!   a single [`TrustInput`](scp_core::trust::TrustInput) for agent-level
 //!   evaluation.
+//!
+//! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
+//! methods in Phase 4 PR 4 sub-slice E (#1549).
 //!
 //! The trust engine does not produce trust "scores" — it provides verifiable
 //! facts (participation records, attestation verification results, challenge
@@ -25,33 +36,21 @@ use std::sync::Arc;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use crate::runtime::PyBridgeInstance;
 use crate::validate;
 
 // ---------------------------------------------------------------------------
-// trust_query_score
+// trust_query_score — per-bridge helper used by PyScp method
 // ---------------------------------------------------------------------------
 
-/// Queries participation-based trust data for a DID within a context.
-///
-/// Returns a dict with:
-/// - `message_count` (int): Number of `MessageSent` events by this DID.
-/// - `governance_count` (int): Number of `GovernanceAction` events by this DID.
-/// - `composite_score` (float): Normalized summary (0.0–1.0) based on
-///   participation count. This is a convenience metric, not an authoritative
-///   trust judgment — agents should evaluate the raw counts per their own
-///   criteria.
-///
-/// The data is derived from the event log via the participation record
-/// computation (Layer 2 of the four-layer trust model). Two agents may compute
-/// different records from different event log views — this is correct behavior
-/// per the protocol design.
-///
-/// # Errors
-///
-/// Returns `ScpError` if input validation fails.
-#[pyfunction]
-#[pyo3(name = "trust_query_score")]
-pub fn py_trust_query_score(py: Python<'_>, did: &str, context_id: &str) -> PyResult<Py<PyDict>> {
+/// Queries participation-based trust data for a DID within a context on the
+/// given bridge instance.
+fn trust_query_score_impl(
+    bi: &PyBridgeInstance,
+    py: Python<'_>,
+    did: &str,
+    context_id: &str,
+) -> PyResult<Py<PyDict>> {
     validate::validate_did(did)?;
     validate::validate_context_id(context_id)?;
 
@@ -59,7 +58,7 @@ pub fn py_trust_query_score(py: Python<'_>, did: &str, context_id: &str) -> PyRe
     // hashes (Merkle tree), not full events. The runtime registry tracks
     // per-context event metadata sufficient for participation summaries.
     let (message_count, governance_count) =
-        crate::runtime::query_trust_event_counts(context_id, did);
+        crate::runtime::query_trust_event_counts(bi, context_id, did);
 
     // Compute a normalized composite score. This is a convenience metric:
     // log2(1 + total_events) / 10, capped at 1.0.
@@ -313,10 +312,9 @@ pub fn py_verify_participation_requirements(
 /// Returns `ScpError` if any JSON input is malformed or if aggregation fails.
 ///
 /// See ADR-017 acceptance criterion 9, spec §7.3.
-#[pyfunction]
-#[pyo3(name = "aggregate_trust_input")]
 #[allow(clippy::too_many_arguments)]
-pub fn py_aggregate_trust_input(
+fn aggregate_trust_input_impl(
+    bi: &PyBridgeInstance,
     context_id: &str,
     subject_did: &str,
     events_json: &str,
@@ -383,6 +381,7 @@ pub fn py_aggregate_trust_input(
         })?;
 
     aggregate_with_storage(
+        bi,
         context_id,
         subject_did,
         cached_attestations,
@@ -404,6 +403,7 @@ pub fn py_aggregate_trust_input(
 /// Otherwise falls back to an ephemeral in-memory store.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_with_storage(
+    bi: &PyBridgeInstance,
     context_id: &str,
     subject_did: &str,
     cached_attestations: Vec<scp_core::trust::aggregate::CachedAttestation>,
@@ -426,11 +426,11 @@ fn aggregate_with_storage(
     // aggregations against a `SCP({storage: sqlite})` caller's configured
     // SQLCipher store invisibly landed in an empty ephemeral store. See
     // `with_storage_py` / PR #1690 review.
-    let provider = crate::runtime::get_storage().map_err(|_| {
+    let provider = crate::runtime::get_storage(bi).map_err(|_| {
         pyo3::exceptions::PyValueError::new_err(format!(
             "{}: bridge storage not initialized — trust aggregation is \
-             unreachable until the default PyBridgeInstance has allocated \
-             its storage provider (bridge init bug)",
+             unreachable until this PyBridgeInstance has allocated its \
+             storage provider (bridge init bug)",
             scp_ffi_common::error_codes::VALID_7005
         ))
     })?;
@@ -478,17 +478,97 @@ fn aggregate_with_storage(
 }
 
 // ---------------------------------------------------------------------------
+// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
+// ---------------------------------------------------------------------------
+
+#[pymethods]
+impl crate::scp::PyScp {
+    /// Queries participation-based trust data for a DID within a context.
+    ///
+    /// Returns a dict with:
+    /// - `message_count` (int): Number of `MessageSent` events by this DID.
+    /// - `governance_count` (int): Number of `GovernanceAction` events by this DID.
+    /// - `composite_score` (float): Normalized summary (0.0–1.0) based on
+    ///   participation count. This is a convenience metric, not an authoritative
+    ///   trust judgment — agents should evaluate the raw counts per their own
+    ///   criteria.
+    ///
+    /// The data is derived from the event log via the participation record
+    /// computation (Layer 2 of the four-layer trust model).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError` if input validation fails.
+    #[pyo3(name = "trust_query_score")]
+    pub fn trust_query_score(
+        &self,
+        py: Python<'_>,
+        did: &str,
+        context_id: &str,
+    ) -> PyResult<Py<PyDict>> {
+        let bi = &*self.inner;
+        trust_query_score_impl(bi, py, did, context_id)
+    }
+
+    /// Aggregates all trust engine layers into a single `TrustInput` for
+    /// agent-level evaluation.
+    ///
+    /// Accepts all inputs as JSON strings and returns the aggregated `TrustInput`
+    /// as a JSON string. Uses the `BridgeInstance` storage provider for persistent
+    /// trust data when initialized (trust data survives across calls and restarts);
+    /// falls back to an ephemeral in-memory store otherwise. See issue #502.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError` if any JSON input is malformed or if aggregation fails.
+    ///
+    /// See ADR-017 acceptance criterion 9, spec §7.3.
+    #[pyo3(name = "aggregate_trust_input")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn aggregate_trust_input(
+        &self,
+        context_id: &str,
+        subject_did: &str,
+        events_json: &str,
+        merkle_root_json: &str,
+        consequence_rules_json: &str,
+        threshold_requirements_json: &str,
+        attestor_sets_json: &str,
+        cached_attestations_json: &str,
+        challenge_results_json: &str,
+    ) -> PyResult<String> {
+        let bi = &*self.inner;
+        aggregate_trust_input_impl(
+            bi,
+            context_id,
+            subject_did,
+            events_json,
+            merkle_root_json,
+            consequence_rules_json,
+            threshold_requirements_json,
+            attestor_sets_json,
+            cached_attestations_json,
+            challenge_results_json,
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
-/// Registers trust engine bridge functions with the Python module.
+/// Registers trust engine bridge free functions with the Python module.
+///
+/// Post-migration (Phase 4 PR 4 sub-slice E), stateful trust operations
+/// (`trust_query_score`, `aggregate_trust_input`) are exposed as methods on
+/// `SCP`. Only pure helpers (attestation verification, challenge creation,
+/// response verification, participation requirement verification) remain as
+/// free `#[pyfunction]` exports.
 pub fn register_trust(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_function(wrap_pyfunction!(py_trust_query_score, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_verify_attestation, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_create_challenge, m)?)?;
     m.add_function(wrap_pyfunction!(py_trust_verify_response, m)?)?;
     m.add_function(wrap_pyfunction!(py_verify_participation_requirements, m)?)?;
-    m.add_function(wrap_pyfunction!(py_aggregate_trust_input, m)?)?;
     Ok(())
 }
 
@@ -501,12 +581,16 @@ pub fn register_trust(m: &Bound<'_, PyModule>) -> PyResult<()> {
 mod tests {
     use super::*;
 
+    fn default_scp() -> crate::scp::PyScp {
+        crate::scp::PyScp::new()
+    }
+
     #[test]
     fn trust_query_score_validates_did() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             // Empty DID should fail validation.
-            let result = py_trust_query_score(py, "", "ctx-1");
+            let result = default_scp().trust_query_score(py, "", "ctx-1");
             assert!(result.is_err());
         });
     }
@@ -516,7 +600,7 @@ mod tests {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
             // Empty context ID should fail validation.
-            let result = py_trust_query_score(py, "did:key:test", "");
+            let result = default_scp().trust_query_score(py, "did:key:test", "");
             assert!(result.is_err());
         });
     }
@@ -525,7 +609,7 @@ mod tests {
     fn trust_query_score_returns_valid_dict() {
         pyo3::prepare_freethreaded_python();
         Python::with_gil(|py| {
-            let result = py_trust_query_score(py, "did:key:test", "ctx-valid");
+            let result = default_scp().trust_query_score(py, "did:key:test", "ctx-valid");
             assert!(result.is_ok());
             let dict = result.unwrap();
             let dict_ref = dict.bind(py);
@@ -594,7 +678,7 @@ mod tests {
 
     #[test]
     fn aggregate_trust_input_rejects_invalid_events_json() {
-        let result = py_aggregate_trust_input(
+        let result = default_scp().aggregate_trust_input(
             "ctx-1",
             "did:key:test",
             "not json",
@@ -610,7 +694,7 @@ mod tests {
 
     #[test]
     fn aggregate_trust_input_rejects_wrong_merkle_root_length() {
-        let result = py_aggregate_trust_input(
+        let result = default_scp().aggregate_trust_input(
             "ctx-1",
             "did:key:test",
             "[]",
@@ -626,7 +710,7 @@ mod tests {
 
     #[test]
     fn aggregate_trust_input_rejects_empty_did() {
-        let result = py_aggregate_trust_input(
+        let result = default_scp().aggregate_trust_input(
             "ctx-1",
             "",
             "[]",

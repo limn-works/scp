@@ -1,11 +1,12 @@
-"""Tests for the SCP #[pyclass] exposed by the PyO3 bridge (#1549 Phase 4 PR 1 + PR 3).
+"""Tests for the SCP #[pyclass] exposed by the PyO3 bridge (#1549 Phase 4 PR 1 + PR 3 + PR 4).
 
 The SCP class wraps `PyBridgeInstance` and is the Python-facing entry
 point for the multi-instance refactor.  Each test verifies:
 
 1. `SCP()` constructs successfully (fresh instance).
-2. `SCP.default_instance()` returns the process-global default,
-   stable across calls.
+2. Phase 4 PR 4 (#1549) removed `SCP.default_instance()`; every
+   `SCP()` call must produce a distinct instance with a distinct id
+   (inverse invariant — no process-global default survives).
 3. `SCP.instance_id` is monotonic across new instances.
 4. Native `SCP.suspend()` / `.resume()` / `.shutdown(timeout)` drive
    the lifecycle without errors. (Native `.resume()` is sync-callable;
@@ -47,16 +48,18 @@ def test_scp_constructs_successfully() -> None:
     assert scp.instance_id > 0, "new SCP instance must have a monotonic nonzero id"
 
 
-def test_default_instance_returns_stable_id() -> None:
-    """Two calls to `SCP.default_instance()` must share the same instance_id.
+def test_default_instance_is_absent() -> None:
+    """Phase 4 PR 4 (#1549) deleted the process-global default bridge.
 
-    The wrapper objects are distinct Python objects, but they wrap the
-    same `Arc<PyBridgeInstance>` so `instance_id` is identical.
+    The inverted invariant: ``SCP`` must expose no ``default_instance``
+    factory at all. Asserting absence keeps us from silently re-adding
+    a process-global singleton in a future refactor.
     """
-    a = SCP.default_instance()
-    b = SCP.default_instance()
-    assert a.instance_id == b.instance_id
-    assert a.instance_id > 0
+    assert not hasattr(SCP, "default_instance"), (
+        "SCP.default_instance was removed in Phase 4 PR 4 (#1549) — "
+        "re-introducing a process-global default violates ADR-048 "
+        "multi-instance architecture"
+    )
 
 
 def test_instance_id_is_monotonic_across_new_instances() -> None:
@@ -66,13 +69,17 @@ def test_instance_id_is_monotonic_across_new_instances() -> None:
         assert later > earlier, f"expected monotonic ids, got {ids}"
 
 
-def test_new_instances_have_distinct_id_from_default() -> None:
-    """Fresh `SCP()` instances must NOT share the default's id."""
-    fresh = SCP()
-    default = SCP.default_instance()
-    assert fresh.instance_id != default.instance_id, (
-        "SCP() must allocate a fresh instance, not reuse the default"
-    )
+def test_fresh_instances_have_distinct_ids() -> None:
+    """Every ``SCP()`` call must allocate a fresh, unique instance_id.
+
+    With no process-global default to reuse, the only way two bridges
+    share an id is a monotonic-counter bug. Asserting distinctness
+    keeps the allocator honest.
+    """
+    a = SCP()
+    b = SCP()
+    assert a.instance_id != b.instance_id, "two SCP() calls must produce distinct instance_ids"
+    assert a.instance_id > 0 and b.instance_id > 0
 
 
 def test_suspend_resume_shutdown_lifecycle() -> None:

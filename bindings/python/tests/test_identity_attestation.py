@@ -2,12 +2,17 @@
 
 Covers:
 - IdentityAttestation dataclass construction and serialization
-- Identity.create_attestation bridge-not-available error
-- Identity.list_attestations / attestations property bridge-not-available error
-- Identity.remove_attestation bridge-not-available error
-- Identity.renew_attestation bridge-not-available error
-- IdentityAttestation.verify bridge-not-available error
+- SCP.create_identity_link_attestation bridge-not-available error
+- SCP.identity_link_attestations bridge-not-available error
+- SCP.remove_identity_link_attestation bridge-not-available error
+- SCP.identity_renew_attestation bridge-not-available error
 - Round-trip _from_dict / _to_bridge_dict
+- NaN / Infinity / bool / negative guards (SCP-VALID-7005)
+
+Phase 4 PR 5 Agent B+C (#1549) moved attestation operations from
+:class:`Identity` instance methods onto :class:`scp_sdk.SCP` methods.
+:class:`IdentityAttestation` no longer has a ``verify`` instance method
+(it was removed in #1458, Agent B+C reaffirms).
 
 See ``.docs/specs/03-identity.md`` section 3.5.
 """
@@ -21,7 +26,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from scp_sdk.errors import IdentityError, ValidationError
-from scp_sdk.identity import Identity, IdentityAttestation, RevocationStatus, _parse_finite_int
+from scp_sdk.identity import IdentityAttestation, RevocationStatus, _parse_finite_int
 
 # ---------------------------------------------------------------------------
 # IdentityAttestation dataclass tests
@@ -131,65 +136,100 @@ class TestIdentityAttestationDataclass:
 
 
 # ---------------------------------------------------------------------------
-# Identity attestation method tests (bridge not available)
+# SCP.* attestation method tests (bridge not available)
 # ---------------------------------------------------------------------------
 
 
-def _make_identity() -> Identity:
-    """Create a mock Identity for testing."""
-    handle = MagicMock()
-    handle.did = "did:dht:z6MkTest"
-    handle.custody = "in_memory"
-    return Identity(handle)
+def _make_scp_without_attestation_methods(*, missing: tuple[str, ...]) -> MagicMock:
+    """Build a mock SCP whose ``_native`` does not expose the listed methods.
+
+    ``MagicMock(spec=...)`` restricts ``hasattr()`` to the spec list — so
+    anything not in the spec reports ``hasattr == False``, triggering the
+    SDK's attestation availability guards.
+    """
+    mock_scp = MagicMock()
+    # Start with every attestation method present, then drop the ones
+    # under test so hasattr() returns False for them specifically.
+    all_methods = {
+        "create_identity_link_attestation",
+        "identity_link_attestations",
+        "remove_identity_link_attestation",
+        "identity_renew_attestation",
+        "py_verify_identity_link_attestation",
+    }
+    present = tuple(all_methods - set(missing))
+    mock_scp._native = MagicMock(spec=present)
+    return mock_scp
 
 
-class TestIdentityCreateAttestation:
-    """Tests for Identity.create_attestation when bridge is unavailable."""
+class TestScpCreateAttestation:
+    """Tests for :meth:`SCP.create_identity_link_attestation` bridge guard."""
 
     def test_raises_when_bridge_missing(self) -> None:
-        identity = _make_identity()
+        from scp_sdk.scp import SCP
+
+        scp = _make_scp_without_attestation_methods(missing=("create_identity_link_attestation",))
         with pytest.raises(IdentityError, match="SCP-ATTEST-9010"):
-            asyncio.get_event_loop().run_until_complete(
-                identity.create_attestation("github.com", "alice", "proof123")
+            asyncio.new_event_loop().run_until_complete(
+                SCP.create_identity_link_attestation(
+                    scp,  # type: ignore[arg-type]
+                    "did:dht:z6MkTest",
+                    "github.com",
+                    "alice",
+                    "proof123",
+                    "did:dht:z6MkTest#active",
+                )
             )
 
 
-class TestIdentityListAttestations:
-    """Tests for Identity.list_attestations when bridge is unavailable."""
+class TestScpListAttestations:
+    """Tests for :meth:`SCP.identity_link_attestations` bridge guard."""
 
     def test_raises_when_bridge_missing(self) -> None:
-        identity = _make_identity()
+        from scp_sdk.scp import SCP
+
+        scp = _make_scp_without_attestation_methods(missing=("identity_link_attestations",))
         with pytest.raises(IdentityError, match="SCP-ATTEST-9011"):
-            asyncio.get_event_loop().run_until_complete(identity.list_attestations())
+            asyncio.new_event_loop().run_until_complete(
+                SCP.identity_link_attestations(scp, "did:dht:z6MkTest")  # type: ignore[arg-type]
+            )
 
 
-class TestIdentityRemoveAttestation:
-    """Tests for Identity.remove_attestation when bridge is unavailable."""
+class TestScpRemoveAttestation:
+    """Tests for :meth:`SCP.remove_identity_link_attestation` bridge guard."""
 
     def test_raises_when_bridge_missing(self) -> None:
-        identity = _make_identity()
+        from scp_sdk.scp import SCP
+
+        scp = _make_scp_without_attestation_methods(missing=("remove_identity_link_attestation",))
         with pytest.raises(IdentityError, match="SCP-ATTEST-9012"):
-            asyncio.get_event_loop().run_until_complete(identity.remove_attestation("att-id-123"))
+            asyncio.new_event_loop().run_until_complete(
+                SCP.remove_identity_link_attestation(  # type: ignore[arg-type]
+                    scp, "did:dht:z6MkTest", "att-id-123"
+                )
+            )
 
 
-class TestIdentityRenewAttestation:
-    """Tests for Identity.renew_attestation when bridge is unavailable."""
+class TestScpRenewAttestation:
+    """Tests for :meth:`SCP.identity_renew_attestation` bridge guard."""
 
     def test_raises_when_bridge_missing(self) -> None:
-        att = IdentityAttestation(
-            id="abc123",
-            platform="github.com",
-            platform_handle="alice",
-            verification_method="did:dht:z6Mk...#active",
-            verified_at=1700000000,
-        )
-        identity = _make_identity()
+        from scp_sdk.scp import SCP
+
+        scp = _make_scp_without_attestation_methods(missing=("identity_renew_attestation",))
         with pytest.raises(IdentityError, match="SCP-ATTEST-9013"):
-            asyncio.get_event_loop().run_until_complete(identity.renew_attestation(att))
+            asyncio.new_event_loop().run_until_complete(
+                SCP.identity_renew_attestation(scp, "did:dht:z6MkTest", "abc123")  # type: ignore[arg-type]
+            )
 
 
 class TestIdentityAttestationVerifyRemoved:
-    """Verify that verify() was removed from IdentityAttestation (see #1458)."""
+    """Verify that verify() was removed from IdentityAttestation (see #1458).
+
+    Post-Phase-4-PR-5 (#1549), verification of an attestation is a
+    :class:`scp_sdk.SCP` method — :meth:`SCP.verify_identity_link_attestation`.
+    The data class itself exposes no verification behavior.
+    """
 
     def test_verify_method_does_not_exist(self) -> None:
         att = IdentityAttestation(
