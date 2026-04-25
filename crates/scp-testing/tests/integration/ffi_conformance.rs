@@ -582,6 +582,52 @@ fn wasm_sources() -> Vec<&'static str> {
 }
 
 // ---------------------------------------------------------------------------
+// Category coverage helper
+// ---------------------------------------------------------------------------
+
+/// Asserts that every op in `ops` (a slice of `(category, canonical, wasm_required)`
+/// tuples — typically produced by filtering `parity_operations()` to a single
+/// category) is present in all four bridges, modulo `bridge-aliases.json`
+/// exemptions. The `label` parameter controls the category name printed in
+/// failure messages — this is decoupled from the category in the tuple so
+/// callers can preserve historical wording (e.g. "UCAN" rather than "ucan",
+/// "tool" rather than "tools").
+fn assert_category_coverage(label: &str, ops: &[&(&'static str, &'static str, bool)]) {
+    let pyo3_srcs = pyo3_sources();
+    let napi_srcs = napi_sources();
+    let wasm_srcs = wasm_sources();
+
+    let pyo3_exempt = exemptions_for("pyo3");
+    let uniffi_exempt = exemptions_for("uniffi");
+    let napi_exempt = exemptions_for("napi");
+    let wasm_exempt = exemptions_for("wasm");
+
+    for (_, op, _) in ops {
+        if !pyo3_exempt.contains(*op) {
+            assert!(
+                pyo3_has_operation(&pyo3_srcs, op),
+                "PyO3 missing {label} op: {op}"
+            );
+        }
+        if !uniffi_exempt.contains(*op) {
+            assert!(uniffi_has_operation(op), "UniFFI missing {label} op: {op}");
+        }
+        if !napi_exempt.contains(*op) {
+            assert!(
+                napi_has_operation(&napi_srcs, op),
+                "NAPI missing {label} op: {op}"
+            );
+        }
+        if !wasm_exempt.contains(*op) {
+            assert!(
+                wasm_has_operation(&wasm_srcs, op),
+                "WASM missing {label} op: {op}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Coverage result
 // ---------------------------------------------------------------------------
 
@@ -982,39 +1028,7 @@ fn identity_category_coverage() {
         .iter()
         .filter(|(cat, _, _)| *cat == "identity")
         .collect();
-
-    let pyo3_srcs = pyo3_sources();
-    let napi_srcs = napi_sources();
-    let wasm_srcs = wasm_sources();
-
-    let uniffi_exempt = exemptions_for("uniffi");
-    let napi_exempt = exemptions_for("napi");
-    let pyo3_exempt = exemptions_for("pyo3");
-    let wasm_exempt = exemptions_for("wasm");
-
-    for (_, op, _) in &identity_ops {
-        if !pyo3_exempt.contains(*op) {
-            assert!(
-                pyo3_has_operation(&pyo3_srcs, op),
-                "PyO3 missing identity op: {op}"
-            );
-        }
-        if !wasm_exempt.contains(*op) {
-            assert!(
-                wasm_has_operation(&wasm_srcs, op),
-                "WASM missing identity op: {op}"
-            );
-        }
-        if !uniffi_exempt.contains(*op) {
-            assert!(uniffi_has_operation(op), "UniFFI missing identity op: {op}");
-        }
-        if !napi_exempt.contains(*op) {
-            assert!(
-                napi_has_operation(&napi_srcs, op),
-                "NAPI missing identity op: {op}"
-            );
-        }
-    }
+    assert_category_coverage("identity", &identity_ops);
 }
 
 /// Verifies context lifecycle operations are present across all bridges.
@@ -1024,39 +1038,7 @@ fn identity_category_coverage() {
 fn context_category_coverage() {
     let ops = parity_operations();
     let context_ops: Vec<_> = ops.iter().filter(|(cat, _, _)| *cat == "context").collect();
-
-    let pyo3_srcs = pyo3_sources();
-    let napi_srcs = napi_sources();
-    let wasm_srcs = wasm_sources();
-
-    let uniffi_exempt = exemptions_for("uniffi");
-    let napi_exempt = exemptions_for("napi");
-    let pyo3_exempt = exemptions_for("pyo3");
-    let wasm_exempt = exemptions_for("wasm");
-
-    for (_, op, _) in &context_ops {
-        if !pyo3_exempt.contains(*op) {
-            assert!(
-                pyo3_has_operation(&pyo3_srcs, op),
-                "PyO3 missing context op: {op}"
-            );
-        }
-        if !uniffi_exempt.contains(*op) {
-            assert!(uniffi_has_operation(op), "UniFFI missing context op: {op}");
-        }
-        if !napi_exempt.contains(*op) {
-            assert!(
-                napi_has_operation(&napi_srcs, op),
-                "NAPI missing context op: {op}"
-            );
-        }
-        if !wasm_exempt.contains(*op) {
-            assert!(
-                wasm_has_operation(&wasm_srcs, op),
-                "WASM missing context op: {op}"
-            );
-        }
-    }
+    assert_category_coverage("context", &context_ops);
 }
 
 /// Verifies UCAN operations are present across all bridges. Per-bridge
@@ -1065,39 +1047,7 @@ fn context_category_coverage() {
 fn ucan_category_coverage() {
     let ops = parity_operations();
     let ucan_ops: Vec<_> = ops.iter().filter(|(cat, _, _)| *cat == "ucan").collect();
-
-    let pyo3_srcs = pyo3_sources();
-    let napi_srcs = napi_sources();
-    let wasm_srcs = wasm_sources();
-
-    let uniffi_exempt = exemptions_for("uniffi");
-    let napi_exempt = exemptions_for("napi");
-    let pyo3_exempt = exemptions_for("pyo3");
-    let wasm_exempt = exemptions_for("wasm");
-
-    for (_, op, _) in &ucan_ops {
-        if !pyo3_exempt.contains(*op) {
-            assert!(
-                pyo3_has_operation(&pyo3_srcs, op),
-                "PyO3 missing UCAN op: {op}"
-            );
-        }
-        if !uniffi_exempt.contains(*op) {
-            assert!(uniffi_has_operation(op), "UniFFI missing UCAN op: {op}");
-        }
-        if !napi_exempt.contains(*op) {
-            assert!(
-                napi_has_operation(&napi_srcs, op),
-                "NAPI missing UCAN op: {op}"
-            );
-        }
-        if !wasm_exempt.contains(*op) {
-            assert!(
-                wasm_has_operation(&wasm_srcs, op),
-                "WASM missing UCAN op: {op}"
-            );
-        }
-    }
+    assert_category_coverage("UCAN", &ucan_ops);
 }
 
 /// Verifies tool operations are present across all bridges. Per-bridge
@@ -1106,39 +1056,7 @@ fn ucan_category_coverage() {
 fn tools_category_coverage() {
     let ops = parity_operations();
     let tool_ops: Vec<_> = ops.iter().filter(|(cat, _, _)| *cat == "tools").collect();
-
-    let pyo3_srcs = pyo3_sources();
-    let napi_srcs = napi_sources();
-    let wasm_srcs = wasm_sources();
-
-    let uniffi_exempt = exemptions_for("uniffi");
-    let napi_exempt = exemptions_for("napi");
-    let pyo3_exempt = exemptions_for("pyo3");
-    let wasm_exempt = exemptions_for("wasm");
-
-    for (_, op, _) in &tool_ops {
-        if !pyo3_exempt.contains(*op) {
-            assert!(
-                pyo3_has_operation(&pyo3_srcs, op),
-                "PyO3 missing tool op: {op}"
-            );
-        }
-        if !uniffi_exempt.contains(*op) {
-            assert!(uniffi_has_operation(op), "UniFFI missing tool op: {op}");
-        }
-        if !napi_exempt.contains(*op) {
-            assert!(
-                napi_has_operation(&napi_srcs, op),
-                "NAPI missing tool op: {op}"
-            );
-        }
-        if !wasm_exempt.contains(*op) {
-            assert!(
-                wasm_has_operation(&wasm_srcs, op),
-                "WASM missing tool op: {op}"
-            );
-        }
-    }
+    assert_category_coverage("tool", &tool_ops);
 }
 
 /// Verifies broadcast operations are present across all bridges.
@@ -1151,42 +1069,7 @@ fn broadcast_category_coverage() {
         .iter()
         .filter(|(cat, _, _)| *cat == "broadcast")
         .collect();
-
-    let pyo3_srcs = pyo3_sources();
-    let napi_srcs = napi_sources();
-    let wasm_srcs = wasm_sources();
-
-    let uniffi_exempt = exemptions_for("uniffi");
-    let napi_exempt = exemptions_for("napi");
-    let pyo3_exempt = exemptions_for("pyo3");
-    let wasm_exempt = exemptions_for("wasm");
-
-    for (_, op, _) in &broadcast_ops {
-        if !pyo3_exempt.contains(*op) {
-            assert!(
-                pyo3_has_operation(&pyo3_srcs, op),
-                "PyO3 missing broadcast op: {op}"
-            );
-        }
-        if !uniffi_exempt.contains(*op) {
-            assert!(
-                uniffi_has_operation(op),
-                "UniFFI missing broadcast op: {op}"
-            );
-        }
-        if !napi_exempt.contains(*op) {
-            assert!(
-                napi_has_operation(&napi_srcs, op),
-                "NAPI missing broadcast op: {op}"
-            );
-        }
-        if !wasm_exempt.contains(*op) {
-            assert!(
-                wasm_has_operation(&wasm_srcs, op),
-                "WASM missing broadcast op: {op}"
-            );
-        }
-    }
+    assert_category_coverage("broadcast", &broadcast_ops);
 }
 
 /// Verifies trust operations are present across all bridges. Per-bridge
@@ -1195,39 +1078,7 @@ fn broadcast_category_coverage() {
 fn trust_category_coverage() {
     let ops = parity_operations();
     let trust_ops: Vec<_> = ops.iter().filter(|(cat, _, _)| *cat == "trust").collect();
-
-    let pyo3_srcs = pyo3_sources();
-    let napi_srcs = napi_sources();
-    let wasm_srcs = wasm_sources();
-
-    let uniffi_exempt = exemptions_for("uniffi");
-    let napi_exempt = exemptions_for("napi");
-    let pyo3_exempt = exemptions_for("pyo3");
-    let wasm_exempt = exemptions_for("wasm");
-
-    for (_, op, _) in &trust_ops {
-        if !pyo3_exempt.contains(*op) {
-            assert!(
-                pyo3_has_operation(&pyo3_srcs, op),
-                "PyO3 missing trust op: {op}"
-            );
-        }
-        if !uniffi_exempt.contains(*op) {
-            assert!(uniffi_has_operation(op), "UniFFI missing trust op: {op}");
-        }
-        if !napi_exempt.contains(*op) {
-            assert!(
-                napi_has_operation(&napi_srcs, op),
-                "NAPI missing trust op: {op}"
-            );
-        }
-        if !wasm_exempt.contains(*op) {
-            assert!(
-                wasm_has_operation(&wasm_srcs, op),
-                "WASM missing trust op: {op}"
-            );
-        }
-    }
+    assert_category_coverage("trust", &trust_ops);
 }
 
 /// Verifies event_log operations are present across all bridges. Per-bridge
@@ -1239,42 +1090,7 @@ fn event_log_category_coverage() {
         .iter()
         .filter(|(cat, _, _)| *cat == "event_log")
         .collect();
-
-    let pyo3_srcs = pyo3_sources();
-    let napi_srcs = napi_sources();
-    let wasm_srcs = wasm_sources();
-
-    let uniffi_exempt = exemptions_for("uniffi");
-    let napi_exempt = exemptions_for("napi");
-    let pyo3_exempt = exemptions_for("pyo3");
-    let wasm_exempt = exemptions_for("wasm");
-
-    for (_, op, _) in &event_log_ops {
-        if !pyo3_exempt.contains(*op) {
-            assert!(
-                pyo3_has_operation(&pyo3_srcs, op),
-                "PyO3 missing event_log op: {op}"
-            );
-        }
-        if !uniffi_exempt.contains(*op) {
-            assert!(
-                uniffi_has_operation(op),
-                "UniFFI missing event_log op: {op}"
-            );
-        }
-        if !napi_exempt.contains(*op) {
-            assert!(
-                napi_has_operation(&napi_srcs, op),
-                "NAPI missing event_log op: {op}"
-            );
-        }
-        if !wasm_exempt.contains(*op) {
-            assert!(
-                wasm_has_operation(&wasm_srcs, op),
-                "WASM missing event_log op: {op}"
-            );
-        }
-    }
+    assert_category_coverage("event_log", &event_log_ops);
 }
 
 /// Verifies discovery and provenance operations are present across all bridges.
@@ -1282,43 +1098,16 @@ fn event_log_category_coverage() {
 #[test]
 fn discovery_and_provenance_coverage() {
     let ops = parity_operations();
-    let selected: Vec<_> = ops
+    let discovery_ops: Vec<_> = ops
         .iter()
-        .filter(|(cat, _, _)| *cat == "discovery" || *cat == "provenance")
+        .filter(|(cat, _, _)| *cat == "discovery")
         .collect();
-
-    let pyo3_srcs = pyo3_sources();
-    let napi_srcs = napi_sources();
-    let wasm_srcs = wasm_sources();
-
-    let uniffi_exempt = exemptions_for("uniffi");
-    let napi_exempt = exemptions_for("napi");
-    let pyo3_exempt = exemptions_for("pyo3");
-    let wasm_exempt = exemptions_for("wasm");
-
-    for (cat, op, _) in &selected {
-        if !pyo3_exempt.contains(*op) {
-            assert!(
-                pyo3_has_operation(&pyo3_srcs, op),
-                "PyO3 missing {cat} op: {op}"
-            );
-        }
-        if !uniffi_exempt.contains(*op) {
-            assert!(uniffi_has_operation(op), "UniFFI missing {cat} op: {op}");
-        }
-        if !napi_exempt.contains(*op) {
-            assert!(
-                napi_has_operation(&napi_srcs, op),
-                "NAPI missing {cat} op: {op}"
-            );
-        }
-        if !wasm_exempt.contains(*op) {
-            assert!(
-                wasm_has_operation(&wasm_srcs, op),
-                "WASM missing {cat} op: {op}"
-            );
-        }
-    }
+    let provenance_ops: Vec<_> = ops
+        .iter()
+        .filter(|(cat, _, _)| *cat == "provenance")
+        .collect();
+    assert_category_coverage("discovery", &discovery_ops);
+    assert_category_coverage("provenance", &provenance_ops);
 }
 
 // =========================================================================
