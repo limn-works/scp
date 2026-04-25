@@ -4042,6 +4042,7 @@ pub async fn outlet_register(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.as_secs()),
                 signature: Vec::new(),
+                message_catalog: Vec::new(),
             };
 
             // Build a role state for capability checking.
@@ -5237,6 +5238,7 @@ fn build_outlet_registration_from_uniffi(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
         signature: Vec::new(),
+        message_catalog: Vec::new(),
     })
 }
 

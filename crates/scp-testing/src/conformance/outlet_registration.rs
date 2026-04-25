@@ -40,11 +40,11 @@
 use std::path::PathBuf;
 
 use ed25519_dalek::{Signer, SigningKey};
+use scp_core::context::outlets::OutletKind;
 use scp_core::context::outlets::registry::{
     OutletCost, OutletRegistration, OutletSchema, OutletTestVector,
     compute_outlet_registration_canonical_bytes, verify_outlet_registration_signature,
 };
-use scp_core::context::outlets::OutletKind;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -174,6 +174,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             cost: None,
             registered_at: REF_TIMESTAMP,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         },
     ));
 
@@ -196,6 +197,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             cost: None,
             registered_at: REF_TIMESTAMP,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         },
     ));
 
@@ -218,6 +220,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             cost: None,
             registered_at: REF_TIMESTAMP,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         },
     ));
 
@@ -245,6 +248,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             }),
             registered_at: REF_TIMESTAMP,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         },
     ));
 
@@ -272,6 +276,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             }),
             registered_at: REF_TIMESTAMP,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         },
     ));
 
@@ -303,6 +308,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             cost: None,
             registered_at: REF_TIMESTAMP,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         },
     ));
 
@@ -335,6 +341,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             cost: None,
             registered_at: REF_TIMESTAMP,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         },
     ));
 
@@ -366,6 +373,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             cost: None,
             registered_at: REF_TIMESTAMP,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         },
     ));
 
@@ -400,6 +408,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             }),
             registered_at: REF_TIMESTAMP,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         },
     ));
 
@@ -428,6 +437,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             }),
             registered_at: REF_TIMESTAMP,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         },
     ));
 
@@ -464,6 +474,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             }),
             registered_at: REF_TIMESTAMP,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         },
     ));
 
@@ -495,24 +506,126 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             cost: None,
             registered_at: REF_TIMESTAMP,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         },
     ));
 
-    debug_assert_eq!(out.len(), 12, "must produce exactly 12 vectors");
+    // 13. SCP-OUT-040 cross-SDK fixture (small catalog) — 4 catalog entries.
+    //     Exercises the §5.4.1 V2 `catalog_hash` term across all bridges.
+    let catalog_small = vec![
+        scp_protocol::MessageTemplate::try_new("authorization.expired", "authorization expired")
+            .expect("valid catalog template"),
+        scp_protocol::MessageTemplate::try_new("authorization.revoked", "authorization revoked")
+            .expect("valid catalog template"),
+        scp_protocol::MessageTemplate::try_new("input.invalid-shape", "bad input shape")
+            .expect("valid catalog template"),
+        scp_protocol::MessageTemplate::try_new("output.too-large", "output exceeds size cap")
+            .expect("valid catalog template"),
+    ];
+    out.push((
+        "with-message-catalog-small".to_owned(),
+        "Registration with a 4-entry message_catalog. Exercises the SCP-OUT-040 \
+         `catalog_hash` term of the §5.4.1 V2 preimage. Each bridge must \
+         round-trip the catalog with identical canonical MessagePack bytes \
+         and therefore identical catalog_hash and signature."
+            .to_owned(),
+        OutletRegistration {
+            outlet_id: "catalog-small-outlet".to_owned(),
+            kind: OutletKind::Action,
+            name: "Catalog Small".to_owned(),
+            description: "Outlet with a 4-entry message catalog (SCP-OUT-040).".to_owned(),
+            schema: OutletSchema {
+                input_schema: json!({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}),
+                output_schema: json!({"type": "object", "properties": {"r": {"type": "string"}}}),
+            },
+            implementation_hash: sha256_label(b"catalog-small-implementation"),
+            test_vectors: Vec::new(),
+            operator_did: REF_OPERATOR_DID.into(),
+            cost: None,
+            registered_at: REF_TIMESTAMP,
+            signature: Vec::new(),
+            message_catalog: catalog_small,
+        },
+    ));
+
+    // 14. SCP-OUT-040 cross-SDK fixture (large catalog + description) — 10
+    //     catalog entries with realistic dotted-segment keys, non-empty
+    //     description that will hash distinctly under `description_hash`.
+    let catalog_large: Vec<scp_protocol::MessageTemplate> = (0..10)
+        .map(|i| {
+            scp_protocol::MessageTemplate::try_new(
+                format!("execution.detail-{i:02}"),
+                format!("execution detail {i}: synthetic operator-authored prose"),
+            )
+            .expect("valid catalog template")
+        })
+        .collect();
+    out.push((
+        "with-message-catalog-large-and-description".to_owned(),
+        "Registration with a 10-entry message_catalog and a non-trivial \
+         description. Exercises both the SCP-OUT-040 `catalog_hash` and \
+         `description_hash` V2 preimage terms simultaneously. Bridges that \
+         drop or reorder the catalog produce a different signature."
+            .to_owned(),
+        OutletRegistration {
+            outlet_id: "catalog-large-outlet".to_owned(),
+            kind: OutletKind::Action,
+            name: "Catalog Large".to_owned(),
+            description: "Outlet with a 10-entry message catalog and a longer \
+             operator-authored description body. Both fields are committed to \
+             the V2 signature via dedicated hash terms (SCP-OUT-040)."
+                .to_owned(),
+            schema: OutletSchema {
+                input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}, "k": {"type": "string"}}}),
+                output_schema: json!({"type": "object", "properties": {"v": {"type": "string"}}}),
+            },
+            implementation_hash: sha256_label(b"catalog-large-implementation"),
+            test_vectors: Vec::new(),
+            operator_did: REF_OPERATOR_DID.into(),
+            cost: None,
+            registered_at: REF_TIMESTAMP,
+            signature: Vec::new(),
+            message_catalog: catalog_large,
+        },
+    ));
+
+    debug_assert_eq!(
+        out.len(),
+        14,
+        "must produce 14 vectors (12 base + 2 SCP-OUT-040)"
+    );
     out
 }
 
 /// Reconstruct the V2 canonical preimage byte sequence.
 ///
 /// The byte sequence is the SHA-256 input that hashes to the canonical
-/// V2 outlet-registration digest. This function mirrors
-/// `compute_outlet_registration_canonical_bytes` byte-for-byte for the
-/// transitional V2 layout (§5.4.1, §5.4.2). As of SCP-OUT-011 the
-/// `kind_byte` is sourced from `reg.kind` (`0x00` Query, `0x01` Action) —
-/// the SCP-OUT-002 placeholder is removed. Independent implementers
-/// regenerate this and check equality.
+/// V2 outlet-registration digest (§5.4.1). This function mirrors the
+/// in-tree [`scp_protocol::context::outlets::hash::outlet_registration_v2_preimage`]
+/// builder byte-for-byte so independent implementers can byte-compare an
+/// alternative implementation against the published vectors.
+///
+/// SCP-OUT-040 (round-5 ADR-049) added `description_hash` and
+/// `catalog_hash` terms to the preimage. The full §5.4.1 layout is:
+///
+/// ```text
+/// "SCP-OUTLET-REGISTRATION-V2:"
+///   || BE32(len(outlet_id)) || outlet_id
+///   || kind_byte
+///   || BE32(len(name)) || name
+///   || description_hash
+///   || BE32(len(operator_did)) || operator_did
+///   || schema_hash
+///   || implementation_hash
+///   || test_vectors_hash
+///   || cost_hash
+///   || catalog_hash
+///   || registered_at_be
+/// ```
 #[must_use]
 pub fn compute_v2_preimage(reg: &OutletRegistration) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+
     let mut buf = Vec::new();
     buf.extend_from_slice(b"SCP-OUTLET-REGISTRATION-V2:");
 
@@ -523,47 +636,44 @@ pub fn compute_v2_preimage(reg: &OutletRegistration) -> Vec<u8> {
     };
 
     length_prefix(&mut buf, reg.outlet_id.as_bytes());
-    // §5.4.1 kind_byte sourced from reg.kind (SCP-OUT-011).
     buf.push(reg.kind.canonical_byte());
     length_prefix(&mut buf, reg.name.as_bytes());
-    length_prefix(&mut buf, reg.description.as_bytes());
 
-    let input_json = scp_protocol::jcs::to_vec(&reg.schema.input_schema).unwrap_or_default();
-    length_prefix(&mut buf, &input_json);
-    let output_json = scp_protocol::jcs::to_vec(&reg.schema.output_schema).unwrap_or_default();
-    length_prefix(&mut buf, &output_json);
+    // description_hash (32 bytes)
+    let description_hash: [u8; 32] = Sha256::digest(reg.description.as_bytes()).into();
+    buf.extend_from_slice(&description_hash);
+
+    length_prefix(&mut buf, reg.operator_did.as_bytes());
+
+    // schema_hash (32 bytes) = SHA-256(MessagePack(schema))
+    let schema_msgpack = rmp_serde::to_vec(&reg.schema).expect("MessagePack schema");
+    let schema_hash: [u8; 32] = Sha256::digest(&schema_msgpack).into();
+    buf.extend_from_slice(&schema_hash);
 
     buf.extend_from_slice(&reg.implementation_hash);
 
-    let n_vectors = u32::try_from(reg.test_vectors.len()).expect("test_vector count exceeds u32");
-    buf.extend_from_slice(&n_vectors.to_be_bytes());
-    for tv in &reg.test_vectors {
-        let input_bytes = scp_protocol::jcs::to_vec(&tv.input).unwrap_or_default();
-        length_prefix(&mut buf, &input_bytes);
-        let output_bytes = scp_protocol::jcs::to_vec(&tv.expected_output).unwrap_or_default();
-        length_prefix(&mut buf, &output_bytes);
-        length_prefix(&mut buf, tv.description.as_bytes());
-    }
+    // test_vectors_hash (32 bytes) = SHA-256(MessagePack(test_vectors))
+    let tv_msgpack = rmp_serde::to_vec(&reg.test_vectors).expect("MessagePack test_vectors");
+    let tv_hash: [u8; 32] = Sha256::digest(&tv_msgpack).into();
+    buf.extend_from_slice(&tv_hash);
 
-    length_prefix(&mut buf, reg.operator_did.as_bytes());
+    // cost_hash (32 bytes) = SHA-256(MessagePack(cost)) | SHA-256(0x00) absent
+    let cost_hash: [u8; 32] = reg.cost.as_ref().map_or_else(
+        || Sha256::digest([0x00u8]).into(),
+        |c| {
+            let bytes = rmp_serde::to_vec(c).expect("MessagePack cost");
+            Sha256::digest(&bytes).into()
+        },
+    );
+    buf.extend_from_slice(&cost_hash);
+
+    // catalog_hash (32 bytes) = SHA-256(MessagePack(message_catalog))
+    let catalog_msgpack =
+        rmp_serde::to_vec(&reg.message_catalog).expect("MessagePack message_catalog");
+    let catalog_hash: [u8; 32] = Sha256::digest(&catalog_msgpack).into();
+    buf.extend_from_slice(&catalog_hash);
+
     buf.extend_from_slice(&reg.registered_at.to_be_bytes());
-
-    match &reg.cost {
-        Some(tc) => {
-            buf.push(0x01);
-            buf.extend_from_slice(&tc.amount.to_be_bytes());
-            length_prefix(&mut buf, tc.currency.as_bytes());
-            match &tc.cost_formula {
-                Some(f) => {
-                    buf.push(0x01);
-                    length_prefix(&mut buf, f.as_bytes());
-                }
-                None => buf.push(0x00),
-            }
-            length_prefix(&mut buf, tc.payee.as_bytes());
-        }
-        None => buf.push(0x00),
-    }
 
     buf
 }
@@ -751,6 +861,19 @@ fn serialize_registration_for_json(reg: &OutletRegistration) -> Value {
         Value::from(reg.operator_did.0.clone()),
     );
     m.insert("cost".to_owned(), cost_value.unwrap_or(Value::Null));
+    // SCP-OUT-040: surface the message_catalog so independent implementers
+    // can rebuild the V2 catalog_hash term against the fixture input.
+    let catalog_value: Vec<Value> = reg
+        .message_catalog
+        .iter()
+        .map(|t| {
+            let mut em = serde_json::Map::new();
+            em.insert("key".to_owned(), Value::from(t.key.clone()));
+            em.insert("template".to_owned(), Value::from(t.template.clone()));
+            Value::Object(em)
+        })
+        .collect();
+    m.insert("message_catalog".to_owned(), Value::Array(catalog_value));
     m.insert("registered_at".to_owned(), Value::from(reg.registered_at));
     Value::Object(m)
 }
@@ -782,7 +905,11 @@ pub fn registration_from_json_input(
         Some(Value::String(s)) => match s.as_str() {
             "query" => OutletKind::Query,
             "action" => OutletKind::Action,
-            other => return Err(format!("invalid kind: {other:?} (expected 'query' or 'action')")),
+            other => {
+                return Err(format!(
+                    "invalid kind: {other:?} (expected 'query' or 'action')"
+                ));
+            }
         },
         Some(other) => return Err(format!("kind must be string, got {other}")),
     };
@@ -891,6 +1018,37 @@ pub fn registration_from_json_input(
     let signature_bytes =
         hex::decode(expected_signature_hex).map_err(|e| format!("bad signature hex: {e}"))?;
 
+    // SCP-OUT-040: read the message_catalog so the V2 preimage `catalog_hash`
+    // term can be reconstructed from the fixture input.
+    let message_catalog: Vec<scp_protocol::MessageTemplate> = match obj.get("message_catalog") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let entry = item
+                    .as_object()
+                    .ok_or_else(|| format!("message_catalog[{i}] not an object"))?;
+                let key = entry
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("message_catalog[{i}].key missing"))?
+                    .to_owned();
+                let template = entry
+                    .get("template")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("message_catalog[{i}].template missing"))?
+                    .to_owned();
+                out.push(scp_protocol::MessageTemplate { key, template });
+            }
+            out
+        }
+        Some(other) => {
+            return Err(format!(
+                "message_catalog must be array or null, got {other}"
+            ));
+        }
+    };
+
     Ok(OutletRegistration {
         outlet_id,
         kind,
@@ -906,6 +1064,7 @@ pub fn registration_from_json_input(
         cost,
         registered_at,
         signature: signature_bytes,
+        message_catalog,
     })
 }
 

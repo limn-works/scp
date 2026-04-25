@@ -129,6 +129,7 @@ fn simple_tool_registration() -> scp_core::context::params::OutletRegistration {
         cost: None,
         registered_at: 0,
         signature: Vec::new(),
+        message_catalog: Vec::new(),
     }
 }
 

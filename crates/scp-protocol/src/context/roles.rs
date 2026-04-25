@@ -276,7 +276,6 @@ impl Capability {
         }
     }
 
-
     /// Returns the canonical input name of this capability.
     ///
     /// For [`OutletQuery`](Self::OutletQuery) and [`OutletCall`](Self::OutletCall)
@@ -3296,10 +3295,22 @@ mod tests {
     fn out014_capability_new_wildcards_round_trip_both_forms() {
         // AC5/AC6: Capability::new("outlet:query:*") and "outlet:call:*"
         // return the wildcard variants. Both wire and SDK forms accepted.
-        assert_eq!(Capability::new("outlet:query:*"), Some(Capability::OutletQueryAll));
-        assert_eq!(Capability::new("outlet_query:*"), Some(Capability::OutletQueryAll));
-        assert_eq!(Capability::new("outlet:call:*"), Some(Capability::OutletCallAll));
-        assert_eq!(Capability::new("outlet_call:*"), Some(Capability::OutletCallAll));
+        assert_eq!(
+            Capability::new("outlet:query:*"),
+            Some(Capability::OutletQueryAll)
+        );
+        assert_eq!(
+            Capability::new("outlet_query:*"),
+            Some(Capability::OutletQueryAll)
+        );
+        assert_eq!(
+            Capability::new("outlet:call:*"),
+            Some(Capability::OutletCallAll)
+        );
+        assert_eq!(
+            Capability::new("outlet_call:*"),
+            Some(Capability::OutletCallAll)
+        );
     }
 
     #[test]
@@ -3395,7 +3406,11 @@ mod tests {
         for cap in &originals {
             let displayed = cap.to_string();
             let reparsed = Capability::new(&displayed);
-            assert_eq!(reparsed.as_ref(), Some(cap), "round-trip failed for {cap:?}");
+            assert_eq!(
+                reparsed.as_ref(),
+                Some(cap),
+                "round-trip failed for {cap:?}"
+            );
         }
     }
 
@@ -3403,14 +3418,24 @@ mod tests {
     fn out014_round_trip_wire_form_through_new() {
         // The wire form `outlet_query:{id}` must also round-trip through new().
         let pairs = [
-            ("outlet_query:my-tool", Capability::OutletQuery("my-tool".to_owned())),
+            (
+                "outlet_query:my-tool",
+                Capability::OutletQuery("my-tool".to_owned()),
+            ),
             ("outlet_query:*", Capability::OutletQueryAll),
-            ("outlet_call:send_payment", Capability::OutletCall("send_payment".to_owned())),
+            (
+                "outlet_call:send_payment",
+                Capability::OutletCall("send_payment".to_owned()),
+            ),
             ("outlet_call:*", Capability::OutletCallAll),
         ];
         for (wire, expected) in &pairs {
             let parsed = Capability::new(wire);
-            assert_eq!(parsed.as_ref(), Some(expected), "wire form {wire:?} did not parse to {expected:?}");
+            assert_eq!(
+                parsed.as_ref(),
+                Some(expected),
+                "wire form {wire:?} did not parse to {expected:?}"
+            );
         }
     }
 
@@ -3488,5 +3513,4 @@ mod tests {
             );
         }
     }
-
 }

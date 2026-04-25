@@ -285,6 +285,7 @@ fn out012_query_reg(
         cost,
         registered_at: 0,
         signature: Vec::new(),
+        message_catalog: Vec::new(),
     }
 }
 

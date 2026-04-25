@@ -622,6 +622,7 @@ mod tests {
                 cost: None,
                 registered_at: 0,
                 signature: Vec::new(),
+                message_catalog: Vec::new(),
             }),
         };
         assert_eq!(classify_action(&action), MlsImpact::NoMlsChange);

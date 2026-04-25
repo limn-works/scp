@@ -1913,11 +1913,14 @@ fn conf_043_outlet_registration_v2_shape() {
         file.rejected_predecessor_separator,
         "SCP-TOOL-REGISTRATION-V1:"
     );
-    print_step(2, "Vector file enumerates exactly 12 entries");
+    print_step(2, "Vector file enumerates exactly 14 entries");
+    // SCP-OUT-009 baseline: 12 vectors. SCP-OUT-040 adds 2 catalog-bearing
+    // vectors that exercise the new `catalog_hash` and `description_hash`
+    // V2 preimage terms — total 14.
     assert_eq!(
         file.vectors.len(),
-        12,
-        "SCP-OUT-009 AC1 requires exactly 12 vectors, got {}",
+        14,
+        "SCP-OUT-009 + SCP-OUT-040 require exactly 14 vectors, got {}",
         file.vectors.len()
     );
     print_step(3, "Each entry carries the required fields");
@@ -1925,7 +1928,7 @@ fn conf_043_outlet_registration_v2_shape() {
         file.vectors.iter().map(|v| v.name.as_str()).collect();
     assert_eq!(
         names.len(),
-        12,
+        14,
         "vector names must be unique (set has {} entries)",
         names.len()
     );
@@ -2201,4 +2204,124 @@ fn conf_outlet_registration_v2_regen() {
         file.vectors.len(),
         file.v1_rejection_corpus.len()
     );
+}
+
+/// CONF-047: SCP-OUT-040 `catalog_hash` and `description_hash` are committed
+/// by the V2 preimage exactly as the spec describes — and silent operator
+/// edits to either field invalidate the canonical signature.
+///
+/// Layer: Bridge | Tier: Full | Spec: §5.4.1 round-5 | ADR-049 | Story: SCP-OUT-040
+#[test]
+fn conf_047_outlet_registration_v2_catalog_and_description_hashes() {
+    use scp_core::context::outlets::OutletKind;
+    use scp_core::context::outlets::hash::{
+        catalog_hash as core_catalog_hash, description_hash as core_description_hash,
+        outlet_registration_v2_preimage,
+    };
+    use scp_core::context::outlets::message_catalog::{EMPTY_CATALOG_MESSAGEPACK, MessageTemplate};
+    use scp_core::context::outlets::registration::OutletRegistration;
+    use scp_core::context::outlets::registry::OutletSchema;
+
+    println!(
+        "=== CONF-047: SCP-OUT-040 catalog_hash + description_hash V2 preimage commitment ==="
+    );
+    let file = load_outlet_registration_vector_file();
+
+    // 1. The fixture file enumerates the 14 vectors total (12 base + 2
+    //    SCP-OUT-040 catalog-bearing).
+    print_step(
+        1,
+        "Vector file enumerates the 12 base + 2 catalog-bearing vectors",
+    );
+    let names: std::collections::HashSet<&str> =
+        file.vectors.iter().map(|v| v.name.as_str()).collect();
+    assert!(
+        names.contains("with-message-catalog-small"),
+        "expected SCP-OUT-040 small-catalog fixture in vector file"
+    );
+    assert!(
+        names.contains("with-message-catalog-large-and-description"),
+        "expected SCP-OUT-040 large-catalog-and-description fixture"
+    );
+
+    // 2. Empty-catalog hash is exactly SHA-256(0x90) — every base vector
+    //    that declares no catalog produces this digest.
+    print_step(2, "Empty-catalog hash is the well-defined SHA-256(0x90)");
+    let want_empty_hash: [u8; 32] = sha2::Sha256::digest(EMPTY_CATALOG_MESSAGEPACK).into();
+    assert_eq!(core_catalog_hash(&[]), want_empty_hash);
+
+    // 3. Single-byte catalog template change ⇒ different catalog_hash AND
+    //    different V2 preimage.
+    print_step(
+        3,
+        "Single-byte catalog template change flips catalog_hash and preimage",
+    );
+    let cat_a =
+        vec![MessageTemplate::try_new("policy.expired", "policy expired").expect("template")];
+    let cat_b =
+        vec![MessageTemplate::try_new("policy.expired", "policy expirex").expect("template")];
+    assert_ne!(core_catalog_hash(&cat_a), core_catalog_hash(&cat_b));
+    let reg_a = OutletRegistration {
+        outlet_id: "ctx-test".to_owned(),
+        kind: OutletKind::Action,
+        name: "Catalog Test".to_owned(),
+        description: "fixture".to_owned(),
+        schema: OutletSchema {
+            input_schema: serde_json::json!({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}),
+            output_schema: serde_json::json!({"type": "object", "properties": {"r": {"type": "string"}}}),
+        },
+        implementation_hash: [0xAB; 32],
+        test_vectors: Vec::new(),
+        operator_did: "did:dht:z6MkTestOp".into(),
+        cost: None,
+        registered_at: 1_700_000_000,
+        signature: Vec::new(),
+        message_catalog: cat_a,
+    };
+    let mut reg_b = reg_a.clone();
+    reg_b.message_catalog = cat_b;
+    assert_ne!(
+        outlet_registration_v2_preimage(&reg_a),
+        outlet_registration_v2_preimage(&reg_b)
+    );
+
+    // 4. Single-byte description change ⇒ different description_hash AND
+    //    different V2 preimage.
+    print_step(
+        4,
+        "Single-byte description change flips description_hash and preimage",
+    );
+    let desc_hash_a = core_description_hash("policy v1");
+    let desc_hash_b = core_description_hash("policy v2");
+    assert_ne!(desc_hash_a, desc_hash_b);
+    let mut reg_c = reg_a.clone();
+    reg_c.description = "policy v2".to_owned();
+    assert_ne!(
+        outlet_registration_v2_preimage(&reg_a),
+        outlet_registration_v2_preimage(&reg_c)
+    );
+
+    // 5. The on-disk SCP-OUT-040 fixtures sign-verify with a non-empty
+    //    catalog round-tripped through the JSON input shape.
+    print_step(
+        5,
+        "Catalog-bearing fixtures round-trip and sign-verify against the on-disk vector file",
+    );
+    use scp_testing::conformance::outlet_registration as orv;
+    for v in file
+        .vectors
+        .iter()
+        .filter(|v| v.name.starts_with("with-message-catalog"))
+    {
+        let reg =
+            orv::registration_from_json_input(&v.input, &v.expected_signature).expect("rebuild");
+        assert!(
+            !reg.message_catalog.is_empty(),
+            "vector '{}' must carry a non-empty catalog",
+            v.name
+        );
+        let manual = orv::compute_v2_preimage(&reg);
+        assert_eq!(hex::encode(&manual), v.expected_preimage);
+    }
+    println!("  PASS: SCP-OUT-040 catalog_hash + description_hash V2 preimage commitment verified");
 }

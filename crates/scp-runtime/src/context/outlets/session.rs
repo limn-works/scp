@@ -490,6 +490,7 @@ mod tests {
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         };
         register_outlet(&mut registry, role_state, registration, registrant_did).unwrap();
         registry

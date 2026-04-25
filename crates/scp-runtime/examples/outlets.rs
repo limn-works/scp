@@ -72,6 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cost: None,
         registered_at: 0,
         signature: Vec::new(),
+        message_catalog: Vec::new(),
     };
 
     let (outlet_id, event) = register_outlet(&mut registry, &role_state, registration, &creator)

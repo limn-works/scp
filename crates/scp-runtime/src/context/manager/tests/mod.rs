@@ -1459,9 +1459,12 @@ pub(super) async fn setup_failing_capture_manager_with_context(
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
             Capability::MemberBan,
         ],
         economic_policy: Some(policy),
@@ -1501,9 +1504,12 @@ pub(super) async fn setup_active_context() -> (ContextManager, ContextHandle) {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
             Capability::OutletRegister,
             Capability::OutletInterface,
             Capability::ChildContextCreate,
@@ -1533,9 +1539,12 @@ pub(super) async fn setup_active_context_with_key_resolver() -> (ContextManager,
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
             Capability::OutletRegister,
             Capability::OutletInterface,
             Capability::ChildContextCreate,
@@ -1649,9 +1658,12 @@ pub(super) async fn setup_broadcast_context_two_authors() -> (ContextManager, Co
         mode: ContextMode::Broadcast,
         memory_scope: scp_protocol::context::MemoryScope::Full,
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
             Capability::MemberBan,
         ],
         ..ContextParams::default()
@@ -1704,9 +1716,12 @@ pub(super) async fn setup_broadcast_with_member_ban() -> (ContextManager, String
         mode: ContextMode::Broadcast,
         memory_scope: scp_protocol::context::MemoryScope::Full,
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
             scp_protocol::context::params::Capability::new("member:ban").expect("known capability"),
         ],
         ..ContextParams::default()
@@ -1798,13 +1813,19 @@ pub(super) async fn setup_encrypted_with_member_ban() -> (ContextManager, String
 pub(super) fn governance_params() -> ContextParams {
     ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
-            scp_protocol::context::params::Capability::new("governance:propose").expect("known capability"),
-            scp_protocol::context::params::Capability::new("governance:vote").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("governance:propose")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("governance:vote")
+                .expect("known capability"),
             scp_protocol::context::params::Capability::new("member:ban").expect("known capability"),
-            scp_protocol::context::params::Capability::new("context:close").expect("known capability"),
+            scp_protocol::context::params::Capability::new("context:close")
+                .expect("known capability"),
             Capability::OutletRegister,
         ],
         ..ContextParams::default()
@@ -1833,6 +1854,7 @@ pub(super) fn test_outlet_registration(id: &str) -> OutletRegistration {
         cost: None,
         registered_at: 0,
         signature: Vec::new(),
+        message_catalog: Vec::new(),
     }
 }
 
@@ -1853,9 +1875,12 @@ pub(super) async fn setup_broadcast_context() -> (ContextManager, ContextHandle,
         mode: ContextMode::Broadcast,
         memory_scope: scp_protocol::context::MemoryScope::Full,
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };

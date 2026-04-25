@@ -33,9 +33,13 @@ pub mod uri;
 //   is reachable from the crate root.
 pub use context::outlets::integrity::OutletVerificationSchedule;
 pub use context::outlets::interface::OutletInterface;
+pub use context::outlets::message_catalog::{
+    CATALOG_MAX_ENTRIES, MessageTemplate, MessageTemplateError, TEMPLATE_MAX_BYTES,
+    canonical_catalog_messagepack,
+};
+pub use context::outlets::registration::{OutletRegistration, RegistrationError};
 pub use context::outlets::registry::{
-    OutletCost, OutletRegistration, OutletRegistry, OutletSchema, OutletTestVector,
-    OutletVerificationResult,
+    OutletCost, OutletRegistry, OutletSchema, OutletTestVector, OutletVerificationResult,
 };
 pub use context::outlets::{
     OutletCancel, OutletError, OutletErrorCode, OutletExecutionError, OutletInvokedEvent,

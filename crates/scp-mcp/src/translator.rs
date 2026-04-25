@@ -229,12 +229,9 @@ pub fn scp_to_mcp(value: Value) -> Value {
 fn translate_mcp_to_scp_value(value: Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(translate_mcp_to_scp_object(map)),
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(translate_mcp_to_scp_value)
-                .collect(),
-        ),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(translate_mcp_to_scp_value).collect())
+        }
         other => other,
     }
 }
@@ -311,10 +308,7 @@ fn translate_tools_call_params_to_invoke(mut map: Map<String, Value>) -> Map<Str
 
     let mut out = Map::new();
     out.insert("outlet_id".to_owned(), Value::String(outlet_id));
-    out.insert(
-        "kind".to_owned(),
-        Value::String(kind.as_str().to_owned()),
-    );
+    out.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
     if let Some(args) = map.remove("arguments") {
         out.insert("arguments".to_owned(), translate_mcp_to_scp_value(args));
     }
@@ -327,14 +321,13 @@ fn translate_tools_call_params_to_invoke(mut map: Map<String, Value>) -> Map<Str
 }
 
 fn translate_tools_list_result_to_outlet_list(mut map: Map<String, Value>) -> Map<String, Value> {
-    let tools = map.remove("tools").unwrap_or_else(|| Value::Array(Vec::new()));
+    let tools = map
+        .remove("tools")
+        .unwrap_or_else(|| Value::Array(Vec::new()));
     let outlets = match tools {
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(translate_mcp_to_scp_value)
-                .collect(),
-        ),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(translate_mcp_to_scp_value).collect())
+        }
         other => translate_mcp_to_scp_value(other),
     };
 
@@ -350,11 +343,10 @@ fn translate_tools_list_result_to_outlet_list(mut map: Map<String, Value>) -> Ma
 }
 
 fn translate_call_tool_result_to_outlet_result(mut map: Map<String, Value>) -> Map<String, Value> {
-    let is_error = map
-        .get("isError")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let content = map.remove("content").unwrap_or_else(|| Value::Array(Vec::new()));
+    let is_error = map.get("isError").and_then(Value::as_bool).unwrap_or(false);
+    let content = map
+        .remove("content")
+        .unwrap_or_else(|| Value::Array(Vec::new()));
     let meta = map.remove("_meta");
 
     if is_error {
@@ -454,10 +446,7 @@ fn translate_tool_definition_to_outlet(mut map: Map<String, Value>) -> Map<Strin
 
     let mut out = Map::new();
     out.insert("outlet_id".to_owned(), Value::String(outlet_id));
-    out.insert(
-        "kind".to_owned(),
-        Value::String(kind.as_str().to_owned()),
-    );
+    out.insert("kind".to_owned(), Value::String(kind.as_str().to_owned()));
     if let Some(desc) = map.remove("description") {
         out.insert("description".to_owned(), desc);
     }
@@ -491,12 +480,9 @@ fn recurse_mcp_to_scp(map: Map<String, Value>) -> Map<String, Value> {
 fn translate_scp_to_mcp_value(value: Value) -> Value {
     match value {
         Value::Object(map) => Value::Object(translate_scp_to_mcp_object(map)),
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(translate_scp_to_mcp_value)
-                .collect(),
-        ),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(translate_scp_to_mcp_value).collect())
+        }
         other => other,
     }
 }
@@ -589,14 +575,13 @@ fn translate_invoke_params_to_tools_call(mut map: Map<String, Value>) -> Map<Str
 }
 
 fn translate_outlet_list_to_tools_list(mut map: Map<String, Value>) -> Map<String, Value> {
-    let outlets = map.remove("outlets").unwrap_or_else(|| Value::Array(Vec::new()));
+    let outlets = map
+        .remove("outlets")
+        .unwrap_or_else(|| Value::Array(Vec::new()));
     let tools = match outlets {
-        Value::Array(items) => Value::Array(
-            items
-                .into_iter()
-                .map(translate_scp_to_mcp_value)
-                .collect(),
-        ),
+        Value::Array(items) => {
+            Value::Array(items.into_iter().map(translate_scp_to_mcp_value).collect())
+        }
         other => translate_scp_to_mcp_value(other),
     };
 
@@ -665,7 +650,9 @@ fn translate_outlet_definition_to_tool(mut map: Map<String, Value>) -> Map<Strin
 
 fn translate_outlet_error_to_call_tool_result(mut err: Map<String, Value>) -> Map<String, Value> {
     // Canonical shape: { "isError": true, "content": [...], "_meta": {...} }.
-    let content = err.remove("content").unwrap_or_else(|| Value::Array(Vec::new()));
+    let content = err
+        .remove("content")
+        .unwrap_or_else(|| Value::Array(Vec::new()));
     let message = err.remove("message");
 
     // Meta reconstruction with scp_ prefixed keys (round-trip-safe).
@@ -725,7 +712,9 @@ fn translate_outlet_stream_to_call_tool_result(mut map: Map<String, Value>) -> M
     // it), use that; otherwise collapse chunks by flattening Data payloads
     // and, if absent, using the terminal End.aggregate.
     let precomputed_content = map.remove("content");
-    let chunks = map.remove("chunks").unwrap_or_else(|| Value::Array(Vec::new()));
+    let chunks = map
+        .remove("chunks")
+        .unwrap_or_else(|| Value::Array(Vec::new()));
     let meta = map.remove("_meta");
 
     let content = match precomputed_content {
@@ -886,10 +875,7 @@ fn collect_content_as_chunks(content: &Value) -> Vec<Value> {
     }
     let mut end = Map::new();
     end.insert("@type".to_owned(), Value::String("End".to_owned()));
-    end.insert(
-        "sequence".to_owned(),
-        Value::from(chunks.len() as u64),
-    );
+    end.insert("sequence".to_owned(), Value::from(chunks.len() as u64));
     end.insert("aggregate".to_owned(), content.clone());
     chunks.push(Value::Object(end));
     chunks
@@ -1384,9 +1370,12 @@ mod tests {
                 }
                 Value::Object(out)
             }
-            Value::Array(items) => {
-                Value::Array(items.into_iter().map(normalize_for_mcp_round_trip).collect())
-            }
+            Value::Array(items) => Value::Array(
+                items
+                    .into_iter()
+                    .map(normalize_for_mcp_round_trip)
+                    .collect(),
+            ),
             other => other,
         }
     }

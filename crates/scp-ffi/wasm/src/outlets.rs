@@ -468,6 +468,7 @@ pub fn outlet_register(context: &WasmContextHandle, definition_json: String) -> 
             cost,
             registered_at,
             signature,
+            message_catalog: Vec::new(),
         };
 
         with_manager(|mgr| mgr.register_outlet(&context_id, registration))
@@ -703,6 +704,7 @@ fn build_outlet_registration_from_json(
         cost,
         registered_at,
         signature,
+        message_catalog: Vec::new(),
     })
 }
 

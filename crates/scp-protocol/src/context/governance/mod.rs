@@ -2121,6 +2121,7 @@ mod tests {
                     cost: None,
                     registered_at: 0,
                     signature: Vec::new(),
+                    message_catalog: Vec::new(),
                 }),
             },
             GovernanceAction::RemoveOutlet {
@@ -2686,6 +2687,7 @@ mod tests {
                     cost: None,
                     registered_at: 0,
                     signature: Vec::new(),
+                    message_catalog: Vec::new(),
                 }),
             },
             GovernanceAction::RemoveOutlet {

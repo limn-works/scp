@@ -518,7 +518,11 @@ fn invoke_outlet_with_economy_wires_escalation_and_rollback() {
         "invoke_outlet_with_economy must record the invocation for velocity tracking"
     );
     assert!(
-        fn_body_contains(MANAGER_SRC, "invoke_outlet_with_economy", "velocity_tracker"),
+        fn_body_contains(
+            MANAGER_SRC,
+            "invoke_outlet_with_economy",
+            "velocity_tracker"
+        ),
         "invoke_outlet_with_economy must thread velocity_tracker into OutletEconomyContext"
     );
     assert!(
@@ -725,7 +729,11 @@ fn wasm_send_message_inspects_spending_ucan_and_economic_policy() {
 #[test]
 fn c4_pyo3_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     assert!(
-        fn_body_contains(PYO3_OUTLETS_SRC, "py_outlet_invoke", "invoke_outlet_with_economy"),
+        fn_body_contains(
+            PYO3_OUTLETS_SRC,
+            "py_outlet_invoke",
+            "invoke_outlet_with_economy"
+        ),
         "PyO3 py_outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). Calling try_consume_hard_rate_limit_blocking against \
          a bridge-owned registry instead disables per-invocation pricing, \
@@ -739,8 +747,8 @@ fn c4_pyo3_outlet_invoke_accepts_spending_ucan() {
     // The bridge MUST accept the spending UCAN parameter — the
     // runtime's `invoke_outlet_with_economy` requires it for §19.5
     // AND-composition on paid actions.
-    let body =
-        extract_fn_body(PYO3_OUTLETS_SRC, "py_outlet_invoke").expect("py_outlet_invoke body must exist");
+    let body = extract_fn_body(PYO3_OUTLETS_SRC, "py_outlet_invoke")
+        .expect("py_outlet_invoke body must exist");
     assert!(
         body.contains("spending_ucan"),
         "PyO3 py_outlet_invoke must accept and forward a spending UCAN argument \
@@ -757,7 +765,11 @@ fn c4_pyo3_outlet_invoke_accepts_spending_ucan() {
 #[test]
 fn c4_napi_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     assert!(
-        fn_body_contains(NAPI_OUTLETS_SRC, "outlet_invoke", "invoke_outlet_with_economy"),
+        fn_body_contains(
+            NAPI_OUTLETS_SRC,
+            "outlet_invoke",
+            "invoke_outlet_with_economy"
+        ),
         "NAPI outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). The previous bypass path called \
          try_consume_hard_rate_limit against the bridge-owned outlet registry, \
@@ -768,8 +780,8 @@ fn c4_napi_outlet_invoke_routes_through_invoke_outlet_with_economy() {
 
 #[test]
 fn c4_napi_outlet_invoke_accepts_spending_ucan() {
-    let body =
-        extract_fn_body(NAPI_OUTLETS_SRC, "outlet_invoke").expect("NAPI outlet_invoke body must exist");
+    let body = extract_fn_body(NAPI_OUTLETS_SRC, "outlet_invoke")
+        .expect("NAPI outlet_invoke body must exist");
     assert!(
         body.contains("spending_ucan_jwt"),
         "NAPI outlet_invoke must accept and forward a spending_ucan_jwt argument \
@@ -860,7 +872,11 @@ fn c4_uniffi_outlet_invoke_routes_through_invoke_outlet_with_economy() {
     // `extract_fn_body` returns the first match, which is the
     // top-level `outlet_invoke` (not `outlet_invoke_cross_context`).
     assert!(
-        fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_invoke", "invoke_outlet_with_economy"),
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "outlet_invoke",
+            "invoke_outlet_with_economy"
+        ),
         "UniFFI outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (PR #1606 / C4). The previous bypass path called \
          try_consume_hard_rate_limit against the bridge-owned outlet registry, \
@@ -928,17 +944,29 @@ fn out008_register_outlet_reaches_runtime_pipeline() {
 #[test]
 fn out008_invoke_outlet_reaches_runtime_pipeline() {
     assert!(
-        fn_body_contains(PYO3_OUTLETS_SRC, "py_outlet_invoke", "invoke_outlet_with_economy"),
+        fn_body_contains(
+            PYO3_OUTLETS_SRC,
+            "py_outlet_invoke",
+            "invoke_outlet_with_economy"
+        ),
         "PyO3 py_outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (SCP-OUT-008 AC22)"
     );
     assert!(
-        fn_body_contains(NAPI_OUTLETS_SRC, "outlet_invoke", "invoke_outlet_with_economy"),
+        fn_body_contains(
+            NAPI_OUTLETS_SRC,
+            "outlet_invoke",
+            "invoke_outlet_with_economy"
+        ),
         "NAPI outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (SCP-OUT-008 AC22)"
     );
     assert!(
-        fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_invoke", "invoke_outlet_with_economy"),
+        fn_body_contains(
+            UNIFFI_BRIDGE_SRC,
+            "outlet_invoke",
+            "invoke_outlet_with_economy"
+        ),
         "UniFFI outlet_invoke must call ContextManager::invoke_outlet_with_economy \
          (SCP-OUT-008 AC22)"
     );

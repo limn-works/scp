@@ -3734,6 +3734,7 @@ impl WasmContextManager {
             cost: None,
             registered_at,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         };
         crate::runtime::outlet_registry_insert_unique(&mut ctx.outlet_registry, reg).map_err(
             |e| ScpWasmError::Tool {

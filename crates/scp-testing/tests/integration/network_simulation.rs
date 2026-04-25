@@ -1319,6 +1319,7 @@ async fn application_layer_demo() {
         cost: None,
         registered_at: 1_700_000_000,
         signature: vec![],
+        message_catalog: Vec::new(),
     };
 
     println!("  Registering tool: '{}'", search_tool.name);
@@ -1327,8 +1328,13 @@ async fn application_layer_demo() {
     println!("    input:       query (string), max_results (integer)");
     println!("    output:      results (array), total (integer)");
 
-    let (outlet_id, reg_event) =
-        register_outlet(&mut outlet_registry, &role_state, search_tool, alice.as_ref()).unwrap();
+    let (outlet_id, reg_event) = register_outlet(
+        &mut outlet_registry,
+        &role_state,
+        search_tool,
+        alice.as_ref(),
+    )
+    .unwrap();
 
     println!("  Registered! outlet_id = {outlet_id}");
     println!(
@@ -1368,6 +1374,7 @@ async fn application_layer_demo() {
         cost: None,
         registered_at: 1_700_000_001,
         signature: vec![],
+        message_catalog: Vec::new(),
     };
 
     let (calc_id, _) =

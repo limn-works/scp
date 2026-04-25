@@ -119,10 +119,7 @@ const CAP_MEMBER_BAN: &str = "member:ban";
 ///
 /// Used by broadcast templates where `member:ban` is not applicable.
 fn messaging_ceiling() -> Vec<Capability> {
-    vec![
-        Capability::MessagesRead,
-        Capability::MessagesWrite,
-    ]
+    vec![Capability::MessagesRead, Capability::MessagesWrite]
 }
 
 /// Returns the messaging ceiling with ban: `messages:read` + `messages:write`
@@ -1335,22 +1332,37 @@ mod tests {
 
     #[test]
     fn capabilities_match_same_order() {
-        let a = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
-        let b = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
+        let a = vec![
+            Capability::new("a").expect("known capability"),
+            Capability::new("b").expect("known capability"),
+        ];
+        let b = vec![
+            Capability::new("a").expect("known capability"),
+            Capability::new("b").expect("known capability"),
+        ];
         assert!(capabilities_match(&a, &b));
     }
 
     #[test]
     fn capabilities_match_different_order() {
-        let a = vec![Capability::new("b").expect("known capability"), Capability::new("a").expect("known capability")];
-        let b = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
+        let a = vec![
+            Capability::new("b").expect("known capability"),
+            Capability::new("a").expect("known capability"),
+        ];
+        let b = vec![
+            Capability::new("a").expect("known capability"),
+            Capability::new("b").expect("known capability"),
+        ];
         assert!(capabilities_match(&a, &b));
     }
 
     #[test]
     fn capabilities_match_different_lengths() {
         let a = vec![Capability::new("a").expect("known capability")];
-        let b = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
+        let b = vec![
+            Capability::new("a").expect("known capability"),
+            Capability::new("b").expect("known capability"),
+        ];
         assert!(!capabilities_match(&a, &b));
     }
 
@@ -1626,6 +1638,7 @@ mod tests {
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         }];
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(

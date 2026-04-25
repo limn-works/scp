@@ -912,7 +912,13 @@ async fn participation_profile_produce_verify() {
     let events = vec![
         make_event(EventType::MessageSent, alice, 1000, 0, vec![]),
         make_event(EventType::MessageSent, alice, 2000, 1, vec![]),
-        make_event(EventType::OutletInvoked, alice, 3000, 2, b"tool-x\0".to_vec()),
+        make_event(
+            EventType::OutletInvoked,
+            alice,
+            3000,
+            2,
+            b"tool-x\0".to_vec(),
+        ),
     ];
 
     let profile = produce_participation_profile(

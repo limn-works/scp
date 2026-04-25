@@ -373,8 +373,14 @@ async fn all_capability_variants() {
     }
 
     // Verify Capability::new round-trips for well-known names
-    assert_eq!(Capability::new("messages:read").expect("known capability"), Capability::MessagesRead);
-    assert_eq!(Capability::new("context:close").expect("known capability"), Capability::ContextClose);
+    assert_eq!(
+        Capability::new("messages:read").expect("known capability"),
+        Capability::MessagesRead
+    );
+    assert_eq!(
+        Capability::new("context:close").expect("known capability"),
+        Capability::ContextClose
+    );
     assert_eq!(
         Capability::new("outlet:call:my-tool").expect("known capability"),
         Capability::OutletCall("my-tool".to_owned())

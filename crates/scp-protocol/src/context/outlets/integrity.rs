@@ -200,7 +200,9 @@ where
 /// Converts a [`SchemaVerificationResult`] to a [`OutletVerificationResult`]
 /// for backward compatibility with the existing exact-match API.
 #[must_use]
-pub fn schema_result_to_outlet_result(result: &SchemaVerificationResult) -> OutletVerificationResult {
+pub fn schema_result_to_outlet_result(
+    result: &SchemaVerificationResult,
+) -> OutletVerificationResult {
     OutletVerificationResult {
         outlet_id: result.outlet_id.clone(),
         vector_results: result
@@ -364,6 +366,7 @@ mod tests {
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         };
         registry.insert(reg);
         registry

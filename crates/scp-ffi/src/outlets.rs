@@ -360,6 +360,10 @@ pub fn py_outlet_register(context_id: &str, registration: &Bound<'_, PyDict>) ->
     // Generate a tool ID from the name (deterministic, human-readable).
     let outlet_id = format!("tool-{}", name.replace(' ', "-").to_lowercase());
 
+    // SCP-OUT-040: surface the optional message_catalog through the bridge
+    // so Python registrations carry through to the V2 catalog_hash term.
+    let message_catalog = extract_message_catalog(registration)?;
+
     // Build the scp-core OutletRegistration.
     let core_registration = scp_core::context::tools::OutletRegistration {
         outlet_id,
@@ -378,6 +382,7 @@ pub fn py_outlet_register(context_id: &str, registration: &Bound<'_, PyDict>) ->
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
         signature: vec![],
+        message_catalog,
     };
 
     // Look up the context runtime and register the tool. SCP-OUT-012:
@@ -924,6 +929,54 @@ fn extract_test_vectors(
     }
 
     Ok(result)
+}
+
+/// Extract the optional `message_catalog` Python list from a registration
+/// dict. Each entry must be a `{ "key": str, "template": str }` mapping
+/// matching the §5.4.1 grammar / template-byte cap. Absent or `None`
+/// yields an empty catalog (legacy callers continue to work).
+///
+/// SCP-OUT-040 wires the field through the `PyO3` bridge so Python SDKs
+/// can round-trip catalog-bearing registrations into the same
+/// `OutletRegistration` type the canonical V2 hash builder consumes.
+fn extract_message_catalog(
+    registration: &Bound<'_, PyDict>,
+) -> PyResult<Vec<scp_core::context::outlets::MessageTemplate>> {
+    let raw = match registration.get_item("message_catalog")? {
+        Some(val) if !val.is_none() => val,
+        _ => return Ok(Vec::new()),
+    };
+
+    let list = raw
+        .downcast::<pyo3::types::PyList>()
+        .map_err(|_| ScpPyError::ValidationError {
+            message: "'message_catalog' must be a list".to_owned(),
+            code: codes::VALID_7037.to_owned(),
+        })?;
+
+    let mut out = Vec::with_capacity(list.len());
+    for (i, item) in list.iter().enumerate() {
+        let dict = item
+            .downcast::<PyDict>()
+            .map_err(|_| ScpPyError::ValidationError {
+                message: format!("'message_catalog[{i}]' must be a dict"),
+                code: codes::VALID_7037.to_owned(),
+            })?;
+        let key: String = dict
+            .get_item("key")?
+            .ok_or_else(|| ScpPyError::validation(format!("'message_catalog[{i}].key' missing")))?
+            .extract()?;
+        let template: String = dict
+            .get_item("template")?
+            .ok_or_else(|| {
+                ScpPyError::validation(format!("'message_catalog[{i}].template' missing"))
+            })?
+            .extract()?;
+        let entry = scp_core::context::outlets::MessageTemplate::try_new(key, template)
+            .map_err(|e| ScpPyError::validation(format!("invalid 'message_catalog[{i}]': {e}")))?;
+        out.push(entry);
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1593,6 +1646,17 @@ fn outlet_registration_to_dict<'py>(
     }
     dict.set_item("test_vectors", vectors)?;
 
+    // SCP-OUT-040: surface the registered message_catalog so SDK wrappers
+    // can round-trip the field through the Python bridge.
+    let catalog = pyo3::types::PyList::empty(py);
+    for entry in &reg.message_catalog {
+        let ed = PyDict::new(py);
+        ed.set_item("key", &entry.key)?;
+        ed.set_item("template", &entry.template)?;
+        catalog.append(ed)?;
+    }
+    dict.set_item("message_catalog", catalog)?;
+
     Ok(dict)
 }
 
@@ -1672,6 +1736,9 @@ fn build_outlet_registration_from_py(
     // rejected. The SDK surface (`OutletNamespace.update`) requires
     // `kind` on the new definition; the bridge re-enforces it.
     let kind = extract_kind(registration)?;
+    // SCP-OUT-040: extract optional message_catalog so update paths
+    // round-trip the field instead of silently dropping it.
+    let message_catalog = extract_message_catalog(registration)?;
 
     Ok(scp_core::context::tools::OutletRegistration {
         outlet_id,
@@ -1690,6 +1757,7 @@ fn build_outlet_registration_from_py(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
         signature: vec![],
+        message_catalog,
     })
 }
 

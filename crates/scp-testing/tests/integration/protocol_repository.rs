@@ -234,13 +234,7 @@ async fn delete_context_removes_all_associated_state() {
     assert!(store.load_context_params(ctx).await.unwrap().is_none());
     assert!(store.load_membership(ctx, &did).await.unwrap().is_none());
     assert!(store.load_role(ctx, "admin").await.unwrap().is_none());
-    assert!(
-        store
-            .load_outlet(ctx, "outlet-1")
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(store.load_outlet(ctx, "outlet-1").await.unwrap().is_none());
     assert!(
         store
             .load_outlet_session(ctx, "sess-1")

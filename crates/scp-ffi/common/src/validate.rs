@@ -1386,6 +1386,7 @@ mod tests {
                 cost: None,
                 registered_at: 0,
                 signature: vec![],
+                message_catalog: Vec::new(),
             }),
         };
         let err = validate_governance_action_strings(&action).unwrap_err();
@@ -1413,6 +1414,7 @@ mod tests {
                 cost: None,
                 registered_at: 0,
                 signature: vec![],
+                message_catalog: Vec::new(),
             }),
         };
         let err = validate_governance_action_strings(&action).unwrap_err();

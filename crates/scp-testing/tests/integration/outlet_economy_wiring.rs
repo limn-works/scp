@@ -36,7 +36,9 @@ use scp_core::context::builder::{
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::manager::ContextManager;
 use scp_core::context::tools::OutletId;
-use scp_core::context::tools::registry::{OutletTestVector, OutletRegistration, OutletRegistry, OutletSchema};
+use scp_core::context::tools::registry::{
+    OutletRegistration, OutletRegistry, OutletSchema, OutletTestVector,
+};
 use scp_core::context::{
     AddMemberOutput, Capability, ContextError, ContextParams, RemoveMemberOutput,
 };
@@ -279,6 +281,7 @@ fn echo_outlet() -> OutletRegistration {
         cost: None,
         registered_at: 0,
         signature: Vec::new(),
+        message_catalog: Vec::new(),
     }
 }
 

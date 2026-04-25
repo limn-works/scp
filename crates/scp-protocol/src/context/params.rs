@@ -1071,6 +1071,7 @@ mod tests {
                 cost: None,
                 registered_at: 0,
                 signature: Vec::new(),
+                message_catalog: Vec::new(),
             }],
             ttl: Some(Duration::from_hours(1)),
             memory_scope: MemoryScope::Full,
@@ -1139,6 +1140,7 @@ mod tests {
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         };
         let cloned = tool.clone();
         assert_eq!(tool, cloned);

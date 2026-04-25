@@ -19,9 +19,14 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::{
-    DID, OutletError, OutletId, OutletKind, OutletRegisteredEvent, OutletUpdatedEvent,
-    OutletVerifiedEvent, has_admin_role, has_outlet_register_capability, schema,
+    DID, OutletError, OutletId, OutletRegisteredEvent, OutletUpdatedEvent, OutletVerifiedEvent,
+    has_admin_role, has_outlet_register_capability, schema,
 };
+// `OutletKind` is referenced only by the tests module below; gating the
+// import keeps the lib build warning-free while preserving the test-only
+// fixture helpers that exercise both Query and Action kinds.
+#[cfg(test)]
+use super::OutletKind;
 use crate::context::roles::ContextRoleState;
 
 // ---------------------------------------------------------------------------
@@ -85,122 +90,14 @@ pub struct OutletCost {
 // ---------------------------------------------------------------------------
 // OutletRegistration
 // ---------------------------------------------------------------------------
-
-/// Full tool registration entry for an SCP context.
-///
-/// Contains all metadata required for tool integrity verification: schema,
-/// implementation hash, test vectors, and operator identity. See ADR-010
-/// acceptance criterion 1.
-///
-/// Provenance fields (`registered_at`, `signature`) close spec audit finding
-/// [5.4] — tool registration wire format now includes a timestamp and an
-/// Ed25519 signature over the canonical registration bytes, enabling
-/// independent verification that the registration was created by the claimed
-/// registrant. Both fields default to zero/empty for backward compatibility.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OutletRegistration {
-    /// Unique identifier for this tool within the context.
-    pub outlet_id: OutletId,
-    /// Structural classification of the outlet (spec §5.4.2).
-    ///
-    /// `OutletKind::Query` for read-only, idempotent, cacheable outlets;
-    /// `OutletKind::Action` for outlets that may mutate context state. The
-    /// `kind` is committed to the §5.4.1 V2 canonical preimage as a fixed
-    /// `kind_byte` (`0x00` Query, `0x01` Action) between `outlet_id` and
-    /// `name`.
-    ///
-    /// On-wire serde form: `"kind": "query"` or `"kind": "action"` (lowercase
-    /// per §5.4.2). Deserialization that omits the field defaults to
-    /// `OutletKind::Action` — the fail-safe per §5.4.2 (an undeclared kind
-    /// cannot accidentally be treated as read-only).
-    #[serde(default)]
-    pub kind: OutletKind,
-    /// Human-readable name of the tool.
-    pub name: String,
-    /// Description of the tool's purpose and behavior.
-    pub description: String,
-    /// MCP-compatible JSON Schema for input and output.
-    pub schema: OutletSchema,
-    /// SHA-256 hash of the tool implementation. Used for integrity verification.
-    /// Any change to the implementation produces a new hash.
-    pub implementation_hash: [u8; 32],
-    /// Known input-output pairs for continuous verification.
-    pub test_vectors: Vec<OutletTestVector>,
-    /// The DID of the operator accountable for this tool.
-    pub operator_did: DID,
-    /// Optional per-invocation cost metadata (spec §5.4.1, §19.3).
-    pub cost: Option<OutletCost>,
-    /// Unix timestamp (seconds) when the tool was registered.
-    ///
-    /// Provides temporal provenance for tool registrations. Defaults to 0 for
-    /// backward compatibility with registrations created before this field
-    /// existed.
-    #[serde(default)]
-    pub registered_at: u64,
-    /// Ed25519 signature over the canonical registration bytes, produced by
-    /// the registrant's signing key.
-    ///
-    /// Enables independent verification that the registration was created by
-    /// the claimed registrant. The signed payload is the `MessagePack` encoding
-    /// of all fields except `signature` itself. Defaults to empty for backward
-    /// compatibility.
-    #[serde(default)]
-    pub signature: Vec<u8>,
-}
-
-impl OutletRegistration {
-    /// Validates structural invariants on the registration that do not
-    /// require any context state — pure on-the-payload checks suitable for
-    /// invocation at registration time and at the runtime event-log commit
-    /// boundary.
-    ///
-    /// # §5.4.2 Query structural cost floor (SCP-OUT-012)
-    ///
-    /// A `Query` outlet MUST declare either `cost == None` or
-    /// `cost.amount == 0`, AND MUST NOT carry a `cost.cost_formula`. A
-    /// dynamic pricing formula on an idempotent read is not coherent
-    /// (§5.4.2). Declaring a positive cost or a pricing formula at
-    /// registration is a validation failure rejected before the
-    /// registration reaches the event log.
-    ///
-    /// `Action` outlets have no structural cost floor — any cost
-    /// configuration is accepted at this layer (§5.4.2). The §5.4.4
-    /// `OutletErrorClass::Protocol::QueryCostViolation` typed class lands
-    /// with SCP-OUT-036/038; this story emits the existing
-    /// [`OutletError::QueryCostViolation`] variant.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`OutletError::QueryCostViolation`] when `kind == Query`
-    /// AND any of:
-    /// - `cost.is_some() && cost.amount > 0` (positive declared cost)
-    /// - `cost.is_some() && cost.cost_formula.is_some()` (dynamic formula)
-    pub fn validate(&self) -> Result<(), OutletError> {
-        if matches!(self.kind, OutletKind::Query)
-            && let Some(cost) = self.cost.as_ref()
-        {
-            if cost.amount > 0 {
-                return Err(OutletError::QueryCostViolation {
-                    reason: format!(
-                        "Query outlet \"{}\" declares positive cost.amount = {} \
-                         (§5.4.2 requires cost == None || cost.amount == 0)",
-                        self.outlet_id, cost.amount
-                    ),
-                });
-            }
-            if cost.cost_formula.is_some() {
-                return Err(OutletError::QueryCostViolation {
-                    reason: format!(
-                        "Query outlet \"{}\" declares cost.cost_formula \
-                         (§5.4.2 forbids dynamic pricing on Query outlets)",
-                        self.outlet_id
-                    ),
-                });
-            }
-        }
-        Ok(())
-    }
-}
+//
+// The struct definition and validation entry points live in the sibling
+// `registration` module per SCP-OUT-040 (the §5.4.1 V2 preimage now includes
+// `description_hash` and `catalog_hash` terms that need to live next to the
+// `message_catalog` field they cover). The re-export below preserves the
+// public path `scp_protocol::context::outlets::registry::OutletRegistration`
+// for every existing caller.
+pub use super::registration::OutletRegistration;
 
 // ---------------------------------------------------------------------------
 // OutletVerificationResult
@@ -583,94 +480,22 @@ where
 // Tool registration signature verification (M15)
 // ---------------------------------------------------------------------------
 
-/// Computes the canonical bytes for tool registration signature verification.
+/// Computes the canonical SHA-256 digest of the §5.4.1 V2 outlet-registration
+/// preimage.
 ///
-/// The signed payload is a SHA-256 hash of a canonical struct containing all
-/// `OutletRegistration` fields except `signature` itself, in a deterministic
-/// order. JSON schema fields use RFC 8785 JCS canonical serialization.
+/// Returns the 32-byte SHA-256 output as a `Vec<u8>` for backward
+/// compatibility with the original signature; new code should prefer
+/// [`super::hash::compute_outlet_registration_canonical_bytes`], which
+/// returns a typed `[u8; 32]`. Both calls produce byte-identical output;
+/// this shim exists so downstream callers (FFI bridges, conformance
+/// fixtures, tests) keep compiling.
 ///
-/// The canonical representation includes:
-/// - `outlet_id`
-/// - `kind_byte` (per §5.4.1: 0x00 = Query, 0x01 = Action). SCP-OUT-011 wires
-///   the real value from [`OutletRegistration::kind`] via
-///   [`OutletKind::canonical_byte`]; the placeholder `0x01` from SCP-OUT-002
-///   is replaced.
-/// - `name`, `description`
-/// - `input_schema`, `output_schema` (JCS canonical JSON bytes)
-/// - `implementation_hash` (32 bytes)
-/// - `test_vectors` (count + hashes)
-/// - `operator_did`
-/// - `registered_at` (timestamp)
-/// - `cost` (if present)
-///
-/// Note: the V2 spec preimage (§5.4.1) uses `description_hash`, `schema_hash`,
-/// `test_vectors_hash`, `cost_hash`, and `catalog_hash` in place of inline
-/// length-prefixed bytes, and reorders `operator_did` and `registered_at`.
-/// Those structural changes ship with SCP-OUT-013 / SCP-OUT-024.
-/// SCP-OUT-002 introduced the V2 domain separator and the `kind_byte` slot;
-/// SCP-OUT-011 wires the real `kind` field; the remaining layout changes are
-/// scoped to downstream stories.
+/// The V2 preimage layout is documented in [`super::hash`]; SCP-OUT-040 added
+/// `description_hash` and `catalog_hash` terms (round-5 ADR-049) closing the
+/// remaining operator-prose covert-channel surface.
 #[must_use]
 pub fn compute_outlet_registration_canonical_bytes(registration: &OutletRegistration) -> Vec<u8> {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(b"SCP-OUTLET-REGISTRATION-V2:");
-    // Length-prefix helper for variable-length fields.
-    #[allow(clippy::cast_possible_truncation)]
-    let length_prefix = |hasher: &mut Sha256, bytes: &[u8]| {
-        hasher.update((bytes.len() as u32).to_be_bytes());
-        hasher.update(bytes);
-    };
-
-    length_prefix(&mut hasher, registration.outlet_id.as_bytes());
-    // §5.4.1 kind_byte — the real OutletKind classification (SCP-OUT-011).
-    // Sits between `outlet_id` and `name`; 0x00 = Query, 0x01 = Action.
-    hasher.update([registration.kind.canonical_byte()]);
-    length_prefix(&mut hasher, registration.name.as_bytes());
-    length_prefix(&mut hasher, registration.description.as_bytes());
-
-    // Schema as RFC 8785 JCS canonical JSON bytes.
-    let input_json = crate::jcs::to_vec(&registration.schema.input_schema).unwrap_or_default();
-    length_prefix(&mut hasher, &input_json);
-    let output_json = crate::jcs::to_vec(&registration.schema.output_schema).unwrap_or_default();
-    length_prefix(&mut hasher, &output_json);
-
-    hasher.update(registration.implementation_hash);
-
-    // Test vectors: count + hash of each vector's canonical form.
-    #[allow(clippy::cast_possible_truncation)]
-    hasher.update((registration.test_vectors.len() as u32).to_be_bytes());
-    for tv in &registration.test_vectors {
-        let input_bytes = crate::jcs::to_vec(&tv.input).unwrap_or_default();
-        length_prefix(&mut hasher, &input_bytes);
-        let output_bytes = crate::jcs::to_vec(&tv.expected_output).unwrap_or_default();
-        length_prefix(&mut hasher, &output_bytes);
-        length_prefix(&mut hasher, tv.description.as_bytes());
-    }
-
-    length_prefix(&mut hasher, registration.operator_did.as_bytes());
-    hasher.update(registration.registered_at.to_be_bytes());
-
-    // Cost metadata presence flag + contents.
-    match &registration.cost {
-        Some(tc) => {
-            hasher.update([0x01]);
-            hasher.update(tc.amount.to_be_bytes());
-            length_prefix(&mut hasher, tc.currency.as_bytes());
-            match &tc.cost_formula {
-                Some(formula) => {
-                    hasher.update([0x01]);
-                    length_prefix(&mut hasher, formula.as_bytes());
-                }
-                None => hasher.update([0x00]),
-            }
-            length_prefix(&mut hasher, tc.payee.as_bytes());
-        }
-        None => hasher.update([0x00]),
-    }
-
-    hasher.finalize().to_vec()
+    super::hash::compute_outlet_registration_canonical_bytes(registration).to_vec()
 }
 
 /// Verifies the Ed25519 signature on a tool registration.
@@ -834,6 +659,7 @@ mod tests {
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         }
     }
 
@@ -1604,7 +1430,10 @@ mod tests {
     /// AC: serde wire values are `"query"` and `"action"` (lowercase).
     #[test]
     fn outlet_kind_serde_lowercase_strings() {
-        assert_eq!(serde_json::to_string(&OutletKind::Query).unwrap(), "\"query\"");
+        assert_eq!(
+            serde_json::to_string(&OutletKind::Query).unwrap(),
+            "\"query\""
+        );
         assert_eq!(
             serde_json::to_string(&OutletKind::Action).unwrap(),
             "\"action\""
@@ -1746,10 +1575,7 @@ mod tests {
     /// Helper for the four-case validate matrix. Returns a registration
     /// with the requested `kind` and `cost`, schema/`test_vectors` stripped
     /// to keep the test focused on the cost-floor check.
-    fn validate_fixture(
-        kind: OutletKind,
-        cost: Option<OutletCost>,
-    ) -> OutletRegistration {
+    fn validate_fixture(kind: OutletKind, cost: Option<OutletCost>) -> OutletRegistration {
         let mut reg = valid_registration("validate-fixture");
         reg.kind = kind;
         reg.cost = cost;
@@ -1905,7 +1731,10 @@ mod tests {
             "expected QueryCostViolation from register_outlet, got {err:?}"
         );
         // Registry must remain empty — the registration MUST NOT land.
-        assert!(registry.is_empty(), "rejected registration must not be stored");
+        assert!(
+            registry.is_empty(),
+            "rejected registration must not be stored"
+        );
     }
 
     /// Defense-in-depth: [`update_outlet`] rejects flipping a stored Action
@@ -1925,13 +1754,7 @@ mod tests {
             payee: "did:dht:z6MkPayee".into(),
             cost_formula: None,
         });
-        register_outlet(
-            &mut registry,
-            &role_state,
-            original,
-            "did:dht:z6MkCreator",
-        )
-        .unwrap();
+        register_outlet(&mut registry, &role_state, original, "did:dht:z6MkCreator").unwrap();
 
         // Try to update by flipping to Query while keeping the positive
         // cost — must be rejected.

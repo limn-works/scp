@@ -317,10 +317,7 @@ pub trait QueryMisdeclarationSink: Send + Sync {
     /// Records an integrity-failure signal. Implementations must be
     /// non-blocking — emission happens inline with the executor's failed
     /// write attempt and must not stall the invocation.
-    fn record(
-        &self,
-        event: scp_protocol::context::outlets::OutletVerifiedEvent,
-    );
+    fn record(&self, event: scp_protocol::context::outlets::OutletVerifiedEvent);
 }
 
 /// In-memory [`QueryMisdeclarationSink`] backed by a `Mutex<Vec<_>>`. Used
@@ -413,8 +410,7 @@ pub struct ReadOnlyInvocation<'a> {
     economic_policy: Option<&'a scp_protocol::economy::types::EconomicPolicy>,
     /// Optional caveat counter store snapshot — `(member_did, counter_key) ->
     /// current value`. Pure read view; writes go through Action outlets.
-    caveat_counters:
-        Option<&'a std::collections::HashMap<(String, String), u64>>,
+    caveat_counters: Option<&'a std::collections::HashMap<(String, String), u64>>,
 }
 
 impl<'a> ReadOnlyInvocation<'a> {
@@ -433,9 +429,7 @@ impl<'a> ReadOnlyInvocation<'a> {
         events: &'a [scp_event_log::Event],
         epoch: u64,
         economic_policy: Option<&'a scp_protocol::economy::types::EconomicPolicy>,
-        caveat_counters: Option<
-            &'a std::collections::HashMap<(String, String), u64>,
-        >,
+        caveat_counters: Option<&'a std::collections::HashMap<(String, String), u64>>,
     ) -> Self {
         Self {
             context,
@@ -471,11 +465,7 @@ impl<'a> ReadOnlyInvocation<'a> {
     /// Lists all member DIDs currently in the context (PRD AC2).
     #[must_use]
     pub fn list_members(&self) -> Vec<&str> {
-        self.role_state
-            .members
-            .iter()
-            .map(String::as_str)
-            .collect()
+        self.role_state.members.iter().map(String::as_str).collect()
     }
 
     /// Returns the role assigned to `member_did`, if any (PRD AC2).
@@ -727,10 +717,7 @@ impl<'a> MutableInvocation<'a> {
     /// Returns [`OutletExecutorError::QueryViolation`] when this handle's
     /// kind is `Query` (defense-in-depth — the type system normally
     /// prevents this).
-    pub fn send_message(
-        &mut self,
-        payload: serde_json::Value,
-    ) -> Result<(), OutletExecutorError> {
+    pub fn send_message(&mut self, payload: serde_json::Value) -> Result<(), OutletExecutorError> {
         self.guard_kind("send_message")?;
         self.pending.push(MutationIntent::SendMessage { payload });
         Ok(())
@@ -777,10 +764,7 @@ impl<'a> MutableInvocation<'a> {
     ///
     /// Returns [`OutletExecutorError::QueryViolation`] on Query
     /// misdeclaration.
-    pub fn append_event(
-        &mut self,
-        event: serde_json::Value,
-    ) -> Result<(), OutletExecutorError> {
+    pub fn append_event(&mut self, event: serde_json::Value) -> Result<(), OutletExecutorError> {
         self.guard_kind("append_event")?;
         self.pending.push(MutationIntent::AppendEvent { event });
         Ok(())
@@ -885,10 +869,7 @@ impl<'a> MutableInvocation<'a> {
     /// sink (if configured) and returns [`OutletExecutorError::QueryViolation`].
     /// On `Action` kind: returns `Ok(())`.
     fn guard_kind(&self, operation: &'static str) -> Result<(), OutletExecutorError> {
-        if matches!(
-            self.kind,
-            scp_protocol::context::outlets::OutletKind::Query
-        ) {
+        if matches!(self.kind, scp_protocol::context::outlets::OutletKind::Query) {
             if let Some(sink) = self.misdeclaration_sink {
                 sink.record(scp_protocol::context::outlets::OutletVerifiedEvent {
                     outlet_id: self.inner.outlet_id.clone(),
@@ -1053,12 +1034,11 @@ where
     // a stable value even if the registry mutates between dispatch and
     // execution (the registry is not `&mut` here, so it cannot, but the
     // value is also borrowed by the executor closure below).
-    let registration =
-        registry
-            .get(outlet_id)
-            .ok_or_else(|| InvocationError::OutletNotFound {
-                outlet_id: outlet_id.to_owned(),
-            })?;
+    let registration = registry
+        .get(outlet_id)
+        .ok_or_else(|| InvocationError::OutletNotFound {
+            outlet_id: outlet_id.to_owned(),
+        })?;
     let kind = registration.kind;
 
     // Snapshot the events the read handle exposes. The free `invoke_outlet`
@@ -1067,9 +1047,8 @@ where
     // `ContextManager::invoke_outlet_dispatch_with_economy` wires the real
     // snapshot through.
     let empty_events: &[scp_event_log::Event] = &[];
-    let events_snapshot: &[scp_event_log::Event] = economy
-        .as_deref()
-        .map_or(empty_events, |econ| econ.events);
+    let events_snapshot: &[scp_event_log::Event] =
+        economy.as_deref().map_or(empty_events, |econ| econ.events);
 
     // Build the read handle. Borrowing through the closure below carries
     // its lifetime; we extend the borrow scope to cover the executor
@@ -1164,9 +1143,9 @@ where
                             expected: scp_protocol::context::outlets::OutletKind::Action,
                         }
                     )),
-                    Err(OutletExecutorError::QueryViolation { operation }) => Err(format!(
-                        "query violation in exec_action: {operation}"
-                    )),
+                    Err(OutletExecutorError::QueryViolation { operation }) => {
+                        Err(format!("query violation in exec_action: {operation}"))
+                    }
                     Err(OutletExecutorError::Failed(msg)) => Err(msg),
                 }
             }
@@ -2434,6 +2413,7 @@ mod tests {
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         };
         register_outlet(&mut registry, role_state, registration, registrant_did).unwrap();
         registry
@@ -3036,8 +3016,7 @@ mod tests {
 
         // validate_outlet_invocation_ucan expects outlet_call:calculator,
         // but the token only has messages:write — must be rejected.
-        let result =
-            validate_outlet_invocation_ucan(
+        let result = validate_outlet_invocation_ucan(
             &token.encoded,
             "ctx-test",
             "calculator",
@@ -3217,6 +3196,7 @@ mod tests {
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         };
         register_outlet(&mut registry, role_state, registration, registrant_did).unwrap();
         registry
@@ -3257,9 +3237,10 @@ mod tests {
         let invoker: DID = creator_did.into();
         let outlet_id_owned: OutletId = "query-tool".to_owned();
         let events: Vec<scp_event_log::Event> = Vec::new();
-        let counters = std::collections::HashMap::from([
-            (("did:dht:z6MkCreator".to_owned(), "spend".to_owned()), 7u64),
-        ]);
+        let counters = std::collections::HashMap::from([(
+            ("did:dht:z6MkCreator".to_owned(), "spend".to_owned()),
+            7u64,
+        )]);
         let read = super::ReadOnlyInvocation::new(
             &context,
             &role_state,
@@ -3333,11 +3314,7 @@ mod tests {
                 .send_message(serde_json::json!({"text": "hi"}))
                 .is_ok()
         );
-        assert!(
-            mutable
-                .assign_role("did:dht:z6MkOther", "member")
-                .is_ok()
-        );
+        assert!(mutable.assign_role("did:dht:z6MkOther", "member").is_ok());
         assert!(
             mutable
                 .register_outlet(serde_json::json!({"id": "new-outlet"}))
@@ -3358,8 +3335,16 @@ mod tests {
                 .cast_governance_vote("prop-1", serde_json::json!("yes"))
                 .is_ok()
         );
-        assert!(mutable.debit_economic_ledger("did:dht:z6MkCreator", 5).is_ok());
-        assert!(mutable.credit_economic_ledger("did:dht:z6MkCreator", 5).is_ok());
+        assert!(
+            mutable
+                .debit_economic_ledger("did:dht:z6MkCreator", 5)
+                .is_ok()
+        );
+        assert!(
+            mutable
+                .credit_economic_ledger("did:dht:z6MkCreator", 5)
+                .is_ok()
+        );
         assert!(mutable.increment_caveat_counter("k", 1).is_ok());
 
         let pending = mutable.take_pending_mutations();
@@ -3478,7 +3463,9 @@ mod tests {
         let mut mutable = super::MutableInvocation::new(read, OutletKind::Action, None);
 
         let executor = OnlyQuery;
-        let result = executor.exec_action(&mut mutable, serde_json::json!({})).await;
+        let result = executor
+            .exec_action(&mut mutable, serde_json::json!({}))
+            .await;
         assert!(
             matches!(
                 result,
@@ -3755,7 +3742,10 @@ mod tests {
         assert_eq!(drained.len(), 9, "9 refused operations → 9 signals");
         for event in &drained {
             assert!(!event.integrity_ok);
-            assert_eq!(event.reason, Some(OutletVerifiedReason::QueryMisdeclaration));
+            assert_eq!(
+                event.reason,
+                Some(OutletVerifiedReason::QueryMisdeclaration)
+            );
             assert_eq!(event.outlet_id, "calculator");
         }
     }

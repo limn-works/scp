@@ -143,8 +143,10 @@ async fn send_message_transport_failure_no_phantom_event() {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -374,9 +376,12 @@ async fn setup_two_member_verified_context() -> (
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
             Capability::MemberBan,
         ],
         ..ContextParams::default()
@@ -664,9 +669,12 @@ async fn revoked_member_cannot_decrypt_new_messages() {
 
     let bob_params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
             Capability::MemberBan,
         ],
         ..ContextParams::default()
@@ -1326,8 +1334,10 @@ async fn send_message_produces_valid_outer_envelope() {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -1580,8 +1590,10 @@ async fn velocity_consequence_trigger_on_send() {
 
     let mut params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -2506,6 +2518,7 @@ fn strict_output_tool_registration(id: &str) -> OutletRegistration {
         cost: None,
         registered_at: 0,
         signature: Vec::new(),
+        message_catalog: Vec::new(),
     }
 }
 
@@ -3389,8 +3402,10 @@ async fn capture_send_payment_success_no_failure_event() {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
         ],
         economic_policy: Some(policy),
         ..ContextParams::default()
@@ -3660,9 +3675,12 @@ async fn setup_two_member_context_with(
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
             Capability::MemberBan,
         ],
         ..ContextParams::default()
@@ -4512,8 +4530,10 @@ async fn send_message_encrypted_uses_pseudonym_fanout() {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -4791,8 +4811,7 @@ async fn manager_dispatch_routes_action_outlet_through_exec_action() {
     use scp_protocol::context::outlets::registry::OutletRegistry;
 
     use crate::context::outlets::invoke::{
-        MutableInvocation, MutationIntent, OutletExecutor, OutletExecutorError,
-        ReadOnlyInvocation,
+        MutableInvocation, MutationIntent, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
     };
 
     let manager = ContextManager::new(
@@ -4920,13 +4939,11 @@ async fn manager_dispatch_query_outlet_misdeclared_emits_signal() {
         }
     });
     // test vector matches the new schemas
-    reg.test_vectors = vec![
-        scp_protocol::context::outlets::registry::OutletTestVector {
-            input: serde_json::json!({"q": 1, "scope": "a"}),
-            expected_output: serde_json::json!({"ok": true, "data": null}),
-            description: "noop".to_owned(),
-        },
-    ];
+    reg.test_vectors = vec![scp_protocol::context::outlets::registry::OutletTestVector {
+        input: serde_json::json!({"q": 1, "scope": "a"}),
+        expected_output: serde_json::json!({"ok": true, "data": null}),
+        description: "noop".to_owned(),
+    }];
     registry.insert(reg);
 
     struct ActionOnly;

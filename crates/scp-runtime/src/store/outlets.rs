@@ -119,11 +119,7 @@ impl<S: Storage> ProtocolRepository<S> {
     /// # Errors
     ///
     /// Returns [`StoreError::Storage`] if the underlying storage delete fails.
-    pub async fn delete_outlet(
-        &self,
-        context_id: &str,
-        outlet_id: &str,
-    ) -> Result<(), StoreError> {
+    pub async fn delete_outlet(&self, context_id: &str, outlet_id: &str) -> Result<(), StoreError> {
         let key = outlet_key(context_id, outlet_id)?;
         self.storage.delete(&key).await?;
         Ok(())

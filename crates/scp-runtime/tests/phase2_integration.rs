@@ -351,6 +351,7 @@ async fn phase2_end_to_end_integration() {
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         }],
         ttl: Some(Duration::from_mins(5)), // 5 minutes
         memory_scope: MemoryScope::Ephemeral,
@@ -407,6 +408,7 @@ async fn phase2_end_to_end_integration() {
         cost: None,
         registered_at: 0,
         signature: Vec::new(),
+        message_catalog: Vec::new(),
     };
     let (outlet_id, _tool_registered_event) = register_outlet(
         &mut outlet_registry,

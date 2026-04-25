@@ -317,10 +317,14 @@ async fn setup_context_with_member_remove() -> (ContextManager, ContextHandle) {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
-            scp_protocol::context::params::Capability::new("member:remove").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("member:remove")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -446,9 +450,12 @@ async fn concurrent_joins_and_sends_do_not_corrupt_state() {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -520,9 +527,12 @@ async fn panic_does_not_poison_mutex() {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -702,9 +712,12 @@ async fn persist_drop_restore_roundtrip() {
         mode: ContextMode::Broadcast,
         memory_scope: scp_protocol::context::MemoryScope::Full,
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -839,9 +852,12 @@ async fn restore_preserves_executed_proposals() {
         mode: ContextMode::Broadcast,
         memory_scope: scp_protocol::context::MemoryScope::Full,
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -961,9 +977,12 @@ async fn restore_respawns_ttl_timer() {
     let params = ContextParams {
         ttl: Some(std::time::Duration::from_mins(5)),
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -1513,9 +1532,12 @@ async fn restore_preserves_spending_nonce_tracker_across_restart() {
         mode: ContextMode::Encrypted,
         memory_scope: scp_protocol::context::MemoryScope::Full,
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
-            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -2626,8 +2648,10 @@ async fn auto_accept_blocked_by_economics_rejects_join() {
 
     let mut params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -2710,8 +2734,10 @@ async fn budget_exceeded_on_join_rejects() {
 
     let mut params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -2965,8 +2991,10 @@ async fn capture_join_payment_failure_appends_event_log_entry() {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -3493,8 +3521,10 @@ async fn restore_context_preserves_budget_tracker() {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -3575,8 +3605,10 @@ async fn restore_context_validates_consequence_rules() {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
-            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:read")
+                .expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write")
+                .expect("known capability"),
         ],
         ..ContextParams::default()
     };

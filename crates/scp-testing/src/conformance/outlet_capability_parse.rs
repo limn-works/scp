@@ -89,8 +89,8 @@ pub fn fixture_path() -> PathBuf {
 #[must_use]
 pub fn load_fixture() -> OutletCapabilityParseFixture {
     let path = fixture_path();
-    let bytes = std::fs::read(&path)
-        .unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
+    let bytes =
+        std::fs::read(&path).unwrap_or_else(|e| panic!("read fixture {}: {e}", path.display()));
     serde_json::from_slice::<OutletCapabilityParseFixture>(&bytes)
         .unwrap_or_else(|e| panic!("parse fixture {}: {e}", path.display()))
 }

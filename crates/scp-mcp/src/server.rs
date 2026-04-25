@@ -874,7 +874,7 @@ mod tests {
         contexts: Vec<ContextId>,
         agent_did: String,
         roles: Vec<(String, String)>,               // (context_id, role)
-        tools: Vec<(String, ContextOutletInfo)>,      // (context_id, tool)
+        tools: Vec<(String, ContextOutletInfo)>,    // (context_id, tool)
         denied_capabilities: Vec<(String, String)>, // (context_id, tool_name)
         invoke_result: Result<Value, String>,
         members: Vec<(String, MemberInfo)>,

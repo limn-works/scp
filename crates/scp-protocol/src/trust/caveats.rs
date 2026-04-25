@@ -86,9 +86,7 @@ pub const CAVEAT_MINT_LIMIT_EXCEEDED_CODE: &str = "SCP-TOOL-6114";
 /// Serialization is transparent: the wire encoding is the inner `u32`, so
 /// `MessagePack` and JSON treat the mask exactly like a plain unsigned 32-bit
 /// integer. Round-trips through `from_bits` re-validate the width invariant.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HoursOfDayMask(u32);
 
@@ -149,9 +147,7 @@ impl HoursOfDayMask {
 /// Serialization is transparent: the wire encoding is the inner `u8`, so
 /// `MessagePack` and JSON treat the mask exactly like a plain unsigned 8-bit
 /// integer. Round-trips through `from_bits` re-validate the width invariant.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct DaysOfWeekMask(u8);
 
@@ -260,11 +256,19 @@ pub struct RateWindow {
 #[serde(deny_unknown_fields)]
 pub struct InvocationCaveats {
     /// Per-invocation economic ceiling (§19).
-    #[serde(rename = "amountMaxPerCall", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "amountMaxPerCall",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub amount_max_per_call: Option<Amount>,
 
     /// Cumulative ceiling across invocations.
-    #[serde(rename = "amountMaxCumulative", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "amountMaxCumulative",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub amount_max_cumulative: Option<Amount>,
 
     /// Unix seconds; tighter than UCAN `nbf`.
@@ -272,15 +276,27 @@ pub struct InvocationCaveats {
     pub valid_from: Option<u64>,
 
     /// Unix seconds; tighter than UCAN `exp`.
-    #[serde(rename = "validUntil", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "validUntil",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub valid_until: Option<u64>,
 
     /// 24-bit UTC-hour mask. See [`HoursOfDayMask`].
-    #[serde(rename = "hoursOfDay", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "hoursOfDay",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub hours_of_day: Option<HoursOfDayMask>,
 
     /// 7-bit weekday mask. See [`DaysOfWeekMask`].
-    #[serde(rename = "daysOfWeek", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "daysOfWeek",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub days_of_week: Option<DaysOfWeekMask>,
 
     /// Absolute invocation cap.
@@ -288,22 +304,38 @@ pub struct InvocationCaveats {
     pub max_calls: Option<u64>,
 
     /// Sliding-window rate cap.
-    #[serde(rename = "rateWindow", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "rateWindow",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub rate_window: Option<RateWindow>,
 
     /// Partial JSON Schema narrowing the parent's `input_schema`.
     /// Restricted by [`MAX_INPUT_SCHEMA_BYTES`] and
     /// [`MAX_INPUT_SCHEMA_DEPTH`]. Conservative narrowing keywords only
     /// (§7.3.8 conservative JSON Schema narrowing).
-    #[serde(rename = "inputSchema", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "inputSchema",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub input_schema: Option<serde_json::Value>,
 
     /// Restrict invocations to a subset of payment adapters (§19.2).
-    #[serde(rename = "allowedAdapters", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "allowedAdapters",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub allowed_adapters: Option<Vec<PaymentAdapterRef>>,
 
     /// Restrict cross-context invocations to a subset of peer DIDs (§6.2).
-    #[serde(rename = "allowedTargetDids", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "allowedTargetDids",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub allowed_target_dids: Option<Vec<DID>>,
 
     /// §6.2.0.3 amplification — MUST equal the parent's `origin_kind` at
@@ -313,7 +345,11 @@ pub struct InvocationCaveats {
     /// inference is unambiguous. EVERY non-root delegation MUST materialize
     /// an explicit value — a non-root with `origin_kind = None` fails
     /// `narrow()` (SCP-OUT-019) with [`AttenuationViolation::OriginKindUnspecified`].
-    #[serde(rename = "originKind", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        rename = "originKind",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub origin_kind: Option<OutletKind>,
 }
 
@@ -408,28 +444,31 @@ impl InvocationCaveats {
         }
 
         if let Some(window) = &caveats.rate_window
-            && (window.window_secs == 0 || window.window_secs > MAX_RATE_WINDOW_SECS) {
-                return Err(CaveatMintError::RateWindowSecsOutOfRange {
-                    window_secs: window.window_secs,
-                });
-            }
+            && (window.window_secs == 0 || window.window_secs > MAX_RATE_WINDOW_SECS)
+        {
+            return Err(CaveatMintError::RateWindowSecsOutOfRange {
+                window_secs: window.window_secs,
+            });
+        }
 
         if let Some(adapters) = &caveats.allowed_adapters
-            && adapters.len() > MAX_LIST_ENTRIES {
-                return Err(CaveatMintError::ListTooLong {
-                    field: "allowedAdapters",
-                    len: adapters.len(),
-                    cap: MAX_LIST_ENTRIES,
-                });
-            }
+            && adapters.len() > MAX_LIST_ENTRIES
+        {
+            return Err(CaveatMintError::ListTooLong {
+                field: "allowedAdapters",
+                len: adapters.len(),
+                cap: MAX_LIST_ENTRIES,
+            });
+        }
         if let Some(dids) = &caveats.allowed_target_dids
-            && dids.len() > MAX_LIST_ENTRIES {
-                return Err(CaveatMintError::ListTooLong {
-                    field: "allowedTargetDids",
-                    len: dids.len(),
-                    cap: MAX_LIST_ENTRIES,
-                });
-            }
+            && dids.len() > MAX_LIST_ENTRIES
+        {
+            return Err(CaveatMintError::ListTooLong {
+                field: "allowedTargetDids",
+                len: dids.len(),
+                cap: MAX_LIST_ENTRIES,
+            });
+        }
 
         if let Some(schema) = &caveats.input_schema {
             check_input_schema_size_and_depth(schema)?;
@@ -514,12 +553,10 @@ impl InvocationCaveats {
         };
 
         if let (Some(declared), Some(inferred)) = (caveats.origin_kind, inferred_kind)
-            && declared != inferred {
-                return Err(CaveatMintError::OriginKindStemMismatch {
-                    declared,
-                    inferred,
-                });
-            }
+            && declared != inferred
+        {
+            return Err(CaveatMintError::OriginKindStemMismatch { declared, inferred });
+        }
 
         // Run the structural mint check.
         Self::try_new(caveats)
@@ -539,8 +576,7 @@ impl InvocationCaveats {
     /// value tree (e.g., embedded non-finite floats — JSON has no IEEE 754
     /// special-value encoding).
     pub fn to_canonical_json_bytes(&self) -> Result<Vec<u8>, CaveatSerError> {
-        let value =
-            serde_json::to_value(self).map_err(|e| CaveatSerError::Json(e.to_string()))?;
+        let value = serde_json::to_value(self).map_err(|e| CaveatSerError::Json(e.to_string()))?;
         serde_json_canonicalizer::to_string(&value)
             .map(String::into_bytes)
             .map_err(|e| CaveatSerError::Json(e.to_string()))
@@ -569,13 +605,15 @@ impl InvocationCaveats {
 /// outside its legal range.
 pub const fn assert_mask_widths(caveats: &InvocationCaveats) -> Result<(), MaskWidthError> {
     if let Some(mask) = caveats.hours_of_day
-        && mask.bits() & !HoursOfDayMask::VALID_BITS != 0 {
-            return Err(MaskWidthError::HoursOfDayHighBitsSet { bits: mask.bits() });
-        }
+        && mask.bits() & !HoursOfDayMask::VALID_BITS != 0
+    {
+        return Err(MaskWidthError::HoursOfDayHighBitsSet { bits: mask.bits() });
+    }
     if let Some(mask) = caveats.days_of_week
-        && mask.bits() & !DaysOfWeekMask::VALID_BITS != 0 {
-            return Err(MaskWidthError::DaysOfWeekHighBitSet { bits: mask.bits() });
-        }
+        && mask.bits() & !DaysOfWeekMask::VALID_BITS != 0
+    {
+        return Err(MaskWidthError::DaysOfWeekHighBitSet { bits: mask.bits() });
+    }
     Ok(())
 }
 
@@ -589,18 +627,10 @@ pub const fn assert_mask_widths(caveats: &InvocationCaveats) -> Result<(), MaskW
 fn schema_nesting_depth(value: &serde_json::Value) -> usize {
     match value {
         serde_json::Value::Object(map) => {
-            1 + map
-                .values()
-                .map(schema_nesting_depth)
-                .max()
-                .unwrap_or(0)
+            1 + map.values().map(schema_nesting_depth).max().unwrap_or(0)
         }
         serde_json::Value::Array(items) => {
-            1 + items
-                .iter()
-                .map(schema_nesting_depth)
-                .max()
-                .unwrap_or(0)
+            1 + items.iter().map(schema_nesting_depth).max().unwrap_or(0)
         }
         _ => 0,
     }
@@ -609,8 +639,11 @@ fn schema_nesting_depth(value: &serde_json::Value) -> usize {
 /// Validates the `input_schema` size and depth caps. The size check uses the
 /// canonical (JCS) byte length so the limit is reproducible across SDKs.
 fn check_input_schema_size_and_depth(value: &serde_json::Value) -> Result<(), CaveatMintError> {
-    let canonical = serde_json_canonicalizer::to_string(value)
-        .map_err(|e| CaveatMintError::SchemaSerializationFailed { reason: e.to_string() })?;
+    let canonical = serde_json_canonicalizer::to_string(value).map_err(|e| {
+        CaveatMintError::SchemaSerializationFailed {
+            reason: e.to_string(),
+        }
+    })?;
     let size = canonical.len();
     if size > MAX_INPUT_SCHEMA_BYTES {
         return Err(CaveatMintError::SchemaTooLarge {
@@ -643,7 +676,9 @@ pub enum CaveatMintError {
     /// More than [`MAX_POPULATED_CAVEATS`] non-`origin_kind` caveats are
     /// populated. `origin_kind` is exempt per §7.3.8 mint-limits.
     /// Slug: `caveat-mint-limit-exceeded`.
-    #[error("caveat-mint-limit-exceeded: {populated} populated non-origin_kind caveats exceeds cap {cap}")]
+    #[error(
+        "caveat-mint-limit-exceeded: {populated} populated non-origin_kind caveats exceeds cap {cap}"
+    )]
     TooManyCaveats {
         /// The actual populated count.
         populated: usize,
@@ -704,7 +739,9 @@ pub enum CaveatMintError {
     /// newtype constructor was bypassed (e.g., a corrupted wire value or
     /// a test harness using the `_unchecked_for_tests` constructor) since
     /// `from_bits` rejects the same input.
-    #[error("hours-of-day-high-bits-set: HoursOfDayMask carries bits outside 0..=23 (raw 0x{bits:08x})")]
+    #[error(
+        "hours-of-day-high-bits-set: HoursOfDayMask carries bits outside 0..=23 (raw 0x{bits:08x})"
+    )]
     HoursOfDayHighBitsSet {
         /// The actual raw bit pattern.
         bits: u32,
@@ -713,7 +750,9 @@ pub enum CaveatMintError {
     /// `days_of_week` newtype carries bits outside the legal `0x7F` range.
     /// Slug: `days-of-week-high-bit-set`. See [`Self::HoursOfDayHighBitsSet`]
     /// for reachability notes.
-    #[error("days-of-week-high-bit-set: DaysOfWeekMask carries bits outside 0..=6 (raw 0x{bits:02x})")]
+    #[error(
+        "days-of-week-high-bit-set: DaysOfWeekMask carries bits outside 0..=6 (raw 0x{bits:02x})"
+    )]
     DaysOfWeekHighBitSet {
         /// The actual raw bit pattern.
         bits: u8,
@@ -722,7 +761,9 @@ pub enum CaveatMintError {
     /// On a root token, `origin_kind` was explicitly declared but disagrees
     /// with the inferred kind from the stem family. Slug:
     /// `origin-kind-stem-mismatch`.
-    #[error("origin-kind-stem-mismatch: caveats.origin_kind = {declared:?} disagrees with inferred kind {inferred:?}")]
+    #[error(
+        "origin-kind-stem-mismatch: caveats.origin_kind = {declared:?} disagrees with inferred kind {inferred:?}"
+    )]
     OriginKindStemMismatch {
         /// The declared `origin_kind` value.
         declared: OutletKind,
@@ -736,7 +777,9 @@ pub enum CaveatMintError {
     /// unconditionally per §7.3.8 round-3 because a mixed-stem root with
     /// `origin_kind = None` could be exercised at one hop under one kind
     /// and at a downstream hop under the other.
-    #[error("origin-kind-mixed-stem-root: root token capability set contains both outlet_query and outlet_call stems")]
+    #[error(
+        "origin-kind-mixed-stem-root: root token capability set contains both outlet_query and outlet_call stems"
+    )]
     OriginKindMixedStemRoot,
 }
 
@@ -819,7 +862,9 @@ pub enum AttenuationViolation {
     /// A non-root delegation's `origin_kind` is `None`. §7.3.8 rule (4)
     /// requires every non-root delegation to materialize an explicit
     /// value — inheritance is explicit, not ambient.
-    #[error("origin_kind unspecified on non-root delegation (parent {parent:?}); rule §7.3.8 (4) requires explicit materialization")]
+    #[error(
+        "origin_kind unspecified on non-root delegation (parent {parent:?}); rule §7.3.8 (4) requires explicit materialization"
+    )]
     OriginKindUnspecified {
         /// The parent's declared `origin_kind` (informational; the rule
         /// fires regardless of parent value).
@@ -852,11 +897,7 @@ pub enum CaveatSerError {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic
-)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::context::roles::Capability;
@@ -981,7 +1022,10 @@ mod tests {
             hours_of_day: Some(HoursOfDayMask::from_bits(0x00FF_FFFF).unwrap()),
             days_of_week: Some(DaysOfWeekMask::from_bits(0x7F).unwrap()),
             max_calls: Some(10_000),
-            rate_window: Some(RateWindow { max: 60, window_secs: 60 }),
+            rate_window: Some(RateWindow {
+                max: 60,
+                window_secs: 60,
+            }),
             input_schema: None,
             allowed_adapters: None,
             allowed_target_dids: None,
@@ -1005,11 +1049,23 @@ mod tests {
         let mut caveats = caveats_with_eight_non_origin_fields();
         caveats.input_schema = Some(json!({"type": "string"}));
         let err = InvocationCaveats::try_new(caveats.clone()).unwrap_err();
-        assert!(matches!(err, CaveatMintError::TooManyCaveats { populated: 9, cap: 8 }));
+        assert!(matches!(
+            err,
+            CaveatMintError::TooManyCaveats {
+                populated: 9,
+                cap: 8
+            }
+        ));
         // Setting origin_kind to a value does not save it.
         caveats.origin_kind = Some(OutletKind::Action);
         let err = InvocationCaveats::try_new(caveats).unwrap_err();
-        assert!(matches!(err, CaveatMintError::TooManyCaveats { populated: 9, cap: 8 }));
+        assert!(matches!(
+            err,
+            CaveatMintError::TooManyCaveats {
+                populated: 9,
+                cap: 8
+            }
+        ));
     }
 
     #[test]
@@ -1076,11 +1132,7 @@ mod tests {
     #[test]
     fn try_new_rejects_overlong_allowed_target_dids() {
         let caveats = InvocationCaveats {
-            allowed_target_dids: Some(
-                (0..20)
-                    .map(|i| DID(format!("did:dht:z6Mk{i}")))
-                    .collect(),
-            ),
+            allowed_target_dids: Some((0..20).map(|i| DID(format!("did:dht:z6Mk{i}"))).collect()),
             ..InvocationCaveats::empty()
         };
         let err = InvocationCaveats::try_new(caveats).unwrap_err();
@@ -1097,7 +1149,10 @@ mod tests {
     #[test]
     fn try_new_rejects_rate_window_secs_zero_or_too_large() {
         let caveats = InvocationCaveats {
-            rate_window: Some(RateWindow { max: 1, window_secs: 0 }),
+            rate_window: Some(RateWindow {
+                max: 1,
+                window_secs: 0,
+            }),
             ..InvocationCaveats::empty()
         };
         assert!(matches!(
@@ -1201,8 +1256,8 @@ mod tests {
             Capability::OutletQuery("foo".to_owned()),
             Capability::OutletCall("bar".to_owned()),
         ];
-        let err = InvocationCaveats::try_new_for_root(InvocationCaveats::empty(), &stems)
-            .unwrap_err();
+        let err =
+            InvocationCaveats::try_new_for_root(InvocationCaveats::empty(), &stems).unwrap_err();
         assert!(matches!(err, CaveatMintError::OriginKindMixedStemRoot));
         assert_eq!(err.slug(), "origin-kind-mixed-stem-root");
 
@@ -1273,10 +1328,17 @@ mod tests {
     fn caveat_mint_error_has_all_required_variants() {
         // Compile-time check that each variant exists. A missing variant
         // makes the test fail to compile.
-        let _ = CaveatMintError::TooManyCaveats { populated: 0, cap: 0 };
+        let _ = CaveatMintError::TooManyCaveats {
+            populated: 0,
+            cap: 0,
+        };
         let _ = CaveatMintError::SchemaTooLarge { size: 0, cap: 0 };
         let _ = CaveatMintError::SchemaTooDeep { depth: 0, cap: 0 };
-        let _ = CaveatMintError::ListTooLong { field: "x", len: 0, cap: 0 };
+        let _ = CaveatMintError::ListTooLong {
+            field: "x",
+            len: 0,
+            cap: 0,
+        };
         let _ = CaveatMintError::HoursOfDayHighBitsSet { bits: 0 };
         let _ = CaveatMintError::DaysOfWeekHighBitSet { bits: 0 };
         let _ = CaveatMintError::OriginKindStemMismatch {
@@ -1295,8 +1357,7 @@ mod tests {
         let _ = AttenuationViolation::OriginKindUnspecified {
             parent: Some(OutletKind::Query),
         };
-        let _ =
-            AttenuationViolation::MaskWidth(MaskWidthError::HoursOfDayHighBitsSet { bits: 0 });
+        let _ = AttenuationViolation::MaskWidth(MaskWidthError::HoursOfDayHighBitsSet { bits: 0 });
     }
 
     #[test]

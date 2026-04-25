@@ -43,22 +43,34 @@
 //! - [`OutletCancel`] -- Cancellation request. (Re-exported from [`lifecycle`].)
 
 pub mod errors;
+pub mod hash;
 pub mod integrity;
 pub mod interface;
 pub mod lifecycle;
+pub mod message_catalog;
+pub mod registration;
 pub mod registry;
 pub mod schema;
 pub mod summary;
 
 use crate::context::roles;
 
+pub use hash::{
+    OUTLET_REGISTRATION_V2_DOMAIN, catalog_hash, compute_outlet_registration_canonical_bytes,
+    cost_hash, description_hash, outlet_registration_v2_preimage, schema_hash, test_vectors_hash,
+};
 pub use lifecycle::{
     DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, OutletCancel, OutletErrorCode, OutletExecutionError,
     OutletInvokedEvent, OutletRequest, OutletResponse, OutletStatus, Provenance, sha256_json,
 };
+pub use message_catalog::{
+    CATALOG_MAX_ENTRIES, MessageTemplate, MessageTemplateError, TEMPLATE_MAX_BYTES,
+    canonical_catalog_messagepack, empty_catalog_messagepack,
+};
+pub use registration::{OutletRegistration, RegistrationError};
 pub use registry::{
-    OutletCost, OutletRegistration, OutletRegistry, OutletSchema, OutletTestVector,
-    OutletVerificationResult, VectorResult, register_outlet, update_outlet, verify_outlet,
+    OutletCost, OutletRegistry, OutletSchema, OutletTestVector, OutletVerificationResult,
+    VectorResult, register_outlet, update_outlet, verify_outlet,
 };
 pub use schema::{SchemaValidationError, validate_schema, validate_value_against_schema};
 

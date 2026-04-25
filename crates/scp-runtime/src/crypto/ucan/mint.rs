@@ -267,8 +267,8 @@ pub async fn mint_ucan(
             // `MalformedToken` rather than silently degrading to a
             // `Custom` capability. This is the parser-differential
             // guard required by SCP-OUT-014.
-            let capability = scp_protocol::context::roles::Capability::new(cap)
-                .ok_or_else(|| {
+            let capability =
+                scp_protocol::context::roles::Capability::new(cap).ok_or_else(|| {
                     UcanError::MalformedToken(format!(
                         "invalid capability name {cap:?} (fails §5.4.2.1 parser)"
                     ))

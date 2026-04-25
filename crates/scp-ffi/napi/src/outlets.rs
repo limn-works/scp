@@ -342,6 +342,7 @@ pub async fn outlet_register(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
         signature: Vec::new(),
+        message_catalog: Vec::new(),
     };
 
     // Register the tool in the context's tool registry.
@@ -1303,6 +1304,7 @@ fn build_outlet_registration_from_napi(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
         signature: Vec::new(),
+        message_catalog: Vec::new(),
     })
 }
 

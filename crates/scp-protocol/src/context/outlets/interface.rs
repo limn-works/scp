@@ -1075,12 +1075,11 @@ pub fn expose_tool(
     // the kind from the *registered* outlet (not a parameter) means the
     // tier always matches the declaration the source context committed
     // to at registration time.
-    let registration =
-        registry
-            .get(outlet_id)
-            .ok_or_else(|| OutletError::OutletNotFound {
-                outlet_id: outlet_id.to_owned(),
-            })?;
+    let registration = registry
+        .get(outlet_id)
+        .ok_or_else(|| OutletError::OutletNotFound {
+            outlet_id: outlet_id.to_owned(),
+        })?;
     let kind = registration.kind;
 
     let defaults = OutletInterfaceDefaults::for_kind(kind);
@@ -1291,9 +1290,10 @@ pub fn accept_tool_interface_with_kind(
     // and `kind` is supplied, defaults are derived from the kind via
     // `InboundPolicy::for_kind` — Query → 600/min, Action → 60/min. When
     // both are `None`, falls back to the §5.4.2 fail-safe Action default.
-    interface.inbound_policy = Some(inbound_policy.unwrap_or_else(|| {
-        kind.map_or_else(InboundPolicy::default, InboundPolicy::for_kind)
-    }));
+    interface.inbound_policy = Some(
+        inbound_policy
+            .unwrap_or_else(|| kind.map_or_else(InboundPolicy::default, InboundPolicy::for_kind)),
+    );
     Ok(())
 }
 
@@ -1668,6 +1668,7 @@ mod tests {
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         };
         register_outlet(&mut registry, role_state, registration, registrant_did).unwrap();
         registry
@@ -2768,6 +2769,7 @@ mod tests {
                 cost: None,
                 registered_at: 0,
                 signature: Vec::new(),
+                message_catalog: Vec::new(),
             },
             outbound_policy: OutboundPolicy::default(),
             expires_at: 1000 + OFFER_EXPIRY_MS,
@@ -3439,6 +3441,7 @@ mod tests {
             cost: None,
             registered_at: 0,
             signature: Vec::new(),
+            message_catalog: Vec::new(),
         }
     }
 
@@ -4039,16 +4042,16 @@ mod tests {
     fn ac2_interface_established_messagepack_roundtrip_byte_identical() {
         let original = sample_interface_established();
 
-        let bytes = rmp_serde::to_vec(&original)
-            .expect("InterfaceEstablished must MessagePack-serialize");
+        let bytes =
+            rmp_serde::to_vec(&original).expect("InterfaceEstablished must MessagePack-serialize");
         let decoded: InterfaceEstablished = rmp_serde::from_slice(&bytes)
             .expect("InterfaceEstablished must MessagePack-deserialize");
 
         assert_eq!(decoded, original, "decoded value must equal original");
 
         // Re-serialize the decoded value — bytes must be byte-identical.
-        let bytes2 = rmp_serde::to_vec(&decoded)
-            .expect("re-serializing the decoded value must succeed");
+        let bytes2 =
+            rmp_serde::to_vec(&decoded).expect("re-serializing the decoded value must succeed");
         assert_eq!(
             bytes, bytes2,
             "re-serialized bytes must match the original (byte-for-byte field preservation)"
@@ -4061,9 +4064,7 @@ mod tests {
     /// payload bytes.
     #[test]
     fn ac3_interface_established_event_log_roundtrip_byte_identical() {
-        use scp_event_log::test_helpers::{
-            did_from_pubkey, sign_event, test_keypair,
-        };
+        use scp_event_log::test_helpers::{did_from_pubkey, sign_event, test_keypair};
         use scp_event_log::tree::GENESIS_PREV_HASH;
         use scp_event_log::{EventLog, EventType, tree};
 
@@ -4071,8 +4072,8 @@ mod tests {
         let actor_did = did_from_pubkey(&verifying_key);
 
         let evt = sample_interface_established();
-        let payload_bytes = rmp_serde::to_vec(&evt)
-            .expect("InterfaceEstablished must MessagePack-serialize");
+        let payload_bytes =
+            rmp_serde::to_vec(&evt).expect("InterfaceEstablished must MessagePack-serialize");
 
         let mut log = EventLog::new("ctx-source-A".to_owned());
         let signed = sign_event(
@@ -4094,8 +4095,9 @@ mod tests {
             "payload bytes must round-trip through EventLog::get_event byte-identically"
         );
 
-        let decoded: InterfaceEstablished = rmp_serde::from_slice(&retrieved.payload.data)
-            .expect("retrieved payload must MessagePack-deserialize back into InterfaceEstablished");
+        let decoded: InterfaceEstablished = rmp_serde::from_slice(&retrieved.payload.data).expect(
+            "retrieved payload must MessagePack-deserialize back into InterfaceEstablished",
+        );
         assert_eq!(
             decoded, evt,
             "round-tripped InterfaceEstablished must equal the original"
