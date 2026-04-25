@@ -52,9 +52,17 @@ const PYO3_MEDIA: &str = include_str!("../../../../crates/scp-ffi/src/media.rs")
 // files above still contain these methods on PyScp; `scp.rs` holds the
 // lifecycle surface (new / with_storage / suspend / resume / shutdown).
 const PYO3_SCP: &str = include_str!("../../../../crates/scp-ffi/src/scp.rs");
+// PyO3 surface for `scpid_*` (challenge/sign/verify) and the server lifecycle
+// (start_in_memory / start_local / enable_site_projection / disable_site_projection).
+// Both files were not previously embedded — Batch 2 (#1543) folds them in so
+// SCPID and site-projection canonicals can resolve.
+const PYO3_SCPID: &str = include_str!("../../../../crates/scp-ffi/src/scpid.rs");
+const PYO3_SERVER: &str = include_str!("../../../../crates/scp-ffi/src/server.rs");
 
-// UniFFI bridge (single file)
+// UniFFI bridge (single file) plus the server module that hosts UniFFI's
+// site-projection methods (enable/disable_site_projection on the Server type).
 const UNIFFI_BRIDGE: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
+const UNIFFI_SERVER: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/server.rs");
 
 // NAPI bridge sources
 const NAPI_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/napi/src/identity.rs");
@@ -76,6 +84,9 @@ const NAPI_MEDIA: &str = include_str!("../../../../crates/scp-ffi/napi/src/media
 // methods in `scp.rs`. The per-category source files retain helpers and types,
 // but the canonical bridge surface now lives on the `Scp` struct.
 const NAPI_SCP: &str = include_str!("../../../../crates/scp-ffi/napi/src/scp.rs");
+// NAPI server module hosts `enable_site_projection` / `disable_site_projection`
+// methods on the `Server` type — added in Batch 2 (#1543).
+const NAPI_SERVER: &str = include_str!("../../../../crates/scp-ffi/napi/src/server.rs");
 
 // WASM bridge sources
 const WASM_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/wasm/src/identity.rs");
@@ -89,6 +100,9 @@ const WASM_PROVENANCE: &str = include_str!("../../../../crates/scp-ffi/wasm/src/
 const WASM_DISCOVERY: &str = include_str!("../../../../crates/scp-ffi/wasm/src/discovery.rs");
 const WASM_TRUST: &str = include_str!("../../../../crates/scp-ffi/wasm/src/trust.rs");
 const WASM_ECONOMY: &str = include_str!("../../../../crates/scp-ffi/wasm/src/economy.rs");
+// WASM SCPID module hosts `scpid_challenge` / `scpid_sign` (verify is exempt
+// per ADR-034 — see crates/scp-ffi/wasm/src/scpid.rs:11). Added in Batch 2 (#1543).
+const WASM_SCPID: &str = include_str!("../../../../crates/scp-ffi/wasm/src/scpid.rs");
 
 // ---------------------------------------------------------------------------
 // Shared alias table — compiled in at build time from scripts/bridge-aliases.json
@@ -483,9 +497,12 @@ fn pyo3_has_operation(sources: &[&'static str], canonical: &str) -> bool {
 }
 
 fn uniffi_has_operation(canonical: &str) -> bool {
+    // UniFFI's surface spans both the central bridge.rs (most ops) and a
+    // smaller server.rs module that hosts site-projection methods on the
+    // `Server` type. Search both — Batch 2 (#1543).
     uniffi_names(canonical)
         .iter()
-        .any(|name| source_has_fn(UNIFFI_BRIDGE, name))
+        .any(|name| source_has_fn(UNIFFI_BRIDGE, name) || source_has_fn(UNIFFI_SERVER, name))
 }
 
 fn napi_has_operation(sources: &[&'static str], canonical: &str) -> bool {
@@ -521,6 +538,8 @@ fn pyo3_sources() -> Vec<&'static str> {
         PYO3_ECONOMY,
         PYO3_MEDIA,
         PYO3_SCP,
+        PYO3_SCPID,
+        PYO3_SERVER,
     ]
 }
 
@@ -541,6 +560,7 @@ fn napi_sources() -> Vec<&'static str> {
         NAPI_ECONOMY,
         NAPI_MEDIA,
         NAPI_SCP,
+        NAPI_SERVER,
     ]
 }
 
@@ -557,6 +577,7 @@ fn wasm_sources() -> Vec<&'static str> {
         WASM_DISCOVERY,
         WASM_TRUST,
         WASM_ECONOMY,
+        WASM_SCPID,
     ]
 }
 
@@ -998,6 +1019,7 @@ fn identity_category_coverage() {
 
 /// Verifies context lifecycle operations are present across all bridges.
 /// Handles naming variance: PyO3 uses `context_receive` for `context_subscribe`.
+/// Per-bridge exemptions are sourced from `scripts/bridge-aliases.json`.
 #[test]
 fn context_category_coverage() {
     let ops = parity_operations();
@@ -1007,24 +1029,38 @@ fn context_category_coverage() {
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
+    let uniffi_exempt = exemptions_for("uniffi");
+    let napi_exempt = exemptions_for("napi");
+    let pyo3_exempt = exemptions_for("pyo3");
+    let wasm_exempt = exemptions_for("wasm");
+
     for (_, op, _) in &context_ops {
-        assert!(
-            pyo3_has_operation(&pyo3_srcs, op),
-            "PyO3 missing context op: {op}"
-        );
-        assert!(uniffi_has_operation(op), "UniFFI missing context op: {op}");
-        assert!(
-            napi_has_operation(&napi_srcs, op),
-            "NAPI missing context op: {op}"
-        );
-        assert!(
-            wasm_has_operation(&wasm_srcs, op),
-            "WASM missing context op: {op}"
-        );
+        if !pyo3_exempt.contains(*op) {
+            assert!(
+                pyo3_has_operation(&pyo3_srcs, op),
+                "PyO3 missing context op: {op}"
+            );
+        }
+        if !uniffi_exempt.contains(*op) {
+            assert!(uniffi_has_operation(op), "UniFFI missing context op: {op}");
+        }
+        if !napi_exempt.contains(*op) {
+            assert!(
+                napi_has_operation(&napi_srcs, op),
+                "NAPI missing context op: {op}"
+            );
+        }
+        if !wasm_exempt.contains(*op) {
+            assert!(
+                wasm_has_operation(&wasm_srcs, op),
+                "WASM missing context op: {op}"
+            );
+        }
     }
 }
 
-/// Verifies UCAN operations are present across all bridges.
+/// Verifies UCAN operations are present across all bridges. Per-bridge
+/// exemptions are sourced from `scripts/bridge-aliases.json`.
 #[test]
 fn ucan_category_coverage() {
     let ops = parity_operations();
@@ -1034,24 +1070,38 @@ fn ucan_category_coverage() {
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
+    let uniffi_exempt = exemptions_for("uniffi");
+    let napi_exempt = exemptions_for("napi");
+    let pyo3_exempt = exemptions_for("pyo3");
+    let wasm_exempt = exemptions_for("wasm");
+
     for (_, op, _) in &ucan_ops {
-        assert!(
-            pyo3_has_operation(&pyo3_srcs, op),
-            "PyO3 missing UCAN op: {op}"
-        );
-        assert!(uniffi_has_operation(op), "UniFFI missing UCAN op: {op}");
-        assert!(
-            napi_has_operation(&napi_srcs, op),
-            "NAPI missing UCAN op: {op}"
-        );
-        assert!(
-            wasm_has_operation(&wasm_srcs, op),
-            "WASM missing UCAN op: {op}"
-        );
+        if !pyo3_exempt.contains(*op) {
+            assert!(
+                pyo3_has_operation(&pyo3_srcs, op),
+                "PyO3 missing UCAN op: {op}"
+            );
+        }
+        if !uniffi_exempt.contains(*op) {
+            assert!(uniffi_has_operation(op), "UniFFI missing UCAN op: {op}");
+        }
+        if !napi_exempt.contains(*op) {
+            assert!(
+                napi_has_operation(&napi_srcs, op),
+                "NAPI missing UCAN op: {op}"
+            );
+        }
+        if !wasm_exempt.contains(*op) {
+            assert!(
+                wasm_has_operation(&wasm_srcs, op),
+                "WASM missing UCAN op: {op}"
+            );
+        }
     }
 }
 
-/// Verifies tool operations are present across all bridges.
+/// Verifies tool operations are present across all bridges. Per-bridge
+/// exemptions are sourced from `scripts/bridge-aliases.json`.
 #[test]
 fn tools_category_coverage() {
     let ops = parity_operations();
@@ -1061,25 +1111,39 @@ fn tools_category_coverage() {
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
+    let uniffi_exempt = exemptions_for("uniffi");
+    let napi_exempt = exemptions_for("napi");
+    let pyo3_exempt = exemptions_for("pyo3");
+    let wasm_exempt = exemptions_for("wasm");
+
     for (_, op, _) in &tool_ops {
-        assert!(
-            pyo3_has_operation(&pyo3_srcs, op),
-            "PyO3 missing tool op: {op}"
-        );
-        assert!(uniffi_has_operation(op), "UniFFI missing tool op: {op}");
-        assert!(
-            napi_has_operation(&napi_srcs, op),
-            "NAPI missing tool op: {op}"
-        );
-        assert!(
-            wasm_has_operation(&wasm_srcs, op),
-            "WASM missing tool op: {op}"
-        );
+        if !pyo3_exempt.contains(*op) {
+            assert!(
+                pyo3_has_operation(&pyo3_srcs, op),
+                "PyO3 missing tool op: {op}"
+            );
+        }
+        if !uniffi_exempt.contains(*op) {
+            assert!(uniffi_has_operation(op), "UniFFI missing tool op: {op}");
+        }
+        if !napi_exempt.contains(*op) {
+            assert!(
+                napi_has_operation(&napi_srcs, op),
+                "NAPI missing tool op: {op}"
+            );
+        }
+        if !wasm_exempt.contains(*op) {
+            assert!(
+                wasm_has_operation(&wasm_srcs, op),
+                "WASM missing tool op: {op}"
+            );
+        }
     }
 }
 
 /// Verifies broadcast operations are present across all bridges.
 /// Accounts for naming variance: `broadcast_block` vs `broadcast_block_subscriber`.
+/// Per-bridge exemptions are sourced from `scripts/bridge-aliases.json`.
 #[test]
 fn broadcast_category_coverage() {
     let ops = parity_operations();
@@ -1092,27 +1156,41 @@ fn broadcast_category_coverage() {
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
+    let uniffi_exempt = exemptions_for("uniffi");
+    let napi_exempt = exemptions_for("napi");
+    let pyo3_exempt = exemptions_for("pyo3");
+    let wasm_exempt = exemptions_for("wasm");
+
     for (_, op, _) in &broadcast_ops {
-        assert!(
-            pyo3_has_operation(&pyo3_srcs, op),
-            "PyO3 missing broadcast op: {op}"
-        );
-        assert!(
-            uniffi_has_operation(op),
-            "UniFFI missing broadcast op: {op}"
-        );
-        assert!(
-            napi_has_operation(&napi_srcs, op),
-            "NAPI missing broadcast op: {op}"
-        );
-        assert!(
-            wasm_has_operation(&wasm_srcs, op),
-            "WASM missing broadcast op: {op}"
-        );
+        if !pyo3_exempt.contains(*op) {
+            assert!(
+                pyo3_has_operation(&pyo3_srcs, op),
+                "PyO3 missing broadcast op: {op}"
+            );
+        }
+        if !uniffi_exempt.contains(*op) {
+            assert!(
+                uniffi_has_operation(op),
+                "UniFFI missing broadcast op: {op}"
+            );
+        }
+        if !napi_exempt.contains(*op) {
+            assert!(
+                napi_has_operation(&napi_srcs, op),
+                "NAPI missing broadcast op: {op}"
+            );
+        }
+        if !wasm_exempt.contains(*op) {
+            assert!(
+                wasm_has_operation(&wasm_srcs, op),
+                "WASM missing broadcast op: {op}"
+            );
+        }
     }
 }
 
-/// Verifies trust operations are present across all bridges.
+/// Verifies trust operations are present across all bridges. Per-bridge
+/// exemptions are sourced from `scripts/bridge-aliases.json`.
 #[test]
 fn trust_category_coverage() {
     let ops = parity_operations();
@@ -1122,24 +1200,38 @@ fn trust_category_coverage() {
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
+    let uniffi_exempt = exemptions_for("uniffi");
+    let napi_exempt = exemptions_for("napi");
+    let pyo3_exempt = exemptions_for("pyo3");
+    let wasm_exempt = exemptions_for("wasm");
+
     for (_, op, _) in &trust_ops {
-        assert!(
-            pyo3_has_operation(&pyo3_srcs, op),
-            "PyO3 missing trust op: {op}"
-        );
-        assert!(uniffi_has_operation(op), "UniFFI missing trust op: {op}");
-        assert!(
-            napi_has_operation(&napi_srcs, op),
-            "NAPI missing trust op: {op}"
-        );
-        assert!(
-            wasm_has_operation(&wasm_srcs, op),
-            "WASM missing trust op: {op}"
-        );
+        if !pyo3_exempt.contains(*op) {
+            assert!(
+                pyo3_has_operation(&pyo3_srcs, op),
+                "PyO3 missing trust op: {op}"
+            );
+        }
+        if !uniffi_exempt.contains(*op) {
+            assert!(uniffi_has_operation(op), "UniFFI missing trust op: {op}");
+        }
+        if !napi_exempt.contains(*op) {
+            assert!(
+                napi_has_operation(&napi_srcs, op),
+                "NAPI missing trust op: {op}"
+            );
+        }
+        if !wasm_exempt.contains(*op) {
+            assert!(
+                wasm_has_operation(&wasm_srcs, op),
+                "WASM missing trust op: {op}"
+            );
+        }
     }
 }
 
-/// Verifies event_log operations are present across all bridges.
+/// Verifies event_log operations are present across all bridges. Per-bridge
+/// exemptions are sourced from `scripts/bridge-aliases.json`.
 #[test]
 fn event_log_category_coverage() {
     let ops = parity_operations();
@@ -1152,27 +1244,41 @@ fn event_log_category_coverage() {
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
+    let uniffi_exempt = exemptions_for("uniffi");
+    let napi_exempt = exemptions_for("napi");
+    let pyo3_exempt = exemptions_for("pyo3");
+    let wasm_exempt = exemptions_for("wasm");
+
     for (_, op, _) in &event_log_ops {
-        assert!(
-            pyo3_has_operation(&pyo3_srcs, op),
-            "PyO3 missing event_log op: {op}"
-        );
-        assert!(
-            uniffi_has_operation(op),
-            "UniFFI missing event_log op: {op}"
-        );
-        assert!(
-            napi_has_operation(&napi_srcs, op),
-            "NAPI missing event_log op: {op}"
-        );
-        assert!(
-            wasm_has_operation(&wasm_srcs, op),
-            "WASM missing event_log op: {op}"
-        );
+        if !pyo3_exempt.contains(*op) {
+            assert!(
+                pyo3_has_operation(&pyo3_srcs, op),
+                "PyO3 missing event_log op: {op}"
+            );
+        }
+        if !uniffi_exempt.contains(*op) {
+            assert!(
+                uniffi_has_operation(op),
+                "UniFFI missing event_log op: {op}"
+            );
+        }
+        if !napi_exempt.contains(*op) {
+            assert!(
+                napi_has_operation(&napi_srcs, op),
+                "NAPI missing event_log op: {op}"
+            );
+        }
+        if !wasm_exempt.contains(*op) {
+            assert!(
+                wasm_has_operation(&wasm_srcs, op),
+                "WASM missing event_log op: {op}"
+            );
+        }
     }
 }
 
 /// Verifies discovery and provenance operations are present across all bridges.
+/// Per-bridge exemptions are sourced from `scripts/bridge-aliases.json`.
 #[test]
 fn discovery_and_provenance_coverage() {
     let ops = parity_operations();
@@ -1185,20 +1291,33 @@ fn discovery_and_provenance_coverage() {
     let napi_srcs = napi_sources();
     let wasm_srcs = wasm_sources();
 
+    let uniffi_exempt = exemptions_for("uniffi");
+    let napi_exempt = exemptions_for("napi");
+    let pyo3_exempt = exemptions_for("pyo3");
+    let wasm_exempt = exemptions_for("wasm");
+
     for (cat, op, _) in &selected {
-        assert!(
-            pyo3_has_operation(&pyo3_srcs, op),
-            "PyO3 missing {cat} op: {op}"
-        );
-        assert!(uniffi_has_operation(op), "UniFFI missing {cat} op: {op}");
-        assert!(
-            napi_has_operation(&napi_srcs, op),
-            "NAPI missing {cat} op: {op}"
-        );
-        assert!(
-            wasm_has_operation(&wasm_srcs, op),
-            "WASM missing {cat} op: {op}"
-        );
+        if !pyo3_exempt.contains(*op) {
+            assert!(
+                pyo3_has_operation(&pyo3_srcs, op),
+                "PyO3 missing {cat} op: {op}"
+            );
+        }
+        if !uniffi_exempt.contains(*op) {
+            assert!(uniffi_has_operation(op), "UniFFI missing {cat} op: {op}");
+        }
+        if !napi_exempt.contains(*op) {
+            assert!(
+                napi_has_operation(&napi_srcs, op),
+                "NAPI missing {cat} op: {op}"
+            );
+        }
+        if !wasm_exempt.contains(*op) {
+            assert!(
+                wasm_has_operation(&wasm_srcs, op),
+                "WASM missing {cat} op: {op}"
+            );
+        }
     }
 }
 
@@ -1304,6 +1423,51 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     // Governance checkpoints
     "context_create_governance_checkpoint",
     "context_add_checkpoint_cosignature",
+    // Batch 2 (#1543) — 31 Batch-1 ops promoted from optional to required after
+    // matrix hygiene confirmed each is implemented across all four bridges with
+    // a real `fn` definition (verified by every_alias_resolves_to_a_real_fn_or_exemption).
+    // Governance lifecycle (4)
+    "context_governance_propose",
+    "context_governance_approve",
+    "context_governance_reject",
+    "context_governance_withdraw",
+    // Context lifecycle (6)
+    "context_finalize_close",
+    "context_apply_pending_ceiling_modification",
+    "context_get_economic_policy",
+    "context_set_economic_policy",
+    "context_restore",
+    "context_restore_all",
+    // TTL (3)
+    "context_handle_ttl_expiry",
+    "context_propose_ttl_extension",
+    "context_reset_ttl_timer",
+    // Broadcast (4)
+    "broadcast_publish_asset",
+    "broadcast_publish_assets",
+    "broadcast_handle_key_request",
+    "broadcast_unblock",
+    // Identity (7)
+    "identity_link_attestations",
+    "identity_create_with_agent_key",
+    "identity_execute_recovery",
+    "identity_execute_custody_migration",
+    "identity_add_agent_key",
+    "identity_remove_agent_key",
+    "identity_rotate_agent_key",
+    // Stateless utility ops (4)
+    "address_resolve",
+    "aggregate_trust_input",
+    "evaluate_invitation",
+    "transport_disconnect",
+    // Provenance (3)
+    "provenance_redact_counterparties",
+    "provenance_pseudonymize_counterparties",
+    "provenance_update_source_type",
+    // Batch 2 — newly registered SCPID ops promoted alongside the 31 Batch-1
+    // ops. `scpid_verify` stays optional (WASM-exempt: needs network DID resolver).
+    "scpid_challenge",
+    "scpid_sign",
 ];
 
 // ---------------------------------------------------------------------------
@@ -1517,13 +1681,12 @@ fn every_alias_resolves_to_a_real_fn_or_exemption() {
         }
         // --- uniffi ---
         if !uniffi_exempt.contains(op.canonical.as_str()) {
-            let any_resolves = op
-                .uniffi
-                .iter()
-                .any(|name| source_has_fn(UNIFFI_BRIDGE, name));
+            let any_resolves = op.uniffi.iter().any(|name| {
+                source_has_fn(UNIFFI_BRIDGE, name) || source_has_fn(UNIFFI_SERVER, name)
+            });
             if !any_resolves {
                 phantom.push(format!(
-                    "uniffi:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/uniffi/src/bridge.rs",
+                    "uniffi:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/uniffi/src/{{bridge,server}}.rs",
                     op.canonical, op.uniffi
                 ));
             }

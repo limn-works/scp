@@ -1772,7 +1772,7 @@
     {
       "canonical": "context_governance_propose",
       "category": "governance",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "governance_propose"
       ],
@@ -1789,7 +1789,7 @@
     {
       "canonical": "context_governance_approve",
       "category": "governance",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "governance_approve"
       ],
@@ -1806,7 +1806,7 @@
     {
       "canonical": "context_governance_reject",
       "category": "governance",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "governance_reject"
       ],
@@ -1823,7 +1823,7 @@
     {
       "canonical": "context_governance_withdraw",
       "category": "governance",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "governance_withdraw"
       ],
@@ -1840,7 +1840,7 @@
     {
       "canonical": "context_finalize_close",
       "category": "context",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "finalize_close"
       ],
@@ -1857,7 +1857,7 @@
     {
       "canonical": "context_apply_pending_ceiling_modification",
       "category": "context",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "apply_pending_ceiling_modification"
       ],
@@ -1874,7 +1874,7 @@
     {
       "canonical": "context_get_economic_policy",
       "category": "economy",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "get_economic_policy"
       ],
@@ -1891,7 +1891,7 @@
     {
       "canonical": "context_set_economic_policy",
       "category": "economy",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "set_economic_policy"
       ],
@@ -1908,7 +1908,7 @@
     {
       "canonical": "context_restore",
       "category": "context",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "restore_context"
       ],
@@ -1925,7 +1925,7 @@
     {
       "canonical": "context_restore_all",
       "category": "context",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "restore_all_contexts"
       ],
@@ -1942,7 +1942,7 @@
     {
       "canonical": "context_handle_ttl_expiry",
       "category": "context",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "context_handle_ttl_expiry"
       ],
@@ -1959,7 +1959,7 @@
     {
       "canonical": "context_propose_ttl_extension",
       "category": "context",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "context_propose_ttl_extension"
       ],
@@ -1976,7 +1976,7 @@
     {
       "canonical": "context_reset_ttl_timer",
       "category": "context",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "context_reset_ttl_timer"
       ],
@@ -1993,7 +1993,7 @@
     {
       "canonical": "broadcast_publish_asset",
       "category": "broadcast",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "broadcast_publish_asset"
       ],
@@ -2010,7 +2010,7 @@
     {
       "canonical": "broadcast_publish_assets",
       "category": "broadcast",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "broadcast_publish_assets"
       ],
@@ -2027,7 +2027,7 @@
     {
       "canonical": "broadcast_handle_key_request",
       "category": "broadcast",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "broadcast_handle_key_request"
       ],
@@ -2044,7 +2044,7 @@
     {
       "canonical": "broadcast_unblock",
       "category": "broadcast",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "broadcast_unblock_subscriber"
       ],
@@ -2061,7 +2061,7 @@
     {
       "canonical": "identity_link_attestations",
       "category": "identity",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "identity_link_attestations"
       ],
@@ -2078,7 +2078,7 @@
     {
       "canonical": "identity_create_with_agent_key",
       "category": "identity",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "identity_create_with_agent_key"
       ],
@@ -2095,7 +2095,7 @@
     {
       "canonical": "identity_execute_recovery",
       "category": "identity",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "identity_execute_recovery"
       ],
@@ -2112,7 +2112,7 @@
     {
       "canonical": "identity_execute_custody_migration",
       "category": "identity",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "identity_execute_custody_migration"
       ],
@@ -2129,7 +2129,7 @@
     {
       "canonical": "identity_add_agent_key",
       "category": "identity",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "identity_add_agent_key"
       ],
@@ -2147,7 +2147,7 @@
     {
       "canonical": "identity_remove_agent_key",
       "category": "identity",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "identity_remove_agent_key"
       ],
@@ -2165,7 +2165,7 @@
     {
       "canonical": "identity_rotate_agent_key",
       "category": "identity",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "identity_rotate_agent_key"
       ],
@@ -2183,7 +2183,7 @@
     {
       "canonical": "address_resolve",
       "category": "discovery",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "address_resolve"
       ],
@@ -2200,7 +2200,7 @@
     {
       "canonical": "aggregate_trust_input",
       "category": "trust",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "aggregate_trust_input"
       ],
@@ -2217,7 +2217,7 @@
     {
       "canonical": "evaluate_invitation",
       "category": "membership",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "evaluate_invitation"
       ],
@@ -2234,7 +2234,7 @@
     {
       "canonical": "transport_disconnect",
       "category": "transport",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "transport_disconnect"
       ],
@@ -2251,7 +2251,7 @@
     {
       "canonical": "provenance_redact_counterparties",
       "category": "provenance",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "provenance_redact_counterparties"
       ],
@@ -2268,7 +2268,7 @@
     {
       "canonical": "provenance_pseudonymize_counterparties",
       "category": "provenance",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "provenance_pseudonymize_counterparties"
       ],
@@ -2285,7 +2285,7 @@
     {
       "canonical": "provenance_update_source_type",
       "category": "provenance",
-      "wasm_required": false,
+      "wasm_required": true,
       "pyo3": [
         "provenance_update_source_type"
       ],
@@ -2297,6 +2297,108 @@
       ],
       "wasm": [
         "provenance_update_source_type"
+      ]
+    },
+    {
+      "canonical": "scpid_challenge",
+      "category": "scpid",
+      "wasm_required": true,
+      "pyo3": [
+        "scpid_challenge"
+      ],
+      "uniffi": [
+        "scpid_challenge"
+      ],
+      "napi": [
+        "scpid_challenge"
+      ],
+      "wasm": [
+        "scpid_challenge"
+      ]
+    },
+    {
+      "canonical": "scpid_sign",
+      "category": "scpid",
+      "wasm_required": true,
+      "pyo3": [
+        "scpid_sign"
+      ],
+      "uniffi": [
+        "scpid_sign"
+      ],
+      "napi": [
+        "scpid_sign"
+      ],
+      "wasm": [
+        "scpid_sign"
+      ]
+    },
+    {
+      "canonical": "scpid_verify",
+      "category": "scpid",
+      "wasm_required": false,
+      "pyo3": [
+        "scpid_verify"
+      ],
+      "uniffi": [
+        "scpid_verify"
+      ],
+      "napi": [
+        "scpid_verify"
+      ],
+      "wasm": [
+        "scpid_verify"
+      ]
+    },
+    {
+      "canonical": "enable_site_projection",
+      "category": "server",
+      "wasm_required": false,
+      "pyo3": [
+        "enable_site_projection"
+      ],
+      "uniffi": [
+        "enable_site_projection"
+      ],
+      "napi": [
+        "enable_site_projection"
+      ],
+      "wasm": [
+        "enable_site_projection"
+      ]
+    },
+    {
+      "canonical": "disable_site_projection",
+      "category": "server",
+      "wasm_required": false,
+      "pyo3": [
+        "disable_site_projection"
+      ],
+      "uniffi": [
+        "disable_site_projection"
+      ],
+      "napi": [
+        "disable_site_projection"
+      ],
+      "wasm": [
+        "disable_site_projection"
+      ]
+    },
+    {
+      "canonical": "context_tombstone_migrated",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "tombstone_migrated_context"
+      ],
+      "uniffi": [
+        "tombstone_migrated_context"
+      ],
+      "napi": [
+        "context_tombstone_migrated"
+      ],
+      "wasm": [
+        "context_tombstone_migrated"
       ]
     }
   ],
@@ -2319,6 +2421,23 @@
         "reason": "not yet exported in NAPI bridge (known gap)"
       }
     ],
-    "wasm": []
+    "wasm": [
+      {
+        "canonical": "scpid_verify",
+        "reason": "SCPID verification requires DID resolver with DHT/network access; WASM lacks raw UDP and the tokio multi-thread runtime per ADR-034 (see crates/scp-ffi/wasm/src/scpid.rs:11)"
+      },
+      {
+        "canonical": "enable_site_projection",
+        "reason": "Site projection depends on scp-platform server APIs; WASM cannot host an HTTP server per ADR-034"
+      },
+      {
+        "canonical": "disable_site_projection",
+        "reason": "Site projection depends on scp-platform server APIs; WASM cannot host an HTTP server per ADR-034"
+      },
+      {
+        "canonical": "context_tombstone_migrated",
+        "reason": "Tombstone helper relies on scp-platform persistence; WASM defers persistence to host JS runtime per ADR-034"
+      }
+    ]
   }
 }
