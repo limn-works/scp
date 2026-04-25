@@ -827,7 +827,7 @@
       "gate": "gate-classification",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-protocol/src/context/outlets/mod.rs",
         "crates/scp-protocol/src/context/outlets/lifecycle.rs",
