@@ -261,11 +261,22 @@ pub async fn mint_ucan(
         .capabilities
         .iter()
         .map(|cap| {
-            let capability = scp_protocol::context::roles::Capability::new(cap);
+            // Strict §5.4.2.1 parser: malformed outlet stems (e.g.
+            // `outlet:invoke:foo`, `outlet_query:` empty suffix,
+            // `outlet_query:FOO` uppercase) reject with
+            // `MalformedToken` rather than silently degrading to a
+            // `Custom` capability. This is the parser-differential
+            // guard required by SCP-OUT-014.
+            let capability = scp_protocol::context::roles::Capability::new(cap)
+                .ok_or_else(|| {
+                    UcanError::MalformedToken(format!(
+                        "invalid capability name {cap:?} (fails §5.4.2.1 parser)"
+                    ))
+                })?;
             let (resource, action) = capability.ucan_resource_action();
-            (resource.into_owned(), action.into_owned())
+            Ok::<(String, String), UcanError>((resource.into_owned(), action.into_owned()))
         })
-        .collect();
+        .collect::<Result<Vec<_>, UcanError>>()?;
 
     // Enforce ceiling compliance before doing any work (§5.3, #339).
     // Defense-in-depth: when no explicit ceiling is provided, apply the

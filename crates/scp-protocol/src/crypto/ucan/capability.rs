@@ -148,8 +148,8 @@ impl CapabilityUri {
     /// A wildcard URI matches any URI with the same resource and action.
     /// A specific URI matches only URIs with the same context ID, resource,
     /// and action. A wildcard action (`"*"`) on the granting URI matches any
-    /// action on the same resource (e.g., `outlet_invoke:*` grants
-    /// `outlet_invoke:calculator`).
+    /// action on the same resource (e.g., `outlet_call:*` grants
+    /// `outlet_call:calculator` — SCP-OUT-014).
     ///
     /// This is used during capability matching in UCAN validation: a token's
     /// attenuation must match the required capability.
@@ -186,7 +186,7 @@ impl CapabilityUri {
     ///
     /// A wildcard entry `{resource}:*` in the ceiling covers all actions on
     /// that resource. For example, `"outlet_call:*"` in the ceiling allows
-    /// `outlet_invoke:calculator`, `outlet_invoke:assistant`, etc.
+    /// `outlet_call:calculator`, `outlet_call:assistant`, etc.
     ///
     /// # Arguments
     ///
@@ -501,7 +501,7 @@ mod tests {
         let uris = [
             "scp:ctx:abc123/messages:write",
             "scp:ctx:abc123/messages:read",
-            "scp:ctx:abc123/outlet_invoke:assistant",
+            "scp:ctx:abc123/outlet_call:assistant",
             "scp:ctx:abc123/member:invite",
             "scp:ctx:abc123/role:assign",
             "scp:ctx:abc123/context:close",
@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn matches_wildcard_action_grants_specific_action() {
-        // outlet_invoke:* grants outlet_invoke:calculator (#1326)
+        // outlet_call:* grants outlet_call:calculator (SCP-OUT-014, #1326)
         let granted = CapabilityUri::new("abc123", "outlet_call", "*");
         let required = CapabilityUri::new("abc123", "outlet_call", "calculator");
         assert!(granted.matches(&required));
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn is_within_ceiling_wildcard_action_covers_specific() {
-        // "outlet_call:*" in ceiling allows outlet_invoke:calculator (#1326)
+        // "outlet_call:*" in ceiling allows outlet_call:calculator (#1326)
         let ceiling: HashSet<String> = ["outlet_call:*".to_owned()].into_iter().collect();
         let uri = CapabilityUri::new("abc123", "outlet_call", "calculator");
         assert!(uri.is_within_ceiling(&ceiling));

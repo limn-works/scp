@@ -1418,7 +1418,7 @@ pub fn ensure_registered(handle: &NapiContextHandle) -> Result<(), ScpNapiError>
     } else {
         handle_ceiling
             .into_iter()
-            .map(|s| scp_core::context::roles::Capability::new(&s).ucan_capability_name())
+            .filter_map(|s| scp_core::context::roles::Capability::new(&s).map(|c| c.ucan_capability_name()))
             .collect::<HashSet<String>>()
     };
 

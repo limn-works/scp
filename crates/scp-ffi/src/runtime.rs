@@ -1395,7 +1395,7 @@ pub fn register_ffi_state(
             } else {
                 user_ceiling
                     .iter()
-                    .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+                    .filter_map(|s| scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name()))
                     .collect::<HashSet<String>>()
             };
             let role_state =
@@ -2439,7 +2439,7 @@ mod tests {
 
         let ceiling = with_ffi_state(&ctx_id, |st| Ok(st.ceiling_strings.clone())).unwrap();
 
-        // Default ceiling must include outlet_invoke:* (not tool:invoke:*).
+        // Default ceiling must include outlet_query:* / outlet_call:* (post-SCP-OUT-014).
         assert!(
             ceiling.contains("outlet_call:*"),
             "default ceiling should contain 'outlet_call:*' but got: {ceiling:?}"

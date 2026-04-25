@@ -106,6 +106,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "fuzz_ucan_capability_parse_ffi"
+path = "fuzz_targets/fuzz_ucan_capability_parse_ffi.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "fuzz_broadcast_content"
 path = "fuzz_targets/fuzz_broadcast_content.rs"
 test = false

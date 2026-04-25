@@ -359,10 +359,10 @@ fn make_manager() -> ContextManager {
 fn encrypted_params() -> ContextParams {
     ContextParams {
         ceiling: vec![
-            Capability::new("messages:read"),
-            Capability::new("messages:write"),
-            Capability::new("role:assign"),
-            Capability::new("member:remove"),
+            Capability::new("messages:read").expect("known capability"),
+            Capability::new("messages:write").expect("known capability"),
+            Capability::new("role:assign").expect("known capability"),
+            Capability::new("member:remove").expect("known capability"),
         ],
         ..ContextParams::default()
     }
@@ -374,9 +374,9 @@ fn broadcast_params() -> ContextParams {
         mode: ContextMode::Broadcast,
         memory_scope: scp_core::context::params::MemoryScope::Full,
         ceiling: vec![
-            Capability::new("messages:read"),
-            Capability::new("messages:write"),
-            Capability::new("role:assign"),
+            Capability::new("messages:read").expect("known capability"),
+            Capability::new("messages:write").expect("known capability"),
+            Capability::new("role:assign").expect("known capability"),
         ],
         ..ContextParams::default()
     }

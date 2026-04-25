@@ -393,34 +393,34 @@ mod tests {
 
     fn voice_ceiling() -> Vec<ParamCapability> {
         vec![
-            ParamCapability::new("messages:read"),
-            ParamCapability::new("messages:write"),
-            ParamCapability::new("media:voice"),
+            ParamCapability::new("messages:read").expect("known capability"),
+            ParamCapability::new("messages:write").expect("known capability"),
+            ParamCapability::new("media:voice").expect("known capability"),
         ]
     }
 
     fn video_ceiling() -> Vec<ParamCapability> {
         vec![
-            ParamCapability::new("messages:read"),
-            ParamCapability::new("media:voice"),
-            ParamCapability::new("media:video"),
+            ParamCapability::new("messages:read").expect("known capability"),
+            ParamCapability::new("media:voice").expect("known capability"),
+            ParamCapability::new("media:video").expect("known capability"),
         ]
     }
 
     fn full_media_ceiling() -> Vec<ParamCapability> {
         vec![
-            ParamCapability::new("messages:read"),
-            ParamCapability::new("messages:write"),
-            ParamCapability::new("media:voice"),
-            ParamCapability::new("media:video"),
-            ParamCapability::new("media:screen_share"),
+            ParamCapability::new("messages:read").expect("known capability"),
+            ParamCapability::new("messages:write").expect("known capability"),
+            ParamCapability::new("media:voice").expect("known capability"),
+            ParamCapability::new("media:video").expect("known capability"),
+            ParamCapability::new("media:screen_share").expect("known capability"),
         ]
     }
 
     fn no_media_ceiling() -> Vec<ParamCapability> {
         vec![
-            ParamCapability::new("messages:read"),
-            ParamCapability::new("messages:write"),
+            ParamCapability::new("messages:read").expect("known capability"),
+            ParamCapability::new("messages:write").expect("known capability"),
         ]
     }
 

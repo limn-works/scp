@@ -748,8 +748,8 @@ async fn promote_context_succeeds_when_policy_is_promotable() {
         memory_scope: MemoryScope::Ephemeral,
         ttl: Some(std::time::Duration::from_hours(1)),
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read"),
-            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -831,7 +831,7 @@ async fn promote_context_does_not_mutate_promotion_policy() {
         memory_scope: MemoryScope::Ephemeral,
         ceiling: vec![scp_protocol::context::params::Capability::new(
             "messages:read",
-        )],
+        ).expect("known capability")],
         ..ContextParams::default()
     };
 
@@ -1553,12 +1553,12 @@ async fn setup_governance_context() -> (ContextManager, ContextHandle, String) {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read"),
-            scp_protocol::context::params::Capability::new("messages:write"),
-            scp_protocol::context::params::Capability::new("role:assign"),
-            scp_protocol::context::params::Capability::new("governance:propose"),
-            scp_protocol::context::params::Capability::new("governance:vote"),
-            scp_protocol::context::params::Capability::new("context:close"),
+            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("governance:propose").expect("known capability"),
+            scp_protocol::context::params::Capability::new("governance:vote").expect("known capability"),
+            scp_protocol::context::params::Capability::new("context:close").expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -1717,10 +1717,10 @@ async fn governance_propose_checked_records_events() {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read"),
-            scp_protocol::context::params::Capability::new("messages:write"),
-            scp_protocol::context::params::Capability::new("governance:propose"),
-            scp_protocol::context::params::Capability::new("governance:vote"),
+            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("governance:propose").expect("known capability"),
+            scp_protocol::context::params::Capability::new("governance:vote").expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -1764,11 +1764,11 @@ async fn governance_threshold_propose_approve_lifecycle() {
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read"),
-            scp_protocol::context::params::Capability::new("messages:write"),
-            scp_protocol::context::params::Capability::new("role:assign"),
-            scp_protocol::context::params::Capability::new("governance:propose"),
-            scp_protocol::context::params::Capability::new("governance:vote"),
+            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("governance:propose").expect("known capability"),
+            scp_protocol::context::params::Capability::new("governance:vote").expect("known capability"),
         ],
         governance: GovernanceModel::Threshold {
             threshold: 2,
@@ -4286,11 +4286,11 @@ async fn setup_budget_context(ctx_id: &str) -> (ContextManager, DID, DID) {
     );
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read"),
-            scp_protocol::context::params::Capability::new("messages:write"),
-            scp_protocol::context::params::Capability::new("role:assign"),
-            scp_protocol::context::params::Capability::new("governance:propose"),
-            scp_protocol::context::params::Capability::new("governance:vote"),
+            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("governance:propose").expect("known capability"),
+            scp_protocol::context::params::Capability::new("governance:vote").expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -4391,10 +4391,10 @@ async fn approve_spend_rejects_non_member_spender() {
     );
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read"),
-            scp_protocol::context::params::Capability::new("messages:write"),
-            scp_protocol::context::params::Capability::new("governance:propose"),
-            scp_protocol::context::params::Capability::new("governance:vote"),
+            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("governance:propose").expect("known capability"),
+            scp_protocol::context::params::Capability::new("governance:vote").expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -5815,7 +5815,7 @@ async fn role_demotion_changes_member_role() {
             name: "observer".to_owned(),
             capabilities: std::iter::once(scp_protocol::context::params::Capability::new(
                 "messages:read",
-            ))
+            ).expect("known capability"))
             .collect(),
         });
     let _handle = manager
@@ -14468,9 +14468,9 @@ async fn test_member_reset_rotates_sender_keys() {
 
     let mut params = ContextParams::default();
     params.ceiling = vec![
-        scp_protocol::context::params::Capability::new("messages:read"),
-        scp_protocol::context::params::Capability::new("messages:write"),
-        scp_protocol::context::params::Capability::new("role:assign"),
+        scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
+        scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+        scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
         Capability::MemberBan,
     ];
 
@@ -14697,9 +14697,9 @@ async fn h17_setup_alice_and_bob(
 
     let alice_params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read"),
-            scp_protocol::context::params::Capability::new("messages:write"),
-            scp_protocol::context::params::Capability::new("role:assign"),
+            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
             Capability::MemberBan,
         ],
         // EMPTY rules on Alice's side — her send-side enforcement
@@ -14741,9 +14741,9 @@ async fn h17_setup_alice_and_bob(
 
     let bob_params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read"),
-            scp_protocol::context::params::Capability::new("messages:write"),
-            scp_protocol::context::params::Capability::new("role:assign"),
+            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
             Capability::MemberBan,
         ],
         consequence_rules: bob_consequence_rules,
@@ -16209,8 +16209,8 @@ async fn create_with_governance_accepts_valid_rules() {
     let params = ContextParams {
         governance,
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read"),
-            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
         ],
         consequence_rules: vec![ConsequenceRule {
             trigger: ConsequenceTrigger::MessageVelocity,

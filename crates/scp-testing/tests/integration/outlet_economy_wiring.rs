@@ -228,13 +228,13 @@ fn signing_key_for_did(did: &DID) -> ed25519_dalek::SigningKey {
 fn governance_params_with_tools() -> ContextParams {
     ContextParams {
         ceiling: vec![
-            Capability::new("messages:read"),
-            Capability::new("messages:write"),
-            Capability::new("role:assign"),
-            Capability::new("governance:propose"),
-            Capability::new("governance:vote"),
-            Capability::new("member:ban"),
-            Capability::new("context:close"),
+            Capability::new("messages:read").expect("known capability"),
+            Capability::new("messages:write").expect("known capability"),
+            Capability::new("role:assign").expect("known capability"),
+            Capability::new("governance:propose").expect("known capability"),
+            Capability::new("governance:vote").expect("known capability"),
+            Capability::new("member:ban").expect("known capability"),
+            Capability::new("context:close").expect("known capability"),
             Capability::OutletRegister,
             Capability::OutletCallAll,
         ],

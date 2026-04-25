@@ -88,20 +88,27 @@ pub enum TemplateError {
 // ---------------------------------------------------------------------------
 
 /// Standard capability name for reading messages.
+#[cfg(test)]
 const CAP_MESSAGES_READ: &str = "messages:read";
 /// Standard capability name for writing messages.
+#[cfg(test)]
 const CAP_MESSAGES_WRITE: &str = "messages:write";
 /// Standard capability name for invoking any registered Query outlet
 /// (§5.4.2).
+#[cfg(test)]
 const CAP_OUTLET_QUERY_ALL: &str = "outlet:query:*";
 /// Standard capability name for invoking any registered Action outlet
 /// (§5.4.2).
+#[cfg(test)]
 const CAP_OUTLET_CALL_ALL: &str = "outlet:call:*";
 /// Standard capability name for registering new outlets.
+#[cfg(test)]
 const CAP_OUTLET_REGISTER: &str = "outlet:register";
 /// Standard capability name for inviting new members.
+#[cfg(test)]
 const CAP_MEMBER_INVITE: &str = "member:invite";
 /// Standard capability name for banning members from a context.
+#[cfg(test)]
 const CAP_MEMBER_BAN: &str = "member:ban";
 
 // ---------------------------------------------------------------------------
@@ -113,8 +120,8 @@ const CAP_MEMBER_BAN: &str = "member:ban";
 /// Used by broadcast templates where `member:ban` is not applicable.
 fn messaging_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new(CAP_MESSAGES_READ),
-        Capability::new(CAP_MESSAGES_WRITE),
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
     ]
 }
 
@@ -125,9 +132,9 @@ fn messaging_ceiling() -> Vec<Capability> {
 /// ephemeral, bilateral persistent).
 fn messaging_ban_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new(CAP_MESSAGES_READ),
-        Capability::new(CAP_MESSAGES_WRITE),
-        Capability::new(CAP_MEMBER_BAN),
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::MemberBan,
     ]
 }
 
@@ -140,11 +147,11 @@ fn messaging_ban_ceiling() -> Vec<Capability> {
 /// dynamically register new ones.
 fn messaging_outlet_call_ban_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new(CAP_MESSAGES_READ),
-        Capability::new(CAP_MESSAGES_WRITE),
-        Capability::new(CAP_OUTLET_QUERY_ALL),
-        Capability::new(CAP_OUTLET_CALL_ALL),
-        Capability::new(CAP_MEMBER_BAN),
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
+        Capability::MemberBan,
     ]
 }
 
@@ -156,11 +163,11 @@ fn messaging_outlet_call_ban_ceiling() -> Vec<Capability> {
 /// broadcast contexts do not support member banning.
 fn messaging_tools_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new(CAP_MESSAGES_READ),
-        Capability::new(CAP_MESSAGES_WRITE),
-        Capability::new(CAP_OUTLET_QUERY_ALL),
-        Capability::new(CAP_OUTLET_CALL_ALL),
-        Capability::new(CAP_OUTLET_REGISTER),
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
+        Capability::OutletRegister,
     ]
 }
 
@@ -172,12 +179,12 @@ fn messaging_tools_ceiling() -> Vec<Capability> {
 /// member banning is supported.
 fn messaging_tools_ban_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new(CAP_MESSAGES_READ),
-        Capability::new(CAP_MESSAGES_WRITE),
-        Capability::new(CAP_OUTLET_QUERY_ALL),
-        Capability::new(CAP_OUTLET_CALL_ALL),
-        Capability::new(CAP_OUTLET_REGISTER),
-        Capability::new(CAP_MEMBER_BAN),
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::OutletQueryAll,
+        Capability::OutletCallAll,
+        Capability::OutletRegister,
+        Capability::MemberBan,
     ]
 }
 
@@ -185,10 +192,10 @@ fn messaging_tools_ban_ceiling() -> Vec<Capability> {
 /// + `member:ban`.
 fn messaging_invite_ban_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new(CAP_MESSAGES_READ),
-        Capability::new(CAP_MESSAGES_WRITE),
-        Capability::new(CAP_MEMBER_INVITE),
-        Capability::new(CAP_MEMBER_BAN),
+        Capability::MessagesRead,
+        Capability::MessagesWrite,
+        Capability::MemberInvite,
+        Capability::MemberBan,
     ]
 }
 
@@ -1234,7 +1241,7 @@ mod tests {
     fn validate_rejects_wrong_ceiling() {
         let mut params = template_params(&TemplateId::BilateralEphemeral);
         params.ttl = Some(Duration::from_mins(5));
-        params.ceiling.push(Capability::new(CAP_OUTLET_CALL_ALL));
+        params.ceiling.push(Capability::OutletCallAll);
         let err = validate_against_template(&params).unwrap_err();
         assert!(matches!(
             err,
@@ -1315,9 +1322,9 @@ mod tests {
         params.ttl = Some(Duration::from_mins(5));
         // Reverse the ceiling order
         params.ceiling = vec![
-            Capability::new(CAP_MEMBER_BAN),
-            Capability::new(CAP_MESSAGES_WRITE),
-            Capability::new(CAP_MESSAGES_READ),
+            Capability::MemberBan,
+            Capability::MessagesWrite,
+            Capability::MessagesRead,
         ];
         assert!(validate_against_template(&params).is_ok());
     }
@@ -1328,29 +1335,29 @@ mod tests {
 
     #[test]
     fn capabilities_match_same_order() {
-        let a = vec![Capability::new("a"), Capability::new("b")];
-        let b = vec![Capability::new("a"), Capability::new("b")];
+        let a = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
+        let b = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
         assert!(capabilities_match(&a, &b));
     }
 
     #[test]
     fn capabilities_match_different_order() {
-        let a = vec![Capability::new("b"), Capability::new("a")];
-        let b = vec![Capability::new("a"), Capability::new("b")];
+        let a = vec![Capability::new("b").expect("known capability"), Capability::new("a").expect("known capability")];
+        let b = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
         assert!(capabilities_match(&a, &b));
     }
 
     #[test]
     fn capabilities_match_different_lengths() {
-        let a = vec![Capability::new("a")];
-        let b = vec![Capability::new("a"), Capability::new("b")];
+        let a = vec![Capability::new("a").expect("known capability")];
+        let b = vec![Capability::new("a").expect("known capability"), Capability::new("b").expect("known capability")];
         assert!(!capabilities_match(&a, &b));
     }
 
     #[test]
     fn capabilities_match_different_names() {
-        let a = vec![Capability::new("a")];
-        let b = vec![Capability::new("b")];
+        let a = vec![Capability::new("a").expect("known capability")];
+        let b = vec![Capability::new("b").expect("known capability")];
         assert!(!capabilities_match(&a, &b));
     }
 

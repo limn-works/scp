@@ -527,7 +527,7 @@ impl PerContextState {
             }
             "member" => {
                 // Default member capabilities: messages:read, messages:write,
-                // outlet_invoke:* — intersected with ceiling.
+                // outlet_call:* — intersected with ceiling (SCP-OUT-014).
                 let role_grants = matches!(
                     capability,
                     "messages:read" | "messages:write" | "outlet_call:*"
@@ -1895,6 +1895,32 @@ impl WasmContextManager {
     pub fn tool_exists(&self, context_id: &str, outlet_id: &str) -> Result<bool, ScpWasmError> {
         let ctx = self.require_active_context(context_id)?;
         Ok(ctx.outlet_registry.get(outlet_id).is_some())
+    }
+
+    /// Returns the registered [`OutletKind`] for a registered outlet.
+    ///
+    /// Used by the WASM UCAN validator (`validate_outlet_ucan_wasm`) to
+    /// decide which split capability stem (`outlet_query:{id}` for Query
+    /// outlets, `outlet_call:{id}` for Action outlets) the caller's UCAN
+    /// must carry per SCP-OUT-014 / spec §5.4.2.1.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is not found, is not active, or has
+    /// no registered outlet under `outlet_id`.
+    pub fn outlet_kind(
+        &self,
+        context_id: &str,
+        outlet_id: &str,
+    ) -> Result<scp_protocol::context::outlets::OutletKind, ScpWasmError> {
+        let ctx = self.require_active_context(context_id)?;
+        ctx.outlet_registry
+            .get(outlet_id)
+            .map(|r| r.kind)
+            .ok_or_else(|| ScpWasmError::Validation {
+                message: format!("outlet not found: {outlet_id}"),
+                code: codes::TOOL_6002.to_owned(),
+            })
     }
 
     /// Registers a handler function for a tool.

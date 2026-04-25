@@ -119,58 +119,163 @@ pub enum Capability {
     Custom(String),
 }
 
+/// Validates an outlet-stem suffix against §5.4.2.1 step 2.
+///
+/// Returns `Some(suffix.to_owned())` if `suffix` matches the regex
+/// `^[a-z0-9_-]{1,128}$`. Returns `None` for the empty string, suffixes
+/// longer than 128 bytes, suffixes containing characters outside
+/// `[a-z0-9_-]` (uppercase, colons, dots, etc.), or any other shape.
+///
+/// The wildcard `*` is NOT handled here — exact-name match handles it.
+/// This helper is for the parameterized `outlet_query:{id}` /
+/// `outlet_call:{id}` form only.
+///
+/// # Spec reference
+///
+/// `.docs/specs/05-contexts.md` §5.4.2.1 UCAN Capability Stem Parser
+/// (step 2: opaque suffix with `outlet_id` validation). Identical bounds
+/// must apply across every bridge per the parser-differential guard.
+fn parse_outlet_suffix(suffix: &str) -> Option<String> {
+    // Step 2a: length bound. Empty and >128 byte suffixes fail. The
+    // length check uses bytes (UTF-8 is irrelevant — the alphabet is
+    // ASCII) and `len()` matches the regex `{1,128}` quantifier.
+    if suffix.is_empty() || suffix.len() > 128 {
+        return None;
+    }
+    // Step 2b: character class. Every byte must be in `[a-z0-9_-]`.
+    // Uppercase, colons, dots, slashes, plus signs, and any non-ASCII
+    // bytes all reject. Walking bytes (rather than chars) is correct
+    // because every accepted character is exactly one byte in UTF-8.
+    if !suffix
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+    {
+        return None;
+    }
+    Some(suffix.to_owned())
+}
+
 impl Capability {
-    /// Creates a capability from a string name.
+    /// Creates a capability from a string name, applying strict validation
+    /// for parameterized stems.
     ///
-    /// Recognized names: `"messages:read"`, `"messages:write"`,
-    /// `"outlet:query:*"`, `"outlet:call:*"`, `"outlet:register"`,
-    /// `"member:invite"`, `"member:remove"`, `"role:assign"`,
-    /// `"governance:propose"`, `"governance:vote"`, `"context:close"`,
-    /// `"context:child:create"`, `"outlet:interface"`, `"bridging"`,
-    /// `"media:voice"`, `"media:video"`, `"media:screen_share"`,
-    /// `"member:ban"`, `"metadata:edit"`.
-    /// Names starting with `"outlet:query:"` are parsed as `OutletQuery(id)`.
-    /// Names starting with `"outlet:call:"` are parsed as `OutletCall(id)`.
-    /// Names starting with `"custom:"` are parsed as `Custom(remainder)`.
-    /// Anything else maps to `Custom(name)`.
+    /// Returns `None` if the input fails the §5.4.2.1 two-step parser for
+    /// the `outlet_query:` / `outlet_call:` stems (or their SDK-facing
+    /// `outlet:query:` / `outlet:call:` aliases), if it uses the deleted
+    /// `outlet:invoke:` / `outlet_invoke:` stem (hard break per ADR-049 §1
+    /// and SCP-OUT-014), or if it parses any pre-rename `tool:invoke:` /
+    /// `tool_invoke:` legacy form. Otherwise returns `Some(capability)`.
+    ///
+    /// # Recognized exact names
+    ///
+    /// `"messages:read"`, `"messages:write"`, `"outlet:query:*"`,
+    /// `"outlet:call:*"`, `"outlet:register"`, `"member:invite"`,
+    /// `"member:remove"`, `"role:assign"`, `"governance:propose"`,
+    /// `"governance:vote"`, `"context:close"`, `"context:child:create"`,
+    /// `"outlet:interface"`, `"bridging"`, `"media:voice"`, `"media:video"`,
+    /// `"media:screen_share"`, `"member:ban"`, `"metadata:edit"`.
+    ///
+    /// # Parameterized prefixes (strict — §5.4.2.1)
+    ///
+    /// - `"outlet:query:{id}"` and `"outlet_query:{id}"` parse as
+    ///   [`OutletQuery(id)`](Self::OutletQuery).
+    /// - `"outlet:call:{id}"` and `"outlet_call:{id}"` parse as
+    ///   [`OutletCall(id)`](Self::OutletCall).
+    /// - `"outlet:query:*"` / `"outlet_query:*"` parse as
+    ///   [`OutletQueryAll`](Self::OutletQueryAll).
+    /// - `"outlet:call:*"` / `"outlet_call:*"` parse as
+    ///   [`OutletCallAll`](Self::OutletCallAll).
+    ///
+    /// The suffix after the stem prefix must be the literal wildcard `*` or
+    /// match the regex `^[a-z0-9_-]{1,128}$`. Suffixes that contain a colon
+    /// (`outlet_query:call:foo`), are empty (`outlet_query:`), use uppercase
+    /// (`outlet_query:FOO`), or exceed the 128-byte length bound all return
+    /// `None`. This is the parser-differential guard required by spec
+    /// §5.4.2.1 step 2.
+    ///
+    /// # Custom prefix
+    ///
+    /// Names starting with `"custom:"` parse as `Custom(remainder)`. Anything
+    /// else (with no recognized prefix) maps to `Custom(name)`.
+    ///
+    /// # Hard-break prefixes (always `None`)
+    ///
+    /// - `"outlet:invoke:..."` / `"outlet_invoke:..."` — deleted in
+    ///   SCP-OUT-014 (no transitional alias, ADR-049 §1).
+    /// - `"tool:invoke:..."` / `"tool_invoke:..."` — pre-rename legacy form
+    ///   removed in SCP-OUT-002 (no transitional alias).
+    /// - `"tool:register"`, `"tool:interface"` — pre-rename legacy form.
     #[must_use]
-    pub fn new(name: impl AsRef<str>) -> Self {
-        match name.as_ref() {
-            "messages:read" => Self::MessagesRead,
-            "messages:write" => Self::MessagesWrite,
-            "outlet:query:*" => Self::OutletQueryAll,
-            "outlet:call:*" => Self::OutletCallAll,
-            "outlet:register" => Self::OutletRegister,
-            "member:invite" => Self::MemberInvite,
-            "member:remove" => Self::MemberRemove,
-            "role:assign" => Self::RoleAssign,
-            "governance:propose" => Self::GovernancePropose,
-            "governance:vote" => Self::GovernanceVote,
-            "context:close" => Self::ContextClose,
-            "context:child:create" => Self::ChildContextCreate,
-            "outlet:interface" => Self::OutletInterface,
-            "bridging" => Self::Bridging,
-            "media:voice" => Self::MediaVoice,
-            "media:video" => Self::MediaVideo,
-            "media:screen_share" => Self::MediaScreenShare,
-            "member:ban" => Self::MemberBan,
-            "metadata:edit" => Self::MetadataEdit,
-            other => other.strip_prefix("outlet:query:").map_or_else(
-                || {
-                    other.strip_prefix("outlet:call:").map_or_else(
-                        || {
-                            other.strip_prefix("custom:").map_or_else(
-                                || Self::Custom(other.to_owned()),
-                                |custom_name| Self::Custom(custom_name.to_owned()),
-                            )
-                        },
-                        |id| Self::OutletCall(id.to_owned()),
-                    )
-                },
-                |id| Self::OutletQuery(id.to_owned()),
-            ),
+    pub fn new(name: impl AsRef<str>) -> Option<Self> {
+        let n = name.as_ref();
+        // Hard-break forms must NEVER parse — checked before any prefix
+        // splitting so a `outlet_invoke:foo` cannot reach the Custom
+        // catch-all below (ADR-049 §1, SCP-OUT-014).
+        if n.starts_with("outlet:invoke:") || n.starts_with("outlet_invoke:") {
+            return None;
+        }
+        if n == "outlet:invoke:*" || n == "outlet_invoke:*" {
+            return None;
+        }
+        if n.starts_with("tool:invoke:") || n.starts_with("tool_invoke:") {
+            return None;
+        }
+        if matches!(
+            n,
+            "tool:register" | "tool:interface" | "tool_register" | "tool_interface"
+        ) {
+            return None;
+        }
+
+        match n {
+            "messages:read" => Some(Self::MessagesRead),
+            "messages:write" => Some(Self::MessagesWrite),
+            "outlet:query:*" | "outlet_query:*" => Some(Self::OutletQueryAll),
+            "outlet:call:*" | "outlet_call:*" => Some(Self::OutletCallAll),
+            "outlet:register" => Some(Self::OutletRegister),
+            "member:invite" => Some(Self::MemberInvite),
+            "member:remove" => Some(Self::MemberRemove),
+            "role:assign" => Some(Self::RoleAssign),
+            "governance:propose" => Some(Self::GovernancePropose),
+            "governance:vote" => Some(Self::GovernanceVote),
+            "context:close" => Some(Self::ContextClose),
+            "context:child:create" => Some(Self::ChildContextCreate),
+            "outlet:interface" => Some(Self::OutletInterface),
+            "bridging" => Some(Self::Bridging),
+            "media:voice" => Some(Self::MediaVoice),
+            "media:video" => Some(Self::MediaVideo),
+            "media:screen_share" => Some(Self::MediaScreenShare),
+            "member:ban" => Some(Self::MemberBan),
+            "metadata:edit" => Some(Self::MetadataEdit),
+            // Strict §5.4.2.1 parser for the four valid outlet-stem prefixes.
+            // The wildcard `*` form is matched as an exact name above; the
+            // remaining suffix must satisfy `parse_outlet_suffix`. Invalid
+            // suffixes return `None` rather than falling back to Custom —
+            // this is what distinguishes `outlet_query:call:foo` (parser-
+            // differential rejection) from a Custom capability.
+            _ if n.starts_with("outlet:query:") => {
+                parse_outlet_suffix(&n["outlet:query:".len()..]).map(Self::OutletQuery)
+            }
+            _ if n.starts_with("outlet_query:") => {
+                parse_outlet_suffix(&n["outlet_query:".len()..]).map(Self::OutletQuery)
+            }
+            _ if n.starts_with("outlet:call:") => {
+                parse_outlet_suffix(&n["outlet:call:".len()..]).map(Self::OutletCall)
+            }
+            _ if n.starts_with("outlet_call:") => {
+                parse_outlet_suffix(&n["outlet_call:".len()..]).map(Self::OutletCall)
+            }
+            // Custom prefix and bare custom names. The Custom catch-all is
+            // unreachable for outlet-stem inputs because the four prefixes
+            // above (and the hard-break checks at the top) already cover
+            // every `outlet:` / `outlet_` shape.
+            _ => Some(n.strip_prefix("custom:").map_or_else(
+                || Self::Custom(n.to_owned()),
+                |custom_name| Self::Custom(custom_name.to_owned()),
+            )),
         }
     }
+
 
     /// Returns the canonical input name of this capability.
     ///
@@ -1442,7 +1547,8 @@ mod tests {
             let displayed = cap.to_string();
             let roundtripped = Capability::new(&displayed);
             assert_eq!(
-                *cap, roundtripped,
+                Some(cap.clone()),
+                roundtripped,
                 "Display→new roundtrip failed for {cap:?} (displayed as {displayed:?})"
             );
         }
@@ -1463,7 +1569,8 @@ mod tests {
             let displayed = cap.to_string();
             let roundtripped = Capability::new(&displayed);
             assert_eq!(
-                *cap, roundtripped,
+                Some(cap.clone()),
+                roundtripped,
                 "Display→new roundtrip failed for {cap:?} (displayed as {displayed:?})"
             );
         }
@@ -1474,7 +1581,7 @@ mod tests {
         for cap in standard_caps.iter().chain(&custom_caps) {
             let via_name = Capability::new(cap.name());
             assert_eq!(
-                *cap,
+                Some(cap.clone()),
                 via_name,
                 "name()→new() roundtrip failed for {cap:?} (name = {:?})",
                 cap.name()
@@ -1501,7 +1608,7 @@ mod tests {
 
     #[test]
     fn member_ban_capability_new_and_name() {
-        let cap = Capability::new("member:ban");
+        let cap = Capability::new("member:ban").expect("known capability");
         assert_eq!(cap, Capability::MemberBan);
         assert_eq!(cap.name(), "member:ban");
         assert_eq!(format!("{cap}"), "member:ban");
@@ -2921,7 +3028,7 @@ mod tests {
     #[test]
     fn ucan_resource_action_from_name_string() {
         // Parsing from the canonical colon name produces the correct UCAN pair.
-        let cap = Capability::new("outlet:call:*");
+        let cap = Capability::new("outlet:call:*").expect("valid wildcard");
         let (resource, action) = cap.ucan_resource_action();
         assert_eq!(resource.as_ref(), "outlet_call");
         assert_eq!(action.as_ref(), "*");
@@ -2929,7 +3036,7 @@ mod tests {
 
     #[test]
     fn ucan_resource_action_tool_invoke_specific_from_name() {
-        let cap = Capability::new("outlet:call:calculator");
+        let cap = Capability::new("outlet:call:calculator").expect("valid call");
         let (resource, action) = cap.ucan_resource_action();
         assert_eq!(resource.as_ref(), "outlet_call");
         assert_eq!(action.as_ref(), "calculator");
@@ -3158,4 +3265,228 @@ mod tests {
             "SuspendAll must preserve membership — that's what RemoveMember is for"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-014 — split outlet stems, strict §5.4.2.1 parser, attenuation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn out014_capability_new_returns_some_for_outlet_query_id() {
+        // AC3: Capability::new("outlet:query:{outlet_id}") returns Some(OutletQuery(..))
+        assert_eq!(
+            Capability::new("outlet:query:my-tool"),
+            Some(Capability::OutletQuery("my-tool".to_owned()))
+        );
+        assert_eq!(
+            Capability::new("outlet:query:lookup_users"),
+            Some(Capability::OutletQuery("lookup_users".to_owned()))
+        );
+    }
+
+    #[test]
+    fn out014_capability_new_returns_some_for_outlet_call_id() {
+        // AC4: Capability::new("outlet:call:{outlet_id}") returns Some(OutletCall(..))
+        assert_eq!(
+            Capability::new("outlet:call:send_payment"),
+            Some(Capability::OutletCall("send_payment".to_owned()))
+        );
+    }
+
+    #[test]
+    fn out014_capability_new_wildcards_round_trip_both_forms() {
+        // AC5/AC6: Capability::new("outlet:query:*") and "outlet:call:*"
+        // return the wildcard variants. Both wire and SDK forms accepted.
+        assert_eq!(Capability::new("outlet:query:*"), Some(Capability::OutletQueryAll));
+        assert_eq!(Capability::new("outlet_query:*"), Some(Capability::OutletQueryAll));
+        assert_eq!(Capability::new("outlet:call:*"), Some(Capability::OutletCallAll));
+        assert_eq!(Capability::new("outlet_call:*"), Some(Capability::OutletCallAll));
+    }
+
+    #[test]
+    fn out014_capability_new_returns_none_for_outlet_invoke_hard_break() {
+        // AC7: Capability::new("outlet:invoke:{outlet_id}") returns None (hard break)
+        assert_eq!(Capability::new("outlet:invoke:foo"), None);
+        assert_eq!(Capability::new("outlet:invoke:*"), None);
+        assert_eq!(Capability::new("outlet_invoke:foo"), None);
+        assert_eq!(Capability::new("outlet_invoke:*"), None);
+    }
+
+    #[test]
+    fn out014_capability_new_returns_none_for_inner_colon_in_suffix() {
+        // AC15: Capability::new('outlet_query:call:foo') returns None
+        assert_eq!(Capability::new("outlet_query:call:foo"), None);
+        assert_eq!(Capability::new("outlet:query:call:foo"), None);
+        assert_eq!(Capability::new("outlet_call:invoke:bar"), None);
+        assert_eq!(Capability::new("outlet:call:do:something"), None);
+    }
+
+    #[test]
+    fn out014_capability_new_returns_none_for_empty_suffix() {
+        // AC16: Capability::new('outlet_query:') returns None
+        assert_eq!(Capability::new("outlet_query:"), None);
+        assert_eq!(Capability::new("outlet:query:"), None);
+        assert_eq!(Capability::new("outlet_call:"), None);
+        assert_eq!(Capability::new("outlet:call:"), None);
+    }
+
+    #[test]
+    fn out014_capability_new_returns_none_for_uppercase_suffix() {
+        // AC17: Capability::new('outlet_query:FOO') returns None
+        assert_eq!(Capability::new("outlet_query:FOO"), None);
+        assert_eq!(Capability::new("outlet:call:Bar"), None);
+        assert_eq!(Capability::new("outlet_call:abcDEF"), None);
+    }
+
+    #[test]
+    fn out014_capability_new_returns_none_for_oversized_suffix() {
+        // AC18: 129-char suffix returns None
+        let oversized: String = "a".repeat(129);
+        let input = format!("outlet_query:{oversized}");
+        assert_eq!(Capability::new(&input), None);
+        // Boundary: 128 chars MUST parse.
+        let max: String = "a".repeat(128);
+        let ok = format!("outlet_query:{max}");
+        assert_eq!(Capability::new(&ok), Some(Capability::OutletQuery(max)));
+    }
+
+    #[test]
+    fn out014_capability_new_rejects_non_ascii_and_punctuation() {
+        // Defense-in-depth: characters outside [a-z0-9_-] reject.
+        assert_eq!(Capability::new("outlet_query:hello world"), None);
+        assert_eq!(Capability::new("outlet_call:foo.bar"), None);
+        assert_eq!(Capability::new("outlet_query:foo/bar"), None);
+        assert_eq!(Capability::new("outlet_query:foo+bar"), None);
+        assert_eq!(Capability::new("outlet_query:héllo"), None); // non-ASCII
+    }
+
+    #[test]
+    fn out014_ucan_wire_form_uses_underscore() {
+        // AC8: UCAN wire form is `outlet_query:{id}` / `outlet_call:{id}`.
+        let cap = Capability::OutletQuery("calc".to_owned());
+        let (resource, action) = cap.ucan_resource_action();
+        assert_eq!(resource.as_ref(), "outlet_query");
+        assert_eq!(action.as_ref(), "calc");
+        assert_eq!(cap.ucan_capability_name(), "outlet_query:calc");
+
+        let cap2 = Capability::OutletCall("send".to_owned());
+        assert_eq!(cap2.ucan_capability_name(), "outlet_call:send");
+    }
+
+    #[test]
+    fn out014_sdk_form_uses_colon() {
+        // AC9: SDK-facing display form is `outlet:query:{id}` / `outlet:call:{id}`.
+        let cap = Capability::OutletQuery("calc".to_owned());
+        assert_eq!(cap.name().as_ref(), "outlet:query:calc");
+        assert_eq!(format!("{cap}"), "outlet:query:calc");
+
+        let cap2 = Capability::OutletCall("send".to_owned());
+        assert_eq!(cap2.name().as_ref(), "outlet:call:send");
+    }
+
+    #[test]
+    fn out014_round_trip_capability_new_to_display() {
+        // The SDK-facing colon form round-trips through Display.
+        let originals = [
+            Capability::OutletQuery("my-tool".to_owned()),
+            Capability::OutletQueryAll,
+            Capability::OutletCall("send_log".to_owned()),
+            Capability::OutletCallAll,
+        ];
+        for cap in &originals {
+            let displayed = cap.to_string();
+            let reparsed = Capability::new(&displayed);
+            assert_eq!(reparsed.as_ref(), Some(cap), "round-trip failed for {cap:?}");
+        }
+    }
+
+    #[test]
+    fn out014_round_trip_wire_form_through_new() {
+        // The wire form `outlet_query:{id}` must also round-trip through new().
+        let pairs = [
+            ("outlet_query:my-tool", Capability::OutletQuery("my-tool".to_owned())),
+            ("outlet_query:*", Capability::OutletQueryAll),
+            ("outlet_call:send_payment", Capability::OutletCall("send_payment".to_owned())),
+            ("outlet_call:*", Capability::OutletCallAll),
+        ];
+        for (wire, expected) in &pairs {
+            let parsed = Capability::new(wire);
+            assert_eq!(parsed.as_ref(), Some(expected), "wire form {wire:?} did not parse to {expected:?}");
+        }
+    }
+
+    #[test]
+    fn out014_attenuation_query_all_to_query_specific_is_valid() {
+        // AC11: parent(OutletQueryAll) → child(OutletQuery(x)) is valid.
+        // CapabilityCeiling::contains is the protocol-level subset check.
+        let ceiling = CapabilityCeiling::new([Capability::OutletQueryAll]);
+        assert!(ceiling.contains(&Capability::OutletQuery("any-tool".to_owned())));
+        assert!(ceiling.contains(&Capability::OutletQuery("other".to_owned())));
+        assert!(ceiling.contains(&Capability::OutletQueryAll));
+    }
+
+    #[test]
+    fn out014_attenuation_query_all_does_not_grant_call() {
+        // AC11: parent(OutletQueryAll) → child(OutletCall(x)) is REJECTED (cross-class).
+        let ceiling = CapabilityCeiling::new([Capability::OutletQueryAll]);
+        assert!(!ceiling.contains(&Capability::OutletCall("any-tool".to_owned())));
+        assert!(!ceiling.contains(&Capability::OutletCallAll));
+    }
+
+    #[test]
+    fn out014_attenuation_call_all_does_not_grant_query() {
+        // Mirror: parent(OutletCallAll) → child(OutletQuery(x)) is REJECTED.
+        let ceiling = CapabilityCeiling::new([Capability::OutletCallAll]);
+        assert!(!ceiling.contains(&Capability::OutletQuery("any-tool".to_owned())));
+        assert!(!ceiling.contains(&Capability::OutletQueryAll));
+    }
+
+    #[test]
+    fn out014_capability_uri_matches_rejects_cross_class() {
+        // The UCAN-layer attenuation check (CapabilityUri::matches) MUST
+        // reject cross-class because the resource strings differ.
+        use crate::crypto::ucan::capability::CapabilityUri;
+        let parent_query_all = CapabilityUri::new("ctx-1", "outlet_query", "*");
+        let child_call_specific = CapabilityUri::new("ctx-1", "outlet_call", "tool");
+        assert!(
+            !parent_query_all.matches(&child_call_specific),
+            "outlet_query:* must NOT match outlet_call:tool — cross-class attenuation"
+        );
+
+        let parent_call_all = CapabilityUri::new("ctx-1", "outlet_call", "*");
+        let child_query_specific = CapabilityUri::new("ctx-1", "outlet_query", "tool");
+        assert!(
+            !parent_call_all.matches(&child_query_specific),
+            "outlet_call:* must NOT match outlet_query:tool — cross-class attenuation"
+        );
+
+        // Same-class attenuation MUST succeed.
+        let parent_query_all = CapabilityUri::new("ctx-1", "outlet_query", "*");
+        let child_query_specific = CapabilityUri::new("ctx-1", "outlet_query", "tool");
+        assert!(
+            parent_query_all.matches(&child_query_specific),
+            "outlet_query:* MUST match outlet_query:tool — same-class wildcard"
+        );
+    }
+
+    #[test]
+    fn out014_no_outlet_invoke_variant_remains() {
+        // AC2: Capability enum does NOT have variants OutletInvoke / OutletInvokeAll.
+        // This is enforced statically by the enum definition, but we also
+        // verify by construction that the deleted forms cannot be produced.
+        // A grep over the codebase covers the static side; this test covers
+        // the runtime side: the parser refuses to admit those forms.
+        for input in [
+            "outlet:invoke:*",
+            "outlet:invoke:any",
+            "outlet_invoke:*",
+            "outlet_invoke:any",
+        ] {
+            assert_eq!(
+                Capability::new(input),
+                None,
+                "deleted stem {input:?} must not parse"
+            );
+        }
+    }
+
 }

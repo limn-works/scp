@@ -232,12 +232,12 @@ fn new_manager() -> ContextManager {
 /// Standard ceiling that includes all governance-relevant capabilities.
 fn governance_ceiling() -> Vec<Capability> {
     vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("role:assign"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("context:close"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("context:close").expect("known capability"),
         Capability::MemberBan,
     ]
 }
@@ -889,8 +889,8 @@ async fn ac9_checked_propose_requires_capability() {
     let params = ContextParams {
         // Deliberately omit governance:propose from ceiling to test permission denial.
         ceiling: vec![
-            Capability::new("messages:read"),
-            Capability::new("messages:write"),
+            Capability::new("messages:read").expect("known capability"),
+            Capability::new("messages:write").expect("known capability"),
         ],
         governance: GovernanceModel::SingleAdmin,
         ..ContextParams::default()

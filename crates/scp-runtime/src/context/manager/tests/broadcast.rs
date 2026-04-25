@@ -762,10 +762,10 @@ async fn broadcast_close_context_drops_state() {
         mode: ContextMode::Broadcast,
         memory_scope: scp_protocol::context::MemoryScope::Full,
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read"),
-            scp_protocol::context::params::Capability::new("messages:write"),
-            scp_protocol::context::params::Capability::new("role:assign"),
-            scp_protocol::context::params::Capability::new("context:close"),
+            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
+            scp_protocol::context::params::Capability::new("context:close").expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -2513,8 +2513,8 @@ async fn revoke_write_access_rejected_without_member_ban() {
         mode: ContextMode::Encrypted,
         memory_scope: scp_protocol::context::MemoryScope::Full,
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read"),
-            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
         ],
         ..ContextParams::default()
     };

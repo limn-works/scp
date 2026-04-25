@@ -52,19 +52,20 @@
 "messages:write"
 "messages:read"
 
-# Outlet capability URIs (SCP-OUT-008 — post-rename vocabulary).
-# Wire form uses underscore; SDK-facing display form uses colon (ADR-049 §1).
-# The split outlet_query: / outlet_call: stems land in SCP-OUT-020; this
-# story adds outlet_invoke: as a placeholder so the fuzzer still exercises
-# the capability-URI parser on outlet-vocabulary tokens.
-"outlet_invoke:*"
+# Outlet capability URIs (SCP-OUT-014 — split stems landed).
+# Wire form uses underscore (`outlet_query:`, `outlet_call:`) — these are
+# the canonical UCAN resource strings; SDK-facing display form uses colon
+# (`outlet:query:`, `outlet:call:`) per ADR-049 §1 and spec §5.4.2.1.
+# Both forms must round-trip through `Capability::new` and reject invalid
+# suffixes (empty, uppercase, inner colon, > 128 bytes).
 "outlet_query:*"
 "outlet_call:*"
 "outlet:query:*"
 "outlet:call:*"
 
-# Retained: legacy tool_invoke:* is an INVALID-input corpus entry per ADR-049
-# (hard break, no aliases). The fuzzer should exercise rejection of the
-# legacy form — either as `OldFormatRejected` or as
-# `OutletErrorClass::Protocol::UnknownOperation`.
+# Negative-input corpus per SCP-OUT-014 / ADR-049 §1 hard break:
+# the deleted `outlet_invoke:` and pre-rename `tool_invoke:` stems must
+# parse to `None`. Including them as fuzzer tokens lets the parser
+# differential exercise rejection paths on every iteration.
+"outlet_invoke:*"
 "tool_invoke:*"

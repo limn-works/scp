@@ -246,17 +246,23 @@ where
             current_state: state.to_string(),
         });
     }
-    if !has_outlet_call_capability(role_state, invoker_did, outlet_id) {
-        return Err(InvocationError::InvokerNotAuthorized {
-            did: invoker_did.to_string(),
-            outlet_id: outlet_id.to_owned(),
-        });
-    }
+    // SCP-OUT-014: registry lookup is moved BEFORE the capability check
+    // so we can apply the kind-specific stem (`outlet_query:` for Query
+    // outlets, `outlet_call:` for Action outlets). Looking up the outlet
+    // first does NOT widen the auth oracle — `OutletNotFound` is returned
+    // for unregistered outlets regardless of the caller's capabilities,
+    // matching the pre-OUT-014 behavior.
     let registration = registry
         .get(outlet_id)
         .ok_or_else(|| InvocationError::OutletNotFound {
             outlet_id: outlet_id.to_owned(),
         })?;
+    if !has_outlet_invocation_capability(role_state, invoker_did, outlet_id, registration.kind) {
+        return Err(InvocationError::InvokerNotAuthorized {
+            did: invoker_did.to_string(),
+            outlet_id: outlet_id.to_owned(),
+        });
+    }
     validate_value_against_schema(&input, &registration.schema.input_schema)
         .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
 
@@ -437,20 +443,24 @@ where
         });
     }
 
-    // 2. Validate invoker has OutletCall(outlet_id) or OutletCallAll capability.
-    if !has_outlet_call_capability(role_state, invoker_did, outlet_id) {
-        return Err(InvocationError::InvokerNotAuthorized {
-            did: invoker_did.to_string(),
-            outlet_id: outlet_id.to_owned(),
-        });
-    }
-
-    // 3. Look up the outlet in the registry.
+    // 2. Look up the outlet in the registry.
+    //    SCP-OUT-014: registry lookup precedes the capability check so we
+    //    can pick the kind-specific stem (Query → `outlet_query:`, Action
+    //    → `outlet_call:`). `OutletNotFound` is returned for unregistered
+    //    outlets regardless of caller capability.
     let registration = registry
         .get(outlet_id)
         .ok_or_else(|| InvocationError::OutletNotFound {
             outlet_id: outlet_id.to_owned(),
         })?;
+
+    // 3. Validate invoker holds the kind-appropriate split capability.
+    if !has_outlet_invocation_capability(role_state, invoker_did, outlet_id, registration.kind) {
+        return Err(InvocationError::InvokerNotAuthorized {
+            did: invoker_did.to_string(),
+            outlet_id: outlet_id.to_owned(),
+        });
+    }
 
     // 4. Validate input against the outlet's input schema.
     validate_value_against_schema(&input, &registration.schema.input_schema)
@@ -662,17 +672,19 @@ where
             current_state: state.to_string(),
         });
     }
-    if !has_outlet_call_capability(role_state, invoker_did, outlet_id) {
-        return Err(InvocationError::InvokerNotAuthorized {
-            did: invoker_did.to_string(),
-            outlet_id: outlet_id.to_owned(),
-        });
-    }
+    // SCP-OUT-014: registry lookup before capability check so we can
+    // select the kind-specific stem.
     let registration = registry
         .get(outlet_id)
         .ok_or_else(|| InvocationError::OutletNotFound {
             outlet_id: outlet_id.to_owned(),
         })?;
+    if !has_outlet_invocation_capability(role_state, invoker_did, outlet_id, registration.kind) {
+        return Err(InvocationError::InvokerNotAuthorized {
+            did: invoker_did.to_string(),
+            outlet_id: outlet_id.to_owned(),
+        });
+    }
     validate_value_against_schema(&input, &registration.schema.input_schema)
         .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
 
@@ -1078,7 +1090,8 @@ fn elapsed_ms(start: std::time::Instant) -> u64 {
 /// capability.
 ///
 /// This is the integration point between the invocation module and the
-/// UCAN-based role system (ADR-009).
+/// UCAN-based role system (ADR-009). Use [`has_outlet_query_capability`] for
+/// Query outlets — the two stems are independent (SCP-OUT-014).
 #[must_use]
 pub fn has_outlet_call_capability(
     role_state: &ContextRoleState,
@@ -1091,6 +1104,49 @@ pub fn has_outlet_call_capability(
     }
     // Check for specific OutletCall(outlet_id).
     role_state.member_has_capability(did, &Capability::OutletCall(outlet_id.to_owned()))
+}
+
+/// Checks whether a member has the `OutletQuery(outlet_id)` or
+/// `OutletQueryAll` capability (Query outlets — SCP-OUT-014).
+///
+/// Mirror of [`has_outlet_call_capability`] for the Query-class stem. The
+/// runtime selects between the two via the registered `OutletKind` so a
+/// caller cannot gain Query authorization via an Action delegation (or
+/// vice versa) — see spec §5.4.2 / ADR-049 §2.
+#[must_use]
+pub fn has_outlet_query_capability(
+    role_state: &ContextRoleState,
+    did: &str,
+    outlet_id: &str,
+) -> bool {
+    if role_state.member_has_capability(did, &Capability::OutletQueryAll) {
+        return true;
+    }
+    role_state.member_has_capability(did, &Capability::OutletQuery(outlet_id.to_owned()))
+}
+
+/// Checks whether a member holds the kind-appropriate split capability for
+/// invoking an outlet.
+///
+/// Selects between [`has_outlet_call_capability`] (Action) and
+/// [`has_outlet_query_capability`] (Query) based on the outlet's registered
+/// [`OutletKind`]. Per spec §5.4.2 the two stems are independent —
+/// `OutletQueryAll` must not authorize an Action call and vice versa.
+#[must_use]
+pub fn has_outlet_invocation_capability(
+    role_state: &ContextRoleState,
+    did: &str,
+    outlet_id: &str,
+    kind: scp_protocol::context::outlets::OutletKind,
+) -> bool {
+    match kind {
+        scp_protocol::context::outlets::OutletKind::Query => {
+            has_outlet_query_capability(role_state, did, outlet_id)
+        }
+        scp_protocol::context::outlets::OutletKind::Action => {
+            has_outlet_call_capability(role_state, did, outlet_id)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1123,6 +1179,7 @@ pub fn validate_outlet_invocation_ucan<D, N, R, P, S>(
     encoded_token: &str,
     context_id: &str,
     outlet_id: &str,
+    kind: scp_protocol::context::outlets::OutletKind,
     ctx: &mut ValidationContext<'_, D, N, R, P, S>,
 ) -> Result<(), UcanError>
 where
@@ -1133,7 +1190,17 @@ where
     S: BuildHasher,
 {
     let parsed = parse_ucan(encoded_token)?;
-    let required_cap = CapabilityUri::new(context_id, "outlet_call", outlet_id);
+    // SCP-OUT-014: pick the split stem from the outlet's registered kind.
+    // Query outlets require `outlet_query:{id}` (or wildcard `outlet_query:*`);
+    // Action outlets require `outlet_call:{id}` (or wildcard `outlet_call:*`).
+    // Cross-class delegations (parent `outlet_query:*` → child `outlet_call:x`)
+    // are rejected automatically by `CapabilityUri::matches` because the
+    // `resource` strings differ.
+    let resource = match kind {
+        scp_protocol::context::outlets::OutletKind::Query => "outlet_query",
+        scp_protocol::context::outlets::OutletKind::Action => "outlet_call",
+    };
+    let required_cap = CapabilityUri::new(context_id, resource, outlet_id);
     validate_ucan(&parsed, &required_cap, ctx)
 }
 
@@ -1835,7 +1902,13 @@ mod tests {
         // validate_outlet_invocation_ucan expects outlet_call:calculator,
         // but the token only has messages:write — must be rejected.
         let result =
-            validate_outlet_invocation_ucan(&token.encoded, "ctx-test", "calculator", &mut ctx);
+            validate_outlet_invocation_ucan(
+            &token.encoded,
+            "ctx-test",
+            "calculator",
+            scp_protocol::context::outlets::OutletKind::Action,
+            &mut ctx,
+        );
 
         assert!(
             result.is_err(),

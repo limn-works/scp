@@ -96,7 +96,7 @@ pub fn media_check_capability(ceiling: Vec<String>, capability: String) -> napi:
     let cap = parse_media_capability(&capability)?;
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .map(scp_core::context::params::Capability::new)
+        .filter_map(scp_core::context::params::Capability::new)
         .collect();
     check_media_capability(&param_caps, &cap).map_err(media_error_to_napi)?;
     Ok(true)
@@ -121,7 +121,7 @@ pub fn media_initiate_session(
 
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .map(scp_core::context::params::Capability::new)
+        .filter_map(scp_core::context::params::Capability::new)
         .collect();
 
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]

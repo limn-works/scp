@@ -1976,9 +1976,9 @@ mod tests {
             governance: GovernanceModel::SingleAdmin,
             // Include role:assign capability so the admin can add members.
             ceiling: vec![
-                Capability::new("messages:read"),
-                Capability::new("messages:write"),
-                Capability::new("role:assign"),
+                Capability::new("messages:read").expect("known capability"),
+                Capability::new("messages:write").expect("known capability"),
+                Capability::new("role:assign").expect("known capability"),
             ],
             ..ContextParams::default()
         };

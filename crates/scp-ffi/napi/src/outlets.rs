@@ -29,6 +29,21 @@ fn validate_ucan_for_tool(
     proof_resolver: &scp_ffi_common::BridgeProofResolver,
 ) -> Result<(), ScpNapiError> {
     crate::runtime::with_context(context_id, |rt| {
+        // SCP-OUT-014: select the split capability stem from the outlet's
+        // registered kind. `outlet_query:{id}` for Query outlets,
+        // `outlet_call:{id}` for Action outlets — the legacy
+        // `outlet_invoke:` stem is deleted with no transitional alias.
+        let outlet_kind_for_ucan =
+            rt.outlet_registry
+                .get(outlet_id)
+                .map(|r| r.kind)
+                .ok_or_else(|| ScpNapiError::Permission {
+                    message: format!(
+                        "tool '{outlet_id}' not registered in context '{context_id}'"
+                    ),
+                    code: codes::TOOL_6002.to_owned(),
+                })?;
+
         let production_resolver = crate::runtime::did_resolver();
         let did_resolver = scp_ffi_common::DispatchDidResolver::new(
             production_resolver.map(std::convert::AsRef::as_ref),
@@ -54,7 +69,7 @@ fn validate_ucan_for_tool(
         };
 
         scp_core::context::tools::validate_outlet_invocation_ucan(
-            ucan_token, context_id, outlet_id, &mut ctx,
+            ucan_token, context_id, outlet_id, outlet_kind_for_ucan, &mut ctx,
         )
         .map_err(|e| ScpNapiError::Permission {
             message: format!("UCAN authorization failed for tool '{outlet_id}': {e}"),

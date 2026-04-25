@@ -1018,8 +1018,8 @@ mod tests {
         let params = ContextParams {
             mode: ContextMode::Broadcast,
             ceiling: vec![
-                Capability::new("messages:read"),
-                Capability::new("messages:write"),
+                Capability::new("messages:read").expect("known capability"),
+                Capability::new("messages:write").expect("known capability"),
             ],
             ceiling_policy: CeilingPolicy::Governed,
             promotion_policy: PromotionPolicy::Promotable,
@@ -1088,7 +1088,7 @@ mod tests {
 
     #[test]
     fn capability_new_and_name() {
-        let cap = Capability::new("messages:write");
+        let cap = Capability::new("messages:write").expect("known capability");
         assert_eq!(cap.name(), "messages:write");
     }
 
@@ -1188,7 +1188,7 @@ mod tests {
     fn context_params_serialization_roundtrip() {
         let params = ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: vec![Capability::new("messages:read")],
+            ceiling: vec![Capability::new("messages:read").expect("known capability")],
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: vec![RoleDefinition {
@@ -1233,7 +1233,7 @@ mod tests {
 
         let params = ContextParams {
             mode: ContextMode::Encrypted,
-            ceiling: vec![Capability::new("messages:read")],
+            ceiling: vec![Capability::new("messages:read").expect("known capability")],
             ceiling_policy: CeilingPolicy::Immutable,
             promotion_policy: PromotionPolicy::NoPromotion,
             roles: vec![],
@@ -1438,7 +1438,7 @@ mod tests {
         // Default MetadataVisibilityPolicy has all fields PreJoin,
         // so public_metadata() should return everything.
         let params = ContextParams {
-            ceiling: vec![Capability::new("messages:read")],
+            ceiling: vec![Capability::new("messages:read").expect("known capability")],
             mode: ContextMode::Encrypted,
             ..ContextParams::default()
         };
@@ -1522,8 +1522,8 @@ mod tests {
         // Even with all operational fields MemberOnly, structural fields persist.
         let params = ContextParams {
             ceiling: vec![
-                Capability::new("messages:read"),
-                Capability::new("messages:write"),
+                Capability::new("messages:read").expect("known capability"),
+                Capability::new("messages:write").expect("known capability"),
             ],
             ceiling_policy: CeilingPolicy::Governed,
             mode: ContextMode::Broadcast,
@@ -1711,7 +1711,7 @@ mod tests {
     #[test]
     fn public_metadata_serialization_roundtrip() {
         let params = ContextParams {
-            ceiling: vec![Capability::new("messages:read")],
+            ceiling: vec![Capability::new("messages:read").expect("known capability")],
             ..ContextParams::default()
         };
         let runtime = full_runtime();

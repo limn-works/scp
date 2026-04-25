@@ -1,0 +1,301 @@
+{
+  "version": "v1",
+  "spec_section": ".docs/specs/05-contexts.md §5.4.2.1 UCAN Capability Stem Parser",
+  "adr": ".docs/adrs/ADR-049-outlet-redesign.md §1, §2",
+  "story": "SCP-OUT-014",
+  "description": "Conformance vectors for the §5.4.2.1 outlet capability stem parser. Every bridge (PyO3, NAPI, UniFFI Swift, UniFFI Kotlin, WASM) must accept every positive vector and reject every negative vector identically — divergence is a parser-differential bug that allows authorization-class confusion. The Rust core's scp_protocol::context::roles::Capability::new is the reference implementation; bridges MAY add wrapper validation but MUST NOT weaken the rejection criteria.",
+  "rules": [
+    "Wire form: `outlet_query:` / `outlet_call:` (UCAN resource string).",
+    "SDK display form: `outlet:query:` / `outlet:call:` (round-trips through Display).",
+    "Suffix must be `*` (wildcard) or `^[a-z0-9_-]{1,128}$`.",
+    "`outlet:invoke:` / `outlet_invoke:` are HARD-BREAK deleted (ADR-049 §1).",
+    "`tool:invoke:` / `tool_invoke:` / `tool:register` / `tool:interface` are pre-rename legacy (rejected).",
+    "Inner colons in the suffix (`outlet_query:call:foo`) are rejected (parser-differential guard).",
+    "Empty suffix (`outlet_query:`) is rejected.",
+    "Uppercase characters in the suffix are rejected (case-sensitive regex).",
+    "Suffix length > 128 bytes is rejected.",
+    "Non-ASCII bytes in the suffix are rejected."
+  ],
+  "positive": [
+    {
+      "input": "messages:read",
+      "expected": {
+        "kind": "MessagesRead"
+      }
+    },
+    {
+      "input": "messages:write",
+      "expected": {
+        "kind": "MessagesWrite"
+      }
+    },
+    {
+      "input": "outlet:register",
+      "expected": {
+        "kind": "OutletRegister"
+      }
+    },
+    {
+      "input": "outlet:interface",
+      "expected": {
+        "kind": "OutletInterface"
+      }
+    },
+    {
+      "input": "member:invite",
+      "expected": {
+        "kind": "MemberInvite"
+      }
+    },
+    {
+      "input": "context:close",
+      "expected": {
+        "kind": "ContextClose"
+      }
+    },
+    {
+      "input": "context:child:create",
+      "expected": {
+        "kind": "ChildContextCreate"
+      }
+    },
+    {
+      "input": "media:voice",
+      "expected": {
+        "kind": "MediaVoice"
+      }
+    },
+    {
+      "input": "outlet:query:*",
+      "expected": {
+        "kind": "OutletQueryAll"
+      }
+    },
+    {
+      "input": "outlet_query:*",
+      "expected": {
+        "kind": "OutletQueryAll"
+      }
+    },
+    {
+      "input": "outlet:call:*",
+      "expected": {
+        "kind": "OutletCallAll"
+      }
+    },
+    {
+      "input": "outlet_call:*",
+      "expected": {
+        "kind": "OutletCallAll"
+      }
+    },
+    {
+      "input": "outlet:query:my-tool",
+      "expected": {
+        "kind": "OutletQuery",
+        "id": "my-tool"
+      }
+    },
+    {
+      "input": "outlet:query:lookup_users",
+      "expected": {
+        "kind": "OutletQuery",
+        "id": "lookup_users"
+      }
+    },
+    {
+      "input": "outlet:query:a",
+      "expected": {
+        "kind": "OutletQuery",
+        "id": "a"
+      }
+    },
+    {
+      "input": "outlet:call:send_payment",
+      "expected": {
+        "kind": "OutletCall",
+        "id": "send_payment"
+      }
+    },
+    {
+      "input": "outlet:call:tool-1",
+      "expected": {
+        "kind": "OutletCall",
+        "id": "tool-1"
+      }
+    },
+    {
+      "input": "outlet:call:0",
+      "expected": {
+        "kind": "OutletCall",
+        "id": "0"
+      }
+    },
+    {
+      "input": "outlet_query:lookup",
+      "expected": {
+        "kind": "OutletQuery",
+        "id": "lookup"
+      }
+    },
+    {
+      "input": "outlet_query:my-query",
+      "expected": {
+        "kind": "OutletQuery",
+        "id": "my-query"
+      }
+    },
+    {
+      "input": "outlet_call:write_log",
+      "expected": {
+        "kind": "OutletCall",
+        "id": "write_log"
+      }
+    },
+    {
+      "input": "outlet_call:abc-123_xyz",
+      "expected": {
+        "kind": "OutletCall",
+        "id": "abc-123_xyz"
+      }
+    },
+    {
+      "input": "outlet:call:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "expected": {
+        "kind": "OutletCall",
+        "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "input": "outlet_query:zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "expected": {
+        "kind": "OutletQuery",
+        "id": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"
+      }
+    },
+    {
+      "input": "custom:my-app:do_thing",
+      "expected": {
+        "kind": "Custom",
+        "name": "my-app:do_thing"
+      }
+    },
+    {
+      "input": "custom:foo",
+      "expected": {
+        "kind": "Custom",
+        "name": "foo"
+      }
+    }
+  ],
+  "negative": [
+    {
+      "input": "outlet:invoke:*",
+      "reason": "outlet:invoke:* deleted (ADR-049 §1)"
+    },
+    {
+      "input": "outlet_invoke:*",
+      "reason": "outlet_invoke:* deleted"
+    },
+    {
+      "input": "outlet:invoke:my-tool",
+      "reason": "outlet:invoke:{id} deleted"
+    },
+    {
+      "input": "outlet_invoke:my_tool",
+      "reason": "outlet_invoke:{id} deleted"
+    },
+    {
+      "input": "tool:invoke:*",
+      "reason": "tool:invoke:* pre-rename legacy"
+    },
+    {
+      "input": "tool_invoke:*",
+      "reason": "tool_invoke:* pre-rename legacy"
+    },
+    {
+      "input": "tool:invoke:calculator",
+      "reason": "tool:invoke:{id} pre-rename legacy"
+    },
+    {
+      "input": "tool_invoke:calc",
+      "reason": "tool_invoke:{id} pre-rename legacy"
+    },
+    {
+      "input": "tool:register",
+      "reason": "tool:register pre-rename legacy"
+    },
+    {
+      "input": "tool:interface",
+      "reason": "tool:interface pre-rename legacy"
+    },
+    {
+      "input": "outlet_query:call:foo",
+      "reason": "inner colon in suffix"
+    },
+    {
+      "input": "outlet:query:call:foo",
+      "reason": "inner colon in suffix (SDK form)"
+    },
+    {
+      "input": "outlet_call:invoke:bar",
+      "reason": "inner colon in suffix"
+    },
+    {
+      "input": "outlet_query:",
+      "reason": "empty suffix"
+    },
+    {
+      "input": "outlet:query:",
+      "reason": "empty suffix (SDK form)"
+    },
+    {
+      "input": "outlet_call:",
+      "reason": "empty suffix"
+    },
+    {
+      "input": "outlet:call:",
+      "reason": "empty suffix (SDK form)"
+    },
+    {
+      "input": "outlet_query:FOO",
+      "reason": "uppercase in suffix"
+    },
+    {
+      "input": "outlet:call:Tool",
+      "reason": "uppercase in suffix"
+    },
+    {
+      "input": "outlet_call:abcDEF",
+      "reason": "mixed case"
+    },
+    {
+      "input": "outlet_query:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "reason": "suffix > 128 bytes"
+    },
+    {
+      "input": "outlet:call:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "reason": "suffix > 128 bytes (SDK form)"
+    },
+    {
+      "input": "outlet_query:hello world",
+      "reason": "space in suffix"
+    },
+    {
+      "input": "outlet_call:foo.bar",
+      "reason": "dot in suffix"
+    },
+    {
+      "input": "outlet_query:foo/bar",
+      "reason": "slash in suffix"
+    },
+    {
+      "input": "outlet_query:foo+bar",
+      "reason": "plus in suffix"
+    },
+    {
+      "input": "outlet_query:héllo",
+      "reason": "non-ASCII in suffix"
+    }
+  ]
+}

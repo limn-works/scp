@@ -146,7 +146,7 @@ pub fn py_fullstack_create_context(
             |arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str())
-                    .map(Capability::new)
+                    .filter_map(Capability::new)
                     .collect::<Vec<_>>()
             },
         );

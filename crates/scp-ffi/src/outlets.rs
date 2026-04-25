@@ -407,6 +407,20 @@ fn validate_outlet_ucan(
         crate::ucan::build_proof_resolver_from_tokens(proof_tokens.map(Vec::as_slice))?;
 
     crate::runtime::with_context(context_id, |rt| {
+        // SCP-OUT-014: select the split capability stem from the outlet's
+        // registered kind. `outlet_query:{id}` for Query outlets,
+        // `outlet_call:{id}` for Action outlets — `outlet_invoke:` is
+        // deleted with no transitional alias (ADR-049 §1).
+        let outlet_kind_for_ucan = rt
+            .outlet_registry
+            .get(outlet_id)
+            .map(|r| r.kind)
+            .ok_or_else(|| {
+                ScpPyError::ucan(format!(
+                    "tool '{outlet_id}' not registered in context '{context_id}'"
+                ))
+            })?;
+
         let production_resolver = crate::runtime::did_resolver();
         let did_resolver = crate::bridge_adapters::DispatchDidResolver::new(
             production_resolver.map(std::convert::AsRef::as_ref),
@@ -432,7 +446,7 @@ fn validate_outlet_ucan(
         };
 
         scp_core::context::tools::validate_outlet_invocation_ucan(
-            ucan_token, context_id, outlet_id, &mut ctx,
+            ucan_token, context_id, outlet_id, outlet_kind_for_ucan, &mut ctx,
         )
         .map_err(|e| {
             ScpPyError::ucan(format!(

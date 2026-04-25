@@ -508,9 +508,20 @@ pub fn outlet_invoke(
     future_to_promise(async move {
         // UCAN authorization: validate the token via the WASM-local
         // 11-step pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+        // Look up the outlet's registered kind so the UCAN validator
+        // checks the correct split capability stem (SCP-OUT-014).
+        let outlet_kind_for_ucan =
+            crate::manager::with_manager(|mgr| mgr.outlet_kind(&context_id, &outlet_id))
+                .map_err(ScpWasmError::into_js)?;
         match ucan_token {
             Some(ref token) if !token.is_empty() => {
-                crate::ucan::validate_outlet_ucan_wasm(&context_id, &outlet_id, token, &identity_did)
+                crate::ucan::validate_outlet_ucan_wasm(
+                    &context_id,
+                    &outlet_id,
+                    outlet_kind_for_ucan,
+                    token,
+                    &identity_did,
+                )
                     .map_err(|e| {
                     ScpWasmError::Permission {
                         message: format!("UCAN authorization failed for tool '{outlet_id}': {e}"),
@@ -800,7 +811,18 @@ pub fn outlet_invoke_cross_context(
             .into_js()
             .into());
         }
-        crate::ucan::validate_outlet_ucan_wasm(&target_id, &outlet_id, &ucan_token, &invoker_did)
+        // Look up the outlet kind in the TARGET context (the cross-context
+        // delegation must carry the right split stem; SCP-OUT-014).
+        let outlet_kind_for_ucan =
+            crate::manager::with_manager(|mgr| mgr.outlet_kind(&target_id, &outlet_id))
+                .map_err(ScpWasmError::into_js)?;
+        crate::ucan::validate_outlet_ucan_wasm(
+            &target_id,
+            &outlet_id,
+            outlet_kind_for_ucan,
+            &ucan_token,
+            &invoker_did,
+        )
             .map_err(|e| {
                 ScpWasmError::Permission {
                     message: format!(
@@ -908,9 +930,13 @@ pub fn outlet_session_invoke(
         let outlet_id_for_ucan = with_manager(|mgr| mgr.session_outlet_id(&context_id, &session_id))
             .map_err(ScpWasmError::into_js)?;
 
+        let outlet_kind_for_ucan =
+            with_manager(|mgr| mgr.outlet_kind(&context_id, &outlet_id_for_ucan))
+                .map_err(ScpWasmError::into_js)?;
         crate::ucan::validate_outlet_ucan_wasm(
             &context_id,
             &outlet_id_for_ucan,
+            outlet_kind_for_ucan,
             &ucan_token,
             &invoker_did,
         )

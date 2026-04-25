@@ -3297,7 +3297,7 @@ pub async fn context_create(
                 ceiling_strings: params
                     .ceiling
                     .iter()
-                    .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+                    .filter_map(|s| scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name()))
                     .collect(),
                 outlet_registry: tokio::sync::Mutex::new(
                     scp_core::context::tools::OutletRegistry::new(),
@@ -4104,8 +4104,8 @@ pub async fn outlet_invoke(
             // enforce this. Reject early if missing (§6.2, ADR-016, #423).
             let ucan_token = ucan_token.ok_or_else(|| ScpError::Permission {
                 msg: "UCAN token is required for tool invocation — \
-                          pass a valid JWT-encoded UCAN with outlet_invoke:{outlet_id} \
-                          or outlet_invoke:* capability"
+                          pass a valid JWT-encoded UCAN with outlet_query:{outlet_id} / outlet_call:{outlet_id} \
+                          or outlet_query:* / outlet_call:* capability (SCP-OUT-014)"
                     .to_owned(),
                 code: codes::PERM_3001.to_owned(),
             })?;
@@ -4130,10 +4130,22 @@ pub async fn outlet_invoke(
             // Primary authorization: UCAN token validation via the full
             // 11-step ADR-016 pipeline. Bridge-owned because the proof
             // resolver, revocation list, and nonce tracker live in the
-            // bridge UCAN registry, not in the runtime.
+            // bridge UCAN registry, not in the runtime. SCP-OUT-014: pick
+            // the kind-specific stem from the outlet's registered kind.
+            let outlet_kind = {
+                let registry = handle.outlet_registry.lock().await;
+                registry
+                    .get(&outlet_id)
+                    .map(|r| r.kind)
+                    .ok_or_else(|| ScpError::Tool {
+                        msg: format!("tool '{outlet_id}' not registered"),
+                        code: codes::TOOL_6002.to_owned(),
+                    })?
+            };
             validate_outlet_ucan_uniffi(
                 &handle,
                 &outlet_id,
+                outlet_kind,
                 &ucan_token,
                 &identity.did,
                 proof_tokens.as_ref(),
@@ -4249,6 +4261,7 @@ pub async fn outlet_invoke(
 fn validate_outlet_ucan_uniffi(
     handle: &ContextHandle,
     outlet_id: &str,
+    kind: scp_core::context::outlets::OutletKind,
     ucan_token: &str,
     identity_did: &str,
     proof_tokens: Option<&Vec<String>>,
@@ -4303,7 +4316,7 @@ fn validate_outlet_ucan_uniffi(
             clock: &scp_primitives::SystemClock,
         };
 
-        validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, &mut ctx).map_err(
+        validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, kind, &mut ctx).map_err(
             |e| ScpError::Permission {
                 msg: format!("UCAN authorization failed for tool '{outlet_id}': {e}"),
                 code: codes::PERM_3002.to_owned(),
@@ -4493,10 +4506,25 @@ pub async fn outlet_invoke_cross_context(
 
             // Primary authorization: UCAN token validation via the full 11-step
             // ADR-016 pipeline against the TARGET context's ceiling.
-            // See spec §6.2, §8, ADR-016, and issue #319.
+            // See spec §6.2, §8, ADR-016, and issue #319. SCP-OUT-014: the
+            // split stem is selected from the TARGET-side registered kind.
+            let outlet_kind_for_ucan = {
+                let registry = target_handle.outlet_registry.lock().await;
+                registry
+                    .get(&outlet_id)
+                    .map(|r| r.kind)
+                    .ok_or_else(|| ScpError::Tool {
+                        msg: format!(
+                            "tool '{outlet_id}' not found in target context '{}'",
+                            target_handle.context_id
+                        ),
+                        code: codes::TOOL_6002.to_owned(),
+                    })?
+            };
             validate_outlet_ucan_uniffi(
                 &target_handle,
                 &outlet_id,
+                outlet_kind_for_ucan,
                 &ucan_token,
                 &identity.did,
                 proof_tokens.as_ref(),
@@ -4702,9 +4730,21 @@ pub async fn outlet_session_invoke(
 
             // Primary authorization: UCAN token validation via the full 11-step
             // ADR-016 pipeline. See spec §6.2, §8, ADR-016, and issue #319.
+            // SCP-OUT-014: pick the split stem from the registered kind.
+            let outlet_kind_for_ucan = {
+                let registry = handle.outlet_registry.lock().await;
+                registry
+                    .get(&outlet_id_for_ucan)
+                    .map(|r| r.kind)
+                    .ok_or_else(|| ScpError::Tool {
+                        msg: format!("tool '{outlet_id_for_ucan}' not found"),
+                        code: codes::TOOL_6002.to_owned(),
+                    })?
+            };
             validate_outlet_ucan_uniffi(
                 &handle,
                 &outlet_id_for_ucan,
+                outlet_kind_for_ucan,
                 &ucan_token,
                 &identity.did,
                 proof_tokens.as_ref(),
@@ -6075,8 +6115,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
 
     fn validate_capability(&self, context_id: &str, outlet_name: &str) -> Result<(), String> {
         // Primary check: UCAN token validation via the full 11-step ADR-016
-        // pipeline. Verifies the token grants outlet_invoke:{outlet_name} or
-        // outlet_invoke:* for this context.
+        // pipeline. Verifies the token grants outlet_query:{outlet_name} /
+        // outlet_call:{outlet_name} (or wildcards) for this context, picked
+        // by the registered OutletKind (SCP-OUT-014, spec §5.4.2.1).
         if let Some(ref token) = self.agent_ucan_token {
             // Build proof resolver from optional proof tokens.
             let mut proofs = std::collections::HashMap::new();
@@ -6103,6 +6144,28 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     &handle.ceiling_strings,
                 );
             }
+
+            // SCP-OUT-014: look up the outlet's registered kind to
+            // select the split stem (`outlet_query:` for Query, `outlet_call:`
+            // for Action). Without the kind, the validator cannot enforce the
+            // class-specific authorization required by spec §5.4.2.
+            let outlet_kind_for_ucan = {
+                let registry = context_handle_registry();
+                let Some(handle) = registry.get(context_id) else {
+                    return Err(format!(
+                        "context '{context_id}' not found in handle registry"
+                    ));
+                };
+                let outlet_registry = handle.outlet_registry.blocking_lock();
+                outlet_registry
+                    .get(outlet_name)
+                    .map(|r| r.kind)
+                    .ok_or_else(|| {
+                        format!(
+                            "tool '{outlet_name}' not registered in context '{context_id}'"
+                        )
+                    })?
+            };
 
             let agent_did = self.agent_did.clone();
             crate::runtime::with_ucan_state(context_id, |ucan_state| {
@@ -6131,7 +6194,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                 };
 
                 scp_core::context::tools::validate_outlet_invocation_ucan(
-                    token, context_id, outlet_name, &mut ctx,
+                    token, context_id, outlet_name, outlet_kind_for_ucan, &mut ctx,
                 )
                 .map_err(|e| {
                     tracing::warn!(
@@ -11030,7 +11093,7 @@ pub fn media_check_capability(ceiling: Vec<String>, capability: String) -> Resul
     let cap = parse_media_capability(&capability)?;
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .map(scp_core::context::params::Capability::new)
+        .filter_map(scp_core::context::params::Capability::new)
         .collect();
     scp_media::session::check_media_capability(&param_caps, &cap).map_err(|e| {
         ScpError::Context {
@@ -11060,7 +11123,7 @@ pub fn media_initiate_session(
 
     let param_caps: Vec<scp_core::context::params::Capability> = ceiling
         .iter()
-        .map(scp_core::context::params::Capability::new)
+        .filter_map(scp_core::context::params::Capability::new)
         .collect();
 
     let session = scp_media::session::initiate_media_session(
@@ -12868,8 +12931,8 @@ pub fn sandbox_validate_declaration(
             code: codes::VALID_7070.to_owned(),
         })?;
 
-    let ceiling: Vec<Capability> = ceiling_capabilities.iter().map(Capability::new).collect();
-    let role_caps: Vec<Capability> = role_capabilities.iter().map(Capability::new).collect();
+    let ceiling: Vec<Capability> = ceiling_capabilities.iter().filter_map(Capability::new).collect();
+    let role_caps: Vec<Capability> = role_capabilities.iter().filter_map(Capability::new).collect();
 
     let handle = CoreContextHandle::new("validation-context".to_owned(), ContextParams::default());
 
@@ -12914,8 +12977,16 @@ pub fn sandbox_check_capability(
     use scp_core::context::roles::Capability;
     use std::collections::HashSet;
 
-    let granted: HashSet<Capability> = granted_capabilities.iter().map(Capability::new).collect();
-    let required = Capability::new(&required_capability);
+    let granted: HashSet<Capability> = granted_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
+    // Fail-closed: if the required capability is malformed (e.g. the
+    // deleted `outlet_invoke:` stem or an out-of-range outlet suffix),
+    // deny the check rather than panicking. SCP-OUT-014.
+    let Some(required) = Capability::new(&required_capability) else {
+        return false;
+    };
 
     if granted.contains(&required) {
         return true;

@@ -590,7 +590,7 @@ pub async fn context_create(
         mode: mode_str,
         ceiling: ceiling
             .iter()
-            .map(|s| scp_core::context::roles::Capability::new(s).ucan_capability_name())
+            .filter_map(|s| scp_core::context::roles::Capability::new(s).map(|c| c.ucan_capability_name()))
             .collect(),
         ceiling_policy,
         ttl_seconds,
@@ -3293,8 +3293,8 @@ pub fn validate_capability_declaration(
     let decl: CapabilityDeclaration = serde_json::from_str(&declaration_json)
         .map_err(|e| NapiError::from_reason(format!("invalid declaration JSON: {e}")))?;
 
-    let ceiling: Vec<Capability> = ceiling_capabilities.iter().map(Capability::new).collect();
-    let role_caps: Vec<Capability> = role_capabilities.iter().map(Capability::new).collect();
+    let ceiling: Vec<Capability> = ceiling_capabilities.iter().filter_map(Capability::new).collect();
+    let role_caps: Vec<Capability> = role_capabilities.iter().filter_map(Capability::new).collect();
 
     let handle = ContextHandle::new("validation-context".to_owned(), ContextParams::default());
 
@@ -3333,8 +3333,16 @@ pub fn check_scoped_capability(
     use scp_core::context::roles::Capability;
     use std::collections::HashSet;
 
-    let granted: HashSet<Capability> = granted_capabilities.iter().map(Capability::new).collect();
-    let required = Capability::new(&required_capability);
+    let granted: HashSet<Capability> = granted_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
+    // Fail-closed: if the required capability is malformed (e.g. the
+    // deleted `outlet_invoke:` stem or an out-of-range outlet suffix),
+    // deny the check rather than panicking. SCP-OUT-014.
+    let Some(required) = Capability::new(&required_capability) else {
+        return false;
+    };
 
     if granted.contains(&required) {
         return true;
@@ -3749,7 +3757,7 @@ mod tests {
         let creator = DID("did:key:z6MkCreator".to_owned());
 
         let params = ContextParams {
-            ceiling: vec![Capability::new("role:assign")],
+            ceiling: vec![Capability::new("role:assign").expect("known capability")],
             ..ContextParams::default()
         };
 
@@ -3838,7 +3846,7 @@ mod tests {
         let ctx_id = format!("napi-sync-role-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator1";
         let params = ContextParams {
-            ceiling: vec![Capability::new("role:assign")],
+            ceiling: vec![Capability::new("role:assign").expect("known capability")],
             ..ContextParams::default()
         };
         manager
@@ -3899,7 +3907,7 @@ mod tests {
         let ctx_id = format!("napi-sync-add-{}", uuid::Uuid::new_v4());
         let creator = "did:key:z6MkNapiCreator2";
         let params = ContextParams {
-            ceiling: vec![Capability::new("role:assign")],
+            ceiling: vec![Capability::new("role:assign").expect("known capability")],
             ..ContextParams::default()
         };
         manager
@@ -3952,7 +3960,7 @@ mod tests {
         let creator = "did:key:z6MkNapiCreator3";
         let target = "did:key:z6MkNapiRemTarget";
         let params = ContextParams {
-            ceiling: vec![Capability::new("role:assign")],
+            ceiling: vec![Capability::new("role:assign").expect("known capability")],
             ..ContextParams::default()
         };
         manager

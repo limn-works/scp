@@ -658,6 +658,21 @@ impl ContextProvider for FfiBridgeProvider {
         // outlet_invoke:* for this context.
         // See spec §6.2, §8, ADR-016, and issue #319.
         if let Some(ref token) = self.agent_ucan_token {
+            // SCP-OUT-014: select the split capability stem from the
+            // outlet's registered kind. `outlet_query:{id}` for Query
+            // outlets, `outlet_call:{id}` for Action outlets. The legacy
+            // `outlet_invoke:` stem is deleted with no transitional alias.
+            let outlet_kind_for_ucan = crate::runtime::with_context(context_id, |rt| {
+                rt.outlet_registry
+                    .get(outlet_name)
+                    .map(|r| r.kind)
+                    .ok_or_else(|| {
+                        ScpPyError::ucan(format!(
+                            "tool '{outlet_name}' not registered in context '{context_id}'"
+                        ))
+                    })
+            })
+            .map_err(|e: ScpPyError| e.to_string())?;
             // Build proof resolver from optional proof tokens (supports delegated UCANs).
             let proof_resolver =
                 crate::ucan::build_proof_resolver_from_tokens(self.agent_proof_tokens.as_deref())
@@ -689,7 +704,7 @@ impl ContextProvider for FfiBridgeProvider {
                 };
 
                 scp_core::context::tools::validate_outlet_invocation_ucan(
-                    token, context_id, outlet_name, &mut ctx,
+                    token, context_id, outlet_name, outlet_kind_for_ucan, &mut ctx,
                 )
                 .map_err(|e| {
                     tracing::warn!(

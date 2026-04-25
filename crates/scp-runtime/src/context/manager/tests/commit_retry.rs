@@ -104,9 +104,9 @@ async fn setup_retry_manager() -> (
 
     let params = ContextParams {
         ceiling: vec![
-            scp_protocol::context::params::Capability::new("messages:read"),
-            scp_protocol::context::params::Capability::new("messages:write"),
-            scp_protocol::context::params::Capability::new("role:assign"),
+            scp_protocol::context::params::Capability::new("messages:read").expect("known capability"),
+            scp_protocol::context::params::Capability::new("messages:write").expect("known capability"),
+            scp_protocol::context::params::Capability::new("role:assign").expect("known capability"),
             Capability::MemberRemove,
         ],
         ..ContextParams::default()

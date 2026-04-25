@@ -529,7 +529,7 @@ pub fn ucan_delegate(
 
 /// Validates a UCAN token for tool invocation authorization (WASM bridge).
 ///
-/// Extracts capability from the token and verifies it includes `outlet_invoke`
+/// Extracts capability from the token and verifies it includes the kind-specific outlet stem (`outlet_query` or `outlet_call`, SCP-OUT-014)
 /// permission for the given `outlet_id`. Uses scp-protocol's full 11-step UCAN
 /// validation pipeline via extract-validate-writeback.
 ///
@@ -542,13 +542,21 @@ pub fn ucan_delegate(
 pub fn validate_outlet_ucan_wasm(
     context_id: &str,
     outlet_id: &str,
+    kind: scp_protocol::context::outlets::OutletKind,
     token: &str,
     identity_did: &str,
 ) -> Result<(), String> {
     let parsed = parse_ucan(token).map_err(|e| format!("malformed UCAN token: {e}"))?;
 
-    // Build the required capability URI: scp:ctx:{context_id}/outlet_invoke:{outlet_id}
-    let required_capability_str = format!("scp:ctx:{context_id}/outlet_invoke:{outlet_id}");
+    // Build the required capability URI from the outlet's registered kind
+    // (SCP-OUT-014). Query outlets check `outlet_query:{outlet_id}`; Action
+    // outlets check `outlet_call:{outlet_id}`. The legacy `outlet_invoke:`
+    // stem is deleted with no transitional alias (ADR-049 §1).
+    let stem = match kind {
+        scp_protocol::context::outlets::OutletKind::Query => "outlet_query",
+        scp_protocol::context::outlets::OutletKind::Action => "outlet_call",
+    };
+    let required_capability_str = format!("scp:ctx:{context_id}/{stem}:{outlet_id}");
     let required_capability: CapabilityUri = required_capability_str
         .parse()
         .map_err(|e: UcanError| format!("invalid capability URI: {e}"))?;
@@ -881,7 +889,7 @@ mod tests {
         let required = CapabilityUri::new("ctx-1", "messages", "write");
         assert!(
             !granted.matches(&required),
-            "wildcard on outlet_invoke must not match messages resource"
+            "wildcard on outlet_call must not match messages resource"
         );
     }
 
@@ -905,7 +913,7 @@ mod tests {
         assert!(ceiling.contains("messages:read"), "missing messages:read");
         assert!(ceiling.contains("messages:write"), "missing messages:write");
         assert!(ceiling.contains("outlet:register"), "missing tool:register");
-        assert!(ceiling.contains("outlet_call:*"), "missing outlet_invoke:*");
+        assert!(ceiling.contains("outlet_call:*"), "missing outlet_call:*");
         assert!(ceiling.contains("role:assign"), "missing role:assign");
         assert!(ceiling.contains("member:invite"), "missing member:invite");
         assert!(ceiling.contains("member:remove"), "missing member:remove");

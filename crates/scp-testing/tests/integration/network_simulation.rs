@@ -1102,15 +1102,15 @@ async fn application_layer_demo() {
 
     let params = ContextParams {
         ceiling: vec![
-            Capability::new("messages:read"),
-            Capability::new("messages:write"),
-            Capability::new("outlet:register"),
-            Capability::new("outlet:call:*"),
-            Capability::new("role:assign"),
-            Capability::new("member:remove"),
-            Capability::new("governance:propose"),
-            Capability::new("governance:vote"),
-            Capability::new("context:close"),
+            Capability::new("messages:read").expect("known capability"),
+            Capability::new("messages:write").expect("known capability"),
+            Capability::new("outlet:register").expect("known capability"),
+            Capability::new("outlet:call:*").expect("known capability"),
+            Capability::new("role:assign").expect("known capability"),
+            Capability::new("member:remove").expect("known capability"),
+            Capability::new("governance:propose").expect("known capability"),
+            Capability::new("governance:vote").expect("known capability"),
+            Capability::new("context:close").expect("known capability"),
         ],
         ..ContextParams::default()
     };
@@ -1244,15 +1244,15 @@ async fn application_layer_demo() {
     // Build the role state directly — ContextManager tracks this internally,
     // but for the free-function tool API we need to construct it.
     let ceiling = CapabilityCeiling::new(vec![
-        Capability::new("messages:read"),
-        Capability::new("messages:write"),
-        Capability::new("outlet:register"),
-        Capability::new("outlet:call:*"),
-        Capability::new("role:assign"),
-        Capability::new("member:remove"),
-        Capability::new("governance:propose"),
-        Capability::new("governance:vote"),
-        Capability::new("context:close"),
+        Capability::new("messages:read").expect("known capability"),
+        Capability::new("messages:write").expect("known capability"),
+        Capability::new("outlet:register").expect("known capability"),
+        Capability::new("outlet:call:*").expect("known capability"),
+        Capability::new("role:assign").expect("known capability"),
+        Capability::new("member:remove").expect("known capability"),
+        Capability::new("governance:propose").expect("known capability"),
+        Capability::new("governance:vote").expect("known capability"),
+        Capability::new("context:close").expect("known capability"),
     ]);
     let mut role_state = ContextRoleState::new(
         ctx_id,

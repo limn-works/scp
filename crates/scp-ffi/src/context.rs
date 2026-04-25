@@ -3583,8 +3583,8 @@ fn py_validate_capability_declaration(
     let decl: CapabilityDeclaration = serde_json::from_str(&declaration_json)
         .map_err(|e| PyValueError::new_err(format!("invalid declaration JSON: {e}")))?;
 
-    let ceiling: Vec<Capability> = ceiling_capabilities.iter().map(Capability::new).collect();
-    let role_caps: Vec<Capability> = role_capabilities.iter().map(Capability::new).collect();
+    let ceiling: Vec<Capability> = ceiling_capabilities.iter().filter_map(Capability::new).collect();
+    let role_caps: Vec<Capability> = role_capabilities.iter().filter_map(Capability::new).collect();
 
     let handle = ContextHandle::new("validation-context".to_owned(), ContextParams::default());
 
@@ -3626,8 +3626,14 @@ fn py_check_scoped_capability(
 ) -> bool {
     use scp_core::context::roles::Capability;
 
-    let granted: HashSet<Capability> = granted_capabilities.iter().map(Capability::new).collect();
-    let required = Capability::new(&required_capability);
+    let granted: HashSet<Capability> = granted_capabilities
+        .iter()
+        .filter_map(Capability::new)
+        .collect();
+    // Fail-closed: malformed required capability -> deny.
+    let Some(required) = Capability::new(&required_capability) else {
+        return false;
+    };
 
     if granted.contains(&required) {
         return true;
@@ -4775,7 +4781,7 @@ mod tests {
         let mgr = crate::runtime::context_manager().unwrap();
         let rt = crate::runtime().unwrap();
         let params = scp_core::context::ContextParams {
-            ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
+            ceiling: vec![scp_core::context::params::Capability::new("role:assign").expect("known capability")],
             ..scp_core::context::ContextParams::default()
         };
         rt.block_on(mgr.create_context(
@@ -4835,7 +4841,7 @@ mod tests {
         let mgr = crate::runtime::context_manager().unwrap();
         let rt = crate::runtime().unwrap();
         let params = scp_core::context::ContextParams {
-            ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
+            ceiling: vec![scp_core::context::params::Capability::new("role:assign").expect("known capability")],
             ..scp_core::context::ContextParams::default()
         };
         rt.block_on(mgr.create_context(
@@ -4888,7 +4894,7 @@ mod tests {
         let mgr = crate::runtime::context_manager().unwrap();
         let rt = crate::runtime().unwrap();
         let params = scp_core::context::ContextParams {
-            ceiling: vec![scp_core::context::params::Capability::new("role:assign")],
+            ceiling: vec![scp_core::context::params::Capability::new("role:assign").expect("known capability")],
             ..scp_core::context::ContextParams::default()
         };
         rt.block_on(mgr.create_context(
