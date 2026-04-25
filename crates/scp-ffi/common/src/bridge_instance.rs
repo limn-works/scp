@@ -2270,6 +2270,9 @@ mod tests {
             Box::new(NoOpEventLog),
             key_resolver,
             None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -3455,6 +3458,9 @@ mod tests {
             Box::new(NoOpEventLog),
             key_resolver,
             Some(persistence_for_supervisor),
+            None,
+            None,
+            None,
         );
 
         let instance = CoreFields::with_persistence(persistence_for_instance);

@@ -1084,6 +1084,9 @@ fn build_supervisor(
         event_log,
         not_configured_key_resolver(),
         persistence,
+        None,
+        None,
+        None,
     )
 }
 

@@ -897,6 +897,9 @@ fn build_supervisor_arc(
         event_log,
         not_configured_key_resolver(),
         Some(persistence),
+        None,
+        None,
+        None,
     )
 }
 
