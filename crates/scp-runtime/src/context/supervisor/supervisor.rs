@@ -418,6 +418,7 @@ impl Supervisor {
     /// `Arc<Supervisor>` — already wrapped because FFI bridges store
     /// their per-instance supervisor in an `Arc` slot.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // FFI bridges need to compose providers in one call
     pub fn with_providers(
         crypto: Arc<crate::crypto::mls::provider::MlsCryptoProvider>,
         transport: Box<dyn ContextTransportProvider>,
