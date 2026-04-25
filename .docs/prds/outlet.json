@@ -734,7 +734,7 @@
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-testing/src/conformance/mod.rs",
         "crates/scp-testing/tests/integration/conformance.rs",
