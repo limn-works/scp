@@ -2485,6 +2485,23 @@
       "wasm": [
         "context_governance_list_proposals"
       ]
+    },
+    {
+      "canonical": "init_storage",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "init_storage"
+      ],
+      "uniffi": [
+        "init_storage"
+      ],
+      "napi": [
+        "init_storage"
+      ],
+      "wasm": [
+        "init_storage"
+      ]
     }
   ],
   "exemptions": {
@@ -2498,12 +2515,20 @@
       {
         "canonical": "mcp_client",
         "reason": "UniFFI targets mobile; MCP is PyO3/NAPI only"
+      },
+      {
+        "canonical": "init_storage",
+        "reason": "Other bridges use SCP::with_storage(StorageConfig) factory (PR #1684); PyO3 retains init_storage for incremental initialization compatibility with pre-Phase-4 callers."
       }
     ],
     "napi": [
       {
         "canonical": "identity_migrate",
         "reason": "not yet exported in NAPI bridge (known gap)"
+      },
+      {
+        "canonical": "init_storage",
+        "reason": "Other bridges use SCP::with_storage(StorageConfig) factory (PR #1684); PyO3 retains init_storage for incremental initialization compatibility with pre-Phase-4 callers."
       }
     ],
     "wasm": [
@@ -2534,6 +2559,10 @@
       {
         "canonical": "access_key_restore",
         "reason": "Restoration reads persisted access key state; WASM has no scp-platform per ADR-034."
+      },
+      {
+        "canonical": "init_storage",
+        "reason": "Other bridges use SCP::with_storage(StorageConfig) factory (PR #1684); PyO3 retains init_storage for incremental initialization compatibility with pre-Phase-4 callers."
       }
     ]
   }
