@@ -101,8 +101,9 @@ use scp_protocol::trust::consequence::{ConsequenceRule, evaluate_consequence_rul
 
 use crate::context::ContextHandle;
 use crate::context::builder::ContextEventLogProvider;
+use crate::context::governance_helpers;
 use crate::context::manager::{
-    self, ContextManager, PSEUDONYM_ANNOUNCEMENT_TAG, PerContextState, PseudonymAnnouncement,
+    self, PSEUDONYM_ANNOUNCEMENT_TAG, PerContextState, PseudonymAnnouncement,
 };
 use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
@@ -647,7 +648,7 @@ pub async fn send_message(
         // mutation's MLS Commit failed to broadcast and exhausted
         // retries, messages encrypted under the divergent epoch may
         // be undecryptable by members who never received the Commit.
-        ContextManager::check_commit_fault(ctx)?;
+        governance_helpers::check_commit_fault(ctx)?;
         // H7: check capability BEFORE budget deduction so a capability
         // failure doesn't leak budget. The suspension-aware
         // member_has_capability check handles both role-based and
@@ -1447,7 +1448,7 @@ pub async fn finalize_send(
         && let Ok(guard) = manager_methods::relock_context(supervisor, ctx_gen).await
     {
         let ctx = &*guard;
-        let snapshot = ContextManager::snapshot_context(ctx);
+        let snapshot = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
     Ok(())

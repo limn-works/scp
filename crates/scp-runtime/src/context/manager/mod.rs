@@ -3542,71 +3542,13 @@ impl ContextManager {
     /// Takes a `ContextSnapshot` from the current `PerContextState`.
     ///
     /// Must be called while the contexts mutex is held (snapshot under lock).
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::manager_methods::snapshot_context`]
+    /// free function (ADR-049 commit 12c.9g.3.5). Deleted in commit
+    /// 12c.9g.4.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.3.5 helper rewire; deleted in 12c.9g.4.
     pub(crate) fn snapshot_context(ctx: &PerContextState) -> ContextSnapshot {
-        let state = ctx.handle.try_read_state().unwrap_or(ContextState::Active);
-        let ttl_remaining_secs = ctx.ttl.timer.remaining_secs();
-        // Capture grace entries for transactional persistence (§23.11).
-        // On clock error, persist an empty vec — the recovery path will
-        // treat the missing entries as expired (conservative: forward secrecy
-        // prioritized over message recovery, per §23.11 inconsistent state
-        // fallback).
-        let grace_entries = ctx.epoch.grace_store.to_grace_entries();
-        ContextSnapshot {
-            context_id: ctx.handle.context_id().to_owned(),
-            state,
-            context_params: ctx.handle.params().clone(),
-            membership: ctx.membership.clone(),
-            role_state: ctx.role_state.clone(),
-            executed_proposals: ctx.governance.executed_proposals.keys().copied().collect(),
-            ttl_remaining_secs,
-            registered_tools: ctx.governance.registered_tools.clone(),
-            read_exclusion_list: ctx.access.read_exclusion_list.clone(),
-            tool_interfaces: ctx.governance.tool_interfaces.clone(),
-            threshold_signers: ctx.governance.threshold_signers.clone(),
-            threshold_value: ctx.governance.threshold_value,
-            pruning_policy: ctx.governance.pruning_policy.clone(),
-            governance_model_config: Some(ctx.governance.engine.model_config()),
-            economic_policy: ctx.governance.economic_policy.clone(),
-            budget_tracker: ctx.governance.budget_tracker.clone(),
-            approved_proposals: ctx.governance.approved_proposals.clone(),
-            next_proposal_seq: ctx.governance.next_proposal_seq,
-            governance_freeze: ctx.governance.freeze,
-            pending_ceiling_modification: ctx.governance.pending_ceiling_modification.clone(),
-            pending_economic_policy_change: ctx.governance.pending_economic_policy_change.clone(),
-            mls_epoch: ctx.epoch.mls_epoch,
-            epoch_coordination_records: ctx.epoch.coordinator.records().to_vec(),
-            grace_entries,
-            needs_reconnect: ctx.epoch.needs_reconnect,
-            // MLS crypto state is populated in `persist_context_snapshot`
-            // where the crypto provider is available. Initialized empty here.
-            mls_crypto_state: Vec::new(),
-            migration_state: ctx.migration_state.clone(),
-            access_key_store: ctx.access.access_key_store.clone(),
-            consequence_rules: ctx.governance.consequence_rules.clone(),
-            participation_cache: ctx.governance.participation_cache.clone(),
-            velocity_tracker: Some(ctx.governance.velocity_tracker.window_secs()),
-            velocity_tracker_state: Some(VelocityTrackerSnapshot {
-                window_secs: ctx.governance.velocity_tracker.window_secs(),
-                entries: ctx.governance.velocity_tracker.snapshot_entries(),
-            }),
-            cooldown_until: ctx.governance.cooldown_until.clone(),
-            proposal_timestamps: ctx.governance.proposal_timestamps.clone(),
-            message_pricing: ctx.governance.message_pricing.clone(),
-            hard_rate_limit_config: Some(ctx.governance.hard_rate_limit.config().clone()),
-            hard_rate_limit_state: ctx.governance.hard_rate_limit.snapshot_entries(),
-            spending_nonce_tracker_state: ctx.governance.spending_nonce_tracker.snapshot_entries(),
-            pending_commits: ctx.pending_commits.clone(),
-            commit_fault: ctx.commit_fault.clone(),
-            checkpoint_events_since: ctx.checkpoint_events_since,
-            checkpoint_last_time_secs: ctx.checkpoint_last_time_secs,
-            generation: ctx.generation,
-            local_pseudonym: ctx.local_pseudonym,
-            pseudonym_registry: ctx
-                .pseudonym_registry
-                .iter()
-                .map(|(did, p)| (did.to_string(), *p))
-                .collect(),
-        }
+        crate::context::manager_methods::snapshot_context(ctx)
     }
 
     /// Appends a `PaymentCaptureFailed` entry to the event log and pushes a

@@ -62,9 +62,7 @@ use scp_protocol::context::governance::{
     CheckpointAttestationStatus, ContextCheckpoint, CosignedCheckpoint,
 };
 
-use crate::context::manager::{
-    ContextManager, PerContextState, context_id_to_bytes, require_active,
-};
+use crate::context::manager::{PerContextState, context_id_to_bytes, require_active};
 use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
 
@@ -295,7 +293,7 @@ pub async fn recovery_advance_epoch(
         && let Ok(guard) = manager_methods::relock_context(supervisor, &ctx_gen).await
     {
         let ctx = &*guard;
-        let snapshot = ContextManager::snapshot_context(ctx);
+        let snapshot = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
 

@@ -99,9 +99,10 @@ use scp_protocol::economy::budget::MemberBudgetTracker;
 
 use crate::context::ContextHandle;
 use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
+use crate::context::governance_helpers;
 use crate::context::manager::{
-    self, AccessControlState, CommitOperation, ContextManager, EpochState, GovernanceState,
-    PerContextState, TtlState,
+    self, AccessControlState, CommitOperation, EpochState, GovernanceState, PerContextState,
+    TtlState,
 };
 use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
@@ -150,7 +151,7 @@ pub async fn export_context(
         })?;
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
-        ContextManager::snapshot_context(ctx)
+        manager_methods::snapshot_context(ctx)
     };
 
     let event_log_data = supervisor
@@ -575,7 +576,7 @@ pub async fn import_context(
     {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
-        let snap = ContextManager::snapshot_context(ctx);
+        let snap = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, &context_id, snap);
     }
 
@@ -1063,7 +1064,7 @@ pub async fn join_context(
     {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
-        let snapshot = ContextManager::snapshot_context(ctx);
+        let snapshot = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, &context_id, snapshot);
     }
 
@@ -1240,7 +1241,7 @@ pub async fn leave_context(
                 "caller lacks permission to remove this member".into(),
             ));
         }
-        ContextManager::check_commit_fault(ctx)?;
+        governance_helpers::check_commit_fault(ctx)?;
         (ctx.broadcast_context.is_some(), generation)
     };
 
@@ -1362,7 +1363,7 @@ pub async fn leave_context(
         && let Ok(guard) = manager_methods::relock_context(supervisor, &ctx_gen).await
     {
         let ctx = &*guard;
-        let snapshot = ContextManager::snapshot_context(ctx);
+        let snapshot = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, &context_id, snapshot);
     }
 
@@ -1566,7 +1567,7 @@ pub async fn close_context_with_key(
         && let Ok(guard) = manager_methods::relock_context(supervisor, &ctx_gen).await
     {
         let ctx = &*guard;
-        let snapshot = ContextManager::snapshot_context(ctx);
+        let snapshot = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, &context_id, snapshot);
     }
 
@@ -1695,7 +1696,7 @@ pub async fn handle_ttl_expiry(
         && let Ok(guard) = manager_methods::relock_context(supervisor, &ctx_gen).await
     {
         let ctx = &*guard;
-        let snapshot = ContextManager::snapshot_context(ctx);
+        let snapshot = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, &context_id, snapshot);
     }
 
@@ -1752,7 +1753,7 @@ pub async fn propose_ttl_extension(
 
     // Persist context state after proposal consent (best-effort).
     if manager_methods::has_persistence(supervisor) {
-        let ctx_snapshot = ContextManager::snapshot_context(ctx);
+        let ctx_snapshot = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, context_id, ctx_snapshot);
     }
 
@@ -1793,7 +1794,7 @@ pub async fn reset_ttl_timer(
     {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
-        let snapshot = ContextManager::snapshot_context(ctx);
+        let snapshot = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
 }

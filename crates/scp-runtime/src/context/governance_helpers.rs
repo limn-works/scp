@@ -83,20 +83,26 @@
 //! `LockEconomicPolicy`, `ModifyHardRateLimit`,
 //! `ProposeContextMigration`, `CancelContextMigration`).
 //!
-//! # Not hoisted (kept as pub(crate) on `ContextManager`)
+//! # Static / associated helpers hoisted in 12c.9g.3.5
 //!
-//! The background-task path reachable only through
-//! [`ContextManager::start_governance_timeout_task`] stays on the
-//! manager: `translate_timeout_events`, `evaluate_periodic_consequences`,
-//! `process_pending_commits`, `process_pending_commits_static`,
-//! `compute_commit_retry_outcomes`, `apply_commit_retry_outcomes`. These
-//! are spawned by lifecycle-driven task machinery and are not reached by
-//! the actor-handler governance path. `governance_event_label` and
-//! `check_commit_fault` remain as cheap associated fns on
-//! `ContextManager` because both the hoisted helpers and the kept
-//! `start_governance_timeout_task` path reach them; duplicating them
-//! into the helpers module would force a second call site to follow any
-//! future change.
+//! ADR-049 commit 12c.9g.3.5 hoists the remaining static / associated
+//! `ContextManager` helpers reachable from this module into free
+//! functions:
+//! - [`governance_event_label`] — Merkle event-log label for a
+//!   `GovernanceEvent` variant.
+//! - [`check_commit_fault`] — fail-close gate for governance executors.
+//! - [`translate_timeout_events`] — converts governance timeout events
+//!   into receive-buffer `ContextEvent`s.
+//! - [`evaluate_periodic_consequences`] — Phase 4 of the timeout task
+//!   (#1531).
+//! - [`process_pending_commits`] — drains the persistent MLS Commit
+//!   retry queue (PR #1606 C6). The legacy `_static` suffix is dropped
+//!   in the free-function form.
+//!
+//! Forwarders remain on
+//! [`ContextManager`](crate::context::manager::ContextManager) under
+//! `#[allow(dead_code)]` until the outer shim is deleted in commit
+//! 12c.9g.4.
 
 use std::sync::Arc;
 
@@ -118,7 +124,8 @@ use scp_protocol::economy::types::EconomicPolicy;
 use tracing::instrument;
 
 use crate::context::manager::governance::{
-    check_proposer_eligibility, dispatch_consequences, event_log_entries_for_consequences,
+    EnforceConsequencesCtx, check_proposer_eligibility, dispatch_consequences,
+    enforce_triggered_consequences, event_log_entries_for_consequences,
 };
 use crate::context::supervisor::Supervisor;
 
@@ -130,12 +137,12 @@ const ATTACHED_EXPECT: &str = "governance_helpers: Supervisor must be fully atta
      (set by Supervisor::attach_context_manager during bridge construction)";
 use crate::context::manager::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
-    ContentKeysRotatedResult, ContextGeneration, ContextManager,
-    ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS, EXECUTED_PROPOSALS_TTL_SECS, GovernanceActionResult,
-    GovernanceReconfiguredResult, MAX_PENDING_COMMITS, MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS,
-    MAX_TOOL_INTERFACES, MigrationProposedResult, MigrationState, PendingCeilingModification,
-    PendingCommit, PendingEconomicPolicyChange, PerContextState, ProposalOutcome,
-    RestoreAccessResult, RevokeResult, SuspendMemberResult, commit_retry_backoff,
+    ContentKeysRotatedResult, ContextGeneration, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
+    EXECUTED_PROPOSALS_TTL_SECS, GovernanceActionResult, GovernanceReconfiguredResult,
+    MAX_COMMIT_AGE_SECS, MAX_COMMIT_RETRIES, MAX_PENDING_COMMITS, MAX_REGISTERED_TOOLS,
+    MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES, MigrationProposedResult, MigrationState,
+    PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange, PerContextState,
+    ProposalOutcome, RestoreAccessResult, RevokeResult, SuspendMemberResult, commit_retry_backoff,
     context_id_to_bytes, push_welcome_event, require_active, require_migrating_out,
     strip_event_payload,
 };
@@ -196,7 +203,7 @@ pub async fn execute_governance_action(
     let ctx_gen = {
         let (mut guard, generation) = manager_methods::lock_context(supervisor, context_id).await?;
         let ctx = &mut *guard;
-        ContextManager::check_commit_fault(ctx)?;
+        check_commit_fault(ctx)?;
 
         if ctx
             .governance
@@ -352,7 +359,7 @@ pub async fn finalize_governance_action(
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
         .append_context_event_with_payload(
             &context_id_bytes,
-            ContextManager::governance_event_label(&executed_event),
+            governance_event_label(&executed_event),
             proposal.proposer_did.as_ref(),
             payload.as_ref(),
         )?;
@@ -485,7 +492,7 @@ pub async fn finalize_governance_action(
 
             // 4. Persist the updated context state (best-effort).
             if manager_methods::has_persistence(supervisor) {
-                let snapshot = ContextManager::snapshot_context(ctx);
+                let snapshot = manager_methods::snapshot_context(ctx);
                 manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
             }
         } else {
@@ -557,7 +564,7 @@ pub async fn dispatch_governance_action(
                 );
 
                 if manager_methods::has_persistence(supervisor) {
-                    Some(ContextManager::snapshot_context(ctx))
+                    Some(manager_methods::snapshot_context(ctx))
                 } else {
                     None
                 }
@@ -1199,7 +1206,7 @@ pub async fn propose_governance_action_inner(
     {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
-        let snapshot = ContextManager::snapshot_context(ctx);
+        let snapshot = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
 
@@ -1427,7 +1434,7 @@ pub async fn vote_on_proposal_inner(
     {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
-        let snapshot = ContextManager::snapshot_context(ctx);
+        let snapshot = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
 
@@ -1682,7 +1689,7 @@ pub async fn withdraw_governance_vote(
             .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
             .append_context_event(
                 &context_id_bytes,
-                ContextManager::governance_event_label(event),
+                governance_event_label(event),
                 voter_did.as_ref(),
             )?;
         event_count += 1;
@@ -1701,7 +1708,7 @@ pub async fn withdraw_governance_vote(
     {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
-        let snapshot = ContextManager::snapshot_context(ctx);
+        let snapshot = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
     }
 
@@ -1763,7 +1770,7 @@ pub async fn execute_suspend_member(
         );
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -1914,7 +1921,7 @@ pub async fn execute_revoke(
             && ctx.broadcast_context.is_none();
 
         let snap = if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         };
@@ -2078,7 +2085,7 @@ pub async fn execute_restore_access(
         }
 
         let snap = if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         };
@@ -2185,7 +2192,7 @@ pub async fn execute_add_member(
         );
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -2301,7 +2308,7 @@ pub async fn execute_remove_member(
         (
             remove_output,
             if manager_methods::has_persistence(supervisor) {
-                Some(ContextManager::snapshot_context(ctx))
+                Some(manager_methods::snapshot_context(ctx))
             } else {
                 None
             },
@@ -2407,7 +2414,7 @@ pub async fn execute_change_role(
         }
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -2467,7 +2474,7 @@ pub async fn execute_register_tool(
         }
         ctx.governance.registered_tools.push(registration.clone());
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -2514,7 +2521,7 @@ pub async fn execute_remove_tool(
             .registered_tools
             .retain(|t| t.tool_id != tool_id);
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -2601,7 +2608,7 @@ pub async fn execute_modify_ceiling(
         );
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -2664,7 +2671,7 @@ pub async fn apply_pending_ceiling_modification(
         ctx.governance.pending_ceiling_modification = None;
 
         let snap = if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         };
@@ -2737,7 +2744,7 @@ pub async fn execute_close_context(
             ctx.governance.decay_participation();
 
             if manager_methods::has_persistence(supervisor) {
-                Some(ContextManager::snapshot_context(ctx))
+                Some(manager_methods::snapshot_context(ctx))
             } else {
                 None
             }
@@ -2856,7 +2863,7 @@ pub async fn execute_extend_ttl(
 
         let h = ctx.handle.clone();
         let snap = if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         };
@@ -2976,7 +2983,7 @@ pub async fn execute_transfer_admin(
         }
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -3112,7 +3119,7 @@ pub async fn execute_modify_pruning_policy(
 
         ctx.governance.pruning_policy = Some(new_policy.clone());
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -3205,7 +3212,7 @@ pub async fn execute_add_signer(
         }
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -3290,7 +3297,7 @@ pub async fn execute_remove_signer(
         }
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -3342,7 +3349,7 @@ pub async fn execute_modify_threshold(
         }
         ctx.governance.threshold_value = new_threshold;
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -3402,7 +3409,7 @@ pub async fn execute_establish_tool_interface(
         }
         ctx.governance.tool_interfaces.push(interface.clone());
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -3673,7 +3680,7 @@ pub async fn execute_resolve_conflict(
         ctx.governance.freeze = None;
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -3761,7 +3768,7 @@ pub async fn execute_promote_context(
         ctx.handle.promote_memory_scope();
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -3874,7 +3881,7 @@ pub async fn execute_rotate_content_keys(
         ctx.emit_event(rotated_event, context_id, supervisor.event_tx_ref());
 
         let snap = if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         };
@@ -4004,7 +4011,7 @@ pub async fn execute_reconfigure_governance(
         }
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -4109,7 +4116,7 @@ pub async fn execute_set_economic_policy(
         );
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -4170,7 +4177,7 @@ pub async fn apply_pending_economic_policy_change(
         ctx.governance.pending_economic_policy_change = None;
 
         let snap = if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         };
@@ -4240,7 +4247,7 @@ pub async fn execute_approve_spend(
         ctx.governance.budget_tracker.grant(spender, amount);
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -4306,7 +4313,7 @@ pub async fn execute_lock_economic_policy(
         }
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -4400,7 +4407,7 @@ pub async fn execute_modify_hard_rate_limit(
             );
 
         if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         }
@@ -4548,7 +4555,7 @@ pub async fn execute_propose_context_migration(
         ctx.receive_buffer.push(started_event.clone());
 
         let snap = if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         };
@@ -4684,7 +4691,7 @@ pub async fn execute_cancel_context_migration(
         );
 
         let snapshot = if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         };
@@ -4807,7 +4814,7 @@ pub async fn tombstone_migrated_context(
         ctx.governance.decay_participation();
 
         let snapshot = if manager_methods::has_persistence(supervisor) {
-            Some(ContextManager::snapshot_context(ctx))
+            Some(manager_methods::snapshot_context(ctx))
         } else {
             None
         };
@@ -5362,7 +5369,7 @@ pub async fn start_governance_timeout_task(supervisor: &Supervisor, context_id: 
                         return current_state.is_none(); // true = continue, false = stop
                     }
 
-                    let gov_ctx = ContextManager::build_governance_context(ctx, &*clock);
+                    let gov_ctx = build_governance_context(ctx, &*clock);
                     // Detect departed members since last tick.
                     let current_members: HashSet<DID> =
                         ctx.membership.members().map(|m| m.did.clone()).collect();
@@ -5419,7 +5426,7 @@ pub async fn start_governance_timeout_task(supervisor: &Supervisor, context_id: 
                 };
 
                 // Phase 2: Build context events (no lock needed).
-                let ctx_events = ContextManager::translate_timeout_events(
+                let ctx_events = translate_timeout_events(
                     &result.events,
                     mls_epoch,
                     &conditions,
@@ -5448,7 +5455,7 @@ pub async fn start_governance_timeout_task(supervisor: &Supervisor, context_id: 
                 }
 
                 // Phase 4: Periodic consequence evaluation (#1531).
-                ContextManager::evaluate_periodic_consequences(
+                evaluate_periodic_consequences(
                     &contexts,
                     &ctx_id,
                     &*clock,
@@ -5462,7 +5469,7 @@ pub async fn start_governance_timeout_task(supervisor: &Supervisor, context_id: 
                 // whose backoff timer has elapsed and either dequeues
                 // them on success or marks the context fail-closed
                 // when the retry budget is exhausted.
-                ContextManager::process_pending_commits_static(
+                process_pending_commits(
                     &contexts,
                     &ctx_id,
                     Arc::clone(&transport_for_retry),
@@ -5476,4 +5483,504 @@ pub async fn start_governance_timeout_task(supervisor: &Supervisor, context_id: 
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// governance_event_label (transitive helper)
+// ---------------------------------------------------------------------------
+
+/// Returns the event-log label string for a [`GovernanceEvent`] variant.
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::governance_event_label`](crate::context::manager::ContextManager::governance_event_label)
+/// (ADR-049 commit 12c.9g.3.5). Byte-identical behavior.
+///
+/// Used when appending governance events to the Merkle event log. Each
+/// variant maps to a deterministic string label so event consumers can
+/// filter by type without deserializing the full event.
+pub const fn governance_event_label(event: &GovernanceEvent) -> &'static str {
+    match event {
+        GovernanceEvent::ProposalCreated { .. } => "GovernanceProposalCreated",
+        GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
+        GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
+        GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
+        GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
+        GovernanceEvent::ConflictDetected { .. } => "GovernanceConflictDetected",
+        GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
+        GovernanceEvent::GovernanceActionExecuted { .. } => "GovernanceActionExecuted",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// check_commit_fault (transitive helper)
+// ---------------------------------------------------------------------------
+
+/// Returns `Err(CommitBroadcastFault)` if the context has an active
+/// commit fault marker (PR #1606 C6), otherwise `Ok(())`.
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::check_commit_fault`](crate::context::manager::ContextManager::check_commit_fault)
+/// (ADR-049 commit 12c.9g.3.5). Byte-identical behavior.
+///
+/// Called by every governance executor that mutates context state. While
+/// the marker is set, the context is fail-closed: no further mutations
+/// are accepted until an operator clears the marker via
+/// [`acknowledge_commit_fault`].
+///
+/// # Errors
+///
+/// Returns [`ContextError::CommitBroadcastFault`] if the context has an
+/// active fault marker.
+pub fn check_commit_fault(ctx: &PerContextState) -> Result<(), ContextError> {
+    if let Some(ref marker) = ctx.commit_fault {
+        return Err(ContextError::CommitBroadcastFault {
+            operation: marker.operation.label(),
+            reason: marker.reason.clone(),
+            attempts: marker.retry_count,
+        });
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// translate_timeout_events (transitive helper)
+// ---------------------------------------------------------------------------
+
+/// Translates governance timeout events into [`ContextEvent`]s for the
+/// receive buffer.
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::translate_timeout_events`](crate::context::manager::ContextManager::translate_timeout_events)
+/// (ADR-049 commit 12c.9g.3.5). Byte-identical behavior.
+pub fn translate_timeout_events(
+    result_events: &[GovernanceEvent],
+    mls_epoch: u64,
+    conditions: &[crate::context::governance::timeout::DeadlockCondition],
+    recovery_in_progress: bool,
+) -> Vec<ContextEvent> {
+    let mut ctx_events = Vec::new();
+    for event in result_events {
+        let ctx_event = match event {
+            GovernanceEvent::ProposalResolved {
+                proposal_id,
+                status,
+            } => ContextEvent::ProposalTimedOut {
+                proposal_id: *proposal_id,
+                resolution_summary: format!("ProposalResolved({status:?})"),
+                resulting_epoch: Some(mls_epoch),
+            },
+            GovernanceEvent::VoteWithdrawn {
+                proposal_id,
+                voter_did,
+            } => ContextEvent::VoteWithdrawn {
+                proposal_id: *proposal_id,
+                voter_did: voter_did.clone(),
+            },
+            GovernanceEvent::GovernanceActionExecuted {
+                proposal_id,
+                action,
+                executor_did,
+                resulting_epoch,
+            } => ContextEvent::GovernanceActionExecuted {
+                proposal_id: *proposal_id,
+                action_summary: action.variant_name().to_owned(),
+                executor_did: executor_did.clone(),
+                resulting_epoch: *resulting_epoch,
+                target_did: action.target_did().cloned(),
+            },
+            // These variants are not expected from timeout processing;
+            // listed explicitly so the compiler warns on new variants.
+            GovernanceEvent::ProposalCreated { .. }
+            | GovernanceEvent::VoteCast { .. }
+            | GovernanceEvent::DeadlockRecovery { .. }
+            | GovernanceEvent::ConflictDetected { .. }
+            | GovernanceEvent::ConflictResolved { .. } => continue,
+        };
+        ctx_events.push(ctx_event);
+    }
+
+    if !conditions.is_empty() && !recovery_in_progress {
+        for condition in conditions {
+            let summary = match condition {
+                crate::context::governance::timeout::DeadlockCondition::ThresholdInsufficient {
+                    ..
+                } => "ThresholdInsufficient",
+                crate::context::governance::timeout::DeadlockCondition::MajorityUnresponsive {
+                    ..
+                } => "MajorityUnresponsive",
+                crate::context::governance::timeout::DeadlockCondition::UnanimityOffline {
+                    ..
+                } => "UnanimityOffline",
+            };
+            ctx_events.push(ContextEvent::DeadlockDetected {
+                condition_summary: summary.to_owned(),
+                resulting_epoch: Some(mls_epoch),
+            });
+        }
+    }
+
+    ctx_events
+}
+
+// ---------------------------------------------------------------------------
+// evaluate_periodic_consequences (transitive helper)
+// ---------------------------------------------------------------------------
+
+/// Phase 4 of the governance timeout task: evaluates consequence rules for
+/// all members (#1531).
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::evaluate_periodic_consequences`](crate::context::manager::ContextManager::evaluate_periodic_consequences)
+/// (ADR-049 commit 12c.9g.3.5). Byte-identical behavior.
+///
+/// Time-based rules (e.g., "if no messages in 1 hour, downgrade role") must
+/// fire even when no user action occurs. Evaluates all members on every
+/// tick. Early return when no rules are configured (the common case).
+pub async fn evaluate_periodic_consequences(
+    contexts: &Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<PerContextState>>>>,
+    ctx_id: &str,
+    clock: &dyn Clock,
+    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+    event_tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+) {
+    use scp_protocol::trust::consequence::{TriggeredConsequence, evaluate_consequence_rules};
+
+    // M9: Clone data under lock, drop lock for evaluation, reacquire
+    // for enforcement. This prevents holding the contexts lock for
+    // the entire evaluation duration (which includes event log I/O).
+    let now = clock.now_secs();
+    let (rules, member_dids, events) = {
+        let Some(ctx_entry) = contexts.get(ctx_id) else {
+            return;
+        };
+        let ctx_arc = Arc::clone(ctx_entry.value());
+        drop(ctx_entry);
+        let guard = ctx_arc.lock().await;
+        let ctx = &*guard;
+        let rules = ctx.governance.consequence_rules.clone();
+        if rules.is_empty() {
+            return;
+        }
+        let member_dids: Vec<DID> = ctx.membership.members().map(|m| m.did.clone()).collect();
+        let events = event_log_entries_for_consequences(ctx, ctx_id, now, event_log);
+        (rules, member_dids, events)
+    };
+    // Lock dropped — pure evaluation with no lock held.
+    let mut results: Vec<(DID, Vec<TriggeredConsequence>)> = Vec::new();
+    for member_did in member_dids {
+        let triggered = evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
+        if !triggered.is_empty() {
+            results.push((member_did, triggered));
+        }
+    }
+    if results.is_empty() {
+        return;
+    }
+    // Reacquire lock for enforcement.
+    let Some(ctx_entry) = contexts.get(ctx_id) else {
+        return;
+    };
+    let ctx_arc = Arc::clone(ctx_entry.value());
+    drop(ctx_entry);
+    let mut guard = ctx_arc.lock().await;
+    let ctx = &mut *guard;
+    let ctx = &mut *ctx;
+    for (member_did, triggered) in &results {
+        enforce_triggered_consequences(
+            ctx,
+            &EnforceConsequencesCtx {
+                context_id: ctx_id,
+                member_did,
+                now,
+                triggered,
+                rules: &rules,
+                clock,
+                event_log,
+                event_tx,
+            },
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// process_pending_commits (transitive helper, formerly _static)
+// ---------------------------------------------------------------------------
+
+// PR #1606 C6 helper types — outcome of attempting to retry a single
+// pending commit. Lifted out of `process_pending_commits` to satisfy
+// `clippy::items_after_statements`.
+struct CommitRetryOutcome {
+    index: usize,
+    kind: CommitRetryOutcomeKind,
+}
+
+enum CommitRetryOutcomeKind {
+    Success {
+        attempts: u32,
+        operation: CommitOperation,
+    },
+    Retry {
+        error: String,
+        next_attempt_at: u64,
+        new_retry_count: u32,
+        operation: CommitOperation,
+    },
+    Failed {
+        reason: String,
+        attempts: u32,
+        operation: CommitOperation,
+    },
+}
+
+/// Processes the per-context MLS Commit retry queue (PR #1606 C6).
+///
+/// Hoisted body of the legacy
+/// [`ContextManager::process_pending_commits_static`](crate::context::manager::ContextManager::process_pending_commits_static)
+/// (ADR-049 commit 12c.9g.3.5). The legacy `_static` suffix is dropped
+/// because the free function form has no `&self` ambiguity.
+/// Byte-identical behavior.
+///
+/// Called periodically from
+/// [`start_governance_timeout_task`].
+/// Walks `ctx.pending_commits`, retries any commits whose
+/// `next_attempt_at <= now`, and either:
+/// 1. Dequeues on success (emits `CommitBroadcastSucceeded`).
+/// 2. Updates retry count + next attempt on failure (emits
+///    `CommitBroadcastPending` with the new attempt count).
+/// 3. Marks the context fail-closed and emits `CommitBroadcastFailed`
+///    when `retry_count >= MAX_COMMIT_RETRIES` or
+///    `now - first_attempt_at >= MAX_COMMIT_AGE_SECS`.
+///
+/// All transport sends happen with the contexts lock RELEASED to
+/// avoid holding the lock across I/O.
+pub async fn process_pending_commits(
+    contexts: &Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<PerContextState>>>>,
+    context_id: &str,
+    transport: Arc<dyn crate::context::builder::ContextTransportProvider>,
+    event_log: Arc<dyn crate::context::builder::ContextEventLogProvider>,
+    clock: Arc<dyn Clock>,
+    event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+) {
+    // Snapshot the queue under lock.
+    let snapshot: Vec<PendingCommit> = {
+        let Some(ctx_entry) = contexts.get(context_id) else {
+            return;
+        };
+        let ctx_arc = Arc::clone(ctx_entry.value());
+        drop(ctx_entry);
+        let guard = ctx_arc.lock().await;
+        let ctx = &*guard;
+        // If a fault marker is already set, do not retry — the queue
+        // is frozen until an operator acknowledges.
+        if ctx.commit_fault.is_some() {
+            return;
+        }
+        ctx.pending_commits.iter().cloned().collect()
+    };
+    if snapshot.is_empty() {
+        return;
+    }
+    let now = clock.now_secs();
+    // Phase A (no lock held): retry each pending entry whose backoff has
+    // elapsed and classify the outcome.
+    let outcomes = compute_commit_retry_outcomes(&snapshot, now, transport.as_ref());
+    if outcomes.is_empty() {
+        return;
+    }
+    // Phase B (lock held): apply the outcomes to the queue.
+    let context_id_bytes = context_id_to_bytes(context_id);
+    let event_log_writes =
+        apply_commit_retry_outcomes(contexts, context_id, outcomes, &*clock, event_tx.as_ref())
+            .await;
+    // Phase C (no lock held): append durable event log entries.
+    let mut retry_event_count: u64 = 0;
+    for label in event_log_writes {
+        if let Err(e) = event_log.append_context_event(&context_id_bytes, label, "system") {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to append commit retry event to durable log"
+            );
+        }
+        retry_event_count += 1;
+    }
+    if retry_event_count > 0
+        && let Some(ctx_entry) = contexts.get(context_id)
+    {
+        let ctx_arc = Arc::clone(ctx_entry.value());
+        drop(ctx_entry);
+        let mut guard = ctx_arc.lock().await;
+        let ctx = &mut *guard;
+        ctx.checkpoint_events_since += retry_event_count;
+    }
+}
+
+/// Phase A of [`process_pending_commits`]: classifies each
+/// pending commit whose backoff has elapsed as `Success`, `Retry`,
+/// or `Failed`. Returns one outcome per processed entry (entries whose
+/// `next_attempt_at` is still in the future are skipped).
+fn compute_commit_retry_outcomes(
+    snapshot: &[PendingCommit],
+    now: u64,
+    transport: &dyn crate::context::builder::ContextTransportProvider,
+) -> Vec<CommitRetryOutcome> {
+    let mut outcomes: Vec<CommitRetryOutcome> = Vec::new();
+    for (idx, pending) in snapshot.iter().enumerate() {
+        if now < pending.next_attempt_at {
+            continue;
+        }
+        // Age budget check. If we're past MAX_COMMIT_AGE_SECS, force-fail
+        // without making another network call.
+        let age = now.saturating_sub(pending.first_attempt_at);
+        if age >= MAX_COMMIT_AGE_SECS {
+            outcomes.push(CommitRetryOutcome {
+                index: idx,
+                kind: CommitRetryOutcomeKind::Failed {
+                    reason: format!("max age exceeded ({age}s >= {MAX_COMMIT_AGE_SECS}s)"),
+                    attempts: pending.retry_count,
+                    operation: pending.operation.clone(),
+                },
+            });
+            continue;
+        }
+        // Attempt the send.
+        match transport.send_message(&pending.routing_id, &pending.commit_bytes) {
+            Ok(()) => {
+                outcomes.push(CommitRetryOutcome {
+                    index: idx,
+                    kind: CommitRetryOutcomeKind::Success {
+                        attempts: pending.retry_count,
+                        operation: pending.operation.clone(),
+                    },
+                });
+            }
+            Err(e) => {
+                let new_retry_count = pending.retry_count.saturating_add(1);
+                if new_retry_count > MAX_COMMIT_RETRIES {
+                    outcomes.push(CommitRetryOutcome {
+                        index: idx,
+                        kind: CommitRetryOutcomeKind::Failed {
+                            reason: e.to_string(),
+                            attempts: new_retry_count,
+                            operation: pending.operation.clone(),
+                        },
+                    });
+                } else {
+                    let backoff = commit_retry_backoff(new_retry_count);
+                    outcomes.push(CommitRetryOutcome {
+                        index: idx,
+                        kind: CommitRetryOutcomeKind::Retry {
+                            error: e.to_string(),
+                            next_attempt_at: now.saturating_add(backoff),
+                            new_retry_count,
+                            operation: pending.operation.clone(),
+                        },
+                    });
+                }
+            }
+        }
+    }
+    outcomes
+}
+
+/// Phase B of [`process_pending_commits`]: applies the outcomes
+/// to `PerContextState::pending_commits` under lock. Pushes receive
+/// buffer events and returns the labels that should be appended to
+/// the durable event log.
+async fn apply_commit_retry_outcomes(
+    contexts: &Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<PerContextState>>>>,
+    context_id: &str,
+    outcomes: Vec<CommitRetryOutcome>,
+    clock: &dyn Clock,
+    event_tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+) -> Vec<&'static str> {
+    let mut event_log_writes: Vec<&'static str> = Vec::new();
+    let Some(ctx_entry) = contexts.get(context_id) else {
+        return event_log_writes;
+    };
+    let ctx_arc = Arc::clone(ctx_entry.value());
+    drop(ctx_entry);
+    let mut guard = ctx_arc.lock().await;
+    let ctx = &mut *guard;
+    let queue_len = ctx.pending_commits.len();
+    // Apply outcomes by their snapshot index. The queue is only mutated
+    // by this task (success/failed removals) and by new enqueue calls
+    // (which append to the end), so prefix indices remain stable
+    // between Phase A and Phase B.
+    let mut to_remove: Vec<usize> = Vec::new();
+    for outcome in outcomes {
+        if outcome.index >= queue_len {
+            continue;
+        }
+        match outcome.kind {
+            CommitRetryOutcomeKind::Success {
+                attempts,
+                operation,
+            } => {
+                ctx.emit_event(
+                    ContextEvent::CommitBroadcastSucceeded {
+                        operation: operation.label(),
+                        attempts,
+                    },
+                    context_id,
+                    event_tx,
+                );
+                event_log_writes.push("CommitBroadcastSucceeded");
+                to_remove.push(outcome.index);
+            }
+            CommitRetryOutcomeKind::Retry {
+                error,
+                next_attempt_at,
+                new_retry_count,
+                operation,
+            } => {
+                if let Some(entry) = ctx.pending_commits.get_mut(outcome.index) {
+                    entry.retry_count = new_retry_count;
+                    entry.next_attempt_at = next_attempt_at;
+                    entry.last_error = Some(error.clone());
+                }
+                ctx.emit_event(
+                    ContextEvent::CommitBroadcastPending {
+                        operation: operation.label(),
+                        error,
+                        attempt: new_retry_count,
+                    },
+                    context_id,
+                    event_tx,
+                );
+                event_log_writes.push("CommitBroadcastPending");
+            }
+            CommitRetryOutcomeKind::Failed {
+                reason,
+                attempts,
+                operation,
+            } => {
+                let now_failed = clock.now_secs();
+                ctx.commit_fault = Some(CommitFaultMarker {
+                    operation: operation.clone(),
+                    reason: reason.clone(),
+                    failed_at: now_failed,
+                    retry_count: attempts,
+                });
+                ctx.emit_event(
+                    ContextEvent::CommitBroadcastFailed {
+                        operation: operation.label(),
+                        reason,
+                        attempts,
+                    },
+                    context_id,
+                    event_tx,
+                );
+                event_log_writes.push("CommitBroadcastFailed");
+                to_remove.push(outcome.index);
+            }
+        }
+    }
+    // Remove successful/failed entries in reverse-index order so earlier
+    // indices stay valid.
+    to_remove.sort_unstable_by(|a, b| b.cmp(a));
+    for idx in to_remove {
+        ctx.pending_commits.remove(idx);
+    }
+    event_log_writes
 }

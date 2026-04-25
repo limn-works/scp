@@ -17,11 +17,13 @@ use super::{
 // PR #1606 C6 helper types — outcome of attempting to retry a single
 // pending commit. Lifted out of `process_pending_commits_static` to satisfy
 // `clippy::items_after_statements`.
+#[allow(dead_code)] // Used only by legacy forwarders; deleted in 12c.9g.4.
 struct CommitRetryOutcome {
     index: usize,
     kind: CommitRetryOutcomeKind,
 }
 
+#[allow(dead_code)] // Used only by legacy forwarders; deleted in 12c.9g.4.
 enum CommitRetryOutcomeKind {
     Success {
         attempts: u32,
@@ -2442,74 +2444,23 @@ impl ContextManager {
     /// [`crate::context::governance_helpers::start_governance_timeout_task`]
     /// free function can call it from outside the `manager/` submodule
     /// tree.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::governance_helpers::translate_timeout_events`]
+    /// free function (ADR-049 commit 12c.9g.3.5). Deleted in commit
+    /// 12c.9g.4.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.3.5 helper rewire; deleted in 12c.9g.4.
     pub(crate) fn translate_timeout_events(
         result_events: &[GovernanceEvent],
         mls_epoch: u64,
         conditions: &[crate::context::governance::timeout::DeadlockCondition],
         recovery_in_progress: bool,
     ) -> Vec<ContextEvent> {
-        let mut ctx_events = Vec::new();
-        for event in result_events {
-            let ctx_event = match event {
-                GovernanceEvent::ProposalResolved {
-                    proposal_id,
-                    status,
-                } => ContextEvent::ProposalTimedOut {
-                    proposal_id: *proposal_id,
-                    resolution_summary: format!("ProposalResolved({status:?})"),
-                    resulting_epoch: Some(mls_epoch),
-                },
-                GovernanceEvent::VoteWithdrawn {
-                    proposal_id,
-                    voter_did,
-                } => ContextEvent::VoteWithdrawn {
-                    proposal_id: *proposal_id,
-                    voter_did: voter_did.clone(),
-                },
-                GovernanceEvent::GovernanceActionExecuted {
-                    proposal_id,
-                    action,
-                    executor_did,
-                    resulting_epoch,
-                } => ContextEvent::GovernanceActionExecuted {
-                    proposal_id: *proposal_id,
-                    action_summary: action.variant_name().to_owned(),
-                    executor_did: executor_did.clone(),
-                    resulting_epoch: *resulting_epoch,
-                    target_did: action.target_did().cloned(),
-                },
-                // These variants are not expected from timeout processing;
-                // listed explicitly so the compiler warns on new variants.
-                GovernanceEvent::ProposalCreated { .. }
-                | GovernanceEvent::VoteCast { .. }
-                | GovernanceEvent::DeadlockRecovery { .. }
-                | GovernanceEvent::ConflictDetected { .. }
-                | GovernanceEvent::ConflictResolved { .. } => continue,
-            };
-            ctx_events.push(ctx_event);
-        }
-
-        if !conditions.is_empty() && !recovery_in_progress {
-            for condition in conditions {
-                let summary = match condition {
-                    crate::context::governance::timeout::DeadlockCondition::ThresholdInsufficient {
-                        ..
-                    } => "ThresholdInsufficient",
-                    crate::context::governance::timeout::DeadlockCondition::MajorityUnresponsive {
-                        ..
-                    } => "MajorityUnresponsive",
-                    crate::context::governance::timeout::DeadlockCondition::UnanimityOffline { .. } => {
-                        "UnanimityOffline"
-                    }
-                };
-                ctx_events.push(ContextEvent::DeadlockDetected {
-                    condition_summary: summary.to_owned(),
-                    resulting_epoch: Some(mls_epoch),
-                });
-            }
-        }
-
-        ctx_events
+        crate::context::governance_helpers::translate_timeout_events(
+            result_events,
+            mls_epoch,
+            conditions,
+            recovery_in_progress,
+        )
     }
 
     /// Starts the governance timeout background task for a context (ADR-031 §5).
@@ -2551,6 +2502,11 @@ impl ContextManager {
     /// [`crate::context::governance_helpers::start_governance_timeout_task`]
     /// free function can call it from outside the `manager/` submodule
     /// tree.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::governance_helpers::evaluate_periodic_consequences`]
+    /// free function (ADR-049 commit 12c.9g.3.5). Deleted in commit
+    /// 12c.9g.4.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.3.5 helper rewire; deleted in 12c.9g.4.
     pub(crate) async fn evaluate_periodic_consequences(
         contexts: &Arc<super::DashMap<String, Arc<super::Mutex<PerContextState>>>>,
         ctx_id: &str,
@@ -2558,61 +2514,10 @@ impl ContextManager {
         event_log: &dyn super::super::builder::ContextEventLogProvider,
         event_tx: Option<&tokio::sync::broadcast::Sender<(String, super::ContextEvent)>>,
     ) {
-        // M9: Clone data under lock, drop lock for evaluation, reacquire
-        // for enforcement. This prevents holding the contexts lock for
-        // the entire evaluation duration (which includes event log I/O).
-        let now = clock.now_secs();
-        let (rules, member_dids, events) = {
-            let Some(ctx_entry) = contexts.get(ctx_id) else {
-                return;
-            };
-            let ctx_arc = Arc::clone(ctx_entry.value());
-            drop(ctx_entry);
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-            let rules = ctx.governance.consequence_rules.clone();
-            if rules.is_empty() {
-                return;
-            }
-            let member_dids: Vec<DID> = ctx.membership.members().map(|m| m.did.clone()).collect();
-            let events = event_log_entries_for_consequences(ctx, ctx_id, now, event_log);
-            (rules, member_dids, events)
-        };
-        // Lock dropped — pure evaluation with no lock held.
-        let mut results: Vec<(DID, Vec<TriggeredConsequence>)> = Vec::new();
-        for member_did in member_dids {
-            let triggered = evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
-            if !triggered.is_empty() {
-                results.push((member_did, triggered));
-            }
-        }
-        if results.is_empty() {
-            return;
-        }
-        // Reacquire lock for enforcement.
-        let Some(ctx_entry) = contexts.get(ctx_id) else {
-            return;
-        };
-        let ctx_arc = Arc::clone(ctx_entry.value());
-        drop(ctx_entry);
-        let mut guard = ctx_arc.lock().await;
-        let ctx = &mut *guard;
-        let ctx = &mut *ctx;
-        for (member_did, triggered) in &results {
-            enforce_triggered_consequences(
-                ctx,
-                &EnforceConsequencesCtx {
-                    context_id: ctx_id,
-                    member_did,
-                    now,
-                    triggered,
-                    rules: &rules,
-                    clock,
-                    event_log,
-                    event_tx,
-                },
-            );
-        }
+        crate::context::governance_helpers::evaluate_periodic_consequences(
+            contexts, ctx_id, clock, event_log, event_tx,
+        )
+        .await;
     }
 
     /// Returns the event-log label string for a [`GovernanceEvent`] variant.
@@ -2620,17 +2525,13 @@ impl ContextManager {
     /// Used when appending governance events to the Merkle event log. Each
     /// variant maps to a deterministic string label so event consumers can
     /// filter by type without deserializing the full event.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::governance_helpers::governance_event_label`]
+    /// free function (ADR-049 commit 12c.9g.3.5). Deleted in commit
+    /// 12c.9g.4.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.3.5 helper rewire; deleted in 12c.9g.4.
     pub(crate) const fn governance_event_label(event: &GovernanceEvent) -> &'static str {
-        match event {
-            GovernanceEvent::ProposalCreated { .. } => "GovernanceProposalCreated",
-            GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
-            GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
-            GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
-            GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
-            GovernanceEvent::ConflictDetected { .. } => "GovernanceConflictDetected",
-            GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
-            GovernanceEvent::GovernanceActionExecuted { .. } => "GovernanceActionExecuted",
-        }
+        crate::context::governance_helpers::governance_event_label(event)
     }
 
     // -----------------------------------------------------------------------
@@ -2649,15 +2550,13 @@ impl ContextManager {
     ///
     /// Returns [`ContextError::CommitBroadcastFault`] if the context has an
     /// active fault marker.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::governance_helpers::check_commit_fault`]
+    /// free function (ADR-049 commit 12c.9g.3.5). Deleted in commit
+    /// 12c.9g.4.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.3.5 helper rewire; deleted in 12c.9g.4.
     pub(crate) fn check_commit_fault(ctx: &PerContextState) -> Result<(), ContextError> {
-        if let Some(ref marker) = ctx.commit_fault {
-            return Err(ContextError::CommitBroadcastFault {
-                operation: marker.operation.label(),
-                reason: marker.reason.clone(),
-                attempts: marker.retry_count,
-            });
-        }
-        Ok(())
+        crate::context::governance_helpers::check_commit_fault(ctx)
     }
 
     /// Attempts to broadcast an MLS Commit and, on transport failure,
@@ -2746,6 +2645,12 @@ impl ContextManager {
     /// [`crate::context::governance_helpers::start_governance_timeout_task`]
     /// free function can call it from outside the `manager/` submodule
     /// tree.
+    /// Legacy one-line forwarder to the hoisted
+    /// [`crate::context::governance_helpers::process_pending_commits`]
+    /// free function (ADR-049 commit 12c.9g.3.5). The legacy `_static`
+    /// suffix is dropped in the free-function form. Deleted in commit
+    /// 12c.9g.4.
+    #[allow(dead_code)] // Forwarder unreachable post-12c.9g.3.5 helper rewire; deleted in 12c.9g.4.
     pub(crate) async fn process_pending_commits_static(
         contexts: &Arc<super::DashMap<String, Arc<super::Mutex<PerContextState>>>>,
         context_id: &str,
@@ -2754,69 +2659,17 @@ impl ContextManager {
         clock: Arc<dyn Clock>,
         event_tx: Option<tokio::sync::broadcast::Sender<(String, super::ContextEvent)>>,
     ) {
-        // Snapshot the queue under lock.
-        let snapshot: Vec<PendingCommit> = {
-            let Some(ctx_entry) = contexts.get(context_id) else {
-                return;
-            };
-            let ctx_arc = Arc::clone(ctx_entry.value());
-            drop(ctx_entry);
-            let guard = ctx_arc.lock().await;
-            let ctx = &*guard;
-            // If a fault marker is already set, do not retry — the queue
-            // is frozen until an operator acknowledges.
-            if ctx.commit_fault.is_some() {
-                return;
-            }
-            ctx.pending_commits.iter().cloned().collect()
-        };
-        if snapshot.is_empty() {
-            return;
-        }
-        let now = clock.now_secs();
-        // Phase A (no lock held): retry each pending entry whose backoff has
-        // elapsed and classify the outcome.
-        let outcomes = Self::compute_commit_retry_outcomes(&snapshot, now, transport.as_ref());
-        if outcomes.is_empty() {
-            return;
-        }
-        // Phase B (lock held): apply the outcomes to the queue.
-        let context_id_bytes = context_id_to_bytes(context_id);
-        let event_log_writes = Self::apply_commit_retry_outcomes(
-            contexts,
-            context_id,
-            outcomes,
-            &*clock,
-            event_tx.as_ref(),
+        crate::context::governance_helpers::process_pending_commits(
+            contexts, context_id, transport, event_log, clock, event_tx,
         )
         .await;
-        // Phase C (no lock held): append durable event log entries.
-        let mut retry_event_count: u64 = 0;
-        for label in event_log_writes {
-            if let Err(e) = event_log.append_context_event(&context_id_bytes, label, "system") {
-                tracing::warn!(
-                    context_id = %context_id,
-                    error = %e,
-                    "failed to append commit retry event to durable log"
-                );
-            }
-            retry_event_count += 1;
-        }
-        if retry_event_count > 0
-            && let Some(ctx_entry) = contexts.get(context_id)
-        {
-            let ctx_arc = Arc::clone(ctx_entry.value());
-            drop(ctx_entry);
-            let mut guard = ctx_arc.lock().await;
-            let ctx = &mut *guard;
-            ctx.checkpoint_events_since += retry_event_count;
-        }
     }
 
     /// Phase A of [`process_pending_commits_static`]: classifies each
     /// pending commit whose backoff has elapsed as `Success`, `Retry`,
     /// or `Failed`. Returns one outcome per processed entry (entries whose
     /// `next_attempt_at` is still in the future are skipped).
+    #[allow(dead_code)] // Internal helper of the legacy forwarder; deleted in 12c.9g.4.
     fn compute_commit_retry_outcomes(
         snapshot: &[PendingCommit],
         now: u64,
@@ -2885,6 +2738,7 @@ impl ContextManager {
     /// to `PerContextState::pending_commits` under lock. Pushes receive
     /// buffer events and returns the labels that should be appended to
     /// the durable event log.
+    #[allow(dead_code)] // Internal helper of the legacy forwarder; deleted in 12c.9g.4.
     async fn apply_commit_retry_outcomes(
         contexts: &Arc<super::DashMap<String, Arc<super::Mutex<PerContextState>>>>,
         context_id: &str,

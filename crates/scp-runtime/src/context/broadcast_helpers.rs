@@ -89,7 +89,7 @@ use scp_protocol::crypto::ucan::validate::{
     DidResolver, NonceTracker, ProofResolver, RevocationChecker, ValidationContext,
 };
 
-use crate::context::manager::{ContextManager, context_id_to_bytes, require_active};
+use crate::context::manager::{context_id_to_bytes, require_active};
 use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
 
@@ -188,7 +188,7 @@ where
     {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
-        let ctx_snapshot = ContextManager::snapshot_context(ctx);
+        let ctx_snapshot = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, context_id, ctx_snapshot);
     }
 
@@ -278,7 +278,7 @@ pub async fn unsubscribe_broadcast(
     {
         let guard = ctx_arc.lock().await;
         let ctx = &*guard;
-        let ctx_snapshot = ContextManager::snapshot_context(ctx);
+        let ctx_snapshot = manager_methods::snapshot_context(ctx);
         manager_methods::persist_context_snapshot(supervisor, context_id, ctx_snapshot);
     }
 
