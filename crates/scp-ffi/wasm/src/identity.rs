@@ -2043,20 +2043,12 @@ struct MigrationSourceKeys {
     public_bytes: [u8; 32],
 }
 
-/// Outcome of `IDENTITY_REGISTRY` lookup during migration. Distinguishes
-/// "not present" (`SCP-IDENT-1002`) from "present but lacking key
-/// material" (`SCP-IDENT-1028`).
-enum MigrationLookupOutcome {
-    Found(MigrationSourceKeys),
-    NotLocal,
-    NotFound,
-}
-
 /// Looks up the source identity for [`migrate_inner`] and returns its
-/// retained key material (or a typed error: `SCP-IDENT-1002` for "DID
-/// not found" / `SCP-IDENT-1028` for `Resolved` records).
+/// retained key material. Refuses with `SCP-IDENT-1002` for unknown
+/// DIDs and `SCP-IDENT-1028` for `Resolved` records (no retained key
+/// material).
 fn lookup_migration_source(did: &str) -> Result<MigrationSourceKeys, ScpWasmError> {
-    let lookup = IDENTITY_REGISTRY.with(|reg| {
+    IDENTITY_REGISTRY.with(|reg| {
         let map = reg.borrow();
         match map.get(did) {
             Some(IdentityRecord::Local {
@@ -2064,29 +2056,24 @@ fn lookup_migration_source(did: &str) -> Result<MigrationSourceKeys, ScpWasmErro
                 pre_rotation_signing_key_bytes,
                 public_key_bytes,
                 ..
-            }) => MigrationLookupOutcome::Found(MigrationSourceKeys {
+            }) => Ok(MigrationSourceKeys {
                 signing: zeroize::Zeroizing::new(**signing_key_bytes),
                 pre_rotation: zeroize::Zeroizing::new(**pre_rotation_signing_key_bytes),
                 public_bytes: *public_key_bytes,
             }),
-            Some(IdentityRecord::Resolved { .. }) => MigrationLookupOutcome::NotLocal,
-            None => MigrationLookupOutcome::NotFound,
+            Some(IdentityRecord::Resolved { .. }) => Err(ScpWasmError::Identity {
+                message: format!(
+                    "identity '{did}' was resolved from a DID string without local \
+                     key material — cannot migrate without the retained pre-rotation key"
+                ),
+                code: codes::IDENT_1028.to_owned(),
+            }),
+            None => Err(ScpWasmError::Identity {
+                message: format!("identity not found in registry: {did}"),
+                code: codes::IDENT_1002.to_owned(),
+            }),
         }
-    });
-    match lookup {
-        MigrationLookupOutcome::Found(k) => Ok(k),
-        MigrationLookupOutcome::NotFound => Err(ScpWasmError::Identity {
-            message: format!("identity not found in registry: {did}"),
-            code: codes::IDENT_1002.to_owned(),
-        }),
-        MigrationLookupOutcome::NotLocal => Err(ScpWasmError::Identity {
-            message: format!(
-                "identity '{did}' was resolved from a DID string without local \
-                 key material — cannot migrate without the retained pre-rotation key"
-            ),
-            code: codes::IDENT_1028.to_owned(),
-        }),
-    }
+    })
 }
 
 /// Removes the source identity, capacity-checks, and installs the
