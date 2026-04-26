@@ -2840,12 +2840,16 @@
       "gate": "gate-round5-fixes",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/governance/admin_removal.rs",
-        "crates/scp-runtime/src/context/manager/interface.rs",
-        "crates/scp-runtime/src/context/interface/hop_salt.rs",
-        "crates/scp-testing/src/pipeline_wiring.rs"
+        "crates/scp-runtime/src/governance/mod.rs",
+        "crates/scp-runtime/src/lib.rs",
+        "crates/scp-runtime/src/context/manager/governance.rs",
+        "crates/scp-protocol/src/context/outlets/interface.rs",
+        "crates/scp-protocol/src/context/governance/mod.rs",
+        "crates/scp-protocol/src/context/governance/mls_integration.rs",
+        "crates/scp-testing/tests/integration/pipeline_wiring.rs"
       ],
       "description": "Implement the atomic admin-removal + InterfaceSaltRotated emission per §6.2.0.1 round-6 with the three-state hop_salt invariant (PreRotation / Frozen / PostRotation), the SCP-OUTLET-IKM-ROTATE-V1: signature preimage, the removal_event_id binding, and the peer-side Frozen response. Adds a pipeline_wiring.rs assertion forbidding a RemoveMember-admin handler from terminating without emitting the induced rotations. Registers the new slug authorization.salt-rotation-unjustified (SCP-TOOL-6115).",
       "acceptanceCriteria": [
