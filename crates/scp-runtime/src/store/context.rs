@@ -1008,6 +1008,28 @@ impl<S: Storage + 'static> crate::context::manager::ContextPersistence
         Ok(())
     }
 
+    fn persist_outlet_message_key(
+        &self,
+        context_id: &str,
+        outlet_id: &str,
+        registration_event_id: &[u8; 32],
+        outlet_message_key: &[u8; 32],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let store = self.store.clone();
+        let ctx_id = context_id.to_owned();
+        let outlet = outlet_id.to_owned();
+        let event_id = *registration_event_id;
+        let key = *outlet_message_key;
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                store
+                    .store_outlet_message_key(&ctx_id, &outlet, &event_id, &key)
+                    .await
+            })
+        })?;
+        Ok(())
+    }
+
     fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {

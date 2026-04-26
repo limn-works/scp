@@ -549,6 +549,14 @@ impl ContextManager {
                     ),
                 revoked_spending_ucan_cids: HashSet::new(),
                 proposal_timestamps: ctx_snapshot.proposal_timestamps,
+                // SCP-OUT-041a: pinned outlet_message_keys are persisted
+                // separately via [`ProtocolRepository::store_outlet_message_key`]
+                // (path `context/{ctx}/outlet/{outlet}/registration/...
+                // /message_key`), not as part of the context snapshot.
+                // The OUT-041b receiver-side LRU lazily restores entries
+                // from the dedicated path on the next emission lookup;
+                // initializing empty here is correct.
+                pinned_outlet_message_keys: HashMap::new(),
             },
             role_state: ctx_snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
@@ -1279,6 +1287,12 @@ impl ContextManager {
                 // proposal slots — every imported timestamp is a free
                 // bite out of the importing node's enforcement window.
                 proposal_timestamps: HashMap::new(),
+                // SCP-OUT-041a: pinned outlet_message_keys are per-local
+                // runtime state (mirrors of `ProtocolRepository` writes)
+                // and do not transfer across an import. Re-derivation
+                // must happen on the next outlet-registration acceptance
+                // in this importing instance.
+                pinned_outlet_message_keys: HashMap::new(),
             },
             epoch: EpochState {
                 mls_epoch: export.snapshot.mls_epoch,
@@ -1485,6 +1499,7 @@ impl ContextManager {
                 ),
                 revoked_spending_ucan_cids: HashSet::new(),
                 proposal_timestamps: HashMap::new(),
+                pinned_outlet_message_keys: HashMap::new(),
             },
             role_state,
             receive_buffer: ReceiveBuffer::new(),
@@ -1812,6 +1827,7 @@ impl ContextManager {
                 ),
                 revoked_spending_ucan_cids: HashSet::new(),
                 proposal_timestamps: HashMap::new(),
+                pinned_outlet_message_keys: HashMap::new(),
             },
             epoch: EpochState {
                 mls_epoch: 0,

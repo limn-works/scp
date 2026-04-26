@@ -946,6 +946,39 @@ pub trait ContextPersistence: Send + Sync {
     fn list_persisted_contexts(
         &self,
     ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Persists a 32-byte pinned `outlet_message_key` for a single outlet
+    /// registration (§5.4.4 round-5, SCP-OUT-041a).
+    ///
+    /// The key is persisted under
+    /// `context/{context_id}/outlet/{outlet_id}/registration/{registration_event_id_hex}/message_key`
+    /// — keyed by `registration_event_id` so concurrent registrations of
+    /// the same outlet do not overwrite each other (the SCP-OUT-041b LRU
+    /// prerequisite).
+    ///
+    /// Default implementation is a no-op so legacy persistence backends
+    /// (e.g., test fixtures that only persist context snapshots) compile
+    /// without modification. The canonical implementation is
+    /// [`crate::store::context::ProtocolRepositoryContextBridge`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying storage write fails.
+    fn persist_outlet_message_key(
+        &self,
+        context_id: &str,
+        outlet_id: &str,
+        registration_event_id: &[u8; 32],
+        outlet_message_key: &[u8; 32],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _ = (
+            context_id,
+            outlet_id,
+            registration_event_id,
+            outlet_message_key,
+        );
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1061,6 +1094,25 @@ struct GovernanceState {
     /// enforce `max_governance_proposals_per_window` from `EarnedCapacityPolicy`.
     /// Entries outside the sliding window are evicted on each check.
     proposal_timestamps: HashMap<String, Vec<u64>>,
+    /// Pinned per-outlet `outlet_message_key` values keyed by
+    /// `(outlet_id, registration_event_id)` (§5.4.4 round-5, SCP-OUT-041a).
+    ///
+    /// Each entry is the 32-byte HMAC key derived at outlet-registration
+    /// acceptance via
+    /// `MLS_EXPORTER("scp-outlet-message-v1:" || BE32(len(outlet_id))
+    /// || outlet_id, b"", 32)` and pinned for the lifetime of that
+    /// registration. Keying by `registration_event_id` (the event-log
+    /// id of the `OutletRegistration` event) supports the SCP-OUT-041b
+    /// receiver-side LRU: concurrent registrations of the same outlet
+    /// must not overwrite each other.
+    ///
+    /// The persistence path
+    /// `context/{ctx}/outlet/{outlet}/registration/{event_id_hex}/message_key`
+    /// (managed by [`crate::store::ProtocolRepository::store_outlet_message_key`])
+    /// is the durable mirror of this map; this in-memory map is the
+    /// authoritative read path during the registration's lifetime.
+    pinned_outlet_message_keys:
+        HashMap<(scp_protocol::context::outlets::OutletId, [u8; 32]), [u8; 32]>,
 }
 
 impl GovernanceState {

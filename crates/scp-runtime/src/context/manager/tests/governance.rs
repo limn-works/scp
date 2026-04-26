@@ -5329,6 +5329,21 @@ async fn test_remove_member_sender_key_before_mls_removal() {
         ) -> Result<scp_protocol::context::builder::AdvanceEpochOutput, ContextError> {
             self.inner.advance_epoch(ctx)
         }
+        // Delegated for SCP-OUT-041a so outlet-registration-driven test
+        // paths exercise the same exporter the production code uses.
+        fn export_secret_for_context(
+            &self,
+            ctx: &[u8; 32],
+            label: &[u8],
+            context: &[u8],
+            length: usize,
+        ) -> Result<zeroize::Zeroizing<Vec<u8>>, ContextError> {
+            self.inner
+                .export_secret_for_context(ctx, label, context, length)
+        }
+        fn current_mls_epoch_for_context(&self, ctx: &[u8; 32]) -> Result<u64, ContextError> {
+            self.inner.current_mls_epoch_for_context(ctx)
+        }
     }
 
     let log_handle = Arc::clone(&call_log);

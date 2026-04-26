@@ -586,6 +586,44 @@ impl ContextCryptoProvider for MockCrypto {
 
         Ok(())
     }
+
+    /// Test-only MLS exporter — produces a deterministic 32-byte payload
+    /// per `(context_id, label, context)` triple via SHA-256 so that
+    /// SCP-OUT-041a (`outlet_message_key` derivation at outlet
+    /// registration acceptance) is exercised by the existing
+    /// `MockCrypto`-backed governance/queries test suite.
+    ///
+    /// Distinct `context_id`s produce disjoint outputs, matching the
+    /// real MLS exporter's per-group-state isolation.
+    fn export_secret_for_context(
+        &self,
+        context_id: &[u8; 32],
+        label: &[u8],
+        context: &[u8],
+        length: usize,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, ContextError> {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(b"MOCK-EXPORTER-V1:");
+        hasher.update(context_id);
+        let label_len = u32::try_from(label.len()).unwrap_or(u32::MAX);
+        let context_len = u32::try_from(context.len()).unwrap_or(u32::MAX);
+        hasher.update(label_len.to_be_bytes());
+        hasher.update(label);
+        hasher.update(context_len.to_be_bytes());
+        hasher.update(context);
+        let digest: [u8; 32] = hasher.finalize().into();
+        if length > 32 {
+            return Err(ContextError::CryptoFailed(format!(
+                "MockCrypto exporter produces 32-byte outputs, requested {length}"
+            )));
+        }
+        Ok(zeroize::Zeroizing::new(digest[..length].to_vec()))
+    }
+
+    fn current_mls_epoch_for_context(&self, _context_id: &[u8; 32]) -> Result<u64, ContextError> {
+        Ok(0)
+    }
 }
 
 pub(super) struct MockTransport {

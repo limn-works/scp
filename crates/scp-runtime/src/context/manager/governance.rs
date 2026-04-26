@@ -3180,6 +3180,84 @@ impl ContextManager {
         }
         self.event_log
             .append_context_event(&context_id_bytes, "OutletRegistered", actor_did)?;
+
+        // SCP-OUT-041a: derive and pin the §5.4.4 round-5 outlet_message_key
+        // at registration acceptance. The exporter is evaluated ONCE here on
+        // the hosting context's MLS epoch (the moment MLS commits the
+        // registration); the 32-byte key is pinned for the lifetime of the
+        // registration and never re-derived at error emission. Closes the
+        // BH5-B2 epoch-grace covert channel.
+        //
+        // The registration_event_id is the SHA-256 hash of the just-appended
+        // `OutletRegistered` event log entry (read after the append so the
+        // entry is guaranteed to be present). Concurrent registrations of
+        // the same outlet produce distinct registration_event_id values, so
+        // the per-outlet LRU added in SCP-OUT-041b can keep them resolvable
+        // concurrently across re-registration windows.
+        let registration_event_id = self
+            .event_log
+            .event_log_entries(&context_id_bytes)
+            .ok()
+            .flatten()
+            .and_then(|entries| entries.last().map(|e| e.hash));
+        if let Some(registration_event_id) = registration_event_id {
+            match crate::context::outlets::registration::pin_outlet_message_key_at_acceptance(
+                self.crypto.as_ref(),
+                &context_id_bytes,
+                &registration.outlet_id,
+                registration_event_id,
+            ) {
+                Ok(pinned) => {
+                    // Mirror to durable storage (best-effort) before
+                    // updating the in-memory map, so a successful storage
+                    // write is observable to a future restart even if
+                    // the in-memory mutation panics in some pathological
+                    // scenario.
+                    if let Some(ref persistence) = self.persistence
+                        && let Err(e) = persistence.persist_outlet_message_key(
+                            context_id,
+                            &registration.outlet_id,
+                            &pinned.registration_event_id,
+                            &pinned.outlet_message_key,
+                        )
+                    {
+                        tracing::warn!(
+                            context_id = %context_id,
+                            outlet_id = %registration.outlet_id,
+                            error = %e,
+                            "failed to persist outlet_message_key (best-effort)"
+                        );
+                    }
+                    if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                        let mut guard = ctx_arc.lock().await;
+                        let ctx = &mut *guard;
+                        ctx.governance.pinned_outlet_message_keys.insert(
+                            (pinned.outlet_id.clone(), pinned.registration_event_id),
+                            pinned.outlet_message_key,
+                        );
+                    }
+                }
+                Err(err) => {
+                    return Err(
+                        crate::context::outlets::registration::derive_error_to_context_error(err),
+                    );
+                }
+            }
+        } else {
+            // Defense-in-depth: this branch is only reachable if the
+            // event log provider does not support entry reading
+            // (`event_log_entries` returns the default error). In that
+            // configuration the §5.4.4 round-5 wire-message HMAC cannot
+            // be computed, which is a hard cryptographic invariant —
+            // surface as `CryptoFailed` so the registration aborts
+            // rather than silently leaving the outlet without a key.
+            return Err(ContextError::CryptoFailed(
+                "event log provider does not expose entries; \
+                 outlet_message_key cannot be pinned at registration acceptance"
+                    .into(),
+            ));
+        }
+
         {
             if let Ok(ctx_arc) = self.get_context_arc(context_id) {
                 let mut guard = ctx_arc.lock().await;
