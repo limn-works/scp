@@ -168,10 +168,12 @@ enum IdentityRecord {
     /// `StdRng`) builds — see ADR-046 for cross-bridge parity.
     Local {
         /// Ed25519 signing key bytes (32 bytes) for the DID-deriving
-        /// identity key (`#0`). Used to sign device attestations and
-        /// identity link attestations; NEVER used for day-to-day
-        /// `#active` signatures (those go through
-        /// `active_signing_key_bytes`).
+        /// identity key (`#0`). Used to sign device attestations
+        /// (signed by `#0` per spec). NEVER used for day-to-day
+        /// `#active` signatures, identity link attestations
+        /// (signed by `#active` or `#agent` per spec §3.5/§3.5.2),
+        /// or other operational signatures — those go through
+        /// `active_signing_key_bytes`.
         ///
         /// Wrapped in `Zeroizing` for defense-in-depth: WASM linear
         /// memory is readable by same-origin JS, so key material must be
@@ -2626,8 +2628,9 @@ pub fn identity_create_link_attestation(
         // Compute canonical signing bytes via the shared function (§9.5.1).
         let canonical = compute_attestation_canonical_bytes(&attestation)?;
 
-        // Sign inside the registry closure. Link attestations sign
-        // with the `#0` identity key (§3.5.2). Only `Local` records
+        // Sign with the issuer's #active key per spec §3.5 ("signed by
+        // the issuer's #active or #agent key") and §3.5.2 wire format
+        // ("using issuer's #active or #agent key"). Only `Local` records
         // carry it; `Resolved` handles refuse structurally.
         let signature_bytes = IDENTITY_REGISTRY.with(|reg| {
             let map = reg.borrow();
@@ -2640,10 +2643,11 @@ pub fn identity_create_link_attestation(
                 .into()
             })?;
 
-            let signing_key_bytes = match entry {
+            let active_signing_key_bytes = match entry {
                 IdentityRecord::Local {
-                    signing_key_bytes, ..
-                } => signing_key_bytes,
+                    active_signing_key_bytes,
+                    ..
+                } => active_signing_key_bytes,
                 IdentityRecord::Resolved { .. } => {
                     return Err::<[u8; 64], JsValue>(
                         ScpWasmError::Identity {
@@ -2659,7 +2663,7 @@ pub fn identity_create_link_attestation(
                     );
                 }
             };
-            let signing_key = ed25519_dalek::SigningKey::from_bytes(signing_key_bytes);
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(active_signing_key_bytes);
             let signature = signing_key.sign(&canonical);
             Ok::<[u8; 64], JsValue>(signature.to_bytes())
         })?;
