@@ -337,11 +337,8 @@ async fn handle_deliver_incoming(
 ) -> Outcome<()> {
     // Phase 1 fix-up of ADR-049 (post-review-round-1): the helper reads
     // `clock` / `key_resolver` from the supervisor directly.
-    let deliver_fut = crate::context::messaging_helpers::deliver_incoming(
-        supervisor,
-        context_id,
-        envelope_bytes,
-    );
+    let deliver_fut =
+        crate::context::messaging_helpers::deliver_incoming(supervisor, context_id, envelope_bytes);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, deliver_fut).await {
         Ok(Ok(opt)) => (Outcome::ok_mutated(()), Ok(opt)),

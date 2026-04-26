@@ -12,7 +12,7 @@
 //!
 //! This module hoists the broadcast-domain methods that the actor handler
 //! in [`crate::context::actor::handlers::broadcast`] currently reaches via
-//! `view.manager().X(...)`. After ADR-049 commit 12 (ContextManager
+//! `view.manager().X(...)`. After ADR-049 commit 12 (`ContextManager`
 //! deletion) every helper takes `&Supervisor`; Phase 2 of the
 //! post-review-round-1 plan will retarget the handler-side helpers to
 //! `&mut PerContextState + &ActorDeps`.

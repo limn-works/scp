@@ -107,7 +107,7 @@ use crate::context::supervisor::Supervisor;
 /// per-helper `ATTACHED_EXPECT` constants. One canonical string keeps
 /// the diagnostic stable across the helper graph; future audit
 /// tooling can grep for the single identifier.
-pub(crate) const PROVIDER_NOT_INITIALIZED: &str =
+pub const PROVIDER_NOT_INITIALIZED: &str =
     "Supervisor providers not initialized — call Supervisor::with_providers";
 
 // ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@
 //! actor handlers in
 //! [`crate::context::actor::handlers::lifecycle`] /
 //! [`crate::context::actor::handlers::ttl_close`] currently reach via
-//! `view.manager().X(...)`. After ADR-049 commit 12 (ContextManager
+//! `view.manager().X(...)`. After ADR-049 commit 12 (`ContextManager`
 //! deletion) every helper takes `&Supervisor`; Phase 2 of the
 //! post-review-round-1 plan will retarget the handler-side helpers to
 //! `&mut PerContextState + &ActorDeps`.
@@ -2477,15 +2477,15 @@ pub fn flush_all_contexts_sync(supervisor: &Supervisor) {
 /// Required by destructor / atexit-style sync callers (the FFI
 /// bridge instance's blocking-shutdown path) that cannot `.await`.
 /// Phase 1 fix-up of ADR-049 (post-review-round-1): the async
-/// helper acquires the supervisor write_lock with `lock().await`
+/// helper acquires the supervisor `write_lock` with `lock().await`
 /// rather than `try_lock`, so the sync caller MUST drive an
 /// internal `block_on`. Mirrors the structure of
 /// [`flush_all_contexts_sync`].
 pub fn shutdown_all_contexts_sync(supervisor: &Supervisor) {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
-            tokio::task::block_in_place(|| {
-                handle.block_on(shutdown_all_contexts(supervisor));
+            tokio::task::block_in_place(|| { // ci-allow: block-on: shutdown teardown — destructor / atexit path; no async caller available
+                handle.block_on(shutdown_all_contexts(supervisor)); // ci-allow: block-on: shutdown teardown — see surrounding block_in_place
             });
         }
         Err(e) => {

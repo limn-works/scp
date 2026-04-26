@@ -832,18 +832,18 @@ impl Supervisor {
         key_package_store: crate::context::supervisor::key_package_actor::KeyPackageStoreHandle,
     ) -> Result<crate::context::actor::deps::ActorDeps, ContextError> {
         use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
-        let transport = Arc::clone(
-            self.transport_ref()
-                .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?,
-        );
-        let event_log = Arc::clone(
-            self.event_log_ref()
-                .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?,
-        );
-        let clock = Arc::clone(
-            self.clock_ref()
-                .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?,
-        );
+        let transport =
+            Arc::clone(self.transport_ref().ok_or_else(|| {
+                ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned())
+            })?);
+        let event_log =
+            Arc::clone(self.event_log_ref().ok_or_else(|| {
+                ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned())
+            })?);
+        let clock =
+            Arc::clone(self.clock_ref().ok_or_else(|| {
+                ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned())
+            })?);
         let key_resolver = self
             .key_resolver_ref()
             .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?
@@ -1628,13 +1628,8 @@ impl Supervisor {
         // a line of code after `.await` — a panic anywhere inside the FSM
         // would leave the guard set, blocking every subsequent `start_saga`
         // until process restart. Phase 1 fix-up of ADR-049
-        // (post-review-round-1).
-        struct SagaGuardReset<'a>(&'a std::sync::atomic::AtomicBool);
-        impl Drop for SagaGuardReset<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::Release);
-            }
-        }
+        // (post-review-round-1). The guard type is defined at module
+        // scope below ([`SagaGuardReset`]).
         let _guard = SagaGuardReset(&self.saga_pending_guard);
 
         let saga_id = SagaId::new();
@@ -2670,6 +2665,19 @@ impl Supervisor {
 // ---------------------------------------------------------------------------
 // Saga FSM helpers
 // ---------------------------------------------------------------------------
+
+/// RAII reset for [`Supervisor::saga_pending_guard`]. Ensures the pending
+/// flag clears on scope exit even if the FSM body panics. Phase 1 fix-up
+/// of ADR-049 (post-review-round-1) — the prior implementation cleared
+/// the flag with a line of code after `.await`, leaving the guard set on
+/// any unwind path.
+struct SagaGuardReset<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for SagaGuardReset<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
 
 /// Phase tag used by the coordinator's Prepare dispatch. Enables
 /// single-match dispatch on `(input, phase)` so the Prepare-A and

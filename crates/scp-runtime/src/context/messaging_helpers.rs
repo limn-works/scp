@@ -7,7 +7,7 @@
 //! `crate::context::messaging_helpers`. Commit 12b.1 hoisted six pure
 //! [`PerContextState`]-scoped helpers. Commit 12c.1 extends the hoist to
 //! the two top-level messaging methods [`send_message`] and
-//! [`deliver_incoming`]. After ADR-049 commit 12 (ContextManager
+//! [`deliver_incoming`]. After ADR-049 commit 12 (`ContextManager`
 //! deletion) every helper takes `&Supervisor`; Phase 2 of the
 //! post-review-round-1 plan will retarget the handler-side helpers to
 //! `&mut PerContextState + &ActorDeps`.

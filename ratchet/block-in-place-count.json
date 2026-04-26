@@ -1,11 +1,11 @@
 {
   "_comment": "Ratchet baseline for `tokio::task::block_in_place`, `.block_on(...)`, `Runtime::new()`, and sync-bridge macro wrappers in the actor-refactor scope (ADR-049). See scripts/check-block-in-place.py for scope, detection rules, and the inline allow-list directive `// ci-allow: block-on: <reason>`. Enforcement is PER-FILE: the gate fails when any file's count goes UP. The previous per-crate-aggregate baseline was gameable — an attacker could delete a legit site and add a new one within the same crate without detection. Per-file baselines close that gap. Test code (`**/tests/**` paths and `#[cfg(test)] mod` items) is excluded from counting. Allow-listed sites are excluded from counting and must carry a reason string.",
-  "_updated": "2026-04-19 (commit 3 remediation — per-file granularity + macro/rebind coverage)",
-  "_context": "Pre-refactor state. scp-runtime counts are sync-in-async bridges in ContextManager, MlsCryptoProvider, recovery, trust store, and per-context store. scp-transport counts are in the provider.rs sync-adapter bridge and native/relay_persistence.rs. scp-node has one site in the HTTP/3 request handler (sync trait method, legitimate and will be annotated once post-refactor patterns settle). The actor refactor eliminates every scp-runtime and scp-transport site listed below; the scp-node site may remain and be annotated with `// ci-allow: block-on: <reason>` in a later commit.",
+  "_updated": "2026-04-25 (post-review-round-1 phase 1 — file-rename migration after ADR-049 commit 12 deleted manager/ and hoisted bodies into *_helpers.rs)",
+  "_context": "Pre-refactor state. scp-runtime counts are sync-in-async bridges in (now-deleted) ContextManager, MlsCryptoProvider, recovery, trust store, and per-context store. scp-transport counts are in the provider.rs sync-adapter bridge and native/relay_persistence.rs. scp-node has one site in the HTTP/3 request handler (sync trait method, legitimate and will be annotated once post-refactor patterns settle). The actor refactor eliminates every scp-runtime and scp-transport site listed below; the scp-node site may remain and be annotated with `// ci-allow: block-on: <reason>` in a later commit. Post-commit-12 file-rename mapping: `manager/mod.rs` (2 sites: flush_all_contexts_sync) → `lifecycle_helpers.rs`; `manager/tools.rs` (6 sites) → `tools_helpers.rs`. Site counts unchanged at the rename — the bodies are byte-identical hoists.",
   "files": {
     "crates/scp-node/src/http.rs": 1,
-    "crates/scp-runtime/src/context/manager/mod.rs": 2,
-    "crates/scp-runtime/src/context/manager/tools.rs": 6,
+    "crates/scp-runtime/src/context/lifecycle_helpers.rs": 2,
+    "crates/scp-runtime/src/context/tools_helpers.rs": 6,
     "crates/scp-runtime/src/identity/recovery.rs": 2,
     "crates/scp-runtime/src/store/context.rs": 20,
     "crates/scp-runtime/src/store/trust.rs": 6,
@@ -22,8 +22,8 @@
       "crates/scp-node/src/http.rs:1541 — HTTP/3 RequestHandler sync trait method (block_on)"
     ],
     "scp-runtime": [
-      "crates/scp-runtime/src/context/manager/mod.rs:2328-2329 (1 block_in_place + 1 block_on)",
-      "crates/scp-runtime/src/context/manager/tools.rs:322-353, 398-401 (2 block_in_place + 4 block_on)",
+      "crates/scp-runtime/src/context/lifecycle_helpers.rs:2461-2462 (1 block_in_place + 1 block_on — flush_all_contexts_sync; renamed from manager/mod.rs in ADR-049 commit 12)",
+      "crates/scp-runtime/src/context/tools_helpers.rs:237-327 (2 block_in_place + 4 block_on — try_consume / refund hard rate limit blocking + from_any_context wrappers; renamed from manager/tools.rs in ADR-049 commit 12)",
       "crates/scp-runtime/src/identity/recovery.rs:782-784 (1 block_in_place + 1 block_on)",
       "crates/scp-runtime/src/store/context.rs:944-1109 (10 block_in_place + 10 block_on — RwLock-backed per-context store sync bridge)",
       "crates/scp-runtime/src/store/trust.rs:273-336 (6 block_on via stored Handle)"

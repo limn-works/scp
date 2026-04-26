@@ -12,7 +12,7 @@
 //!
 //! This module hoists the governance-domain methods that the actor handlers
 //! in [`crate::context::actor::handlers::governance`] currently reach via
-//! `view.manager().X(...)`. After ADR-049 commit 12 (ContextManager
+//! `view.manager().X(...)`. After ADR-049 commit 12 (`ContextManager`
 //! deletion) every helper takes `&Supervisor`; Phase 2 of the
 //! post-review-round-1 plan will retarget the handler-side helpers to
 //! `&mut PerContextState + &ActorDeps`.
@@ -2216,6 +2216,39 @@ pub async fn execute_add_member(
 // execute_remove_member
 // ---------------------------------------------------------------------------
 
+/// Sender-key step failed after the MLS commit succeeded. Mark the
+/// context fail-closed via [`CommitFaultMarker`] and surface a typed
+/// `CryptoFailed` error so the operator must `acknowledge_commit_fault`
+/// before subsequent sends can resume. Phase 1 fix-up of ADR-049
+/// (post-review-round-1).
+fn fail_close_remove_member(
+    ctx: &mut PerContextState,
+    supervisor: &Supervisor,
+    context_id: &str,
+    did: &DID,
+    operation: &str,
+    error: &str,
+) -> Result<(), ContextError> {
+    tracing::error!(
+        context_id,
+        member = %did,
+        op = operation,
+        error,
+        "{operation} failed after MLS removal — fail-closing context"
+    );
+    ctx.commit_fault = Some(CommitFaultMarker {
+        operation: CommitOperation::RemoveMember {
+            target_did: did.clone(),
+        },
+        reason: format!("{operation} failed: {error}"),
+        failed_at: supervisor.clock_ref().map_or(0, Clock::now_secs),
+        retry_count: 0,
+    });
+    Err(ContextError::CryptoFailed(format!(
+        "{operation} failed after MLS removal of {did}: {error}"
+    )))
+}
+
 pub async fn execute_remove_member(
     supervisor: &Supervisor,
     context_id: &str,
@@ -2259,30 +2292,18 @@ pub async fn execute_remove_member(
         // `acknowledge_commit_fault`. Returning `Err` leaves the
         // context in an explicitly-degraded state rather than a
         // silently-divergent one.
-        if let Err(e) = supervisor
+        let crypto = supervisor
             .crypto_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-            .remove_member_sender_key(&context_id_bytes, did.as_ref())
-        {
-            tracing::error!(
+            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
+        if let Err(e) = crypto.remove_member_sender_key(&context_id_bytes, did.as_ref()) {
+            return fail_close_remove_member(
+                ctx,
+                supervisor,
                 context_id,
-                member = %did,
-                error = %e,
-                "remove_member_sender_key failed after MLS removal — fail-closing context"
+                did,
+                "remove_member_sender_key",
+                &e.to_string(),
             );
-            ctx.commit_fault = Some(CommitFaultMarker {
-                operation: CommitOperation::RemoveMember {
-                    target_did: did.clone(),
-                },
-                reason: format!("remove_member_sender_key failed: {e}"),
-                failed_at: supervisor
-                    .clock_ref()
-                    .map_or(0, |c| c.now_secs()),
-                retry_count: 0,
-            });
-            return Err(ContextError::CryptoFailed(format!(
-                "remove_member_sender_key failed after MLS removal of {did}: {e}"
-            )));
         }
 
         // Rotate the local sender key so the removed member cannot
@@ -2291,29 +2312,15 @@ pub async fn execute_remove_member(
         //
         // Phase 1 fix-up of ADR-049 (post-review-round-1): rotation
         // failure is fatal — same rationale as the remove path above.
-        if let Err(e) = supervisor
-            .crypto_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-            .rotate_sender_key(&context_id_bytes)
-        {
-            tracing::error!(
+        if let Err(e) = crypto.rotate_sender_key(&context_id_bytes) {
+            return fail_close_remove_member(
+                ctx,
+                supervisor,
                 context_id,
-                error = %e,
-                "rotate_sender_key failed after member removal — fail-closing context"
+                did,
+                "rotate_sender_key",
+                &e.to_string(),
             );
-            ctx.commit_fault = Some(CommitFaultMarker {
-                operation: CommitOperation::RemoveMember {
-                    target_did: did.clone(),
-                },
-                reason: format!("rotate_sender_key failed: {e}"),
-                failed_at: supervisor
-                    .clock_ref()
-                    .map_or(0, |c| c.now_secs()),
-                retry_count: 0,
-            });
-            return Err(ContextError::CryptoFailed(format!(
-                "rotate_sender_key failed after member removal of {did}: {e}"
-            )));
         }
 
         ctx.membership.remove_member(did);
