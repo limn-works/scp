@@ -88,6 +88,14 @@ pub const MAX_RELAY_URL_LEN: usize = 2048;
 /// Maximum length for a transport mode string.
 pub const MAX_TRANSPORT_MODE_LEN: usize = 64;
 
+/// Maximum length for a storage path (filesystem directory for `SQLite`, etc.).
+///
+/// 4 KiB is comfortably above POSIX `PATH_MAX` (4096) and Windows
+/// `MAX_PATH` (260) in their long-path forms. Defends against accidental
+/// or malicious oversized inputs without rejecting legitimate deeply
+/// nested project paths.
+pub const MAX_STORAGE_PATH_LEN: usize = 4096;
+
 /// Maximum length for a deploy ID (matches `scp-core::context::broadcast_content::MAX_DEPLOY_ID_BYTES`).
 pub const MAX_DEPLOY_ID_LEN: usize = 128;
 
@@ -468,6 +476,45 @@ pub fn validate_relay_url(url: &str) -> Result<(), ValidationError> {
         )));
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Storage path validation (#1543 PR-C security follow-up)
+// ---------------------------------------------------------------------------
+
+/// Validates a filesystem path string supplied as caller input to a
+/// storage backend (e.g., the `SQLite` directory passed to
+/// `SCP.with_storage({"type": "sqlite", "path": ...})`).
+///
+/// Defense-in-depth at the FFI boundary, mirroring the project's
+/// pattern for every other caller-supplied string (DID, relay URL,
+/// tool name, etc.). The caller is in-process trusted code, but
+/// the consistency matters: error and tracing paths may otherwise
+/// surface unsanitized control characters from this single un-validated
+/// string into logs (log injection via embedded ANSI / CRLF).
+///
+/// Checks:
+/// - Non-empty.
+/// - Length <= [`MAX_STORAGE_PATH_LEN`] (4 KiB).
+/// - No control characters (U+0000–U+001F, U+007F–U+009F) — covers NUL,
+///   CRLF, ANSI escape sequences, etc.
+///
+/// Does NOT enforce any specific filesystem semantics:
+/// - Relative vs. absolute is the caller's choice.
+/// - `..` traversal is allowed — paths are resolved by the OS, and the
+///   caller is in-process trusted code that already has whatever
+///   filesystem privileges the process has.
+/// - Path existence / writability is checked by the storage backend
+///   (`SqliteStorage::new`) at open time, not here.
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] if the path is empty, exceeds
+/// [`MAX_STORAGE_PATH_LEN`], or contains a control character.
+pub fn validate_storage_path(path: &str) -> Result<(), ValidationError> {
+    validate_non_empty(path, "storage path", MAX_STORAGE_PATH_LEN)?;
+    reject_control_chars(path, "storage path")?;
     Ok(())
 }
 
@@ -1150,6 +1197,43 @@ mod tests {
     fn empty_transport_mode_rejected() {
         let err = validate_transport_mode("").unwrap_err();
         assert!(err.message.contains("must not be empty"));
+    }
+
+    // -- Storage path --
+
+    #[test]
+    fn valid_storage_paths() {
+        assert!(validate_storage_path("/tmp/scp-test").is_ok());
+        assert!(validate_storage_path("./relative/path").is_ok());
+        assert!(validate_storage_path("/absolute/path/to/db").is_ok());
+        // `..` traversal is allowed (caller is in-process trusted).
+        assert!(validate_storage_path("../parent/dir").is_ok());
+    }
+
+    #[test]
+    fn empty_storage_path_rejected() {
+        let err = validate_storage_path("").unwrap_err();
+        assert!(err.message.contains("must not be empty"));
+    }
+
+    #[test]
+    fn storage_path_too_long_rejected() {
+        let long = "a".repeat(MAX_STORAGE_PATH_LEN + 1);
+        let err = validate_storage_path(&long).unwrap_err();
+        assert!(err.message.contains("exceeds max"));
+    }
+
+    #[test]
+    fn storage_path_with_control_chars_rejected() {
+        // CRLF (log injection vector)
+        let err = validate_storage_path("/tmp/db\r\nHEADER: evil").unwrap_err();
+        assert!(err.message.contains("control character"));
+        // NUL
+        let err = validate_storage_path("/tmp/db\0xyz").unwrap_err();
+        assert!(err.message.contains("control character"));
+        // ANSI escape
+        let err = validate_storage_path("/tmp/db\x1b[31mred\x1b[0m").unwrap_err();
+        assert!(err.message.contains("control character"));
     }
 
     // -- Attestation fields --

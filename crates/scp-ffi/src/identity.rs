@@ -3,7 +3,6 @@
 //! Exposes [`PyIdentity`] and [`PyDIDDocument`] as opaque Python objects with
 //! attribute access, plus identity lifecycle methods on the `SCP` class:
 //!
-//! - `PyScp::init_storage` — initialises the storage provider.
 //! - `PyScp::identity_create` — creates a new DID identity.
 //! - `PyScp::identity_create_with_agent_key` — creates a new DID identity
 //!   with an agent signing key.
@@ -626,27 +625,6 @@ fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyErro
 
 #[pymethods]
 impl crate::scp::PyScp {
-    /// Initializes the storage provider for identity persistence.
-    ///
-    /// Must be called before `PyScp::identity_create` or
-    /// `PyScp::identity_load` if storage persistence is desired. The storage
-    /// provider is scoped to this instance; separate `SCP` instances hold
-    /// independent providers.
-    ///
-    /// # Arguments
-    ///
-    /// * `storage_type` — The storage backend type: `"in_memory"`.
-    ///
-    /// # Errors
-    ///
-    /// Raises `ValidationError` if the storage type is not recognized.
-    ///
-    /// See SCP-217 and spec section 17.4.
-    pub fn init_storage(&self, storage_type: &str) -> PyResult<()> {
-        let bi = &*self.inner;
-        crate::runtime::init_storage(bi, storage_type).map_err(PyErr::from)
-    }
-
     /// Creates a new DID identity.
     ///
     /// # Arguments
@@ -664,8 +642,8 @@ impl crate::scp::PyScp {
     ///
     /// # Storage
     ///
-    /// If a storage provider has been initialized via
-    /// `PyScp::init_storage`, the identity state (DID, custody type) is
+    /// If a storage provider was attached at construction via
+    /// `PyScp::with_storage`, the identity state (DID, custody type) is
     /// persisted under the key `identity/{did}/state` after successful
     /// creation (SCP-217).
     ///
@@ -890,7 +868,8 @@ impl crate::scp::PyScp {
     ///
     /// Raises `IdentityError` if:
     /// - The DID format is unsupported (not `did:dht:` prefix).
-    /// - Storage has not been initialized (call `init_storage` first).
+    /// - Storage has not been initialized (construct via
+    ///   `SCP.with_storage({...})` instead of bare `SCP()`).
     /// - The DID is not found in storage.
     /// - The stored state is malformed.
     /// - The identity has no live crypto state in the registry

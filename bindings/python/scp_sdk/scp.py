@@ -591,10 +591,6 @@ class SCP:
             self._native.identity_verify_device_attestation, did, token_base64
         )
 
-    async def init_storage(self, storage_type: str) -> Any:
-        """Delegate to ``_scp_core.SCP.init_storage``."""
-        return await asyncio.to_thread(self._native.init_storage, storage_type)
-
     async def remove_identity_link_attestation(self, did: str, attestation_id: str) -> bool:
         """Remove an identity link attestation.
 

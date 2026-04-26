@@ -140,6 +140,15 @@ impl Scp {
                         })
                     })?
                     .to_owned();
+                // Defense-in-depth: validate path string at FFI boundary
+                // (matches the project pattern for every other caller-supplied
+                // string). #1543 PR-C security review.
+                scp_ffi_common::validate::validate_storage_path(&path_str).map_err(|e| {
+                    napi::Error::from(ScpNapiError::Validation {
+                        message: format!("withStorage(sqlite): invalid 'path' — {}", e.message),
+                        code: codes::VALID_7005.to_owned(),
+                    })
+                })?;
                 // `key` is accepted either as a hex-encoded string (most
                 // common from JS/TS where JSON has no native bytes type)
                 // or as a JSON array of byte values.

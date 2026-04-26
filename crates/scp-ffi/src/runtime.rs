@@ -283,19 +283,6 @@ impl StorageProvider {
         )))
     }
 
-    /// Constructs a `SQLCipher`-encrypted provider at the given directory.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`PlatformError::StorageError`] if the database cannot be
-    /// opened or the encryption key is rejected. The key material is
-    /// consumed (moved) so that the original `Zeroizing<Vec<u8>>` is
-    /// dropped — `SQLCipher` retains its own derived key internally.
-    pub fn new_sqlite(path: &std::path::Path, key: &[u8]) -> Result<Self, PlatformError> {
-        let storage = SqliteStorage::new(path, key)?;
-        Ok(Self::Sqlite(Arc::new(storage)))
-    }
-
     /// Releases any persistent resources held by the variant.
     ///
     /// For [`StorageProvider::Sqlite`] this delegates to
@@ -383,9 +370,10 @@ pub struct PyBridgeInstance {
 
     /// Encrypted storage provider — [`StorageProvider`] enum dispatching
     /// between `EncryptingAdapter<InMemoryStorage>` and `SqliteStorage`.
-    /// `OnceLock` because it is set once at `py_init_storage` (or
-    /// construction) time. Typed (not `dyn`) because the `Storage` trait is
-    /// not dyn-compatible (RPITIT).
+    /// `OnceLock` because it is set once at construction via
+    /// [`PyBridgeInstance::with_storage_py`] (driven from Python by
+    /// `SCP.with_storage({...})`). Typed (not `dyn`) because the `Storage`
+    /// trait is not dyn-compatible (RPITIT).
     pub(crate) storage_provider: OnceLock<StorageProvider>,
 
     // -----------------------------------------------------------------
@@ -505,14 +493,15 @@ impl PyBridgeInstance {
     ///   also registered as `storage_provider` so identity, event log,
     ///   trust, and MCP reads hit the same connection pool (one DB
     ///   connection per process — `SQLite` cannot share one across two
-    ///   `SqliteStorage::new` calls). If opening fails, the bridge is
-    ///   returned with neither `storage_provider` nor `persistence` set
-    ///   and the caller sees the existing "storage not initialized" error
-    ///   paths. Errors are logged via `tracing::error!` so they are not
-    ///   silently swallowed.
+    ///   `SqliteStorage::new` calls). If opening fails, the
+    ///   [`StorageInitError::SqliteOpen`] error is returned to the caller
+    ///   (and logged via `tracing::error!`) — no half-constructed bridge
+    ///   is exposed.
     ///
-    /// For fallible construction that surfaces the `SQLite` error, use
-    /// [`PyBridgeInstance::new_py`] + [`PyBridgeInstance::init_sqlite_storage`].
+    /// # Errors
+    ///
+    /// Returns [`StorageInitError::SqliteOpen`] if `SqliteStorage::new`
+    /// fails (bad key, permission denied, corrupt file, schema mismatch).
     pub fn with_storage_py(cfg: StorageConfig) -> Result<Self, StorageInitError> {
         match cfg {
             StorageConfig::InMemory => {
@@ -655,52 +644,6 @@ impl PyBridgeInstance {
     ) -> &std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>> {
         &self.network
     }
-
-    /// Initializes the in-memory storage provider on this instance.
-    ///
-    /// Returns an error if storage was already initialized on this instance
-    /// (`OnceLock` semantics) — matches the previous
-    /// `set_storage_provider` warning behaviour but surfaces the failure
-    /// to the caller instead of silently dropping it.
-    ///
-    /// # Errors
-    ///
-    /// Returns `ScpPyError::ContextError` if storage was already set.
-    pub fn init_in_memory_storage(&self) -> Result<(), ScpPyError> {
-        self.storage_provider
-            .set(StorageProvider::new_in_memory_encrypted())
-            .map_err(|_| {
-                ScpPyError::context(
-                    "storage already initialized — py_init_storage may only be called once per SCP instance"
-                        .to_owned(),
-                )
-            })
-    }
-
-    /// Initializes a SQLCipher-encrypted storage provider on this instance.
-    ///
-    /// Opens a database at `{path}/scp.db` with the given raw encryption
-    /// key. Subsequent calls return an error (`OnceLock` semantics).
-    ///
-    /// # Errors
-    ///
-    /// Returns `ScpPyError::ContextError` if storage was already set or if
-    /// `SqliteStorage::new` fails (database open, schema creation, or
-    /// encryption key rejection).
-    pub fn init_sqlite_storage(
-        &self,
-        path: &std::path::Path,
-        key: &[u8],
-    ) -> Result<(), ScpPyError> {
-        let provider = StorageProvider::new_sqlite(path, key)
-            .map_err(|e| ScpPyError::context(format!("failed to open SQLite storage: {e}")))?;
-        self.storage_provider.set(provider).map_err(|_| {
-            ScpPyError::context(
-                "storage already initialized — init_sqlite_storage may only be called once per SCP instance"
-                    .to_owned(),
-            )
-        })
-    }
 }
 
 #[async_trait::async_trait]
@@ -826,11 +769,13 @@ impl Drop for PyBridgeInstance {
 /// returning `None`, ensuring governance vote signature verification failures
 /// are visible rather than silently skipped.
 ///
-/// When the `BridgeInstance` storage provider has been initialized via
-/// [`init_storage`], a [`ProtocolRepositoryContextBridge`] is constructed
-/// from it and injected into the `ContextManager`. This enables context state
-/// persistence across process restarts without requiring callers to manually
-/// wire persistence. See issue #329.
+/// When the `BridgeInstance` was constructed via
+/// [`PyBridgeInstance::with_storage_py`] (driven from Python by
+/// `SCP.with_storage({...})`), a [`ProtocolRepositoryContextBridge`] is
+/// constructed from the attached storage provider and injected into the
+/// `ContextManager`. This enables context state persistence across process
+/// restarts without requiring callers to manually wire persistence.
+/// See issue #329.
 ///
 /// The `local_did` is consumed only by `MlsCryptoProvider::new` — the
 /// `BridgeInstance` itself carries no DID (spec §12.2.3).
@@ -911,12 +856,14 @@ pub fn init_context_manager_for_test(bi: &PyBridgeInstance) {
     bi.core.set_context_manager(cm_arc);
 }
 
-/// Constructs a [`ProtocolRepositoryContextBridge`] from the global storage provider,
-/// if it has been initialized.
+/// Constructs a [`ProtocolRepositoryContextBridge`] from the bridge's storage
+/// provider, if one was attached at construction time.
 ///
-/// Returns `None` if [`init_storage`] has not been called yet. This is
-/// expected during early initialization -- the `ContextManager` will operate
-/// without persistence until the storage provider is available.
+/// Returns `None` for `PyBridgeInstance` instances built via
+/// [`PyBridgeInstance::new_py`] (no storage attached) — only instances
+/// constructed via [`PyBridgeInstance::with_storage_py`] (driven from Python
+/// by `SCP.with_storage({...})`) carry a provider. The `ContextManager` will
+/// operate without persistence in the no-storage case.
 ///
 /// Uses `Arc<EncryptingAdapter<InMemoryStorage>>` as the storage backend
 /// for `ProtocolRepository`, sharing the same underlying storage instance as
@@ -1761,58 +1708,25 @@ pub fn remove_identity(bi: &PyBridgeInstance, did: &str) {
 // Storage provider registry (SCP-217: identity persistence)
 // ---------------------------------------------------------------------------
 
-/// Initializes the storage provider and stores it in the `BridgeInstance`.
+/// Returns a reference to the storage provider attached to this bridge instance.
 ///
-/// Must be called before any storage-dependent bridge function
-/// (`py_identity_create`, `py_identity_load`). Calling multiple times is
-/// a no-op — the first call wins (`OnceLock` in `BridgeInstance`).
-///
-/// Wraps `InMemoryStorage` in [`EncryptingAdapter`] with a random
-/// AES-256-GCM key generated via `OsRng`. This ensures all stored
-/// values are encrypted at rest, satisfying the `EncryptedStorage` bound.
-///
-/// See spec section 17.3 for key conventions and section 17.4 for
-/// `ProtocolRepository` design.
-///
-/// # Arguments
-///
-/// * `storage_type` — Currently only `"in_memory"` is supported.
+/// Storage is fixed at construction via [`PyBridgeInstance::with_storage_py`]
+/// (driven from Python by `SCP.with_storage({...})`). A `PyBridgeInstance`
+/// constructed via [`PyBridgeInstance::new_py`] has no storage attached —
+/// callers needing persistence must use the factory.
 ///
 /// # Errors
 ///
-/// Returns `ScpPyError::ValidationError` if the storage type is not
-/// recognized, or `ScpPyError::ContextError` if the bridge has not been
-/// initialized.
-pub fn init_storage(bi: &PyBridgeInstance, storage_type: &str) -> Result<(), ScpPyError> {
-    match storage_type {
-        "in_memory" => {
-            // `init_in_memory_storage` returns an error if already set; match
-            // the previous silent-no-op behaviour by converting already-set
-            // to Ok (OnceLock semantics: first wins, subsequent silent).
-            if bi.init_in_memory_storage().is_err() {
-                tracing::debug!(
-                    "init_storage: storage already initialized on this instance — reusing existing provider"
-                );
-            }
-            Ok(())
-        }
-        other => Err(ScpPyError::validation(format!(
-            "unknown storage type: {other:?} — expected \"in_memory\""
-        ))),
-    }
-}
-
-/// Returns a reference to the global storage provider.
-///
-/// # Errors
-///
-/// Returns `ScpPyError::IdentityError` if storage has not been initialized
-/// via [`init_storage`], or `ScpPyError::ContextError` if the bridge has
-/// not been initialized.
+/// Returns `ScpPyError::IdentityError` if no storage provider was attached
+/// at construction time. The legacy `init_storage` imperative-attach path
+/// (and the matching Python `SCP.init_storage(...)` shim) was removed in
+/// favour of the `with_storage` factory — see #1543 PR-C.
 pub fn get_storage(bi: &PyBridgeInstance) -> Result<&StorageProvider, ScpPyError> {
     bi.storage_provider().ok_or_else(|| {
         ScpPyError::identity(
-            "storage not initialized — call py_init_storage(\"in_memory\") first".to_owned(),
+            "storage not initialized — construct the SCP instance via \
+             SCP.with_storage({...}) instead of bare SCP()"
+                .to_owned(),
         )
     })
 }
