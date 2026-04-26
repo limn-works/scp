@@ -129,13 +129,11 @@ use crate::context::governance_logic::{
 };
 use crate::context::supervisor::Supervisor;
 
-/// Shared expectation message for `Supervisor::with_providers()`
-/// and `Supervisor::*_ref()` accessors inside helpers. The attach-time
-/// contract installs the manager (and lifts every provider slot)
-/// before any FFI caller or test can invoke a helper.
-const ATTACHED_EXPECT: &str = "governance_helpers: Supervisor must be fully attached before helper invocation \
-     (set by Supervisor::with_providers during bridge construction)";
+// Phase 1 fix-up of ADR-049 (post-review-round-1): per-helper
+// `ATTACHED_EXPECT` constants consolidated to the single
+// `PROVIDER_NOT_INITIALIZED` definition in `manager_methods`.
 use crate::context::manager_methods;
+use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT;
 use crate::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
     ContentKeysRotatedResult, ContextGeneration, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
@@ -2249,43 +2247,74 @@ pub async fn execute_remove_member(
             .remove_member(&context_id_bytes, did)
             .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
-        // Sender key cleanup is best-effort: log failures but do not
-        // propagate. The MLS removal above is the hard boundary; sender
-        // key removal is defense-in-depth for the independent sender key
-        // confidentiality layer (§9.16).
+        // Phase 1 fix-up of ADR-049 (post-review-round-1): treat
+        // sender-key removal + rotation as fatal. The MLS commit
+        // hard-removes the member; if the sender-key layer fails to
+        // remove or rotate, the removed member retains the
+        // pre-rotation per-author broadcast key and forward secrecy
+        // for the sender-key confidentiality layer (§9.16) is broken.
+        //
+        // On failure: set `commit_fault` so subsequent sends
+        // refuse with `ContextError::CommitBroadcastFault` until an
+        // operator manually intervenes via
+        // `acknowledge_commit_fault`. Returning `Err` leaves the
+        // context in an explicitly-degraded state rather than a
+        // silently-divergent one.
         if let Err(e) = supervisor
             .crypto_ref()
             .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
             .remove_member_sender_key(&context_id_bytes, did.as_ref())
         {
-            tracing::warn!(
+            tracing::error!(
                 context_id,
                 member = %did,
                 error = %e,
-                "remove_member_sender_key failed after MLS removal — \
-                 sender key layer may retain stale key"
+                "remove_member_sender_key failed after MLS removal — fail-closing context"
             );
+            ctx.commit_fault = Some(CommitFaultMarker {
+                operation: CommitOperation::RemoveMember {
+                    target_did: did.clone(),
+                },
+                reason: format!("remove_member_sender_key failed: {e}"),
+                failed_at: supervisor
+                    .clock_ref()
+                    .map_or(0, |c| c.now_secs()),
+                retry_count: 0,
+            });
+            return Err(ContextError::CryptoFailed(format!(
+                "remove_member_sender_key failed after MLS removal of {did}: {e}"
+            )));
         }
 
         // Rotate the local sender key so the removed member cannot
         // decrypt future messages (§9.16.4). Generates a fresh key,
         // increments the epoch, and HPKE-seals to remaining members.
         //
-        // Non-fatal: MLS removal above is the hard security boundary.
-        // If rotation fails after MLS removal succeeded, returning Err
-        // would leave the system inconsistent (member removed from MLS
-        // but governance action appears to have failed).
+        // Phase 1 fix-up of ADR-049 (post-review-round-1): rotation
+        // failure is fatal — same rationale as the remove path above.
         if let Err(e) = supervisor
             .crypto_ref()
             .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
             .rotate_sender_key(&context_id_bytes)
         {
-            tracing::warn!(
+            tracing::error!(
                 context_id,
                 error = %e,
-                "rotate_sender_key failed after member removal — \
-                 remaining members retain old sender key"
+                "rotate_sender_key failed after member removal — fail-closing context"
             );
+            ctx.commit_fault = Some(CommitFaultMarker {
+                operation: CommitOperation::RemoveMember {
+                    target_did: did.clone(),
+                },
+                reason: format!("rotate_sender_key failed: {e}"),
+                failed_at: supervisor
+                    .clock_ref()
+                    .map_or(0, |c| c.now_secs()),
+                retry_count: 0,
+            });
+            return Err(ContextError::CryptoFailed(format!(
+                "rotate_sender_key failed after member removal of {did}: {e}"
+            )));
         }
 
         ctx.membership.remove_member(did);
@@ -4899,7 +4928,6 @@ pub async fn migration_state(supervisor: &Supervisor, context_id: &str) -> Optio
 ///
 /// # Returns
 /// A vector of governance events to emit (empty if no conflicts)
-#[allow(clippy::unused_self)] // method for API consistency within ContextManager
 pub fn detect_and_handle_conflicts(
     supervisor: &Supervisor,
     ctx: &mut PerContextState,
@@ -5047,7 +5075,6 @@ pub fn detect_and_handle_conflicts(
 ///
 /// # Returns
 /// A vector of governance events to emit (empty if no expired freezes)
-#[allow(clippy::unused_self)] // method for API consistency within ContextManager
 pub fn check_and_resolve_expired_freezes(
     supervisor: &Supervisor,
     ctx: &mut PerContextState,
@@ -5321,6 +5348,14 @@ pub async fn start_governance_timeout_task(supervisor: &Supervisor, context_id: 
     let mut guard = ctx_arc.lock().await;
     let ctx = &mut *guard;
 
+    // Capture the spawn-time generation so each tick can detect a
+    // remove-and-recreate of the same context_id and abort. Mirrors
+    // `spawn_ttl_timer` (lifecycle_helpers.rs) generation gating —
+    // without this, a stale governance task would mutate the new
+    // generation's state on every tick. Phase 1 fix-up of ADR-049
+    // (post-review-round-1).
+    let spawn_generation = ctx.generation;
+
     ctx.governance.timeout_task.start_in(&mut task_set, {
         let ctx_id = ctx_id.clone();
         let clock = Arc::clone(&clock_arc);
@@ -5347,6 +5382,21 @@ pub async fn start_governance_timeout_task(supervisor: &Supervisor, context_id: 
                     drop(ctx_entry);
                     let mut guard = ctx_arc.lock().await;
                     let ctx = &mut *guard;
+
+                    // Generation check: if the context was removed and
+                    // recreated since this task was spawned, the task
+                    // belongs to the old context — stop. Mirrors the
+                    // gating in `spawn_ttl_timer`. Phase 1 fix-up of
+                    // ADR-049 (post-review-round-1).
+                    if ctx.generation != spawn_generation {
+                        tracing::warn!(
+                            context_id = %ctx_id,
+                            spawn_generation,
+                            current_generation = ctx.generation,
+                            "governance timeout task fired for stale context generation; stopping loop"
+                        );
+                        return false;
+                    }
 
                     // Use try_read_state() to avoid deadlock: the per-context
                     // Mutex is already held, and handle.state().await would

@@ -66,10 +66,10 @@ use crate::context::manager_methods;
 use crate::context::state::{PerContextState, context_id_to_bytes, require_active};
 use crate::context::supervisor::Supervisor;
 
-/// Shared expectation message for `Supervisor::with_providers()`
-/// inside helpers (ADR-049 commit 12c.9d).
-const ATTACHED_EXPECT: &str = "trust_recovery_helpers: Supervisor must be fully attached before helper invocation \
-     (set by Supervisor::with_providers during bridge construction)";
+// Phase 1 fix-up of ADR-049 (post-review-round-1): per-helper
+// `ATTACHED_EXPECT` constants consolidated to the single
+// `PROVIDER_NOT_INITIALIZED` definition in `manager_methods`.
+use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT;
 
 // ---------------------------------------------------------------------------
 // 1. create_governance_checkpoint

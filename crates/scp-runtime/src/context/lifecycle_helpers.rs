@@ -110,8 +110,12 @@ use crate::context::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 
 /// Shared expectation message for `Supervisor::with_providers()`
 /// inside helpers (ADR-049 commit 12c.9d).
-const ATTACHED_EXPECT: &str = "lifecycle_helpers: Supervisor must be fully attached before helper invocation \
-     (set by Supervisor::with_providers during bridge construction)";
+// Phase 1 fix-up of ADR-049 (post-review-round-1): per-helper
+// `ATTACHED_EXPECT` constants consolidated to the single
+// `PROVIDER_NOT_INITIALIZED` definition in `manager_methods`. The
+// alias keeps existing call sites intact while routing every emission
+// through one canonical message.
+use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT;
 
 // ---------------------------------------------------------------------------
 // 1. export_context (top-level)
@@ -535,11 +539,20 @@ pub async fn import_context(
     };
 
     // 7. Register the context.
-    //    Re-check replaceability under the lock to close the TOCTOU gap
-    //    between step 2 (which dropped the lock for event log import) and
-    //    this insertion. A concurrent `create_context` or `import_context`
-    //    could have registered an Active context in the meantime.
+    //    Phase 1 fix-up of ADR-049 (post-review-round-1): hold
+    //    `supervisor.write_lock` across the replaceability re-check +
+    //    `remove_context` + `insert_context` sequence. The previous
+    //    structure dropped the per-context lock between `is_replaceable`
+    //    and `remove_context`, leaving a TOCTOU window where a
+    //    concurrent caller could insert an Active context that we then
+    //    silently overwrote. The supervisor's `write_lock` serializes
+    //    all writes to `contexts`, closing that window.
+    //
+    //    The per-context lock can stay scoped tight inside the
+    //    replaceability check — `write_lock` provides the cross-context
+    //    serialization that matters for the remove+insert atomicity.
     {
+        let _write_guard = supervisor.write_lock.lock().await;
         if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, &context_id) {
             let existing = ctx_arc.lock().await;
             let is_replaceable = existing.handle.try_read_state().is_some_and(|s| {
@@ -556,6 +569,10 @@ pub async fn import_context(
                     "context '{context_id}' was concurrently registered during import"
                 )));
             }
+            // Drop the per-context guard before the remove call; the
+            // outer `write_lock` keeps the remove+insert atomic with
+            // respect to other writers.
+            drop(existing);
         }
         manager_methods::remove_context(supervisor, &context_id);
         manager_methods::insert_context(supervisor, context_id.clone(), per_context)
@@ -2456,6 +2473,32 @@ pub fn flush_all_contexts_sync(supervisor: &Supervisor) {
     }
 }
 
+/// Sync wrapper for [`shutdown_all_contexts`].
+///
+/// Required by destructor / atexit-style sync callers (the FFI
+/// bridge instance's blocking-shutdown path) that cannot `.await`.
+/// Phase 1 fix-up of ADR-049 (post-review-round-1): the async
+/// helper acquires the supervisor write_lock with `lock().await`
+/// rather than `try_lock`, so the sync caller MUST drive an
+/// internal `block_on`. Mirrors the structure of
+/// [`flush_all_contexts_sync`].
+pub fn shutdown_all_contexts_sync(supervisor: &Supervisor) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| {
+                handle.block_on(shutdown_all_contexts(supervisor));
+            });
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "shutdown_all_contexts_sync called outside tokio runtime; \
+                 skipping shutdown — supervisor registries may retain stale state"
+            );
+        }
+    }
+}
+
 /// Persists a degraded `ContextSnapshot` for a context whose lock could
 /// not be acquired within the flush budget.
 fn persist_degraded_snapshot(supervisor: &Supervisor, context_id: &str) {
@@ -2549,10 +2592,15 @@ fn build_degraded_snapshot(context_id: &str) -> crate::context::state::ContextSn
 /// Shut down every context the supervisor owns (best-effort, local
 /// cleanup only).
 ///
-/// Hoisted body of the legacy
-/// `ContextManager::shutdown_all_contexts`
-/// (ADR-049 commit 12). Byte-identical behavior.
-pub fn shutdown_all_contexts(supervisor: &Supervisor) {
+/// Hoisted body of the legacy `ContextManager::shutdown_all_contexts`
+/// (ADR-049 commit 12). Phase 1 fix-up of ADR-049
+/// (post-review-round-1): now async, replacing the prior `try_lock`
+/// best-effort pattern with awaited lock acquisitions. Also clears
+/// `local_dids` and `wrapping_keys` so a fresh
+/// [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers)
+/// observes empty per-identity state. Wrapping-key secrets zeroize on
+/// drop via the `Zeroizing<[u8;32]>` field on `WrappingKeyPair`.
+pub async fn shutdown_all_contexts(supervisor: &Supervisor) {
     use crate::context::state::context_id_to_bytes;
 
     let context_ids: Vec<String> = supervisor
@@ -2596,24 +2644,30 @@ pub fn shutdown_all_contexts(supervisor: &Supervisor) {
         supervisor.contexts_ref().remove(context_id);
     }
 
-    // Clear standing contexts tracking via write_lock + ArcSwap.
+    // Clear supervisor-level state under the write lock. Acquired
+    // once for the standing_contexts + local_dids stores so a
+    // concurrent reader observes a coherent shutdown rather than a
+    // partially-cleared registry.
     {
-        let standing_arc = supervisor.standing_contexts_ref();
-        // Best-effort: try to acquire the write lock; on contention,
-        // skip cleanup (callers can retry).
-        if let Ok(_guard) = supervisor.write_lock.try_lock() {
-            standing_arc.store(Arc::new(HashMap::new()));
-        }
+        let _guard = supervisor.write_lock.lock().await;
+        supervisor
+            .standing_contexts_ref()
+            .store(Arc::new(HashMap::new()));
+        supervisor.local_dids_ref().store(Arc::new(HashSet::new()));
     }
 
-    if let Some(task_set) = supervisor.task_set_ref()
-        && let Ok(mut tasks) = task_set.try_lock()
-    {
+    // Wrapping-key cleanup. `clear_wrapping_keys` drops every
+    // `ArcSwap<WrappingKeyPair>`; the inner `WrappingKeyPair`'s
+    // `Zeroizing<[u8;32]>` secret zeroes on drop.
+    supervisor.clear_wrapping_keys();
+
+    if let Some(task_set) = supervisor.task_set_ref() {
+        let mut tasks = task_set.lock().await;
         tasks.abort_all();
     }
 
     tracing::info!(
         removed_count = context_ids.len(),
-        "shutdown: removed all contexts and aborted background tasks"
+        "shutdown: removed all contexts, cleared identity registries, and aborted background tasks"
     );
 }

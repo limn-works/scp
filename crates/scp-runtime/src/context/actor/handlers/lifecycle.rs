@@ -485,14 +485,13 @@ async fn handle_import_context(
 
 /// Handle [`LifecycleCommand::RestoreContext`]: rebuild an ephemeral
 /// handle from the supplied params and delegate to
-/// [`ContextManager::restore_context`](crate::context::supervisor::Supervisor::restore_context)
+/// [`lifecycle_helpers::restore_context`](crate::context::lifecycle_helpers::restore_context)
 /// under a 30s timeout.
 ///
-/// `restore_context` has no `lifecycle_helpers` peer at this point in
-/// the ADR-049 commit ladder; it remains an inherent method on
-/// `ContextManager`. The handler calls it directly via the attached
-/// manager. When a future commit hoists the body, this dispatch will
-/// switch to the hoisted free function transparently.
+/// Calls the hoisted helper free function directly with the
+/// supervisor reference. The handler is the actor-side dispatch entry
+/// point for the production restore path; FFI bridges reach it through
+/// the supervisor's command-dispatch surface.
 async fn handle_restore_context(
     supervisor: &Supervisor,
     context_id: String,

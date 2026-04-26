@@ -66,14 +66,10 @@ use crate::context::ContextHandle;
 use crate::context::supervisor::Supervisor;
 use crate::context::{lifecycle_helpers, manager_methods};
 
-/// Shared expectation message for `Supervisor::with_providers()`
-/// inside helpers (ADR-049 commit 12c.9d). The attach-time contract
-/// (see
-/// [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers))
-/// installs the manager before any FFI caller or test can invoke a
-/// helper, so unwrap is panic-only under a contract violation.
-const ATTACHED_EXPECT: &str = "standing_helpers: Supervisor must be fully attached before helper invocation \
-     (set by Supervisor::with_providers during bridge construction)";
+// Phase 1 fix-up of ADR-049 (post-review-round-1): per-helper
+// `ATTACHED_EXPECT` constants consolidated to the single
+// `PROVIDER_NOT_INITIALIZED` definition in `manager_methods`.
+use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT;
 
 // ---------------------------------------------------------------------------
 // generate_standing_context_id (pure helper, no mgr parameter)

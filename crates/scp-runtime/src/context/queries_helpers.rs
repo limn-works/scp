@@ -105,13 +105,13 @@
 //! takes an explicit `&dyn ContextEventLogProvider`) is also hoisted
 //! here.
 //!
-//! # Not hoisted (kept as inherent methods on `ContextManager`)
+//! # Not hoisted (kept as inherent methods on `Supervisor`)
 //!
-//! `set_payment_adapter` is a `&mut self` one-time setter used only by
-//! the builder and integration-test wiring. It is not reached from
-//! actor handlers and has a structural shape (`&mut self`) that does
-//! not fit the free-function pattern; it remains on
-//! [`Supervisor`](crate::context::supervisor::Supervisor).
+//! `set_payment_adapter` was deleted in the post-review-round-1 phase 1
+//! fix-up of ADR-049 — payment adapters are now passed exclusively into
+//! [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers)
+//! at construction time. The two-paths-to-set seam had no production
+//! callers.
 //!
 //! `event_log_provider` is a pure accessor that returns
 //! `&dyn ContextEventLogProvider`; the modern accessor is
@@ -135,10 +135,10 @@ use crate::context::state::{
 };
 use crate::context::supervisor::Supervisor;
 
-/// Shared expectation message for `Supervisor::with_providers()`
-/// inside helpers (ADR-049 commit 12c.9d).
-const ATTACHED_EXPECT: &str = "queries_helpers: Supervisor must be fully attached before helper invocation \
-     (set by Supervisor::with_providers during bridge construction)";
+// Phase 1 fix-up of ADR-049 (post-review-round-1): per-helper
+// `ATTACHED_EXPECT` constants consolidated to the single
+// `PROVIDER_NOT_INITIALIZED` definition in `manager_methods`.
+use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT;
 
 /// Maximum number of checkpoints retained per context. Older checkpoints
 /// are drained when this limit is exceeded to prevent unbounded growth.

@@ -95,15 +95,31 @@ use crate::context::state::{
 use crate::context::supervisor::Supervisor;
 
 // ---------------------------------------------------------------------------
+// Shared "provider not initialized" diagnostic
+// ---------------------------------------------------------------------------
+
+/// Canonical diagnostic message for the
+/// [`ContextError::NotInitialized`] error variant returned when a
+/// helper consults a provider slot that has not been populated by
+/// [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers).
+///
+/// Phase 1 fix-up of ADR-049 (post-review-round-1): replaces the prior
+/// per-helper `ATTACHED_EXPECT` constants. One canonical string keeps
+/// the diagnostic stable across the helper graph; future audit
+/// tooling can grep for the single identifier.
+pub(crate) const PROVIDER_NOT_INITIALIZED: &str =
+    "Supervisor providers not initialized — call Supervisor::with_providers";
+
+// ---------------------------------------------------------------------------
 // 1. lock_context
 // ---------------------------------------------------------------------------
 
 /// Locks the per-context `Mutex` and returns an owned guard plus a
 /// generation token for confused-deputy detection on later reacquire.
 ///
-/// Hoisted body of the legacy
-/// [`ContextManager::lock_context`](crate::context::supervisor::Supervisor::lock_context)
-/// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
+/// Hoisted body of the legacy `ContextManager::lock_context` method
+/// (deleted in commit 12 of the ADR-049 ladder). Byte-identical
+/// behavior.
 ///
 /// # Errors
 ///
@@ -136,9 +152,9 @@ pub async fn lock_context(
 /// matches `token`. Detects the confused-deputy scenario where the context
 /// was removed and recreated between lock release and reacquire.
 ///
-/// Hoisted body of the legacy
-/// [`ContextManager::relock_context`](crate::context::supervisor::Supervisor::relock_context)
-/// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
+/// Hoisted body of the legacy `ContextManager::relock_context` method
+/// (deleted in commit 12 of the ADR-049 ladder). Byte-identical
+/// behavior.
 ///
 /// # Errors
 ///

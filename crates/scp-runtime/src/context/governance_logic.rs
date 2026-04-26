@@ -12,39 +12,16 @@ use scp_protocol::trust::consequence::{
     ConsequenceRule, TriggeredConsequence, evaluate_consequence_rules,
 };
 
-use super::state::{CommitOperation, PerContextState, context_id_to_bytes};
+use super::state::{PerContextState, context_id_to_bytes};
 
 // ---------------------------------------------------------------------------
 // RuntimeConsequenceDispatcher — bridges PerContextState to the shared trait
 // ---------------------------------------------------------------------------
-
-// PR #1606 C6 helper types — outcome of attempting to retry a single
-// pending commit. Lifted out of `process_pending_commits_static` to satisfy
-// `clippy::items_after_statements`.
-#[allow(dead_code)] // Used only by legacy forwarders; deleted in 12c.9g.4.
-struct CommitRetryOutcome {
-    index: usize,
-    kind: CommitRetryOutcomeKind,
-}
-
-#[allow(dead_code)] // Used only by legacy forwarders; deleted in 12c.9g.4.
-enum CommitRetryOutcomeKind {
-    Success {
-        attempts: u32,
-        operation: CommitOperation,
-    },
-    Retry {
-        error: String,
-        next_attempt_at: u64,
-        new_retry_count: u32,
-        operation: CommitOperation,
-    },
-    Failed {
-        reason: String,
-        attempts: u32,
-        operation: CommitOperation,
-    },
-}
+//
+// The `CommitRetryOutcome` / `CommitRetryOutcomeKind` types that previously
+// lived here for a legacy forwarder are gone — the active definitions are in
+// `governance_helpers.rs` (the `process_pending_commits` retry pipeline).
+// Removed in the post-review-round-1 phase 1 fix-up of ADR-049.
 
 /// Evaluates consequence rules against a member and dispatches enforcement
 /// actions (capability suspension, access revocation, role demotion).

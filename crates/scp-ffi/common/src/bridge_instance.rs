@@ -1760,7 +1760,7 @@ impl CoreFields {
                     }
                 }
             }
-            if let Err(e) = supervisor.shutdown_all_contexts() {
+            if let Err(e) = supervisor.shutdown_all_contexts().await {
                 tracing::warn!(
                     error = %e,
                     "shutdown_all_contexts returned an error during shutdown \
@@ -1801,10 +1801,10 @@ impl CoreFields {
                      context state may not be persisted"
                 );
             }
-            if let Err(e) = supervisor.shutdown_all_contexts() {
+            if let Err(e) = supervisor.shutdown_all_contexts_sync() {
                 tracing::warn!(
                     error = %e,
-                    "shutdown_all_contexts returned an error during shutdown \
+                    "shutdown_all_contexts_sync returned an error during shutdown \
                      (likely supervisor providers detached mid-flight)"
                 );
             }

@@ -158,10 +158,13 @@ pub struct SendMessagePayload {
 /// management messages all stay on the legacy `ContextManager` surface
 /// until commits 10-11 per the plan row-6 scope.
 pub enum MessagingCommand {
-    /// Placeholder — retained so out-of-tree callers constructed during
-    /// commit 6 still compile. Handler replies `NotImplemented` and
-    /// returns `Outcome::err`. Removed in commit 12 when the shim is
-    /// deleted.
+    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
+    /// ADR-049 (post-review-round-1 plan). Used by the actor's
+    /// `run()` skeleton dispatch as a no-op handshake target so the
+    /// mailbox machinery exercises end-to-end without a real
+    /// command. Handler replies
+    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
+    /// and returns `Outcome::err`.
     Placeholder {
         /// Oneshot reply channel. Handler stub sends
         /// `Err(ContextError::NotImplemented(..))` back.
@@ -445,10 +448,13 @@ pub struct RestoreContextPayload {
 /// / [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context)
 /// directly; saga wiring moves into this enum in commit 11.
 pub enum LifecycleCommand {
-    /// Placeholder — retained so out-of-tree callers constructed during
-    /// commit 6 still compile. Handler replies `NotImplemented` and
-    /// returns `Outcome::err`. Removed in commit 12 when the shim is
-    /// deleted.
+    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
+    /// ADR-049 (post-review-round-1 plan). Used by the actor's
+    /// `run()` skeleton dispatch as a no-op handshake target so the
+    /// mailbox machinery exercises end-to-end without a real
+    /// command. Handler replies
+    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
+    /// and returns `Outcome::err`.
     Placeholder {
         /// Oneshot reply channel. Handler stub sends
         /// `Err(ContextError::NotImplemented(..))` back.
@@ -714,9 +720,11 @@ pub struct ExecuteGovernanceActionPayload {
 /// mirrors the manager methods that accept them, not the actions
 /// themselves.
 pub enum GovernanceCommand {
-    /// Placeholder — retained so out-of-tree callers constructed during
-    /// commit 6 still compile. Handler replies `NotImplemented`. Removed
-    /// in commit 12 when the shim is deleted.
+    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
+    /// ADR-049 (post-review-round-1 plan). Used as a no-op
+    /// handshake target by mailbox tests so the end-to-end dispatch
+    /// pipe is exercised without a real command. Handler replies
+    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
     Placeholder {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
@@ -1048,9 +1056,11 @@ pub struct BroadcastBlockPayload {
 /// for the custody reference, matching the bridge-level wiring the
 /// legacy method uses today.
 pub enum BroadcastCommand {
-    /// Placeholder — retained so out-of-tree callers constructed during
-    /// commit 6 still compile. Handler replies `NotImplemented`. Removed
-    /// in commit 12 with the shim.
+    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
+    /// ADR-049 (post-review-round-1 plan). Used as a no-op
+    /// handshake target by mailbox tests so the end-to-end dispatch
+    /// pipe is exercised without a real command. Handler replies
+    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
     Placeholder {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
@@ -1210,9 +1220,11 @@ pub type VerifyPaymentReceiptsReply = oneshot::Sender<
 /// internally rather than calling the helpers directly; commit 10
 /// lands only the public surface.
 pub enum EconomyCommand {
-    /// Placeholder — retained so out-of-tree callers constructed during
-    /// commit 6 still compile. Handler replies `NotImplemented`. Removed
-    /// in commit 12 when the shim is deleted.
+    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
+    /// ADR-049 (post-review-round-1 plan). Used as a no-op
+    /// handshake target by mailbox tests so the end-to-end dispatch
+    /// pipe is exercised without a real command. Handler replies
+    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
     Placeholder {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
@@ -1303,9 +1315,11 @@ pub struct RecoveryNotifyContactPayload {
 /// checkpoints + cosignatures, compromise-recovery epoch advance, and
 /// recovery notifications (spec §9.12).
 pub enum TrustRecoveryCommand {
-    /// Placeholder — retained so out-of-tree callers constructed during
-    /// commit 6 still compile. Handler replies `NotImplemented`. Removed
-    /// in commit 12 when the shim is deleted.
+    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
+    /// ADR-049 (post-review-round-1 plan). Used as a no-op
+    /// handshake target by mailbox tests so the end-to-end dispatch
+    /// pipe is exercised without a real command. Handler replies
+    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
     Placeholder {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
@@ -1389,9 +1403,11 @@ pub enum TrustRecoveryCommand {
 /// spec-gapped — see
 /// `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
 pub enum StandingCommand {
-    /// Placeholder — retained so out-of-tree callers constructed during
-    /// commit 6 still compile. Handler replies `NotImplemented`. Removed
-    /// in commit 12 with the shim.
+    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
+    /// ADR-049 (post-review-round-1 plan). Used as a no-op
+    /// handshake target by mailbox tests so the end-to-end dispatch
+    /// pipe is exercised without a real command. Handler replies
+    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
     Placeholder {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
@@ -1530,10 +1546,13 @@ pub struct TtlTimerPayload {
 /// synchronously. Full timer-owning actor logic migrates with plan row
 /// 11.
 pub enum TtlCloseCommand {
-    /// Placeholder — retained so out-of-tree callers constructed during
-    /// commit 6 still compile. Handler replies `NotImplemented` and
-    /// returns `Outcome::err`. Removed in commit 12 when the shim is
-    /// deleted.
+    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
+    /// ADR-049 (post-review-round-1 plan). Used by the actor's
+    /// `run()` skeleton dispatch as a no-op handshake target so the
+    /// mailbox machinery exercises end-to-end without a real
+    /// command. Handler replies
+    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
+    /// and returns `Outcome::err`.
     Placeholder {
         /// Oneshot reply channel. Handler stub sends
         /// `Err(ContextError::NotImplemented(..))` back.
@@ -1625,9 +1644,11 @@ pub enum TtlCloseCommand {
 /// [`crate::context::tools_helpers`] migrate here because they are the
 /// supervisor-observable tool surface.
 pub enum ToolsCommand {
-    /// Placeholder — retained so out-of-tree callers constructed during
-    /// commit 6 still compile. Handler replies `NotImplemented`. Removed
-    /// in commit 12 with the shim.
+    /// Placeholder — reserved for Phase 2 actor-mailbox wiring of
+    /// ADR-049 (post-review-round-1 plan). Used as a no-op
+    /// handshake target by mailbox tests so the end-to-end dispatch
+    /// pipe is exercised without a real command. Handler replies
+    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented).
     Placeholder {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,

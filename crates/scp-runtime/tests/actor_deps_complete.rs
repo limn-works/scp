@@ -246,8 +246,9 @@ async fn build_actor_deps_populates_every_field() {
         deps.supervisor.local_dids().is_empty(),
         "fresh supervisor exposes empty local_dids snapshot through the handle"
     );
+    let unknown_peer = scp_identity::DID("did:example:never-registered".to_owned());
     assert!(
-        deps.supervisor.standing_peer("never-registered").is_none(),
+        deps.supervisor.standing_peer(&unknown_peer).is_none(),
         "fresh supervisor exposes empty standing_contexts through the handle"
     );
 

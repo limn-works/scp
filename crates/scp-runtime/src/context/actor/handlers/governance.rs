@@ -225,11 +225,19 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: GovernanceCommand) -> Outc
 }
 
 /// Handle [`GovernanceCommand::ProposeGovernanceAction`] — delegates to
-/// [`ContextManager::propose_governance_action`](crate::context::supervisor::Supervisor::propose_governance_action)
-/// under a 30s timeout. `_checked` is a sibling flag the dispatch
-/// function uses to pick between the two manager entry points; this
-/// helper handles only the unchecked variant (checked has its own
-/// helper because the reply type differs).
+/// [`propose_governance_action_inner`](crate::context::governance_helpers::propose_governance_action_inner)
+/// with `check_propose_capability=true` under a 30s timeout.
+///
+/// Phase 1 fix-up of ADR-049 (post-review-round-1): the prior wiring
+/// invoked the unchecked
+/// [`propose_governance_action`](crate::context::governance_helpers::propose_governance_action)
+/// helper. The variant doc previously claimed engine-side enforcement
+/// was sufficient, but spec §5.9 capability suspension overlays bypass
+/// the engine — so the propose path MUST run the suspension-aware
+/// `member_has_capability` check under the same lock as the proposal
+/// submission to prevent suspended proposers from slipping mutations
+/// past suspension. The `_checked` parameter is now ignored: both
+/// dispatch arms (checked and unchecked) take the same secure path.
 async fn handle_propose_governance_action(
     supervisor: &Supervisor,
     p: ProposeGovernanceActionPayload,
@@ -246,12 +254,13 @@ async fn handle_propose_governance_action(
     // path). Boxing moves the state onto the heap.
     let propose_fut = async move {
         Box::pin(
-            crate::context::governance_helpers::propose_governance_action(
+            crate::context::governance_helpers::propose_governance_action_inner(
                 supervisor,
                 &p.context_id,
                 &p.proposer_did,
                 p.action,
                 &signing_key,
+                true,
             ),
         )
         .await
@@ -327,8 +336,16 @@ async fn handle_propose_governance_action_checked(
 }
 
 /// Handle [`GovernanceCommand::VoteOnProposal`] — delegates to
-/// [`ContextManager::vote_on_proposal`](crate::context::supervisor::Supervisor::vote_on_proposal)
-/// under a 30s timeout.
+/// [`vote_on_proposal_inner`](crate::context::governance_helpers::vote_on_proposal_inner)
+/// with `check_vote_capability=true` under a 30s timeout.
+///
+/// Phase 1 fix-up of ADR-049 (post-review-round-1): the prior wiring
+/// invoked the unchecked
+/// [`vote_on_proposal`](crate::context::governance_helpers::vote_on_proposal)
+/// helper. Same rationale as `handle_propose_governance_action`: spec
+/// §5.9 suspension overlays must apply to the vote path, so the
+/// suspension-aware capability check runs under the same lock as the
+/// vote.
 async fn handle_vote_on_proposal(
     supervisor: &Supervisor,
     p: VoteOnProposalPayload,
@@ -343,13 +360,14 @@ async fn handle_vote_on_proposal(
     // the 12c.3b hoist; boxing inside the `async move` keeps the
     // heap allocation per-call rather than per-handler.
     let vote_fut = async move {
-        Box::pin(crate::context::governance_helpers::vote_on_proposal(
+        Box::pin(crate::context::governance_helpers::vote_on_proposal_inner(
             supervisor,
             &p.context_id,
             &p.proposal_id,
             &p.voter_did,
             approve,
             &signing_key,
+            true,
         ))
         .await
     };

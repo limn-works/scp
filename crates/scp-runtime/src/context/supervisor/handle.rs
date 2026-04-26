@@ -85,14 +85,22 @@ impl SupervisorHandle {
         self.supervisor.local_dids.load_full()
     }
 
-    /// Look up the peer DID for a standing-context. Returns `None` if
-    /// the context is not a standing pair.
+    /// Look up the registered standing-context peer DID for `peer_did`.
+    /// Returns `None` if the peer has no registered standing context.
+    ///
+    /// Phase 1 fix-up of ADR-049 (post-review-round-1): the prior
+    /// signature took `ctx_id: &str` but the underlying
+    /// `standing_contexts: ArcSwap<HashMap<String, DID>>` is keyed by
+    /// the peer DID's `to_string()` form (see `standing_helpers.rs`
+    /// lines 161/230/291). Querying by context ID always returned
+    /// `None`. The renamed parameter matches the actual key shape; the
+    /// lookup is now correct.
     #[must_use]
-    pub fn standing_peer(&self, ctx_id: &str) -> Option<DID> {
+    pub fn standing_peer(&self, peer_did: &DID) -> Option<DID> {
         self.supervisor
             .standing_contexts
             .load()
-            .get(ctx_id)
+            .get(peer_did.as_ref())
             .cloned()
     }
 
@@ -264,7 +272,8 @@ mod tests {
     #[tokio::test]
     async fn standing_peer_returns_none_when_unknown() {
         let (_sup, handle) = test_handle();
-        assert!(handle.standing_peer("never-registered").is_none());
+        let unknown = DID("did:example:never-registered".to_owned());
+        assert!(handle.standing_peer(&unknown).is_none());
     }
 
     #[tokio::test]

@@ -24,24 +24,17 @@
 //! arguments. The outer methods are deleted in commit 12f once every
 //! handler has migrated off them.
 //!
-//! # 12c.1 hoist scope — messaging-internal transitives NOT hoisted
+//! # Module-internal helpers
 //!
-//! Commit 12c.1 hoists only the two top-level methods. The
-//! messaging-internal private helpers
-//! [`ContextManager::encrypt_and_send`](crate::context::supervisor::Supervisor::encrypt_and_send),
-//! [`ContextManager::authorize_send_payment`](crate::context::supervisor::Supervisor::authorize_send_payment),
-//! [`ContextManager::capture_send_payment`](crate::context::supervisor::Supervisor::capture_send_payment),
-//! [`ContextManager::finalize_send`](crate::context::supervisor::Supervisor::finalize_send),
-//! [`ContextManager::decrypt_and_dispatch`](crate::context::supervisor::Supervisor::decrypt_and_dispatch),
-//! [`ContextManager::validate_and_drain_timeouts`](crate::context::supervisor::Supervisor::validate_and_drain_timeouts),
-//! [`ContextManager::buffer_ahead_message`](crate::context::supervisor::Supervisor::buffer_ahead_message),
-//! and
-//! [`ContextManager::deliver_message_and_drain_buffered`](crate::context::supervisor::Supervisor::deliver_message_and_drain_buffered)
-//! remain as inherent methods on `ContextManager` for this commit — the
-//! hoisted [`send_message`] / [`deliver_incoming`] call them via the
-//! `mgr` parameter. They are themselves hoisted in a follow-up step of
-//! 12c.1 (continuation) and then deleted alongside the outer shim in
-//! commit 12f.
+//! Every messaging-internal helper now lives in this module as a free
+//! function on `&Supervisor` / `&mut PerContextState`. The functions
+//! `encrypt_and_send`, `authorize_send_payment`, `capture_send_payment`,
+//! `finalize_send`, `decrypt_and_dispatch`,
+//! `validate_and_drain_timeouts`, `buffer_ahead_message`, and
+//! `deliver_message_and_drain_buffered` are reachable from
+//! [`send_message`] and [`deliver_incoming`] within this file (no
+//! cross-module dispatch needed). The legacy `ContextManager`
+//! inherent forms were deleted in commit 12 of the ADR-049 ladder.
 //!
 //! # Helpers hoisted
 //!
@@ -108,15 +101,10 @@ use crate::context::state::{
 };
 use crate::context::supervisor::Supervisor;
 
-/// Shared expectation message for `Supervisor::with_providers()`
-/// and `Supervisor::*_ref()` accessors inside helpers. The attach-time
-/// contract (see
-/// [`Supervisor::with_providers`](crate::context::supervisor::Supervisor::with_providers))
-/// installs the manager (and lifts every provider slot) before any FFI
-/// caller or test can invoke a helper, so unwrap is panic-only under a
-/// contract violation.
-const ATTACHED_EXPECT: &str = "messaging_helpers: Supervisor must be fully attached before helper invocation \
-     (set by Supervisor::with_providers during bridge construction)";
+// Phase 1 fix-up of ADR-049 (post-review-round-1): per-helper
+// `ATTACHED_EXPECT` constants consolidated to the single
+// `PROVIDER_NOT_INITIALIZED` definition in `manager_methods`.
+use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT;
 
 /// Alias for the broadcast channel used to fan out [`ContextEvent`]s to
 /// external subscribers (webhook dispatcher, SDK event streams).
@@ -602,34 +590,26 @@ pub fn run_buffered_post_delivery(
 ///
 /// # Collaborators
 ///
-/// - `mgr` — manager reference used to reach still-on-manager helpers
-///   (`lock_context`, `relock_context`, `authorize_send_payment`,
-///   `encrypt_and_send`, `capture_send_payment`, `finalize_send`,
-///   `void_paid_action`, and the economy-ticket rollback helpers). The
-///   messaging-internal private methods remain on `ContextManager` in
-///   commit 12c.1; they are hoisted in a 12c.1 continuation step and
-///   finally deleted in commit 12f alongside this outer shim.
-/// - `clock` — wall-clock source used for the `now_secs` stamp in the
-///   Phase 1 rate-limit / velocity / economy branch. Passed explicitly
-///   so the 12b.1 helpers ([`enforce_send_economy`]) receive the same
-///   clock as the surrounding code — a divergence here would race on
-///   the rate-limit window boundary.
-/// - `key_resolver` — forwarded into [`enforce_send_economy`] for
-///   UCAN signature verification on the spending-UCAN path.
+/// - `supervisor` — the authoritative state owner; provides
+///   `clock_ref()`, `key_resolver_ref()`, `crypto_ref()`,
+///   `transport_ref()`, `event_log_ref()`. Phase 1 fix-up of ADR-049
+///   (post-review-round-1): `clock` and `key_resolver` are no longer
+///   passed as explicit parameters — they are read from the supervisor
+///   inside the helper. Resolves the symmetry-breaking pattern where
+///   the actor handler had to fetch them from the supervisor and pass
+///   them back into the helper that had the supervisor reference all
+///   along.
 ///
 /// # Behavior preservation
 ///
-/// Byte-identical to the legacy method form in commit 12b.1. The
-/// forwarder in `ContextManager::send_message` calls this function
-/// with `self` as `mgr` and `&self.clock` / `&self.key_resolver` as the
-/// explicit collaborators.
+/// Byte-identical to the legacy method form. The
+/// forwarder in `Supervisor::send_message` calls this function
+/// without the now-implicit `clock` / `key_resolver` arguments.
 #[allow(clippy::too_many_lines)] // Matches legacy method shape; cannot split further without fragmenting the Phase 1 lock scope.
-#[allow(clippy::too_many_arguments)] // Hoisted body retains the legacy signature plus explicit collaborators per task spec.
+#[allow(clippy::too_many_arguments)] // Hoisted body retains the legacy signature shape.
 #[allow(clippy::significant_drop_tightening)] // Legacy body held guards across await points deliberately — narrowing changes lock-ordering semantics.
 pub async fn send_message(
     supervisor: &Supervisor,
-    clock: &Arc<dyn Clock>,
-    key_resolver: &KeyResolver,
     handle: &ContextHandle,
     sender_did: &DID,
     payload: &[u8],
@@ -637,6 +617,12 @@ pub async fn send_message(
     source_provenance: Option<&SourceContextInfo>,
     spending_ucan: Option<&UcanToken>,
 ) -> Result<(), ContextError> {
+    let clock = supervisor
+        .clock_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
+    let key_resolver = supervisor
+        .key_resolver_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id = handle.context_id().to_owned();
     let context_id_bytes = scp_protocol::context::context_id_bytes(&context_id);
     // Routing ID computation is deferred to Phase 1 (under lock) where
@@ -922,24 +908,18 @@ pub async fn send_message(
 ///
 /// # Collaborators
 ///
-/// - `mgr` — manager reference used to reach still-on-manager helpers
-///   (`get_context_arc`, `decrypt_and_dispatch`,
-///   `validate_and_drain_timeouts`, `deliver_message_and_drain_buffered`,
-///   `buffer_ahead_message`). These are hoisted in a 12c.1 continuation
-///   step and deleted in commit 12f alongside this outer shim.
-/// - `clock` — wall-clock source for the `now_millis` stamp used by
-///   anti-replay / reorder-buffer logic. Passed explicitly so the
-///   hoisted verify + unwrap path receives the same clock instance as
-///   the downstream manager calls.
-/// - `key_resolver` — forwarded into [`verify_and_unwrap`] to resolve
-///   the sender's Ed25519 verifying key for inner-signature verification.
+/// - `supervisor` — the authoritative state owner; provides
+///   `clock_ref()`, `key_resolver_ref()`, `crypto_ref()`,
+///   `transport_ref()`, `event_log_ref()`. Phase 1 fix-up of ADR-049
+///   (post-review-round-1): `clock` and `key_resolver` are no longer
+///   passed as explicit parameters — they are read from the supervisor
+///   inside the helper.
 ///
 /// # Behavior preservation
 ///
-/// Byte-identical to the legacy method form in commit 12b.1. The
-/// forwarder in `ContextManager::deliver_incoming` calls this function
-/// with `self` as `mgr` and `&self.clock` / `&self.key_resolver` as the
-/// explicit collaborators.
+/// Byte-identical to the legacy method form. The forwarder in
+/// `Supervisor::deliver_incoming` calls this function without the
+/// now-implicit `clock` / `key_resolver` arguments.
 #[allow(clippy::significant_drop_tightening)]
 // Legacy body held guards across await points deliberately — narrowing changes lock-ordering semantics.
 #[allow(
@@ -949,11 +929,15 @@ pub async fn send_message(
 )]
 pub async fn deliver_incoming(
     supervisor: &Supervisor,
-    clock: &Arc<dyn Clock>,
-    key_resolver: &KeyResolver,
     context_id: &str,
     encrypted_blob: &[u8],
 ) -> Result<Option<(Vec<u8>, String)>, ContextError> {
+    let clock = supervisor
+        .clock_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
+    let key_resolver = supervisor
+        .key_resolver_ref()
+        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
     let context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
 
     // Phase 1: state check + read local member DID + access key.
@@ -1136,10 +1120,9 @@ pub async fn deliver_incoming(
 ///
 /// # Behavior preservation
 ///
-/// Byte-identical to the legacy
-/// [`ContextManager::encrypt_and_send`](crate::context::supervisor::Supervisor::encrypt_and_send)
-/// method form. The `self.transport.send_message(rid, &encrypted)`
-/// call becomes `supervisor.transport_ref().ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?.send_message(rid, &encrypted)` —
+/// Byte-identical to the legacy form on the deleted `ContextManager`.
+/// The `self.transport.send_message(rid, &encrypted)` call becomes
+/// `supervisor.transport_ref().ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?.send_message(rid, &encrypted)` —
 /// the literal `.send_message(` call-text is preserved so pipeline
 /// wiring assertions continue to match.
 #[allow(clippy::too_many_arguments)] // Retains legacy method signature plus explicit `mgr` param per ADR-049 §12c.1b.
@@ -2142,24 +2125,11 @@ pub async fn send_pseudonym_announcement(
         );
         return;
     };
-    let Some(clock) = supervisor.clock_ref() else {
-        tracing::warn!(
-            context_id = %context_id,
-            "send_pseudonym_announcement: clock provider not configured"
-        );
-        return;
-    };
-    let Some(key_resolver) = supervisor.key_resolver_ref() else {
-        tracing::warn!(
-            context_id = %context_id,
-            "send_pseudonym_announcement: key_resolver not configured"
-        );
-        return;
-    };
+    // `send_message` reads `clock` / `key_resolver` from the supervisor
+    // internally (Phase 1 fix-up of ADR-049, post-review-round-1) — no
+    // need to fetch them here.
     if let Err(e) = send_message(
         supervisor,
-        clock,
-        key_resolver,
         handle,
         sender_did,
         &payload,

@@ -179,10 +179,19 @@ async fn dispatch_inner(
 
 /// Handle [`MessagingCommand::SendMessage`]: reserve a sequence number
 /// via RAII, delegate to
-/// [`ContextManager::send_message`](crate::context::supervisor::Supervisor::send_message)
+/// [`messaging_helpers::send_message`](crate::context::messaging_helpers::send_message)
 /// under a 30s timeout, commit the reservation on success or let it
 /// drop (RAII rollback) on any failure path.
-#[allow(clippy::too_many_arguments)] // unavoidable — matches ContextManager::send_message signature
+///
+/// Phase 1 fix-up of ADR-049 (post-review-round-1): the helper now
+/// reads `clock` / `key_resolver` directly from the supervisor's
+/// provider slots, so the handler no longer fishes them out before the
+/// call.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "matches messaging_helpers::send_message signature \
+              after the clock/key_resolver parameter drop"
+)]
 async fn handle_send_message(
     supervisor: &Supervisor,
     send_tracker: &mut SendSequenceTracker,
@@ -195,33 +204,11 @@ async fn handle_send_message(
     spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    // ADR-049 commit 12 — providers read directly from the supervisor
-    // (no manager backpointer). The Supervisor::with_providers contract
-    // guarantees every provider OnceLock is populated; on violation we
-    // surface `NotInitialized` through the reply and the handler's
-    // `Outcome`.
-    let Some(clock) = supervisor.clock_ref() else {
-        let err = ContextError::NotInitialized(
-            "handle_send_message: clock provider not configured".to_owned(),
-        );
-        let sketch = outcome_error_sketch(&err);
-        let _ = reply.send(Err(err));
-        return Outcome::err(sketch);
-    };
-    let Some(key_resolver) = supervisor.key_resolver_ref() else {
-        let err = ContextError::NotInitialized(
-            "handle_send_message: key_resolver provider not configured".to_owned(),
-        );
-        let sketch = outcome_error_sketch(&err);
-        let _ = reply.send(Err(err));
-        return Outcome::err(sketch);
-    };
-
     // Step 1: reserve the next actor-shape sequence number. The RAII
     // guard rolls back on any early `?` return below, on transport
-    // timeout, or on crypto failure. Legacy `MembershipState` wire
-    // sequence numbers are assigned inside `ContextManager::send_message`
-    // during the shim period.
+    // timeout, or on crypto failure. Wire sequence numbers
+    // (`MembershipState::next_sequence_number`) are assigned inside
+    // `messaging_helpers::send_message`.
     let reservation = SequenceReservation::reserve(send_tracker);
     let _reserved = reservation.number();
 
@@ -253,8 +240,6 @@ async fn handle_send_message(
     let sk_ref = sk.as_ref();
     let send_fut = crate::context::messaging_helpers::send_message(
         supervisor,
-        clock,
-        key_resolver,
         &handle,
         sender_did,
         payload,
@@ -350,27 +335,10 @@ async fn handle_deliver_incoming(
     envelope_bytes: &[u8],
     reply: crate::context::actor::commands::DeliverIncomingReply,
 ) -> Outcome<()> {
-    // ADR-049 commit 12 — providers read directly from the supervisor.
-    let Some(clock) = supervisor.clock_ref() else {
-        let err = ContextError::NotInitialized(
-            "handle_deliver_incoming: clock provider not configured".to_owned(),
-        );
-        let sketch = outcome_error_sketch(&err);
-        let _ = reply.send(Err(err));
-        return Outcome::err(sketch);
-    };
-    let Some(key_resolver) = supervisor.key_resolver_ref() else {
-        let err = ContextError::NotInitialized(
-            "handle_deliver_incoming: key_resolver provider not configured".to_owned(),
-        );
-        let sketch = outcome_error_sketch(&err);
-        let _ = reply.send(Err(err));
-        return Outcome::err(sketch);
-    };
+    // Phase 1 fix-up of ADR-049 (post-review-round-1): the helper reads
+    // `clock` / `key_resolver` from the supervisor directly.
     let deliver_fut = crate::context::messaging_helpers::deliver_incoming(
         supervisor,
-        clock,
-        key_resolver,
         context_id,
         envelope_bytes,
     );
@@ -441,12 +409,10 @@ async fn handle_drain_events(
 /// announcement, if successfully sent, advances the wire-sequence
 /// counter on the underlying `send_message` path.
 ///
-/// `send_pseudonym_announcement` has no `*_helpers` peer at this
-/// point in the ADR-049 commit ladder; it remains an inherent method
-/// on `ContextManager`. The handler calls it directly via the
-/// attached manager. When a future commit hoists the body to
-/// `messaging_helpers`, this dispatch will switch to the hoisted
-/// free function transparently.
+/// Calls
+/// [`messaging_helpers::send_pseudonym_announcement`](crate::context::messaging_helpers::send_pseudonym_announcement)
+/// directly on the supervisor reference. The 30s timeout is the same
+/// budget every handler uses for transport-touching operations.
 async fn handle_send_pseudonym_announcement(
     supervisor: &Supervisor,
     context_id: String,

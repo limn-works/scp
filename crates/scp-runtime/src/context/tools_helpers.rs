@@ -464,21 +464,21 @@ where
     F: FnOnce(serde_json::Value) -> Fut,
     Fut: Future<Output = Result<serde_json::Value, String>>,
 {
-    const ATTACHED_EXPECT: &str = "tools_helpers::invoke_tool_with_economy: provider slot empty";
+    use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
 
     let clock = Arc::clone(
         supervisor
             .clock_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+            .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?,
     );
     let event_log = Arc::clone(
         supervisor
             .event_log_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
+            .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?,
     );
     let key_resolver = supervisor
         .key_resolver_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
+        .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?
         .clone();
     let event_tx = supervisor.event_tx_ref().cloned();
 

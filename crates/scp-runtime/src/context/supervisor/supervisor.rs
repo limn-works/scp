@@ -194,44 +194,42 @@ pub struct PendingSagaProjection {
 pub struct Supervisor {
     /// Actor registry. `context_id` → `ContextActorHandle`. Lookups via
     /// [`Self::lookup`] are lock-free (`DashMap::get`).
-    #[allow(dead_code)]
-    // read in commit 11 when BridgeInstance wires supervisor into the suspend path
     pub(in crate::context::supervisor) actors: DashMap<String, ContextActorHandle>,
-    /// Standing-pair context index. `context_id` → peer `DID`. Read
+    /// Standing-pair context index. peer DID string → peer `DID`. Read
     /// via `ArcSwap::load` (lock-free); mutated under
     /// [`Self::write_lock`].
-    #[allow(dead_code)] // populated by `standing` handler in commit 11
     pub(in crate::context::supervisor) standing_contexts: ArcSwap<HashMap<String, DID>>,
     /// Local identities. Grows once per `identity_add`; read-heavy.
-    #[allow(dead_code)] // populated by `lifecycle` handler in commit 9
     pub(in crate::context::supervisor) local_dids: ArcSwap<HashSet<DID>>,
     /// Per-identity X25519 wrapping keys. Wrapped in `ArcSwap` so
     /// rotation is atomic; outer `DashMap` keyed by DID.
-    #[allow(dead_code)] // populated by lifecycle / identity paths
     pub(in crate::context::supervisor) wrapping_keys: DashMap<DID, ArcSwap<WrappingKeyPair>>,
     /// Persistence backend; stored so `spawn_actor` / `crash_recovery`
     /// can plumb it through to per-actor state.
-    #[allow(dead_code)] // read in spawn paths landing with lifecycle migration
+    // Operational in Phase 2 of post-review-round-1 plan (actor model wiring).
+    #[allow(dead_code)]
     pub(in crate::context::supervisor) persistence: Arc<dyn ContextPersistence>,
     /// Single-producer-multi-read write lock — plan §"Write path".
-    #[allow(dead_code)]
-    // read in commit 11 when handlers acquire it for standing/lifecycle writes
     pub(crate) write_lock: tokio::sync::Mutex<()>,
     /// Pending sagas keyed by saga ID; projection of the durable
     /// journal for fast lookup.
-    #[allow(dead_code)] // real body lands with saga migration in commit 11
+    // Operational in Phase 2 of post-review-round-1 plan (saga FSM real
+    // Prepare/Commit dispatch + watchdog).
+    #[allow(dead_code)]
     pub(in crate::context::supervisor) pending_sagas: DashMap<SagaId, PendingSagaProjection>,
     /// Durable saga journal (plan §"Cross-context saga protocol").
-    #[allow(dead_code)] // wired through saga migration in commit 11
     pub(in crate::context::supervisor) saga_journal: Arc<dyn SagaJournal>,
     /// Per-identity `KeyPackageStoreActor` handles.
-    #[allow(dead_code)] // populated by identity_add in later commits
     pub(in crate::context::supervisor) key_package_stores: DashMap<DID, KeyPackageStoreHandle>,
     /// Configuration.
-    #[allow(dead_code)] // plumbed into handlers later
+    // Operational in Phase 2 of post-review-round-1 plan (saga + watchdog
+    // configuration plumbed through ActorDeps).
+    #[allow(dead_code)]
     pub(in crate::context::supervisor) health_config: SupervisorConfig,
     /// Per-context crash-count windows (respawn budget state).
-    #[allow(dead_code)] // populated by watchdog in commit 11
+    // Operational in Phase 2 of post-review-round-1 plan (watchdog respawn
+    // budget per ADR-049 §10).
+    #[allow(dead_code)]
     pub(in crate::context::supervisor) crash_windows: DashMap<String, CrashWindow>,
 
     // -----------------------------------------------------------------
@@ -277,8 +275,10 @@ pub struct Supervisor {
     /// clone is a reference-count bump.
     key_resolver: OnceLock<KeyResolver>,
     /// Optional payment adapter. Empty `OnceLock` means "no adapter
-    /// configured"; populated by [`Self::with_providers`] or the
-    /// post-construction setter [`Self::set_payment_adapter`].
+    /// configured"; populated by [`Self::with_providers`] when the
+    /// caller passes `Some(adapter)`. There is no post-construction
+    /// setter — the deleted prior `set_payment_adapter` opened a
+    /// two-paths-to-set seam that no production caller used.
     payment_adapter: OnceLock<Arc<dyn PaymentAdapterDyn>>,
     /// Optional broadcast sender for fan-out of [`ContextEvent`]s to
     /// external consumers. Empty `OnceLock` means "no channel
@@ -325,8 +325,28 @@ impl Supervisor {
     /// the supervisor is never a singleton — bridge instances in
     /// `scp_ffi_common::bridge_instance` construct one per SCP
     /// instance and drop it on `shutdown`.
+    ///
+    /// Visibility is `pub(crate)` in production builds; only
+    /// [`Self::with_providers`] (the FFI-facing factory) calls into
+    /// `new`. Integration tests in `crates/scp-runtime/tests/` reach
+    /// the constructor through the `testing`-feature gate so they can
+    /// build supervisors without provider wiring.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn new(
+        persistence: Arc<dyn ContextPersistence>,
+        saga_journal: Arc<dyn SagaJournal>,
+        health_config: SupervisorConfig,
+    ) -> Self {
+        Self::new_inner(persistence, saga_journal, health_config)
+    }
+
+    /// Internal constructor reachable from production builds. The public
+    /// surface goes through [`Self::with_providers`]; the test-only
+    /// [`Self::new`] alias forwards here so the same body services both
+    /// the production factory and the test integration suites.
+    #[must_use]
+    pub(crate) fn new_inner(
         persistence: Arc<dyn ContextPersistence>,
         saga_journal: Arc<dyn SagaJournal>,
         health_config: SupervisorConfig,
@@ -361,21 +381,26 @@ impl Supervisor {
         }
     }
 
-    /// Convenience constructor used by the commits-7-to-11 FFI query
-    /// shim. Builds a supervisor whose `persistence` and `saga_journal`
-    /// fields are no-op stubs — the query-path shim
-    /// ([`Self::dispatch_query`]) does not touch either field; saga and
-    /// actor-spawn wiring arrive in commits 9-11.
+    /// Test-only constructor used by saga + spawn unit tests that never
+    /// invoke a provider-touching helper.
     ///
-    /// Every FFI bridge embeds one `Supervisor` per bridge instance.
-    /// When the migration completes (commit 12) this helper is deleted
-    /// along with the shim and callers switch to [`Self::new`] with
-    /// real production impls.
+    /// Builds a [`Supervisor`] whose `persistence` and `saga_journal`
+    /// fields are no-op stubs — saga FSM tests assert the coordinator's
+    /// observable state transitions, and spawn tests exercise registry
+    /// insertion only. Production code paths build supervisors through
+    /// [`Self::with_providers`], which wires real providers; bridge
+    /// instances in `scp_ffi_common::bridge_instance` never call
+    /// `for_query_shim`.
+    ///
+    /// Gated behind the `testing` feature so production FFI builds
+    /// cannot reach a provider-less supervisor.
     #[must_use]
+    #[cfg(any(test, feature = "testing"))]
     pub fn for_query_shim() -> Self {
-        let persistence: Arc<dyn ContextPersistence> = Arc::new(NoopContextPersistence);
+        let persistence: Arc<dyn ContextPersistence> =
+            Arc::new(crate::context::persistence::NoopContextPersistence);
         let saga_journal: Arc<dyn SagaJournal> = Arc::new(NoopSagaJournal);
-        Self::new(persistence, saga_journal, SupervisorConfig::default())
+        Self::new_inner(persistence, saga_journal, SupervisorConfig::default())
     }
 
     /// Construct a supervisor with the providers that previously lived on
@@ -387,11 +412,11 @@ impl Supervisor {
     /// is the only handle they hold.
     ///
     /// Saga journal + supervisor-level persistence wire to no-op stubs
-    /// the [`Self::for_query_shim`] path uses — saga orchestration is
-    /// not yet active in the FFI bridges (it lands with the watchdog
-    /// migration in commit 12c.10), and the supervisor's own
-    /// persistence slot is wired to a no-op
-    /// [`NoopContextPersistence`] when `persistence` is `None`.
+    /// the test-only `for_query_shim` path uses — saga orchestration
+    /// is not yet active (it lands with Phase 2's actor wiring), and
+    /// the supervisor's own persistence slot is wired to a no-op
+    /// [`NoopContextPersistence`](crate::context::persistence::NoopContextPersistence)
+    /// when `persistence` is `None`.
     ///
     /// # Arguments
     ///
@@ -438,7 +463,8 @@ impl Supervisor {
         // best-effort persist calls.
         let (supervisor_persistence, helper_persistence_arc) = persistence.map_or_else(
             || {
-                let stub: Arc<dyn ContextPersistence> = Arc::new(NoopContextPersistence);
+                let stub: Arc<dyn ContextPersistence> =
+                    Arc::new(crate::context::persistence::NoopContextPersistence);
                 (stub, None)
             },
             |boxed| {
@@ -447,7 +473,7 @@ impl Supervisor {
             },
         );
         let saga_journal: Arc<dyn SagaJournal> = Arc::new(NoopSagaJournal);
-        let supervisor = Arc::new(Self::new(
+        let supervisor = Arc::new(Self::new_inner(
             supervisor_persistence,
             saga_journal,
             SupervisorConfig::default(),
@@ -477,28 +503,6 @@ impl Supervisor {
         )));
 
         supervisor
-    }
-
-    /// Install a payment adapter post-construction. First call wins;
-    /// subsequent calls return [`ContextError::InvalidState`].
-    ///
-    /// Used by FFI bridges that compose the payment adapter after
-    /// [`Self::with_providers`] runs (typically because the adapter
-    /// depends on a DID resolver wired at a later stage).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ContextError::InvalidState`] if a payment adapter has
-    /// already been configured.
-    pub fn set_payment_adapter(
-        &self,
-        adapter: Arc<dyn PaymentAdapterDyn>,
-    ) -> Result<(), ContextError> {
-        self.payment_adapter.set(adapter).map_err(|_| {
-            ContextError::InvalidState(
-                "Supervisor::set_payment_adapter — payment adapter already configured".to_owned(),
-            )
-        })
     }
 
     // -------------------------------------------------------------------
@@ -678,9 +682,21 @@ impl Supervisor {
     /// same poll (no storage in async-state struct fields) so a
     /// subsequent [`Self::set_wrapping_keys`] rotation can drop the
     /// prior bytes promptly.
+    ///
+    /// Visibility is `pub(in crate::context::supervisor)` until Phase 2
+    /// of the post-review-round-1 plan threads `OwnedIdentityDid`
+    /// through `ActorDeps` — handlers call this through
+    /// [`SupervisorHandle::my_wrapping_public_key`](crate::context::supervisor::handle::SupervisorHandle::my_wrapping_public_key)
+    /// which wraps the read with the capability proof. Direct
+    /// `&Supervisor` access elsewhere in `crate::context::*` is
+    /// forbidden so the wrapping-key surface is reachable only from
+    /// supervisor-module code.
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.10 with the dissolution finale
-    pub(crate) fn wrapping_public_key_for(&self, did: &DID) -> Option<Arc<Vec<u8>>> {
+    #[allow(dead_code)] // first caller lands in Phase 2 with the actor wiring + capability thread
+    pub(in crate::context::supervisor) fn wrapping_public_key_for(
+        &self,
+        did: &DID,
+    ) -> Option<Arc<Vec<u8>>> {
         self.wrapping_keys.get(did).map(|entry| {
             let pair = entry.value().load_full();
             Arc::new(pair.public.to_vec())
@@ -693,9 +709,17 @@ impl Supervisor {
     /// Same reader discipline as [`Self::wrapping_public_key_for`]:
     /// drop the returned `Arc` within the same poll. The inner
     /// [`Zeroizing`] wrapper guarantees the bytes are zeroed on drop.
+    ///
+    /// Visibility is `pub(in crate::context::supervisor)` per the
+    /// master plan §"Cross-identity isolation" — wrapping-secret
+    /// access must be capability-gated by `&OwnedIdentityDid`. Until
+    /// Phase 2 wires that capability through `ActorDeps`, the
+    /// narrower visibility scopes call sites to supervisor-module code
+    /// so handler code outside `supervisor/` cannot read another
+    /// identity's secret.
     #[must_use]
-    #[allow(dead_code)] // first caller lands in 12c.10 with the dissolution finale
-    pub(crate) fn wrapping_secret_key_for(
+    #[allow(dead_code)] // first caller lands in Phase 2 with the actor wiring + capability thread
+    pub(in crate::context::supervisor) fn wrapping_secret_key_for(
         &self,
         did: &DID,
     ) -> Option<Arc<zeroize::Zeroizing<Vec<u8>>>> {
@@ -703,6 +727,17 @@ impl Supervisor {
             let pair = entry.value().load_full();
             Arc::new(zeroize::Zeroizing::new(pair.secret.to_vec()))
         })
+    }
+
+    /// Clear every per-identity wrapping keypair. Used by the
+    /// shutdown helper so a fresh
+    /// [`Self::with_providers`] observes empty per-identity state.
+    /// Wrapping-key secrets zeroize on drop via the
+    /// `Zeroizing<[u8;32]>` field on
+    /// [`WrappingKeyPair`](crate::context::actor::state::WrappingKeyPair).
+    /// Phase 1 fix-up of ADR-049 (post-review-round-1).
+    pub(crate) fn clear_wrapping_keys(&self) {
+        self.wrapping_keys.clear();
     }
 
     /// Atomically registers (or rotates) the X25519 wrapping keypair
@@ -796,23 +831,22 @@ impl Supervisor {
         mls_storage: Arc<dyn crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
         key_package_store: crate::context::supervisor::key_package_actor::KeyPackageStoreHandle,
     ) -> Result<crate::context::actor::deps::ActorDeps, ContextError> {
-        const ATTACHED: &str =
-            "Supervisor::build_actor_deps — provider slot empty (call with_providers first)";
+        use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
         let transport = Arc::clone(
             self.transport_ref()
-                .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?,
+                .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?,
         );
         let event_log = Arc::clone(
             self.event_log_ref()
-                .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?,
+                .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?,
         );
         let clock = Arc::clone(
             self.clock_ref()
-                .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?,
+                .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?,
         );
         let key_resolver = self
             .key_resolver_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?
+            .ok_or_else(|| ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned()))?
             .clone();
 
         let handle = crate::context::supervisor::handle::SupervisorHandle::wrap(Arc::clone(self));
@@ -1589,8 +1623,20 @@ impl Supervisor {
             ));
         }
 
-        // Always clear the guard on exit — wrap the FSM body in an
-        // inner closure so panics/? propagate through the guard reset.
+        // RAII guard: ensure the pending flag clears even if `run_saga_fsm`
+        // panics or unwinds. The prior implementation cleared the flag with
+        // a line of code after `.await` — a panic anywhere inside the FSM
+        // would leave the guard set, blocking every subsequent `start_saga`
+        // until process restart. Phase 1 fix-up of ADR-049
+        // (post-review-round-1).
+        struct SagaGuardReset<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for SagaGuardReset<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _guard = SagaGuardReset(&self.saga_pending_guard);
+
         let saga_id = SagaId::new();
         let participants = saga_input_participants(&input);
         let secret_bearing = saga_input_is_secret_bearing(&input);
@@ -1604,7 +1650,8 @@ impl Supervisor {
             )
             .await;
 
-        self.saga_pending_guard.store(false, Ordering::Release);
+        // `_guard` clears the flag on scope exit — including on the
+        // panic-unwind path through `run_saga_fsm`.
 
         fsm_result.map(|()| SagaOutput { saga_id })
     }
@@ -2059,18 +2106,42 @@ impl Supervisor {
     /// Destroys per-context sender keys + MLS groups + event logs in
     /// that order (zeroize secrets before tearing down structure),
     /// removes the contexts from the supervisor's registry, clears the
-    /// standing-context tracking, and aborts background tasks (TTL
-    /// timers, governance timeouts). Does NOT send leave messages or
-    /// notify remote peers — used by
-    /// `scp_ffi_common::BridgeInstance::shutdown` for process exit /
-    /// test teardown.
+    /// standing-context tracking + local-DID registry + per-identity
+    /// wrapping keys, and aborts background tasks (TTL timers,
+    /// governance timeouts). Does NOT send leave messages or notify
+    /// remote peers — used by `scp_ffi_common::BridgeInstance::shutdown`
+    /// for process exit / test teardown.
+    ///
+    /// Phase 1 fix-up of ADR-049 (post-review-round-1): now async to
+    /// allow proper `lock().await` acquisition rather than the prior
+    /// best-effort `try_lock` that silently skipped cleanup on
+    /// contention.
     ///
     /// # Errors
     ///
     /// Currently always returns `Ok(())`. Best-effort cleanup logs
     /// per-context failures via `tracing::warn!` inside the helper.
-    pub fn shutdown_all_contexts(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::shutdown_all_contexts(self);
+    pub async fn shutdown_all_contexts(&self) -> Result<(), ContextError> {
+        crate::context::lifecycle_helpers::shutdown_all_contexts(self).await;
+        Ok(())
+    }
+
+    /// Sync wrapper for [`Self::shutdown_all_contexts`].
+    ///
+    /// Required by destructor / atexit-style sync callers (the FFI
+    /// bridge instance's blocking-shutdown path) that cannot `.await`.
+    /// Uses [`tokio::runtime::Handle::try_current`] to bridge sync →
+    /// async; **callers MUST be inside a tokio runtime**. No-op (with
+    /// warning) when called outside a runtime.
+    ///
+    /// Phase 1 fix-up of ADR-049 (post-review-round-1).
+    ///
+    /// # Errors
+    ///
+    /// Currently always returns `Ok(())`. Per-context cleanup failures
+    /// are logged via `tracing` inside the helper.
+    pub fn shutdown_all_contexts_sync(&self) -> Result<(), ContextError> {
+        crate::context::lifecycle_helpers::shutdown_all_contexts_sync(self);
         Ok(())
     }
 
@@ -2367,20 +2438,10 @@ impl Supervisor {
         source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     ) -> Result<(), ContextError> {
-        const ATTACHED: &str =
-            "Supervisor::send_message — provider slot empty (call with_providers first)";
-        let clock = self
-            .clock_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?
-            .clone();
-        let key_resolver = self
-            .key_resolver_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?
-            .clone();
+        // Phase 1 fix-up of ADR-049 (post-review-round-1): the helper
+        // reads `clock` / `key_resolver` from the supervisor directly.
         crate::context::messaging_helpers::send_message(
             self,
-            &clock,
-            &key_resolver,
             handle,
             sender_did,
             payload,
@@ -2425,9 +2486,17 @@ impl Supervisor {
     /// Passthrough to
     /// [`crate::context::governance_helpers::propose_governance_action`].
     ///
+    /// Gated behind the `testing` feature — the unchecked propose path
+    /// is not part of the production FFI surface (every bridge calls
+    /// [`Self::propose_governance_action_checked`] instead). Crate-
+    /// internal callers that bypass the capability check are limited
+    /// to integration tests under `crates/scp-runtime/tests/`. Phase 1
+    /// fix-up of ADR-049 (post-review-round-1).
+    ///
     /// # Errors
     ///
     /// Propagates [`ContextError`] from the helper.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn propose_governance_action(
         &self,
         context_id: &str,
@@ -2478,9 +2547,17 @@ impl Supervisor {
     /// Passthrough to
     /// [`crate::context::governance_helpers::vote_on_proposal`].
     ///
+    /// Gated behind the `testing` feature — the unchecked vote path
+    /// is not part of the production FFI surface (every bridge calls
+    /// the suspension-aware
+    /// [`vote_on_proposal_inner`](crate::context::governance_helpers::vote_on_proposal_inner)
+    /// helper with `check_vote_capability=true`).
+    /// Phase 1 fix-up of ADR-049 (post-review-round-1).
+    ///
     /// # Errors
     ///
     /// Propagates [`ContextError`] from the helper.
+    #[cfg(any(test, feature = "testing"))]
     pub async fn vote_on_proposal(
         &self,
         context_id: &str,
@@ -2663,70 +2740,16 @@ fn current_timestamp_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
-// No-op ContextPersistence + SagaJournal — plumbed into the FFI query
-// shim's `Supervisor::for_query_shim` constructor. Neither surface is
-// touched by the query path; the saga + lifecycle handlers that DO touch
-// them land in commits 9-11 and replace these stubs with the real
-// production wiring.
+// No-op SagaJournal — plumbed into the FFI [`Self::with_providers`] factory
+// (and the test-only [`Self::for_query_shim`] constructor) when no production
+// saga journal is wired. The `NoopContextPersistence` counterpart lives in
+// [`crate::context::persistence`] (single public definition; the prior local
+// duplicate was deleted in the post-review-round-1 phase 1 fix-up).
 // ---------------------------------------------------------------------------
 
-/// No-op persistence — every operation is a no-op success. Used by
-/// `Supervisor::for_query_shim`; deleted in commit 12 with the shim.
-struct NoopContextPersistence;
-
-impl ContextPersistence for NoopContextPersistence {
-    fn persist_context(
-        &self,
-        _context_id: &str,
-        _snapshot: &crate::context::state::ContextSnapshot,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-
-    fn load_context(
-        &self,
-        _context_id: &str,
-    ) -> Result<
-        Option<crate::context::state::ContextSnapshot>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        Ok(None)
-    }
-
-    fn persist_broadcast(
-        &self,
-        _context_id: &str,
-        _snapshot: &scp_protocol::context::broadcast::BroadcastContextSnapshot,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-
-    fn load_broadcast(
-        &self,
-        _context_id: &str,
-    ) -> Result<
-        Option<scp_protocol::context::broadcast::BroadcastContextSnapshot>,
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
-        Ok(None)
-    }
-
-    fn delete_context(
-        &self,
-        _context_id: &str,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        Ok(())
-    }
-
-    fn list_persisted_contexts(
-        &self,
-    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Vec::new())
-    }
-}
-
 /// No-op saga journal — every operation is a no-op success. Used by
-/// `Supervisor::for_query_shim`; deleted in commit 12 with the shim.
+/// [`Self::with_providers`] until the production saga path lands; also used
+/// by [`Self::for_query_shim`] in tests.
 struct NoopSagaJournal;
 
 #[async_trait::async_trait]
