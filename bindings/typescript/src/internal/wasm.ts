@@ -262,10 +262,10 @@ interface WasmModule {
     did: string;
     custodyType: string;
   };
-  identity_migrate: (identity: {
-    did: string;
-    custodyType: string;
-  }) => Promise<{ did: string; custodyType: string }>;
+  identity_migrate: (identity: { did: string; custodyType: string }) => Promise<{
+    identity: { did: string; custodyType: string };
+    rotationEventJson: string;
+  }>;
   identity_attest_device: (did: string) => Promise<string>;
   identity_verify_device_attestation: (did: string, tokenBase64: string) => Promise<boolean>;
   // Identity link attestation (§3.5.1)
@@ -1797,8 +1797,13 @@ export function createWasmBridge(): Bridge {
 
     async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
       const wasm = getWasm();
-      const updated = await wasm.identity_migrate(handle);
-      return { did: updated.did, custodyType: updated.custodyType };
+      const result = await wasm.identity_migrate(handle);
+      // The WASM bridge now also returns a `DidRotationEvent` JSON
+      // (`rotationEventJson`) carrying the migration + pre-rotation
+      // proofs. The narrow `BridgeIdentityHandle` shape is preserved
+      // for the existing wrapper consumers; surfacing the rotation
+      // event lives at the SDK layer alongside its native counterparts.
+      return { did: result.identity.did, custodyType: result.identity.custodyType };
     },
 
     async identityAttestDevice(did: string): Promise<string> {
