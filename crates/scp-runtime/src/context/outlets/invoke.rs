@@ -5,11 +5,13 @@
 //! UCAN capability checking, input/output schema validation, timeout
 //! enforcement, cancellation, error propagation, and event log recording.
 //!
-//! Outlet execution errors are returned in [`OutletResponse::error`](super::lifecycle::OutletResponse),
-//! not as protocol-level errors. Schema validation failures are caught by
-//! the SDK (this module), not by the outlet itself.
+//! Outlet execution errors are surfaced through the §5.4.5 streaming wire
+//! types (`ChunkPayload::Error { terminal: true, .. }`) and the §5.4.4 typed
+//! `OutletError` envelope, not as protocol-level errors. Schema validation
+//! failures are caught by the SDK (this module), not by the outlet itself.
 //!
-//! See ADR-010 in `.docs/adrs/phase-2.md` for the full design.
+//! See ADR-049 §5 (streaming-native invocation) and ADR-010 in
+//! `.docs/adrs/phase-2.md` for the original (pre-redesign) design.
 
 use std::future::Future;
 use std::hash::BuildHasher;
@@ -47,8 +49,9 @@ use scp_protocol::trust::consequence::evaluate_consequence_rules;
 /// Errors produced by [`invoke_outlet`].
 ///
 /// These are protocol-level errors that prevent the invocation from being
-/// dispatched. Outlet execution errors are returned inside
-/// [`OutletResponse::error`](super::lifecycle::OutletResponse) instead.
+/// dispatched. Outlet execution errors are surfaced through the §5.4.5
+/// streaming wire types (`ChunkPayload::Error { terminal: true, .. }`)
+/// instead.
 #[derive(Debug, thiserror::Error)]
 pub enum InvocationError {
     /// The context is not in the Active state.

@@ -1,20 +1,21 @@
-//! Tool invocation lifecycle types: request, response, cancellation, and status.
+//! Tool invocation lifecycle types: request, status, cancellation.
 //!
-//! Every tool invocation follows a defined lifecycle with explicit states,
-//! timeouts, and error handling. Tool execution errors are returned in
-//! [`OutletResponse::error`], not as protocol-level errors. Schema validation
-//! failures are caught by the SDK, not the tool.
+//! Every tool invocation is a stream by construction (§5.4.5). The legacy
+//! non-streaming response type (`OutletResponse`) was deleted by SCP-OUT-032
+//! and is replaced by the §5.4.5 wire types in [`super::stream`]:
+//! `OutletStreamOpen` / `OutletStreamChunk` / `OutletStreamCredit` /
+//! `ChunkPayload`. The §5.4.4 typed `OutletError` envelope
+//! ([`super::errors::OutletError`]) replaces the legacy
+//! `OutletExecutionError` / `OutletErrorCode` shape.
 //!
-//! See ADR-010 in `.docs/adrs/phase-2.md` for the full design.
+//! See ADR-049 §5 (streaming-native invocation) and §4 (typed error
+//! envelope).
 //!
 //! # Types
 //!
 //! - [`OutletRequest`] -- A tool invocation request sent as an MLS application
 //!   message.
-//! - [`OutletResponse`] -- A tool invocation response.
 //! - [`OutletStatus`] -- The four terminal statuses of a tool invocation.
-//! - [`OutletExecutionError`] -- Structured execution error with retryable hint.
-//! - [`OutletErrorCode`] -- Error code enum covering all tool error categories.
 //! - [`OutletCancel`] -- Cancellation request referencing a pending invocation.
 
 use serde::{Deserialize, Serialize};
@@ -114,33 +115,6 @@ impl OutletRequest {
 }
 
 // ---------------------------------------------------------------------------
-// OutletResponse
-// ---------------------------------------------------------------------------
-
-/// A tool invocation response, sent as an MLS application message.
-///
-/// Contains the invocation result, timing information, and provenance metadata.
-/// Tool execution errors are returned in the [`error`](Self::error) field, not
-/// as protocol-level errors.
-///
-/// See ADR-010 acceptance criterion 3.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutletResponse {
-    /// Matches the [`OutletRequest::request_id`].
-    pub request_id: String,
-    /// Terminal status of the invocation.
-    pub status: OutletStatus,
-    /// The tool's output, present on [`OutletStatus::Success`].
-    pub output: Option<serde_json::Value>,
-    /// Structured error, present on non-success statuses.
-    pub error: Option<OutletExecutionError>,
-    /// Wall-clock execution time in milliseconds.
-    pub execution_time_ms: u64,
-    /// Provenance metadata for this response.
-    pub provenance: Provenance,
-}
-
-// ---------------------------------------------------------------------------
 // OutletStatus
 // ---------------------------------------------------------------------------
 
@@ -166,74 +140,6 @@ impl std::fmt::Display for OutletStatus {
             Self::Error => write!(f, "Error"),
             Self::Timeout => write!(f, "Timeout"),
             Self::Cancelled => write!(f, "Cancelled"),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// OutletExecutionError
-// ---------------------------------------------------------------------------
-
-/// Structured tool execution error.
-///
-/// Returned in [`OutletResponse::error`] for non-success invocations. The
-/// [`retryable`](Self::retryable) field indicates whether the caller should
-/// attempt the invocation again.
-///
-/// See ADR-010 acceptance criterion 5.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutletExecutionError {
-    /// Categorized error code.
-    pub code: OutletErrorCode,
-    /// Human-readable error description.
-    pub message: String,
-    /// Whether the caller should retry the invocation.
-    pub retryable: bool,
-}
-
-// ---------------------------------------------------------------------------
-// OutletErrorCode
-// ---------------------------------------------------------------------------
-
-/// Categorized error codes for tool invocation failures.
-///
-/// Covers the full range of failure modes from validation through execution.
-///
-/// See ADR-010 acceptance criterion 6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OutletErrorCode {
-    /// Input did not pass the tool's input schema validation.
-    InputValidationFailed,
-    /// Output did not pass the tool's output schema validation.
-    OutputValidationFailed,
-    /// Tool execution failed with an internal error.
-    ExecutionFailed,
-    /// Tool execution timed out.
-    Timeout,
-    /// Tool execution was cancelled.
-    Cancelled,
-    /// Invocation was rejected due to rate limiting.
-    RateLimited,
-    /// The requested tool was not found in the registry.
-    OutletNotFound,
-    /// The invoker does not have the required capability.
-    PermissionDenied,
-    /// An unexpected internal error occurred.
-    InternalError,
-}
-
-impl std::fmt::Display for OutletErrorCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::InputValidationFailed => write!(f, "InputValidationFailed"),
-            Self::OutputValidationFailed => write!(f, "OutputValidationFailed"),
-            Self::ExecutionFailed => write!(f, "ExecutionFailed"),
-            Self::Timeout => write!(f, "Timeout"),
-            Self::Cancelled => write!(f, "Cancelled"),
-            Self::RateLimited => write!(f, "RateLimited"),
-            Self::OutletNotFound => write!(f, "OutletNotFound"),
-            Self::PermissionDenied => write!(f, "PermissionDenied"),
-            Self::InternalError => write!(f, "InternalError"),
         }
     }
 }
@@ -387,19 +293,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_error_code_display() {
-        assert_eq!(
-            format!("{}", OutletErrorCode::InputValidationFailed),
-            "InputValidationFailed"
-        );
-        assert_eq!(
-            format!("{}", OutletErrorCode::PermissionDenied),
-            "PermissionDenied"
-        );
-        assert_eq!(format!("{}", OutletErrorCode::Timeout), "Timeout");
-    }
-
-    #[test]
     fn tool_status_serialization_roundtrip() {
         for status in [
             OutletStatus::Success,
@@ -410,26 +303,6 @@ mod tests {
             let json = serde_json::to_string(&status).unwrap();
             let deserialized: OutletStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(status, deserialized);
-        }
-    }
-
-    #[test]
-    fn tool_error_code_serialization_roundtrip() {
-        let codes = [
-            OutletErrorCode::InputValidationFailed,
-            OutletErrorCode::OutputValidationFailed,
-            OutletErrorCode::ExecutionFailed,
-            OutletErrorCode::Timeout,
-            OutletErrorCode::Cancelled,
-            OutletErrorCode::RateLimited,
-            OutletErrorCode::OutletNotFound,
-            OutletErrorCode::PermissionDenied,
-            OutletErrorCode::InternalError,
-        ];
-        for code in codes {
-            let json = serde_json::to_string(&code).unwrap();
-            let deserialized: OutletErrorCode = serde_json::from_str(&json).unwrap();
-            assert_eq!(code, deserialized);
         }
     }
 
@@ -489,20 +362,6 @@ mod tests {
         let hash1 = sha256_json(&serde_json::json!({"a": 1}));
         let hash2 = sha256_json(&serde_json::json!({"a": 2}));
         assert_ne!(hash1, hash2);
-    }
-
-    #[test]
-    fn tool_execution_error_serialization_roundtrip() {
-        let error = OutletExecutionError {
-            code: OutletErrorCode::ExecutionFailed,
-            message: "something broke".to_owned(),
-            retryable: true,
-        };
-        let json = serde_json::to_string(&error).unwrap();
-        let deserialized: OutletExecutionError = serde_json::from_str(&json).unwrap();
-        assert_eq!(deserialized.code, OutletErrorCode::ExecutionFailed);
-        assert_eq!(deserialized.message, "something broke");
-        assert!(deserialized.retryable);
     }
 
     #[test]

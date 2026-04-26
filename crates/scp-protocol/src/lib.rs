@@ -20,13 +20,15 @@ pub mod uri;
 
 // Outlet surface re-exports (SCP-OUT-002, AC-5). `OutletId` is exported from
 // [`context::roles`]; the remaining types come from [`context::outlets`] and
-// its submodules. See §5.4.1 and ADR-049.
+// its submodules. See §5.4.1, §5.4.5, and ADR-049.
 //
 // Coverage notes:
 // - `OutletLifecycleEvent`, `OutletIntegrityStatus`, and `OutletSummary` are
 //   umbrella names in the story. The current implementation factors lifecycle
-//   into `OutletInvokedEvent` / `OutletRequest` / `OutletResponse` /
-//   `OutletStatus` / `OutletErrorCode` / `OutletExecutionError` / `OutletCancel`;
+//   into `OutletInvokedEvent` / `OutletRequest` / `OutletStatus` /
+//   `OutletCancel` (legacy `OutletResponse` / `OutletErrorCode` /
+//   `OutletExecutionError` were deleted by SCP-OUT-032 and replaced by the
+//   §5.4.5 streaming wire types and the §5.4.4 `OutletErrorEnvelope`);
 //   integrity into `OutletVerificationResult` / `OutletVerificationSchedule`;
 //   and summary into `ContextSummary` (shared with other context facets).
 //   All the concrete types are re-exported below so every story-named facade
@@ -41,10 +43,19 @@ pub use context::outlets::registration::{OutletRegistration, RegistrationError};
 pub use context::outlets::registry::{
     OutletCost, OutletRegistry, OutletSchema, OutletTestVector, OutletVerificationResult,
 };
+pub use context::outlets::stream::{
+    ChunkPayload, CreditGrantSigningInputs, DEFAULT_CREDIT_WINDOW,
+    DEFAULT_STREAM_CREDIT_STALL_SECS, DEFAULT_STREAM_UCAN_RECHECK_SECS, OpenObservation,
+    OutletStreamChunk, OutletStreamCredit, OutletStreamOpen, RequestId as OutletRequestId,
+    SCP_OUTLET_CAVEAT_BIND_V1, SCP_OUTLET_CHUNK_SIG_V1, SCP_OUTLET_CHUNK_V1, SCP_OUTLET_CREDIT_V1,
+    SessionState, StreamRejection, StreamTerminalStatus, compute_caveats_binding,
+    compute_chunk_sig_preimage, compute_credit_sig_preimage, evaluate_open_pinning,
+    evaluate_revocation_recheck, evaluate_session_open, sign_chunk, sign_credit_grant,
+    verify_chunk_signature, verify_credit_signature,
+};
 pub use context::outlets::{
-    OutletCancel, OutletError, OutletErrorCode, OutletExecutionError, OutletInvokedEvent,
-    OutletKind, OutletRegisteredEvent, OutletRequest, OutletResponse, OutletStatus,
-    OutletUpdatedEvent, OutletVerifiedEvent, OutletVerifiedReason,
+    OutletCancel, OutletError, OutletInvokedEvent, OutletKind, OutletRegisteredEvent,
+    OutletRequest, OutletStatus, OutletUpdatedEvent, OutletVerifiedEvent, OutletVerifiedReason,
 };
 pub use context::roles::OutletId;
 
@@ -73,6 +84,7 @@ pub use context::outlets::error_codes::{
     CODE_AUTHORIZATION_SALT_ROTATION, CODE_ECONOMIC_FAULT, CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
     CODE_EXECUTION_CREDIT, CODE_EXECUTION_CREDIT_STALL, CODE_EXECUTION_FAULT,
     CODE_GOVERNANCE_FAULT, CODE_INPUT_VIOLATION, CODE_OUTPUT_VIOLATION, CODE_PROTOCOL_SESSION,
-    CODE_PROTOCOL_VIOLATION, CODE_TRANSPORT_FAULT, SlugError, error_code_to_class,
-    error_code_to_default_slug, error_code_to_retry_policy, slug_to_class, validate_slug,
+    CODE_PROTOCOL_VIOLATION, CODE_TRANSPORT_FAULT, SLUG_PROTOCOL_UNKNOWN_SESSION, SlugError,
+    error_code_to_class, error_code_to_default_slug, error_code_to_retry_policy, slug_to_class,
+    validate_slug,
 };

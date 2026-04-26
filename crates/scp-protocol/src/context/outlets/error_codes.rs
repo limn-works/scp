@@ -23,7 +23,7 @@
 //! | Code | Class | Default slug | Slugs covered (§5.4.4 + round-4/5/6) |
 //! |------|-------|--------------|--------------------------------------|
 //! | [`CODE_PROTOCOL_VIOLATION`] (`SCP-TOOL-6100`) | `Protocol` | `protocol.violation` | `query-cost-violation`, `query-violation`, `kind-mismatch`, `amplification-violation`, `structural-floor-violation`, `schema-immutability-violation`, `query-misdeclaration`, `protocol.catalog-rotation-too-frequent`, `protocol.stream-already-open`, `protocol.violation` |
-//! | [`CODE_PROTOCOL_SESSION`] (`SCP-TOOL-6101`) | `Protocol` | `protocol.session-id-conflict` | `protocol.session-id-conflict`, `protocol.malformed-session-id` |
+//! | [`CODE_PROTOCOL_SESSION`] (`SCP-TOOL-6101`) | `Protocol` | `protocol.session-id-conflict` | `protocol.session-id-conflict`, `protocol.malformed-session-id`, `protocol.unknown-session` |
 //! | [`CODE_AUTHORIZATION_DENIED`] (`SCP-TOOL-6110`) | `Authorization` | `authorization.denied` | `authorization.denied` (oracle-collapse target), `authorization.expired`, `authorization.revoked`, `authorization.missing`, `authorization.attenuation-violation`, `authorization.mint-limit-exceeded`, `authorization.time-box-violation`, `authorization.rate-exceeded`, `authorization.cumulative-exceeded`, `authorization.adapter-not-allowed`, `authorization.revoked-mid-stream`, `authorization.credit-stream-mismatch`, `authorization.ikm-signature-invalid`, `authorization.credit-replay` |
 //! | [`CODE_AUTHORIZATION_ATTENUATION`] (`SCP-TOOL-6114`) | `Authorization` | `attenuation.mask-width-violation` | `attenuation.caveat-mint-limit-exceeded`, `attenuation.hours-of-day-high-bits-set`, `attenuation.days-of-week-high-bit-set`, `attenuation.origin-kind-stem-mismatch`, `attenuation.origin-kind-mixed-stem-root`, `attenuation.origin-kind-unspecified`, `attenuation.mask-width-violation` |
 //! | [`CODE_AUTHORIZATION_SALT_ROTATION`] (`SCP-TOOL-6115`) | `Authorization` | `authorization.salt-rotation-unjustified` | `authorization.salt-rotation-unjustified` |
@@ -248,6 +248,9 @@ pub const SLUG_PROTOCOL_STREAM_ALREADY_OPEN: &str = "protocol.stream-already-ope
 pub const SLUG_PROTOCOL_SESSION_ID_CONFLICT: &str = "protocol.session-id-conflict";
 /// Slug `protocol.malformed-session-id` — §6.2.1.1(a) `UUIDv7` format.
 pub const SLUG_PROTOCOL_MALFORMED_SESSION_ID: &str = "protocol.malformed-session-id";
+/// Slug `protocol.unknown-session` — §6.2.1.1(a) `OutletStreamOpen.session_id`
+/// references an unknown or expired session.
+pub const SLUG_PROTOCOL_UNKNOWN_SESSION: &str = "protocol.unknown-session";
 
 // --- Authorization class --------------------------------------------------
 
@@ -569,7 +572,8 @@ pub fn slug_to_class(slug: &str) -> Option<OutletErrorClass> {
         | SLUG_PROTOCOL_CATALOG_ROTATION_TOO_FREQUENT
         | SLUG_PROTOCOL_STREAM_ALREADY_OPEN
         | SLUG_PROTOCOL_SESSION_ID_CONFLICT
-        | SLUG_PROTOCOL_MALFORMED_SESSION_ID => Some(OutletErrorClass::Protocol),
+        | SLUG_PROTOCOL_MALFORMED_SESSION_ID
+        | SLUG_PROTOCOL_UNKNOWN_SESSION => Some(OutletErrorClass::Protocol),
 
         // Authorization class — code 6110 (general denial) AND code 6114
         // (attenuation sub-class) AND code 6115 (salt-rotation) all map to
@@ -1058,7 +1062,7 @@ mod tests {
     #[test]
     fn slug_count_is_at_least_forty() {
         let slugs: &[&str] = &[
-            // Protocol (12)
+            // Protocol (13)
             SLUG_PROTOCOL_VIOLATION,
             SLUG_QUERY_COST_VIOLATION,
             SLUG_QUERY_VIOLATION,
@@ -1071,6 +1075,7 @@ mod tests {
             SLUG_PROTOCOL_STREAM_ALREADY_OPEN,
             SLUG_PROTOCOL_SESSION_ID_CONFLICT,
             SLUG_PROTOCOL_MALFORMED_SESSION_ID,
+            SLUG_PROTOCOL_UNKNOWN_SESSION,
             // Authorization (15)
             SLUG_AUTHORIZATION_DENIED,
             SLUG_AUTHORIZATION_EXPIRED,

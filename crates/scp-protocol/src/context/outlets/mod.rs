@@ -7,17 +7,22 @@
 //! schema, implementation hash, test vectors, and operator DID -- providing
 //! verifiable integrity (spec section 7.3.3).
 //!
-//! See ADR-010 in `.docs/adrs/phase-2.md` for the full design.
+//! See ADR-010 in `.docs/adrs/phase-2.md` for the original design and ADR-049
+//! for the streaming-native invocation redesign (§5).
 //!
 //! # Modules
 //!
-//! - [`registry`] -- Tool registration storage, `register_outlet`, `update_outlet`,
-//!   `verify_outlet`.
+//! - [`registry`] -- Tool registration storage, `register_outlet`,
+//!   `update_outlet`, `verify_outlet`.
 //! - [`schema`] -- JSON Schema validation helpers and MCP compatibility.
-//! - `invoke` (in `scp-runtime`) -- Tool invocation with full execution lifecycle:
-//!   capability checking, schema validation, timeout, cancellation.
-//! - [`lifecycle`] -- Request/response types, status codes, error codes,
-//!   cancellation, and event log integration for tool invocations.
+//! - `invoke` (in `scp-runtime`) -- Outlet invocation with full execution
+//!   lifecycle: capability checking, schema validation, timeout, cancellation.
+//! - [`lifecycle`] -- Request types, terminal status, cancellation, and event
+//!   log integration for outlet invocations.
+//! - [`stream`] -- §5.4.5 streaming wire types: `OutletStreamOpen`,
+//!   `OutletStreamChunk`, `OutletStreamCredit`, `ChunkPayload`,
+//!   `StreamTerminalStatus`. The legacy non-streaming `OutletResponse` was
+//!   deleted by SCP-OUT-032.
 //!
 //! # Types
 //!
@@ -33,14 +38,12 @@
 //!   (Re-exported from [`registry`].)
 //! - [`OutletRequest`] -- Tool invocation request. (Re-exported from
 //!   [`lifecycle`].)
-//! - [`OutletResponse`] -- Tool invocation response. (Re-exported from
-//!   [`lifecycle`].)
 //! - [`OutletStatus`] -- Invocation terminal status. (Re-exported from
 //!   [`lifecycle`].)
-//! - [`OutletExecutionError`] -- Structured execution error. (Re-exported from
-//!   [`lifecycle`].)
-//! - [`OutletErrorCode`] -- Error code enum. (Re-exported from [`lifecycle`].)
 //! - [`OutletCancel`] -- Cancellation request. (Re-exported from [`lifecycle`].)
+//! - [`OutletStreamOpen`] / [`OutletStreamChunk`] / [`OutletStreamCredit`] /
+//!   [`ChunkPayload`] / [`StreamTerminalStatus`] -- §5.4.5 streaming wire
+//!   types. (Re-exported from [`stream`].)
 
 pub mod error_codes;
 pub mod errors;
@@ -52,6 +55,7 @@ pub mod message_catalog;
 pub mod registration;
 pub mod registry;
 pub mod schema;
+pub mod stream;
 pub mod summary;
 
 use crate::context::roles;
@@ -61,8 +65,8 @@ pub use hash::{
     cost_hash, description_hash, outlet_registration_v2_preimage, schema_hash, test_vectors_hash,
 };
 pub use lifecycle::{
-    DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, OutletCancel, OutletErrorCode, OutletExecutionError,
-    OutletInvokedEvent, OutletRequest, OutletResponse, OutletStatus, Provenance, sha256_json,
+    DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, OutletCancel, OutletInvokedEvent, OutletRequest,
+    OutletStatus, Provenance, sha256_json,
 };
 pub use message_catalog::{
     CATALOG_MAX_ENTRIES, MessageTemplate, MessageTemplateError, TEMPLATE_MAX_BYTES,
@@ -74,6 +78,16 @@ pub use registry::{
     VectorResult, register_outlet, update_outlet, verify_outlet,
 };
 pub use schema::{SchemaValidationError, validate_schema, validate_value_against_schema};
+pub use stream::{
+    ChunkPayload, CreditGrantSigningInputs, DEFAULT_CREDIT_WINDOW,
+    DEFAULT_STREAM_CREDIT_STALL_SECS, DEFAULT_STREAM_UCAN_RECHECK_SECS, Ed25519Signature, MlsEpoch,
+    OpenObservation, OutletStreamChunk, OutletStreamCredit, OutletStreamOpen, RequestId,
+    SCP_OUTLET_CAVEAT_BIND_V1, SCP_OUTLET_CHUNK_SIG_V1, SCP_OUTLET_CHUNK_V1, SCP_OUTLET_CREDIT_V1,
+    SessionState, StreamRejection, StreamTerminalStatus, compute_caveats_binding,
+    compute_chunk_sig_preimage, compute_credit_sig_preimage, evaluate_open_pinning,
+    evaluate_revocation_recheck, evaluate_session_open, sign_chunk, sign_credit_grant,
+    verify_chunk_signature, verify_credit_signature,
+};
 
 // ---------------------------------------------------------------------------
 // OutletKind

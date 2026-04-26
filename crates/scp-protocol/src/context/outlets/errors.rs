@@ -233,7 +233,8 @@ pub enum OutletErrorClass {
     /// `query-violation`, `query-misdeclaration`, `outlet-not-registered`,
     /// `kind-mismatch`, `amplification-violation`,
     /// `protocol.catalog-rotation-too-frequent`, `protocol.stream-already-open`,
-    /// `protocol.session-id-conflict`, `protocol.malformed-session-id`.
+    /// `protocol.session-id-conflict`, `protocol.malformed-session-id`,
+    /// `protocol.unknown-session`.
     Protocol,
     /// UCAN, caveat, role, capability, amplification denials
     /// (`SCP-TOOL-6110..6119`). Examples: `authorization.denied`,
