@@ -2349,7 +2349,7 @@ fn conf_048_outlet_error_messagepack_forward_compat() {
     use scp_protocol::context::outlets::OutletId;
     use scp_protocol::context::outlets::errors::{
         CatalogKey, DetailBody, OUTLET_MESSAGE_KEY_LEN, OutletError, OutletErrorClass,
-        PAD_NONCE_LEN, REGISTRATION_EVENT_ID_LEN, RetryPolicy,
+        OutletErrorNewOpts, PAD_NONCE_LEN, REGISTRATION_EVENT_ID_LEN, RetryPolicy,
     };
 
     println!("=== CONF-048: OutletError MessagePack tag-indexed wire format ===");
@@ -2370,21 +2370,22 @@ fn conf_048_outlet_error_messagepack_forward_compat() {
         1,
         "Build a canonical OutletError envelope via OutletError::new",
     );
-    let canonical = OutletError::new(
-        &outlet_id,
-        &outlet_message_key,
+    let canonical = OutletError::new(OutletErrorNewOpts {
+        outlet_id: &outlet_id,
+        outlet_message_key: &outlet_message_key,
         registration_event_id,
-        &catalog_key,
-        &registered,
-        OutletErrorClass::Authorization,
-        "SCP-TOOL-6110",
-        "authorization.denied",
-        RetryPolicy::Never,
-        Some(DetailBody::Authorization {
+        catalog_key: &catalog_key,
+        registered_keys: &registered,
+        class: OutletErrorClass::Authorization,
+        code: "SCP-TOOL-6110",
+        slug: "authorization.denied",
+        retry: RetryPolicy::Never,
+        detail: Some(DetailBody::Authorization {
             capability: "outlet_query:test".to_owned(),
         }),
+        source_chain: Vec::new(),
         pad_nonce,
-    )
+    })
     .expect("constructor must succeed for canonical inputs");
     let canonical_bytes = rmp_serde::to_vec_named(&canonical).expect("Rust-side serialize");
 

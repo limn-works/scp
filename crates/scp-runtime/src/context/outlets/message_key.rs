@@ -39,9 +39,11 @@
 //! - `.docs/adrs/ADR-049-outlet-redesign.md` Round 5 — accept-time exporter
 //!   pinning closes the epoch-grace covert channel.
 
+use std::collections::VecDeque;
+
 use scp_protocol::context::ContextError;
 use scp_protocol::context::outlets::OutletId;
-use scp_protocol::context::outlets::errors::OUTLET_MESSAGE_KEY_LEN;
+use scp_protocol::context::outlets::errors::{OUTLET_MESSAGE_KEY_LEN, REGISTRATION_EVENT_ID_LEN};
 
 use super::super::interface::ikm_commitment::MlsExporter;
 
@@ -153,6 +155,178 @@ pub fn derive_outlet_message_key<E: MlsExporter + ?Sized>(
     let mut key = [0u8; OUTLET_MESSAGE_KEY_LEN];
     key.copy_from_slice(&exporter_bytes[..]);
     Ok(key)
+}
+
+// ---------------------------------------------------------------------------
+// Per-outlet receiver LRU — §5.4.4 round-6 / §9.18.A protocol invariant.
+// ---------------------------------------------------------------------------
+
+/// Receiver-side LRU capacity for outlet-message-key entries
+/// (§9.18.A protocol invariant; see spec §5.4.4 round-6).
+///
+/// Each outlet maintains a per-outlet LRU mapping
+/// `registration_event_id → outlet_message_key`. The four most recent
+/// registrations are kept resolvable concurrently so in-flight
+/// [`OutletError`] envelopes signed under a prior registration are not
+/// silently rejected when the outlet is re-registered mid-flight.
+///
+/// Sized by the catalog-rotation dwell window (≥ 24h). Four entries cover
+/// `4 × 24h = 96h` of cross-context propagation — comfortably beyond
+/// realistic re-registration cadence.
+///
+/// **Not configurable.** This is a §9.18.A protocol invariant; receivers
+/// that pad the cache larger admit a covert channel where the operator
+/// can re-register at high frequency without aging out prior keys.
+///
+/// [`OutletError`]: scp_protocol::context::outlets::errors::OutletError
+pub const MESSAGE_KEY_LRU_CAPACITY: usize = 4;
+
+/// One entry in the per-outlet [`OutletMessageKeyLru`].
+///
+/// Couples a registration's event-log id to the `outlet_message_key`
+/// pinned at that registration's acceptance (§5.4.4 round-5 / round-6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LruEntry {
+    /// Event-log id of the registration whose acceptance produced
+    /// `outlet_message_key`.
+    registration_event_id: [u8; REGISTRATION_EVENT_ID_LEN],
+    /// 32-byte HMAC key for §5.4.4 wire-message construction.
+    outlet_message_key: [u8; OUTLET_MESSAGE_KEY_LEN],
+}
+
+/// Per-outlet bounded LRU mapping `registration_event_id` to the
+/// `outlet_message_key` pinned at that registration's acceptance
+/// (§5.4.4 round-6 / §9.18.A).
+///
+/// The receiver maintains one [`OutletMessageKeyLru`] per outlet. On
+/// every accepted [`OutletRegistration`], the receiver inserts
+/// `(registration_event_id, outlet_message_key)` via [`Self::insert`],
+/// evicting the oldest entry when the cache is full (capacity
+/// [`MESSAGE_KEY_LRU_CAPACITY`] = 4).
+///
+/// When an [`OutletError`] envelope arrives, the receiver looks up the
+/// envelope's `registration_event_id` via [`Self::get`]; on a hit, it
+/// HMAC-verifies the `message` field under the matched key; on a miss
+/// (the cited registration has aged out), it rejects the envelope with
+/// [`OutletErrorConstructionFailed::UnregisteredMessageKey`].
+///
+/// # Why a deque
+///
+/// The cache is small (capacity 4), so a `VecDeque<LruEntry>` with linear
+/// scan beats a `HashMap` on every dimension: smaller memory footprint,
+/// no allocator churn on insert/evict, and the access patterns are
+/// always proportional to the cache size.
+///
+/// # Eviction order
+///
+/// Oldest-first: `insert` appends to the back, evicts from the front
+/// when at capacity. This matches spec §5.4.4: "insert the new entry,
+/// evicting the oldest entry if the capacity is exceeded."
+///
+/// # Story
+///
+/// SCP-OUT-041b.
+///
+/// [`OutletError`]: scp_protocol::context::outlets::errors::OutletError
+/// [`OutletRegistration`]: scp_protocol::context::outlets::OutletRegistration
+/// [`OutletErrorConstructionFailed::UnregisteredMessageKey`]: scp_protocol::context::outlets::errors::OutletErrorConstructionFailed::UnregisteredMessageKey
+#[derive(Debug, Clone, Default)]
+pub struct OutletMessageKeyLru {
+    entries: VecDeque<LruEntry>,
+}
+
+impl OutletMessageKeyLru {
+    /// Constructs an empty LRU.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            entries: VecDeque::with_capacity(MESSAGE_KEY_LRU_CAPACITY),
+        }
+    }
+
+    /// Returns the number of resident entries (`0..=MESSAGE_KEY_LRU_CAPACITY`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` iff the LRU is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Inserts `(registration_event_id, outlet_message_key)` into the LRU.
+    ///
+    /// If `registration_event_id` already resides in the LRU, the entry's
+    /// position is unchanged and the key is overwritten — re-pinning a
+    /// registration with a fresh derive (which would be a bug at the
+    /// caller, since the key is supposed to be byte-stable) does not
+    /// reshuffle the eviction order. This matches §5.4.4 round-6: each
+    /// `registration_event_id` corresponds to exactly one accepted
+    /// registration, so duplicate inserts are idempotent.
+    ///
+    /// If the LRU is at capacity and `registration_event_id` is new, the
+    /// **oldest** entry (front of the deque) is evicted before insertion.
+    ///
+    /// Returns the evicted entry's `registration_event_id` if eviction
+    /// occurred, `None` otherwise. Callers may use this signal for audit
+    /// logging.
+    pub fn insert(
+        &mut self,
+        registration_event_id: [u8; REGISTRATION_EVENT_ID_LEN],
+        outlet_message_key: [u8; OUTLET_MESSAGE_KEY_LEN],
+    ) -> Option<[u8; REGISTRATION_EVENT_ID_LEN]> {
+        // Idempotent: overwrite the key in-place if the registration is
+        // already resident, leaving the eviction order untouched. This
+        // matches the §5.4.4 round-6 contract that each registration_event_id
+        // pins exactly one outlet_message_key.
+        if let Some(existing) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.registration_event_id == registration_event_id)
+        {
+            existing.outlet_message_key = outlet_message_key;
+            return None;
+        }
+
+        let evicted = if self.entries.len() >= MESSAGE_KEY_LRU_CAPACITY {
+            self.entries.pop_front().map(|e| e.registration_event_id)
+        } else {
+            None
+        };
+        self.entries.push_back(LruEntry {
+            registration_event_id,
+            outlet_message_key,
+        });
+        evicted
+    }
+
+    /// Looks up the `outlet_message_key` for a `registration_event_id`.
+    ///
+    /// Returns `Some(&[u8; 32])` on hit, `None` on miss (the cited
+    /// registration has aged out of the LRU). Lookup does NOT change
+    /// the eviction order — promoting on read would let a colluding
+    /// receiver pin a stale registration indefinitely by spamming
+    /// lookups, defeating the §5.4.4 "≥ 24h dwell × 4 entries = 96h"
+    /// bound.
+    #[must_use]
+    pub fn get(
+        &self,
+        registration_event_id: &[u8; REGISTRATION_EVENT_ID_LEN],
+    ) -> Option<&[u8; OUTLET_MESSAGE_KEY_LEN]> {
+        self.entries
+            .iter()
+            .find(|e| &e.registration_event_id == registration_event_id)
+            .map(|e| &e.outlet_message_key)
+    }
+
+    /// Returns `true` iff `registration_event_id` is currently resident
+    /// in the LRU.
+    #[must_use]
+    pub fn contains(&self, registration_event_id: &[u8; REGISTRATION_EVENT_ID_LEN]) -> bool {
+        self.get(registration_event_id).is_some()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -480,6 +654,143 @@ mod tests {
             DeriveOutletMessageKeyError::ProviderFailed(_) => {}
             other => panic!("expected ProviderFailed, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // OutletMessageKeyLru — §5.4.4 round-6 / §9.18.A protocol invariant.
+    // -----------------------------------------------------------------------
+
+    fn key_with_marker(marker: u8) -> [u8; OUTLET_MESSAGE_KEY_LEN] {
+        [marker; OUTLET_MESSAGE_KEY_LEN]
+    }
+
+    fn event_id_with_marker(marker: u8) -> [u8; REGISTRATION_EVENT_ID_LEN] {
+        [marker; REGISTRATION_EVENT_ID_LEN]
+    }
+
+    #[test]
+    fn lru_capacity_is_protocol_constant() {
+        // §9.18.A protocol invariant: MESSAGE_KEY_LRU_CAPACITY = 4.
+        assert_eq!(MESSAGE_KEY_LRU_CAPACITY, 4);
+    }
+
+    #[test]
+    fn lru_starts_empty() {
+        let lru = OutletMessageKeyLru::new();
+        assert!(lru.is_empty());
+        assert_eq!(lru.len(), 0);
+    }
+
+    #[test]
+    fn lru_insert_then_get_returns_key() {
+        let mut lru = OutletMessageKeyLru::new();
+        let event_id = event_id_with_marker(0xE1);
+        let key = key_with_marker(0xA1);
+        let evicted = lru.insert(event_id, key);
+        assert!(evicted.is_none(), "first insert never evicts");
+        assert_eq!(lru.len(), 1);
+        assert!(lru.contains(&event_id));
+        assert_eq!(lru.get(&event_id), Some(&key));
+    }
+
+    #[test]
+    fn lru_get_miss_returns_none() {
+        let lru = OutletMessageKeyLru::new();
+        let event_id = event_id_with_marker(0xE1);
+        assert_eq!(lru.get(&event_id), None);
+        assert!(!lru.contains(&event_id));
+    }
+
+    #[test]
+    fn lru_evicts_oldest_at_capacity() {
+        // §5.4.4 round-6: oldest-first eviction at MESSAGE_KEY_LRU_CAPACITY.
+        let mut lru = OutletMessageKeyLru::new();
+        let e1 = event_id_with_marker(0x01);
+        let e2 = event_id_with_marker(0x02);
+        let e3 = event_id_with_marker(0x03);
+        let e4 = event_id_with_marker(0x04);
+        let e5 = event_id_with_marker(0x05);
+        let k1 = key_with_marker(0xA1);
+        let k2 = key_with_marker(0xA2);
+        let k3 = key_with_marker(0xA3);
+        let k4 = key_with_marker(0xA4);
+        let k5 = key_with_marker(0xA5);
+
+        assert!(lru.insert(e1, k1).is_none());
+        assert!(lru.insert(e2, k2).is_none());
+        assert!(lru.insert(e3, k3).is_none());
+        assert!(lru.insert(e4, k4).is_none());
+        // At capacity. Inserting e5 must evict e1 (oldest).
+        assert_eq!(lru.insert(e5, k5), Some(e1));
+        assert_eq!(lru.len(), MESSAGE_KEY_LRU_CAPACITY);
+        // e1 is gone; e2..e5 remain.
+        assert!(!lru.contains(&e1));
+        assert!(lru.contains(&e2));
+        assert!(lru.contains(&e3));
+        assert!(lru.contains(&e4));
+        assert!(lru.contains(&e5));
+    }
+
+    #[test]
+    fn lru_idempotent_reinsertion_does_not_evict() {
+        // Re-inserting a registration_event_id that is already resident
+        // must not perturb the eviction order — duplicate accept events
+        // for the same registration are idempotent per §5.4.4 round-6
+        // (each registration_event_id pins exactly one outlet_message_key).
+        let mut lru = OutletMessageKeyLru::new();
+        let e1 = event_id_with_marker(0x01);
+        let e2 = event_id_with_marker(0x02);
+        let e3 = event_id_with_marker(0x03);
+        let e4 = event_id_with_marker(0x04);
+        let e5 = event_id_with_marker(0x05);
+        for (eid, k) in [
+            (e1, key_with_marker(0xA1)),
+            (e2, key_with_marker(0xA2)),
+            (e3, key_with_marker(0xA3)),
+            (e4, key_with_marker(0xA4)),
+        ] {
+            lru.insert(eid, k);
+        }
+        // Re-insert e1 (already resident).
+        let evicted = lru.insert(e1, key_with_marker(0xB1));
+        assert!(
+            evicted.is_none(),
+            "re-inserting a resident entry must not evict"
+        );
+        assert_eq!(lru.len(), MESSAGE_KEY_LRU_CAPACITY);
+        // The stored key for e1 is now the new value (idempotent overwrite).
+        assert_eq!(lru.get(&e1), Some(&key_with_marker(0xB1)));
+        // e1 must NOT have been moved to the back — adding e5 still
+        // evicts e1 (proving e1 retains its oldest position).
+        assert_eq!(lru.insert(e5, key_with_marker(0xA5)), Some(e1));
+    }
+
+    #[test]
+    fn lru_get_does_not_promote() {
+        // Lookup is read-only. Reading e1 must not save it from eviction
+        // when e5 is inserted at capacity — a "promote-on-read" design
+        // would let an attacker pin stale registrations indefinitely by
+        // spamming lookups, defeating the §5.4.4 96h bound.
+        let mut lru = OutletMessageKeyLru::new();
+        let e1 = event_id_with_marker(0x01);
+        let e2 = event_id_with_marker(0x02);
+        let e3 = event_id_with_marker(0x03);
+        let e4 = event_id_with_marker(0x04);
+        let e5 = event_id_with_marker(0x05);
+        for (eid, k) in [
+            (e1, key_with_marker(0xA1)),
+            (e2, key_with_marker(0xA2)),
+            (e3, key_with_marker(0xA3)),
+            (e4, key_with_marker(0xA4)),
+        ] {
+            lru.insert(eid, k);
+        }
+        // Repeatedly look up e1 — does NOT promote.
+        for _ in 0..10 {
+            assert!(lru.get(&e1).is_some());
+        }
+        // e1 still gets evicted when e5 lands.
+        assert_eq!(lru.insert(e5, key_with_marker(0xA5)), Some(e1));
     }
 
     /// Defense-in-depth: an exporter that returns an unexpected length

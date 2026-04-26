@@ -609,6 +609,17 @@ pub const MAX_TRAIL_PAD_HMAC_LABEL: &[u8] = b"SCP-OUTLET-HOP-PAD-V1:";
 /// untouched by this story; SCP-OUT-027 / 036 / 038 wire the runtime callsites
 /// over to this typed envelope.
 ///
+/// **Construction signature — options-object.** [`OutletError::new`] takes
+/// a single [`OutletErrorNewOpts`] options-object (SCP-OUT-031 round-6 /
+/// SCP-OUT-041b API MINOR fix). The options-object shape is keyword-only
+/// across all SDK wrappers — Rust callers construct [`OutletErrorNewOpts`]
+/// with explicit field names; Python/TypeScript/Swift/Kotlin SDKs pass a
+/// struct / dict / typed parameter object so the call site reads as
+/// `OutletError.new({ outlet_id, catalog_key, ... })` rather than a
+/// positional 11-arg call. The positional form was rejected because it
+/// produced unreadable call-sites and made it impossible to add new typed
+/// fields without breaking source compatibility.
+///
 /// **Eq derive.** `OutletError` derives `PartialEq` but NOT `Eq`. The forward
 /// -compat [`Self::unknown_fields`] slot stores [`rmpv::Value`], which is
 /// `PartialEq`-only because the spec permits floats inside future-tag
@@ -673,37 +684,103 @@ pub struct OutletError {
     pub unknown_fields: BTreeMap<String, rmpv::Value>,
 }
 
+/// Options-object input for [`OutletError::new`] (SCP-OUT-031 round-6 /
+/// SCP-OUT-041b API MINOR fix).
+///
+/// Aggregates the typed inputs §5.4.4 mandates for envelope construction
+/// behind a single keyword-only struct. SDK bridges expose the same shape
+/// as a Python `TypedDict`, TypeScript object literal, Swift struct, and
+/// Kotlin data class so callers never see a positional 11-arg constructor.
+///
+/// # Fields
+///
+/// - `outlet_id` — typed [`OutletId`] of the emitting outlet. Bound to
+///   the envelope at construction so the runtime can cross-check
+///   `outlet_message_key` against the outlet's pinned registration.
+/// - `outlet_message_key` — the 32-byte per-outlet HMAC key derived from
+///   the hosting context's MLS exporter at registration acceptance
+///   (§5.4.4 round-5). Looked up at the receiver via
+///   `registration_event_id` against the §9.18.A LRU.
+/// - `registration_event_id` — event-log id of the
+///   [`OutletRegistration`](crate::context::outlets::OutletRegistration)
+///   that pinned `outlet_message_key`. Emitted unconditionally on every
+///   envelope per §5.4.4 round-6 (tag 12).
+/// - `catalog_key` — registered [`CatalogKey`] selecting a template from
+///   the outlet's `message_catalog`. The on-wire `message` field is
+///   `HMAC-SHA-256(outlet_message_key, catalog_key.as_str().as_bytes())[..32]`.
+/// - `registered_keys` — slice of every [`CatalogKey`] in the outlet's
+///   currently-pinned `message_catalog` (the §5.4.4 round-5 catalog).
+///   Used to enforce
+///   [`OutletErrorConstructionFailed::UnregisteredMessageKey`] at
+///   construction time.
+/// - `class` — [`OutletErrorClass`] root class (§5.4.4 tag 3).
+/// - `code` — `SCP-TOOL-NNNN` with `NNNN` in the §5.4.4 6100-6199
+///   sub-block.
+/// - `slug` — `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$`.
+/// - `retry` — [`RetryPolicy`].
+/// - `detail` — typed per-class shape; rejected as
+///   [`OutletErrorConstructionFailed::DetailShapeMismatch`] if the
+///   variant does not match `class.expected_detail()`.
+/// - `source_chain` — initial trail of [`ContextHop`] entries. Almost
+///   always empty at construction (cross-context wrapping populates it
+///   later via SCP-OUT-029).
+/// - `pad_nonce` — fresh-per-envelope CSPRNG nonce keying §5.4.4 trail-
+///   pad pseudonyms; emitted unconditionally.
+///
+/// # Why an options-object
+///
+/// Earlier drafts used a positional 11-argument signature. Reviewers
+/// flagged the call-site as unreadable and the positional shape blocked
+/// adding new typed fields (`registration_event_id` arrived in round-6
+/// and would have shifted every existing caller). The options-object
+/// shape is forward-compatible: new fields are added with defaults so
+/// existing callers continue compiling, and every field is named at
+/// every call site.
+#[derive(Debug, Clone)]
+pub struct OutletErrorNewOpts<'a> {
+    /// Typed outlet id of the emitting outlet (§5.4.4).
+    pub outlet_id: &'a OutletId,
+    /// 32-byte pinned per-outlet HMAC key (§5.4.4 round-5).
+    pub outlet_message_key: &'a [u8; OUTLET_MESSAGE_KEY_LEN],
+    /// Event-log id of the [`OutletRegistration`] that pinned
+    /// `outlet_message_key` (§5.4.4 round-6 tag 12).
+    ///
+    /// [`OutletRegistration`]: crate::context::outlets::OutletRegistration
+    pub registration_event_id: [u8; REGISTRATION_EVENT_ID_LEN],
+    /// Registered catalog key selecting a §5.4.4 template.
+    pub catalog_key: &'a CatalogKey,
+    /// Registered catalog (every [`CatalogKey`] in the outlet's pinned
+    /// `message_catalog`). Used to enforce
+    /// [`OutletErrorConstructionFailed::UnregisteredMessageKey`].
+    pub registered_keys: &'a [CatalogKey],
+    /// Root [`OutletErrorClass`] (§5.4.4 tag 3).
+    pub class: OutletErrorClass,
+    /// `SCP-TOOL-NNNN` per the §5.4.4 6100-6199 sub-block.
+    pub code: &'a str,
+    /// Slug per `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$`.
+    pub slug: &'a str,
+    /// [`RetryPolicy`] (§5.4.4 tag 5).
+    pub retry: RetryPolicy,
+    /// Typed per-class detail (§5.4.4 tag 6).
+    pub detail: Option<DetailBody>,
+    /// Initial cross-context trail. Almost always empty; SCP-OUT-029
+    /// `wrap_cross_context_error` populates it at hop time.
+    pub source_chain: Vec<ContextHop>,
+    /// Fresh-per-envelope CSPRNG nonce (§5.4.4 round-5 tag 11).
+    pub pad_nonce: [u8; PAD_NONCE_LEN],
+}
+
 impl OutletError {
     /// Constructs a new [`OutletError`] envelope per §5.4.4 with full
     /// validation.
     ///
+    /// Takes a single [`OutletErrorNewOpts`] options-object (SCP-OUT-031
+    /// round-6 / SCP-OUT-041b API MINOR fix) — the positional 11-arg form
+    /// was rejected as unreadable.
+    ///
     /// # Inputs
     ///
-    /// - `_outlet_id` — typed [`OutletId`] of the emitting outlet. Currently
-    ///   used only as a typed bind for cross-checking against
-    ///   `outlet_message_key`'s registration; SCP-OUT-027/036/038 will pipe
-    ///   it through to runtime call-sites.
-    /// - `outlet_message_key` — the 32-byte per-outlet HMAC key derived from
-    ///   the hosting context's MLS exporter at registration acceptance
-    ///   (§5.4.4 round-5). The receiver looks this key up via
-    ///   `registration_event_id` against the §9.18.A LRU.
-    /// - `registration_event_id` — event-log id of the [`OutletRegistration`]
-    ///   that pinned `outlet_message_key`.
-    /// - `catalog_key` — registered [`CatalogKey`] selecting a template from
-    ///   the outlet's `message_catalog`. The wire `message` field is
-    ///   `HMAC-SHA-256(outlet_message_key, catalog_key)[..32]`.
-    /// - `registered_keys` — slice of every [`CatalogKey`] in the outlet's
-    ///   currently-pinned `message_catalog` (the §5.4.4 round-5 catalog).
-    ///   Used to enforce `UnregisteredMessageKey` at construction time.
-    /// - `class` — [`OutletErrorClass`].
-    /// - `code` — must be `SCP-TOOL-NNNN` with `NNNN` in the §5.4.4 6100-6199
-    ///   sub-block.
-    /// - `slug` — must match `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$`.
-    /// - `retry` — [`RetryPolicy`].
-    /// - `detail` — typed per-class shape; rejected as
-    ///   [`OutletErrorConstructionFailed::DetailShapeMismatch`] if it does
-    ///   not match `class.expected_detail()`.
-    /// - `pad_nonce` — fresh CSPRNG nonce; emitted unconditionally.
+    /// See [`OutletErrorNewOpts`] for the field-by-field contract.
     ///
     /// # Errors
     ///
@@ -720,22 +797,23 @@ impl OutletError {
     ///   ([`OutletErrorConstructionFailed::MessageTooLong`]). The §5.4.4
     ///   message cap is on the catalog template; catalog keys are bounded
     ///   the same way.
-    #[allow(clippy::too_many_arguments)] // 12 typed inputs are mandated by §5.4.4.
-    pub fn new(
-        _outlet_id: &OutletId,
-        outlet_message_key: &[u8; OUTLET_MESSAGE_KEY_LEN],
-        registration_event_id: [u8; REGISTRATION_EVENT_ID_LEN],
-        catalog_key: &CatalogKey,
-        registered_keys: &[CatalogKey],
-        class: OutletErrorClass,
-        code: impl Into<String>,
-        slug: impl Into<String>,
-        retry: RetryPolicy,
-        detail: Option<DetailBody>,
-        pad_nonce: [u8; PAD_NONCE_LEN],
-    ) -> Result<Self, OutletErrorConstructionFailed> {
-        let code = code.into();
-        let slug = slug.into();
+    pub fn new(opts: OutletErrorNewOpts<'_>) -> Result<Self, OutletErrorConstructionFailed> {
+        let OutletErrorNewOpts {
+            outlet_id: _,
+            outlet_message_key,
+            registration_event_id,
+            catalog_key,
+            registered_keys,
+            class,
+            code,
+            slug,
+            retry,
+            detail,
+            source_chain,
+            pad_nonce,
+        } = opts;
+        let code = code.to_owned();
+        let slug = slug.to_owned();
 
         // 1. code regex check (§5.4.4 6100-6199 sub-block).
         if !validate_outlet_error_code(&code) {
@@ -755,7 +833,10 @@ impl OutletError {
             });
         }
 
-        // 4. catalog membership check.
+        // 4. catalog membership check (§5.4.4 round-5/6: an unregistered
+        //    catalog key is rejected with `UnregisteredMessageKey` so
+        //    operators cannot smuggle arbitrary HMAC inputs through the
+        //    wire `message` field).
         if !registered_keys.iter().any(|k| k == catalog_key) {
             return Err(OutletErrorConstructionFailed::UnregisteredMessageKey {
                 catalog_key: catalog_key.as_str().to_owned(),
@@ -788,7 +869,7 @@ impl OutletError {
             message: wire_message,
             retry,
             detail,
-            source_chain: Vec::new(),
+            source_chain,
             pad_nonce,
             registration_event_id,
             unknown_fields: BTreeMap::new(),
@@ -1089,21 +1170,23 @@ mod tests {
     fn build_authorization_error() -> OutletError {
         let outlet_id: OutletId = "outlet-test".to_owned();
         let key = CatalogKey::try_new("authorization.denied").unwrap();
-        OutletError::new(
-            &outlet_id,
-            &fixed_outlet_message_key(),
-            fixed_registration_event_id(),
-            &key,
-            &registered(),
-            OutletErrorClass::Authorization,
-            "SCP-TOOL-6110",
-            "authorization.denied",
-            RetryPolicy::Never,
-            Some(DetailBody::Authorization {
+        let registered = registered();
+        OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &key,
+            registered_keys: &registered,
+            class: OutletErrorClass::Authorization,
+            code: "SCP-TOOL-6110",
+            slug: "authorization.denied",
+            retry: RetryPolicy::Never,
+            detail: Some(DetailBody::Authorization {
                 capability: "outlet_query:test".to_owned(),
             }),
-            fixed_pad_nonce(),
-        )
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        })
         .unwrap()
     }
 
@@ -1294,21 +1377,23 @@ mod tests {
         // 6100-6199 sub-block) returns OutletErrorConstructionFailed.
         let outlet_id: OutletId = "x".to_owned();
         let key = CatalogKey::try_new("authorization.denied").unwrap();
-        let res = OutletError::new(
-            &outlet_id,
-            &fixed_outlet_message_key(),
-            fixed_registration_event_id(),
-            &key,
-            &registered(),
-            OutletErrorClass::Authorization,
-            INVALID_SUBBLOCK_CODE, // outside the 6100-6199 sub-block
-            "authorization.denied",
-            RetryPolicy::Never,
-            Some(DetailBody::Authorization {
+        let registered = registered();
+        let res = OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &key,
+            registered_keys: &registered,
+            class: OutletErrorClass::Authorization,
+            code: INVALID_SUBBLOCK_CODE, // outside the 6100-6199 sub-block
+            slug: "authorization.denied",
+            retry: RetryPolicy::Never,
+            detail: Some(DetailBody::Authorization {
                 capability: "outlet_query:x".to_owned(),
             }),
-            fixed_pad_nonce(),
-        );
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        });
         assert!(matches!(
             res,
             Err(OutletErrorConstructionFailed::MalformedCode { .. })
@@ -1319,21 +1404,23 @@ mod tests {
     fn constructor_validates_slug_regex() {
         let outlet_id: OutletId = "x".to_owned();
         let key = CatalogKey::try_new("authorization.denied").unwrap();
-        let res = OutletError::new(
-            &outlet_id,
-            &fixed_outlet_message_key(),
-            fixed_registration_event_id(),
-            &key,
-            &registered(),
-            OutletErrorClass::Authorization,
-            "SCP-TOOL-6110",
-            "Authorization.Denied", // uppercase — invalid
-            RetryPolicy::Never,
-            Some(DetailBody::Authorization {
+        let registered = registered();
+        let res = OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &key,
+            registered_keys: &registered,
+            class: OutletErrorClass::Authorization,
+            code: "SCP-TOOL-6110",
+            slug: "Authorization.Denied", // uppercase — invalid
+            retry: RetryPolicy::Never,
+            detail: Some(DetailBody::Authorization {
                 capability: "outlet_query:x".to_owned(),
             }),
-            fixed_pad_nonce(),
-        );
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        });
         assert!(matches!(
             res,
             Err(OutletErrorConstructionFailed::MalformedSlug { .. })
@@ -1382,21 +1469,23 @@ mod tests {
         // AC: a catalog-miss catalog_key is rejected with the typed error.
         let outlet_id: OutletId = "x".to_owned();
         let unknown = CatalogKey::try_new("authorization.unknown-key").unwrap();
-        let res = OutletError::new(
-            &outlet_id,
-            &fixed_outlet_message_key(),
-            fixed_registration_event_id(),
-            &unknown,
-            &registered(),
-            OutletErrorClass::Authorization,
-            "SCP-TOOL-6110",
-            "authorization.denied",
-            RetryPolicy::Never,
-            Some(DetailBody::Authorization {
+        let registered = registered();
+        let res = OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &unknown,
+            registered_keys: &registered,
+            class: OutletErrorClass::Authorization,
+            code: "SCP-TOOL-6110",
+            slug: "authorization.denied",
+            retry: RetryPolicy::Never,
+            detail: Some(DetailBody::Authorization {
                 capability: "outlet_query:x".to_owned(),
             }),
-            fixed_pad_nonce(),
-        );
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        });
         assert!(matches!(
             res,
             Err(OutletErrorConstructionFailed::UnregisteredMessageKey { .. })
@@ -1433,22 +1522,24 @@ mod tests {
         // Input-class detail is rejected.
         let outlet_id: OutletId = "x".to_owned();
         let key = CatalogKey::try_new("protocol.query-cost-violation").unwrap();
-        let res = OutletError::new(
-            &outlet_id,
-            &fixed_outlet_message_key(),
-            fixed_registration_event_id(),
-            &key,
-            &registered(),
-            OutletErrorClass::Protocol,
-            "SCP-TOOL-6100",
-            "protocol.query-cost-violation",
-            RetryPolicy::Never,
-            Some(DetailBody::FieldViolation {
+        let registered = registered();
+        let res = OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &key,
+            registered_keys: &registered,
+            class: OutletErrorClass::Protocol,
+            code: "SCP-TOOL-6100",
+            slug: "protocol.query-cost-violation",
+            retry: RetryPolicy::Never,
+            detail: Some(DetailBody::FieldViolation {
                 field_path: "/x".to_owned(),
                 violation: "type".to_owned(),
             }),
-            fixed_pad_nonce(),
-        );
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        });
         assert!(matches!(
             res,
             Err(OutletErrorConstructionFailed::DetailShapeMismatch {
@@ -1465,21 +1556,23 @@ mod tests {
         // contract.
         let outlet_id: OutletId = "x".to_owned();
         let key = CatalogKey::try_new("execution.handler-panic").unwrap();
-        let err = OutletError::new(
-            &outlet_id,
-            &fixed_outlet_message_key(),
-            fixed_registration_event_id(),
-            &key,
-            &registered(),
-            OutletErrorClass::Execution,
-            "SCP-TOOL-6130",
-            "execution.handler-panic",
-            RetryPolicy::Never,
-            Some(DetailBody::ExecutionPanic {
+        let registered = registered();
+        let err = OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &key,
+            registered_keys: &registered,
+            class: OutletErrorClass::Execution,
+            code: "SCP-TOOL-6130",
+            slug: "execution.handler-panic",
+            retry: RetryPolicy::Never,
+            detail: Some(DetailBody::ExecutionPanic {
                 panic_location_hash: [0x99; 32],
             }),
-            fixed_pad_nonce(),
-        )
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        })
         .unwrap();
         match err.detail.as_ref().unwrap() {
             DetailBody::ExecutionPanic {

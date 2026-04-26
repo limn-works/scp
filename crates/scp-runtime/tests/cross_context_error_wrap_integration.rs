@@ -33,7 +33,8 @@
 use scp_protocol::context::metadata::ContextId;
 use scp_protocol::context::outlets::OutletId;
 use scp_protocol::context::outlets::errors::{
-    CatalogKey, MAX_TRAIL_PAD_DEPTH, OutletError, OutletErrorClass, PAD_NONCE_LEN, RetryPolicy,
+    CatalogKey, MAX_TRAIL_PAD_DEPTH, OutletError, OutletErrorClass, OutletErrorNewOpts,
+    PAD_NONCE_LEN, RetryPolicy,
 };
 use scp_runtime::context::manager::{
     OuterCallerStems, OutletErrorWrapView, wrap_cross_context_error,
@@ -53,19 +54,21 @@ fn registered_keys() -> Vec<CatalogKey> {
 fn build_inner_error_at_c() -> OutletError {
     let outlet_id: OutletId = "outlet-c-inner".to_owned();
     let key = CatalogKey::try_new("authorization.denied").unwrap();
-    OutletError::new(
-        &outlet_id,
-        &FIXED_OUTLET_MESSAGE_KEY,
-        FIXED_REGISTRATION_EVENT_ID,
-        &key,
-        &registered_keys(),
-        OutletErrorClass::Authorization,
-        "SCP-TOOL-6110",
-        "authorization.denied",
-        RetryPolicy::Never,
-        None,
-        [0x55; PAD_NONCE_LEN],
-    )
+    let registered = registered_keys();
+    OutletError::new(OutletErrorNewOpts {
+        outlet_id: &outlet_id,
+        outlet_message_key: &FIXED_OUTLET_MESSAGE_KEY,
+        registration_event_id: FIXED_REGISTRATION_EVENT_ID,
+        catalog_key: &key,
+        registered_keys: &registered,
+        class: OutletErrorClass::Authorization,
+        code: "SCP-TOOL-6110",
+        slug: "authorization.denied",
+        retry: RetryPolicy::Never,
+        detail: None,
+        source_chain: Vec::new(),
+        pad_nonce: [0x55; PAD_NONCE_LEN],
+    })
     .unwrap()
 }
 

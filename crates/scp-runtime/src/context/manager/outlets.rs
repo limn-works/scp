@@ -3781,7 +3781,8 @@ mod wrap_cross_context_error_tests {
     use scp_protocol::context::outlets::OutletId;
     use scp_protocol::context::outlets::errors::{
         CatalogKey, MAX_TRAIL_PAD_DEPTH, MAX_TRAIL_PAD_HMAC_LABEL, OutletError, OutletErrorClass,
-        PAD_NONCE_LEN, REGISTRATION_EVENT_ID_LEN, RetryPolicy, WIRE_MESSAGE_LEN,
+        OutletErrorNewOpts, PAD_NONCE_LEN, REGISTRATION_EVENT_ID_LEN, RetryPolicy,
+        WIRE_MESSAGE_LEN,
     };
     use std::collections::HashMap;
 
@@ -3816,38 +3817,42 @@ mod wrap_cross_context_error_tests {
     fn build_inner_authorization_error() -> OutletError {
         let outlet_id: OutletId = "outlet-inner".to_owned();
         let key = CatalogKey::try_new("authorization.denied").unwrap();
-        OutletError::new(
-            &outlet_id,
-            &fixed_outlet_message_key(),
-            fixed_registration_event_id(),
-            &key,
-            &registered(),
-            OutletErrorClass::Authorization,
-            "SCP-TOOL-6110",
-            "authorization.denied",
-            RetryPolicy::Never,
-            None,
-            fixed_pad_nonce(),
-        )
+        let registered = registered();
+        OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &key,
+            registered_keys: &registered,
+            class: OutletErrorClass::Authorization,
+            code: "SCP-TOOL-6110",
+            slug: "authorization.denied",
+            retry: RetryPolicy::Never,
+            detail: None,
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        })
         .unwrap()
     }
 
     fn build_inner_amplification_error() -> OutletError {
         let outlet_id: OutletId = "outlet-amp".to_owned();
         let key = CatalogKey::try_new("authorization.amplification-violation").unwrap();
-        OutletError::new(
-            &outlet_id,
-            &fixed_outlet_message_key(),
-            fixed_registration_event_id(),
-            &key,
-            &registered(),
-            OutletErrorClass::Authorization,
-            "SCP-TOOL-6120",
-            "authorization.amplification-violation",
-            RetryPolicy::Never,
-            None,
-            fixed_pad_nonce(),
-        )
+        let registered = registered();
+        OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &key,
+            registered_keys: &registered,
+            class: OutletErrorClass::Authorization,
+            code: "SCP-TOOL-6120",
+            slug: "authorization.amplification-violation",
+            retry: RetryPolicy::Never,
+            detail: None,
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        })
         .unwrap()
     }
 
@@ -4277,19 +4282,21 @@ mod wrap_cross_context_error_tests {
             for k in ["governance.outlet-deregistered", "protocol.kind-mismatch"] {
                 all_keys.push(CatalogKey::try_new(k).unwrap());
             }
-            let inner = OutletError::new(
-                &outlet_id,
-                &fixed_outlet_message_key(),
-                fixed_registration_event_id(),
-                &CatalogKey::try_new(slug).unwrap(),
-                &all_keys,
+            let catalog_key_obj = CatalogKey::try_new(slug).unwrap();
+            let inner = OutletError::new(OutletErrorNewOpts {
+                outlet_id: &outlet_id,
+                outlet_message_key: &fixed_outlet_message_key(),
+                registration_event_id: fixed_registration_event_id(),
+                catalog_key: &catalog_key_obj,
+                registered_keys: &all_keys,
                 class,
                 code,
                 slug,
-                RetryPolicy::Never,
-                None,
-                fixed_pad_nonce(),
-            )
+                retry: RetryPolicy::Never,
+                detail: None,
+                source_chain: Vec::new(),
+                pad_nonce: fixed_pad_nonce(),
+            })
             .unwrap();
 
             let wrapped = wrap_cross_context_error(&"ctx-b".to_owned(), inner, &view);
@@ -4312,19 +4319,21 @@ mod wrap_cross_context_error_tests {
         let outlet_id: OutletId = "outlet-test".to_owned();
         let mut all_keys = registered();
         all_keys.push(CatalogKey::try_new("protocol.outlet-not-found").unwrap());
-        let inner = OutletError::new(
-            &outlet_id,
-            &fixed_outlet_message_key(),
-            fixed_registration_event_id(),
-            &CatalogKey::try_new("protocol.outlet-not-found").unwrap(),
-            &all_keys,
-            OutletErrorClass::Protocol,
-            "SCP-TOOL-6101",
-            "protocol.outlet-not-found",
-            RetryPolicy::Never,
-            None,
-            fixed_pad_nonce(),
-        )
+        let catalog_key_obj = CatalogKey::try_new("protocol.outlet-not-found").unwrap();
+        let inner = OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &catalog_key_obj,
+            registered_keys: &all_keys,
+            class: OutletErrorClass::Protocol,
+            code: "SCP-TOOL-6101",
+            slug: "protocol.outlet-not-found",
+            retry: RetryPolicy::Never,
+            detail: None,
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        })
         .unwrap();
         let original_code = inner.code.clone();
         let original_slug = inner.slug.clone();
