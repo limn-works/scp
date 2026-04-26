@@ -1874,7 +1874,7 @@
       "gate": "gate-errors",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "scripts/check-error-codes.sh",
         ".docs/standards/sdk-common.md"
