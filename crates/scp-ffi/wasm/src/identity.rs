@@ -140,9 +140,8 @@ mod canonical_attestation {
 ///   `#0` identity key and the distinct `#active` signing key, plus an
 ///   optional `#agent` key. Produced by [`identity_create`],
 ///   [`identity_create_with_agent_key`], and [`identity_migrate`].
-///   [`identity_rotate_key`] mutates an existing `Local` record in place —
-///   replacing only `#active` — rather than constructing a new one.
-///   Can sign.
+///   [`identity_rotate_key`] mutates an existing `Local` record in place,
+///   replacing only `#active`. Can sign.
 /// * [`IdentityRecord::Resolved`] — A DID-resolution-only handle carrying
 ///   just the `#0` public key and custody-type metadata. Produced when the
 ///   bridge knows a DID exists (e.g. after a future JS-driven DID resolve
@@ -660,13 +659,18 @@ pub struct WasmIdentity {
     /// Stored as metadata for JS-side consumption. Actual key material is
     /// managed by the JS `SubtleCrypto` API via `JsKeyCustody`.
     agent_public_key_multibase: Option<String>,
-    /// Hex-encoded Ed25519 verifying-key bytes for the `#active` signing
-    /// key (64 hex chars = 32 raw bytes). `None` for identities constructed
-    /// via `fromDid` (no retained key material).
+    /// Hex-encoded Ed25519 verifying-key bytes for the **identity key**
+    /// (VM `#0`, the DID-deriving key). 64 hex chars = 32 raw bytes.
+    /// `None` for identities constructed via `fromDid` without retained
+    /// key material.
     ///
-    /// Exposed for cross-bridge parity testing (ADR-046): with a
-    /// deterministic seed, every bridge's `identity_create` must produce
-    /// byte-identical verifying keys.
+    /// Exposed as `#0` (not `#active`) for cross-bridge parity per
+    /// ADR-046: every bridge's `identity_create` under a deterministic
+    /// seed produces byte-identical `#0` public keys, and the NAPI bridge
+    /// (`crates/scp-ffi/napi/src/identity.rs:281-290`) is the canonical
+    /// definition of this field. `identity_rotate_key` rotates `#active`
+    /// only — `#0` (and therefore this snapshot) is invariant across
+    /// rotation.
     verifying_key_hex: Option<String>,
 }
 
@@ -688,12 +692,15 @@ impl WasmIdentity {
         self.custody_type.clone()
     }
 
-    /// Returns the hex-encoded Ed25519 verifying-key bytes for the `#active`
-    /// signing key, or `null` if this handle was constructed from a bare DID
-    /// string without live key material.
+    /// Returns the hex-encoded Ed25519 verifying-key bytes for the
+    /// **identity key** (VM `#0`, the DID-deriving key), or `null` if this
+    /// handle was constructed from a bare DID string without live key
+    /// material.
     ///
     /// Under a deterministic `seed`, this value is byte-identical across
-    /// every bridge (ADR-046).
+    /// every bridge (ADR-046). See the `verifying_key_hex` field docs
+    /// for why `#0` rather than `#active` is exposed here. Stable across
+    /// `identity_rotate_key`, since rotation replaces only `#active`.
     #[must_use]
     #[wasm_bindgen(getter, js_name = "verifyingKey")]
     pub fn verifying_key(&self) -> Option<String> {
@@ -1656,9 +1663,37 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
 /// in `alsoKnownAs`) is a distinct operation; use [`identity_migrate`] for
 /// that.
 ///
+/// # Caller responsibilities
+///
+/// Mirrors the native bridges' contract — the FFI rotation only replaces
+/// the local `#active` material. After this call, the caller MUST:
+///
+/// - Issue MLS Update proposals in every active context so peers pick up
+///   the new credential before the old `#active` expires from their
+///   resolved DID document (spec §3.2.1 step 3b).
+/// - Revoke and reissue UCAN tokens that were signed by the old
+///   `#active` key (spec §3.2.1 step 3c).
+/// - Re-sign and republish identity link attestations (§3.5) whose
+///   envelope `signingKeyId` was `#active`; signatures made with the old
+///   key will no longer verify against the resolved DID document
+///   (spec §3.2.1 step 4a, §3.5.2).
+///
+/// The bridge itself does not perform DHT / relay republication — JS-
+/// side publication is the SDK wrapper's responsibility (ADR-022,
+/// ADR-034). Until publication runs, off-host verifiers will continue to
+/// see the old `#active` in the resolved DID document.
+///
+/// # Pre-rotation commitment
+///
+/// Spec §3.7 defines a forward-secure rotation chain via
+/// `pre_rotation_commitment`. Native `ScpIdentity` carries that field
+/// across rotation; the WASM `IdentityRecord::Local` does not model it.
+/// Layer-1 (`#active`) rotation is unaffected: the commitment binds
+/// Layer-2 (`#0`) migration, not active-key rotation.
+///
 /// # Errors
 ///
-/// - `[SCP-IDENT-1009]` — the input DID is not in the local identity
+/// - `[SCP-IDENT-1002]` — the input DID is not in the local identity
 ///   registry. Only identities created via [`identity_create`] /
 ///   [`identity_create_with_agent_key`] can be rotated; bare DIDs constructed
 ///   via [`WasmIdentity::from_did`] carry no retained key material.
@@ -1705,7 +1740,7 @@ fn rotate_active_key_inner(identity: &WasmIdentity) -> Result<WasmIdentity, ScpW
         AgentKeyMutationStatus::NotFound => {
             return Err(ScpWasmError::Identity {
                 message: format!("identity not found in registry: {did}"),
-                code: codes::IDENT_1009.to_owned(),
+                code: codes::IDENT_1002.to_owned(),
             });
         }
         AgentKeyMutationStatus::NotLocal => {
@@ -3665,7 +3700,7 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // identity_rotate_key — active-key-only rotation parity tests (#1717)
+    // identity_rotate_key — active-key-only rotation parity tests
     // -------------------------------------------------------------------
 
     /// Reads the current `#active` private-key bytes for `did` out of the
@@ -3712,7 +3747,7 @@ mod tests {
 
         assert_eq!(
             rotated.did, did,
-            "rotate_key MUST preserve the DID (active-key-only rotation, #1717)"
+            "rotate_key MUST preserve the DID — active-key-only rotation"
         );
         assert_eq!(
             rotated.verifying_key_hex,
@@ -3735,13 +3770,15 @@ mod tests {
         let handle = handle_for(&did, identity_pub_bytes);
         let pre_rotation_active = snapshot_active_signing_key(&did);
 
-        let _ = identity_rotate_key(&handle).expect("rotate_key should succeed");
+        identity_rotate_key(&handle).expect("rotate_key should succeed");
 
         let post_rotation_active = snapshot_active_signing_key(&did);
         assert_ne!(
             pre_rotation_active, post_rotation_active,
             "rotate_key MUST replace the #active signing key bytes"
         );
+
+        cleanup_registries();
     }
 
     #[test]
@@ -3782,6 +3819,8 @@ mod tests {
             expected_agent, agent_pub_bytes,
             "rotate_key MUST NOT touch the agent signing key"
         );
+
+        cleanup_registries();
     }
 
     #[test]
@@ -3790,7 +3829,7 @@ mod tests {
         let (did, identity_pub_bytes, _) = register_identity();
         let handle = handle_for(&did, identity_pub_bytes);
 
-        let _ = identity_rotate_key(&handle).expect("rotate_key should succeed");
+        identity_rotate_key(&handle).expect("rotate_key should succeed");
 
         // No DID change, so no entry should land in MIGRATION_LINKS.
         let migration_link_count = MIGRATION_LINKS.with(|links| links.borrow().len());
@@ -3798,6 +3837,8 @@ mod tests {
             migration_link_count, 0,
             "rotate_key MUST NOT write to MIGRATION_LINKS — that is identity_migrate's contract"
         );
+
+        cleanup_registries();
     }
 
     #[test]
@@ -3814,7 +3855,7 @@ mod tests {
             );
         });
 
-        let _ = identity_rotate_key(&handle).expect("rotate_key should succeed");
+        identity_rotate_key(&handle).expect("rotate_key should succeed");
 
         let attested =
             LINK_ATTESTATIONS.with(|reg| reg.borrow().get(&did).map(Vec::len).unwrap_or_default());
@@ -3823,6 +3864,8 @@ mod tests {
             "rotate_key MUST leave LINK_ATTESTATIONS entries on the original DID — \
              the DID itself does not change"
         );
+
+        cleanup_registries();
     }
 
     #[test]
@@ -3844,12 +3887,14 @@ mod tests {
             ScpWasmError::Identity { ref code, .. } => {
                 assert_eq!(
                     code,
-                    codes::IDENT_1009,
-                    "unknown-DID refusal must use IDENT_1009; got {code}"
+                    codes::IDENT_1002,
+                    "unknown-DID refusal must use IDENT_1002 (\"Identity not found\"); got {code}"
                 );
             }
             other => panic!("expected Identity error, got: {other:?}"),
         }
+
+        cleanup_registries();
     }
 
     #[test]
@@ -3891,7 +3936,7 @@ mod tests {
         let (did, identity_pub_bytes, pre_active_pub) = register_identity();
         let handle = handle_for(&did, identity_pub_bytes);
 
-        let _ = identity_rotate_key(&handle).expect("rotate_key should succeed");
+        identity_rotate_key(&handle).expect("rotate_key should succeed");
 
         // After rotation, identity_resolve must surface the NEW #active VM.
         let fields = resolve_did_document_fields(&did);
@@ -3921,10 +3966,10 @@ mod tests {
         let handle = handle_for(&did, identity_pub_bytes);
         let active_0 = snapshot_active_signing_key(&did);
 
-        let _ = identity_rotate_key(&handle).expect("first rotate_key should succeed");
+        identity_rotate_key(&handle).expect("first rotate_key should succeed");
         let active_1 = snapshot_active_signing_key(&did);
 
-        let _ = identity_rotate_key(&handle).expect("second rotate_key should succeed");
+        identity_rotate_key(&handle).expect("second rotate_key should succeed");
         let active_2 = snapshot_active_signing_key(&did);
 
         assert_ne!(active_0, active_1, "first rotation must replace #active");
@@ -3948,7 +3993,7 @@ mod tests {
         let (did, identity_pub_bytes, _) = register_identity();
         let handle = handle_for(&did, identity_pub_bytes);
 
-        let _ = identity_rotate_key(&handle).expect("rotate_key should succeed");
+        identity_rotate_key(&handle).expect("rotate_key should succeed");
 
         // sign_with_identity(#active) must use the NEW key, and the
         // verifying key surfaced by resolve_verification_method_key(#active)

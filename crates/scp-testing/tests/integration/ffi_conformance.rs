@@ -1269,10 +1269,6 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "identity_add_agent_key",
     "identity_remove_agent_key",
     "identity_rotate_agent_key",
-    // #1717 — WASM `identity_rotate_key` brought into native parity:
-    // active-key-only rotation matching `DidDht::rotate_active_key` on
-    // PyO3 / NAPI / UniFFI. Promoted to wasm_required alongside its
-    // matrix entry in `scripts/bridge-aliases.json`.
     "identity_rotate_key",
     // Stateless utility ops (4)
     "address_resolve",
