@@ -1848,6 +1848,17 @@ pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
 ///
 /// If the source identity has an agent key, a new agent key is generated
 /// for the migrated identity (preserving the `has_agent_key` state).
+///
+/// The old DID's registry entry is removed if present; if `identity.did`
+/// is not in the registry the removal is a no-op and migration still
+/// produces a fresh identity for the new DID.
+///
+/// # Errors
+///
+/// - `[SCP-VALID-7400]` — the WASM identity registry has reached its
+///   capacity limit and cannot accept the new DID.
+/// - `[SCP-VALID-7401]` — the migration-links registry has reached its
+///   capacity limit and cannot record the new→old DID mapping.
 #[wasm_bindgen]
 pub fn identity_migrate(identity: &WasmIdentity) -> Promise {
     let old_did = identity.did.clone();
