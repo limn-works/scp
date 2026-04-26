@@ -126,6 +126,11 @@ function resolveNapiPackage(): string {
 }
 
 let _nativeScp: NativeScpCtor | null = null;
+// why: one-time FFI addon load cache. Holds both the SCP class and the
+// module-level pure-helper exports (templateGetParams,
+// validateAgainstTemplate, validateContextParams, metadataRecordFromJson)
+// per ADR-048 §1. Direct analog of `_nativeScp` extended for free-function
+// exports. Allowlisted in scripts/check-no-ts-mutable-globals.sh.
 let _nativeAddon: NativeAddon | null = null;
 
 function loadAddon(): NativeAddon {

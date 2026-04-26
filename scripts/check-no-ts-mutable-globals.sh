@@ -99,6 +99,12 @@ ALLOWLIST=(
     _initPromise
     # scp.ts — lazy-resolved napi native constructor.
     _nativeScp
+    # scp.ts — cached napi addon handle holding both the SCP class and
+    # module-level pure-helper exports (templateGetParams,
+    # validateAgainstTemplate, validateContextParams,
+    # metadataRecordFromJson per ADR-048 §1). One-time FFI addon load —
+    # the analog of `_nativeScp` for the module-level helper exports.
+    _nativeAddon
     # mcp.ts — cached napi addon handle for MCP bridge functions.
     _mcpAddon
     # server.ts — cached napi addon handle for Server bridge functions.
