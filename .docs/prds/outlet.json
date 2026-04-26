@@ -1463,7 +1463,7 @@
       "gate": "gate-caveats",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/context/manager/outlets.rs",
         "crates/scp-runtime/src/context/manager/economy.rs"
