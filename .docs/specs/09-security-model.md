@@ -302,6 +302,14 @@ SHA-256 is the only approved hash for this construction. The commitment is bindi
 
 **Journal entry handling at rest.** In-memory journal entries MUST be zeroized on drop. Storage backends for the journal MUST declare an at-rest encryption posture. Backends without at-rest encryption MUST refuse to host secret-bearing saga types; the runtime's journal construction fails closed against mismatched backends. Marking a secret-bearing saga resolved MUST synchronously overwrite the on-disk evidence bytes before the operation returns, not at next compaction.
 
+### 9.4.4 Construction-time enforcement of §9.4 invariants in the SCP runtime
+
+The §9.4 invariants — per-context state ownership, cross-identity capability restriction, the authorization-state persistence rule, and the saga journal secret-handling policy — are enforced **by construction** in the SCP reference runtime per [ADR-049 §1, §5, §9](../adrs/ADR-049-actor-per-context.md) (actor-per-context) rather than by review discipline.
+
+The actor model collapses lock-ordering and TOCTOU concerns into per-context single-task ownership: a context's state is owned by exactly one tokio task that holds `&mut PerContextState` by move. Cross-identity reads route through `SupervisorHandle` methods that take `&OwnedIdentityDid`, a capability proof issued at actor spawn time and unconstructable from handler code. The lock-free read invariant ([ADR-049 §Decision 12](../adrs/ADR-049-actor-per-context.md#12-lock-free-read-invariant)) keeps the read path off `RwLock` so per-acquire cost cannot accumulate into a denial-of-service surface. The per-saga-phase journal write satisfies §9.4.3's "synchronous overwrite on terminal resolution" requirement.
+
+Implementers retargeting another runtime to SCP MAY use a different concurrency primitive (mutex-per-context, single-threaded event loop, etc.) provided each §9.4 invariant remains enforced — by construction or by an equivalent mechanical check. Retrofitting these guarantees as discipline rules has been observed to fail in practice (see ADR-049 §Context for the SCP runtime's pre-refactor experience); ADR-049 §Decision 1 documents the choice to pay the one-time refactor cost rather than maintain ongoing review burden.
+
 ## 9.5 Cryptographic Primitive Specification
 
 The protocol mandates a single ciphersuite for v1. No negotiation, no fallback. This eliminates downgrade attacks and simplifies implementation.

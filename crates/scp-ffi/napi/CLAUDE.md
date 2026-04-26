@@ -7,12 +7,12 @@ Node.js/Bun via napi-rs `#[napi]` types and functions.
 
 ## Architecture
 
-### Shared ContextManager (issue #388)
+### Shared Supervisor (post-ADR-049 / commit 12; supersedes the prior `ContextManager`-keyed wiring tracked in #388)
 
 All context lifecycle, messaging, governance, broadcast, membership, and TTL operations
-delegate to a shared `Arc<ContextManager>` initialized once via `OnceLock` in `runtime.rs`.
+delegate to a shared `Arc<Supervisor>` held in the per-bridge `BridgeInstanceCore.supervisor` slot. The previously-shared `Arc<ContextManager>` is gone — see `.docs/adrs/ADR-049-actor-per-context.md` for the rationale.
 
-The `ContextManager` is constructed with production provider implementations:
+The `Supervisor` is constructed via `Supervisor::with_providers(...)` with production provider implementations:
 - `MlsCryptoProvider` — real OpenMLS-backed encryption, sender keys, and group management (#1294)
 - `NotConfiguredTransportProvider` (from `scp-core`) — returns descriptive errors until relay configured (#501)
 - `MerkleEventLogProvider` — persistent Merkle-chained event log backed by
@@ -23,7 +23,7 @@ The `ContextManager` is constructed with production provider implementations:
 
 A separate `DashMap<String, UcanContextState>` in `runtime.rs` stores per-context UCAN
 validation state (revocation lists, nonce trackers, capability ceilings, event logs for
-Merkle proofs). This is NOT a duplicate of `ContextManager` state — the manager does not
+Merkle proofs). This is NOT a duplicate of `Supervisor` state — the supervisor does not
 track UCAN revocation or nonces.
 
 Functions: `ensure_registered`, `with_context`, `remove_context`.
@@ -38,7 +38,7 @@ Functions: `ensure_registered`, `with_context`, `remove_context`.
 | `ucan.rs` | `ucan_validate`, `ucan_mint`, `ucan_revoke` |
 | `event_log.rs` | `event_log_query`, `event_log_verify` |
 | `transport.rs` | `transport_connect`, `transport_disconnect`, `transport_status` |
-| `runtime.rs` | `context_manager()`, `ensure_registered`, `with_context`, `remove_context` |
+| `runtime.rs` | `supervisor()` (formerly `context_manager()`), `ensure_registered`, `with_context`, `remove_context` |
 
 ### Build
 
@@ -82,12 +82,10 @@ The NAPI bridge uses `rand::rngs::OsRng.fill_bytes` directly. Format:
 
 ## Gotchas
 
-- Bridge functions in `context.rs` delegate to the shared `ContextManager` via
-  `crate::runtime::context_manager()`. The `NapiContextHandle` stores a `core_handle: Option<ContextHandle>`
-  for manager operations.
+- Bridge functions in `context.rs` delegate to the shared `Supervisor` (formerly the now-deleted `ContextManager`) via the per-bridge supervisor accessor. The `NapiContextHandle` stores a `core_handle: Option<ContextHandle>` for supervisor operations.
 - UCAN validation state (revocation lists, nonce trackers) lives in a separate `DashMap` registry,
-  NOT in the `ContextManager`. The `ensure_registered` / `with_context` pattern accesses this state.
-- `context_close` does NOT perform bridge-layer authorization — it delegates to `ContextManager::close_context` which checks the `ContextClose` capability. Removes UCAN state via `remove_context` after closing.
+  NOT in the `Supervisor`. The `ensure_registered` / `with_context` pattern accesses this state.
+- `context_close` does NOT perform bridge-layer authorization — it delegates to `Supervisor::close_context` (the hoisted `lifecycle_helpers::close_context` body) which checks the `ContextClose` capability. Removes UCAN state via `remove_context` after closing.
 - `context_create` maps all user-specified fields from params JSON to `ContextParams` (mode, ceiling, ceiling_policy, promotion_policy, memory_scope, governance, ttl).
 - The bridge event log provider uses `MerkleEventLogProvider::with_persistence` backed by
   `ProtocolRepositoryEventLogBridge` over encrypted in-memory storage (#484). The UCAN

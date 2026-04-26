@@ -5,6 +5,41 @@ All notable changes to SCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-04-25
+
+### Actor-per-context refactor (ADR-049)
+
+Internal concurrency redesign of `crates/scp-runtime`. The
+previously-existing `ContextManager` is gone; `Supervisor` is the new
+authoritative state owner (see
+`.docs/adrs/ADR-049-actor-per-context.md`). FFI bridges and SDK
+wrappers are unchanged at the surface level; the rewrite is internal
+to `scp-runtime`.
+
+**Caller-visible behavioral changes:**
+
+- **50ms coalesce-rollback semantics for non-authorization-downward
+  state.** Per ADR-049 §9 and spec §17.15.1, persistence outside the
+  authorization-downward set (any operation that transitions a
+  member's authorization downward — UCAN issuance/attenuation/
+  revocation, role assignment/demotion/blocklist updates, MLS epoch
+  advance, sender-key rotation, event log append, KeyPackage
+  consumption, saga phase transitions) is coalesced on a 50ms write
+  window per actor. On actor crash, the in-flight coalesce window may
+  roll back up to 50ms of non-critical state (participation counters,
+  velocity trackers, receive buffer position, etc.).
+  Authorization-downward operations remain sync-persisted with no
+  rollback risk — see ADR-049 §9 for the full authorization-state
+  persistence rule.
+- **`Supervisor::shutdown_all_contexts` is now async.** The blocking
+  `try_lock` cleanup pattern was replaced with awaited `lock().await`
+  acquisitions so cleanup does not silently skip on contention. Sync
+  callers (destructor / atexit hooks) use the new
+  `Supervisor::shutdown_all_contexts_sync` wrapper.
+
+References: ADR-049 §9 (coalesced persistence rule),
+`.docs/specs/17-persistence-and-storage.md` §17.15.
+
 ## [Unreleased] - 2026-04-18
 
 ### Phase 4 PR 3 — Persistence + async resume + real UniFFI crypto

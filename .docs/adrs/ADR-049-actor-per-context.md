@@ -112,6 +112,56 @@ Respawn budget: 3 crashes in 60s poisons the context. No infinite respawn loop; 
 
 Per ADR-048, `BridgeInstance` splits into per-bridge concrete structs sharing a `BridgeInstanceCore` trait. This ADR extends `BridgeInstanceCore` with default trait methods for `suspend()`, `resume()`, `shutdown()`. Per-bridge structs override only bridge-specific cleanup hooks (`pre_suspend_hook`, `post_suspend_hook`, etc.). All three non-WASM bridges share one implementation. Cross-bridge consistency check (#1543) extends to verify all bridges use the defaults.
 
+### 12. Lock-free read invariant
+
+`tokio::sync::RwLock` and `tokio::sync::Mutex` are FORBIDDEN on read paths — anything that runs more than once per command dispatch. Allowed read primitives are `OnceLock`, `ArcSwap`, `AtomicU64`, `DashMap`, and the actor-owned `&mut PerContextState` borrow.
+
+Empirical justification: OpenSSL issue [#30659](https://github.com/openssl/openssl/issues/30659) ("Analysis of read locks taken while handshaking") measured `RWLOCK_read_lock` at ~67 cycles per acquire even uncontended vs `__atomic_load_n(__ATOMIC_RELAXED)` at ~17 cycles — a 4× hot-path cost. PR [#30670](https://github.com/openssl/openssl/pull/30670) (merged 2026-04-14) applied the TTAS fix; visible gains on `randbytes`, zero gains on `handshake` (rand was 4% of work; contention shifted to other locks). The takeaway: callsite-cost dominates uncontested-acquire frequency, and lock-elimination at one site shifts contention to whichever site is now the next-most-loaded — not necessarily a macro win.
+
+Our `OnceLock<Arc<dyn …>>` for `crypto`/`transport`/`event_log`/`clock`/`key_resolver` is the Rust equivalent of OpenSSL's TTAS pattern. Doc comments on these accessors should name the lineage ("lock-free read per ADR-049 §Decision 12; same pattern as OpenSSL's `__atomic_load_n` TTAS").
+
+Enforced via `crates/scp-runtime/clippy.toml`:
+
+```toml
+disallowed-types = [
+    { path = "tokio::sync::RwLock", reason = "ADR-049 §Decision 12: forbidden on read paths. Use OnceLock/ArcSwap/AtomicU64/DashMap." },
+    { path = "tokio::sync::Mutex",  reason = "ADR-049 §Decision 12: forbidden on read paths. Use ArcSwap+write_lock or Mutex<PerContextState>." },
+]
+```
+
+Allow-list (sites that legitimately use these primitives):
+
+- Actor-owned `Mutex<PerContextState>` (per-context mailbox holder).
+- `Supervisor::write_lock: tokio::sync::Mutex<()>` (write serialization for the ArcSwap+write_lock pattern).
+- OpenMLS storage adapter internals (sync upstream trait).
+- FFI sync boundaries.
+
+The clippy rule lands in commit 13 of the ADR-049 ladder (Phase 3 of the post-review-round-1 plan); commit 12 already conforms to the rule.
+
+### 13. Lock-elimination validation gate (general rule)
+
+Every commit that deletes or splits a serializing primitive needs a Shuttle/stress test under realistic I/O jitter, asserting:
+
+1. Correctness: no deadlock, no stuck mailboxes, sequential equivalence.
+2. No other lock now shows >2× the prior acquire count (no whack-a-mole contention shift — see Decision 12's OpenSSL evidence).
+
+Generalizes the OpenMLS shared-storage gate: any commit that deletes the 5 `std::sync::Mutex` fields off `MlsCryptoProvider` or splits the `pending_joins` global slot into per-actor scratchpads triggers this gate. Coverage path: existing `shuttle_actor` test + persistence-ordering tests + new acquire-count threshold instrumentation. The instrumentation lands in commit 13 alongside the `perf_baseline` test.
+
+### 14. Performance regression as a rollback trigger
+
+Pre-merge baseline + post-merge measurement on six operations at N=1/4/16:
+
+- `handshake` (welcome + keypackage + add_member)
+- `send_message`
+- `deliver_incoming`
+- `governance_propose`
+- `broadcast_publish`
+- `broadcast_subscribe`
+
+A regression of >15% on any (operation, N) pair triggers §Rollback strategy trigger #4. The baseline + post-merge measurement is implemented in `cargo test -p scp-runtime --test perf_baseline`, landing in commit 13 of the ADR-049 ladder (Phase 4 of the post-review-round-1 plan).
+
+Mandatory coverage: BOTH workload classes (crypto-dominated AND protocol-overhead-dominated) AND BOTH read fast path AND write slow path. The handshake path is crypto-dominated; the broadcast publish/subscribe path is overhead-dominated; that pair stresses both classes.
+
 ## Rejected alternatives
 
 ### Keep `Arc<Mutex<PerContextState>>`, just delete `relock_context`
@@ -138,6 +188,10 @@ Fixes state ownership (methods take `&mut ContextCryptoState`) but preserves the
 
 Rejected; MLS ops and HPKE ops are independent primitives. Tests may mock one without the other. Keeping them split matches the actual abstraction boundary.
 
+### Convert `local_dids` / `standing_contexts` from `ArcSwap` to `tokio::sync::RwLock` for callsite parity
+
+Proposed on the grounds that the rest of the supervisor's mutable state lives behind `tokio::sync::Mutex` (the per-context `Mutex<PerContextState>`), and aligning the read path on `RwLock` would simplify reasoning at the callsites. Rejected on Decision 12 grounds + the OpenSSL evidence underlying it: the per-acquire `RwLock::read()` cost is paid forever at every read; the one-time callsite migration cost to the lock-free `ArcSwap`/`OnceLock` pattern is paid once. The performance-rollback trigger (Decision 14) treats this kind of regression as merge-blocking. Any future proposal to convert hot-path read paths to `RwLock` should be redirected here.
+
 ## Consequences
 
 **Positive.** All five defect categories close by construction. `current_thread` tokio becomes viable — tests no longer need to annotate `multi_thread`, FFI embedders can run SCP on host-supplied event loops. New features become "add a command variant plus a handler function"; blast radius for adding a protocol feature collapses from 8-submodule lock-ordering reasoning to one handler file. The `pending_joins` global serialization point is gone. MLS crypto state is per-actor.
@@ -158,7 +212,11 @@ Rejected; MLS ops and HPKE ops are independent primitives. Tests may mock one wi
 
 **Dependencies.** Adds `shuttle` (model checker, dev-only) and `tree-sitter-rust` (AST check tooling, dev-only) to the dev-dependencies.
 
-**Performance.** No baseline measured and none required — correctness is the pre-1.0 priority. Expected overhead sources: `Box<dyn Future>` allocation per `async_trait` call, mailbox send+recv+oneshot reply per command, journal write per saga phase transition, `spawn_blocking` hop per SQLite op. No performance tooling is added by this ADR.
+**Performance.** Baseline measurement is mandatory per Decision 14 — pre-merge baseline + post-merge measurement on six operations (`handshake`, `send_message`, `deliver_incoming`, `governance_propose`, `broadcast_publish`, `broadcast_subscribe`) at N=1/4/16. A regression of >15% on any (operation, N) pair triggers §Rollback strategy trigger #4. The baseline harness lands as `cargo test -p scp-runtime --test perf_baseline` in commit 13.
+
+Expected overhead sources: `Box<dyn Future>` allocation per `async_trait` call, mailbox send+recv+oneshot reply per command, journal write per saga phase transition, `spawn_blocking` hop per SQLite op. The lock-free read invariant (Decision 12) keeps the hot read paths off the `RwLock::read` cost cliff documented in OpenSSL #30659 (~67 cycles per uncontended acquire vs ~17 for `__atomic_load_n`).
+
+Workload sensitivity: handshake is crypto-dominated (overhead is a small fraction); broadcast publish/subscribe is overhead-dominated (mailbox + journal allocations are visible). The baseline harness covers both classes plus both fast and slow paths.
 
 ## Verification
 
@@ -198,4 +256,5 @@ Invariants to verify (documented in plan):
 - Plan: `~/.claude/plans/generic-moseying-lightning.md` (execution detail, commit ladder, per-binding criteria, CI enforcement, failure modes)
 - Spec updates (commit 2): `.docs/specs/05-contexts.md` §5.15, `09-security-model.md` §9.4.1–3, `17-persistence-and-storage.md` §17.15–16, `architecture.md` trait contracts
 - Related ADRs: ADR-034 (WASM), ADR-046 (parity), ADR-047 (symmetry), ADR-048 (multi-instance)
+- Lock-free read evidence (Decisions 12–14): OpenSSL issue [#30659](https://github.com/openssl/openssl/issues/30659) ("Analysis of read locks taken while handshaking") and PR [#30670](https://github.com/openssl/openssl/pull/30670) (TTAS fix; visible gains on `randbytes`, none on `handshake`).
 - Prior plans superseded: none (this is the first actor-per-context ADR)

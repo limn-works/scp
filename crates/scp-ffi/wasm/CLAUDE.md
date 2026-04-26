@@ -8,6 +8,8 @@ This crate is the browser-target Rust half of the `@limn-works/scp-ts` TypeScrip
 
 `scp-runtime` depends on `tokio = { features = ["full"] }` which requires a multi-thread runtime. The `wasm32-unknown-unknown` target cannot compile this. Therefore, **this crate does NOT depend on scp-runtime**. WASM imports pure sync types from `scp-protocol` and event log types from `scp-event-log`. Only WASM-specific orchestration and JS bridge logic remains local.
 
+**Note on the actor model.** ADR-049's actor-per-context refactor (which deleted `ContextManager` from `scp-runtime` in favour of `Supervisor`) lives in `scp-runtime` and is therefore native-only. The WASM bridge continues its re-implementation path: the local `WasmContextManager` type defined in `manager.rs` is a different type from the deleted runtime-side `ContextManager` and has no relation to `Supervisor`. WASM's single-threaded `thread_local!` `RefCell` model is itself a serialization-by-construction actor, so the runtime's tokio-task-per-context concurrency redesign has no analogue here.
+
 ## What Was Migrated (from scp-protocol / scp-event-log)
 
 The following modules previously contained standalone WASM reimplementations. After the scp-protocol migration, they import shared types and algorithms directly:
