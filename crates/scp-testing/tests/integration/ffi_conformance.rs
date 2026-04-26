@@ -1152,6 +1152,7 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "identity_migrate",
     "identity_attest_device",
     "identity_verify_device_attestation",
+    "identity_verify_link_attestation",
     // Context lifecycle
     "context_create",
     "context_join",

@@ -3005,6 +3005,23 @@
       "wasm": [
         "configure_relay_transport"
       ]
+    },
+    {
+      "canonical": "identity_verify_link_attestation",
+      "category": "identity",
+      "wasm_required": true,
+      "pyo3": [
+        "verify_identity_link_attestation"
+      ],
+      "uniffi": [
+        "identity_verify_link_attestation"
+      ],
+      "napi": [
+        "identity_verify_link_attestation"
+      ],
+      "wasm": [
+        "identity_verify_link_attestation_signature"
+      ]
     }
   ],
   "exemptions": {
