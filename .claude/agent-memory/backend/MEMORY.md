@@ -1,0 +1,1 @@
+- [Swift UniFFI bindings regenerated in CI](reference_swift_uniffi_regen.md) — stale committed ScpBindings.swift can hide signature drift; local swift build passes while CI fails
