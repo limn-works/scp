@@ -1059,7 +1059,7 @@ impl Supervisor {
         // the 30-second mailbox-send timeout from
         // `ContextActorHandle::send_with_timeout`.
         if let Some(actor) = self.lookup(ctx_id) {
-            return Self::dispatch_messaging_via_mailbox(&actor, cmd).await;
+            return Self::dispatch_via_mailbox(&actor, ContextCommand::Messaging(cmd)).await;
         }
 
         // Legacy fallback: no actor registered for this context. The
@@ -1156,7 +1156,14 @@ impl Supervisor {
         &self,
         cmd: LifecycleCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12 — lifecycle handler takes `&Supervisor`.
+        // ADR-049 Phase 2A item 5 — try the actor mailbox first for
+        // variants whose context_id is visible without unboxing.
+        if let Some(ctx_id) = Self::lifecycle_command_context_id(&cmd) {
+            if let Some(actor) = self.lookup(ctx_id) {
+                return Self::dispatch_via_mailbox(&actor, ContextCommand::Lifecycle(cmd)).await;
+            }
+        }
+        // Direct-shim fallback: lifecycle handler takes `&Supervisor`.
         // `Box::pin` — the combined size of the rebuilt handle,
         // context params, and the per-variant 30s-timeout future
         // crosses clippy's 16-KB stack budget for async futures.
@@ -1190,7 +1197,13 @@ impl Supervisor {
         &self,
         cmd: TtlCloseCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12 — ttl_close handler takes `&Supervisor`.
+        // ADR-049 Phase 2A item 5 — try the actor mailbox first.
+        if let Some(ctx_id) = Self::ttl_close_command_context_id(&cmd) {
+            if let Some(actor) = self.lookup(ctx_id) {
+                return Self::dispatch_via_mailbox(&actor, ContextCommand::TtlClose(cmd)).await;
+            }
+        }
+        // Direct-shim fallback.
         Ok(handlers::ttl_close::dispatch_from_shim(self, cmd).await)
     }
 
@@ -1228,10 +1241,15 @@ impl Supervisor {
         &self,
         cmd: GovernanceCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12 — governance handler takes `&Supervisor`.
-        // `Box::pin` — see the matching comment on
-        // `handlers::governance::dispatch` for the 16-KB stack-future
-        // rationale.
+        // ADR-049 Phase 2A item 5 — try the actor mailbox first.
+        if let Some(ctx_id) = Self::governance_command_context_id(&cmd) {
+            if let Some(actor) = self.lookup(ctx_id) {
+                return Self::dispatch_via_mailbox(&actor, ContextCommand::Governance(cmd)).await;
+            }
+        }
+        // Direct-shim fallback. `Box::pin` — see the matching comment
+        // on `handlers::governance::dispatch` for the 16-KB stack-
+        // future rationale.
         Ok(Box::pin(handlers::governance::dispatch_from_shim(self, cmd)).await)
     }
 
@@ -1502,7 +1520,13 @@ impl Supervisor {
         &self,
         cmd: StandingCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12 — standing handler takes `&Supervisor`.
+        // ADR-049 Phase 2A item 5 — try the actor mailbox first.
+        if let Some(ctx_id) = Self::standing_command_context_id(&cmd) {
+            if let Some(actor) = self.lookup(ctx_id) {
+                return Self::dispatch_via_mailbox(&actor, ContextCommand::Standing(cmd)).await;
+            }
+        }
+        // Direct-shim fallback.
         Ok(Box::pin(handlers::standing::dispatch_from_shim(self, cmd)).await)
     }
 
@@ -1527,7 +1551,13 @@ impl Supervisor {
         &self,
         cmd: ToolsCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12 — tools handler takes `&Supervisor`.
+        // ADR-049 Phase 2A item 5 — try the actor mailbox first.
+        if let Some(ctx_id) = Self::tools_command_context_id(&cmd) {
+            if let Some(actor) = self.lookup(ctx_id) {
+                return Self::dispatch_via_mailbox(&actor, ContextCommand::Tools(cmd)).await;
+            }
+        }
+        // Direct-shim fallback.
         Ok(handlers::tools::dispatch_from_shim(self, cmd).await)
     }
 
@@ -1552,7 +1582,13 @@ impl Supervisor {
         &self,
         cmd: BroadcastCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12 — broadcast handlers take `&Supervisor`.
+        // ADR-049 Phase 2A item 5 — try the actor mailbox first.
+        if let Some(ctx_id) = Self::broadcast_command_context_id(&cmd) {
+            if let Some(actor) = self.lookup(ctx_id) {
+                return Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(cmd)).await;
+            }
+        }
+        // Direct-shim fallback.
         Ok(Box::pin(handlers::broadcast::dispatch_from_shim(self, cmd)).await)
     }
 
@@ -2681,143 +2717,146 @@ impl Supervisor {
     // ADR-049 Phase 2A — mailbox-routing helpers (item 5)
     // -----------------------------------------------------------------
 
-    /// Send a `MessagingCommand` to the actor's mailbox using the
-    /// [`ContextActorHandle::send_with_timeout`] entry point and await
-    /// the actor's reply. Used by [`Self::dispatch_command`] when an
-    /// actor is registered for the target context.
+    /// Generic mailbox dispatch: enqueue a fully-built `ContextCommand`
+    /// (with its embedded reply oneshot) on the actor's mailbox via
+    /// [`ContextActorHandle::send_with_timeout`]. The actor's run loop
+    /// pulls the command, dispatches it through the matching handler,
+    /// and the handler sends the typed result on the variant's
+    /// embedded oneshot — observable by the FFI caller who already
+    /// holds the matching `oneshot::Receiver`.
     ///
-    /// The reply oneshot is constructed inside this helper and
-    /// embedded into the command before sending. This decouples the
-    /// caller from the per-variant reply-shape — one helper per
-    /// command sub-enum suffices.
+    /// This helper does NOT await the reply — that responsibility
+    /// stays with the caller (FFI bridge code), preserving the
+    /// pre-existing single-await pattern. Returns
+    /// `Ok(Outcome::ok_mutated(()))` after a successful enqueue (the
+    /// real outcome flows through the caller's reply receiver).
+    ///
+    /// Used by every `dispatch_*_command` method when an actor is
+    /// registered for the target context.
     ///
     /// # Errors
     ///
     /// - [`ContextError::ActorBusy`] from the mailbox send (full,
-    ///   closed, or timeout).
-    /// - The handler's typed error returned through the reply oneshot.
-    ///
-    /// `Outcome { mutated: false }` is returned for any error path —
-    /// the actor's `dispatch_state` synthesizes a non-mutated outcome
-    /// when the handler short-circuits before touching state.
-    async fn dispatch_messaging_via_mailbox(
+    ///   closed, or timeout). The reply oneshot inside the command is
+    ///   still alive — the caller's `rx.await` returns
+    ///   `Err(RecvError)` which the bridge maps to its own typed
+    ///   error.
+    async fn dispatch_via_mailbox(
         actor: &ContextActorHandle,
-        cmd: MessagingCommand,
+        cmd: ContextCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // Variants whose typed reply is `Result<(), ContextError>`
-        // share the same plumbing — extract the reply, build a
-        // dispatch-internal oneshot, splice into the command, send,
-        // forward.
+        actor
+            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+            .await?;
+        // The handler runs inside the actor task and writes the typed
+        // result to the embedded reply oneshot. Whether it mutated state
+        // is recorded inside the actor's `dirty` flag via
+        // `dispatch_state`. This dispatch-method-level Outcome is for
+        // legacy callers; mark `mutated: true` because mutating
+        // commands are expected to flow through this path.
+        Ok(Outcome::ok_mutated(()))
+    }
+
+    /// Extract the target context_id from a [`LifecycleCommand`].
+    /// Returns `None` for variants that do not carry one (Placeholder)
+    /// or carry it inside an opaque payload (CreateContext / JoinContext /
+    /// ImportContext / RestoreContext — the boxed payload's inner field
+    /// is not visible without unboxing). Used by
+    /// [`Self::dispatch_lifecycle_command`] to decide whether to route
+    /// through an actor's mailbox.
+    fn lifecycle_command_context_id(cmd: &LifecycleCommand) -> Option<&str> {
         match cmd {
-            MessagingCommand::SendMessage { payload, reply: caller_reply } => {
-                let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), ContextError>>();
-                let cmd = MessagingCommand::SendMessage { payload, reply: tx };
-                actor
-                    .send_with_timeout(
-                        ContextCommand::Messaging(cmd),
-                        crate::context::actor::SEND_TIMEOUT,
-                    )
-                    .await?;
-                let result = rx.await.unwrap_or_else(|_| {
-                    Err(ContextError::ActorBusy(
-                        "actor dropped reply channel before replying".to_owned(),
-                    ))
-                });
-                let outcome = if result.is_ok() {
-                    Outcome::ok_mutated(())
-                } else {
-                    // ContextError is !Clone — synthesize a category-
-                    // preserving copy for the Outcome sink. The
-                    // authoritative typed error rides on caller_reply.
-                    Outcome::err_mutated(ContextError::ActorBusy(
-                        "send_message via mailbox returned typed error".to_owned(),
-                    ))
-                };
-                let _ = caller_reply.send(result);
-                Ok(outcome)
+            LifecycleCommand::ExportContext { context_id, .. }
+            | LifecycleCommand::GenerateContextAccessKey { context_id, .. }
+            | LifecycleCommand::RevokeContextAccessKey { context_id, .. }
+            | LifecycleCommand::RestoreContextAccessKey { context_id, .. } => {
+                Some(context_id.as_str())
             }
-            MessagingCommand::DeliverIncoming { context_id, envelope_bytes, reply: caller_reply } => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let cmd = MessagingCommand::DeliverIncoming { context_id, envelope_bytes, reply: tx };
-                actor
-                    .send_with_timeout(
-                        ContextCommand::Messaging(cmd),
-                        crate::context::actor::SEND_TIMEOUT,
-                    )
-                    .await?;
-                let result = rx.await.unwrap_or_else(|_| {
-                    Err(ContextError::ActorBusy(
-                        "actor dropped reply channel before replying".to_owned(),
-                    ))
-                });
-                let outcome = match &result {
-                    Ok(_) => Outcome::ok_mutated(()),
-                    Err(ContextError::ActorBusy(msg)) => {
-                        Outcome::err_mutated(ContextError::ActorBusy(msg.clone()))
-                    }
-                    Err(_) => Outcome::err_mutated(ContextError::ActorBusy(
-                        "deliver_incoming failed via mailbox".to_owned(),
-                    )),
-                };
-                let _ = caller_reply.send(result);
-                Ok(outcome)
+            // CreateContext / JoinContext / ImportContext / RestoreContext
+            // / LeaveContext / CloseContext / Placeholder either operate on
+            // a context that does not yet exist or carry their context_id
+            // inside a boxed payload not destructured here. Mailbox
+            // routing for these would require unboxing; for Phase 2A they
+            // continue through the direct-shim path.
+            _ => None,
+        }
+    }
+
+    /// Extract the target context_id from a [`BroadcastCommand`].
+    /// Only variants with a literal `context_id` field are routed via
+    /// the mailbox; boxed-payload variants stay on the direct-shim path
+    /// until a follow-on Phase 2 chunk destructures them.
+    fn broadcast_command_context_id(cmd: &BroadcastCommand) -> Option<&str> {
+        match cmd {
+            BroadcastCommand::HandleBroadcastKeyRequest { context_id, .. }
+            | BroadcastCommand::BroadcastSubscriberCount { context_id, .. }
+            | BroadcastCommand::IsBroadcastSubscriber { context_id, .. }
+            | BroadcastCommand::BroadcastAdmission { context_id, .. } => {
+                Some(context_id.as_str())
             }
-            MessagingCommand::DrainEvents { context_id, reply: caller_reply } => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let cmd = MessagingCommand::DrainEvents { context_id, reply: tx };
-                actor
-                    .send_with_timeout(
-                        ContextCommand::Messaging(cmd),
-                        crate::context::actor::SEND_TIMEOUT,
-                    )
-                    .await?;
-                let result = rx.await.unwrap_or_else(|_| {
-                    Err(ContextError::ActorBusy(
-                        "actor dropped reply channel before replying".to_owned(),
-                    ))
-                });
-                let outcome = if result.is_ok() {
-                    Outcome::ok_mutated(())
-                } else {
-                    Outcome::err_mutated(ContextError::ActorBusy(
-                        "drain_events failed via mailbox".to_owned(),
-                    ))
-                };
-                let _ = caller_reply.send(result);
-                Ok(outcome)
+            // SubscribeBroadcast / UnsubscribeBroadcast /
+            // BlockBroadcastSubscriber / UnblockBroadcastSubscriber /
+            // PublishBroadcast / PublishBroadcastContent /
+            // InitiateBroadcastHostingHandshake / Placeholder either
+            // carry context_id inside a boxed payload or have no target.
+            _ => None,
+        }
+    }
+
+    /// Extract the target context_id from a [`TtlCloseCommand`].
+    /// Only `ExtendTtl` has a literal `context_id` field; the others
+    /// (StartTtlTimer / ResetTtlTimer / ExecuteTtlClose / FinalizeClose)
+    /// carry it inside boxed payloads. Boxed-payload variants route via
+    /// the direct-shim path until a follow-on Phase 2 chunk destructures
+    /// them.
+    fn ttl_close_command_context_id(cmd: &TtlCloseCommand) -> Option<&str> {
+        match cmd {
+            TtlCloseCommand::ExtendTtl { context_id, .. } => Some(context_id.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Extract the target context_id from a [`GovernanceCommand`].
+    /// Most variants have a `context_id` string field; a few carry it
+    /// in opaque boxed payloads (those return `None` and route via
+    /// the direct-shim path).
+    fn governance_command_context_id(cmd: &GovernanceCommand) -> Option<&str> {
+        match cmd {
+            GovernanceCommand::GetProposal { context_id, .. }
+            | GovernanceCommand::ListProposals { context_id, .. }
+            | GovernanceCommand::ApplyPendingCeilingModification { context_id, .. }
+            | GovernanceCommand::ApplyPendingEconomicPolicyChange { context_id, .. }
+            | GovernanceCommand::TombstoneMigratedContext { context_id, .. }
+            | GovernanceCommand::MigrationState { context_id, .. }
+            | GovernanceCommand::AcknowledgeCommitFault { context_id, .. } => {
+                Some(context_id.as_str())
             }
-            MessagingCommand::SendPseudonymAnnouncement { payload, reply: caller_reply } => {
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let cmd = MessagingCommand::SendPseudonymAnnouncement { payload, reply: tx };
-                actor
-                    .send_with_timeout(
-                        ContextCommand::Messaging(cmd),
-                        crate::context::actor::SEND_TIMEOUT,
-                    )
-                    .await?;
-                let result = rx.await.unwrap_or_else(|_| {
-                    Err(ContextError::ActorBusy(
-                        "actor dropped reply channel before replying".to_owned(),
-                    ))
-                });
-                let outcome = if result.is_ok() {
-                    Outcome::ok_mutated(())
-                } else {
-                    Outcome::err_mutated(ContextError::ActorBusy(
-                        "send_pseudonym_announcement failed via mailbox".to_owned(),
-                    ))
-                };
-                let _ = caller_reply.send(result);
-                Ok(outcome)
-            }
-            MessagingCommand::Placeholder { reply } => {
-                let _ = reply.send(Err(ContextError::NotImplemented(
-                    "MessagingCommand::Placeholder via mailbox".to_owned(),
-                )));
-                Ok(Outcome::err(ContextError::NotImplemented(
-                    "MessagingCommand::Placeholder via mailbox".to_owned(),
-                )))
-            }
+            // VoteOnProposal / ApproveGovernanceProposal /
+            // RejectGovernanceProposal / WithdrawGovernanceVote /
+            // ExecuteGovernanceAction / ProposeGovernanceAction /
+            // ProposeGovernanceActionChecked carry context_id inside a
+            // boxed payload; not routed via mailbox until that payload
+            // is destructured in a follow-on Phase 2 chunk.
+            _ => None,
+        }
+    }
+
+    /// Extract the target context_id from a [`StandingCommand`].
+    /// Most variants identify the standing peer by `peer_did` rather
+    /// than a context_id and have no actor target — return `None`.
+    /// Phase 2A leaves StandingCommand on the direct-shim path; the
+    /// mailbox-routing extension lands when standing-pair sagas land in
+    /// a follow-on Phase 2 chunk.
+    fn standing_command_context_id(_cmd: &StandingCommand) -> Option<&str> {
+        None
+    }
+
+    /// Extract the target context_id from a [`ToolsCommand`].
+    fn tools_command_context_id(cmd: &ToolsCommand) -> Option<&str> {
+        match cmd {
+            ToolsCommand::TryConsumeHardRateLimit { context_id, .. }
+            | ToolsCommand::RefundHardRateLimit { context_id, .. } => Some(context_id.as_str()),
+            _ => None,
         }
     }
 }
