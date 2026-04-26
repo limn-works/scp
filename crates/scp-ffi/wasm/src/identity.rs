@@ -1062,6 +1062,8 @@ impl WasmDIDDocument {
 fn narrow_testing_seed(
     testing_seed: Option<Vec<u8>>,
 ) -> Result<Option<zeroize::Zeroizing<[u8; 32]>>, JsValue> {
+    use zeroize::Zeroize;
+
     let Some(mut source) = testing_seed else {
         return Ok(None);
     };
@@ -1076,7 +1078,6 @@ fn narrow_testing_seed(
                 }
                 .into_js()
             })?;
-        use zeroize::Zeroize;
         source.zeroize();
         Ok(Some(zeroize::Zeroizing::new(narrowed)))
     }
@@ -1086,7 +1087,6 @@ fn narrow_testing_seed(
         // Wipe the source even on the rejection path — the caller
         // supplied bytes, we must not let them linger regardless of
         // whether we accept them.
-        use zeroize::Zeroize;
         source.zeroize();
         Err(ScpWasmError::Validation {
             message: "`testing_seed` parameter requires the `testing` feature — not available \
@@ -2089,39 +2089,18 @@ fn lookup_migration_source(did: &str) -> Result<MigrationSourceKeys, ScpWasmErro
     }
 }
 
-/// Bundle of values [`install_migrated_identity`] needs to insert the
-/// new `Local` record. Produced by Phase 2 of [`migrate_inner`].
-struct MigratedIdentityInsert {
-    new_did: String,
-    custody: String,
-    new_signing_key_bytes: zeroize::Zeroizing<[u8; 32]>,
-    new_active_signing_key_bytes: zeroize::Zeroizing<[u8; 32]>,
-    new_pre_rotation_signing_key_bytes: zeroize::Zeroizing<[u8; 32]>,
-    new_public_key_bytes: [u8; 32],
-    new_agent_signing_key_bytes: Option<zeroize::Zeroizing<[u8; 32]>>,
-}
-
 /// Removes the source identity, capacity-checks, and installs the
 /// migrated `Local` record. Also ports `LINK_ATTESTATIONS` to the new
 /// DID and records the `MIGRATION_LINKS` mapping for `alsoKnownAs`.
 fn install_migrated_identity(
     old_did: &str,
-    insert: MigratedIdentityInsert,
+    new_did: &str,
+    record: IdentityRecord,
 ) -> Result<(), ScpWasmError> {
-    let MigratedIdentityInsert {
-        new_did,
-        custody,
-        new_signing_key_bytes,
-        new_active_signing_key_bytes,
-        new_pre_rotation_signing_key_bytes,
-        new_public_key_bytes,
-        new_agent_signing_key_bytes,
-    } = insert;
-
     IDENTITY_REGISTRY.with(|reg| -> Result<(), ScpWasmError> {
         let mut map = reg.borrow_mut();
         map.remove(old_did);
-        if !map.contains_key(&new_did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
+        if !map.contains_key(new_did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
             return Err(ScpWasmError::Validation {
                 message: format!(
                     "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
@@ -2130,30 +2109,20 @@ fn install_migrated_identity(
                 code: codes::VALID_7400.to_owned(),
             });
         }
-        map.insert(
-            new_did.clone(),
-            IdentityRecord::Local {
-                signing_key_bytes: new_signing_key_bytes,
-                active_signing_key_bytes: new_active_signing_key_bytes,
-                pre_rotation_signing_key_bytes: new_pre_rotation_signing_key_bytes,
-                public_key_bytes: new_public_key_bytes,
-                custody_type: custody,
-                agent_signing_key_bytes: new_agent_signing_key_bytes,
-            },
-        );
+        map.insert(new_did.to_owned(), record);
         Ok(())
     })?;
 
     LINK_ATTESTATIONS.with(|reg| {
         let mut map = reg.borrow_mut();
         if let Some(attestations) = map.remove(old_did) {
-            map.insert(new_did.clone(), attestations);
+            map.insert(new_did.to_owned(), attestations);
         }
     });
 
     MIGRATION_LINKS.with(|links| -> Result<(), ScpWasmError> {
         let mut map = links.borrow_mut();
-        if !map.contains_key(&new_did) && map.len() >= WASM_MIGRATION_LINKS_CAP {
+        if !map.contains_key(new_did) && map.len() >= WASM_MIGRATION_LINKS_CAP {
             return Err(ScpWasmError::Validation {
                 message: format!(
                     "migration links registry has reached capacity ({WASM_MIGRATION_LINKS_CAP}) \
@@ -2162,7 +2131,7 @@ fn install_migrated_identity(
                 code: codes::VALID_7401.to_owned(),
             });
         }
-        map.insert(new_did, old_did.to_owned());
+        map.insert(new_did.to_owned(), old_did.to_owned());
         Ok(())
     })?;
 
@@ -2308,14 +2277,14 @@ fn migrate_inner(
     // record MIGRATION_LINKS for `alsoKnownAs`.
     install_migrated_identity(
         &old_did,
-        MigratedIdentityInsert {
-            new_did: new_did.clone(),
-            custody: custody.clone(),
-            new_signing_key_bytes: zeroize::Zeroizing::new(new_signing_key.to_bytes()),
-            new_active_signing_key_bytes,
-            new_pre_rotation_signing_key_bytes,
-            new_public_key_bytes: new_pub_bytes,
-            new_agent_signing_key_bytes,
+        &new_did,
+        IdentityRecord::Local {
+            signing_key_bytes: zeroize::Zeroizing::new(new_signing_key.to_bytes()),
+            active_signing_key_bytes: new_active_signing_key_bytes,
+            pre_rotation_signing_key_bytes: new_pre_rotation_signing_key_bytes,
+            public_key_bytes: new_pub_bytes,
+            custody_type: custody.clone(),
+            agent_signing_key_bytes: new_agent_signing_key_bytes,
         },
     )?;
 
@@ -3919,8 +3888,9 @@ mod tests {
         cleanup_registries();
 
         // Register a seeded identity mirroring the seed path in
-        // `identity_create`: identity_key from seed[0..32], active_signing
-        // from seed[32..64], via `StdRng::from_seed`.
+        // `identity_create`: identity_key from seed[0..32], active from
+        // seed[32..64], pre-rotation from seed[64..96], via
+        // `StdRng::from_seed`.
         let seed = [0x42u8; 32];
         let mut rng = rand::rngs::StdRng::from_seed(seed);
         let mut identity_key_bytes = [0u8; 32];
@@ -3929,6 +3899,8 @@ mod tests {
         let identity_pub_bytes = identity_key.verifying_key().to_bytes();
         let mut active_bytes = [0u8; 32];
         rng.fill_bytes(&mut active_bytes);
+        let mut pre_rotation_bytes = [0u8; 32];
+        rng.fill_bytes(&mut pre_rotation_bytes);
 
         let did = format!("did:dht:z{}", zbase32_encode(&identity_pub_bytes));
         IDENTITY_REGISTRY.with(|reg| {
@@ -3937,6 +3909,7 @@ mod tests {
                 IdentityRecord::Local {
                     signing_key_bytes: zeroize::Zeroizing::new(identity_key.to_bytes()),
                     active_signing_key_bytes: zeroize::Zeroizing::new(active_bytes),
+                    pre_rotation_signing_key_bytes: zeroize::Zeroizing::new(pre_rotation_bytes),
                     public_key_bytes: identity_pub_bytes,
                     custody_type: "in_memory".to_owned(),
                     agent_signing_key_bytes: None,
