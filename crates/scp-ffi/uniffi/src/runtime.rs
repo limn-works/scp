@@ -308,6 +308,15 @@ impl UniffiBridgeInstance {
         match config {
             StorageConfig::InMemory => Ok(Self::new_uniffi()),
             StorageConfig::Sqlite { path, key } => {
+                // Defense-in-depth: validate path string at FFI boundary
+                // (matches the project pattern for every other caller-supplied
+                // string). #1543 PR-C security review.
+                scp_ffi_common::validate::validate_storage_path(&path).map_err(|e| {
+                    StorageInitError::SqliteOpen {
+                        path: path.clone(),
+                        message: format!("invalid 'path' — {}", e.message),
+                    }
+                })?;
                 // UniFFI's `Enum` derive cannot carry a `Zeroizing<Vec<u8>>`
                 // across the FFI boundary (no built-in `FfiConverter`), so
                 // the wire type is a plain `Vec<u8>`. The moment we own
