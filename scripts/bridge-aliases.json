@@ -2937,6 +2937,23 @@
       "wasm": [
         "relay_start_local"
       ]
+    },
+    {
+      "canonical": "with_storage",
+      "category": "bridge",
+      "wasm_required": false,
+      "pyo3": [
+        "with_storage"
+      ],
+      "uniffi": [
+        "with_storage"
+      ],
+      "napi": [
+        "with_storage"
+      ],
+      "wasm": [
+        "with_storage"
+      ]
     }
   ],
   "exemptions": {
@@ -3037,6 +3054,10 @@
       {
         "canonical": "relay_start_local",
         "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no transport per ADR-034."
+      },
+      {
+        "canonical": "with_storage",
+        "reason": "WASM bridge has no scp-platform per ADR-034 — no persistent on-disk storage primitives. Storage attachment is a no-op on WASM; consumers either use the in-memory default or wire persistence via the host JS runtime."
       }
     ]
   }

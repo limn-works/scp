@@ -1106,17 +1106,15 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
 }
 
 // ============================================================================
-// Storage initialization
+// Storage initialization (via the with_storage factory)
 // ============================================================================
 
-#[test]
-fn init_storage_in_memory() {
-    setup();
-    assert!(runtime::init_storage(&__bi(), "in_memory").is_ok());
-}
-
-#[test]
-fn init_storage_unknown_type_fails() {
-    setup();
-    assert!(runtime::init_storage(&__bi(), "nonexistent").is_err());
-}
+// The legacy `runtime::init_storage(&bi, "in_memory")` imperative-attach
+// helper was removed in #1543 PR-C in favour of the
+// `PyBridgeInstance::with_storage_py(StorageConfig)` factory — driven from
+// Python by `SCP.with_storage({...})`. Coverage for the factory's InMemory
+// path lives in
+// `crates/scp-ffi/src/runtime.rs::tests::test_py_bridge_instance_with_storage_py_initializes_storage`.
+// Validation of unknown storage `type` strings now happens at the Python
+// boundary in `crate::scp::PyScp::with_storage` (covered by
+// `bindings/python/tests/test_scp_class.py::test_with_storage_rejects_unknown_type`).

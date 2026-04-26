@@ -59,10 +59,17 @@ const PYO3_SCP: &str = include_str!("../../../../crates/scp-ffi/src/scp.rs");
 const PYO3_SCPID: &str = include_str!("../../../../crates/scp-ffi/src/scpid.rs");
 const PYO3_SERVER: &str = include_str!("../../../../crates/scp-ffi/src/server.rs");
 
-// UniFFI bridge (single file) plus the server module that hosts UniFFI's
-// site-projection methods (enable/disable_site_projection on the Server type).
+// UniFFI bridge spans three files: the central `bridge.rs` (most ops),
+// `server.rs` (site-projection methods on the `Server` type), and `scp.rs`
+// which hosts the construction-time lifecycle surface on the `Scp` type
+// (`new` / `with_storage` / `with_persistence` / `suspend` / `resume` /
+// `shutdown`). All three must be embedded so the conformance test sees the
+// full UniFFI surface — without `scp.rs` the alias resolver flags
+// constructors like `with_storage` as phantom even though they are
+// wired and exposed to Swift/Kotlin.
 const UNIFFI_BRIDGE: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
 const UNIFFI_SERVER: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/server.rs");
+const UNIFFI_SCP: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/scp.rs");
 
 // NAPI bridge sources
 const NAPI_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/napi/src/identity.rs");
@@ -497,12 +504,17 @@ fn pyo3_has_operation(sources: &[&'static str], canonical: &str) -> bool {
 }
 
 fn uniffi_has_operation(canonical: &str) -> bool {
-    // UniFFI's surface spans both the central bridge.rs (most ops) and a
-    // smaller server.rs module that hosts site-projection methods on the
-    // `Server` type. Search both — Batch 2 (#1543).
-    uniffi_names(canonical)
-        .iter()
-        .any(|name| source_has_fn(UNIFFI_BRIDGE, name) || source_has_fn(UNIFFI_SERVER, name))
+    // UniFFI's surface spans `bridge.rs` (most ops), `server.rs` (site
+    // projection on the Server type), and `scp.rs` (lifecycle methods on
+    // the Scp type — `new` / `with_storage` / `suspend` / `resume` /
+    // `shutdown`). Search all three. Adding `scp.rs` was a #1543 follow-up
+    // when `with_storage` parity exposed the gap — Batch 2 had only
+    // included bridge.rs + server.rs.
+    uniffi_names(canonical).iter().any(|name| {
+        source_has_fn(UNIFFI_BRIDGE, name)
+            || source_has_fn(UNIFFI_SERVER, name)
+            || source_has_fn(UNIFFI_SCP, name)
+    })
 }
 
 fn napi_has_operation(sources: &[&'static str], canonical: &str) -> bool {
@@ -1480,11 +1492,13 @@ fn every_alias_resolves_to_a_real_fn_or_exemption() {
         // --- uniffi ---
         if !uniffi_exempt.contains(op.canonical.as_str()) {
             let any_resolves = op.uniffi.iter().any(|name| {
-                source_has_fn(UNIFFI_BRIDGE, name) || source_has_fn(UNIFFI_SERVER, name)
+                source_has_fn(UNIFFI_BRIDGE, name)
+                    || source_has_fn(UNIFFI_SERVER, name)
+                    || source_has_fn(UNIFFI_SCP, name)
             });
             if !any_resolves {
                 phantom.push(format!(
-                    "uniffi:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/uniffi/src/{{bridge,server}}.rs",
+                    "uniffi:{} — none of the declared aliases {:?} resolve to `fn <name>(` in crates/scp-ffi/uniffi/src/{{bridge,server,scp}}.rs",
                     op.canonical, op.uniffi
                 ));
             }
