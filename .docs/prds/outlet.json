@@ -1678,7 +1678,7 @@
       "gate": "gate-errors",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-protocol/src/context/outlets/errors.rs",
         "crates/scp-testing/tests/integration/conformance.rs"
