@@ -67,7 +67,16 @@ pub use scp_protocol::context::ContextError;
 // ContextActor — the per-context dispatch loop
 // ---------------------------------------------------------------------------
 
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
 use tokio::sync::mpsc;
+
+/// Coalesced-persistence interval. ADR-049 §Decision 9 (50 ms): a
+/// burst of mutations that all complete within this window collapse to
+/// a single durable snapshot write. The actor's `run()` loop wakes on
+/// this interval iff `dirty == true` and writes the latest snapshot.
+const COALESCE_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Encode a 32-byte context ID as lowercase hex. Matches the string
 /// form used throughout the legacy `ContextManager` shim so the
@@ -156,6 +165,19 @@ pub struct ContextActor {
     /// Initialized `false` at actor construction.
     #[allow(dead_code)] // read by 12b.2b+ run-loop
     dirty: bool,
+    /// **TRANSITIONAL — Phase 2A shim dispatch period.** Held so the
+    /// actor's `run()` loop can route commands through the
+    /// per-handler `dispatch_from_shim` entry points which still take
+    /// `&Supervisor`. Removed when handler bodies migrate to the
+    /// `(&mut PerContextState, &ActorDeps)` signature in Phase 2B-2I.
+    ///
+    /// Sourced from [`deps::ActorDeps::supervisor`] via
+    /// [`crate::context::supervisor::SupervisorHandle::shim_supervisor`]
+    /// at actor construction time. `None` for skeleton-mode actors
+    /// constructed via [`Self::new_skeleton`] (those route through
+    /// the actor's terminal-NotImplemented fallback because they have
+    /// no state/deps to operate on).
+    shim_supervisor: Option<Arc<crate::context::supervisor::Supervisor>>,
 }
 
 impl ContextActor {
@@ -199,6 +221,11 @@ impl ContextActor {
         inbox: mpsc::Receiver<ContextCommand>,
     ) -> Self {
         let context_id = hex_encode_context_id(&state.context_id);
+        // Capture the shim-supervisor pointer before moving `deps` into
+        // the actor: the run loop's transitional handler dispatch needs
+        // an `Arc<Supervisor>` it can pass into the per-handler
+        // `dispatch_from_shim` entry points.
+        let shim_supervisor = Some(deps.supervisor.shim_supervisor());
         Self {
             context_id,
             inbox,
@@ -206,8 +233,9 @@ impl ContextActor {
             deps: Some(deps),
             ttl_timer: None,
             governance_timeout: None,
-            last_persisted_at: std::time::Instant::now(),
+            last_persisted_at: Instant::now(),
             dirty: false,
+            shim_supervisor,
         }
     }
 
@@ -250,32 +278,252 @@ impl ContextActor {
             // carrying a magic-value sentinel. When 12b.2b removes the
             // skeleton path this field is populated identically via
             // [`Self::new`].
-            last_persisted_at: std::time::Instant::now(),
+            last_persisted_at: Instant::now(),
             dirty: false,
+            shim_supervisor: None,
         }
     }
 
-    /// Dispatch loop. See plan §"ContextActor" for the full
-    /// four-arm `select!` shape that commits 7-11 build out. Commit 6's
-    /// loop is a single-arm variant: drain the inbox until it closes or
-    /// a terminal command arrives.
+    /// Dispatch loop. See plan §"ContextActor" — the operational
+    /// four-arm `tokio::select!`:
     ///
-    /// The commit-6 loop is NOT yet wired to state-owning handlers
-    /// (`ContextActor` does not hold `state` / `deps` yet — see the
-    /// struct's field list). Received commands are matched to detect
-    /// the terminal `Shutdown` variant; all other variants receive an
-    /// immediate
-    /// [`ContextError::NotImplemented`](scp_protocol::context::ContextError::NotImplemented)
-    /// reply via the command's embedded `oneshot::Sender`. This keeps
-    /// callers unblocked while the migration commits land.
+    /// 1. **Inbox** — `mpsc::Receiver::recv` for [`ContextCommand`]s.
+    ///    Shutdown commands dispatch and then break the loop.
+    /// 2. **TTL timer** — only when `ttl_timer.is_some()`.
+    /// 3. **Governance timeout** — only when `governance_timeout.is_some()`.
+    /// 4. **Persistence coalesce** — only when `dirty == true`.
+    ///
+    /// `biased;` ordering keeps shutdown priority and gives deterministic
+    /// dispatch under test reproducers.
+    ///
+    /// # State-owning vs. skeleton-mode actors
+    ///
+    /// State-owning actors (constructed via [`Self::new`]) carry both
+    /// `state` and `deps`. The dispatch routes each command to the
+    /// matching handler module's transitional `dispatch_from_shim` entry
+    /// point — those still take `&Supervisor`, sourced from
+    /// `deps.supervisor.shim_supervisor()` at construction. Phase 2B-2I
+    /// migrates each handler to the
+    /// `(&mut PerContextState, &ActorDeps)` signature; when a domain
+    /// migrates, its arm in `dispatch_state` flips to call the
+    /// state-owning `dispatch` entry point.
+    ///
+    /// Skeleton-mode actors (constructed via [`Self::new_skeleton`])
+    /// carry no state or deps — they fall through to the synchronous
+    /// `skeleton_dispatch` path that ACKs every command with
+    /// `NotImplemented`. This preserves the pre-Phase-2A test fixtures'
+    /// behaviour while the production path migrates.
     pub async fn run(mut self) {
-        while let Some(cmd) = self.inbox.recv().await {
-            let is_shutdown = cmd.is_shutdown();
-            Self::skeleton_dispatch(cmd);
-            if is_shutdown {
-                break;
+        // Kick the persistence coalesce timer off the floor: the first
+        // mutation will set `dirty = true`, then the `select!` arm
+        // computes the deadline as `last_persisted_at + COALESCE_INTERVAL`
+        // — which is in the future relative to actor-spawn `now()`.
+        loop {
+            tokio::select! {
+                biased;
+
+                // --- Arm 1: inbox ----------------------------------
+                maybe_cmd = self.inbox.recv() => {
+                    match maybe_cmd {
+                        Some(cmd) => {
+                            let is_shutdown = matches!(
+                                cmd,
+                                ContextCommand::LifecycleControl(
+                                    LifecycleControlCommand::Shutdown { .. }
+                                )
+                            );
+                            self.dispatch(cmd).await;
+                            if is_shutdown {
+                                break;
+                            }
+                        }
+                        // Inbox closed — every sender dropped. Exit
+                        // gracefully (a final coalesced persist runs
+                        // below in the post-loop drain).
+                        None => break,
+                    }
+                }
+
+                // --- Arm 2: TTL timer ------------------------------
+                _ = async {
+                    // SAFETY: guard ensures `ttl_timer.is_some()` before
+                    // this future is polled.
+                    self.ttl_timer.as_mut().unwrap().tick().await
+                }, if self.ttl_timer.is_some() => {
+                    self.on_ttl_tick().await;
+                }
+
+                // --- Arm 3: governance timeout ---------------------
+                () = async {
+                    // SAFETY: guard ensures `governance_timeout.is_some()`
+                    // before this future is polled. `Pin::as_mut` borrows
+                    // the pinned sleep so we can await it in place.
+                    let pinned = self.governance_timeout.as_mut().unwrap();
+                    pinned.as_mut().await;
+                }, if self.governance_timeout.is_some() => {
+                    self.on_governance_timeout().await;
+                    self.governance_timeout = None;
+                }
+
+                // --- Arm 4: persistence coalesce -------------------
+                () = tokio::time::sleep_until(
+                    tokio::time::Instant::from_std(
+                        self.last_persisted_at + COALESCE_INTERVAL
+                    )
+                ), if self.dirty => {
+                    self.persist_snapshot().await;
+                    self.last_persisted_at = Instant::now();
+                    self.dirty = false;
+                }
             }
         }
+        // Final drain: write any pending state before the actor exits
+        // so callers observing the shutdown ack can rely on durability.
+        if self.dirty {
+            self.persist_snapshot().await;
+        }
+    }
+
+    /// Dispatch a single command to its matching handler. The
+    /// transitional implementation routes through
+    /// `handlers::X::dispatch_from_shim` for handlers that have not
+    /// yet migrated to the `(&mut PerContextState, &ActorDeps)`
+    /// signature; the few that have migrated
+    /// (`lifecycle_control`, `saga`) take the actor-owned state
+    /// directly.
+    ///
+    /// Skeleton-mode actors (no state/deps) fall through to
+    /// `skeleton_dispatch` and ACK every variant with
+    /// `NotImplemented`.
+    async fn dispatch(&mut self, cmd: ContextCommand) {
+        // Skeleton path: no state, no deps. Fall through to the
+        // synchronous ACK helper that replies `NotImplemented` to every
+        // variant. Used by the pre-Phase-2A test fixtures.
+        if self.state.is_none() || self.deps.is_none() || self.shim_supervisor.is_none() {
+            Self::skeleton_dispatch(cmd);
+            return;
+        }
+
+        // Take the state/deps/supervisor out so we can pass them as
+        // exclusive borrows without re-borrow conflicts. We restore
+        // them at the end of the function.
+        let mut state = self.state.take().expect("checked Some above");
+        let deps = self.deps.take().expect("checked Some above");
+        let supervisor = self.shim_supervisor.clone().expect("checked Some above");
+
+        let outcome = Self::dispatch_state(&mut state, &deps, &supervisor, cmd).await;
+        if outcome.mutated {
+            self.dirty = true;
+        }
+
+        // Restore.
+        self.state = Some(state);
+        self.deps = Some(deps);
+    }
+
+    /// State-owning dispatch. Routes each `ContextCommand` variant to
+    /// the matching handler's entry point. During the Phase 2A → 2I
+    /// transition, most arms call `dispatch_from_shim(supervisor, ...)`
+    /// — `supervisor` is `Arc<Supervisor>` cloned from
+    /// `deps.supervisor.shim_supervisor()`. Domains that have already
+    /// migrated to the state-owning signature
+    /// (`lifecycle_control`, `saga`) call the actor-shape `dispatch`
+    /// entry point with `&mut state, &deps`.
+    ///
+    /// Returns the handler's [`Outcome`]; the run-loop reads
+    /// `outcome.mutated` to decide whether to set `self.dirty`.
+    async fn dispatch_state(
+        state: &mut state::PerContextState,
+        deps: &deps::ActorDeps,
+        supervisor: &Arc<crate::context::supervisor::Supervisor>,
+        cmd: ContextCommand,
+    ) -> Outcome<()> {
+        match cmd {
+            ContextCommand::Messaging(sub) => {
+                handlers::messaging::dispatch_from_shim(
+                    supervisor,
+                    &mut state.send_tracker,
+                    sub,
+                )
+                .await
+            }
+            ContextCommand::Lifecycle(sub) => {
+                Box::pin(handlers::lifecycle::dispatch_from_shim(supervisor, sub)).await
+            }
+            ContextCommand::Governance(sub) => {
+                Box::pin(handlers::governance::dispatch_from_shim(supervisor, sub)).await
+            }
+            ContextCommand::Broadcast(sub) => {
+                Box::pin(handlers::broadcast::dispatch_from_shim(supervisor, sub)).await
+            }
+            ContextCommand::Economy(sub) => {
+                handlers::economy::dispatch_from_shim(supervisor, sub).await
+            }
+            ContextCommand::TrustRecovery(sub) => {
+                Box::pin(handlers::trust_recovery::dispatch_from_shim(supervisor, sub)).await
+            }
+            ContextCommand::Standing(sub) => {
+                Box::pin(handlers::standing::dispatch_from_shim(supervisor, sub)).await
+            }
+            ContextCommand::TtlClose(sub) => {
+                handlers::ttl_close::dispatch_from_shim(supervisor, sub).await
+            }
+            ContextCommand::Tools(sub) => {
+                handlers::tools::dispatch_from_shim(supervisor, sub).await
+            }
+            // Queries route through the supervisor's query-shim entry
+            // point because the queries handler signature additionally
+            // takes the event-log provider Arc. The supervisor's
+            // `dispatch_query` resolves the per-context state and
+            // event_log together; piping through it preserves the
+            // soft-fallback semantics for missing-context cases.
+            ContextCommand::Queries(sub) => match supervisor.dispatch_query(sub).await {
+                Ok(o) => Outcome { result: o.result, mutated: false },
+                Err(e) => Outcome::err(e),
+            },
+            // SagaPhase + LifecycleControl already migrated to the
+            // state-owning signature.
+            ContextCommand::SagaPhase(msg) => {
+                handlers::saga::dispatch(state, deps, msg).await
+            }
+            ContextCommand::LifecycleControl(sub) => {
+                handlers::lifecycle_control::dispatch(state, deps, sub).await
+            }
+        }
+    }
+
+    /// Drive the TTL-timer arm. Phase 2A leaves the body empty: the
+    /// legacy `ContextManager` continues to drive TTL expiry through
+    /// its own spawned timer until a future Phase 2 sub-chunk migrates
+    /// the timer onto the actor's owned state. The arm exists here so
+    /// future migration is purely additive.
+    ///
+    /// `_state`/`_deps` allow: future migrations read them; for now the
+    /// method is a no-op.
+    async fn on_ttl_tick(&mut self) {
+        // No-op until the TTL handler migrates to the actor's owned
+        // state in a follow-on Phase 2 sub-chunk.
+    }
+
+    /// Drive the governance-timeout arm. Same migration shape as
+    /// `on_ttl_tick`: the legacy supervisor still drives governance
+    /// timeouts; the arm here is a no-op until the migration lands.
+    async fn on_governance_timeout(&mut self) {
+        // No-op until the governance timeout handler migrates to the
+        // actor's owned state in a follow-on Phase 2 sub-chunk.
+    }
+
+    /// Persistence coalesce: write the current state's snapshot.
+    /// Phase 2A delegates to the supervisor's persistence backend if
+    /// the actor owns deps; skeleton-mode is a no-op.
+    async fn persist_snapshot(&mut self) {
+        // The state-owning persist path is wired in a follow-on Phase 2
+        // sub-chunk together with the snapshot-shape contract on
+        // `PerContextState`. For Phase 2A the run loop's coalesce arm
+        // simply clears `dirty` so the loop does not spin; durable
+        // writes continue to flow through the legacy
+        // `ContextManager::persist_context_snapshot` path until the
+        // migration completes.
     }
 
     /// Skeleton dispatch — matches every variant and ACKs via the

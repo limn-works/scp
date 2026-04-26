@@ -155,6 +155,24 @@ impl SupervisorHandle {
             .get(did)
             .map(|r| r.value().clone())
     }
+
+    /// **TRANSITIONAL — shim dispatch period only.** Returns the inner
+    /// `Arc<Supervisor>` so the actor's `run()` loop can route commands
+    /// through the legacy `dispatch_from_shim` handler entry points
+    /// during the Phase 2A → 2I migration window. Removed when handlers
+    /// are migrated to the `(&mut PerContextState, &ActorDeps)`
+    /// signature in the per-domain rows of Phase 2.
+    ///
+    /// Visibility is `pub(in crate::context)` so only code within the
+    /// `context` module tree (the actor's run loop) can call this.
+    /// Handler bodies under `actor/handlers/` MUST NOT call this — they
+    /// receive the supervisor via the explicit `&Supervisor` parameter
+    /// of their `dispatch_from_shim` entry point.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(in crate::context) fn shim_supervisor(&self) -> Arc<Supervisor> {
+        Arc::clone(&self.supervisor)
+    }
 }
 
 // Explicit non-exposure check: ensure no public method returns
