@@ -4548,6 +4548,7 @@ async fn outlet_call_spending_ucan_expired() {
         }],
         prf: vec![],
         fct: Some(serde_json::Value::Object(fct)),
+        nb: None,
     };
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
     let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());

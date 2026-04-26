@@ -1024,6 +1024,32 @@ interface UcanBindings {
         contextHandle: Long,
         memberDid: String,
         capabilitiesJson: String,
+        caveatsJson: String? = null,
+    ): String
+
+    /**
+     * Narrows a parent UCAN token by attaching attenuated §7.3.8 caveats
+     * (SCP-OUT-023). Re-issues the parent to the same audience with the
+     * child caveats; the §7.3.8 narrow rules are enforced inside the
+     * Rust core (numeric ceilings tighten downward, validity windows
+     * shift inward, masks subset, lists subset, `originKind` is
+     * equality).
+     *
+     * @param contextHandle Opaque handle from context create or join.
+     * @param parentToken The full encoded JWT of the parent token.
+     * @param childCaveatsJson Canonical JSON wire form of the
+     *   attenuated [InvocationCaveats]. MUST be a strict attenuation per
+     *   §7.3.8.
+     * @return The narrowed UCAN token string (JWT-encoded).
+     * @throws BridgeException with `SCP-VALID-7000` on malformed JSON,
+     *   `SCP-PERM-3001` on widening or rule violation, or
+     *   `SCP-TOOL-6114` (slug `caveat-mint-limit-exceeded`) on a
+     *   mint-limit overflow.
+     */
+    fun ucanNarrow(
+        contextHandle: Long,
+        parentToken: String,
+        childCaveatsJson: String,
     ): String
 
     /**
@@ -1947,18 +1973,37 @@ class UcanBridge internal constructor(
         }
 
     /**
-     * Mint a UCAN token delegating capabilities to a member DID.
+     * Mint a UCAN token delegating capabilities to a member DID,
+     * optionally with §7.3.8 invocation caveats (SCP-OUT-023).
      *
      * @param contextHandle Handle from context create or join.
      * @param memberDid The DID to delegate capabilities to.
      * @param capabilitiesJson JSON-encoded list of capabilities.
+     * @param caveatsJson Optional canonical wire JSON of the
+     *   [InvocationCaveats] to embed in the UCAN payload's `nb` field.
+     *   Pass `null` for a caveat-free token.
      * @return The minted UCAN token string.
      */
     suspend fun mint(
         contextHandle: Long,
         memberDid: String,
         capabilitiesJson: String,
-    ): String = bridge.ffiCall { bindings.ucanMint(contextHandle, memberDid, capabilitiesJson) }
+        caveatsJson: String? = null,
+    ): String = bridge.ffiCall {
+        bindings.ucanMint(contextHandle, memberDid, capabilitiesJson, caveatsJson)
+    }
+
+    /**
+     * Narrow a parent UCAN by attaching attenuated §7.3.8 caveats
+     * (SCP-OUT-023). The §7.3.8 narrow rules run inside the Rust core.
+     */
+    suspend fun narrow(
+        contextHandle: Long,
+        parentToken: String,
+        childCaveatsJson: String,
+    ): String = bridge.ffiCall {
+        bindings.ucanNarrow(contextHandle, parentToken, childCaveatsJson)
+    }
 
     /**
      * Revoke a previously minted UCAN token.

@@ -123,6 +123,7 @@ fn build_token(
         }],
         prf,
         fct: None,
+        nb: None,
     };
 
     let header = UcanHeader::new();

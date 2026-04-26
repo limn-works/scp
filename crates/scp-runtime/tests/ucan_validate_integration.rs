@@ -143,6 +143,7 @@ async fn validate_ucan_accepts_valid_token() {
         key_scope: None,
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -192,6 +193,7 @@ async fn validate_ucan_rejects_tampered_signature() {
         key_scope: None,
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let mut token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -263,6 +265,7 @@ async fn validate_ucan_accepts_delegated_token() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody_creator,
         &scp_primitives::SystemClock,
@@ -288,6 +291,7 @@ async fn validate_ucan_accepts_delegated_token() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody_delegator,
         &scp_primitives::SystemClock,
@@ -356,6 +360,7 @@ async fn validate_ucan_rejects_broken_chain_aud_iss_mismatch() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody_creator,
         &scp_primitives::SystemClock,
@@ -381,6 +386,7 @@ async fn validate_ucan_rejects_broken_chain_aud_iss_mismatch() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody_b,
         &scp_primitives::SystemClock,
@@ -441,6 +447,7 @@ async fn validate_ucan_rejects_unresolvable_proof() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody,
         &scp_primitives::SystemClock,
@@ -499,6 +506,7 @@ async fn validate_ucan_rejects_wrong_issuer() {
         key_scope: None,
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -559,6 +567,7 @@ async fn validate_ucan_rejects_wrong_root_issuer_in_chain() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody_non_creator,
         &scp_primitives::SystemClock,
@@ -584,6 +593,7 @@ async fn validate_ucan_rejects_wrong_root_issuer_in_chain() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody_delegator,
         &scp_primitives::SystemClock,
@@ -650,6 +660,7 @@ async fn validate_ucan_rejects_audience_mismatch() {
         key_scope: None,
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -707,6 +718,7 @@ async fn validate_ucan_rejects_missing_capability() {
         key_scope: None,
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -761,6 +773,7 @@ async fn validate_ucan_accepts_wildcard_capability_grant() {
         key_scope: None,
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -827,6 +840,7 @@ async fn validate_ucan_rejects_widened_capabilities_in_delegation() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody_creator,
         &scp_primitives::SystemClock,
@@ -852,6 +866,7 @@ async fn validate_ucan_rejects_widened_capabilities_in_delegation() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody_delegator,
         &scp_primitives::SystemClock,
@@ -917,6 +932,7 @@ async fn validate_ucan_rejects_capability_outside_ceiling() {
         key_scope: None,
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -977,6 +993,7 @@ async fn validate_ucan_rejects_nonce_replay() {
         key_scope: None,
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -1045,6 +1062,7 @@ async fn validate_ucan_rejects_revoked_token() {
         key_scope: None,
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -1103,6 +1121,7 @@ async fn validate_ucan_revocation_uses_content_hash_cid() {
         key_scope: None,
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -1163,6 +1182,7 @@ async fn validate_ucan_rejects_expired_token() {
         key_scope: None,
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -1263,6 +1283,7 @@ async fn parse_and_validate_roundtrip() {
         key_scope: None,
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let minted = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -1330,6 +1351,7 @@ async fn full_pipeline_mint_delegate_parse_validate() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody_creator,
         &scp_primitives::SystemClock,
@@ -1361,6 +1383,7 @@ async fn full_pipeline_mint_delegate_parse_validate() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody_delegator,
         &scp_primitives::SystemClock,
@@ -1435,6 +1458,7 @@ fn in_memory_proof_resolver_returns_stored_token() {
             att: vec![],
             prf: vec![],
             fct: None,
+            nb: None,
         },
         signature: vec![0u8; 64],
         encoded: "test.encoded.token".to_owned(),
@@ -1474,6 +1498,7 @@ async fn validate_ucan_rejects_self_delegation_without_key_scope() {
         }],
         prf: vec![],
         fct: None,
+        nb: None,
     };
     let header_json = serde_json::to_vec(&header).unwrap();
     let payload_json = serde_json::to_vec(&payload).unwrap();
@@ -1541,6 +1566,7 @@ async fn validate_ucan_accepts_self_delegation_with_key_scope() {
         key_scope: Some("#active".to_owned()),
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -1607,6 +1633,7 @@ async fn validate_ucan_accepts_matching_key_scope() {
         key_scope: Some("#agent".to_owned()),
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -1670,6 +1697,7 @@ async fn validate_ucan_rejects_mismatched_key_scope() {
         key_scope: Some("#agent".to_owned()), // Says #agent
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -1729,6 +1757,7 @@ async fn validate_ucan_skips_key_scope_check_when_absent() {
         key_scope: None, // No key scope: legacy token
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -1788,6 +1817,7 @@ async fn validate_ucan_scoped_ucan_cannot_be_exercised_by_wrong_key() {
         key_scope: Some("#agent".to_owned()),
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)

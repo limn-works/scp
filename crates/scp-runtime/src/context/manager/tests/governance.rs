@@ -13508,6 +13508,7 @@ async fn test_fabricated_spending_ucan_rejected() {
             att: vec![], // missing spending attestation
             prf: vec![],
             fct: None,
+            nb: None,
         },
         signature: vec![],
         encoded: "fabricated.ucan".to_owned(),
@@ -13768,6 +13769,7 @@ async fn test_spending_ucan_expired_c1() {
         }],
         prf: vec![],
         fct: Some(serde_json::Value::Object(fct)),
+        nb: None,
     };
     let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header).unwrap());
     let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&payload).unwrap());

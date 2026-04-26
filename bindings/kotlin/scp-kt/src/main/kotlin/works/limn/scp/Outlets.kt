@@ -178,7 +178,7 @@ data class Aggregate(
     val executionTimeMs: Long? = null,
 )
 
-/** Narrowed UCAN invocation caveats (§7.3.8, 11 fields). */
+/** Narrowed UCAN invocation caveats (§7.3.8, 11 fields + originKind). */
 data class InvocationCaveats(
     val amountMaxPerCall: Long? = null,
     val amountMaxCumulative: Long? = null,
@@ -192,7 +192,43 @@ data class InvocationCaveats(
     val allowedAdapters: List<String>? = null,
     val allowedTargetDids: List<String>? = null,
     val originKind: String? = null,
-)
+) {
+    /**
+     * Serializes this record to its canonical wire JSON form (§7.3.8
+     * vocabulary). Field naming matches the wire layer verbatim
+     * (camelCase). Absent fields are omitted. `inputSchemaJson` is
+     * embedded as a parsed JSON object. `rateWindow` is wrapped into the
+     * full `{max:1, windowSecs:N}` form because the SDK uses a
+     * single-int convenience while the Rust `RateWindow` deserializer
+     * requires both keys.
+     *
+     * Used by [UcanNamespace.mint] and [UcanNamespace.narrow]
+     * (SCP-OUT-023).
+     */
+    @Suppress("CyclomaticComplexMethod", "LongMethod")
+    fun toWireJson(): String {
+        val parts = mutableListOf<String>()
+        amountMaxPerCall?.let { parts += """"amountMaxPerCall":$it""" }
+        amountMaxCumulative?.let { parts += """"amountMaxCumulative":$it""" }
+        validFrom?.let { parts += """"validFrom":$it""" }
+        validUntil?.let { parts += """"validUntil":$it""" }
+        hoursOfDay?.let { parts += """"hoursOfDay":${it.toLong()}""" }
+        daysOfWeek?.let { parts += """"daysOfWeek":${it.toShort()}""" }
+        maxCalls?.let { parts += """"maxCalls":${it.toLong()}""" }
+        rateWindow?.let { parts += """"rateWindow":{"max":1,"windowSecs":${it.toLong()}}""" }
+        inputSchemaJson?.let { parts += """"inputSchema":$it""" }
+        allowedAdapters?.let {
+            val esc = it.joinToString(",") { s -> "\"${s.replace("\"", "\\\"")}\"" }
+            parts += """"allowedAdapters":[$esc]"""
+        }
+        allowedTargetDids?.let {
+            val esc = it.joinToString(",") { s -> "\"${s.replace("\"", "\\\"")}\"" }
+            parts += """"allowedTargetDids":[$esc]"""
+        }
+        originKind?.let { parts += """"originKind":"$it"""" }
+        return "{${parts.joinToString(",")}}"
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Caveat builder helpers (review item 33).

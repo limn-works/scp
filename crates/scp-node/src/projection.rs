@@ -4416,6 +4416,7 @@ mod tests {
             }],
             prf: vec![],
             fct: None,
+            nb: None,
         };
 
         let h = serde_json::to_vec(&header).unwrap();
@@ -4454,6 +4455,7 @@ mod tests {
             }],
             prf: vec![],
             fct: None,
+            nb: None,
         };
 
         let h = serde_json::to_vec(&header).unwrap();
@@ -4641,6 +4643,7 @@ mod tests {
             }],
             prf: vec![],
             fct: None,
+            nb: None,
         };
 
         let header_json = serde_json::to_vec(&header).unwrap();
@@ -4705,6 +4708,7 @@ mod tests {
             }],
             prf: vec![],
             fct: None,
+            nb: None,
         };
 
         let header_json = serde_json::to_vec(&header).unwrap();
@@ -4834,6 +4838,7 @@ mod tests {
             }],
             prf: vec![],
             fct: None,
+            nb: None,
         };
 
         let header_json = serde_json::to_vec(&header).unwrap();
@@ -5280,6 +5285,7 @@ mod tests {
             }],
             prf: vec![],
             fct: None,
+            nb: None,
         };
 
         let header_json = serde_json::to_vec(&header).unwrap();
@@ -5477,6 +5483,7 @@ mod tests {
             }],
             prf: vec![],
             fct: None,
+            nb: None,
         };
 
         let header_json = serde_json::to_vec(&header).unwrap();
@@ -5536,6 +5543,7 @@ mod tests {
             }],
             prf: vec![],
             fct: None,
+            nb: None,
         };
 
         let header_json = serde_json::to_vec(&header).unwrap();

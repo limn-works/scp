@@ -4714,6 +4714,7 @@ mod amplification_tests {
                 att,
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![],
             encoded: String::new(),

@@ -892,6 +892,7 @@ export function createNativeBridge(): Bridge {
       memberDid: string,
       capabilities: readonly string[],
       proofs?: readonly string[],
+      caveatsJson?: string,
     ): Promise<UcanToken> {
       const token = await (
         addon.ucanMint as (
@@ -899,9 +900,20 @@ export function createNativeBridge(): Bridge {
           d: string,
           c: readonly string[],
           p: readonly string[] | null,
+          cv: string | null,
         ) => Promise<UcanToken>
-      )(handle, memberDid, capabilities, proofs ?? null);
+      )(handle, memberDid, capabilities, proofs ?? null, caveatsJson ?? null);
       return token;
+    },
+
+    async ucanNarrow(
+      handle: BridgeContextHandle,
+      parentToken: string,
+      childCaveatsJson: string,
+    ): Promise<UcanToken> {
+      return await (
+        addon.ucanNarrow as (h: BridgeContextHandle, p: string, c: string) => Promise<UcanToken>
+      )(handle, parentToken, childCaveatsJson);
     },
 
     async ucanRevoke(

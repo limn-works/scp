@@ -3474,6 +3474,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
             .await
@@ -3613,6 +3614,7 @@ mod tests {
                     att: vec![],
                     prf: vec![],
                     fct: Some(serde_json::Value::Object(fct)),
+                    nb: None,
                 },
                 signature: vec![0u8; 64],
                 encoded: String::new(),

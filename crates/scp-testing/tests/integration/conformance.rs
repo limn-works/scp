@@ -1039,6 +1039,7 @@ async fn conf_023_ucan_issuance() {
         key_scope: None,
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
         .await
@@ -1102,6 +1103,7 @@ async fn conf_024_ucan_delegation_chain() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody,
         &scp_primitives::SystemClock,
@@ -1127,6 +1129,7 @@ async fn conf_024_ucan_delegation_chain() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody,
         &scp_primitives::SystemClock,
@@ -1178,6 +1181,7 @@ async fn conf_025_ucan_revocation() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody,
         &scp_primitives::SystemClock,

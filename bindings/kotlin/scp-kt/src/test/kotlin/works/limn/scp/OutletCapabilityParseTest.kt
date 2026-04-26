@@ -59,13 +59,16 @@ class OutletCapabilityParseTest {
 
     private val suffixRegex = Regex("^[a-z0-9_-]{1,128}$")
 
-    @Suppress("ReturnCount", "ComplexMethod", "LongMethod", "CyclomaticComplexMethod")
+    @Suppress("ReturnCount", "ComplexMethod", "LongMethod", "CyclomaticComplexMethod", "ComplexCondition")
     private fun parseCapability(name: String): Parsed? {
         if (name.startsWith("outlet:invoke:") || name.startsWith("outlet_invoke:")) return null
         if (name == "outlet:invoke:*" || name == "outlet_invoke:*") return null
         if (name.startsWith("tool:invoke:") || name.startsWith("tool_invoke:")) return null
         if (name == "tool:register" || name == "tool:interface" ||
-            name == "tool_register" || name == "tool_interface") return null
+            name == "tool_register" || name == "tool_interface"
+        ) {
+            return null
+        }
 
         when (name) {
             "messages:read" -> return Parsed.MessagesRead

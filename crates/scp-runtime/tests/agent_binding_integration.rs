@@ -182,6 +182,7 @@ async fn test_agent_binding_full_flow() {
             key_scope: Some("#agent".to_owned()),
             signing_key_id: Some(SigningKeyId::Active),
             ceiling: None,
+            caveats: None,
         },
         &custody,
         &scp_primitives::SystemClock,

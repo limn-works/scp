@@ -414,6 +414,17 @@ pub struct UcanPayload {
     /// Optional facts — arbitrary JSON data attached to the token.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fct: Option<serde_json::Value>,
+    /// §7.3.8 invocation caveats carried in the UCAN `nb` field
+    /// (SCP-OUT-023). Absent when the token carries no caveat-level
+    /// constraints — preserves backward compatibility with pre-OUT-018
+    /// tokens that have no `nb` field at all.
+    ///
+    /// The wire encoding uses the spec §7.3.8 vocabulary verbatim
+    /// (`amountMaxPerCall`, `validFrom`, …) — see
+    /// [`crate::trust::caveats::InvocationCaveats`] for the field-level
+    /// serialization contract.
+    #[serde(rename = "nb", skip_serializing_if = "Option::is_none", default)]
+    pub nb: Option<crate::trust::caveats::InvocationCaveats>,
 }
 
 // ---------------------------------------------------------------------------
@@ -595,6 +606,7 @@ mod tests {
             }],
             prf: vec!["bafyreiabc123".to_owned()],
             fct: Some(serde_json::json!({"note": "test token"})),
+            nb: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         let deserialized: UcanPayload = serde_json::from_str(&json).unwrap();
@@ -612,6 +624,7 @@ mod tests {
             att: vec![],
             prf: vec![],
             fct: None,
+            nb: None,
         };
         let json = serde_json::to_string(&payload).unwrap();
         // nbf and fct should not appear in the JSON when None
@@ -654,6 +667,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: "eyJ0eXAi...".to_owned(),
@@ -687,6 +701,7 @@ mod tests {
                 ],
                 prf: vec!["bafyreiabc123".to_owned()],
                 fct: Some(serde_json::json!({"role": "member"})),
+                nb: None,
             },
             signature: vec![1u8; 64],
             encoded: "header.payload.signature".to_owned(),
@@ -709,6 +724,7 @@ mod tests {
                 att: vec![],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: String::new(),

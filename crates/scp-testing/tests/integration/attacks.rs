@@ -900,6 +900,7 @@ async fn ucan_expired_token_rejected() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody,
         &scp_primitives::SystemClock,
@@ -999,6 +1000,7 @@ async fn ucan_nonce_replay_rejected() {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         },
         &custody,
         &scp_primitives::SystemClock,
@@ -1455,6 +1457,7 @@ async fn self_delegation_without_key_scope_rejected() {
         key_scope: None,
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
+        caveats: None,
     };
 
     let result = mint_ucan(&params, &custody, &scp_primitives::SystemClock).await;
@@ -1482,6 +1485,7 @@ async fn self_delegation_without_key_scope_rejected() {
         key_scope: Some("#active".to_owned()),
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
+        caveats: None,
     };
     let ok_token = mint_ucan(&params_with_scope, &custody, &scp_primitives::SystemClock).await;
     assert!(
@@ -1528,6 +1532,7 @@ async fn ucan_kid_scope_mismatch_rejected() {
         key_scope: Some("#active".to_owned()),
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
+        caveats: None,
     };
 
     let mut token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)

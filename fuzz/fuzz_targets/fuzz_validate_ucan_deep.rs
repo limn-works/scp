@@ -131,6 +131,7 @@ fn build_signed_token(
         }],
         prf: vec![],
         fct: None,
+        nb: None,
     };
 
     let header_json = serde_json::to_string(&header).expect("header serialization must succeed");

@@ -128,6 +128,7 @@ async fn mint_validate_roundtrip() {
         key_scope: None,
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -318,6 +319,7 @@ async fn token_expiry_rejected() {
         key_scope: None,
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -355,6 +357,7 @@ async fn token_expiry_rejected() {
         key_scope: None,
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
+        caveats: None,
     };
 
     let result = mint_ucan(&params_too_far, &custody, &scp_primitives::SystemClock).await;
@@ -436,6 +439,7 @@ async fn delegation_chain() {
         key_scope: None,
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
+        caveats: None,
     };
     let root_token = mint_ucan(&root_params, &custody, &scp_primitives::SystemClock)
         .await
@@ -456,6 +460,7 @@ async fn delegation_chain() {
         key_scope: None,
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
+        caveats: None,
     };
     let mid_token = mint_ucan(&mid_params, &custody, &scp_primitives::SystemClock)
         .await
@@ -544,6 +549,7 @@ async fn broken_delegation_chain() {
         key_scope: None,
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
+        caveats: None,
     };
     let root_token = mint_ucan(&root_params, &custody, &scp_primitives::SystemClock)
         .await
@@ -565,6 +571,7 @@ async fn broken_delegation_chain() {
         key_scope: Some("#active".to_owned()), // allow self-delegation
         signing_key_id: None,
         ceiling: Some(ceiling.clone()),
+        caveats: None,
     };
     let mid_token = mint_ucan(&mid_params, &custody, &scp_primitives::SystemClock)
         .await
@@ -629,6 +636,7 @@ async fn revocation_cid_deterministic() {
         }],
         prf: vec![],
         fct: None,
+        nb: None,
     };
 
     // compute_revocation_cid takes a raw JWT string (header.payload.signature).
@@ -657,6 +665,7 @@ async fn revocation_cid_deterministic() {
         att: vec![],
         prf: vec![],
         fct: None,
+        nb: None,
     };
     let diff_json = serde_json::to_string(&different_payload).unwrap();
     let token2 = format!(

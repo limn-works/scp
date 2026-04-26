@@ -337,6 +337,7 @@ pub async fn ucan_mint(
     member_did: String,
     capabilities: Vec<String>,
     proofs: Option<Vec<String>>,
+    caveats_json: Option<String>,
 ) -> napi::Result<NapiUcanToken> {
     crate::napi_check_handle!(handle);
     validate_did(&member_did).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -346,10 +347,33 @@ pub async fn ucan_mint(
         }
     }
 
+    // SCP-OUT-023: decode optional caveats JSON at the bridge boundary.
+    // Mint-limit failures from `try_new` surface upstream via mint_ucan →
+    // UcanError::MalformedToken("caveat-mint-limit-exceeded: …"); JSON shape
+    // errors surface here as `SCP-VALID-7000`.
+    let caveats_decoded: Option<scp_core::trust::caveats::InvocationCaveats> =
+        match caveats_json.as_deref() {
+            None => None,
+            Some(json) => Some(
+                scp_ffi_common::caveats::caveats_from_json(json).map_err(|e| {
+                    napi::Error::from(ScpNapiError::Validation {
+                        message: e,
+                        code: codes::VALID_7000.to_owned(),
+                    })
+                })?,
+            ),
+        };
+
     // In-memory custody is only available when `allow_in_memory_custody` is enabled.
     #[cfg(not(feature = "allow_in_memory_custody"))]
     {
-        let _ = (&handle, &member_did, &capabilities, &proofs);
+        let _ = (
+            &handle,
+            &member_did,
+            &capabilities,
+            &proofs,
+            &caveats_decoded,
+        );
         Err(napi::Error::from(ScpNapiError::Permission {
             message: "UCAN minting requires key custody -- the in_memory custody path                       is not available in this build. Enable allow_in_memory_custody                       for dev/desktop use.".to_owned(),
             code: codes::PERM_3023.to_owned(),
@@ -403,6 +427,7 @@ pub async fn ucan_mint(
             key_scope: None,
             signing_key_id: None,
             ceiling,
+            caveats: caveats_decoded.clone(),
         };
 
         // Sign the token using the real InMemoryKeyCustody via scp-core.
@@ -589,6 +614,7 @@ pub async fn ucan_delegate(
                 key_scope: None,
                 signing_key_id: None,
                 ceiling: ceiling.clone(),
+                caveats: None,
             };
 
             // napi-rs async functions run on the tokio runtime, but
@@ -614,6 +640,107 @@ pub async fn ucan_delegate(
             expires_at: Some(token.payload.exp as f64),
         };
 
+        increment_handle_count();
+        Ok(NapiUcanToken {
+            data,
+            encoded: token.encoded,
+            instance_id: crate::runtime::default_instance_id()?,
+        })
+    }
+}
+
+/// Narrows a parent UCAN token by re-issuing it with attenuated caveats
+/// (SCP-OUT-023).
+///
+/// Calls `delegate_ucan` with the parent's audience as the delegatee so the
+/// chain extends in place rather than re-targeting. The §7.3.8 narrow rules
+/// run against the parent token's `nb` field.
+///
+/// # Errors
+///
+/// - Rejects with `SCP-VALID-7000` if `parent_token` or `child_caveats_json`
+///   is malformed.
+/// - Rejects with `SCP-PERM-3023` if the delegator's identity is not in the
+///   identity registry, signing fails, or the §7.3.8 narrow rule rejects.
+#[napi]
+#[allow(clippy::unused_async)]
+#[allow(clippy::needless_pass_by_value)]
+pub async fn ucan_narrow(
+    handle: &NapiContextHandle,
+    parent_token: String,
+    child_caveats_json: String,
+) -> napi::Result<NapiUcanToken> {
+    crate::napi_check_handle!(handle);
+    validate_ucan_token(&parent_token).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+
+    let child_caveats =
+        scp_ffi_common::caveats::caveats_from_json(&child_caveats_json).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: e,
+                code: codes::VALID_7000.to_owned(),
+            })
+        })?;
+
+    #[cfg(not(feature = "allow_in_memory_custody"))]
+    {
+        let _ = (&handle, &parent_token, &child_caveats);
+        Err(napi::Error::from(ScpNapiError::Permission {
+            message: "UCAN narrow requires key custody -- enable allow_in_memory_custody"
+                .to_owned(),
+            code: codes::PERM_3023.to_owned(),
+        }))
+    }
+
+    #[cfg(feature = "allow_in_memory_custody")]
+    {
+        use scp_core::crypto::ucan::mint::{DelegateParams, delegate_ucan};
+        use scp_core::crypto::ucan::validate::parse_ucan;
+
+        let parsed_parent = parse_ucan(&parent_token).map_err(ScpNapiError::from)?;
+        let delegator_did = parsed_parent.payload.aud.clone();
+
+        // Preserve parent ceiling (#1419).
+        let ceiling_strings: std::collections::HashSet<String> =
+            handle.ceiling().into_iter().collect();
+        let ceiling = Some(if ceiling_strings.is_empty() {
+            scp_core::context::roles::default_ceiling().to_ucan_string_set()
+        } else {
+            ceiling_strings
+        });
+
+        let token = crate::runtime::with_identity(&delegator_did, |entry| {
+            let params = DelegateParams {
+                parent_token: &parsed_parent,
+                delegator_did: &delegator_did,
+                delegator_key: &entry.identity.active_signing_key,
+                delegatee_did: &delegator_did,
+                attenuated_capabilities: &parsed_parent.payload.att,
+                lifetime_secs: 3600,
+                facts: None,
+                key_scope: None,
+                signing_key_id: None,
+                ceiling: ceiling.clone(),
+                caveats: Some(child_caveats.clone()),
+            };
+
+            let rt_handle = tokio::runtime::Handle::current();
+            let result = tokio::task::block_in_place(|| {
+                rt_handle.block_on(async {
+                    delegate_ucan(&params, &entry.custody.0, &scp_primitives::SystemClock).await
+                })
+            });
+            result.map_err(ScpNapiError::from)
+        })
+        .map_err(napi::Error::from)?;
+
+        let data = NapiUcanTokenData {
+            token_id: token.payload.nnc.clone(),
+            issuer: token.payload.iss.clone(),
+            audience: token.payload.aud.clone(),
+            capabilities: token.payload.att.iter().map(|a| a.with.clone()).collect(),
+            #[allow(clippy::cast_precision_loss)]
+            expires_at: Some(token.payload.exp as f64),
+        };
         increment_handle_count();
         Ok(NapiUcanToken {
             data,
@@ -850,6 +977,7 @@ mod tests {
                 att: vec![],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: "h.p.s".to_owned(),

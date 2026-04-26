@@ -96,6 +96,35 @@ fn verify_attestation_ceiling_compliance(
     verify_ceiling_compliance(&cap_uris, ceiling)
 }
 
+/// SCP-OUT-023 helper: validates child caveats and runs §7.3.8 narrow
+/// against the parent token's `nb` field. Returns the validated child
+/// caveats (or `None` when the caller didn't supply any). Splitting this
+/// out keeps `delegate_ucan` under the workspace `too_many_lines` cap and
+/// gives the mint-side narrow path a single implementation.
+///
+/// # Errors
+///
+/// Returns [`UcanError::MalformedToken`] when the child caveats fail
+/// [`scp_protocol::trust::caveats::InvocationCaveats::try_new`] (mint-limit
+/// overflow, mask-width violation). Returns
+/// [`UcanError::AttenuationViolation`] when the parent's caveats reject the
+/// child via [`scp_protocol::trust::caveats::InvocationCaveats::narrow`].
+fn build_delegated_caveats(
+    params: &DelegateParams<'_>,
+) -> Result<Option<scp_protocol::trust::caveats::InvocationCaveats>, UcanError> {
+    let Some(child_caveats) = params.caveats.clone() else {
+        return Ok(None);
+    };
+    let validated = scp_protocol::trust::caveats::InvocationCaveats::try_new(child_caveats)
+        .map_err(|e| UcanError::MalformedToken(format!("caveat-mint-limit-exceeded: {e}")))?;
+    if let Some(parent_caveats) = params.parent_token.payload.nb.as_ref() {
+        parent_caveats.narrow(&validated).map_err(|e| {
+            UcanError::AttenuationViolation(format!("caveat narrow violation: {e}"))
+        })?;
+    }
+    Ok(Some(validated))
+}
+
 /// Builds the `fct` (facts) section, merging `scp_key_scope` when present.
 ///
 /// Returns an error if `facts` already contains an `scp_key_scope` value that
@@ -211,6 +240,13 @@ pub struct MintParams<'a> {
     ///
     /// `None` means no ceiling enforcement (backward-compatible default).
     pub ceiling: Option<HashSet<String>>,
+    /// §7.3.8 invocation caveats (SCP-OUT-023). Routed into the UCAN `nb`
+    /// field of the minted/delegated token. `None` produces a caveat-free
+    /// token (legacy behaviour). The mint path runs
+    /// [`scp_protocol::trust::caveats::InvocationCaveats::try_new`] before
+    /// signing — limit violations surface as
+    /// [`UcanError::CaveatMintLimitExceeded`].
+    pub caveats: Option<scp_protocol::trust::caveats::InvocationCaveats>,
 }
 
 /// Mints a new UCAN token with Ed25519 signature.
@@ -329,6 +365,20 @@ pub async fn mint_ucan(
     // is present (ADR-039 acceptance criterion 6).
     let fct = build_facts_with_key_scope(params.facts.as_ref(), params.key_scope.as_ref())?;
 
+    // SCP-OUT-023: validate caveats at mint time (§7.3.8 mint-limits) and
+    // route them into the payload's `nb` field. `None` preserves legacy
+    // caveat-free behaviour. Limit violations are mapped to
+    // `UcanError::MalformedToken` carrying the spec slug, which the bridge
+    // layer surfaces as `SCP-TOOL-6114` (`caveat-mint-limit-exceeded`).
+    let nb = match params.caveats.clone() {
+        None => None,
+        Some(caveats) => Some(
+            scp_protocol::trust::caveats::InvocationCaveats::try_new(caveats).map_err(|e| {
+                UcanError::MalformedToken(format!("caveat-mint-limit-exceeded: {e}"))
+            })?,
+        ),
+    };
+
     let payload = UcanPayload {
         iss: params.issuer_did.to_owned(),
         aud: params.audience_did.to_owned(),
@@ -338,6 +388,7 @@ pub async fn mint_ucan(
         att,
         prf: params.proofs.clone(),
         fct,
+        nb,
     };
 
     // Encode header and payload as base64url JSON.
@@ -456,6 +507,13 @@ pub struct DelegateParams<'a> {
     ///
     /// `None` means no ceiling enforcement (backward-compatible default).
     pub ceiling: Option<HashSet<String>>,
+    /// §7.3.8 invocation caveats (SCP-OUT-023). Routed into the UCAN `nb`
+    /// field of the minted/delegated token. `None` produces a caveat-free
+    /// token (legacy behaviour). The mint path runs
+    /// [`scp_protocol::trust::caveats::InvocationCaveats::try_new`] before
+    /// signing — limit violations surface as
+    /// [`UcanError::CaveatMintLimitExceeded`].
+    pub caveats: Option<scp_protocol::trust::caveats::InvocationCaveats>,
 }
 
 /// Creates a delegated UCAN token from a parent token.
@@ -583,6 +641,12 @@ pub async fn delegate_ucan(
     // is present (ADR-039).
     let fct = build_facts_with_key_scope(params.facts.as_ref(), params.key_scope.as_ref())?;
 
+    // SCP-OUT-023: child caveats are validated against parent caveats via
+    // `narrow()`, then routed into the delegated token's `nb` field. The
+    // helper centralises the try_new / narrow sequence so the mint-side
+    // and any future caveat-bearing path share a single implementation.
+    let nb = build_delegated_caveats(params)?;
+
     let payload = UcanPayload {
         iss: params.delegator_did.to_owned(),
         aud: params.delegatee_did.to_owned(),
@@ -592,6 +656,7 @@ pub async fn delegate_ucan(
         att: params.attenuated_capabilities.to_vec(),
         prf: proofs,
         fct,
+        nb,
     };
 
     // Encode header and payload as base64url JSON.
@@ -658,6 +723,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -710,6 +776,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -754,6 +821,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -794,6 +862,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token1 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -827,6 +896,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -853,6 +923,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         assert!(
@@ -884,6 +955,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -923,6 +995,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -955,6 +1028,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -995,6 +1069,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -1026,6 +1101,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -1055,6 +1131,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token1 = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -1091,6 +1168,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -1135,6 +1213,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
         mint_ucan(&params, custody, &scp_primitives::SystemClock)
             .await
@@ -1176,6 +1255,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1234,6 +1314,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1279,6 +1360,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1338,6 +1420,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1383,6 +1466,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1424,6 +1508,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1467,6 +1552,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let d1 = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1531,6 +1617,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let bob_to_carol = delegate_ucan(
@@ -1563,6 +1650,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let carol_to_dave = delegate_ucan(
@@ -1618,6 +1706,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let err = delegate_ucan(&delegate_params, &eve_custody, &scp_primitives::SystemClock)
@@ -1663,6 +1752,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1713,6 +1803,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1757,6 +1848,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1800,6 +1892,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1843,6 +1936,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1884,6 +1978,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1918,6 +2013,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
         let mut root_token = mint_ucan(&params, &alice_custody, &scp_primitives::SystemClock)
             .await
@@ -1942,6 +2038,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let delegated = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -1975,6 +2072,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2021,6 +2119,7 @@ mod tests {
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2065,6 +2164,7 @@ mod tests {
             key_scope: Some("#active".to_owned()),
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2109,6 +2209,7 @@ mod tests {
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2149,6 +2250,7 @@ mod tests {
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2189,6 +2291,7 @@ mod tests {
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2228,6 +2331,7 @@ mod tests {
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2277,6 +2381,7 @@ mod tests {
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2315,6 +2420,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2352,6 +2458,7 @@ mod tests {
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2382,6 +2489,7 @@ mod tests {
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2412,6 +2520,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2441,6 +2550,7 @@ mod tests {
             key_scope: Some("#agent".to_owned()),
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2467,6 +2577,7 @@ mod tests {
             key_scope: Some("agent".to_owned()),
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2499,6 +2610,7 @@ mod tests {
                 key_scope: None,
                 signing_key_id: None,
                 ceiling: None,
+                caveats: None,
             },
             &custody,
             &scp_primitives::SystemClock,
@@ -2518,6 +2630,7 @@ mod tests {
                 key_scope: Some("no-hash".to_owned()),
                 signing_key_id: None,
                 ceiling: None,
+                caveats: None,
             },
             &custody_b,
             &scp_primitives::SystemClock,
@@ -2550,6 +2663,7 @@ mod tests {
                 key_scope: None,
                 signing_key_id: None,
                 ceiling: None,
+                caveats: None,
             },
             &custody,
             &scp_primitives::SystemClock,
@@ -2569,6 +2683,7 @@ mod tests {
                 key_scope: None,
                 signing_key_id: None,
                 ceiling: None,
+                caveats: None,
             },
             &custody_b,
             &scp_primitives::SystemClock,
@@ -2601,6 +2716,7 @@ mod tests {
                 key_scope: None,
                 signing_key_id: None,
                 ceiling: None,
+                caveats: None,
             },
             &custody,
             &scp_primitives::SystemClock,
@@ -2620,6 +2736,7 @@ mod tests {
                 key_scope: Some("#agent".to_owned()),
                 signing_key_id: None,
                 ceiling: None,
+                caveats: None,
             },
             &custody_b,
             &scp_primitives::SystemClock,
@@ -2654,6 +2771,7 @@ mod tests {
             key_scope: None,
             signing_key_id: Some(SigningKeyId::Agent),
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2686,6 +2804,7 @@ mod tests {
             key_scope: None,
             signing_key_id: Some(SigningKeyId::Active),
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2721,6 +2840,7 @@ mod tests {
             key_scope: Some("#active".to_owned()),
             signing_key_id: Some(SigningKeyId::Agent),
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2761,6 +2881,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2799,6 +2920,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: Some(ceiling),
+            caveats: None,
         };
 
         let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2835,6 +2957,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: Some(ceiling),
+            caveats: None,
         };
 
         assert!(
@@ -2869,6 +2992,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         assert!(
@@ -2901,6 +3025,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -2955,6 +3080,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: Some(ceiling),
+            caveats: None,
         };
 
         let err = delegate_ucan(&delegate_params, &bob_custody, &scp_primitives::SystemClock)
@@ -3004,6 +3130,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: Some(ceiling),
+            caveats: None,
         };
 
         assert!(
@@ -3038,6 +3165,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -3070,6 +3198,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -3105,6 +3234,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: Some(ceiling),
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -3137,6 +3267,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: None,
+            caveats: None,
         };
 
         let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -3172,6 +3303,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: Some(ceiling),
+            caveats: None,
         };
 
         assert!(
@@ -3203,6 +3335,7 @@ mod tests {
             key_scope: None,
             signing_key_id: None,
             ceiling: Some(ceiling),
+            caveats: None,
         };
 
         let err = mint_ucan(&params, &custody, &scp_primitives::SystemClock)

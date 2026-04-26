@@ -68,6 +68,10 @@ class ConformanceStubBindings : NativeBindings {
     var ucanValidateError: BridgeException? = null
     var ucanMintResult: String = "minted-token"
     var ucanMintError: BridgeException? = null
+    var ucanMintLastCaveatsJson: String? = null
+    var ucanNarrowResult: String = "narrowed-token"
+    var ucanNarrowError: BridgeException? = null
+    var ucanNarrowLastCaveatsJson: String? = null
     var ucanRevokeError: BridgeException? = null
     var ucanDelegateResult: String = "delegated-token"
     var ucanDelegateError: BridgeException? = null
@@ -434,9 +438,21 @@ class ConformanceStubBindings : NativeBindings {
         contextHandle: Long,
         memberDid: String,
         capabilitiesJson: String,
+        caveatsJson: String?,
     ): String {
         ucanMintError?.let { throw it }
+        ucanMintLastCaveatsJson = caveatsJson
         return ucanMintResult
+    }
+
+    override fun ucanNarrow(
+        contextHandle: Long,
+        parentToken: String,
+        childCaveatsJson: String,
+    ): String {
+        ucanNarrowError?.let { throw it }
+        ucanNarrowLastCaveatsJson = childCaveatsJson
+        return ucanNarrowResult
     }
 
     override fun ucanRevoke(
@@ -502,6 +518,14 @@ class ConformanceStubBindings : NativeBindings {
     }
 
     fun reset() {
+        resetIdentity()
+        resetContext()
+        resetTools()
+        resetUcan()
+        resetInfra()
+    }
+
+    private fun resetIdentity() {
         identityCreateResult = 1L
         identityCreateError = null
         identityCreateCustody = null
@@ -510,6 +534,9 @@ class ConformanceStubBindings : NativeBindings {
         identityLoadDid = null
         identityResolveResult = """{"did":"did:dht:stub"}"""
         identityResolveError = null
+    }
+
+    private fun resetContext() {
         contextCreateResult = 10L
         contextCreateError = null
         contextJoinError = null
@@ -522,6 +549,9 @@ class ConformanceStubBindings : NativeBindings {
         contextSendPayload = null
         contextSubscribeResult = 100L
         lastMessageCallback = null
+    }
+
+    private fun resetTools() {
         toolRegisterResult = "tool-001"
         toolRegisterError = null
         toolInvokeResult = """{"output":"ok"}"""
@@ -535,12 +565,22 @@ class ConformanceStubBindings : NativeBindings {
         toolSessionInvokeResult = """{"session":"ok"}"""
         toolSessionInvokeError = null
         toolSessionCloseError = null
+    }
+
+    private fun resetUcan() {
         ucanValidateError = null
         ucanMintResult = "minted-token"
         ucanMintError = null
+        ucanMintLastCaveatsJson = null
+        ucanNarrowResult = "narrowed-token"
+        ucanNarrowError = null
+        ucanNarrowLastCaveatsJson = null
         ucanRevokeError = null
         ucanDelegateResult = "delegated-token"
         ucanDelegateError = null
+    }
+
+    private fun resetInfra() {
         eventLogQueryResult = """[{"event":"joined"}]"""
         eventLogQueryError = null
         eventLogVerifyResult = true

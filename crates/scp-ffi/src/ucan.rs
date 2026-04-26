@@ -97,6 +97,11 @@ pub struct PyUcanToken {
     #[pyo3(get)]
     pub proofs: Vec<String>,
 
+    /// Full encoded JWT string (SCP-OUT-023). Exposed so SDKs can decode
+    /// the payload's `nb` field for caveat round-trip conformance tests.
+    #[pyo3(get)]
+    pub encoded: String,
+
     /// Bridge instance affinity id (Phase 4 PR 1 — #1549).
     ///
     /// `dead_code` allowance: future commits of this PR will add
@@ -263,13 +268,14 @@ pub fn py_ucan_validate(
 /// See ADR-013 §6 and SCP-214 criterion 7.
 #[pyfunction]
 #[pyo3(name = "ucan_mint")]
-#[pyo3(signature = (context_id, member_did, capabilities, proofs=None))]
+#[pyo3(signature = (context_id, member_did, capabilities, proofs=None, caveats_json=None))]
 #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec/Option<Vec> for #[pyfunction] arguments.
 pub fn py_ucan_mint(
     context_id: &str,
     member_did: &str,
     capabilities: Vec<String>,
     proofs: Option<Vec<String>>,
+    caveats_json: Option<String>,
 ) -> PyResult<PyUcanToken> {
     validate::validate_context_id(context_id)?;
     validate::validate_did(member_did)?;
@@ -281,6 +287,18 @@ pub fn py_ucan_mint(
             validate::validate_ucan_token(t)?;
         }
     }
+    // SCP-OUT-023: decode caveats JSON at the bridge boundary so the
+    // mint path receives a fully-typed `InvocationCaveats` (or `None`).
+    // Mint-limit failures from `try_new` surface upstream via
+    // `mint_ucan` → `UcanError::MalformedToken("caveat-mint-limit-exceeded: …")`,
+    // which `ScpPyError::from(UcanError)` already maps. JSON shape errors
+    // surface here as `SCP-VALID-7000`.
+    let caveats_decoded = match caveats_json.as_deref() {
+        None => None,
+        Some(json) => {
+            Some(scp_ffi_common::caveats::caveats_from_json(json).map_err(ScpPyError::validation)?)
+        }
+    };
     // Look up the context to get the creator DID (issuer).
     let creator_did = crate::runtime::with_context(context_id, |rt| Ok(rt.creator_did.clone()))?;
 
@@ -308,6 +326,7 @@ pub fn py_ucan_mint(
             key_scope: None,
             signing_key_id: None,
             ceiling: Some(ceiling_strings),
+            caveats: caveats_decoded.clone(),
         };
 
         let result = rt.block_on(async {
@@ -333,6 +352,7 @@ pub fn py_ucan_mint(
         #[allow(clippy::cast_precision_loss)]
         expires_at: Some(token.payload.exp as f64),
         proofs: token.payload.prf,
+        encoded: token.encoded,
         instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
     }
     .stamp_instance_id())
@@ -432,6 +452,7 @@ pub fn py_ucan_delegate(
             key_scope: None,
             signing_key_id: None,
             ceiling: Some(ceiling_strings.clone()),
+            caveats: None,
         };
 
         let result = rt.block_on(async {
@@ -456,6 +477,7 @@ pub fn py_ucan_delegate(
         #[allow(clippy::cast_precision_loss)]
         expires_at: Some(token.payload.exp as f64),
         proofs: token.payload.prf,
+        encoded: token.encoded,
         instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
     }
     .stamp_instance_id())
@@ -527,6 +549,99 @@ pub fn py_ucan_revoke(context_id: &str, token: &str, revoker_did: &str) -> PyRes
     Ok(())
 }
 
+/// Narrows a parent UCAN token by re-issuing it with attenuated caveats
+/// (SCP-OUT-023).
+///
+/// Takes the parent token's encoded JWT and an SDK-built JSON caveats
+/// record; calls `delegate_ucan` with `caveats = Some(child)` so the core
+/// path runs the §7.3.8 `narrow()` rules against the parent's `nb` field.
+/// The audience is preserved (delegator → delegator) — caveats narrow on
+/// the same chain rather than re-targeting.
+///
+/// Mint-limit failures surface as `SCP-TOOL-6114`; attenuation violations
+/// surface as `SCP-PERM-3001`. JSON shape errors surface as
+/// `SCP-VALID-7000`.
+///
+/// # Errors
+///
+/// Raises `ValidationError` if `parent_token` or `child_caveats_json` is
+/// malformed; `UcanError` if the narrow rule rejects (widening field,
+/// origin-kind mismatch, mask-width violation).
+#[pyfunction]
+#[pyo3(name = "ucan_narrow")]
+#[pyo3(signature = (context_id, parent_token, child_caveats_json))]
+#[allow(clippy::needless_pass_by_value)]
+pub fn py_ucan_narrow(
+    context_id: &str,
+    parent_token: &str,
+    child_caveats_json: &str,
+) -> PyResult<PyUcanToken> {
+    validate::validate_context_id(context_id)?;
+    validate::validate_ucan_token(parent_token)?;
+
+    // Decode child caveats from JSON. Bridge-layer shape failures surface
+    // as `SCP-VALID-7000`; the structural mint-limit checks happen later
+    // inside `delegate_ucan` via `InvocationCaveats::try_new` and
+    // `parent.narrow(child)`.
+    let child_caveats = scp_ffi_common::caveats::caveats_from_json(child_caveats_json)
+        .map_err(ScpPyError::validation)?;
+
+    let parsed_parent = parse_ucan(parent_token).map_err(ScpPyError::from)?;
+    // The delegator is the parent's audience by construction (§7.3.8
+    // narrowing operates on a chain owned by a single agent). Look up the
+    // identity registry by that DID so we can sign with their key.
+    let delegator_did = parsed_parent.payload.aud.clone();
+
+    let rt = crate::runtime()?;
+    let context_id_owned = context_id.to_owned();
+
+    // Get the ceiling so the child token preserves the parent's ceiling
+    // bound (#339, #1419) — narrowing must not silently widen ceiling.
+    let ceiling_strings =
+        crate::runtime::with_context(&context_id_owned, |rt| Ok(rt.ceiling_strings.clone()))?;
+
+    let token = crate::runtime::with_identity(&delegator_did, |entry| {
+        let params = DelegateParams {
+            parent_token: &parsed_parent,
+            delegator_did: &delegator_did,
+            delegator_key: &entry.identity.active_signing_key,
+            delegatee_did: &delegator_did,
+            attenuated_capabilities: &parsed_parent.payload.att,
+            lifetime_secs: 3600,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: Some(ceiling_strings.clone()),
+            caveats: Some(child_caveats),
+        };
+
+        let result = rt.block_on(async {
+            scp_core::crypto::ucan::mint::delegate_ucan(
+                &params,
+                entry.custody.as_ref(),
+                &scp_primitives::SystemClock,
+            )
+            .await
+        });
+        result.map_err(ScpPyError::from)
+    })?;
+
+    let capability_uris: Vec<String> = token.payload.att.iter().map(|a| a.with.clone()).collect();
+
+    Ok(PyUcanToken {
+        token_id: token.payload.nnc.clone(),
+        issuer: token.payload.iss.clone(),
+        audience: token.payload.aud.clone(),
+        capabilities: capability_uris,
+        #[allow(clippy::cast_precision_loss)]
+        expires_at: Some(token.payload.exp as f64),
+        proofs: token.payload.prf,
+        encoded: token.encoded,
+        instance_id: scp_ffi_common::bridge_instance::UNSET_INSTANCE_ID,
+    }
+    .stamp_instance_id())
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -575,6 +690,7 @@ pub fn register_ucan(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyUcanToken>()?;
     m.add_function(wrap_pyfunction!(py_ucan_validate, m)?)?;
     m.add_function(wrap_pyfunction!(py_ucan_mint, m)?)?;
+    m.add_function(wrap_pyfunction!(py_ucan_narrow, m)?)?;
     m.add_function(wrap_pyfunction!(py_ucan_delegate, m)?)?;
     m.add_function(wrap_pyfunction!(py_ucan_revoke, m)?)?;
     Ok(())
@@ -706,6 +822,7 @@ mod tests {
                 att: vec![],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: "h.p.s".to_owned(),

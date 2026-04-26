@@ -484,6 +484,16 @@ pub const TOOL_6032: &str = "SCP-TOOL-6032";
 pub const TOOL_6033: &str = "SCP-TOOL-6033";
 /// Tool verify output schema error.
 pub const TOOL_6035: &str = "SCP-TOOL-6035";
+/// Caveat mint-limit exceeded (§7.3.8 `Authorization::Attenuation`).
+///
+/// Mirrors `scp_protocol::CODE_AUTHORIZATION_ATTENUATION`. Slugs:
+/// `caveat-mint-limit-exceeded`, `hours-of-day-high-bits-set`,
+/// `days-of-week-high-bit-set`, `origin-kind-stem-mismatch`,
+/// `origin-kind-mixed-stem-root`, `origin-kind-unspecified`,
+/// `mask-width-violation`. Used by SCP-OUT-023 SDK mint paths to surface
+/// caveat structural failures to language SDKs without re-implementing
+/// the typed [`scp_protocol::trust::caveats::CaveatMintError`] taxonomy.
+pub const TOOL_6114: &str = "SCP-TOOL-6114";
 
 // -------------------------------------------------------------------------
 // Validation (SCP-VALID- 7000--7999)

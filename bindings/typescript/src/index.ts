@@ -121,7 +121,7 @@ export { Transport } from "./transport";
 // UCAN
 // ---------------------------------------------------------------------------
 
-export { delegateUcan, mintUcan, revokeUcan, validateUcan } from "./ucan";
+export { delegateUcan, mintUcan, narrowUcan, revokeUcan, validateUcan } from "./ucan";
 
 // ---------------------------------------------------------------------------
 // MCP

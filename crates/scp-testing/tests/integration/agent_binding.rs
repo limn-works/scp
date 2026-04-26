@@ -101,6 +101,7 @@ async fn self_delegation_ucan_with_key_scope() {
         key_scope: Some("#agent".to_owned()),
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let token = mint_ucan(&params, &custody, &scp_primitives::SystemClock)
@@ -142,6 +143,7 @@ async fn self_delegation_without_key_scope_fails() {
         key_scope: None, // no key scope
         signing_key_id: None,
         ceiling: None,
+        caveats: None,
     };
 
     let result = mint_ucan(&params, &custody, &scp_primitives::SystemClock).await;
@@ -179,6 +181,7 @@ async fn key_scope_mismatch_fails() {
         key_scope: Some("#active".to_owned()),
         signing_key_id: Some(SigningKeyId::Agent), // kid="#agent" but scope="#active"
         ceiling: None,
+        caveats: None,
     };
 
     // Minting itself should succeed — the mismatch is detected at validation time.

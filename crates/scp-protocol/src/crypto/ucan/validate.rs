@@ -1350,6 +1350,7 @@ mod tests {
                     .collect(),
                 prf: proofs.iter().map(|s| (*s).to_owned()).collect(),
                 fct: None,
+                nb: None,
             },
             signature: Vec::new(),
             encoded: encoded.to_owned(),

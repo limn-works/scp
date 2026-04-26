@@ -661,6 +661,7 @@ async fn ucan_mint_and_revoke() {
         bob.did(),
         vec!["messages:read".to_owned(), "messages:write".to_owned()],
         None,
+        None,
     )
     .await
     .unwrap();

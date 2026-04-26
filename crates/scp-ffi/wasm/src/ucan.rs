@@ -488,11 +488,42 @@ pub fn ucan_mint(
     _member_did: String,
     _capabilities_json: String,
     _proofs_json: Option<String>,
+    _caveats_json: Option<String>,
 ) -> Promise {
     future_to_promise(async {
         Err(ScpWasmError::Permission {
             message: "UCAN minting requires JS-side key custody (WebCrypto) — use the TypeScript \
                       SDK wrapper's mintUcan() method which signs via SubtleCrypto"
+                .to_owned(),
+            code: codes::PERM_3000.to_owned(),
+        }
+        .into_js()
+        .into())
+    })
+}
+
+/// Narrows a parent UCAN token by re-issuing it with attenuated caveats
+/// (SCP-OUT-023).
+///
+/// As with [`ucan_mint`], narrowing requires JS-side key custody. The
+/// TypeScript SDK wrapper performs the §7.3.8 narrow rule against the
+/// parent token's `nb` field (using the shared `scp_protocol`
+/// `InvocationCaveats::narrow` algorithm imported by this crate) and signs
+/// the new JWT via `SubtleCrypto`.
+///
+/// # Errors
+///
+/// Always returns `SCP-PERM-3000` since the actual narrow flow runs in JS.
+#[wasm_bindgen]
+pub fn ucan_narrow(
+    _context: &WasmContextHandle,
+    _parent_token: String,
+    _child_caveats_json: String,
+) -> Promise {
+    future_to_promise(async {
+        Err(ScpWasmError::Permission {
+            message: "UCAN narrow requires JS-side key custody (WebCrypto) — use the TypeScript \
+                      SDK wrapper's narrowUcan() method which signs via SubtleCrypto"
                 .to_owned(),
             code: codes::PERM_3000.to_owned(),
         }
@@ -699,6 +730,7 @@ mod tests {
             att: vec![],
             prf: vec![],
             fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+            nb: None,
         };
         assert_eq!(extract_key_scope(&payload), Some("#agent".to_owned()));
     }
@@ -714,6 +746,7 @@ mod tests {
             att: vec![],
             prf: vec![],
             fct: None,
+            nb: None,
         };
         assert_eq!(extract_key_scope(&payload), None);
     }
@@ -729,6 +762,7 @@ mod tests {
             att: vec![],
             prf: vec![],
             fct: Some(serde_json::json!({"other_fact": "value"})),
+            nb: None,
         };
         assert_eq!(extract_key_scope(&payload), None);
     }
@@ -744,6 +778,7 @@ mod tests {
             att: vec![],
             prf: vec![],
             fct: Some(serde_json::json!({"scp_key_scope": 42})),
+            nb: None,
         };
         assert_eq!(extract_key_scope(&payload), None);
     }
@@ -788,6 +823,7 @@ mod tests {
             att: vec![],
             prf: vec![],
             fct: None,
+            nb: None,
         };
         let header_json = serde_json::to_vec(&header).unwrap();
         let payload_json = serde_json::to_vec(&payload).unwrap();
@@ -812,6 +848,7 @@ mod tests {
             att: vec![],
             prf: vec![],
             fct: None,
+            nb: None,
         };
         let header_json = serde_json::to_vec(&header).unwrap();
         let payload_json = serde_json::to_vec(&payload).unwrap();
@@ -1131,6 +1168,7 @@ mod tests {
             }],
             prf: vec![],
             fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+            nb: None,
         };
 
         let jwt = build_signed_ucan(&header, &payload, &agent_key);
@@ -1179,6 +1217,7 @@ mod tests {
             }],
             prf: vec![],
             fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+            nb: None,
         };
 
         let jwt = build_signed_ucan(&header, &payload, &agent_key);
@@ -1232,6 +1271,7 @@ mod tests {
             }],
             prf: vec![],
             fct: Some(serde_json::json!({"scp_key_scope": "#active"})),
+            nb: None,
         };
 
         let jwt = build_signed_ucan(&header, &payload, &identity_key);
@@ -1284,6 +1324,7 @@ mod tests {
             }],
             prf: vec![],
             fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+            nb: None,
         };
 
         let jwt = build_signed_ucan(&header, &payload, &agent_key);
@@ -1337,6 +1378,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+                nb: None,
             };
 
             let jwt = build_signed_ucan(&header, &payload, &agent_key);

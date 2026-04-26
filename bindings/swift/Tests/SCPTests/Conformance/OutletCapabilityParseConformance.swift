@@ -61,6 +61,7 @@ struct OutletCapabilityParseConformance {
         case custom(String)
     }
 
+    // swiftlint:disable cyclomatic_complexity function_body_length for_where trailing_comma
     /// Reference Swift implementation of `Capability::new` from the Rust
     /// core. Mirrors the \u00a75.4.2.1 two-step parser and the ADR-049 \u00a71
     /// hard-break rejection set.
@@ -126,10 +127,10 @@ struct OutletCapabilityParseConformance {
         let bytes = Array(suffix.utf8)
         guard !bytes.isEmpty, bytes.count <= 128 else { return false }
         for byte in bytes {
-            let isLower = (0x61...0x7A).contains(byte) // a-z
-            let isDigit = (0x30...0x39).contains(byte) // 0-9
-            let isUS = byte == 0x5F                    // _
-            let isDash = byte == 0x2D                  // -
+            let isLower = (0x61 ... 0x7A).contains(byte) // a-z
+            let isDigit = (0x30 ... 0x39).contains(byte) // 0-9
+            let isUS = byte == 0x5F // _
+            let isDash = byte == 0x2D // -
             if !(isLower || isDigit || isUS || isDash) { return false }
         }
         return true
@@ -156,6 +157,9 @@ struct OutletCapabilityParseConformance {
         return try JSONDecoder().decode(Fixture.self, from: data)
     }
 
+    // swiftlint:enable cyclomatic_complexity function_body_length for_where trailing_comma
+
+    // swiftlint:disable cyclomatic_complexity
     private static func expectedToParsed(_ expected: ExpectedPositive) -> Parsed {
         switch expected.kind {
         case "MessagesRead": return .messagesRead
@@ -184,6 +188,8 @@ struct OutletCapabilityParseConformance {
         }
     }
 
+    // swiftlint:enable cyclomatic_complexity
+
     @Test func fixtureLoadsAndCardinality() throws {
         let fixture = try Self.loadFixture()
         #expect(fixture.story == "SCP-OUT-014")
@@ -193,18 +199,18 @@ struct OutletCapabilityParseConformance {
 
     @Test func positiveVectorsParse() throws {
         let fixture = try Self.loadFixture()
-        for v in fixture.positive {
-            let actual = Self.parseCapability(v.input)
-            let expected = Self.expectedToParsed(v.expected)
-            #expect(actual == expected, "positive fixture failed for \(v.input)")
+        for vector in fixture.positive {
+            let actual = Self.parseCapability(vector.input)
+            let expected = Self.expectedToParsed(vector.expected)
+            #expect(actual == expected, "positive fixture failed for \(vector.input)")
         }
     }
 
     @Test func negativeVectorsReject() throws {
         let fixture = try Self.loadFixture()
-        for v in fixture.negative {
-            let actual = Self.parseCapability(v.input)
-            #expect(actual == nil, "negative fixture must reject \(v.input) (\(v.reason))")
+        for vector in fixture.negative {
+            let actual = Self.parseCapability(vector.input)
+            #expect(actual == nil, "negative fixture must reject \(vector.input) (\(vector.reason))")
         }
     }
 

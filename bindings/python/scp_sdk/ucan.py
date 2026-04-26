@@ -3,9 +3,11 @@
 Provides Pythonic wrappers around the ``_scp_core`` UCAN bridge functions:
 
 - :func:`validate` -- Validate a UCAN token against a required capability.
-- :func:`mint` -- Mint a new UCAN token.
+- :func:`mint` -- Mint a new UCAN token (optionally with §7.3.8 caveats).
 - :func:`revoke` -- Revoke a UCAN token.
 - :func:`delegate` -- Create a delegated (attenuated) UCAN from a parent token.
+- :func:`narrow` -- Narrow a parent UCAN by attaching attenuated caveats
+  (SCP-OUT-023, §7.3.8).
 
 UCAN (User Controlled Authorization Networks) tokens are the capability
 enforcement mechanism for SCP.  Every protocol action -- message send, tool
@@ -24,11 +26,16 @@ specification and ADR-013 section 6 for the bridge layer design.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 from scp_sdk._deprecation import deprecated_default_instance
 from scp_sdk.errors import UcanPermissionError
+
+if TYPE_CHECKING:
+    from scp_sdk.outlets import InvocationCaveats
 
 try:
     import _scp_core  # type: ignore[import-not-found]
@@ -77,6 +84,10 @@ class UcanToken:
     #: chain. Empty for root tokens.
     proofs: list[str] = field(default_factory=list)
 
+    #: Full encoded JWT string (SCP-OUT-023). Exposed so callers can decode
+    #: the payload's ``nb`` field for caveat round-trip conformance.
+    encoded: str = ""
+
     @classmethod
     def _from_bridge(cls, bridge_token: object) -> UcanToken:
         """Construct a :class:`UcanToken` from a ``_scp_core.UcanToken``.
@@ -96,7 +107,72 @@ class UcanToken:
             capabilities=list(bridge_token.capabilities),  # type: ignore[attr-defined]
             expires_at=bridge_token.expires_at,  # type: ignore[attr-defined]
             proofs=list(bridge_token.proofs),  # type: ignore[attr-defined]
+            encoded=getattr(bridge_token, "encoded", ""),
         )
+
+
+# ---------------------------------------------------------------------------
+# Caveat marshalling — SDK snake_case <-> wire camelCase (§7.3.8).
+# ---------------------------------------------------------------------------
+
+
+# Mapping from SDK snake_case field to wire camelCase key (§7.3.8 vocabulary).
+# Kept in lockstep with `bindings/python/scp_sdk/outlets.py::InvocationCaveats`
+# and the Rust `scp_protocol::trust::caveats::InvocationCaveats` serde rename
+# attributes.
+_CAVEAT_WIRE_KEYS: dict[str, str] = {
+    "amount_max_per_call": "amountMaxPerCall",
+    "amount_max_cumulative": "amountMaxCumulative",
+    "valid_from": "validFrom",
+    "valid_until": "validUntil",
+    "hours_of_day": "hoursOfDay",
+    "days_of_week": "daysOfWeek",
+    "max_calls": "maxCalls",
+    "rate_window": "rateWindow",
+    "input_schema": "inputSchema",
+    "allowed_adapters": "allowedAdapters",
+    "allowed_target_dids": "allowedTargetDids",
+    "origin_kind": "originKind",
+}
+
+
+def _caveats_to_wire_dict(caveats: InvocationCaveats) -> dict[str, Any]:
+    """Convert :class:`scp_sdk.outlets.InvocationCaveats` to wire JSON dict.
+
+    Field names map snake_case → camelCase per §7.3.8. Absent fields are
+    omitted (the Rust serde layer uses ``skip_serializing_if`` so wire bytes
+    stay byte-stable across SDKs).
+
+    For composite fields:
+
+    * ``amount_max_per_call`` / ``amount_max_cumulative`` accept an ``int``
+      (SDK convention) and are serialized as a u64 (matching the Rust
+      ``Amount(u64)`` newtype).
+    * ``rate_window`` accepts an ``int`` (the SDK builder helper passes
+      ``window_secs`` directly) and is wrapped into the wire object form
+      ``{"max": 1, "windowSecs": <int>}`` so the protocol-level
+      ``RateWindow`` deserializer is satisfied. Callers who need a custom
+      ``max`` should pass a ``dict`` directly.
+    """
+    wire: dict[str, Any] = {}
+    for snake, camel in _CAVEAT_WIRE_KEYS.items():
+        value = getattr(caveats, snake, None)
+        if value is None:
+            continue
+        # Special-case rate_window int → dict (the SDK uses the seconds value
+        # as the only knob; wire form requires both `max` and `windowSecs`).
+        if snake == "rate_window" and isinstance(value, int):
+            wire[camel] = {"max": 1, "windowSecs": value}
+        else:
+            wire[camel] = value
+    return wire
+
+
+def _caveats_to_json(caveats: InvocationCaveats | None) -> str | None:
+    """Serialize :class:`scp_sdk.outlets.InvocationCaveats` to wire JSON, or ``None``."""
+    if caveats is None:
+        return None
+    return json.dumps(_caveats_to_wire_dict(caveats), separators=(",", ":"))
 
 
 # ---------------------------------------------------------------------------
@@ -140,8 +216,9 @@ async def mint(
     context: str,
     expiry: float | None = None,
     proofs: Sequence[str] | None = None,
+    caveats: InvocationCaveats | None = None,
 ) -> UcanToken:
-    """Mint a new UCAN token.
+    """Mint a new UCAN token, optionally with §7.3.8 invocation caveats.
 
     Creates a new UCAN token granting the specified capabilities to the
     audience DID, scoped to the given context.  The token is signed by
@@ -158,13 +235,20 @@ async def mint(
         proofs: Optional list of parent UCAN token IDs forming the
             delegation proof chain.  Required when minting a delegated
             token (see :func:`delegate`).
+        caveats: Optional :class:`scp_sdk.outlets.InvocationCaveats`
+            (SCP-OUT-023, §7.3.8). Routed into the UCAN payload's ``nb``
+            field. Mint-limit failures (more than 8 populated non-
+            ``origin_kind`` fields, list overflows, schema overflows,
+            etc.) surface as :class:`UcanPermissionError` carrying error
+            code ``SCP-TOOL-6114`` (slug ``caveat-mint-limit-exceeded``).
 
     Returns:
         A :class:`UcanToken` containing the minted token's metadata.
 
     Raises:
         UcanPermissionError: If minting fails (capabilities outside the
-            context ceiling, issuer not authorized, etc.).
+            context ceiling, issuer not authorized, mint-limit exceeded,
+            etc.).
 
     Note:
         The issuer is always the context creator. The Rust bridge
@@ -182,6 +266,66 @@ async def mint(
             audience,
             list(capabilities),
             list(proofs) if proofs is not None else None,
+            _caveats_to_json(caveats),
+        )
+    except Exception as exc:
+        raise UcanPermissionError(str(exc)) from exc
+    return UcanToken._from_bridge(bridge_token)
+
+
+@deprecated_default_instance
+async def narrow(
+    parent_token: UcanToken,
+    child_caveats: InvocationCaveats,
+    context: str,
+    *,
+    encoded_parent: str | None = None,
+) -> UcanToken:
+    """Narrow a parent UCAN token by attenuating its caveats (SCP-OUT-023).
+
+    Re-issues ``parent_token`` to the same audience with attenuated
+    :class:`~scp_sdk.outlets.InvocationCaveats`. Each field's narrowing
+    rule (§7.3.8) is enforced inside the Rust core: numeric ceilings
+    tighten downward, validity windows shift inward, masks subset, lists
+    subset, ``origin_kind`` is equality (no widening, no narrowing, no
+    reset). Widening any field rejects with
+    :class:`UcanPermissionError`.
+
+    Args:
+        parent_token: The parent :class:`UcanToken` to narrow. Its
+            ``encoded`` field is forwarded to the bridge so the core
+            ``narrow()`` rule can consult the parent's signed caveats.
+        child_caveats: The attenuated caveats. MUST be a strict
+            attenuation of the parent's caveats per §7.3.8.
+        context: The context ID the token belongs to.
+        encoded_parent: Optional override for the encoded JWT
+            (defaults to ``parent_token.encoded``).
+
+    Returns:
+        A new :class:`UcanToken` carrying the narrowed caveats in its
+        ``nb`` field.
+
+    Raises:
+        UcanPermissionError: If the narrow rule rejects (widening field,
+            origin-kind mismatch, mask-width violation, mint-limit
+            exceeded).
+    """
+    encoded = encoded_parent if encoded_parent is not None else parent_token.encoded
+    if not encoded:
+        raise UcanPermissionError(
+            "narrow requires the parent token's encoded JWT — pass "
+            "encoded_parent=… or use a UcanToken minted with "
+            "ucan.mint(...) which populates `.encoded`",
+        )
+    try:
+        wire_caveats = _caveats_to_json(child_caveats)
+        if wire_caveats is None:  # narrow() requires concrete caveats
+            wire_caveats = "{}"
+        bridge_token = await asyncio.to_thread(
+            _scp_core.ucan_narrow,
+            context,
+            encoded,
+            wire_caveats,
         )
     except Exception as exc:
         raise UcanPermissionError(str(exc)) from exc
@@ -266,6 +410,7 @@ __all__ = [
     "UcanToken",
     "delegate",
     "mint",
+    "narrow",
     "revoke",
     "validate",
 ]

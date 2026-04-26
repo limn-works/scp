@@ -7238,6 +7238,7 @@ pub async fn ucan_mint(
     member_did: String,
     capabilities: Vec<String>,
     proofs: Option<Vec<String>>,
+    caveats_json: Option<String>,
 ) -> Result<Arc<UcanToken>, ScpError> {
     crate::uniffi_check_handle!(handle);
     validate_did(&member_did)?;
@@ -7249,7 +7250,7 @@ pub async fn ucan_mint(
             })?;
         }
     }
-    ucan_mint_impl(handle, member_did, capabilities, proofs).await
+    ucan_mint_impl(handle, member_did, capabilities, proofs, caveats_json).await
 }
 
 /// Inner implementation of [`ucan_mint`], split out for cfg-gating clarity.
@@ -7259,7 +7260,19 @@ async fn ucan_mint_impl(
     member_did: String,
     capabilities: Vec<String>,
     proofs: Option<Vec<String>>,
+    caveats_json: Option<String>,
 ) -> Result<Arc<UcanToken>, ScpError> {
+    // SCP-OUT-023: decode optional caveats JSON at the bridge boundary.
+    let caveats_decoded: Option<scp_core::trust::caveats::InvocationCaveats> =
+        match caveats_json.as_deref() {
+            None => None,
+            Some(json) => Some(scp_ffi_common::caveats::caveats_from_json(json).map_err(
+                |msg| ScpError::Validation {
+                    msg,
+                    code: codes::VALID_7010.to_owned(),
+                },
+            )?),
+        };
     runtime()
         .spawn(async move {
             // Extract key custody and signing key from the context handle.
@@ -7299,6 +7312,7 @@ async fn ucan_mint_impl(
                 } else {
                     handle.ceiling_strings.iter().cloned().collect()
                 }),
+                caveats: caveats_decoded.clone(),
             };
 
             let token = scp_core::crypto::ucan::mint::mint_ucan(
@@ -7338,6 +7352,7 @@ async fn ucan_mint_impl(
     _member_did: String,
     _capabilities: Vec<String>,
     _proofs: Option<Vec<String>>,
+    _caveats_json: Option<String>,
 ) -> Result<Arc<UcanToken>, ScpError> {
     Err(ScpError::Permission {
         msg: "UCAN minting requires key custody — the in_memory custody path \
@@ -7586,6 +7601,7 @@ async fn ucan_delegate_impl(
                 key_scope: None,
                 signing_key_id: None,
                 ceiling,
+                caveats: None,
             };
 
             let token = delegate_ucan(&params, &custody.0, &scp_primitives::SystemClock)
@@ -7629,6 +7645,127 @@ async fn ucan_delegate_impl(
                   \"allow_in_memory_custody\" feature for dev/desktop use, or wire \
                   a KeyCustodyProvider for production."
             .to_owned(),
+        code: codes::PERM_3004.to_owned(),
+    })
+}
+
+/// Narrows a parent UCAN token by re-issuing it with attenuated caveats
+/// (SCP-OUT-023).
+///
+/// Calls `delegate_ucan` with the parent's audience as the delegatee so the
+/// chain extends in place. The §7.3.8 narrow rules run against the
+/// parent's `nb` field.
+///
+/// # Errors
+///
+/// Returns `ScpError::Validation` if the JSON is malformed.
+/// Returns `ScpError::Permission` if signing fails or the narrow rule
+/// rejects the child caveats.
+#[uniffi::export]
+pub async fn ucan_narrow(
+    handle: Arc<ContextHandle>,
+    parent_token: String,
+    child_caveats_json: String,
+) -> Result<Arc<UcanToken>, ScpError> {
+    crate::uniffi_check_handle!(handle);
+    validate_ucan_token(&parent_token)?;
+    ucan_narrow_impl(handle, parent_token, child_caveats_json).await
+}
+
+#[cfg(feature = "allow_in_memory_custody")]
+async fn ucan_narrow_impl(
+    handle: Arc<ContextHandle>,
+    parent_token: String,
+    child_caveats_json: String,
+) -> Result<Arc<UcanToken>, ScpError> {
+    let child_caveats =
+        scp_ffi_common::caveats::caveats_from_json(&child_caveats_json).map_err(|msg| {
+            ScpError::Validation {
+                msg,
+                code: codes::VALID_7010.to_owned(),
+            }
+        })?;
+
+    runtime()
+        .spawn(async move {
+            use scp_core::crypto::ucan::mint::{DelegateParams, delegate_ucan};
+            use scp_core::crypto::ucan::validate::parse_ucan;
+
+            let custody =
+                handle
+                    .in_memory_custody
+                    .as_ref()
+                    .ok_or_else(|| ScpError::Permission {
+                        msg: "UCAN narrow requires key custody — create the context with \
+                              an in_memory identity"
+                            .to_owned(),
+                        code: codes::PERM_3004.to_owned(),
+                    })?;
+            let signing_key = handle.signing_key.ok_or_else(|| ScpError::Permission {
+                msg: "UCAN narrow requires a signing key".to_owned(),
+                code: codes::PERM_3004.to_owned(),
+            })?;
+
+            let parsed_parent = parse_ucan(&parent_token).map_err(|e| ScpError::Permission {
+                msg: format!("malformed parent UCAN token: {e}"),
+                code: codes::PERM_3002.to_owned(),
+            })?;
+            let delegator_did = parsed_parent.payload.aud.clone();
+
+            let ceiling = Some(if handle.ceiling_strings.is_empty() {
+                scp_core::context::roles::default_ceiling().to_ucan_string_set()
+            } else {
+                handle.ceiling_strings.iter().cloned().collect()
+            });
+
+            let params = DelegateParams {
+                parent_token: &parsed_parent,
+                delegator_did: &delegator_did,
+                delegator_key: &signing_key,
+                delegatee_did: &delegator_did,
+                attenuated_capabilities: &parsed_parent.payload.att,
+                lifetime_secs: 3600,
+                facts: None,
+                key_scope: None,
+                signing_key_id: None,
+                ceiling,
+                caveats: Some(child_caveats),
+            };
+
+            let token = delegate_ucan(&params, &custody.0, &scp_primitives::SystemClock)
+                .await
+                .map_err(ScpError::from)?;
+
+            let data = UcanTokenData {
+                token_id: token.payload.nnc.clone(),
+                issuer: token.payload.iss.clone(),
+                audience: token.payload.aud.clone(),
+                capabilities: token.payload.att.iter().map(|a| a.with.clone()).collect(),
+                expires_at: Some(token.payload.exp),
+            };
+            increment_handle_count();
+            Ok(Arc::new(UcanToken {
+                data,
+                encoded: token.encoded,
+                instance_id: handle.instance_id,
+            }))
+        })
+        .await
+        .map_err(|e| ScpError::Permission {
+            msg: format!("tokio task join error during UCAN narrow: {e}"),
+            code: codes::PERM_3005.to_owned(),
+        })?
+}
+
+#[cfg(not(feature = "allow_in_memory_custody"))]
+#[allow(clippy::unused_async)]
+async fn ucan_narrow_impl(
+    _handle: Arc<ContextHandle>,
+    _parent_token: String,
+    _child_caveats_json: String,
+) -> Result<Arc<UcanToken>, ScpError> {
+    Err(ScpError::Permission {
+        msg: "UCAN narrow requires key custody — enable allow_in_memory_custody".to_owned(),
         code: codes::PERM_3004.to_owned(),
     })
 }

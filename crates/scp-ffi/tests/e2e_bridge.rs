@@ -500,6 +500,7 @@ fn ucan_mint_rejects_empty_context() {
         "did:key:someone",
         vec!["messages:write".to_owned()],
         None,
+        None,
     );
     assert!(result.is_err());
 }

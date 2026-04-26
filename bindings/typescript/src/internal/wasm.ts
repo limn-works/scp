@@ -146,6 +146,18 @@ interface WasmModule {
     expiresAt: number | null;
     encoded: string;
   }>;
+  ucan_narrow: (
+    handle: BridgeContextHandle,
+    parentToken: string,
+    childCaveatsJson: string,
+  ) => Promise<{
+    tokenId: string;
+    issuer: string;
+    audience: string;
+    capabilitiesJson: string;
+    expiresAt: number | null;
+    encoded: string;
+  }>;
   ucan_revoke: (handle: BridgeContextHandle, token: string, revokerDid: string) => Promise<void>;
   // Bridge Connector
   bridge_register: (
@@ -1379,9 +1391,14 @@ export function createWasmBridge(): Bridge {
       memberDid: string,
       capabilities: readonly string[],
       _proofs?: readonly string[],
+      _caveatsJson?: string,
     ): Promise<UcanToken> {
       const wasm = getWasm();
       const capabilitiesJson = JSON.stringify(capabilities);
+      // SCP-OUT-023: WASM mint always rejects (JS-side custody). The
+      // _caveatsJson parameter is forwarded so the WASM bridge signature
+      // matches the NAPI bridge — when the WASM SDK adopts JS-side
+      // signing, the caveats field is the wire-form `nb` value.
       const result = await wasm.ucan_mint(handle, memberDid, capabilitiesJson);
       const token: UcanToken = {
         id: result.tokenId,
@@ -1389,6 +1406,29 @@ export function createWasmBridge(): Bridge {
         issuer: result.issuer,
         audience: result.audience,
         capabilities: safeJsonParse(result.capabilitiesJson, "ucan_mint") as string[],
+      };
+      if (result.expiresAt != null) {
+        return { ...token, expiresAt: result.expiresAt };
+      }
+      return token;
+    },
+
+    async ucanNarrow(
+      handle: BridgeContextHandle,
+      parentToken: string,
+      childCaveatsJson: string,
+    ): Promise<UcanToken> {
+      const wasm = getWasm();
+      // SCP-OUT-023: WASM narrow always rejects (JS-side custody required).
+      // The TypeScript SDK consumer uses the NAPI path for narrow until the
+      // browser-side signing flow is added.
+      const result = await wasm.ucan_narrow(handle, parentToken, childCaveatsJson);
+      const token: UcanToken = {
+        id: result.tokenId,
+        encoded: result.encoded,
+        issuer: result.issuer,
+        audience: result.audience,
+        capabilities: safeJsonParse(result.capabilitiesJson, "ucan_narrow") as string[],
       };
       if (result.expiresAt != null) {
         return { ...token, expiresAt: result.expiresAt };

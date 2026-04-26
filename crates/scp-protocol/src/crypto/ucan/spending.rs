@@ -804,6 +804,7 @@ pub fn mint_spending_ucan_payload(
         att,
         prf: vec![],
         fct,
+        nb: None,
     })
 }
 
@@ -1289,6 +1290,7 @@ mod tests {
                 att: vec![],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: String::new(),
@@ -1310,6 +1312,7 @@ mod tests {
                 att: vec![],
                 prf: vec![],
                 fct: Some(serde_json::json!({"other_key": "value"})),
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: String::new(),
@@ -1389,6 +1392,7 @@ mod tests {
                 att: vec![],
                 prf: vec![],
                 fct: Some(serde_json::Value::Object(fct)),
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: String::new(),
@@ -1763,6 +1767,7 @@ mod tests {
                     "spending_capability": serde_json::to_value(cap).unwrap(),
                     "scp_key_scope": "#agent"
                 })),
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: String::new(),
@@ -1812,6 +1817,7 @@ mod tests {
                 }],
                 prf: vec![],
                 fct: None,
+                nb: None,
             },
             signature: vec![0u8; 64],
             encoded: String::new(),

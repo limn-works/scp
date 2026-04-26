@@ -214,6 +214,7 @@ fn build_spending_ucan(
         att: vec![spending_att],
         prf: vec![],
         fct: Some(serde_json::Value::Object(fct)),
+        nb: None,
     };
 
     if !signed {

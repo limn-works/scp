@@ -1,5 +1,45 @@
 import Foundation
 
+// MARK: - Caveat marshalling (SCP-OUT-023)
+
+// swiftlint:disable cyclomatic_complexity
+
+/// Serializes an `InvocationCaveats` to its canonical wire JSON form
+/// (§7.3.8 vocabulary). Returns `nil` when `caveats` is `nil`.
+///
+/// Field naming: snake_case Swift property → camelCase wire key
+/// (`amountMaxPerCall`, `validFrom`, …). Absent fields are omitted.
+/// `inputSchemaJson` is decoded from JSON string into the wire object.
+/// `rateWindow` is wrapped into the wire form `{max:1, windowSecs:N}`
+/// because the SDK uses a single-int convenience and the Rust
+/// `RateWindow` deserializer requires both keys.
+func caveatsToJson(_ caveats: InvocationCaveats?) throws -> String? {
+    guard let cvts = caveats else { return nil }
+    var wire: [String: Any] = [:]
+    if let value = cvts.amountMaxPerCall { wire["amountMaxPerCall"] = value }
+    if let value = cvts.amountMaxCumulative { wire["amountMaxCumulative"] = value }
+    if let value = cvts.validFrom { wire["validFrom"] = value }
+    if let value = cvts.validUntil { wire["validUntil"] = value }
+    if let value = cvts.hoursOfDay { wire["hoursOfDay"] = value }
+    if let value = cvts.daysOfWeek { wire["daysOfWeek"] = value }
+    if let value = cvts.maxCalls { wire["maxCalls"] = value }
+    if let value = cvts.rateWindow {
+        wire["rateWindow"] = ["max": 1, "windowSecs": value] as [String: Any]
+    }
+    if let schema = cvts.inputSchemaJson, let data = schema.data(using: .utf8) {
+        if let parsed = try? JSONSerialization.jsonObject(with: data) {
+            wire["inputSchema"] = parsed
+        }
+    }
+    if let value = cvts.allowedAdapters { wire["allowedAdapters"] = value }
+    if let value = cvts.allowedTargetDids { wire["allowedTargetDids"] = value }
+    if let value = cvts.originKind { wire["originKind"] = value }
+    let data = try JSONSerialization.data(withJSONObject: wire, options: [.sortedKeys])
+    return String(data: data, encoding: .utf8)
+}
+
+// swiftlint:enable cyclomatic_complexity
+
 // UcanToken is now defined by UniFFI in ScpBindings.swift as an open class
 // with methods: issuer(), audience(), expiresAt(), tokenId(), capabilities(), tokenData().
 //
@@ -71,12 +111,23 @@ public enum UcanBridge {
         _ proofTokens: [String]?
     ) async throws -> Void
 
-    /// Mint a UCAN token. Maps to ``ucanMint`` in ScpBindings.
+    /// Mint a UCAN token. Maps to ``ucanMint`` in ScpBindings. The
+    /// `caveatsJson` parameter (SCP-OUT-023) carries the §7.3.8
+    /// invocation caveats wire form; pass `nil` for a caveat-free token.
     public typealias MintFn = @Sendable (
         _ handle: ContextHandle,
         _ memberDid: String,
         _ capabilities: [String],
-        _ proofs: [String]?
+        _ proofs: [String]?,
+        _ caveatsJson: String?
+    ) async throws -> UcanToken
+
+    /// Narrow a UCAN token's caveats. Maps to ``ucanNarrow`` in
+    /// ScpBindings (SCP-OUT-023, §7.3.8).
+    public typealias NarrowFn = @Sendable (
+        _ handle: ContextHandle,
+        _ parentToken: String,
+        _ childCaveatsJson: String
     ) async throws -> UcanToken
 
     /// Revoke a UCAN token. Maps to ``ucanRevoke`` in ScpBindings.
@@ -92,8 +143,13 @@ public enum UcanBridge {
     }
 
     /// Default mint function that delegates to the UniFFI-generated binding.
-    public static let defaultMint: MintFn = { handle, memberDid, capabilities, proofs in
-        try await ucanMint(handle: handle, memberDid: memberDid, capabilities: capabilities, proofs: proofs)
+    public static let defaultMint: MintFn = { handle, memberDid, capabilities, proofs, caveatsJson in
+        try await ucanMint(handle: handle, memberDid: memberDid, capabilities: capabilities, proofs: proofs, caveatsJson: caveatsJson)
+    }
+
+    /// Default narrow function (SCP-OUT-023) — delegates to the UniFFI-generated binding.
+    public static let defaultNarrow: NarrowFn = { handle, parentToken, childCaveatsJson in
+        try await ucanNarrow(handle: handle, parentToken: parentToken, childCaveatsJson: childCaveatsJson)
     }
 
     /// Default revoke function that delegates to the UniFFI-generated binding.
@@ -182,9 +238,36 @@ public func mintUcanToken(
     memberDid: String,
     capabilities: [String],
     proofs: [String]? = nil,
+    caveats: InvocationCaveats? = nil,
     mintFn: UcanBridge.MintFn = UcanBridge.defaultMint
 ) async throws -> UcanToken {
-    try await mintFn(handle, memberDid, capabilities, proofs)
+    let caveatsJson = try caveatsToJson(caveats)
+    return try await mintFn(handle, memberDid, capabilities, proofs, caveatsJson)
+}
+
+/// Narrows a parent UCAN token by attaching attenuated §7.3.8 caveats
+/// (SCP-OUT-023). Re-issues the parent to the same audience with the
+/// child caveats; the §7.3.8 narrow rules are enforced inside the Rust
+/// core (numeric ceilings tighten downward, validity windows shift
+/// inward, masks subset, lists subset, `originKind` is equality).
+///
+/// - Parameters:
+///   - handle: The ``ContextHandle``.
+///   - parentToken: Encoded parent UCAN JWT.
+///   - childCaveats: Attenuated caveats; MUST be a strict attenuation of
+///     the parent's caveats per §7.3.8.
+///   - narrowFn: Bridge function override for testing.
+/// - Returns: A new ``UcanToken`` carrying the narrowed caveats.
+/// - Throws: ``ScpError/Permission(msg:code:)`` on widening or rule
+///   violation; ``ScpError/Validation(msg:code:)`` on JSON shape error.
+public func narrowUcanToken(
+    handle: ContextHandle,
+    parentToken: String,
+    childCaveats: InvocationCaveats,
+    narrowFn: UcanBridge.NarrowFn = UcanBridge.defaultNarrow
+) async throws -> UcanToken {
+    let json = try caveatsToJson(childCaveats) ?? "{}"
+    return try await narrowFn(handle, parentToken, json)
 }
 
 /// Revokes a UCAN token using the full revocation pipeline.
@@ -330,7 +413,7 @@ public func mint(
     mintFn: UcanBridge.MintFn = UcanBridge.defaultMint
 ) async throws -> UcanToken {
     let capStrings = capabilities.map { "\($0.resource):\($0.action)" }
-    return try await mintFn(handle, audienceDid, capStrings, proofs.isEmpty ? nil : proofs)
+    return try await mintFn(handle, audienceDid, capStrings, proofs.isEmpty ? nil : proofs, nil)
 }
 
 /// Revokes a UCAN token.

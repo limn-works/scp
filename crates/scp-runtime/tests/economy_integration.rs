@@ -264,6 +264,7 @@ fn make_spending_ucan(cap: &SpendingCapability, scope_uri: &str) -> UcanToken {
             }],
             prf: vec![],
             fct: Some(serde_json::Value::Object(fct)),
+            nb: None,
         },
         signature: vec![0u8; 64],
         encoded: String::new(),

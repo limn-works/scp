@@ -304,6 +304,7 @@ export interface Bridge {
     memberDid: string,
     capabilities: readonly string[],
     proofs?: readonly string[],
+    caveatsJson?: string,
   ): Promise<UcanToken>;
   ucanRevoke(handle: BridgeContextHandle, token: string, revokerDid: string): Promise<void>;
   ucanDelegate(
@@ -312,6 +313,16 @@ export interface Bridge {
     delegateeDid: string,
     parentToken: string,
     capabilities: readonly string[],
+  ): Promise<UcanToken>;
+  /**
+   * Narrow a parent UCAN by attaching attenuated §7.3.8 caveats
+   * (SCP-OUT-023). `childCaveatsJson` MUST be canonical JSON matching the
+   * `InvocationCaveats` wire format.
+   */
+  ucanNarrow(
+    handle: BridgeContextHandle,
+    parentToken: string,
+    childCaveatsJson: string,
   ): Promise<UcanToken>;
 
   // Trust Aggregation

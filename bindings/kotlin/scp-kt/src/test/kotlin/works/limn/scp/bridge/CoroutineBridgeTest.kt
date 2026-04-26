@@ -972,6 +972,10 @@ class StubNativeBindings : NativeBindings {
     var toolInvokeResult = ""
     var toolVerifyResult = """{"tool_id":"stub","passed":true,"failures":[]}"""
     var ucanMintResult = ""
+    var ucanMintLastCaveatsJson: String? = null
+    var ucanNarrowResult = ""
+    var ucanNarrowCalled = false
+    var ucanNarrowLastCaveatsJson: String? = null
     var ucanDelegateResult = ""
     var eventLogQueryResult = ""
     var eventLogVerifyResult = false
@@ -1398,7 +1402,21 @@ class StubNativeBindings : NativeBindings {
         contextHandle: Long,
         memberDid: String,
         capabilitiesJson: String,
-    ): String = ucanMintResult
+        caveatsJson: String?,
+    ): String {
+        ucanMintLastCaveatsJson = caveatsJson
+        return ucanMintResult
+    }
+
+    override fun ucanNarrow(
+        contextHandle: Long,
+        parentToken: String,
+        childCaveatsJson: String,
+    ): String {
+        ucanNarrowCalled = true
+        ucanNarrowLastCaveatsJson = childCaveatsJson
+        return ucanNarrowResult
+    }
 
     override fun ucanRevoke(
         contextHandle: Long,

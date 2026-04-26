@@ -721,6 +721,38 @@ export function createMockBridge(): Bridge & {
       ctx.revokedTokens.add(token);
     },
 
+    async ucanNarrow(
+      handle: BridgeContextHandle,
+      parentToken: string,
+      childCaveatsJson: string,
+    ): Promise<UcanToken> {
+      // SCP-OUT-023: mock narrow re-issues the parent token with the child
+      // caveats embedded in the JWT payload `nb` field. The mock does not
+      // run the §7.3.8 narrow rule — bridge-level conformance tests cover
+      // that path through the real Rust core.
+      const ctx = getContext(handle);
+      const tokenId = generateId("ucan");
+      const parts = parentToken.split(".");
+      const parentPayload =
+        parts.length === 3
+          ? JSON.parse(Buffer.from(parts[1] ?? "", "base64url").toString())
+          : { iss: ctx.creatorDid, aud: ctx.creatorDid, cap: [] };
+      const nb = JSON.parse(childCaveatsJson);
+      const encoded = `eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.${Buffer.from(
+        JSON.stringify({ ...parentPayload, nb }),
+      ).toString("base64url")}.mock-signature-${tokenId}`;
+      const token: UcanToken = {
+        id: tokenId,
+        encoded,
+        issuer: parentPayload.iss,
+        audience: parentPayload.aud,
+        capabilities: parentPayload.cap ?? [],
+        expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      };
+      ctx.ucans.set(tokenId, token);
+      return token;
+    },
+
     async ucanDelegate(
       handle: BridgeContextHandle,
       delegatorDid: string,

@@ -331,6 +331,7 @@ fn dummy_spending_ucan() -> scp_core::crypto::ucan::UcanToken {
             }],
             prf: vec![],
             fct: Some(serde_json::Value::Object(fct)),
+            nb: None,
         },
         signature: vec![],
         encoded: "test.spending.ucan".to_owned(),
@@ -387,6 +388,7 @@ fn signed_spending_ucan_for(actor_did: &DID) -> scp_core::crypto::ucan::UcanToke
         }],
         prf: vec![],
         fct: Some(serde_json::Value::Object(fct)),
+        nb: None,
     };
 
     let header_json = serde_json::to_vec(&header).expect("header serializes");
