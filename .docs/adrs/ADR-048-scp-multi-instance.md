@@ -28,7 +28,7 @@ Every language SDK exposes a class named exactly `SCP`:
 - Swift: `SCP` (`#[derive(uniffi::Object)] Scp`, renamed in UDL)
 - Kotlin: `SCP` (same UniFFI object, Kotlin binding)
 
-`SCP` wraps an owned `Arc<BridgeInstance>`. Instance state — ContextManager, identity registry, UCAN registry, MCP registries, transport manager, known-contexts cache, rate limiters, economy trackers, petname/handle/scope registries — lives on that instance. Operations that were previously free functions become methods on `SCP`:
+`SCP` wraps an owned `Arc<BridgeInstance>`. Instance state — ContextManager, identity registry, UCAN registry, MCP registries, transport manager, known-contexts cache, rate limiters, economy trackers, petname/handle/scope registries — lives on that instance. Operations that touch instance state become methods on `SCP`:
 
 ```python
 scp = scp_sdk.SCP()               # new
@@ -36,7 +36,17 @@ identity = scp.identity_create(…) # method, not module-level function
 context = scp.context_create(…)
 ```
 
-Pure protocol helpers that touch no registry (hashing, encoding, validation of shape-only inputs) stay as free functions.
+**Pure protocol helpers that touch no registry stay as free functions at the FFI Rust layer.** This rule is normative and non-negotiable. A function that takes `&self` but never reads `self` is a lie about its dependency surface — handle affinity (§4) becomes dead weight, lifecycle coupling (§5, §6) becomes spurious, and multi-instance neutrality (the central goal of this ADR) becomes inverted: `scp_a.X()` and `scp_b.X()` produce identical bytes for any pure helper, making the instance receiver meaningless variance. The compiler can express the difference between `pub fn` and `&self`; the FFI source must use it honestly.
+
+Examples of pure helpers that stay free at the FFI layer:
+- Protocol-constant lookups (`template_get_params` — maps a template ID enum to its canonical `ContextParams` struct)
+- Shape validators (`validate_against_template`, `validate_context_params`, `metadata_record_from_json`)
+- Pure builders (`discovery_create_query`)
+- Process-scoped resolvers (`context_discover` — uses `crate::runtime()` and per-call `DidDht::new()`; reads zero per-instance state)
+
+Detection heuristic during code review: if a `&self` method body never references `self`, or if the helper takes `_bi: &BridgeInstance` with the leading underscore (compiler-enforced unused-parameter elision), the helper is pure and belongs at module scope.
+
+**SDK wrapper layer is governed by §7, not §1.** Each SDK (Python, TypeScript, Swift, Kotlin, WASM) chooses whether to surface a pure helper as an `SCP` class method or as a module-level export based on its own language idiom. §1 governs the FFI Rust source; §7 governs the language-specific wrapper layer above it.
 
 The class is named after the protocol, not after internal plumbing. This matches the prevailing SDK convention (`OpenAI()`, `Anthropic()`, `Stripe()`) and avoids the collisions that `Node`, `Bridge`, or `Client` would create with existing application-layer classes (`server.py:125`, `server.ts:223`, `BridgeConnector` in spec §12).
 
@@ -109,19 +119,48 @@ Short-lived tasks (single-await-then-return) are allowed to hold an `Arc` for th
 
 Regression tests at `crates/scp-ffi/src/transport.rs::tests`, `crates/scp-ffi/src/mcp.rs::tests`, and `crates/scp-ffi/uniffi/src/bridge.rs::tests` assert (a) `Arc::strong_count(&bi) == 1` while the task is parked, and (b) `weak.upgrade().is_none()` once the caller-held `Arc` drops — proving `impl Drop for BridgeInstance` runs and `emergency_cancel_tasks` propagates.
 
-### 7. SDK-level Kotlin-parity: SCP methods are the sole entry point
+### 7. Per-SDK idiomatic shape — language constraints stay local
 
-Every SDK wraps the NAPI `Scp` surface (and its PyO3/UniFFI siblings) as instance methods on its own `SCP` class. The pre-Phase-4 shape — a three-method `SCP` lifecycle object alongside a parallel collection of namespace classes (`Identity`, `Context`, `Transport`, `EventLog`, `McpServer`, `McpClient`, `Relay`, `Node`) with their own lifecycle methods plus ~140 free functions — is gone. There is one class, one surface, one entry point:
+**The rule.** Each SDK chooses its method-vs-free-function shape based on
+its own language semantics and binding-tool constraints. Cross-language
+symmetry is not a value when it requires importing another language's
+constraints. The FFI Rust layer follows §1 strictly (pure helpers stay
+free functions at FFI); the SDK wrapper layer above is per-language.
 
-- **Python:** `scp_sdk.SCP` carries 162 methods (was 3).
-- **TypeScript:** the `SCP` class in `bindings/typescript/src/scp.ts` carries 181 methods (was 3).
-- **Kotlin:** `bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Scp.kt` carries 137 methods. Kotlin was the reference shape — it already expressed this surface via `CoroutineBridge` before Phase 4. Python and TypeScript now match.
+**Stateful operations are methods on `SCP` in every SDK.** Lifecycle,
+content, governance, economy, attestation, sync, MCP, relay, node,
+identity-registry-touching, and any operation that reads or mutates the
+per-instance `BridgeInstance` state lives as `scp.contextCreate(...)`,
+`scp.ucanMint(...)`, etc. Handles are owned by the issuing `SCP` and
+enforced via `instance_id` per §4. The pre-Phase-4 namespace classes
+(`Identity`, `Context`, `Transport`, `EventLog`, `McpServer`,
+`McpClient`, `Relay`, `Node`) collapsed to pure handle types with no
+methods.
 
-The namespace classes collapsed to pure handle types — `Identity { did, custodyType }`, `Context { contextId, identityDid }`, `Transport { handle }`, `EventLog { handle }`, `McpServer { handle }`, `McpClient { handle }`, `Relay { handle, relayPort }`, `Node { handle, relayPort }` — with no methods. Every lifecycle, content, governance, economy, attestation, sync, discovery, event-log, MCP, relay, and node operation is a method on `SCP` (`scp.contextCreate(...)`, `scp.ucanMint(...)`, `scp.eventLogQuery(handle, filter)`, `scp.relayStart(config)`, etc.). Handles are owned by the `SCP` that issued them and enforced by `instance_id` per §4.
+**Pure helpers' SDK-side shape is per-language**:
 
-Swift retains per-object UniFFI-generated wrappers alongside `Scp.swift` — UniFFI does not expose a mechanism to collapse `#[uniffi::Object]` receivers into methods on an unrelated outer object without hand-written shims on both sides of the bridge. Per ADR-021, UniFFI's generator constraints govern the Swift surface. Swift callers get the same semantic surface (one `SCP` instance, handle-scoped operations) with the generator's natural shape; Python, Kotlin, and TypeScript converge on the single-class form.
+- **Kotlin** (`bindings/kotlin/scp-kt/...`): pure helpers are methods on `SCP`. Driven by `CoroutineBridge`'s requirement for object-bound coroutine scope inheritance — Kotlin's structured concurrency makes module-level functions awkward to compose with `SupervisorJob` cancellation. This is a Kotlin-local language-runtime constraint.
 
-Commits (all on `refactor/phase4-facade-delete`, issue #1549): `dc7face6d` (Python Agent A — class scaffold), `4fb4572f8` (TS Agent A — class scaffold), `bdd2cb58a` (TS B1 — namespace class collapse), `4612e7eff` (TS B2 — Proxy mock-bridge rewrite), `ecc668bd3` (Python B+C — handle collapse + test rewrite), `cd85f3f8b` (TS B4 — large test rewrites), `5271ef84d` (TS B5 — WASM + examples).
+- **Python** (`bindings/python/scp_sdk/`): pure helpers stay as module-level functions (`scp_sdk.context.template_get_params`, `scp_sdk.discovery.context_discover`, etc.). Python idiom favors module-level functions for pure operations; forcing them onto `SCP` creates false instance dependencies and forces consumers to instantiate `SCP()` (which spins up the tokio runtime, identity registry, semaphores) just to call deterministic shape validators.
+
+- **TypeScript** (`bindings/typescript/src/scp.ts`): pure helpers MAY be exposed as `SCP` methods or as module-level exports — the choice is TS-local ergonomic. When exposed as methods on `SCP`, the method body routes to a module-level NAPI export, NOT to a method on the underlying `napi-rs` `Scp` class (which does not exist for pure helpers per §1). The class shape is decoration over a free-function FFI.
+
+- **Swift** (`bindings/swift/Sources/SCP/`): per-object UniFFI-generated wrappers retained alongside `Scp.swift`. Per ADR-021, UniFFI's generator constraints prevent collapsing `#[uniffi::Object]` receivers into methods on an unrelated outer class without hand-written shims on both sides — so the SDK surface follows the generator's natural shape. Pure helpers surface as free top-level functions; per-object methods stay on their `#[uniffi::Object]` types. The FFI Rust layer for these helpers is governed by §1 (free `pub fn`) and is unaffected by this Swift-side shape choice.
+
+- **WASM** (`crates/scp-ffi/wasm/src/`, consumed by browser TypeScript): pure helpers are free `#[wasm_bindgen] pub fn` exports. ADR-034 prohibits the full `BridgeInstance` surface in WASM; the wasm-bindgen idiom favors free function exports for stateless utilities.
+
+When a cross-bridge audit or symmetry check flags a function as "missing
+in X but present in Y," the ADR is the reference — both X and Y may be
+wrong. Read §1, then this section, then prescribe.
+
+**Cross-references**:
+- `.docs/lessons/per-sdk-idiom-not-cross-language-dogma.md` — full lesson and the principle that triggered this amendment.
+- §1 above — the FFI Rust layer rule (pure helpers stay free fns).
+- ADR-034 — WASM bridge constraints (no scp-platform; constrained surface).
+- ADR-021 — UniFFI binding constraints.
+- ADR-047 — bridge-symmetry enforcement (matrix supports both alias forms; symmetry is per-bridge, not per-SDK).
+
+Commits documenting the original §7 collapse (issue #1549, all on `refactor/phase4-facade-delete`): `dc7face6d` (Python Agent A — class scaffold), `4fb4572f8` (TS Agent A — class scaffold), `bdd2cb58a` (TS B1 — namespace class collapse), `4612e7eff` (TS B2 — Proxy mock-bridge rewrite), `ecc668bd3` (Python B+C — handle collapse + test rewrite), `cd85f3f8b` (TS B4 — large test rewrites), `5271ef84d` (TS B5 — WASM + examples). The 2026-04-25 amendment that introduced the per-SDK framing is on the same issue (#1543 / Batch 3a follow-up).
 
 **Round-2 and round-3 hardening (post-§7 review loop, 2026-04-21).** After the §7 migration landed the full review roster surfaced three classes of finding that were addressed in `3de6cbe30`, `78102c871`, `d8ffcdadf`, and `d489f6610`. The decisions baked into those commits supersede naïve readings of the earlier §7 framing:
 

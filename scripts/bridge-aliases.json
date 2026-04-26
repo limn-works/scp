@@ -2485,6 +2485,125 @@
       "wasm": [
         "context_governance_list_proposals"
       ]
+    },
+    {
+      "canonical": "template_get_params",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "py_template_get_params"
+      ],
+      "uniffi": [
+        "template_get_params"
+      ],
+      "napi": [
+        "template_get_params"
+      ],
+      "wasm": [
+        "template_get_params"
+      ]
+    },
+    {
+      "canonical": "validate_against_template",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "py_validate_against_template"
+      ],
+      "uniffi": [
+        "validate_against_template"
+      ],
+      "napi": [
+        "validate_against_template"
+      ],
+      "wasm": [
+        "validate_against_template"
+      ]
+    },
+    {
+      "canonical": "validate_context_params",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "py_validate_context_params"
+      ],
+      "uniffi": [
+        "validate_context_params"
+      ],
+      "napi": [
+        "validate_context_params"
+      ],
+      "wasm": [
+        "validate_context_params"
+      ]
+    },
+    {
+      "canonical": "metadata_record_from_json",
+      "category": "context",
+      "wasm_required": false,
+      "pyo3": [
+        "py_metadata_record_from_json"
+      ],
+      "uniffi": [
+        "metadata_record_from_json"
+      ],
+      "napi": [
+        "metadata_record_from_json"
+      ],
+      "wasm": [
+        "metadata_record_from_json"
+      ]
+    },
+    {
+      "canonical": "discovery_create_query",
+      "category": "discovery",
+      "wasm_required": false,
+      "pyo3": [
+        "py_discovery_create_query"
+      ],
+      "uniffi": [
+        "discovery_create_query"
+      ],
+      "napi": [
+        "discovery_create_query"
+      ],
+      "wasm": [
+        "discovery_create_query"
+      ]
+    },
+    {
+      "canonical": "context_discover",
+      "category": "discovery",
+      "wasm_required": false,
+      "pyo3": [
+        "py_context_discover"
+      ],
+      "uniffi": [
+        "context_discover"
+      ],
+      "napi": [
+        "context_discover"
+      ],
+      "wasm": [
+        "context_discover"
+      ]
+    },
+    {
+      "canonical": "identity_remove_link_attestation",
+      "category": "identity",
+      "wasm_required": false,
+      "pyo3": [
+        "remove_identity_link_attestation"
+      ],
+      "uniffi": [
+        "identity_remove_link_attestation"
+      ],
+      "napi": [
+        "identity_remove_link_attestation"
+      ],
+      "wasm": [
+        "identity_remove_link_attestation"
+      ]
     }
   ],
   "exemptions": {

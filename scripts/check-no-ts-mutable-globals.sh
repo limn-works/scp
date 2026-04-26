@@ -99,6 +99,16 @@ ALLOWLIST=(
     _initPromise
     # scp.ts — lazy-resolved napi native constructor.
     _nativeScp
+    # internal/native.ts — single shared napi addon cache. Holds both
+    # the SCP class constructor (`addon.SCP`) and the module-level
+    # pure-helper exports (templateGetParams, validateAgainstTemplate,
+    # validateContextParams, metadataRecordFromJson, scpVersion,
+    # discoveryParseAddress, …) per ADR-048 §1. Both `internal/native.ts`
+    # and `scp.ts` route through `loadNativeAddon()` so there is exactly
+    # one frozen handle per process — a second loader anywhere in the
+    # SDK would defeat the cache discipline and re-open the
+    # `require.cache` mutation surface that the freeze closes.
+    _nativeAddon
     # mcp.ts — cached napi addon handle for MCP bridge functions.
     _mcpAddon
     # server.ts — cached napi addon handle for Server bridge functions.

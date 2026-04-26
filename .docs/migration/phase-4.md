@@ -1,8 +1,8 @@
 # Phase 4 upgrade guide — SCP as first-class SDK object
 
 **Target audience:** external SDK consumers upgrading past the #1549 Phase 4
-merge (PR 1 → PR 2 → PR 3 → PR 4 façade deletion → PR 5 Kotlin-parity
-method collapse).
+merge (PR 1 → PR 2 → PR 3 → PR 4 façade deletion → PR 5 namespace-class
+collapse onto `SCP`).
 **ADR:** [ADR-048 — SCP as First-Class Multi-Instance SDK Object](../adrs/ADR-048-scp-multi-instance.md)
 **Status:** live — update for any breaking change landed after 2026-04-21.
 
@@ -10,13 +10,19 @@ Phase 4 converts the four language SDKs from a single process-wide default
 bridge instance into first-class multi-instance objects (PR 1–3), deletes
 the default-instance façade outright (PR 4), then collapses the per-domain
 namespace classes (`Identity`, `Context`, `Relay`, `Node`, `McpServer`,
-`McpClient`, `Transport`, `EventLog`) onto `SCP` itself (PR 5, ADR-048
-§7). Per ADR-048 (re-scoped 2026-04-19), the builder-tenet "no deferral"
-applies — there is no sunset window, no `DeprecationWarning` scaffold, no
-`SCP.default()` accessor, and post-PR-5 there are no free-function or
-namespace-static entry points: **every stateful operation is an instance
-method on `SCP`**. The four SDK surfaces are now Python 162 / TypeScript
-181 / Kotlin 137 / Swift per-handle methods, respectively.
+`McpClient`, `Transport`, `EventLog`) onto `SCP` itself (PR 5). Per
+ADR-048 (re-scoped 2026-04-19), the builder-tenet "no deferral" applies
+— there is no sunset window, no `DeprecationWarning` scaffold, no
+`SCP.default()` accessor, and post-PR-5 there is no free-function or
+namespace-static façade.
+
+**Per-SDK shape** is governed by [ADR-048 §7](../adrs/ADR-048-scp-multi-instance.md#7-per-sdk-idiomatic-shape--language-constraints-stay-local):
+stateful operations land as instance methods on `SCP` in every SDK, while
+pure protocol helpers' SDK shape is a per-language idiomatic choice (Python
+keeps them as module-level functions; Kotlin folds them onto `SCP`;
+TypeScript supports either; Swift and WASM follow their binding-tool
+constraints). Cross-language symmetry is not a goal where it would force
+one language's binding-tool constraints onto another.
 
 ---
 
@@ -36,9 +42,9 @@ method on `SCP`**. The four SDK surfaces are now Python 162 / TypeScript
 Every SDK entry point that previously delegated to a process-wide default
 instance is gone (PR 4). Post-PR-5 the per-domain namespace classes
 (`Identity`, `Context`, `Relay`, `Node`, `McpServer`, `McpClient`,
-`Transport`, `EventLog`) are pure handle types with no methods — every
-stateful operation is a **method on `SCP`**. Callers construct an `SCP`
-at process start and invoke it directly.
+`Transport`, `EventLog`) are pure handle types with no methods — stateful
+operations are **methods on `SCP`** (see [ADR-048 §7](../adrs/ADR-048-scp-multi-instance.md#7-per-sdk-idiomatic-shape--language-constraints-stay-local)).
+Callers construct an `SCP` at process start and invoke it directly.
 
 ```python
 # Before Phase 4
@@ -46,7 +52,7 @@ from scp_sdk import Identity, Context
 identity = await Identity.create(custody="in_memory")
 ctx = await Context.create(creator=identity, ...)
 
-# After Phase 4 PR 5 (Kotlin-parity — ADR-048 §7)
+# After Phase 4 PR 5
 from scp_sdk import SCP
 with SCP() as scp:
     identity = await scp.identity_create("in_memory")
@@ -59,7 +65,7 @@ import { Identity, Context } from "@limn-works/scp-ts";
 const identity = await Identity.create({ custody: "in_memory" });
 const ctx = await Context.create(identity, { ceiling, memoryScope });
 
-// After Phase 4 PR 5 (Kotlin-parity — ADR-048 §7)
+// After Phase 4 PR 5
 import { SCP } from "@limn-works/scp-ts";
 const scp = new SCP();
 try {
@@ -71,15 +77,22 @@ try {
 ```
 
 Pure protocol helpers that touch no registry state (hashing, encoding,
-shape-only validation, `defineToolDefinition`, `parseAddress`) remain as
-free functions. Swift retains per-handle `#[uniffi::Object]` wrappers
-alongside `Scp.swift` — UniFFI does not expose a mechanism to collapse
-`#[uniffi::Object]` receivers into methods on an unrelated outer object
-without hand-written shims, so Swift callers invoke methods on the
-generated handle types (`ctx.send(payload)`) rather than on `scp`.
-Semantically the surface is identical — every handle still carries the
-issuing `SCP`'s `instance_id` and every operation crosses the same
-handle-affinity gate.
+shape-only validation, `defineToolDefinition`, `parseAddress`) remain
+free functions at the FFI Rust layer per ADR-048 §1; their SDK-side
+shape is per-language (see ADR-048 §7). Python keeps them as
+`scp_sdk.context.template_get_params(...)` module-level imports;
+TypeScript exposes them as both `SCP` methods and direct module imports
+(`import { templateGetParams }`); Kotlin folds them onto `SCP` to
+compose with `CoroutineBridge` scope; Swift surfaces them through the
+generated UniFFI handle types. Swift retains per-handle
+`#[uniffi::Object]` wrappers alongside `Scp.swift` — UniFFI does not
+expose a mechanism to collapse `#[uniffi::Object]` receivers into
+methods on an unrelated outer object without hand-written shims, so
+Swift callers invoke methods on the generated handle types
+(`ctx.send(payload)`) rather than on `scp`. Semantically the surface is
+identical — every handle still carries the issuing `SCP`'s
+`instance_id` and every operation crosses the same handle-affinity
+gate.
 
 ### 2. `SCP.resume()` is async (#1678)
 

@@ -16,10 +16,10 @@
  * in B1 — every call on a live SDK now lands on a `SCP.*` method, which
  * dispatches directly to `this.#native.methodName(...)`.
  *
- * The mock therefore needs to shadow the NAPI `Scp` class surface
- * (~181 methods + `instanceId` + `suspend`/`resume`/`shutdown`). Rather
- * than hand-rolling a full reimplementation, the factory returns a
- * `Proxy` that:
+ * The mock therefore needs to shadow the live `Scp` NAPI surface
+ * (per-instance lifecycle, governance, content, identity, and pure
+ * helper methods). Rather than hand-rolling a full reimplementation,
+ * the factory returns a `Proxy` that:
  *
  * 1. Intercepts every `get` on the fake handle.
  * 2. If the caller has configured a stub for that method name via
