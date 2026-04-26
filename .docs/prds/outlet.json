@@ -1361,7 +1361,7 @@
       "gate": "gate-caveats",
       "priority": "P0",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-runtime/src/trust/caveat_counter_store.rs",
         "crates/scp-runtime/src/trust/mod.rs",
