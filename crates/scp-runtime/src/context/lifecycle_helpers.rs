@@ -2475,27 +2475,93 @@ pub fn flush_all_contexts_sync(supervisor: &Supervisor) {
 /// Sync wrapper for [`shutdown_all_contexts`].
 ///
 /// Required by destructor / atexit-style sync callers (the FFI
-/// bridge instance's blocking-shutdown path) that cannot `.await`.
-/// Phase 1 fix-up of ADR-049 (post-review-round-1): the async
-/// helper acquires the supervisor `write_lock` with `lock().await`
-/// rather than `try_lock`, so the sync caller MUST drive an
-/// internal `block_on`. Mirrors the structure of
-/// [`flush_all_contexts_sync`].
+/// bridge instance's blocking-shutdown path) that cannot `.await`
+/// AND that may run on a `current_thread` tokio runtime where
+/// `block_in_place` would panic. Phase 1 fix-up of ADR-049
+/// (post-review-round-1): runs the same per-context destruction
+/// sequence as the async [`shutdown_all_contexts`] but uses
+/// `try_lock` for the supervisor write-lock + task-set acquisitions
+/// — on contention, the in-flight cleanup degrades to best-effort
+/// (state cleared on next async shutdown call). The destructor path
+/// runs at most once per process exit, so the contention window is
+/// vanishingly small.
 pub fn shutdown_all_contexts_sync(supervisor: &Supervisor) {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            tokio::task::block_in_place(|| { // ci-allow: block-on: shutdown teardown — destructor / atexit path; no async caller available
-                handle.block_on(shutdown_all_contexts(supervisor)); // ci-allow: block-on: shutdown teardown — see surrounding block_in_place
-            });
+    use crate::context::state::context_id_to_bytes;
+
+    let context_ids: Vec<String> = supervisor
+        .contexts_ref()
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+
+    let crypto_opt = supervisor.crypto_ref().cloned();
+    let event_log_opt = supervisor.event_log_ref().cloned();
+
+    for context_id in &context_ids {
+        let ctx_id_bytes = context_id_to_bytes(context_id);
+
+        if let Some(ref crypto) = crypto_opt {
+            if let Err(e) = crypto.destroy_sender_key(&ctx_id_bytes) {
+                tracing::debug!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to destroy sender key during sync shutdown — may already be gone"
+                );
+            }
+            if let Err(e) = crypto.destroy_mls_group(&ctx_id_bytes) {
+                tracing::debug!(
+                    context_id = %context_id,
+                    error = %e,
+                    "failed to destroy MLS group during sync shutdown — may already be gone"
+                );
+            }
         }
-        Err(e) => {
-            tracing::warn!(
+        if let Some(ref event_log) = event_log_opt
+            && let Err(e) = event_log.destroy_event_log(&ctx_id_bytes)
+        {
+            tracing::debug!(
+                context_id = %context_id,
                 error = %e,
-                "shutdown_all_contexts_sync called outside tokio runtime; \
-                 skipping shutdown — supervisor registries may retain stale state"
+                "failed to destroy event log during sync shutdown — may already be gone"
+            );
+        }
+        supervisor.contexts_ref().remove(context_id);
+    }
+
+    // Sync path: try_lock the write_lock once. On contention, log and
+    // skip — the destructor path runs once per process exit; contention
+    // is vanishingly rare, and the next async shutdown finishes the
+    // work cleanly.
+    if let Ok(_guard) = supervisor.write_lock.try_lock() {
+        supervisor
+            .standing_contexts_ref()
+            .store(Arc::new(HashMap::new()));
+        supervisor.local_dids_ref().store(Arc::new(HashSet::new()));
+    } else {
+        tracing::warn!(
+            "shutdown_all_contexts_sync: supervisor write_lock contended; \
+             standing_contexts and local_dids retain stale state"
+        );
+    }
+
+    // Wrapping-key cleanup is lock-free (DashMap::clear).
+    supervisor.clear_wrapping_keys();
+
+    if let Some(task_set) = supervisor.task_set_ref() {
+        if let Ok(mut tasks) = task_set.try_lock() {
+            tasks.abort_all();
+        } else {
+            tracing::warn!(
+                "shutdown_all_contexts_sync: task_set contended; \
+                 background tasks not aborted"
             );
         }
     }
+
+    tracing::info!(
+        removed_count = context_ids.len(),
+        "sync shutdown: removed all contexts and best-effort aborted background tasks"
+    );
 }
 
 /// Persists a degraded `ContextSnapshot` for a context whose lock could
