@@ -59,6 +59,35 @@ ScpError (root)
 | `SCP-ATTEST-9017` | Failed to re-serialize attestation to UTF-8 JSON |
 | `SCP-ATTEST-9018` | Cryptographic-class verification method not verifiable via browser fetch |
 
+### Outlet error sub-block (`SCP-TOOL-6100..6199`)
+
+Per spec [§5.4.4 Outlet Error Taxonomy](../specs/05-contexts.md#544-outlet-error-taxonomy) and [ADR-049 §1](../adrs/ADR-049-outlet-redesign.md#1-rename-tool--outlet-everywhere-hard-break-no-aliases), the `SCP-TOOL-6100..6199` sub-block carries the typed `OutletError` envelope's `code` field. The `SCP-TOOL-` prefix is preserved (not renamed to `SCP-OUTLET-`) because adding a new top-level prefix would force a coordinated change across every language SDK's error surface and every CI gate; sub-block allocation within the existing prefix is the forward-compatible path.
+
+The sub-block is partitioned by `OutletErrorClass` per the spec:
+
+| Range | Class | Spec semantics |
+|-------|-------|----------------|
+| `6100-6109` | `Protocol` | Registration / validation / classification violations (`query-cost-violation`, `kind-mismatch`, `amplification-violation`, `protocol.catalog-rotation-too-frequent`, `protocol.stream-already-open`, `protocol.session-id-conflict`, `protocol.malformed-session-id`) |
+| `6110-6119` | `Authorization` | UCAN / caveat / capability denials (`authorization.denied`, `authorization.expired`, `authorization.revoked`, `authorization.attenuation-violation`, `authorization.mint-limit-exceeded`, `authorization.adapter-not-allowed`, `authorization.revoked-mid-stream`, `authorization.credit-stream-mismatch`, `authorization.ikm-signature-invalid`, `authorization.salt-rotation-unjustified`, `attenuation.*`) |
+| `6120-6129` | `Input` | Schema / size / type / range violations on input (`input.schema-violation`, `input.too-large`, `input.not-serializable`, `input.estimate-exceeds-bound`) |
+| `6130-6139` | `Execution` | Handler panic / timeout / non-determinism / credit / stream-gap / cancel-ack-timeout (`execution.handler-panic`, `execution.timeout`, `execution.credit-exhausted`, `execution.credit-stall`, `execution.cancel-ack-timeout`) |
+| `6140-6149` | `Output` | Output schema / size / non-serializable violations (`output.schema-violation`, `output.too-large`, `output.not-serializable`) |
+| `6150-6159` | `Economic` | Funds / adapter / pricing / budget / escrow (`economic.insufficient-funds`, `economic.adapter-failure`, `economic.pricing-formula-error`, `economic.budget-exceeded`, `economic.escrow-overflow`, `protocol.interface-spam-cost`) |
+| `6160-6169` | `Transport` | Relay / cross-context bridge / rate / concurrency caps (`transport.relay-unavailable`, `transport.cross-context-bridge-failure`, `transport.rate-limited`, `transport.concurrent-streams-per-*`) |
+| `6170-6179` | `Governance` | Deregistration / suspension / ceiling / consequence (`governance.outlet-deregistered`, `governance.outlet-suspended`, `governance.ceiling-exceeded`, `governance.consequence-active`) |
+| `6180-6199` | _reserved_ | Reserved for forward-compatible expansion — every code in this range returns `None` from `error_code_to_class`. |
+
+The taxonomy is intentionally **compact** (≤ 18 codes total across the 8 classes; reserved gaps within each class range are honored). Distinct runtime conditions within a code differentiate via the `slug` field, not via new codes — see [§5.4.4 slug regex](../specs/05-contexts.md#544-outlet-error-taxonomy) and the registry in [`crates/scp-protocol/src/context/outlets/error_codes.rs`](../../crates/scp-protocol/src/context/outlets/error_codes.rs).
+
+`scripts/check-error-codes.sh` Phase 3 enforces the sub-block:
+
+1. Every `pub const CODE_<NAME>: &str = "SCP-TOOL-61NN"` declared in `error_codes.rs` is the source of truth for allocation.
+2. Every registered code must be wired into the `error_code_to_class` match arms (so a defined-but-not-wired constant fails the script).
+3. Every `OutletErrorClass` variant literal (Protocol, Authorization, Input, Execution, Output, Economic, Transport, Governance) must appear in the registry file (so a renamed/removed variant fails the script).
+4. Every `SCP-TOOL-61NN` literal found anywhere in the source tree must either be in the allocated set OR be exempted via an inline `SCP-CODE-OK:` marker — including all 8 classes printed at every run.
+
+CI runs `scripts/check-error-codes.sh` on every PR; the gate has been live since the initial Tier 1 PR Checks job.
+
 ## Stub and Placeholder Policy
 
 Code that does not fully implement its documented contract (acceptance criterion, ADR spec, or trait method) is a **stub**. Stubs are tolerated during phased implementation but must be traceable to the planning system.

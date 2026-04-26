@@ -5,6 +5,12 @@
 #           number in the allocated range (sdk-common.md).
 # Phase 2: Detects cross-bridge error code collisions — same code number
 #           used for semantically different errors.
+# Phase 3: Validates the SCP-TOOL-6100..6199 outlet sub-block against the
+#           registry at `crates/scp-protocol/src/context/outlets/error_codes.rs`
+#           per spec §5.4.4 / ADR-049 §1 / SCP-OUT-030. Also asserts every
+#           registered code has a class wired into `error_code_to_class` and
+#           that all 8 `OutletErrorClass` variant literals are present in
+#           the registry file.
 #
 # Canonical prefixes and ranges:
 #   SCP-IDENT-   1000-1999    SCP-CTX-     2000-2999
@@ -17,16 +23,32 @@
 #   SCP-GOV-     11000-11999
 #   SCP-ECON-    12000-12999
 #
+# Outlet sub-block (Phase 3):
+#   SCP-TOOL-6100..6199    Outlet error taxonomy per spec §5.4.4
+#                          Registry: crates/scp-protocol/src/context/outlets/error_codes.rs
+#                          Classes: Protocol, Authorization, Input, Execution,
+#                                   Output, Economic, Transport, Governance
+#
 # Exit 0 on success, 1 on any violation.
 # Usage: ./scripts/check-error-codes.sh
 #
 # Inline exemption marker:
 #   `SCP-CODE-OK: <reason>` — when present on a line, the line is skipped by
-#   Phase 1 range/prefix validation. Use sparingly and only for legitimate
-#   cases such as validator self-references where the canonical prefix
-#   appears in a `starts_with` / `b"..."` byte comparison rather than as an
-#   actual error code emission. Mirrors the `SCP-DEFAULT-INSTANCE-OK`
-#   pattern from `check-no-default-in-tests.sh`.
+#   Phase 1 range/prefix validation AND by Phase 3 sub-block validation. Use
+#   sparingly. Legitimate cases:
+#     - Validator self-references where the canonical prefix appears in a
+#       `starts_with` / `b"..."` byte comparison rather than as an actual
+#       error code emission.
+#     - Registry constant declarations (`pub const CODE_*: &str = "SCP-TOOL-NNNN"`)
+#       in error_codes.rs — the literal IS the registration, not an emission.
+#     - Reserved-range / reserved-gap test fixtures asserting `error_code_to_class`
+#       returns `None` for unallocated codes.
+#     - Legacy production emission paths flagged for migration to the typed
+#       `OutletError` envelope under SCP-OUT-027 (lossy `PermissionDenied`
+#       string fallback). Marker MUST cite SCP-OUT-027 so the next pass
+#       removes both the marker and the legacy emission.
+#   Mirrors the `SCP-DEFAULT-INSTANCE-OK` pattern from
+#   `check-no-default-in-tests.sh`.
 
 set -euo pipefail
 
@@ -283,6 +305,229 @@ if [[ $COLLISION_COUNT -gt 0 ]]; then
     echo ""
     echo "Found $COLLISION_COUNT error code collision(s)."
     echo "Each error code number must have a single semantic meaning across all bridges."
+fi
+
+# ---------------------------------------------------------------------------
+# Phase 3: Outlet sub-block (SCP-TOOL-6100..6199) registry conformance.
+#
+# Per spec §5.4.4 / ADR-049 §1 / SCP-OUT-030:
+#
+#   1. Read the registry at
+#      `crates/scp-protocol/src/context/outlets/error_codes.rs` and extract
+#      every allocated code from the `pub const CODE_<NAME>: &str =
+#      "SCP-TOOL-61NN";` declarations.
+#
+#   2. Verify each registered code is wired into the `error_code_to_class`
+#      match arms (i.e., the code constant appears in a match arm whose RHS
+#      contains an `OutletErrorClass::<Variant>` literal). Catches the
+#      defining-without-wiring footgun.
+#
+#   3. Verify all 8 `OutletErrorClass` variant literals (Protocol,
+#      Authorization, Input, Execution, Output, Economic, Transport,
+#      Governance) appear in the registry file. Catches drift if a variant
+#      gets renamed or removed without updating the registry's match arms.
+#
+#   4. Walk the tree for any `SCP-TOOL-61NN` literal not in the allocated
+#      set. Same skip rules as Phase 1: test files, `SCP-CODE-OK:` marker,
+#      inline-test heuristic. Plus comment-only line skip mirrored from
+#      Phase 2.
+#
+# Outputs the full class roster on every run for human auditing.
+# ---------------------------------------------------------------------------
+
+REGISTRY_FILE="crates/scp-protocol/src/context/outlets/error_codes.rs"
+
+OUTLET_CLASSES=(
+    Protocol
+    Authorization
+    Input
+    Execution
+    Output
+    Economic
+    Transport
+    Governance
+)
+
+echo ""
+echo "Phase 3: Outlet sub-block (SCP-TOOL-6100..6199) registry conformance."
+echo "  Registry: $REGISTRY_FILE"
+echo "  OutletErrorClass variants:"
+for class in "${OUTLET_CLASSES[@]}"; do
+    echo "    - OutletErrorClass::$class"
+done
+
+if [[ ! -f "$REGISTRY_FILE" ]]; then
+    echo "VIOLATION: registry file $REGISTRY_FILE not found."
+    VIOLATIONS=$((VIOLATIONS + 1))
+fi
+
+PHASE3_VIOLATIONS=0
+
+if [[ -f "$REGISTRY_FILE" ]]; then
+    # Step 1: Parse `pub const CODE_<NAME>: &str = "SCP-TOOL-61NN";` declarations.
+    # Build parallel arrays: allocated_codes[i] / allocated_consts[i].
+    allocated_codes=()
+    allocated_consts=()
+    while IFS=$'\t' read -r const_name code; do
+        [[ -z "$const_name" ]] && continue
+        allocated_consts+=("$const_name")
+        allocated_codes+=("$code")
+    done < <(
+        grep -nE 'pub const CODE_[A-Z_]+:[[:space:]]*&str[[:space:]]*=[[:space:]]*"SCP-TOOL-61[0-9]{2}"' "$REGISTRY_FILE" \
+            | sed -E 's/^[0-9]+:[[:space:]]*pub const (CODE_[A-Z_]+):[[:space:]]*&str[[:space:]]*=[[:space:]]*"(SCP-TOOL-61[0-9]{2})".*$/\1\t\2/'
+    )
+
+    if [[ ${#allocated_codes[@]} -eq 0 ]]; then
+        echo "VIOLATION: registry $REGISTRY_FILE declares zero SCP-TOOL-61NN codes (regex: pub const CODE_<NAME>: &str = \"SCP-TOOL-61NN\")."
+        PHASE3_VIOLATIONS=$((PHASE3_VIOLATIONS + 1))
+    else
+        echo ""
+        echo "  Allocated codes (${#allocated_codes[@]}):"
+        for i in "${!allocated_codes[@]}"; do
+            echo "    ${allocated_codes[$i]}  <-  ${allocated_consts[$i]}"
+        done
+    fi
+
+    # Step 2: Each registered code must be wired into a match arm whose RHS
+    # contains `OutletErrorClass::<Variant>`. Implementation: confirm the
+    # const name appears in at least one match arm fragment that is part of
+    # an `error_code_to_class` arm — we approximate by requiring each const
+    # to appear AT LEAST 2 times in the file (once in its declaration, once
+    # more — typically in `error_code_to_class` plus also `ALL_CODES`,
+    # `error_code_to_default_slug`, `error_code_to_retry_policy`).
+    for i in "${!allocated_consts[@]}"; do
+        const_name="${allocated_consts[$i]}"
+        code="${allocated_codes[$i]}"
+        # Count occurrences of the bare const name (token-bounded) in the file.
+        usage_count=$(grep -cE "\b${const_name}\b" "$REGISTRY_FILE")
+        if [[ "$usage_count" -lt 2 ]]; then
+            echo "VIOLATION: registry constant $const_name ($code) is declared but never referenced — code is not wired into error_code_to_class / ALL_CODES."
+            PHASE3_VIOLATIONS=$((PHASE3_VIOLATIONS + 1))
+        fi
+    done
+
+    # Step 3: Every code constant must reach a match arm rhs of the form
+    # `Some(OutletErrorClass::<Variant>)` — verified structurally by extracting
+    # the `error_code_to_class` function body and asserting every const name
+    # appears within it. Brittle to rename of the function; the function name
+    # is part of the §5.4.4 contract, so a rename should be paired with a
+    # script update.
+    fn_body=$(awk '
+        /pub fn error_code_to_class/ { in_fn = 1 }
+        in_fn { print }
+        in_fn && /^}$/ { exit }
+    ' "$REGISTRY_FILE")
+
+    if [[ -z "$fn_body" ]]; then
+        echo "VIOLATION: $REGISTRY_FILE does not contain a `pub fn error_code_to_class` definition (registry contract requires this lookup function)."
+        PHASE3_VIOLATIONS=$((PHASE3_VIOLATIONS + 1))
+    else
+        for i in "${!allocated_consts[@]}"; do
+            const_name="${allocated_consts[$i]}"
+            code="${allocated_codes[$i]}"
+            if ! echo "$fn_body" | grep -qE "\b${const_name}\b"; then
+                echo "VIOLATION: $code ($const_name) is declared but missing from error_code_to_class match arms — class wiring absent."
+                PHASE3_VIOLATIONS=$((PHASE3_VIOLATIONS + 1))
+            fi
+        done
+    fi
+
+    # Step 4: All 8 OutletErrorClass variant literals must appear in the
+    # registry file (proves the class enum is wired).
+    for class in "${OUTLET_CLASSES[@]}"; do
+        if ! grep -qE "\bOutletErrorClass::${class}\b" "$REGISTRY_FILE"; then
+            echo "VIOLATION: $REGISTRY_FILE does not contain literal `OutletErrorClass::${class}` — class wiring is missing."
+            PHASE3_VIOLATIONS=$((PHASE3_VIOLATIONS + 1))
+        fi
+    done
+
+    # Step 5: Walk the tree for any SCP-TOOL-61NN literal not in the
+    # allocated set. Skip rules mirror Phase 1 (test files, SCP-CODE-OK
+    # marker, inline-test heuristic) plus Phase 2's comment-only skip.
+    UNREGISTERED_HITS=0
+    while IFS=: read -r file line_num content; do
+        # Skip test files (same as Phase 1).
+        case "$file" in
+            */tests/*|*/Tests/*|*_test.rs|*_test.ts|*_test.py|*.test.ts|*.test.js|*Tests.swift|*Test.kt) continue ;;
+        esac
+
+        # Skip lines carrying the SCP-CODE-OK exemption marker.
+        case "$content" in
+            *"SCP-CODE-OK:"*) continue ;;
+        esac
+
+        # Skip inline-test heuristic lines (same as Phase 1).
+        case "$content" in
+            *assert_eq*|*assert!*|*assert_ne*|*matches!*|*"#[test]"*|*"#[cfg(test)]"*) continue ;;
+        esac
+
+        # Skip comment-only lines (mirror Phase 2).
+        trimmed="${content#"${content%%[![:space:]]*}"}"
+        case "$trimmed" in
+            "//"*|"///"*|"//!"*|"#"*|"*"*) continue ;;
+        esac
+
+        # Skip the registry file itself — it declares constants for every
+        # code, and those declarations carry SCP-CODE-OK markers already.
+        # The marker check above already handles the declarations; this
+        # belt-and-suspenders skip protects against a future contributor
+        # forgetting the marker on a new registry constant.
+        case "$file" in
+            *"$REGISTRY_FILE"|"./$REGISTRY_FILE") continue ;;
+        esac
+
+        # Extract every SCP-TOOL-61NN occurrence on the line.
+        remaining="$content"
+        while [[ "$remaining" =~ SCP-TOOL-(61[0-9]{2}) ]]; do
+            full_code="SCP-TOOL-${BASH_REMATCH[1]}"
+            # Is this code in the allocated set?
+            allocated=0
+            for allocated_code in "${allocated_codes[@]}"; do
+                if [[ "$full_code" == "$allocated_code" ]]; then
+                    allocated=1
+                    break
+                fi
+            done
+            if [[ $allocated -eq 0 ]]; then
+                echo "VIOLATION: $file:$line_num: $full_code is in the SCP-TOOL-6100..6199 outlet sub-block but is NOT registered in $REGISTRY_FILE."
+                echo "         Either register the code in the §5.4.4 taxonomy (add a CODE_* constant + class wiring + ALL_CODES entry) or migrate the emission to use an existing CODE_* constant."
+                UNREGISTERED_HITS=$((UNREGISTERED_HITS + 1))
+            fi
+            remaining="${remaining#*"$full_code"}"
+        done
+    done < <(
+        grep -rnE 'SCP-TOOL-61[0-9]{2}' \
+            --include='*.rs' \
+            --include='*.kt' \
+            --include='*.swift' \
+            --include='*.py' \
+            --include='*.ts' \
+            --include='*.js' \
+            --exclude-dir='.git' \
+            --exclude-dir='.claude' \
+            --exclude-dir='.docs' \
+            --exclude-dir='target' \
+            --exclude-dir='build' \
+            --exclude-dir='node_modules' \
+            --exclude='check-error-codes.sh' \
+            --exclude='sdk-common.md' \
+            --exclude='CLAUDE.md' \
+            . 2>/dev/null || true
+    )
+
+    if [[ $UNREGISTERED_HITS -gt 0 ]]; then
+        echo "Phase 3: $UNREGISTERED_HITS unregistered SCP-TOOL-61NN occurrence(s) found."
+        PHASE3_VIOLATIONS=$((PHASE3_VIOLATIONS + UNREGISTERED_HITS))
+    fi
+fi
+
+if [[ $PHASE3_VIOLATIONS -gt 0 ]]; then
+    VIOLATIONS=$((VIOLATIONS + PHASE3_VIOLATIONS))
+    echo ""
+    echo "Phase 3: $PHASE3_VIOLATIONS violation(s) in outlet sub-block conformance."
+else
+    echo ""
+    echo "Phase 3: outlet sub-block conformant — every SCP-TOOL-61NN literal is registered and every registered code is wired to a class."
 fi
 
 if [[ $VIOLATIONS -gt 0 ]]; then

@@ -1247,7 +1247,15 @@ mod tests {
 
     #[test]
     fn constructor_accepts_valid_canonical_code_range() {
-        for code in ["SCP-TOOL-6100", "SCP-TOOL-6110", "SCP-TOOL-6199"] {
+        // Positive-test fixture for the range validator. 6199 is a §5.4.4
+        // reserved-gap that the range validator must accept even though no
+        // CODE_* constant is allocated for it.
+        let valid_codes: [&str; 3] = [
+            "SCP-TOOL-6100",
+            "SCP-TOOL-6110",
+            "SCP-TOOL-6199", // SCP-CODE-OK: §5.4.4 reserved-gap range-validator fixture
+        ];
+        for code in valid_codes {
             assert!(validate_outlet_error_code(code), "expected valid: {code}");
         }
         // Negative-test inputs. Phase 1 of `scripts/check-error-codes.sh`

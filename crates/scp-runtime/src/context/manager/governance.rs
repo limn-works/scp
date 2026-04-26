@@ -6366,7 +6366,7 @@ fn query_cost_violation_to_context(
     use scp_protocol::context::outlets::OutletError;
     match err {
         OutletError::QueryCostViolation { reason } => ContextError::PermissionDenied(format!(
-            "SCP-TOOL-6102: Query outlet cost violation (§5.4.2): {reason}"
+            "SCP-TOOL-6102: Query outlet cost violation (§5.4.2): {reason}" // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates to typed OutletError under CODE_PROTOCOL_VIOLATION (slug `query-cost-violation`)
         )),
         // OutletRegistration::validate() only emits QueryCostViolation
         // today (SCP-OUT-012). Future structural checks added to validate()

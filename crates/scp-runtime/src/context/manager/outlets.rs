@@ -1228,11 +1228,11 @@ impl ContextManager {
                                         },
                                     );
                                 }
-                                Err("SCP-TOOL-6103: outlet kind mismatch (Query expected)".to_owned())
+                                Err("SCP-TOOL-6103: outlet kind mismatch (Query expected)".to_owned()) // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates this to typed OutletError under CODE_PROTOCOL_VIOLATION
                             }
                             Err(crate::context::outlets::invoke::OutletExecutorError::QueryViolation { operation }) => {
                                 Err(format!(
-                                    "SCP-TOOL-6103: query violation in exec_query: {operation}"
+                                    "SCP-TOOL-6103: query violation in exec_query: {operation}" // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates this to typed OutletError under CODE_PROTOCOL_VIOLATION
                                 ))
                             }
                             Err(crate::context::outlets::invoke::OutletExecutorError::Failed(msg)) => {
@@ -1268,11 +1268,11 @@ impl ContextManager {
                                 Ok(value)
                             }
                             Err(crate::context::outlets::invoke::OutletExecutorError::KindMismatch { .. }) => {
-                                Err("SCP-TOOL-6103: outlet kind mismatch (Action expected)".to_owned())
+                                Err("SCP-TOOL-6103: outlet kind mismatch (Action expected)".to_owned()) // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates this to typed OutletError under CODE_PROTOCOL_VIOLATION
                             }
                             Err(crate::context::outlets::invoke::OutletExecutorError::QueryViolation { operation }) => {
                                 Err(format!(
-                                    "SCP-TOOL-6103: query violation in exec_action: {operation}"
+                                    "SCP-TOOL-6103: query violation in exec_action: {operation}" // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates this to typed OutletError under CODE_PROTOCOL_VIOLATION
                                 ))
                             }
                             Err(crate::context::outlets::invoke::OutletExecutorError::Failed(msg)) => {
@@ -1433,17 +1433,17 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
             "SCP-ECON-12010: budget exceeded for {did}: cost {cost}, remaining {remaining}"
         )),
         InvocationError::OutletQueryCostViolation { reason } => ContextError::PermissionDenied(
-            format!("SCP-TOOL-6102: Query outlet cost violation (§5.4.2): {reason}"),
+            format!("SCP-TOOL-6102: Query outlet cost violation (§5.4.2): {reason}"), // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates to typed OutletError under CODE_PROTOCOL_VIOLATION (slug `query-cost-violation`)
         ),
         InvocationError::QueryViolation {
             outlet_id,
             operation,
         } => ContextError::PermissionDenied(format!(
-            "SCP-TOOL-6103: Query outlet \"{outlet_id}\" attempted write \"{operation}\" through ReadOnlyInvocation (§5.4.2)"
+            "SCP-TOOL-6103: Query outlet \"{outlet_id}\" attempted write \"{operation}\" through ReadOnlyInvocation (§5.4.2)" // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates to typed OutletError under CODE_PROTOCOL_VIOLATION (slug `query-violation`)
         )),
         InvocationError::KindMismatch { outlet_id, kind } => {
             ContextError::PermissionDenied(format!(
-                "SCP-TOOL-6103: outlet \"{outlet_id}\" registered as {kind:?} but executor returned KindMismatch (§5.4.2)"
+                "SCP-TOOL-6103: outlet \"{outlet_id}\" registered as {kind:?} but executor returned KindMismatch (§5.4.2)" // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates to typed OutletError under CODE_PROTOCOL_VIOLATION (slug `kind-mismatch`)
             ))
         }
         // SCP-OUT-028: Recovered handler panic. Surfaces with the §5.4.4
@@ -1574,8 +1574,8 @@ impl OutletAmplificationError {
     #[must_use]
     pub const fn error_code(&self) -> &'static str {
         match self {
-            Self::AmplificationViolation { .. } => "SCP-TOOL-6120",
-            Self::ChainDepthExceeded { .. } => "SCP-TOOL-6121",
+            Self::AmplificationViolation { .. } => "SCP-TOOL-6120", // SCP-CODE-OK: legacy event-log payload code; SCP-OUT-027 migrates to typed OutletError (slug `authorization.amplification-violation` → CODE_AUTHORIZATION_DENIED)
+            Self::ChainDepthExceeded { .. } => "SCP-TOOL-6121", // SCP-CODE-OK: legacy event-log payload code; SCP-OUT-027 allocates a registry constant for slug `resource.chain-depth-exceeded` (currently a reserved-gap in the §5.4.4 6120-6129 Input range)
         }
     }
 
@@ -3157,13 +3157,13 @@ mod wrap_cross_context_error_tests {
             ),
             (
                 "deregistered",
-                "SCP-TOOL-6171",
+                "SCP-TOOL-6171", // SCP-CODE-OK: oracle-collapse test input; intentionally an unallocated reserved-gap code so the collapse target (CODE_AUTHORIZATION_DENIED) is asserted to override it
                 OutletErrorClass::Governance,
                 "governance.outlet-deregistered",
             ),
             (
                 "kind-mismatch",
-                "SCP-TOOL-6103",
+                "SCP-TOOL-6103", // SCP-CODE-OK: oracle-collapse test input; intentionally an unallocated reserved-gap code so the collapse target (CODE_AUTHORIZATION_DENIED) is asserted to override it
                 OutletErrorClass::Protocol,
                 "protocol.kind-mismatch",
             ),
