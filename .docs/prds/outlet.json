@@ -1515,7 +1515,7 @@
       "gate": "gate-caveats",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/ucan.rs",
         "crates/scp-ffi/napi/src/ucan.rs",
@@ -1528,7 +1528,7 @@
       ],
       "description": "Expose InvocationCaveats through all 4 FFI bridges and 4 SDKs so apps can mint and delegate caveated tokens. Each SDK gets idiomatic constructors: Python InvocationCaveats(amount_max_per_call=100, ...); TypeScript const c: InvocationCaveats = { amountMaxPerCall: 100, ... }; Swift InvocationCaveats(amountMaxPerCall: 100, ...); Kotlin InvocationCaveats(amountMaxPerCall = 100, ...). Each SDK exposes `ucan.mint(caveats: InvocationCaveats, ...)` and `ucan.narrow(parent_token, child_caveats) -> child_token`. Mint-limit errors surface as SCP-TOOL-6114. Round-trip fidelity enforced via conformance test (SDK-created caveat survives marshal-unmarshal through FFI and back).",
       "acceptanceCriteria": [
-        "Every FFI bridge has an InvocationCaveats marshalling shim that round-trips all 11 fields",
+        "Every FFI bridge has an InvocationCaveats marshalling shim that round-trips all 12 fields",
         "Python: InvocationCaveats dataclass with optional fields; ucan.mint accepts caveats param; ucan.narrow(parent, child_caveats) returns a new token",
         "TypeScript: InvocationCaveats type; ucan.mint + ucan.narrow match",
         "Swift: InvocationCaveats struct; ucan.mint + ucan.narrow match",
