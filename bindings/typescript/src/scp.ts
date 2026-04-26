@@ -28,8 +28,6 @@
  * with `SCP-VALID-7005`.
  */
 
-import { createRequire } from "node:module";
-
 // Deferred imports of opaque classes. The classes import `SCP` for
 // typing, so importing them eagerly here creates a module cycle at
 // evaluation time. Using type-only imports keeps the SCP module
@@ -39,18 +37,21 @@ import { createRequire } from "node:module";
 import type { Context } from "./context";
 import { ValidationError } from "./errors";
 import type { Identity } from "./identity";
+import { loadNativeAddon, type NativeAddon as RawNativeAddon } from "./internal/native";
 import type { Node, Relay } from "./server";
 
 /**
- * Shape of the native addon — a subset sufficient to describe the
- * `SCP` class, its static factories, and the module-level free
- * functions for pure protocol helpers (per ADR-048 §1: pure helpers
- * stay free functions at the FFI Rust layer).
+ * Refined view of the native addon used by this module. The shared
+ * loader in `internal/native.ts` returns the raw addon as
+ * `Record<string, unknown>`; we narrow here to surface the names that
+ * `scp.ts` cares about (the `SCP` class constructor + the four
+ * module-level pure-helper exports per ADR-048 §1).
+ *
+ * Both `internal/native.ts` and this module read from the same
+ * `loadNativeAddon`-cached addon — there is one cache, one freeze,
+ * one platform package resolution.
  */
-type NativeAddon = {
-  // The raw addon exports `SCP` as an opaque napi-rs class. We refine to
-  // `NativeScpCtor` after a runtime `typeof` check; `unknown` keeps
-  // biome's `noExplicitAny` happy while the check provides the real type.
+type NativeAddon = RawNativeAddon & {
   SCP?: unknown;
   // Pure protocol helpers — exported at module scope per ADR-048 §1
   // because they touch no per-instance state. The `SCP` class methods
@@ -92,52 +93,18 @@ interface NativeScpInstance {
 }
 
 /**
- * Resolves the platform-specific napi package name.
+ * Resolves the cached native addon and validates the SCP-class export.
  *
- * Mirrors the mapping in `internal/native.ts` so that `SCP` can load
- * the addon directly without going through the `Bridge` interface
- * (which doesn't expose class constructors).
+ * Routes through the shared `loadNativeAddon` cache in
+ * `internal/native.ts` so this module and the bridge factory share a
+ * single frozen addon reference. The shared loader throws
+ * `TransportError` (`SCP-TRANS-5001`) on platform-package missing or
+ * load failure; this wrapper layers an additional WASM-runtime check
+ * and a stale-addon (no `SCP` class) check, both surfaced as
+ * `ValidationError` (`SCP-VALID-7005`) — the public-API code that
+ * SDK consumers see when they call `new SCP(...)`.
  */
-function resolveNapiPackage(): string {
-  const platform = process.platform;
-  const arch = process.arch;
-
-  const platformMap: Record<string, string> = {
-    "linux-x64": "@limn-works/scp-ts-napi-linux-x64-gnu",
-    "linux-arm64": "@limn-works/scp-ts-napi-linux-arm64-gnu",
-    "darwin-x64": "@limn-works/scp-ts-napi-darwin-x64",
-    "darwin-arm64": "@limn-works/scp-ts-napi-darwin-arm64",
-    "win32-x64": "@limn-works/scp-ts-napi-win32-x64-msvc",
-  };
-
-  const key = `${platform}-${arch}`;
-  const pkg = platformMap[key];
-
-  if (pkg === undefined) {
-    throw new ValidationError(
-      `Native addon not found — the @limn-works/scp-ts-napi-* package for ` +
-        `platform ${key} is not published. Install the matching platform package ` +
-        "for your host, or use the WASM bridge in a browser environment.",
-      "SCP-VALID-7005",
-    );
-  }
-
-  return pkg;
-}
-
-let _nativeScp: NativeScpCtor | null = null;
-// why: one-time FFI addon load cache. Holds both the SCP class and the
-// module-level pure-helper exports (templateGetParams,
-// validateAgainstTemplate, validateContextParams, metadataRecordFromJson)
-// per ADR-048 §1. Direct analog of `_nativeScp` extended for free-function
-// exports. Allowlisted in scripts/check-no-ts-mutable-globals.sh.
-let _nativeAddon: NativeAddon | null = null;
-
 function loadAddon(): NativeAddon {
-  if (_nativeAddon !== null) {
-    return _nativeAddon;
-  }
-
   if (typeof process === "undefined" || !process.versions?.node) {
     throw new ValidationError(
       "SCP class is not available in WASM runtime — the browser build of " +
@@ -147,53 +114,40 @@ function loadAddon(): NativeAddon {
     );
   }
 
-  const packageName = resolveNapiPackage();
   let addon: NativeAddon;
   try {
-    const req = createRequire(import.meta.url);
-    addon = req(packageName) as NativeAddon;
+    addon = loadNativeAddon() as NativeAddon;
   } catch (cause) {
     const underlying = (cause as Error)?.message ?? String(cause);
     throw new ValidationError(
-      `Native addon failed to load: ${underlying}. Package ${packageName} ` +
-        "was resolved but could not be instantiated — check that the binary " +
-        "for your host is installed, then reinstall with " +
-        `\`bun install ${packageName}\`.`,
+      `Native addon failed to load: ${underlying}. ` +
+        "Ensure the matching @limn-works/scp-ts-napi-* platform package is " +
+        "installed, then reinstall with `bun install`.",
       "SCP-VALID-7005",
     );
   }
 
   if (typeof addon.SCP !== "function") {
     throw new ValidationError(
-      `Native addon loaded but does not export the SCP class — ` +
-        `${packageName} was built before the Phase 4 PR 1 multi-instance ` +
+      "Native addon loaded but does not export the SCP class — " +
+        "the platform addon was built before the Phase 4 PR 1 multi-instance " +
         "surface landed. Upgrade the package or rebuild from the current " +
         "codebase with `cargo build -p scp-ffi-napi`.",
       "SCP-VALID-7005",
     );
   }
 
-  _nativeAddon = addon;
-  _nativeScp = addon.SCP as unknown as NativeScpCtor;
-  return _nativeAddon;
+  return addon;
 }
+
+let _nativeScp: NativeScpCtor | null = null;
 
 function nativeScp(): NativeScpCtor {
   if (_nativeScp !== null) {
     return _nativeScp;
   }
-  // loadAddon() either populates _nativeScp or throws — it never returns
-  // without setting the cache.
-  loadAddon();
-  if (_nativeScp === null) {
-    // Defensive: should be unreachable because loadAddon() either
-    // throws (above) or populates _nativeScp before returning.
-    throw new ValidationError(
-      "Native addon loaded but SCP constructor is unavailable — internal " +
-        "invariant violated. File an issue against scp-ts.",
-      "SCP-VALID-7005",
-    );
-  }
+  const addon = loadAddon();
+  _nativeScp = addon.SCP as unknown as NativeScpCtor;
   return _nativeScp;
 }
 

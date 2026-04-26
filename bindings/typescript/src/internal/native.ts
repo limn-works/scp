@@ -89,21 +89,44 @@ function resolveNapiPackage(): string {
 // Native addon loading
 // ---------------------------------------------------------------------------
 
-/** Shape of the native addon's exported functions. */
-type NativeAddon = Record<string, (...args: never[]) => unknown>;
+/**
+ * Shape of the native addon as observed at the bridge layer. Both module-
+ * level NAPI free functions and the `SCP` class constructor live on the
+ * same object; sibling modules narrow at the use-site.
+ */
+export type NativeAddon = Record<string, unknown>;
+
+// why: one-time FFI addon load cache. Holds the raw napi-rs object whose
+// keys carry both the SCP class constructor (`addon.SCP`) and the
+// module-level free-function exports (templateGetParams, scpVersion,
+// discoveryParseAddress, …) per ADR-048 §1. A single shared cache is the
+// only way to guarantee `internal/native.ts` and `scp.ts` see the same
+// frozen handle — a second loader would call `createRequire(...)` again
+// and `require.cache` could be tampered with by a compromised dep
+// between calls. Allowlisted in scripts/check-no-ts-mutable-globals.sh.
+let _nativeAddon: NativeAddon | null = null;
 
 /**
- * Loads the platform-specific native addon via `createRequire`.
+ * Loads (or returns the cached) platform-specific native addon. The
+ * returned object is `Object.freeze`d post-load so any code path that
+ * later holds a reference cannot mutate the export shape (defence
+ * against require-cache tampering between loader calls — see round-3
+ * `_nativeScp` hardening discussion in ADR-048 §7).
  *
- * Uses the Node.js `module.createRequire` API for ESM compatibility.
- * Falls back to a helpful error message if the package is not installed.
+ * Both `internal/native.ts` and `scp.ts` route through this single
+ * loader — the cache discipline only holds because there is exactly one
+ * loader. Adding a second loader anywhere in the SDK is a regression.
  */
-function loadNativeAddon(): NativeAddon {
-  const packageName = resolveNapiPackage();
+export function loadNativeAddon(): NativeAddon {
+  if (_nativeAddon !== null) {
+    return _nativeAddon;
+  }
 
+  const packageName = resolveNapiPackage();
+  let addon: NativeAddon;
   try {
     const req = createRequire(import.meta.url);
-    return req(packageName) as NativeAddon;
+    addon = req(packageName) as NativeAddon;
   } catch {
     throw new TransportError(
       `Failed to load native addon ${packageName}. ` +
@@ -111,6 +134,19 @@ function loadNativeAddon(): NativeAddon {
       "SCP-TRANS-5001",
     );
   }
+
+  // Freeze before caching: any later code path holding the addon
+  // reference (the `addon` closure local in createNativeBridge, or any
+  // `nativeFreeFn` lookup in scp.ts) reads from the same frozen object.
+  // This blocks post-load monkey-patching of the addon's named exports
+  // — a defense-in-depth control against a compromised optional dep
+  // attempting to swap a free function for a malicious one between
+  // loads. The freeze is shallow (its own properties); the SCP class's
+  // prototype is left mutable because napi-rs constructs handles by
+  // dispatching through it.
+  Object.freeze(addon);
+  _nativeAddon = addon;
+  return _nativeAddon;
 }
 
 // ---------------------------------------------------------------------------
@@ -137,6 +173,20 @@ export function createNativeBridge(scp: SCP): Bridge {
   // Type-erased native handle — every NAPI `Scp` class method shares
   // the `async (...args) => unknown` shape after FFI monomorphization,
   // and routing requires dynamic lookup by camelCase method name.
+  //
+  // Dispatcher routing rule (ADR-048 §1 + §7, enforced by
+  // bindings/typescript/tests/dispatcher-invariant.test.ts):
+  //   • `native.X` → method on the per-instance SCP class
+  //                  (Rust source: `impl Scp { #[napi] fn X(&self) }`
+  //                   in crates/scp-ffi/napi/src/scp.rs)
+  //   • `addon.X`  → module-level NAPI free function
+  //                  (Rust source: `#[napi] pub fn X()` in any other
+  //                   crates/scp-ffi/napi/src/*.rs file)
+  // Routing through the wrong handle becomes `(undefined)(args)` at
+  // runtime; a previous regression masked exactly this bug class —
+  // fixed in 97051e32e + 176763958. The dispatcher invariant test
+  // statically reads both source files and fails CI if any site uses
+  // the wrong handle.
   const native = __getNativeScp(scp) as unknown as Record<string, (...args: never[]) => unknown>;
 
   return {
@@ -1082,7 +1132,11 @@ export function createNativeBridge(scp: SCP): Bridge {
       };
     },
 
-    // Bridge Connector
+    // Bridge Connector — `bridgeRegister` and `bridgeEvaluateTrust` are
+    // module-level NAPI free fns in bridge_connector.rs and dispatch
+    // through `addon.X`. `bridgeCreateShadow` is on the SCP class
+    // (scp.rs:3727) and dispatches through `native.X`. The dispatcher
+    // routing rule above governs.
     bridgeRegister(
       contextId: string,
       operatorDid: string,
@@ -1091,7 +1145,6 @@ export function createNativeBridge(scp: SCP): Bridge {
       mode: BridgeMode,
     ) {
       // napi-rs #[napi(object)] returns camelCase keys; Bridge interface expects snake_case.
-      // bridgeRegister is a module-level NAPI free fn (bridge_connector.rs:145), not on the SCP class.
       const raw = (
         addon.bridgeRegister as (
           c: string,
@@ -1123,7 +1176,6 @@ export function createNativeBridge(scp: SCP): Bridge {
       isNativeTransport: boolean,
       shadowStatus: ShadowStatus,
     ) {
-      // Module-level NAPI free fn (bridge_connector.rs:76), not on the SCP class.
       return (addon.bridgeEvaluateTrust as (b: boolean, n: boolean, s: ShadowStatus) => number)(
         isBridged,
         isNativeTransport,
@@ -1162,9 +1214,9 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     // Discovery — pure protocol helpers per ADR-048 §1. These are
-    // module-level NAPI free functions, NOT methods on the SCP class —
-    // dispatch through `addon.<name>`, never `native.<name>` (which is
-    // the SCP class instance and does not inherit module-level exports).
+    // module-level NAPI free fns in discovery.rs; the dispatcher
+    // routing rule (top of createNativeBridge) routes them through
+    // `addon.X`.
     discoveryParseAddress(address: string) {
       return (addon.discoveryParseAddress as (a: string) => string)(address);
     },
@@ -1599,10 +1651,10 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     // Pure protocol helpers per ADR-048 §1 — module-level NAPI free
-    // functions, NOT methods on the SCP class. Dispatch through `addon`,
-    // not `native` (the SCP class instance does not inherit module-level
-    // exports). Was previously `native.<name>` which silently became
-    // `(undefined)(args)` at runtime — fixed in #1543 batch 3a.
+    // fns (template/metadata/validate-* in context.rs). Routed through
+    // `addon.X` per the dispatcher routing rule. Earlier variants were
+    // `native.<name>` and silently became `(undefined)(args)` at
+    // runtime — fixed in #1543 batch 3a (97051e32e + 176763958).
     metadataRecordFromJson(jsonStr: string): string {
       return (addon.metadataRecordFromJson as (j: string) => string)(jsonStr);
     },
@@ -1807,8 +1859,8 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     // SCPID authentication (§3.11) — methods on the SCP class
-    // (scp.rs:3749, 3761, 3781), NOT module-level NAPI exports.
-    // Dispatch through `native` (the SCP class instance), not `addon`.
+    // (scp.rs:3749, 3761, 3781). Routed through `native.X` per the
+    // dispatcher routing rule.
     scpidChallenge(audience: string, ttlSeconds: number): string {
       return (native.scpidChallenge as (a: string, t: number) => string)(audience, ttlSeconds);
     },

@@ -121,11 +121,21 @@ Regression tests at `crates/scp-ffi/src/transport.rs::tests`, `crates/scp-ffi/sr
 
 ### 7. Per-SDK idiomatic shape — language constraints stay local
 
-**Each SDK chooses its method-vs-free-function shape based on its own language semantics.** Cross-language symmetry is not a value when it requires importing another language's binding-tool constraints. The FFI Rust layer follows §1 strictly (pure helpers stay free functions at FFI); the SDK wrapper layer above is per-language.
+**The rule.** Each SDK chooses its method-vs-free-function shape based on
+its own language semantics and binding-tool constraints. Cross-language
+symmetry is not a value when it requires importing another language's
+constraints. The FFI Rust layer follows §1 strictly (pure helpers stay
+free functions at FFI); the SDK wrapper layer above is per-language.
 
-This section was originally drafted (commit `efc58ecfd`, 2026-04-25) with a universalist framing — *"There is one class, one surface, one entry point"* — and tabulated method counts (Python 162, TypeScript 181, Kotlin 137) as if convergence on a single shape was an achieved architectural goal. **It was not.** The single-shape claim was Kotlin's `CoroutineBridge` constraint propagated to Python and TypeScript without independent justification, while Swift (UniFFI generator) and WASM (wasm-bindgen) silently opted out because they couldn't implement it. That framing is amended below.
-
-**Stateful operations (the §1 carve-out's complement) are methods on `SCP` in every SDK.** Lifecycle, content, governance, economy, attestation, sync, MCP, relay, node, identity-registry-touching, and any operation that reads or mutates the per-instance `BridgeInstance` state lives as `scp.contextCreate(...)`, `scp.ucanMint(...)`, etc. Handles are owned by the issuing `SCP` and enforced via `instance_id` per §4. The pre-Phase-4 namespace classes (`Identity`, `Context`, `Transport`, `EventLog`, `McpServer`, `McpClient`, `Relay`, `Node`) collapsed to pure handle types with no methods.
+**Stateful operations are methods on `SCP` in every SDK.** Lifecycle,
+content, governance, economy, attestation, sync, MCP, relay, node,
+identity-registry-touching, and any operation that reads or mutates the
+per-instance `BridgeInstance` state lives as `scp.contextCreate(...)`,
+`scp.ucanMint(...)`, etc. Handles are owned by the issuing `SCP` and
+enforced via `instance_id` per §4. The pre-Phase-4 namespace classes
+(`Identity`, `Context`, `Transport`, `EventLog`, `McpServer`,
+`McpClient`, `Relay`, `Node`) collapsed to pure handle types with no
+methods.
 
 **Pure helpers' SDK-side shape is per-language**:
 
@@ -139,12 +149,12 @@ This section was originally drafted (commit `efc58ecfd`, 2026-04-25) with a univ
 
 - **WASM** (`crates/scp-ffi/wasm/src/`, consumed by browser TypeScript): pure helpers are free `#[wasm_bindgen] pub fn` exports. ADR-034 prohibits the full `BridgeInstance` surface in WASM; the wasm-bindgen idiom favors free function exports for stateless utilities.
 
-**The principle**: language-runtime constraints (Kotlin coroutine scope, Python GIL, JavaScript async/Promise model) and binding-tool structural limits (UniFFI generator, napi-rs class semantics, wasm-bindgen) are local to that language/bridge. They do not propagate. When a binding tool in language A forces a particular API shape, that shape is local to A. Asking "should language B follow A's pattern for cross-SDK consistency" is the wrong question; the right question is "is there a reason in B's own language semantics or binding constraints to use this pattern?"
-
-**Detection heuristic**: when an audit or symmetry check flags a function as "missing in bridge X but present in bridge Y," do NOT assume Y is the reference. The ADR is the reference. Both X and Y may be wrong (the most common case in practice — a pre-existing violation propagated as it was discovered). Read §1 first, then this section, then prescribe.
+When a cross-bridge audit or symmetry check flags a function as "missing
+in X but present in Y," the ADR is the reference — both X and Y may be
+wrong. Read §1, then this section, then prescribe.
 
 **Cross-references**:
-- `.docs/lessons/per-sdk-idiom-not-cross-language-dogma.md` — full lesson on the §1-vs-§7 contradiction history, audit-vs-spec drift, review-agent unanimity epistemics, and the principle that triggered this amendment.
+- `.docs/lessons/per-sdk-idiom-not-cross-language-dogma.md` — full lesson and the principle that triggered this amendment.
 - §1 above — the FFI Rust layer rule (pure helpers stay free fns).
 - ADR-034 — WASM bridge constraints (no scp-platform; constrained surface).
 - ADR-021 — UniFFI binding constraints.
