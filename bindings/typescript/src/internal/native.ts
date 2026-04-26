@@ -1091,8 +1091,9 @@ export function createNativeBridge(scp: SCP): Bridge {
       mode: BridgeMode,
     ) {
       // napi-rs #[napi(object)] returns camelCase keys; Bridge interface expects snake_case.
+      // bridgeRegister is a module-level NAPI free fn (bridge_connector.rs:145), not on the SCP class.
       const raw = (
-        native.bridgeRegister as (
+        addon.bridgeRegister as (
           c: string,
           o: string,
           g: string,
@@ -1122,7 +1123,8 @@ export function createNativeBridge(scp: SCP): Bridge {
       isNativeTransport: boolean,
       shadowStatus: ShadowStatus,
     ) {
-      return (native.bridgeEvaluateTrust as (b: boolean, n: boolean, s: ShadowStatus) => number)(
+      // Module-level NAPI free fn (bridge_connector.rs:76), not on the SCP class.
+      return (addon.bridgeEvaluateTrust as (b: boolean, n: boolean, s: ShadowStatus) => number)(
         isBridged,
         isNativeTransport,
         shadowStatus,
@@ -1804,13 +1806,15 @@ export function createNativeBridge(scp: SCP): Bridge {
       );
     },
 
-    // SCPID authentication (§3.11)
+    // SCPID authentication (§3.11) — methods on the SCP class
+    // (scp.rs:3749, 3761, 3781), NOT module-level NAPI exports.
+    // Dispatch through `native` (the SCP class instance), not `addon`.
     scpidChallenge(audience: string, ttlSeconds: number): string {
-      return (addon.scpidChallenge as (a: string, t: number) => string)(audience, ttlSeconds);
+      return (native.scpidChallenge as (a: string, t: number) => string)(audience, ttlSeconds);
     },
 
     scpidSign(did: string, signingKeyId: string, challengeJson: string): string {
-      return (addon.scpidSign as (d: string, k: string, c: string) => string)(
+      return (native.scpidSign as (d: string, k: string, c: string) => string)(
         did,
         signingKeyId,
         challengeJson,
@@ -1818,7 +1822,7 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     scpidVerify(responseJson: string, challengeJson: string): string {
-      return (addon.scpidVerify as (r: string, c: string) => string)(responseJson, challengeJson);
+      return (native.scpidVerify as (r: string, c: string) => string)(responseJson, challengeJson);
     },
 
     // Trust — participation verification (SCP-BA-004, §7.3.2.1)
