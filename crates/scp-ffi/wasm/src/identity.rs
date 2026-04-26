@@ -139,8 +139,10 @@ mod canonical_attestation {
 /// * [`IdentityRecord::Local`] — A locally-created identity holding both the
 ///   `#0` identity key and the distinct `#active` signing key, plus an
 ///   optional `#agent` key. Produced by [`identity_create`],
-///   [`identity_create_with_agent_key`], [`identity_rotate_key`], and
-///   [`identity_migrate`]. Can sign.
+///   [`identity_create_with_agent_key`], and [`identity_migrate`].
+///   [`identity_rotate_key`] mutates an existing `Local` record in place —
+///   replacing only `#active` — rather than constructing a new one.
+///   Can sign.
 /// * [`IdentityRecord::Resolved`] — A DID-resolution-only handle carrying
 ///   just the `#0` public key and custody-type metadata. Produced when the
 ///   bridge knows a DID exists (e.g. after a future JS-driven DID resolve
@@ -212,8 +214,8 @@ enum IdentityRecord {
     ///
     /// No public bridge function constructs a `Resolved` record today
     /// — all current constructors (`identity_create`,
-    /// `identity_create_with_agent_key`, `identity_rotate_key`,
-    /// `identity_migrate`) produce `Local`. `Resolved` exists as a
+    /// `identity_create_with_agent_key`, `identity_migrate`) produce
+    /// `Local`. `Resolved` exists as a
     /// type-level capacity for future resolution paths (e.g. the JS
     /// side passing a DHT-resolved DID document back across the
     /// boundary) and as a structural guard against the silent-fallback
@@ -1343,8 +1345,9 @@ fn resolve_did_document_fields(did: &str) -> ResolvedDocumentFields {
             },
         );
 
-    // Populate alsoKnownAs from MIGRATION_LINKS — after identity_migrate
-    // or identity_rotate_key, the new DID maps to the old DID (#540).
+    // Populate alsoKnownAs from MIGRATION_LINKS — after identity_migrate,
+    // the new DID maps to the old DID (#540). `identity_rotate_key`
+    // preserves the DID and therefore never writes to MIGRATION_LINKS.
     let also_known_as_json = MIGRATION_LINKS.with(|links| {
         let map = links.borrow();
         map.get(did).map_or_else(
@@ -1633,133 +1636,101 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     })
 }
 
-/// Rotates the main signing key for an identity.
+/// Rotates the `#active` signing key for an identity (spec §3.2.1, ADR-003 §4a).
 ///
-/// Generates a new Ed25519 keypair, derives a new `did:dht` DID from the
-/// new public key, updates the identity registry, and returns a new
-/// `WasmIdentity`. The old DID is stored in the migration links so
-/// `identity_resolve` can include it in `alsoKnownAs`.
+/// This is **active-key-only rotation** — the same Layer-1 operation
+/// implemented by `DidDht::rotate_active_key` on the native bridges
+/// (`PyO3` / NAPI / `UniFFI`). The DID and `#0` identity key are preserved;
+/// only the `#active` signing key is replaced. After rotation, every
+/// future `#active` signature uses the new key, while signatures over `#0`
+/// (device attestations, identity link attestations) remain unaffected.
+///
+/// Behavioral parity with native:
+/// - DID string unchanged (derived from `#0`).
+/// - `#0` identity key unchanged.
+/// - `#agent` signing key unchanged (preserved across rotation).
+/// - `#active` verifying method in the resolved DID document reflects the new
+///   public key on the next `identity_resolve` call.
+///
+/// Identity-key migration (which produces a *new* DID and stores the old DID
+/// in `alsoKnownAs`) is a distinct operation; use [`identity_migrate`] for
+/// that.
 ///
 /// # Errors
 ///
-/// Returns `[SCP-IDENT-1010]` if key generation fails.
+/// - `[SCP-IDENT-1009]` — the input DID is not in the local identity
+///   registry. Only identities created via [`identity_create`] /
+///   [`identity_create_with_agent_key`] can be rotated; bare DIDs constructed
+///   via [`WasmIdentity::from_did`] carry no retained key material.
+/// - `[SCP-IDENT-1028]` — the registry entry is a [`IdentityRecord::Resolved`]
+///   handle without retained signing-key material; rotation requires a
+///   [`IdentityRecord::Local`] record.
 #[wasm_bindgen]
 pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsError> {
-    let old_did = identity.did.clone();
-    let custody = identity.custody_type.clone();
+    rotate_active_key_inner(identity).map_err(ScpWasmError::into_js)
+}
 
-    // Generate a new Ed25519 identity-key (#0) and a distinct
-    // `#active` signing key — spec §3.2.1 requires the two keys to
-    // differ, matching `DidDht::create` on the other bridges (two
-    // consecutive `generate_keypair` calls).
-    let new_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+/// Inner implementation of [`identity_rotate_key`] that surfaces
+/// [`ScpWasmError`] directly. Splitting the function this way lets the
+/// non-wasm `#[test]` build inspect typed error variants — the
+/// `wasm-bindgen` wrapper above can only return `JsError`, which cannot
+/// be unwrapped outside a real wasm runtime.
+fn rotate_active_key_inner(identity: &WasmIdentity) -> Result<WasmIdentity, ScpWasmError> {
+    // Generate the new `#active` Ed25519 keypair before touching the
+    // registry, so a key-generation failure (none today, but defensive)
+    // never leaves the registry in a half-rotated state.
     let new_active = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let new_active_bytes = zeroize::Zeroizing::new(new_active.to_bytes());
-    let new_pub = new_key.verifying_key();
-    let pub_bytes = new_pub.to_bytes();
-    let new_did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
 
-    // Remove old entry and re-insert new entry in a single closure so the
-    // agent key bytes are moved, not cloned.
-    IDENTITY_REGISTRY
-        .with(|reg| {
-            let mut map = reg.borrow_mut();
-
-            // Take the agent key bytes from the old entry before removing it.
-            // `take()` moves the inner value out without cloning; the remaining
-            // entry is zeroized on drop via `remove()`. Only `Local` records
-            // carry an agent key — a `Resolved` record has no key material
-            // to carry forward.
-            let agent_key_bytes = match map.get_mut(&old_did) {
-                Some(IdentityRecord::Local {
-                    agent_signing_key_bytes,
-                    ..
-                }) => agent_signing_key_bytes.take(),
-                Some(IdentityRecord::Resolved { .. }) | None => None,
-            };
-            map.remove(&old_did);
-
-            check_registry_capacity(
-                &*map,
-                &new_did,
-                WASM_IDENTITY_REGISTRY_CAP,
-                "identity registry",
-                codes::VALID_7400,
-            )?;
-
-            map.insert(
-                new_did.clone(),
-                IdentityRecord::Local {
-                    signing_key_bytes: zeroize::Zeroizing::new(new_key.to_bytes()),
-                    active_signing_key_bytes: new_active_bytes,
-                    public_key_bytes: pub_bytes,
-                    custody_type: custody.clone(),
-                    agent_signing_key_bytes: agent_key_bytes,
-                },
-            );
-
-            Ok::<(), JsValue>(())
-        })
-        .map_err(|e| JsError::new(&format!("{e:?}")))?;
-
-    // Migrate any link attestations from the old DID to the new DID so they
-    // remain discoverable after rotation.
-    LINK_ATTESTATIONS.with(|reg| {
+    let did = identity.did.clone();
+    let status = IDENTITY_REGISTRY.with(|reg| {
         let mut map = reg.borrow_mut();
-        if let Some(attestations) = map.remove(&old_did) {
-            map.insert(new_did.clone(), attestations);
-        }
-    });
-
-    // Record the migration link (with capacity check).
-    MIGRATION_LINKS
-        .with(|links| {
-            let mut map = links.borrow_mut();
-            check_registry_capacity(
-                &*map,
-                &new_did,
-                WASM_MIGRATION_LINKS_CAP,
-                "migration links registry",
-                codes::VALID_7401,
-            )?;
-            map.insert(new_did.clone(), old_did);
-            Ok::<(), JsValue>(())
-        })
-        .map_err(|e| JsError::new(&format!("{e:?}")))?;
-
-    // Derive agent key state from the registry entry (authoritative) rather
-    // than copying from the input handle, which may be stale. Only
-    // `Local` records can carry an agent key.
-    let (has_agent, agent_multibase) = IDENTITY_REGISTRY.with(|reg| {
-        let map = reg.borrow();
-        match map.get(&new_did) {
+        match map.get_mut(&did) {
             Some(IdentityRecord::Local {
-                agent_signing_key_bytes: Some(sk_bytes),
+                active_signing_key_bytes,
                 ..
             }) => {
-                let sk = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
-                let pub_bytes = sk.verifying_key().to_bytes();
-                (true, Some(format!("z{}", zbase32_encode(&pub_bytes))))
+                // In-place replacement: the old `Zeroizing<[u8; 32]>` is
+                // dropped and zeroed when the new value is assigned, so no
+                // unprotected copy of the previous active key persists.
+                *active_signing_key_bytes = new_active_bytes;
+                AgentKeyMutationStatus::Updated
             }
-            Some(
-                IdentityRecord::Local {
-                    agent_signing_key_bytes: None,
-                    ..
-                }
-                | IdentityRecord::Resolved { .. },
-            )
-            | None => (false, None),
+            Some(IdentityRecord::Resolved { .. }) => AgentKeyMutationStatus::NotLocal,
+            None => AgentKeyMutationStatus::NotFound,
         }
     });
+    match status {
+        AgentKeyMutationStatus::Updated => {}
+        AgentKeyMutationStatus::NotFound => {
+            return Err(ScpWasmError::Identity {
+                message: format!("identity not found in registry: {did}"),
+                code: codes::IDENT_1009.to_owned(),
+            });
+        }
+        AgentKeyMutationStatus::NotLocal => {
+            return Err(ScpWasmError::Identity {
+                message: format!(
+                    "identity '{did}' was resolved from a DID string without local \
+                     key material — cannot rotate the active signing key"
+                ),
+                code: codes::IDENT_1028.to_owned(),
+            });
+        }
+    }
 
     Ok(WasmIdentity {
-        did: new_did,
-        custody_type: custody,
-        has_agent_key: has_agent,
-        agent_public_key_multibase: agent_multibase,
-        // Key rotation produces a new identity key, hence a new
-        // verifying_key + new DID.
-        verifying_key_hex: Some(hex::encode(pub_bytes)),
+        did,
+        custody_type: identity.custody_type.clone(),
+        // The agent-key state is preserved by the in-place mutation above
+        // (we only touched `active_signing_key_bytes`), so the input
+        // handle's flags carry through unchanged.
+        has_agent_key: identity.has_agent_key,
+        agent_public_key_multibase: identity.agent_public_key_multibase.clone(),
+        // The `#0` identity key (and thus the DID and the
+        // `verifying_key_hex` snapshot of `#0`) is unchanged — the input
+        // handle's value carries through.
+        verifying_key_hex: identity.verifying_key_hex.clone(),
     })
 }
 
@@ -3689,6 +3660,310 @@ mod tests {
         let resolved_pub = IDENTITY_REGISTRY
             .with(|reg| reg.borrow().get(&did).map(IdentityRecord::public_key_bytes));
         assert_eq!(resolved_pub, Some(pub_bytes));
+
+        cleanup_registries();
+    }
+
+    // -------------------------------------------------------------------
+    // identity_rotate_key — active-key-only rotation parity tests (#1717)
+    // -------------------------------------------------------------------
+
+    /// Reads the current `#active` private-key bytes for `did` out of the
+    /// registry. Test-only — production code never copies private key
+    /// material out of the registry.
+    fn snapshot_active_signing_key(did: &str) -> [u8; 32] {
+        IDENTITY_REGISTRY.with(|reg| match reg.borrow().get(did) {
+            Some(IdentityRecord::Local {
+                active_signing_key_bytes,
+                ..
+            }) => **active_signing_key_bytes,
+            other => panic!("expected Local record for {did}, got {other:?}"),
+        })
+    }
+
+    /// Reads the current `#0` identity-key public bytes for `did` out of
+    /// the registry. Test-only.
+    fn snapshot_identity_pub(did: &str) -> [u8; 32] {
+        IDENTITY_REGISTRY.with(|reg| {
+            reg.borrow().get(did).map_or_else(
+                || panic!("expected entry for {did}"),
+                IdentityRecord::public_key_bytes,
+            )
+        })
+    }
+
+    fn handle_for(did: &str, identity_pub_bytes: [u8; 32]) -> WasmIdentity {
+        WasmIdentity {
+            did: did.to_owned(),
+            custody_type: "in_memory".to_owned(),
+            has_agent_key: false,
+            agent_public_key_multibase: None,
+            verifying_key_hex: Some(hex::encode(identity_pub_bytes)),
+        }
+    }
+
+    #[test]
+    fn rotate_key_preserves_did_and_identity_key() {
+        cleanup_registries();
+        let (did, identity_pub_bytes, _) = register_identity();
+        let handle = handle_for(&did, identity_pub_bytes);
+
+        let rotated = identity_rotate_key(&handle).expect("rotate_key should succeed");
+
+        assert_eq!(
+            rotated.did, did,
+            "rotate_key MUST preserve the DID (active-key-only rotation, #1717)"
+        );
+        assert_eq!(
+            rotated.verifying_key_hex,
+            Some(hex::encode(identity_pub_bytes)),
+            "rotate_key MUST preserve the #0 verifying-key snapshot"
+        );
+        assert_eq!(
+            snapshot_identity_pub(&did),
+            identity_pub_bytes,
+            "rotate_key MUST NOT mutate the #0 identity key in the registry"
+        );
+
+        cleanup_registries();
+    }
+
+    #[test]
+    fn rotate_key_changes_active_signing_key() {
+        cleanup_registries();
+        let (did, identity_pub_bytes, _) = register_identity();
+        let handle = handle_for(&did, identity_pub_bytes);
+        let pre_rotation_active = snapshot_active_signing_key(&did);
+
+        let _ = identity_rotate_key(&handle).expect("rotate_key should succeed");
+
+        let post_rotation_active = snapshot_active_signing_key(&did);
+        assert_ne!(
+            pre_rotation_active, post_rotation_active,
+            "rotate_key MUST replace the #active signing key bytes"
+        );
+    }
+
+    #[test]
+    fn rotate_key_preserves_agent_key_bytes() {
+        cleanup_registries();
+        let (did, identity_pub_bytes, _, agent_pub_bytes) = register_identity_with_agent();
+        let mut handle = handle_for(&did, identity_pub_bytes);
+        handle.has_agent_key = true;
+        handle.agent_public_key_multibase = Some(format!("z{}", zbase32_encode(&agent_pub_bytes)));
+
+        let rotated = identity_rotate_key(&handle).expect("rotate_key should succeed");
+
+        // Returned handle reflects the input agent-key state.
+        assert!(
+            rotated.has_agent_key,
+            "rotate_key MUST preserve has_agent_key=true across rotation"
+        );
+        assert_eq!(
+            rotated.agent_public_key_multibase,
+            Some(format!("z{}", zbase32_encode(&agent_pub_bytes))),
+            "rotate_key MUST preserve the agent public-key multibase"
+        );
+
+        // Registry's agent signing key is bit-for-bit unchanged: rotation
+        // touches `#active` only.
+        let post_rotation_agent = IDENTITY_REGISTRY.with(|reg| match reg.borrow().get(&did) {
+            Some(IdentityRecord::Local {
+                agent_signing_key_bytes: Some(bytes),
+                ..
+            }) => **bytes,
+            other => panic!("expected Local with agent key, got {other:?}"),
+        });
+        let expected_agent = ed25519_dalek::VerifyingKey::from(
+            &ed25519_dalek::SigningKey::from_bytes(&post_rotation_agent),
+        )
+        .to_bytes();
+        assert_eq!(
+            expected_agent, agent_pub_bytes,
+            "rotate_key MUST NOT touch the agent signing key"
+        );
+    }
+
+    #[test]
+    fn rotate_key_does_not_record_migration_link() {
+        cleanup_registries();
+        let (did, identity_pub_bytes, _) = register_identity();
+        let handle = handle_for(&did, identity_pub_bytes);
+
+        let _ = identity_rotate_key(&handle).expect("rotate_key should succeed");
+
+        // No DID change, so no entry should land in MIGRATION_LINKS.
+        let migration_link_count = MIGRATION_LINKS.with(|links| links.borrow().len());
+        assert_eq!(
+            migration_link_count, 0,
+            "rotate_key MUST NOT write to MIGRATION_LINKS — that is identity_migrate's contract"
+        );
+    }
+
+    #[test]
+    fn rotate_key_keeps_link_attestations_under_same_did() {
+        cleanup_registries();
+        let (did, identity_pub_bytes, _) = register_identity();
+        let handle = handle_for(&did, identity_pub_bytes);
+
+        // Attach a single attestation to the original DID.
+        LINK_ATTESTATIONS.with(|reg| {
+            reg.borrow_mut().insert(
+                did.clone(),
+                vec![serde_json::json!({"id": "test-attestation"})],
+            );
+        });
+
+        let _ = identity_rotate_key(&handle).expect("rotate_key should succeed");
+
+        let attested =
+            LINK_ATTESTATIONS.with(|reg| reg.borrow().get(&did).map(Vec::len).unwrap_or_default());
+        assert_eq!(
+            attested, 1,
+            "rotate_key MUST leave LINK_ATTESTATIONS entries on the original DID — \
+             the DID itself does not change"
+        );
+    }
+
+    #[test]
+    fn rotate_key_unknown_did_errors() {
+        cleanup_registries();
+        let handle = WasmIdentity {
+            did: "did:dht:znothinghere".to_owned(),
+            custody_type: "in_memory".to_owned(),
+            has_agent_key: false,
+            agent_public_key_multibase: None,
+            verifying_key_hex: None,
+        };
+
+        // Inspect the typed error via the inner function — `JsError`
+        // cannot be unwrapped on non-wasm targets.
+        let err =
+            rotate_active_key_inner(&handle).expect_err("rotate_key on unknown DID must fail");
+        match err {
+            ScpWasmError::Identity { ref code, .. } => {
+                assert_eq!(
+                    code,
+                    codes::IDENT_1009,
+                    "unknown-DID refusal must use IDENT_1009; got {code}"
+                );
+            }
+            other => panic!("expected Identity error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rotate_key_resolved_record_refused() {
+        cleanup_registries();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let pub_bytes = signing_key.verifying_key().to_bytes();
+        let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+
+        IDENTITY_REGISTRY.with(|reg| {
+            reg.borrow_mut().insert(
+                did.clone(),
+                IdentityRecord::Resolved {
+                    public_key_bytes: pub_bytes,
+                    custody_type: "js_custody".to_owned(),
+                },
+            );
+        });
+
+        let handle = handle_for(&did, pub_bytes);
+        let err = rotate_active_key_inner(&handle).expect_err("rotate_key on Resolved must refuse");
+        match err {
+            ScpWasmError::Identity { ref code, .. } => {
+                assert_eq!(
+                    code,
+                    codes::IDENT_1028,
+                    "Resolved refusal must use IDENT_1028; got {code}"
+                );
+            }
+            other => panic!("expected Identity error, got: {other:?}"),
+        }
+
+        cleanup_registries();
+    }
+
+    #[test]
+    fn rotate_key_updates_resolved_active_verification_method() {
+        cleanup_registries();
+        let (did, identity_pub_bytes, pre_active_pub) = register_identity();
+        let handle = handle_for(&did, identity_pub_bytes);
+
+        let _ = identity_rotate_key(&handle).expect("rotate_key should succeed");
+
+        // After rotation, identity_resolve must surface the NEW #active VM.
+        let fields = resolve_did_document_fields(&did);
+        let vms: Vec<serde_json::Value> =
+            serde_json::from_str(&fields.verification_methods_json).unwrap();
+        let active_vm = vms
+            .iter()
+            .find(|vm| vm.get("id").and_then(|v| v.as_str()) == Some(&format!("{did}#active")))
+            .expect("resolved DID document must expose #active after rotation");
+        let active_multibase = active_vm
+            .get("publicKeyMultibase")
+            .and_then(|v| v.as_str())
+            .expect("#active VM must expose publicKeyMultibase");
+        let pre_multibase = format!("z{}", zbase32_encode(&pre_active_pub));
+        assert_ne!(
+            active_multibase, pre_multibase,
+            "rotate_key MUST publish a new #active verifying key in the resolved DID document"
+        );
+
+        cleanup_registries();
+    }
+
+    #[test]
+    fn rotate_key_twice_produces_three_distinct_active_keys() {
+        cleanup_registries();
+        let (did, identity_pub_bytes, _) = register_identity();
+        let handle = handle_for(&did, identity_pub_bytes);
+        let active_0 = snapshot_active_signing_key(&did);
+
+        let _ = identity_rotate_key(&handle).expect("first rotate_key should succeed");
+        let active_1 = snapshot_active_signing_key(&did);
+
+        let _ = identity_rotate_key(&handle).expect("second rotate_key should succeed");
+        let active_2 = snapshot_active_signing_key(&did);
+
+        assert_ne!(active_0, active_1, "first rotation must replace #active");
+        assert_ne!(
+            active_1, active_2,
+            "second rotation must replace #active again"
+        );
+        assert_ne!(
+            active_0, active_2,
+            "back-to-back rotations must not collide"
+        );
+
+        cleanup_registries();
+    }
+
+    #[test]
+    fn rotate_key_then_sign_active_uses_new_key() {
+        use ed25519_dalek::{Signature, Verifier};
+
+        cleanup_registries();
+        let (did, identity_pub_bytes, _) = register_identity();
+        let handle = handle_for(&did, identity_pub_bytes);
+
+        let _ = identity_rotate_key(&handle).expect("rotate_key should succeed");
+
+        // sign_with_identity(#active) must use the NEW key, and the
+        // verifying key surfaced by resolve_verification_method_key(#active)
+        // must verify the signature.
+        let message = b"post-rotation-active-signature";
+        let sig_bytes = sign_with_identity(&did, "#active", message)
+            .expect("sign_with_identity(#active) should succeed after rotation");
+        let signature = Signature::from_bytes(&sig_bytes);
+        let resolved_pub = resolve_verification_method_key(&did, "#active")
+            .expect("resolve_verification_method_key(#active) should succeed after rotation");
+        let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(&resolved_pub)
+            .expect("resolved #active bytes must decode");
+        verifying_key
+            .verify(message, &signature)
+            .expect("post-rotation signature must verify under the resolved #active key");
 
         cleanup_registries();
     }
