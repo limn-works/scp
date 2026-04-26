@@ -1159,9 +1159,12 @@ export function createNativeBridge(scp: SCP): Bridge {
       };
     },
 
-    // Discovery
+    // Discovery — pure protocol helpers per ADR-048 §1. These are
+    // module-level NAPI free functions, NOT methods on the SCP class —
+    // dispatch through `addon.<name>`, never `native.<name>` (which is
+    // the SCP class instance and does not inherit module-level exports).
     discoveryParseAddress(address: string) {
-      return (native.discoveryParseAddress as (a: string) => string)(address);
+      return (addon.discoveryParseAddress as (a: string) => string)(address);
     },
 
     discoveryCreateQuery(
@@ -1170,7 +1173,7 @@ export function createNativeBridge(scp: SCP): Bridge {
       minHistorySecs: number | undefined,
     ) {
       return (
-        native.discoveryCreateQuery as (
+        addon.discoveryCreateQuery as (
           c: string[] | undefined,
           k: string[] | undefined,
           m: number | undefined,
@@ -1179,11 +1182,11 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     discoveryNormalizeAddress(address: string) {
-      return (native.discoveryNormalizeAddress as (a: string) => string)(address);
+      return (addon.discoveryNormalizeAddress as (a: string) => string)(address);
     },
 
     async contextDiscover(query: string): Promise<string> {
-      return await (native.contextDiscover as (q: string) => Promise<string>)(query);
+      return await (addon.contextDiscover as (q: string) => Promise<string>)(query);
     },
 
     // Petnames (§22.4)
@@ -1593,21 +1596,26 @@ export function createNativeBridge(scp: SCP): Bridge {
       )(contextId, sequence, signerDid, timestamp, structuralJson, operationalJson, signatureHex);
     },
 
+    // Pure protocol helpers per ADR-048 §1 — module-level NAPI free
+    // functions, NOT methods on the SCP class. Dispatch through `addon`,
+    // not `native` (the SCP class instance does not inherit module-level
+    // exports). Was previously `native.<name>` which silently became
+    // `(undefined)(args)` at runtime — fixed in #1543 batch 3a.
     metadataRecordFromJson(jsonStr: string): string {
-      return (native.metadataRecordFromJson as (j: string) => string)(jsonStr);
+      return (addon.metadataRecordFromJson as (j: string) => string)(jsonStr);
     },
 
-    // Context template inspection (§5.14, #615)
+    // Context template inspection (§5.14, #615) — pure helpers per ADR-048 §1.
     templateGetParams(templateId: string): string {
-      return (native.templateGetParams as (t: string) => string)(templateId);
+      return (addon.templateGetParams as (t: string) => string)(templateId);
     },
 
     validateAgainstTemplate(paramsJson: string): string | null {
-      return (native.validateAgainstTemplate as (p: string) => string | null)(paramsJson);
+      return (addon.validateAgainstTemplate as (p: string) => string | null)(paramsJson);
     },
 
     validateContextParams(paramsJson: string): string | null {
-      return (native.validateContextParams as (p: string) => string | null)(paramsJson);
+      return (addon.validateContextParams as (p: string) => string | null)(paramsJson);
     },
 
     // Economy (§19, ADR-033)
