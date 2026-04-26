@@ -1020,48 +1020,6 @@
       ]
     },
     {
-      "canonical": "mcp_server",
-      "category": "mcp",
-      "wasm_required": false,
-      "pyo3": [
-        "py_mcp_server",
-        "mcp_server",
-        "py_mcp_serve",
-        "mcp_serve"
-      ],
-      "uniffi": [
-        "mcp_server"
-      ],
-      "napi": [
-        "mcp_server",
-        "mcp_server_create"
-      ],
-      "wasm": [
-        "mcp_server"
-      ]
-    },
-    {
-      "canonical": "mcp_client",
-      "category": "mcp",
-      "wasm_required": false,
-      "pyo3": [
-        "py_mcp_client",
-        "mcp_client",
-        "py_mcp_client_connect_stdio",
-        "mcp_client_connect_stdio"
-      ],
-      "uniffi": [
-        "mcp_client"
-      ],
-      "napi": [
-        "mcp_client",
-        "mcp_client_connect_stdio"
-      ],
-      "wasm": [
-        "mcp_client"
-      ]
-    },
-    {
       "canonical": "economy_estimate_cost",
       "category": "economy",
       "wasm_required": false,
@@ -2604,21 +2562,199 @@
       "wasm": [
         "identity_remove_link_attestation"
       ]
+    },
+    {
+      "canonical": "mcp_server_create",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_serve"
+      ],
+      "uniffi": [
+        "mcp_server_create"
+      ],
+      "napi": [
+        "mcp_server_create"
+      ],
+      "wasm": [
+        "mcp_server_create"
+      ]
+    },
+    {
+      "canonical": "mcp_server_stop",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_server_stop"
+      ],
+      "uniffi": [
+        "mcp_server_stop"
+      ],
+      "napi": [
+        "mcp_server_stop"
+      ],
+      "wasm": [
+        "mcp_server_stop"
+      ]
+    },
+    {
+      "canonical": "mcp_client_connect_stdio",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_client_connect_stdio"
+      ],
+      "uniffi": [
+        "mcp_client_connect_stdio"
+      ],
+      "napi": [
+        "mcp_client_connect_stdio"
+      ],
+      "wasm": [
+        "mcp_client_connect_stdio"
+      ]
+    },
+    {
+      "canonical": "mcp_client_connect_sse",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_client_connect_sse"
+      ],
+      "uniffi": [
+        "mcp_client_connect_sse"
+      ],
+      "napi": [
+        "mcp_client_connect_sse"
+      ],
+      "wasm": [
+        "mcp_client_connect_sse"
+      ]
+    },
+    {
+      "canonical": "mcp_client_disconnect",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_client_disconnect"
+      ],
+      "uniffi": [
+        "mcp_client_disconnect"
+      ],
+      "napi": [
+        "mcp_client_disconnect"
+      ],
+      "wasm": [
+        "mcp_client_disconnect"
+      ]
+    },
+    {
+      "canonical": "mcp_client_list_tools",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_client_list_tools"
+      ],
+      "uniffi": [
+        "mcp_client_list_tools"
+      ],
+      "napi": [
+        "mcp_client_list_tools"
+      ],
+      "wasm": [
+        "mcp_client_list_tools"
+      ]
+    },
+    {
+      "canonical": "mcp_client_invoke",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_client_invoke"
+      ],
+      "uniffi": [
+        "mcp_client_invoke"
+      ],
+      "napi": [
+        "mcp_client_invoke"
+      ],
+      "wasm": [
+        "mcp_client_invoke"
+      ]
+    },
+    {
+      "canonical": "mcp_configure_stdio_allowlist",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_configure_stdio_allowlist"
+      ],
+      "uniffi": [
+        "mcp_configure_stdio_allowlist"
+      ],
+      "napi": [
+        "mcp_configure_stdio_allowlist"
+      ],
+      "wasm": [
+        "mcp_configure_stdio_allowlist"
+      ]
+    },
+    {
+      "canonical": "mcp_disable_stdio_allowlist",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_disable_stdio_allowlist"
+      ],
+      "uniffi": [
+        "mcp_disable_stdio_allowlist"
+      ],
+      "napi": [
+        "mcp_disable_stdio_allowlist"
+      ],
+      "wasm": [
+        "mcp_disable_stdio_allowlist"
+      ]
+    },
+    {
+      "canonical": "mcp_reset_stdio_allowlist",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_reset_stdio_allowlist"
+      ],
+      "uniffi": [
+        "mcp_reset_stdio_allowlist"
+      ],
+      "napi": [
+        "mcp_reset_stdio_allowlist"
+      ],
+      "wasm": [
+        "mcp_reset_stdio_allowlist"
+      ]
+    },
+    {
+      "canonical": "mcp_get_stdio_allowlist",
+      "category": "mcp",
+      "wasm_required": false,
+      "pyo3": [
+        "py_mcp_get_stdio_allowlist"
+      ],
+      "uniffi": [
+        "mcp_get_stdio_allowlist"
+      ],
+      "napi": [
+        "mcp_get_stdio_allowlist"
+      ],
+      "wasm": [
+        "mcp_get_stdio_allowlist"
+      ]
     }
   ],
   "exemptions": {
     "_comment": "Per-bridge exemptions for operations that are intentionally not implemented in that bridge. This is a MIRROR of the language-level exemptions in .docs/standards/sdk-capability-matrix.json, keyed by bridge name (pyo3 / uniffi / napi / wasm) rather than SDK language. The symmetry script consults this map in addition to the wasm_required flag before emitting a finding.",
     "pyo3": [],
-    "uniffi": [
-      {
-        "canonical": "mcp_server",
-        "reason": "UniFFI targets mobile; MCP is PyO3/NAPI only"
-      },
-      {
-        "canonical": "mcp_client",
-        "reason": "UniFFI targets mobile; MCP is PyO3/NAPI only"
-      }
-    ],
+    "uniffi": [],
     "napi": [
       {
         "canonical": "identity_migrate",
@@ -2653,6 +2789,50 @@
       {
         "canonical": "access_key_restore",
         "reason": "Restoration reads persisted access key state; WASM has no scp-platform per ADR-034."
+      },
+      {
+        "canonical": "mcp_server_create",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_server_stop",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_client_connect_stdio",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_client_connect_sse",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_client_disconnect",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_client_list_tools",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_client_invoke",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_configure_stdio_allowlist",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_disable_stdio_allowlist",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_reset_stdio_allowlist",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "mcp_get_stdio_allowlist",
+        "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
       }
     ]
   }
