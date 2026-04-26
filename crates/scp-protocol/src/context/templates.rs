@@ -304,6 +304,8 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: crate::economy::Amount::new(1),
+            outlet_error_buffer_max_secs: 30,
         },
         TemplateId::BilateralPersistent => ContextParams {
             mode: ContextMode::Encrypted,
@@ -331,6 +333,8 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: crate::economy::Amount::new(1),
+            outlet_error_buffer_max_secs: 30,
         },
         TemplateId::Coordination => ContextParams {
             mode: ContextMode::Encrypted,
@@ -358,6 +362,8 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: crate::economy::Amount::new(1),
+            outlet_error_buffer_max_secs: 30,
         },
         TemplateId::GroupDiscussion => ContextParams {
             mode: ContextMode::Encrypted,
@@ -385,6 +391,8 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: crate::economy::Amount::new(1),
+            outlet_error_buffer_max_secs: 30,
         },
         TemplateId::PublicBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -415,6 +423,8 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: crate::economy::Amount::new(1),
+            outlet_error_buffer_max_secs: 30,
         },
         TemplateId::GatedBroadcast => ContextParams {
             mode: ContextMode::Broadcast,
@@ -445,6 +455,8 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: crate::economy::Amount::new(1),
+            outlet_error_buffer_max_secs: 30,
         },
         TemplateId::OutletInterfaceTemplate => ContextParams {
             mode: ContextMode::Encrypted,
@@ -472,6 +484,8 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: crate::economy::Amount::new(1),
+            outlet_error_buffer_max_secs: 30,
         },
         // Extends scp:template/outlet-interface -- same ceiling and governance,
         // but economic_policy is caller-provided and validated separately.
@@ -501,6 +515,8 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: crate::economy::Amount::new(1),
+            outlet_error_buffer_max_secs: 30,
         },
         // Extends scp:template/gated-broadcast -- broadcast mode with gated
         // subscriber admission. economic_policy is caller-provided.
@@ -533,6 +549,8 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: crate::economy::Amount::new(1),
+            outlet_error_buffer_max_secs: 30,
         },
         // Context: encrypted mode with messaging + tool invocation
         // ceiling. Discoverable by default so it can be found via DHT. Used
@@ -563,6 +581,8 @@ pub fn template_params(template_id: &TemplateId) -> ContextParams {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: crate::economy::Amount::new(1),
+            outlet_error_buffer_max_secs: 30,
         },
     }
 }

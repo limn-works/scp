@@ -16,7 +16,7 @@ use scp_primitives::DID;
 use serde::{Deserialize, Serialize};
 
 use crate::bridge::BridgeMode;
-use crate::economy::EconomicPolicy;
+use crate::economy::{Amount, EconomicPolicy};
 use crate::provenance::CounterpartyPolicy;
 use crate::trust::RequireParticipation;
 
@@ -840,6 +840,61 @@ pub struct ContextParams {
     /// check is performed — any valid DID can join.
     #[serde(default)]
     pub sybil_policy: Option<crate::trust::sybil::ContextSybilPolicy>,
+
+    /// Scalar multiplier for the §6.2.0.1 round-6 population-weighted
+    /// interface-spam floor (registered in §9.18.B "Configurable Parameters",
+    /// ADR-049 round 6 §"Cluster detection 4th predicate + population-weighted
+    /// floor").
+    ///
+    /// Combined with `ceil(log2(member_count + 1))` to produce the local
+    /// floor:
+    ///
+    /// ```text
+    /// interface_base_cost_floor(ctx) = max(
+    ///     currency_atomic_unit(ctx.currency),
+    ///     ceil(log2(member_count + 1)) × ContextParams::base_cost_scale,
+    /// )
+    /// ```
+    ///
+    /// Replaces the round-5 flat `interface_base_cost_minimum`. A larger
+    /// context pays a proportionally larger floor on its first same-cluster
+    /// interface, closing the round-5 MAJOR-5 cluster-detection bypass
+    /// residual-risk where small-N sybil contexts could pay only the
+    /// constant currency-atomic-unit fee.
+    ///
+    /// Default: `Amount(1)` — the absolute currency-atomic-unit lower bound
+    /// every currency Amount represents. Deployers SHOULD raise this to a
+    /// currency-meaningful value (e.g. `Amount(100)` for a USD-cent
+    /// denomination, `Amount(10_000)` for a BTC-satoshi denomination).
+    /// Range per §9.18.B: `[currency_atomic_unit, 1_000 ×
+    /// currency_atomic_unit]`.
+    #[serde(default = "default_base_cost_scale")]
+    pub base_cost_scale: Amount,
+
+    /// Maximum seconds an `OutletError` envelope stays in the outbound
+    /// queue during the `Frozen` window of an admin-removal-induced
+    /// `InterfaceSaltRotated` commit (spec §6.2.0.1, registered in §9.18.B,
+    /// ADR-049 round 6 §"Admin-removal rotation TOCTOU closure").
+    ///
+    /// Overflow drops the buffered envelope with an internal audit-log
+    /// entry `governance.remove-member-buffer-overflow` and escalates the
+    /// governance-removal timeout. Default 30 s, range `[5, 300]`.
+    #[serde(default = "default_outlet_error_buffer_max_secs")]
+    pub outlet_error_buffer_max_secs: u32,
+}
+
+/// Default for [`ContextParams::base_cost_scale`] — the absolute
+/// currency-atomic-unit lower bound (`Amount(1)`). Deployers raise this
+/// per §9.18.B for currency-meaningful spam pricing.
+const fn default_base_cost_scale() -> Amount {
+    Amount(1)
+}
+
+/// Default for [`ContextParams::outlet_error_buffer_max_secs`] — 30 s,
+/// per §9.18.B Configurable Parameters and §6.2.0.1 atomic-removal queue
+/// discipline.
+const fn default_outlet_error_buffer_max_secs() -> u32 {
+    30
 }
 
 impl Default for ContextParams {
@@ -870,6 +925,8 @@ impl Default for ContextParams {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: default_base_cost_scale(),
+            outlet_error_buffer_max_secs: default_outlet_error_buffer_max_secs(),
         }
     }
 }
@@ -1092,6 +1149,8 @@ mod tests {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: Amount::new(100),
+            outlet_error_buffer_max_secs: 30,
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -1237,6 +1296,8 @@ mod tests {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: Amount::new(1),
+            outlet_error_buffer_max_secs: 30,
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -1300,6 +1361,8 @@ mod tests {
             consequence_rules: Vec::new(),
             consequence_config: ConsequenceConfig::default(),
             sybil_policy: None,
+            base_cost_scale: Amount::new(1),
+            outlet_error_buffer_max_secs: 30,
         };
 
         let json = serde_json::to_string(&params).unwrap();

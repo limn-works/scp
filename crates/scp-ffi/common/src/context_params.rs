@@ -190,6 +190,8 @@ pub fn build_context_params(params: &CommonContextParams) -> Result<ContextParam
         consequence_rules,
         consequence_config,
         sybil_policy: None,
+        base_cost_scale: scp_core::economy::Amount::new(1),
+        outlet_error_buffer_max_secs: 30,
     })
 }
 

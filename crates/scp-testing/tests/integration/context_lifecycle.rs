@@ -184,6 +184,8 @@ async fn context_params_all_fields() {
         consequence_rules: Vec::new(),
         consequence_config: ConsequenceConfig::default(),
         sybil_policy: None,
+        base_cost_scale: scp_core::economy::Amount::new(100),
+        outlet_error_buffer_max_secs: 30,
     };
 
     assert_eq!(params.mode, ContextMode::Broadcast);

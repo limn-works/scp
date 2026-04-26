@@ -32,11 +32,21 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::outlets::OutletId;
+use scp_protocol::context::outlets::error_codes::{
+    CODE_ECONOMIC_FAULT, SLUG_PROTOCOL_INTERFACE_SPAM_COST,
+};
 use scp_protocol::context::outlets::interface::{
     ContextId, Ed25519Signature, InterfaceEstablished,
 };
+use scp_protocol::context::roles::Capability;
+use scp_protocol::economy::{Amount, CurrencyCode};
+use std::collections::HashSet;
 use thiserror::Error;
 
+use crate::context::interface::cluster_detection::{
+    InterfaceCandidate, compute_cluster_match_count, compute_interface_fee,
+    enumerate_capability_holders,
+};
 use crate::context::interface::ikm_commitment::{
     IkmCommitment, IkmCommitmentDeriveError, IkmSignatureError,
 };
@@ -49,6 +59,21 @@ pub const AUTHORIZATION_IKM_SIGNATURE_INVALID_SLUG: &str = "authorization.ikm-si
 
 /// `SCP-TOOL-NNNN` code attached to the §6.2.0.1 verifier-rule rejection.
 pub const AUTHORIZATION_IKM_SIGNATURE_INVALID_CODE: &str = "SCP-TOOL-6110";
+
+/// `OutletErrorClass::Economic` slug emitted when the §6.2.0.1 round-6
+/// quadratic interface-spam fee exceeds the proposer's balance. The
+/// slug is intentionally `protocol.`-prefixed despite living in the
+/// Economic class (the rule is specified at the protocol layer; the
+/// rejection is an economic failure). Pinned to the
+/// [`SLUG_PROTOCOL_INTERFACE_SPAM_COST`] constant from
+/// `scp_protocol::context::outlets::error_codes` so the bridge layer
+/// reads the exact same string.
+pub const INTERFACE_SPAM_COST_SLUG: &str = SLUG_PROTOCOL_INTERFACE_SPAM_COST;
+
+/// `SCP-TOOL-NNNN` code attached to the §6.2.0.1 round-6 quadratic
+/// interface-spam-fee rejection. Pinned to the [`CODE_ECONOMIC_FAULT`]
+/// constant from `scp_protocol::context::outlets::error_codes`.
+pub const INTERFACE_SPAM_COST_CODE: &str = CODE_ECONOMIC_FAULT;
 
 /// Event-log event name appended on a successful accept. The
 /// [`InterfaceEstablished`] payload is serialized as JSON for the
@@ -115,9 +140,48 @@ pub struct AcceptOutletInterfaceInputs {
     /// Peer admin set at accept-time (sorted lexicographically by the
     /// caller — ordering invariant per `InterfaceEstablished`).
     pub peer_admin_set: Vec<DID>,
-    /// Peer capability-holder set at accept-time (sorted lexicographically
-    /// by the caller).
-    pub peer_capability_holder_set: Vec<DID>,
+    /// Per-DID capability map for the candidate peer context at
+    /// interface-acceptance time. The handler enumerates the round-6
+    /// predicate-4 capability-holder set
+    /// (`outlet:offer:* / query:* / call:*`) from this map via
+    /// [`enumerate_capability_holders`] and persists the deterministic
+    /// sorted list into [`InterfaceEstablished::capability_holder_set`]
+    /// (§6.2.0.1 round-6 cluster predicate 4, ADR-049 round-6
+    /// §"Cluster detection 4th predicate"). Keying by DID directly
+    /// avoids pre-sorting at the call site — the handler's enumerator
+    /// is the single source of truth for the final ordering.
+    pub peer_capability_map: Vec<(DID, HashSet<Capability>)>,
+    // -- Round-6 fee inputs (SCP-OUT-042d) ----------------------------------
+    /// `InterfaceEstablished` events on the local context's event log
+    /// that fall within the §6.2.0.1 cluster-detection 24-hour rolling
+    /// window. The handler invokes [`compute_cluster_match_count`]
+    /// against this slice to compute `k` for the
+    /// `(k+1)²` quadratic fee. Caller filters the rolling window — the
+    /// authoritative event-log adapter holds the indexed history.
+    pub rolling_window_events: Vec<InterfaceEstablished>,
+    /// Local context's economic-policy `base_cost` (§19.3) at accept
+    /// time. Combined with the population-weighted floor to compute
+    /// `unit_cost = max(base_cost, interface_base_cost_floor)`.
+    pub local_base_cost: Amount,
+    /// Local context's declared currency (`EconomicPolicy.cost_schedule.currency`).
+    /// Drives the `currency_atomic_unit` lower bound on the
+    /// population-weighted floor.
+    pub local_currency: CurrencyCode,
+    /// Local context's MLS-writer member count at accept-time
+    /// (§6.2.0.1 "Rolling window + cluster detection"). Feeds the
+    /// `ceil(log2(member_count + 1))` term of the floor.
+    pub local_member_count: u32,
+    /// Local context's `ContextParams::base_cost_scale` at accept-time
+    /// (§9.18.B Configurable Parameters). Multiplied against
+    /// `ceil(log2(member_count + 1))` to compute the population-weighted
+    /// component of the floor.
+    pub local_base_cost_scale: Amount,
+    /// Proposer's spendable balance in the local currency at
+    /// interface-acceptance time. The handler rejects with
+    /// [`AcceptOutletInterfaceError::InterfaceSpamCost`] when the
+    /// computed quadratic fee strictly exceeds this value (§6.2.0.1
+    /// "`InsufficientFunds` path").
+    pub proposer_balance: Amount,
 }
 
 // ---------------------------------------------------------------------------
@@ -161,6 +225,25 @@ pub enum AcceptOutletInterfaceError {
     /// for `append_context_event_with_payload`.
     #[error("InterfaceEstablished JSON serialization failed: {0}")]
     PayloadSerializationFailed(#[source] serde_json::Error),
+    /// The §6.2.0.1 round-6 quadratic interface-spam fee exceeded the
+    /// proposer's balance. Maps to `OutletErrorClass::Economic` with
+    /// the cross-class slug `protocol.interface-spam-cost` (code
+    /// `SCP-TOOL-6150`). Rejection happens at governance approval time,
+    /// not at hop time — the `OutletInterfaceAccepted` event is NOT
+    /// appended to the event log.
+    #[error(
+        "interface-spam fee {fee} exceeds proposer balance {balance} in {currency} (slug={INTERFACE_SPAM_COST_SLUG}, code={INTERFACE_SPAM_COST_CODE})"
+    )]
+    InterfaceSpamCost {
+        /// The computed `(k+1)² × max(base_cost, floor)` quadratic fee.
+        fee: Amount,
+        /// The proposer's available balance at acceptance time.
+        balance: Amount,
+        /// The local context's declared currency.
+        currency: CurrencyCode,
+        /// Cluster-match count `k` over the 24-hour rolling window.
+        cluster_match_count: u32,
+    },
 }
 
 /// Which side's IKM signature failed verification.
@@ -197,6 +280,15 @@ impl ContextManager {
     ///
     /// # Cryptographic order
     ///
+    /// 0. **Round-6 governance gate (SCP-OUT-042d).** Enumerate the
+    ///    candidate peer's `capability_holder_set` from the supplied
+    ///    capability map, compute the §6.2.0.1 cluster-match count `k`
+    ///    over the 24-hour rolling window, compute the
+    ///    population-weighted quadratic interface-spam fee, and
+    ///    reject with [`AcceptOutletInterfaceError::InterfaceSpamCost`]
+    ///    when the fee exceeds the proposer's balance. The fee check
+    ///    runs FIRST so signature verification effort is not spent on a
+    ///    proposer who could not afford the action.
     /// 1. Derive `ikm_local` via `IkmCommitment::derive_accept_time`
     ///    (§6.2.0.1 step 1).
     /// 2. Sign `ikm_local` under the local admin's `#active` key
@@ -205,16 +297,21 @@ impl ContextManager {
     /// 4. Reconstruct the peer-side `IkmCommitment` (canonical pair +
     ///    `peer_ikm` + `peer_epoch`) and verify `peer_ikm_sig` against
     ///    `peer_admin_active_key`.
-    /// 5. **Only on success of (3) and (4)** — append
+    /// 5. **Only on success of (0), (3), and (4)** — append
     ///    `OutletInterfaceAccepted` to the event log with the assembled
-    ///    [`InterfaceEstablished`] payload.
+    ///    [`InterfaceEstablished`] payload, including the deterministic
+    ///    `capability_holder_set` enumerated in step 0.
     ///
     /// # Errors
     ///
-    /// Returns [`AcceptOutletInterfaceError::IkmSignatureInvalid`] when
-    /// either side's signature fails verification — the event does NOT
-    /// land in the local event log. Other variants surface derivation,
-    /// serialization, or event-log failures verbatim.
+    /// Returns [`AcceptOutletInterfaceError::InterfaceSpamCost`] when
+    /// the §6.2.0.1 quadratic fee exceeds `inputs.proposer_balance` —
+    /// rejection happens at governance approval time, not at hop time,
+    /// per §6.2.0.1 "`InsufficientFunds` path". Returns
+    /// [`AcceptOutletInterfaceError::IkmSignatureInvalid`] when
+    /// either side's signature fails verification. In every error case
+    /// the event does NOT land in the local event log. Other variants
+    /// surface derivation, serialization, or event-log failures verbatim.
     #[allow(clippy::unused_async)]
     pub async fn accept_outlet_interface(
         &self,
@@ -222,6 +319,42 @@ impl ContextManager {
         actor_did: &str,
         inputs: AcceptOutletInterfaceInputs,
     ) -> Result<AcceptOutletInterfaceOutput, AcceptOutletInterfaceError> {
+        // -- Step 0a: enumerate the candidate peer's capability_holder_set
+        //    deterministically from the supplied capability map. Sorted
+        //    by DID string by `enumerate_capability_holders` so the
+        //    InterfaceEstablished event serializes byte-identically
+        //    across implementations.
+        let capability_holder_set =
+            enumerate_capability_holders(inputs.peer_capability_map.iter().map(|(d, c)| (d, c)));
+
+        // -- Step 0b: compute the §6.2.0.1 cluster-match count `k` and
+        //    quadratic interface-spam fee. The candidate combines the
+        //    peer ids/sets supplied by the caller with the just-computed
+        //    capability_holder_set so predicate 4 reads the same set
+        //    that lands in the event.
+        let candidate = InterfaceCandidate {
+            context_id: inputs.source_context.clone(),
+            creator_did: inputs.peer_creator_did.clone(),
+            admin_set: inputs.peer_admin_set.clone(),
+            capability_holder_set: capability_holder_set.clone(),
+        };
+        let k = compute_cluster_match_count(&inputs.rolling_window_events, &candidate);
+        let fee = compute_interface_fee(
+            inputs.local_base_cost,
+            inputs.local_currency,
+            inputs.local_member_count,
+            inputs.local_base_cost_scale,
+            k,
+        );
+        if fee.value() > inputs.proposer_balance.value() {
+            return Err(AcceptOutletInterfaceError::InterfaceSpamCost {
+                fee,
+                balance: inputs.proposer_balance,
+                currency: inputs.local_currency,
+                cluster_match_count: k,
+            });
+        }
+
         // -- Step 1: derive local IKM via the §6.2.0.1 peer-suffixed MLS
         //    exporter. The local context_id passed to MlsExporter is the
         //    32-byte MLS group id; the human-readable string ids
@@ -287,9 +420,9 @@ impl ContextManager {
             ikm_a_sig: inputs.peer_ikm_sig.clone(),
             ikm_b: local_commitment.ikm,
             ikm_b_sig: local_ikm_sig,
-            creator_did: inputs.peer_creator_did.clone(),
-            admin_set: inputs.peer_admin_set.clone(),
-            capability_holder_set: inputs.peer_capability_holder_set,
+            creator_did: inputs.peer_creator_did,
+            admin_set: inputs.peer_admin_set,
+            capability_holder_set,
         };
 
         // -- Step 6: append to the local event log. JSON serialization is
@@ -549,5 +682,49 @@ mod tests {
         assert_eq!(c.context_a_id, "ctx-source-A");
         assert_eq!(c.context_b_id, "ctx-target-B");
         assert_eq!(c.epoch, 13);
+    }
+
+    // ----- SCP-OUT-042d wiring assertions ----------------------------------
+
+    /// AC 12 (governance-approval rejection slug pinning). The
+    /// `InterfaceSpamCost` error variant carries the round-6
+    /// cross-class slug `protocol.interface-spam-cost` and economic
+    /// code `SCP-TOOL-6150` — both pinned to the protocol-layer
+    /// constants from `scp_protocol::context::outlets::error_codes`.
+    /// This test fails LOUD if either constant drifts so the bridge
+    /// layer cannot silently disagree.
+    #[test]
+    fn interface_spam_cost_slug_and_code_are_pinned_to_protocol_constants() {
+        assert_eq!(INTERFACE_SPAM_COST_SLUG, "protocol.interface-spam-cost");
+        assert_eq!(INTERFACE_SPAM_COST_CODE, "SCP-TOOL-6150");
+        assert_eq!(INTERFACE_SPAM_COST_SLUG, SLUG_PROTOCOL_INTERFACE_SPAM_COST);
+        assert_eq!(INTERFACE_SPAM_COST_CODE, CODE_ECONOMIC_FAULT);
+    }
+
+    /// AC 12 (rejection construction). When the computed quadratic fee
+    /// exceeds the proposer's balance, the handler-side error variant
+    /// preserves the fee, balance, currency, and cluster-match count
+    /// for diagnostic surfacing. The Display impl includes both the
+    /// slug and the code so receivers can match either.
+    #[test]
+    fn interface_spam_cost_error_carries_diagnostic_fields() {
+        let err = AcceptOutletInterfaceError::InterfaceSpamCost {
+            fee: Amount::new(2_500),
+            balance: Amount::new(100),
+            currency: CurrencyCode::from("USD"),
+            cluster_match_count: 4,
+        };
+        let rendered = err.to_string();
+        assert!(rendered.contains("2500"), "fee must appear: {rendered}");
+        assert!(rendered.contains("100"), "balance must appear: {rendered}");
+        assert!(rendered.contains("USD"), "currency must appear: {rendered}");
+        assert!(
+            rendered.contains("protocol.interface-spam-cost"),
+            "slug must appear: {rendered}"
+        );
+        assert!(
+            rendered.contains("SCP-TOOL-6150"),
+            "code must appear: {rendered}"
+        );
     }
 }

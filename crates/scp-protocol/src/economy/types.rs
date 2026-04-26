@@ -134,6 +134,29 @@ impl std::fmt::Display for CurrencyCode {
     }
 }
 
+/// Returns the smallest non-zero unit (the atomic unit) in the given currency.
+///
+/// The atomic unit is the absolute protocol-level lower bound preventing
+/// `base_cost = 0` from defeating the §6.2.0.1 round-6 quadratic
+/// interface-spam escalator. For every currency tracked by the protocol
+/// the minimum representable value is `Amount(1)` — `Amount` is denominated
+/// in the smallest unit of the carried currency (cents for USD,
+/// satoshis for BTC, lamports for SOL, …). This function returns
+/// `Amount(1)` unconditionally for that reason.
+///
+/// The function is currency-aware so that future currency-specific atomic-unit
+/// adjustments (multi-decimal stablecoins with fractional cents, exotic
+/// off-chain ledgers) can be threaded through without changing the
+/// signature: callers always receive the smallest amount the currency
+/// can express. See spec §9.18.B "Interface base-cost scale" and
+/// §6.2.0.1 "Rolling window + cluster detection" for the floor formula.
+#[must_use]
+pub const fn currency_atomic_unit(_currency: CurrencyCode) -> Amount {
+    // Every currency Amount tracks is denominated in its smallest
+    // representable unit; the smallest non-zero amount is therefore 1.
+    Amount(1)
+}
+
 // ---------------------------------------------------------------------------
 // Coefficient
 // ---------------------------------------------------------------------------

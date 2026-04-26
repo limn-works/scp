@@ -22,4 +22,5 @@ pub use policy::{
 pub use types::{
     Amount, Coefficient, CostSchedule, CurrencyCode, EconomicPolicy, PaidActionType,
     PricingFormula, PricingMetric, PricingVariable, SubscriptionCost, SubscriptionPeriod,
+    currency_atomic_unit,
 };
