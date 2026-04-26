@@ -25,9 +25,9 @@ pub use attestation::{
 pub use capability_uri::{CapabilityUri, CapabilityUriError};
 pub use caveats::{
     AttenuationViolation, CAVEAT_MINT_LIMIT_EXCEEDED_CODE, CaveatMintError, CaveatSerError,
-    DaysOfWeekMask, HoursOfDayMask, InvocationCaveats, MAX_INPUT_SCHEMA_BYTES,
-    MAX_INPUT_SCHEMA_DEPTH, MAX_LIST_ENTRIES, MAX_POPULATED_CAVEATS, MAX_RATE_WINDOW_SECS,
-    MaskWidthError, RateWindow, assert_mask_widths,
+    CheckInvocationError, DaysOfWeekMask, HoursOfDayMask, InvocationCaveats,
+    MAX_INPUT_SCHEMA_BYTES, MAX_INPUT_SCHEMA_DEPTH, MAX_LIST_ENTRIES, MAX_POPULATED_CAVEATS,
+    MAX_RATE_WINDOW_SECS, MaskWidthError, RateWindow, assert_mask_widths,
 };
 pub use challenge::{
     ChallengeRequest, ChallengeResponse, ChallengeSigner, ChallengeType, ChallengeVerification,

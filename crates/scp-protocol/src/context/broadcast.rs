@@ -1852,6 +1852,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result = ctx
@@ -1880,6 +1881,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -1945,6 +1947,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -1969,6 +1972,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -2424,6 +2428,7 @@ mod tests {
             presenting_agent_did: "did:example:sub1",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
         ctx.subscribe("did:example:sub1", Some(&ucan), 1000, Some(&mut val_ctx))
             .unwrap();
@@ -2520,6 +2525,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         // With full validation, a properly signed wildcard UCAN from the
@@ -2591,6 +2597,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result = ctx.subscribe("did:example:bob", Some(&ucan), 1000, Some(&mut val_ctx));
@@ -2963,6 +2970,7 @@ mod tests {
             presenting_agent_did: "did:example:bob",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result = ctx
@@ -3329,6 +3337,7 @@ mod tests {
             presenting_agent_did: "did:example:sub1",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         // Subscribe with UCAN.
@@ -4176,6 +4185,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
@@ -4224,6 +4234,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -4275,6 +4286,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -4322,6 +4334,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -4368,6 +4381,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx)).unwrap();
@@ -4455,6 +4469,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result = ctx.register_subscriber(&reg, Some(&mut val_ctx));
@@ -4496,6 +4511,7 @@ mod tests {
             presenting_agent_did: sub_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &crate::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result = validate_ucan(&ucan, &required_cap, &mut val_ctx);

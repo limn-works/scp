@@ -30,7 +30,7 @@ use crate::context::roles::Capability;
 // canonical home is `trust::caveats`; this is a convenience alias only.
 pub use crate::trust::caveats::{
     AttenuationViolation, CAVEAT_MINT_LIMIT_EXCEEDED_CODE, CaveatField, CaveatMintError,
-    CaveatSerError, DaysOfWeekMask, HoursOfDayMask, InvocationCaveats,
+    CaveatSerError, CheckInvocationError, DaysOfWeekMask, HoursOfDayMask, InvocationCaveats,
     JSON_SCHEMA_NARROWING_WHITELIST, MAX_INPUT_SCHEMA_BYTES, MAX_INPUT_SCHEMA_DEPTH,
     MAX_LIST_ENTRIES, MAX_POPULATED_CAVEATS, MAX_RATE_WINDOW_SECS, MaskWidthError, RateWindow,
     assert_mask_widths, json_schema_narrows,

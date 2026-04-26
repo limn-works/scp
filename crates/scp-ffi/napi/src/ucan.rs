@@ -290,6 +290,7 @@ pub async fn ucan_validate(
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
         };
 
         // Execute the full 11-step validation pipeline.

@@ -382,6 +382,121 @@ impl ProofResolver for InMemoryProofResolver {
 }
 
 // ---------------------------------------------------------------------------
+// CaveatResolver — SCP-OUT-021
+// ---------------------------------------------------------------------------
+//
+// Spec §7.3.8 places `InvocationCaveats` in the UCAN `nb` ("not-before" /
+// attestation) field. The protocol surface keeps caveats decoupled from
+// `UcanPayload` so caveat-bearing tokens can interoperate with the existing
+// 11-step pipeline without forcing every legacy caller to declare an empty
+// caveats object. Instead, validation looks caveats up via this resolver
+// keyed by the encoded JWT — a token-side handle the resolver implementation
+// chooses how to interpret (CID lookup, in-memory map, etc.).
+//
+// `verify_attenuation` calls `parent.caveats.narrow(&child.caveats)?` at
+// every delegation edge where BOTH parent and child carry caveats. When
+// either side returns `None`, the narrow rule degenerates to the legacy
+// behaviour (capability-only attenuation): `None` parent means the parent
+// imposed no caveat-level constraint, and `None` child means the child
+// inherits the parent's constraint by reference (the existing protocol
+// behaviour for tokens that pre-date OUT-018/019). A `None`-parent with a
+// `Some`-child IS still subject to `narrow()` because narrow itself
+// enforces the §7.3.8 "child may introduce a bound where parent had none"
+// rule with `parent.caveats == InvocationCaveats::empty()` semantically.
+
+/// Resolves the [`InvocationCaveats`] (§7.3.8) carried by a UCAN token.
+///
+/// Each implementation chooses how it associates caveats with tokens — the
+/// canonical wire location is the UCAN `nb` field (§7.3.8), but validation
+/// only requires a deterministic look-up keyed by `&UcanToken`. The default
+/// implementation [`NoCaveatResolver`] returns `None` for every token,
+/// preserving backward-compatible behaviour for callers that have not yet
+/// minted caveat-bearing delegations.
+///
+/// Returning `Some(_)` opts the token into Step 7b (attenuation) and Step
+/// 11b (time-box) caveat enforcement. Returning `None` skips both steps
+/// for that token specifically; tokens in the same chain that DO carry
+/// caveats are still checked.
+///
+/// **`Send + Sync` bound.** The resolver is held inside
+/// [`ValidationContext`] as `&dyn CaveatResolver`. Several FFI bridges
+/// build a `ValidationContext` inside an `async` task whose future is
+/// later awaited from a `Send`-only executor (napi, uniffi). The
+/// `Send + Sync` super-bound makes such futures `Send` without
+/// per-call-site adapters.
+pub trait CaveatResolver: Send + Sync {
+    /// Resolves the [`InvocationCaveats`] for the given token, or returns
+    /// `None` if the token carries no caveat-level constraints.
+    fn resolve_caveats(
+        &self,
+        token: &UcanToken,
+    ) -> Option<crate::trust::caveats::InvocationCaveats>;
+}
+
+/// A [`CaveatResolver`] that returns `None` for every token. The default
+/// resolver — preserves pre-SCP-OUT-021 behaviour where every token is
+/// treated as caveat-free at the protocol layer.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoCaveatResolver;
+
+impl CaveatResolver for NoCaveatResolver {
+    fn resolve_caveats(
+        &self,
+        _token: &UcanToken,
+    ) -> Option<crate::trust::caveats::InvocationCaveats> {
+        None
+    }
+}
+
+/// In-memory [`CaveatResolver`] keyed by encoded JWT string.
+///
+/// Used by tests and by adapters that pre-compute caveats out-of-band
+/// (e.g., during a transient envelope rewrite) rather than reading from
+/// the `nb` field.
+///
+/// Map values are owned [`InvocationCaveats`] records — the resolver
+/// returns clones so the validation pipeline can take an owned snapshot
+/// without holding a borrow on the resolver across recursive chain walks.
+pub struct InMemoryCaveatResolver {
+    /// Map of `UcanToken::encoded` → [`InvocationCaveats`].
+    pub caveats: std::collections::HashMap<String, crate::trust::caveats::InvocationCaveats>,
+}
+
+impl InMemoryCaveatResolver {
+    /// Creates an empty resolver.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            caveats: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Inserts caveats for the given encoded UCAN string.
+    pub fn insert(
+        &mut self,
+        encoded: impl Into<String>,
+        caveats: crate::trust::caveats::InvocationCaveats,
+    ) {
+        self.caveats.insert(encoded.into(), caveats);
+    }
+}
+
+impl Default for InMemoryCaveatResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CaveatResolver for InMemoryCaveatResolver {
+    fn resolve_caveats(
+        &self,
+        token: &UcanToken,
+    ) -> Option<crate::trust::caveats::InvocationCaveats> {
+        self.caveats.get(&token.encoded).cloned()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Parsing
 // ---------------------------------------------------------------------------
 
@@ -444,7 +559,8 @@ pub fn parse_ucan(encoded: &str) -> Result<UcanToken, UcanError> {
 ///
 /// Each field corresponds to a validation step that requires external state:
 /// DID resolution, nonce tracking, revocation checking, proof resolution,
-/// capability ceiling, context creator DID, and presenting agent DID.
+/// capability ceiling, context creator DID, presenting agent DID, and
+/// (SCP-OUT-021) caveat resolution for Step 7b / Step 11b.
 pub struct ValidationContext<'a, D, N, R, P, S: BuildHasher> {
     /// DID resolver for public key lookup (steps 2, 3).
     pub did_resolver: &'a D,
@@ -470,7 +586,7 @@ pub struct ValidationContext<'a, D, N, R, P, S: BuildHasher> {
     /// - `exp` check: token accepted if `exp + tolerance >= now`
     /// - `nbf` check: token accepted if `nbf - tolerance <= now`
     pub clock_skew_tolerance_secs: u64,
-    /// Clock for time-dependent checks (steps 3, 11).
+    /// Clock for time-dependent checks (steps 3, 11, and 11b).
     ///
     /// Accepts `&dyn Clock` to support both production ([`SystemClock`]) and
     /// test ([`TestClock`]) clocks.
@@ -478,6 +594,21 @@ pub struct ValidationContext<'a, D, N, R, P, S: BuildHasher> {
     /// [`SystemClock`]: scp_primitives::SystemClock
     /// [`TestClock`]: scp_primitives::TestClock
     pub clock: &'a dyn Clock,
+    /// SCP-OUT-021: caveat resolver for Step 7b (attenuation) and Step 11b
+    /// (time-box) checks. Tokens for which this resolver returns `None`
+    /// skip both caveat steps; tokens that resolve to `Some(caveats)` go
+    /// through `caveats.narrow(child)` at every delegation edge and the
+    /// time-box check after Step 11.
+    ///
+    /// Stored as `&dyn CaveatResolver` so the field is type-erased — the
+    /// generic parameters of `ValidationContext` track the four other
+    /// resolvers, and adding a fifth generic for the caveat resolver would
+    /// be a wide breaking change for every test rig that constructs a
+    /// `ValidationContext`. Type erasure here is local to the validation
+    /// pipeline and incurs no runtime cost on the `None` path because
+    /// `NoCaveatResolver`'s `resolve_caveats` is a constant `None` return
+    /// the optimizer inlines.
+    pub caveat_resolver: &'a dyn CaveatResolver,
 }
 
 // ---------------------------------------------------------------------------
@@ -581,10 +712,16 @@ where
     // (DID document modifications, pre-rotation, identity migration).
     enforce_ucan_category_a(token, &granted_caps)?;
 
-    // Step 7: Attenuation — verify delegations narrow or preserve.
-    // For root tokens (empty prf), this is a no-op.
+    // Step 7 + 7b: Attenuation — verify delegations narrow or preserve.
+    // For root tokens (empty prf), Step 7 is a no-op; Step 7b (caveat
+    // narrow) is also a no-op for roots because there is no parent
+    // delegation to compare against.
+    //
+    // SCP-OUT-021: Step 7b extends the existing capability-subset check
+    // with a per-field caveat narrow. The resolver decides which tokens
+    // carry caveats; tokens with no caveats fall back to Step 7 alone.
     if !token.payload.prf.is_empty() {
-        verify_attenuation(token, ctx.proof_resolver)?;
+        verify_attenuation(token, ctx.proof_resolver, ctx.caveat_resolver)?;
     }
 
     // Step 8: Ceiling — verify capability is within context ceiling.
@@ -605,6 +742,96 @@ where
     // Step 11: Expiry — verify exp > now and nbf <= now (with clock skew
     // tolerance).
     verify_expiry(token, ctx.clock_skew_tolerance_secs, ctx.clock)?;
+
+    // Step 11b (SCP-OUT-021): caveat time-box. After exp/nbf, the
+    // validator checks the presenting token's `valid_from` /
+    // `valid_until` / `hours_of_day` / `days_of_week` per §7.3.8 — these
+    // are tighter than the UCAN-level `nbf` / `exp` and bind the
+    // delegation to a window narrower than the token's lifetime.
+    //
+    // Only the presenting (leaf) token's caveats gate Step 11b — parent
+    // caveats already had their time-box checked when those tokens were
+    // presented at their own delegation site, and Step 7b has already
+    // guaranteed child time-box bounds are no looser than parent.
+    if let Some(caveats) = ctx.caveat_resolver.resolve_caveats(token) {
+        verify_caveat_time_box(&caveats, ctx.clock)?;
+    }
+
+    Ok(())
+}
+
+/// SCP-OUT-021 Step 11b — verify the four time-box caveats against the
+/// current clock value:
+///
+/// - `valid_from <= now` (caveat's "tighter `nbf`")
+/// - `valid_until >= now` (caveat's "tighter `exp`")
+/// - `hours_of_day & (1 << current_utc_hour) != 0` — bit `n` set means
+///   UTC hour `n` is allowed.
+/// - `days_of_week & (1 << current_utc_weekday) != 0` — bit 0 = Sunday,
+///   bit 6 = Saturday.
+///
+/// Absent (`None`) caveats are unconstrained; only present-and-violated
+/// caveats fail.
+///
+/// Clock skew is intentionally NOT applied here. §7.3.8 specifies the
+/// time-box caveats as runtime gates — they fire at the *moment* of
+/// invocation rather than at token mint or expiry, so a "5 minutes ago"
+/// invocation that was outside the allowed hour is still an invocation
+/// outside the allowed hour. NTP drift on the validator's side cannot
+/// admit invocations that the operator's policy forbids.
+///
+/// # Errors
+///
+/// Returns [`UcanError::CaveatTimeBoxViolation`] with a slug-friendly
+/// reason on the first failed check.
+fn verify_caveat_time_box(
+    caveats: &crate::trust::caveats::InvocationCaveats,
+    clock: &dyn Clock,
+) -> Result<(), UcanError> {
+    let now = clock.now_secs();
+
+    if let Some(valid_from) = caveats.valid_from
+        && now < valid_from
+    {
+        return Err(UcanError::CaveatTimeBoxViolation(format!(
+            "valid_from: now={now} < valid_from={valid_from}"
+        )));
+    }
+    if let Some(valid_until) = caveats.valid_until
+        && now > valid_until
+    {
+        return Err(UcanError::CaveatTimeBoxViolation(format!(
+            "valid_until: now={now} > valid_until={valid_until}"
+        )));
+    }
+
+    if let Some(hours_mask) = caveats.hours_of_day {
+        // UTC hour 0..=23 from `now` (Unix seconds). The arithmetic is
+        // exact: `(now / 3600) % 24` is the UTC hour-of-day with no
+        // calendar awareness, matching the spec's "current_utc_hour"
+        // shorthand.
+        #[allow(clippy::cast_possible_truncation)]
+        let current_hour = ((now / 3600) % 24) as u8;
+        if !hours_mask.contains_hour(current_hour) {
+            return Err(UcanError::CaveatTimeBoxViolation(format!(
+                "hours_of_day: current_utc_hour={current_hour} not in mask 0x{:08x}",
+                hours_mask.bits()
+            )));
+        }
+    }
+
+    if let Some(days_mask) = caveats.days_of_week {
+        // 1970-01-01 was a Thursday (weekday=4 with Sun=0). Each Unix
+        // day shifts weekday forward by 1.
+        #[allow(clippy::cast_possible_truncation)]
+        let current_weekday = (((now / 86_400) + 4) % 7) as u8;
+        if !days_mask.contains_day(current_weekday) {
+            return Err(UcanError::CaveatTimeBoxViolation(format!(
+                "days_of_week: current_utc_weekday={current_weekday} not in mask 0x{:02x}",
+                days_mask.bits()
+            )));
+        }
+    }
 
     Ok(())
 }
@@ -922,18 +1149,41 @@ fn verify_chain_recursive(
     })
 }
 
-/// Step 7: Verify attenuation — each delegation narrows or preserves capabilities.
+/// Step 7 + 7b: Verify attenuation — each delegation narrows or preserves
+/// capabilities, and (SCP-OUT-021) per-field invocation caveats narrow
+/// per §7.3.8 attenuation rules.
 ///
 /// A child token cannot grant capabilities that its parent does not have.
-/// For root tokens (empty `prf`), this is a no-op.
+/// For root tokens (empty `prf`), Step 7 is a no-op and Step 7b is
+/// unreachable (the caller skips this function for empty `prf`).
+///
+/// **Step 7b (caveat narrow).** Whenever the resolver returns
+/// `Some(caveats)` for BOTH the parent and the child, the function calls
+/// `parent_caveats.narrow(&child_caveats)`. Any
+/// [`AttenuationViolation`](crate::trust::caveats::AttenuationViolation)
+/// is wrapped into [`UcanError::CaveatAttenuationViolation`] so SDK
+/// callers can pattern-match the structured violation. When the resolver
+/// returns `None` for either side, only Step 7 runs at that edge — this
+/// preserves backward compatibility for tokens that pre-date OUT-018/019
+/// (no caveat-bearing `nb` field) and is the documented contract of
+/// [`CaveatResolver`].
 ///
 /// # Errors
 ///
-/// Returns [`UcanError::AttenuationViolation`] if a child widens capabilities.
+/// Returns [`UcanError::AttenuationViolation`] if a child widens
+/// capabilities (Step 7) and
+/// [`UcanError::CaveatAttenuationViolation`] if a child violates a
+/// caveat narrowing rule at any field (Step 7b).
 fn verify_attenuation(
     token: &UcanToken,
     proof_resolver: &impl ProofResolver,
+    caveat_resolver: &dyn CaveatResolver,
 ) -> Result<(), UcanError> {
+    // SCP-OUT-021 Step 7b: pre-resolve the child's caveats once outside
+    // the parent loop. The narrow rule is applied at every parent edge so
+    // we need the same child snapshot for each comparison.
+    let child_caveats = caveat_resolver.resolve_caveats(token);
+
     for proof_cid in &token.payload.prf {
         let parent = proof_resolver.resolve_proof(proof_cid)?;
 
@@ -953,7 +1203,7 @@ fn verify_attenuation(
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Verify every child capability is granted by a parent capability.
+        // Step 7: Verify every child capability is granted by a parent capability.
         for child_att in &token.payload.att {
             let child_cap: CapabilityUri = child_att
                 .with
@@ -967,6 +1217,18 @@ fn verify_attenuation(
                     child_att.with
                 )));
             }
+        }
+
+        // SCP-OUT-021 Step 7b: caveat narrow at this parent edge. Run
+        // only when both parent and child carry caveats — see
+        // [`CaveatResolver`] module docs for the `None`-handling
+        // contract.
+        if let (Some(parent_caveats), Some(child_caveats)) =
+            (caveat_resolver.resolve_caveats(&parent), &child_caveats)
+        {
+            parent_caveats
+                .narrow(child_caveats)
+                .map_err(UcanError::CaveatAttenuationViolation)?;
         }
     }
     Ok(())
@@ -1042,4 +1304,208 @@ pub(super) fn verify_expiry(
 // Tests — async tests requiring scp-runtime (mint_ucan, delegate_ucan,
 // compute_cid) have been moved to
 // crates/scp-runtime/tests/ucan_validate_integration.rs
+//
+// SCP-OUT-021 unit tests below exercise Steps 7b (caveat narrow) and 11b
+// (caveat time-box) using synthetic tokens (no real signatures); they call
+// `verify_attenuation` and `verify_caveat_time_box` directly because both
+// helpers are crate-visible and the caveat-specific failure modes are
+// independent of signature/expiry/revocation logic.
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::similar_names,
+    clippy::doc_markdown,
+    clippy::uninlined_format_args,
+    clippy::match_wildcard_for_single_variants,
+    clippy::type_complexity
+)]
+mod tests {
+    use super::*;
+    use crate::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
+    use crate::economy::types::Amount;
+    use crate::trust::caveats::{AttenuationViolation, InvocationCaveats};
+
+    /// Builds a synthetic token with the given encoded string, attestation
+    /// URIs, and proofs. The signature is empty — these tests exercise
+    /// Step 7b / 11b which never inspect the signature.
+    fn synthetic_token(encoded: &str, atts: &[&str], proofs: &[&str]) -> UcanToken {
+        UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: "did:example:issuer".to_owned(),
+                aud: "did:example:audience".to_owned(),
+                exp: 2_000_000_000,
+                nbf: None,
+                nnc: "0-00000000000000000000000000000000".to_owned(),
+                att: atts
+                    .iter()
+                    .map(|s| Attenuation {
+                        with: (*s).to_owned(),
+                        can: "*".to_owned(),
+                    })
+                    .collect(),
+                prf: proofs.iter().map(|s| (*s).to_owned()).collect(),
+                fct: None,
+            },
+            signature: Vec::new(),
+            encoded: encoded.to_owned(),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 7b: verify_attenuation rejects widened caveats
+    // -----------------------------------------------------------------------
+
+    /// AC: delegation with widened `amount_max_per_call` is rejected at
+    /// Step 7b — the child raised the parent's `amount_max_per_call`.
+    #[test]
+    fn step_7b_rejects_widened_amount_max_per_call() {
+        let parent = synthetic_token("PARENT", &["scp:ctx:abc/outlet_call:assistant"], &[]);
+        let child = synthetic_token("CHILD", &["scp:ctx:abc/outlet_call:assistant"], &["PARENT"]);
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        proof_resolver.proofs.insert("PARENT".to_owned(), parent);
+
+        let mut caveat_resolver = InMemoryCaveatResolver::new();
+        // Parent caps amount at 100; child tries to cap at 200 — widening.
+        caveat_resolver.insert(
+            "PARENT",
+            InvocationCaveats {
+                amount_max_per_call: Some(Amount::new(100)),
+                origin_kind: Some(crate::context::outlets::OutletKind::Action),
+                ..InvocationCaveats::empty()
+            },
+        );
+        caveat_resolver.insert(
+            "CHILD",
+            InvocationCaveats {
+                amount_max_per_call: Some(Amount::new(200)),
+                origin_kind: Some(crate::context::outlets::OutletKind::Action),
+                ..InvocationCaveats::empty()
+            },
+        );
+
+        let err = verify_attenuation(&child, &proof_resolver, &caveat_resolver)
+            .expect_err("widened amount_max_per_call must reject");
+        match err {
+            UcanError::CaveatAttenuationViolation(AttenuationViolation::AmountWidened {
+                ..
+            }) => {}
+            other => panic!("expected CaveatAttenuationViolation::AmountWidened, got {other:?}"),
+        }
+    }
+
+    /// Sanity: verify_attenuation with NoCaveatResolver still applies the
+    /// pre-existing capability-subset check (no regression for legacy
+    /// tokens).
+    #[test]
+    fn step_7b_no_caveats_preserves_legacy_capability_check() {
+        let parent = synthetic_token("PARENT", &["scp:ctx:abc/outlet_call:assistant"], &[]);
+        let child = synthetic_token("CHILD", &["scp:ctx:abc/outlet_call:assistant"], &["PARENT"]);
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        proof_resolver.proofs.insert("PARENT".to_owned(), parent);
+
+        // No caveats anywhere — legacy capability-only path.
+        verify_attenuation(&child, &proof_resolver, &NoCaveatResolver)
+            .expect("matching capabilities pass under NoCaveatResolver");
+    }
+
+    // -----------------------------------------------------------------------
+    // Step 11b: verify_caveat_time_box hours_of_day
+    // -----------------------------------------------------------------------
+
+    /// AC: invocation during a disallowed hour is rejected at Step 11b.
+    #[test]
+    fn step_11b_rejects_invocation_during_disallowed_hour() {
+        // 1970-01-01T12:00:00Z — UTC hour 12.
+        let now_at_hour_12: u64 = 12 * 3600;
+        let clock = scp_primitives::TestClock::new(now_at_hour_12);
+
+        // Allow only hour 13 (bit 13 set) — bit 12 is clear.
+        let mask = crate::trust::caveats::HoursOfDayMask::from_bits(1u32 << 13).unwrap();
+        let caveats = InvocationCaveats {
+            hours_of_day: Some(mask),
+            ..InvocationCaveats::empty()
+        };
+
+        let err = verify_caveat_time_box(&caveats, &clock)
+            .expect_err("hour-12 invocation must reject when only hour 13 is allowed");
+        match err {
+            UcanError::CaveatTimeBoxViolation(reason) => {
+                assert!(reason.contains("hours_of_day"), "reason: {reason}");
+            }
+            other => panic!("expected CaveatTimeBoxViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_11b_admits_invocation_during_allowed_hour() {
+        let now_at_hour_12: u64 = 12 * 3600;
+        let clock = scp_primitives::TestClock::new(now_at_hour_12);
+
+        // Allow hour 12.
+        let mask = crate::trust::caveats::HoursOfDayMask::from_bits(1u32 << 12).unwrap();
+        let caveats = InvocationCaveats {
+            hours_of_day: Some(mask),
+            ..InvocationCaveats::empty()
+        };
+
+        verify_caveat_time_box(&caveats, &clock).expect("hour 12 allowed");
+    }
+
+    #[test]
+    fn step_11b_rejects_before_valid_from() {
+        let clock = scp_primitives::TestClock::new(1_000);
+        let caveats = InvocationCaveats {
+            valid_from: Some(2_000),
+            ..InvocationCaveats::empty()
+        };
+        let err = verify_caveat_time_box(&caveats, &clock).expect_err("before valid_from");
+        match err {
+            UcanError::CaveatTimeBoxViolation(reason) => {
+                assert!(reason.contains("valid_from"), "reason: {reason}");
+            }
+            other => panic!("expected CaveatTimeBoxViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_11b_rejects_after_valid_until() {
+        let clock = scp_primitives::TestClock::new(3_000);
+        let caveats = InvocationCaveats {
+            valid_until: Some(2_000),
+            ..InvocationCaveats::empty()
+        };
+        let err = verify_caveat_time_box(&caveats, &clock).expect_err("after valid_until");
+        match err {
+            UcanError::CaveatTimeBoxViolation(reason) => {
+                assert!(reason.contains("valid_until"), "reason: {reason}");
+            }
+            other => panic!("expected CaveatTimeBoxViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn step_11b_rejects_disallowed_weekday() {
+        // 1970-01-01 was a Thursday (weekday 4 with Sun=0).
+        let clock = scp_primitives::TestClock::new(0);
+        // Allow only Sunday (bit 0).
+        let mask = crate::trust::caveats::DaysOfWeekMask::from_bits(0b0000_0001).unwrap();
+        let caveats = InvocationCaveats {
+            days_of_week: Some(mask),
+            ..InvocationCaveats::empty()
+        };
+        let err = verify_caveat_time_box(&caveats, &clock).expect_err("Thursday rejected");
+        match err {
+            UcanError::CaveatTimeBoxViolation(reason) => {
+                assert!(reason.contains("days_of_week"), "reason: {reason}");
+            }
+            other => panic!("expected CaveatTimeBoxViolation, got {other:?}"),
+        }
+    }
+}

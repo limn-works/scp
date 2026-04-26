@@ -244,6 +244,7 @@ mod tests {
             presenting_agent_did: &human_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
         };
 
         let result =

@@ -85,6 +85,58 @@ pub struct ManagedOutletInvocationOutput {
     pub payment_receipt: Option<crate::economy::adapter::PaymentReceipt>,
 }
 
+/// SCP-OUT-021 — bundle of state needed for §7.3.8 post-input caveat
+/// enforcement.
+///
+/// Construct one of these and pass it into
+/// [`ContextManager::invoke_outlet_with_economy_and_caveats`] when the
+/// presented spending UCAN (or another token in the chain) carries
+/// invocation caveats. The fields hold owned references / shared `Arc`
+/// handles so the caller retains ownership of the underlying data
+/// across the off-lock invocation.
+///
+/// The `counter_store` field is type-erased as
+/// `Arc<dyn CaveatCounterApi>` so the manager API does not have to
+/// propagate the [`Storage`](scp_platform::traits::Storage) generic
+/// parameter through every caller. Concrete
+/// [`CaveatCounterStore<S>`](crate::trust::CaveatCounterStore) values
+/// implement [`CaveatCounterApi`](crate::trust::CaveatCounterApi) for
+/// every `S: Storage + 'static`, so callers wrap their store as
+/// `Arc::new(store) as Arc<dyn CaveatCounterApi>`.
+///
+/// # Field semantics
+///
+/// - `caveats` — the [`InvocationCaveats`] to enforce. Comes from the
+///   resolved `nb` field of the presenting (leaf) UCAN per §7.3.8.
+/// - `counter_store` — durable per-`(ucan_cid, caveat_kind)` counter
+///   store. Atomic CAS prevents racing invocations from double-spending
+///   `max_calls`, `amount_max_cumulative`, or `rate_window` capacity.
+/// - `ucan_cid` — the CID of the presenting UCAN. Forms half of the
+///   counter-store key alongside `context_id` (which the manager
+///   wrapper already knows).
+/// - `negotiated_adapter` — the [`PaymentAdapterRef`] the runtime is
+///   about to use, if any. Drives the `allowed_adapters` check inside
+///   [`InvocationCaveats::check_invocation_local`](scp_protocol::trust::caveats::InvocationCaveats::check_invocation_local).
+/// - `target_did` — the cross-context target DID, if any. Drives the
+///   `allowed_target_dids` check.
+/// - `estimated_cost` — the runtime's pre-execution cost estimate. Drives
+///   the `amount_max_per_call` check and the `amount_max_cumulative`
+///   counter increment.
+pub struct CaveatEnforcement<'a> {
+    /// Invocation caveats from the presenting UCAN's `nb` field.
+    pub caveats: &'a scp_protocol::trust::caveats::InvocationCaveats,
+    /// Durable counter store (type-erased) for atomic per-UCAN cap accounting.
+    pub counter_store: Arc<dyn crate::trust::CaveatCounterApi>,
+    /// CID of the presenting UCAN (counter-store key).
+    pub ucan_cid: &'a str,
+    /// Negotiated payment adapter reference, if any.
+    pub negotiated_adapter: Option<&'a scp_protocol::economy::types::PaymentAdapterRef>,
+    /// Cross-context target DID, if any.
+    pub target_did: Option<&'a scp_identity::DID>,
+    /// Runtime's pre-execution cost estimate.
+    pub estimated_cost: scp_protocol::economy::types::Amount,
+}
+
 /// Phase-1 bookkeeping bundle for an outlet invocation in flight.
 ///
 /// Every Phase 1 success produces a [`OutletEconomyTicket`]; every Phase 2
@@ -463,6 +515,13 @@ impl ContextManager {
         timeout_ms: Option<u32>,
         executor: F,
         handler_panic_sink: Option<&dyn crate::context::outlets::invoke::HandlerPanicSink>,
+        // SCP-OUT-021: optional invocation caveat enforcement bundle.
+        // `None` preserves pre-OUT-021 behaviour (no caveat checks). When
+        // `Some(enforcement)` is provided the Phase-2 helper runs §7.3.8
+        // post-input caveat enforcement (synchronous local checks +
+        // counter-store CAS) immediately after input schema validation
+        // and before the executor runs.
+        caveat_enforcement: Option<CaveatEnforcement<'_>>,
     ) -> Result<ManagedOutletInvocationOutput, ContextError>
     where
         F: FnOnce(serde_json::Value) -> Fut,
@@ -769,6 +828,97 @@ impl ContextManager {
             ctx_gen,
         } = phase1;
 
+        // SCP-OUT-021: build the post-input caveat hook BEFORE Phase 2
+        // dispatch. The hook captures the caveat-enforcement state by
+        // move and runs §7.3.8 synchronous + counter-store checks
+        // immediately after input schema validation in the helper. The
+        // hook is `None` when caveat enforcement is disabled.
+        let caveat_hook: Option<crate::context::outlets::invoke::CaveatPostInputCheck<'_>> =
+            caveat_enforcement.map(|enf| {
+                let context_id_owned = context_id.to_owned();
+                let ucan_cid_owned = enf.ucan_cid.to_owned();
+                let caveats_clone = enf.caveats.clone();
+                let counter_store: Arc<dyn crate::trust::CaveatCounterApi> = enf.counter_store;
+                let estimated_cost = enf.estimated_cost;
+                let adapter_clone = enf.negotiated_adapter.cloned();
+                let target_clone = enf.target_did.cloned();
+                let hook: crate::context::outlets::invoke::CaveatPostInputCheck<'_> =
+                    Box::new(move |input: &serde_json::Value| {
+                        let input = input.clone();
+                        Box::pin(async move {
+                            // 1. Synchronous local checks
+                            // (input_schema / amount_max_per_call /
+                            // allowed_adapters / allowed_target_dids).
+                            if let Err(err) = caveats_clone.check_invocation_local(
+                                &input,
+                                estimated_cost,
+                                adapter_clone.as_ref(),
+                                target_clone.as_ref(),
+                            ) {
+                                return Err(
+                                    crate::context::outlets::invoke::InvocationError::CaveatViolation {
+                                        slug: err.slug(),
+                                        message: err.to_string(),
+                                    },
+                                );
+                            }
+
+                            // 2. Counter-bearing caveats (§7.3.8): each
+                            // populated counter caveat consults
+                            // CaveatCounterStore. Order is fixed —
+                            // max_calls, amount_max_cumulative,
+                            // rate_window — so the rejection slug is
+                            // deterministic when multiple caveats would
+                            // fail.
+                            if let Some(cap) = caveats_clone.max_calls
+                                && let Err(err) = counter_store
+                                    .check_and_increment(
+                                        &context_id_owned,
+                                        &ucan_cid_owned,
+                                        scp_protocol::trust::CaveatKind::MaxCalls,
+                                        1,
+                                        cap,
+                                        0,
+                                    )
+                                    .await
+                            {
+                                return Err(caveat_counter_error_to_invocation_error(err));
+                            }
+                            if let Some(cap) = caveats_clone.amount_max_cumulative
+                                && let Err(err) = counter_store
+                                    .check_and_increment(
+                                        &context_id_owned,
+                                        &ucan_cid_owned,
+                                        scp_protocol::trust::CaveatKind::AmountCumulative,
+                                        estimated_cost.value(),
+                                        cap.value(),
+                                        0,
+                                    )
+                                    .await
+                            {
+                                return Err(caveat_counter_error_to_invocation_error(err));
+                            }
+                            if let Some(window) = caveats_clone.rate_window
+                                && let Err(err) = counter_store
+                                    .check_and_increment(
+                                        &context_id_owned,
+                                        &ucan_cid_owned,
+                                        scp_protocol::trust::CaveatKind::RateWindow,
+                                        0,
+                                        u64::from(window.max),
+                                        window.window_secs,
+                                    )
+                                    .await
+                            {
+                                return Err(caveat_counter_error_to_invocation_error(err));
+                            }
+
+                            Ok(())
+                        })
+                    });
+                hook
+            });
+
         // ------------------------------------------------------------
         // Phase 2 — UNLOCKED.
         //
@@ -787,6 +937,7 @@ impl ContextManager {
             timeout_ms,
             executor,
             handler_panic_sink,
+            caveat_hook,
         )
         .await
         {
@@ -1144,6 +1295,7 @@ impl ContextManager {
                 timeout_ms,
                 closure,
                 handler_panic_sink,
+                None,
             )
             .await?;
 
@@ -1189,6 +1341,57 @@ struct Phase1Snapshot {
     role_state: scp_protocol::context::roles::ContextRoleState,
     ticket: OutletEconomyTicket,
     ctx_gen: ContextGeneration,
+}
+
+/// SCP-OUT-021 — convert a [`crate::trust::caveat_counter_store::CounterError`]
+/// into the [`InvocationError::CaveatViolation`] envelope. The slug picks
+/// out which counter-bearing caveat rejected the invocation
+/// (`authorization.cumulative-exceeded`, `authorization.rate-exceeded`,
+/// `authorization.denied`); the message preserves the
+/// counter-store-side detail so operators see the cap and the would-be
+/// post-increment value.
+fn caveat_counter_error_to_invocation_error(
+    err: crate::trust::caveat_counter_store::CounterError,
+) -> InvocationError {
+    use crate::trust::caveat_counter_store::{CounterError, CounterExhausted};
+    use scp_protocol::trust::CaveatKind;
+    match err {
+        CounterError::Exhausted(exhausted) => {
+            let slug: &'static str = match exhausted.kind() {
+                CaveatKind::MaxCalls => "authorization.denied",
+                CaveatKind::AmountCumulative => "authorization.cumulative-exceeded",
+                CaveatKind::RateWindow => "authorization.rate-exceeded",
+            };
+            let message = match &exhausted {
+                CounterExhausted::MaxCalls { would_be, cap, .. } => {
+                    format!("max_calls exhausted: would_be={would_be}, cap={cap}")
+                }
+                CounterExhausted::AmountCumulative { would_be, cap, .. } => {
+                    format!("amount_max_cumulative exhausted: would_be={would_be}, cap={cap}")
+                }
+                CounterExhausted::RateWindow {
+                    in_window,
+                    cap,
+                    window_secs,
+                    ..
+                } => format!(
+                    "rate_window exhausted: in_window={in_window}, cap={cap}, window_secs={window_secs}"
+                ),
+            };
+            InvocationError::CaveatViolation { slug, message }
+        }
+        CounterError::Store(store_err) => {
+            // Storage failure on the counter store — surface as an
+            // execution failure rather than an authorization error so
+            // operators can distinguish "infrastructure failed" from
+            // "delegation rejected the call". The slug "authorization.denied"
+            // is intentionally NOT used here because the call did not
+            // fail due to a delegation rule.
+            InvocationError::ExecutionFailed {
+                message: format!("caveat counter store error: {store_err}"),
+            }
+        }
+    }
 }
 
 /// Maps an [`InvocationError`] to a [`ContextError`] with SCP codes.
@@ -1257,6 +1460,17 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
             code = scp_protocol::context::outlets::error_codes::CODE_EXECUTION_FAULT,
             slug = scp_protocol::context::outlets::error_codes::SLUG_EXECUTION_HANDLER_PANIC,
         )),
+        // SCP-OUT-021: caveat violations route to the §5.4.4
+        // Authorization or Input class depending on slug. The slug→code
+        // map mirrors `error_code_to_class`/`error_code_to_default_slug`.
+        InvocationError::CaveatViolation { slug, message } => {
+            let code = if slug.starts_with("input.") {
+                scp_protocol::CODE_INPUT_VIOLATION
+            } else {
+                scp_protocol::CODE_AUTHORIZATION_DENIED
+            };
+            ContextError::PermissionDenied(format!("{code} ({slug}): {message}"))
+        }
     }
 }
 

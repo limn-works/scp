@@ -167,6 +167,7 @@ async fn mint_validate_roundtrip() {
         presenting_agent_did: &audience_did,
         clock_skew_tolerance_secs: 300,
         clock: &scp_primitives::SystemClock,
+        caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
     };
 
     let result = validate_ucan(&token, &required, &mut ctx);
@@ -490,6 +491,7 @@ async fn delegation_chain() {
         presenting_agent_did: &leaf_did,
         clock_skew_tolerance_secs: 300,
         clock: &scp_primitives::SystemClock,
+        caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
     };
 
     let result = validate_ucan(&mid_token, &required, &mut ctx);
@@ -593,6 +595,7 @@ async fn broken_delegation_chain() {
         presenting_agent_did: &mid_did,
         clock_skew_tolerance_secs: 300,
         clock: &scp_primitives::SystemClock,
+        caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
     };
 
     let result = validate_ucan(&mid_token, &required, &mut ctx);

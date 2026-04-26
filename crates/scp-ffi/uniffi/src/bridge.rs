@@ -4273,6 +4273,7 @@ pub async fn outlet_invoke(
                     None,
                     executor,
                     None,
+                    None,
                 )
                 .await
                 .map_err(ScpError::from)?;
@@ -4353,6 +4354,7 @@ fn validate_outlet_ucan_uniffi(
             presenting_agent_did: identity_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
         };
 
         validate_outlet_invocation_ucan(ucan_token, &handle.context_id, outlet_id, kind, &mut ctx)
@@ -6222,6 +6224,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     clock_skew_tolerance_secs:
                         scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                     clock: &scp_primitives::SystemClock,
+                    caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
                 };
 
                 scp_core::context::tools::validate_outlet_invocation_ucan(
@@ -7162,6 +7165,7 @@ pub async fn ucan_validate(
                         presenting_agent_did: agent_did,
                         clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                         clock: &scp_primitives::SystemClock,
+                        caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
                     };
 
                     validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(|e| {

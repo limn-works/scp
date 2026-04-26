@@ -737,6 +737,98 @@ impl InvocationCaveats {
 
         Ok(())
     }
+
+    /// SCP-OUT-021 post-input check (synchronous half).
+    ///
+    /// Runs the §7.3.8 "Post-input checks" that DO NOT require persistent
+    /// counter state:
+    ///
+    /// - `input_schema` — conformance against the caveat's narrowed schema
+    ///   (above and beyond the outlet's own input schema).
+    /// - `amount_max_per_call` — the computed invocation cost MUST be
+    ///   `<=` the per-call ceiling.
+    /// - `allowed_adapters` — the negotiated adapter MUST be in the list.
+    /// - `allowed_target_dids` — the cross-context target DID MUST be in
+    ///   the list.
+    ///
+    /// The three counter-bearing caveats (`max_calls`,
+    /// `amount_max_cumulative`, `rate_window`) are NOT checked here. Those
+    /// require atomic CAS against `CaveatCounterStore` (§7.3.8 runtime
+    /// enforcement) and live in `scp-runtime`. The runtime's
+    /// `enforce_caveat_invocation` glue calls this function FIRST so a
+    /// failure on a synchronous caveat does not consume counter capacity.
+    ///
+    /// `negotiated_adapter` and `target_did` are `Option` to model the
+    /// "no adapter selected" / "intra-context invocation" cases. Absent
+    /// values trigger the caveat only when the caveat is `Some(non_empty_list)`
+    /// — i.e., a token that restricts to specific adapters cannot be
+    /// invoked with no adapter at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckInvocationError`] with a typed variant identifying
+    /// which rule failed; the variant's [`CheckInvocationError::slug`]
+    /// helper returns the spec slug used in the error envelope.
+    pub fn check_invocation_local(
+        &self,
+        input: &serde_json::Value,
+        estimated_cost: Amount,
+        negotiated_adapter: Option<&PaymentAdapterRef>,
+        target_did: Option<&DID>,
+    ) -> Result<(), CheckInvocationError> {
+        // input_schema conformance — caveat-narrowed schema.
+        if let Some(schema) = self.input_schema.as_ref() {
+            crate::context::outlets::schema::validate_value_against_schema(input, schema)
+                .map_err(|message| CheckInvocationError::InputSchemaViolation { message })?;
+        }
+
+        // amount_max_per_call — estimated cost MUST not exceed cap.
+        if let Some(cap) = self.amount_max_per_call
+            && estimated_cost.value() > cap.value()
+        {
+            return Err(CheckInvocationError::AmountMaxPerCallExceeded {
+                estimated_cost,
+                cap,
+            });
+        }
+
+        // allowed_adapters — negotiated adapter MUST be in list.
+        if let Some(allowed) = self.allowed_adapters.as_ref() {
+            // An empty `Some(vec![])` is a token that allows zero
+            // adapters — every invocation is rejected by design (the
+            // mint-time check accepts empty lists; runtime treats them
+            // as "no adapter is admissible"). Absent adapter against a
+            // non-empty list is also a rejection: the caveat opts the
+            // chain into adapter-restricted operation.
+            let negotiated =
+                negotiated_adapter.ok_or_else(|| CheckInvocationError::AdapterNotAllowed {
+                    negotiated: None,
+                    allowed: allowed.clone(),
+                })?;
+            if !allowed.iter().any(|a| a == negotiated) {
+                return Err(CheckInvocationError::AdapterNotAllowed {
+                    negotiated: Some(negotiated.clone()),
+                    allowed: allowed.clone(),
+                });
+            }
+        }
+
+        // allowed_target_dids — cross-context target MUST be in list.
+        if let Some(allowed) = self.allowed_target_dids.as_ref() {
+            let target = target_did.ok_or_else(|| CheckInvocationError::TargetDidNotAllowed {
+                target: None,
+                allowed: allowed.clone(),
+            })?;
+            if !allowed.iter().any(|d| d == target) {
+                return Err(CheckInvocationError::TargetDidNotAllowed {
+                    target: Some(target.clone()),
+                    allowed: allowed.clone(),
+                });
+            }
+        }
+
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2106,6 +2198,99 @@ pub enum CaveatSerError {
     /// JCS / `serde_json` encoding failed.
     #[error("JCS encoding failed: {0}")]
     Json(String),
+}
+
+// ---------------------------------------------------------------------------
+// CheckInvocationError — SCP-OUT-021
+// ---------------------------------------------------------------------------
+
+/// Reasons [`InvocationCaveats::check_invocation_local`] may reject an
+/// invocation.
+///
+/// Each variant corresponds to a specific Authorization-class slug per
+/// §7.3.8 / ADR-049 §4. The slug is returned by
+/// [`CheckInvocationError::slug`] so the caller can populate the
+/// `OutletError` envelope without re-mapping the variant by string.
+///
+/// All variants under this enum map to the
+/// [`crate::CODE_AUTHORIZATION_DENIED`] (`SCP-TOOL-6110`) code; the slug
+/// is what disambiguates the failure mode in the wire envelope.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CheckInvocationError {
+    /// The invocation input failed the caveat's `input_schema`
+    /// conformance check. Slug: `input.schema-violation`.
+    ///
+    /// Note: although `input_schema` failures could plausibly fall under
+    /// the `Input` class (`SCP-TOOL-6120`), §7.3.8 categorises every
+    /// caveat-driven rejection under `Authorization` because the failure
+    /// is a delegation-bound constraint, not a malformed-input error.
+    /// The SDK error envelope receives the Authorization class with the
+    /// Input-shaped slug so the categorisation is unambiguous to
+    /// downstream classifiers.
+    #[error("input violates caveat input_schema: {message}")]
+    InputSchemaViolation {
+        /// Human-readable diagnostic from the JSON Schema validator.
+        message: String,
+    },
+
+    /// The estimated invocation cost exceeds `amount_max_per_call`.
+    /// Slug: `authorization.denied` (per-call ceiling — there is no
+    /// dedicated slug because the spec collapses per-call ceiling
+    /// breaches under the catch-all denied slug; cumulative is
+    /// separate).
+    #[error("amount_max_per_call exceeded: estimated_cost={estimated_cost}, cap={cap}")]
+    AmountMaxPerCallExceeded {
+        /// The cost the runtime computed for this invocation.
+        estimated_cost: Amount,
+        /// The caveat's per-call ceiling.
+        cap: Amount,
+    },
+
+    /// The negotiated adapter is not in `allowed_adapters` (or the caveat
+    /// requires an adapter and none was negotiated).
+    /// Slug: `authorization.adapter-not-allowed`.
+    #[error("adapter not allowed: negotiated={negotiated:?}, allowed={allowed:?}")]
+    AdapterNotAllowed {
+        /// The adapter the runtime was about to use, if any.
+        negotiated: Option<PaymentAdapterRef>,
+        /// The caveat's allow-list.
+        allowed: Vec<PaymentAdapterRef>,
+    },
+
+    /// The cross-context target DID is not in `allowed_target_dids` (or
+    /// the caveat requires a target DID and the invocation was
+    /// intra-context).
+    /// Slug: `authorization.denied` (target DID — no dedicated spec
+    /// slug; falls under the Authorization catch-all).
+    #[error("target DID not in allowed_target_dids: target={target:?}, allowed={allowed:?}")]
+    TargetDidNotAllowed {
+        /// The target DID the runtime was about to invoke, if any.
+        target: Option<DID>,
+        /// The caveat's allow-list.
+        allowed: Vec<DID>,
+    },
+}
+
+impl CheckInvocationError {
+    /// Returns the §5.4.4 / §7.3.8 slug used in the `OutletError`
+    /// envelope. All variants share the
+    /// [`crate::CODE_AUTHORIZATION_DENIED`] code; the slug disambiguates
+    /// the rule that fired.
+    #[must_use]
+    pub const fn slug(&self) -> &'static str {
+        match self {
+            Self::InputSchemaViolation { .. } => "input.schema-violation",
+            Self::AdapterNotAllowed { .. } => "authorization.adapter-not-allowed",
+            // `AmountMaxPerCallExceeded` and `TargetDidNotAllowed` both
+            // collapse onto the catch-all `authorization.denied` slug —
+            // §7.3.8 / §5.4.4 do not allocate a per-call-cap or
+            // target-DID-list-specific slug, so the catch-all is the
+            // correct disambiguator.
+            Self::AmountMaxPerCallExceeded { .. } | Self::TargetDidNotAllowed { .. } => {
+                "authorization.denied"
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3947,5 +4132,155 @@ mod tests {
         ];
         want.sort_unstable();
         assert_eq!(got, want);
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-021 — check_invocation_local
+    // -----------------------------------------------------------------------
+
+    /// AC: invocation with a target_did NOT in `allowed_target_dids` is
+    /// rejected.
+    #[test]
+    fn check_invocation_rejects_target_did_not_in_allowed_list() {
+        let allowed = vec![DID::from("did:example:alice")];
+        let caveats = InvocationCaveats {
+            allowed_target_dids: Some(allowed.clone()),
+            ..InvocationCaveats::empty()
+        };
+        let target = DID::from("did:example:eve");
+        let err = caveats
+            .check_invocation_local(&json!({}), Amount::new(0), None, Some(&target))
+            .expect_err("disallowed target DID must reject");
+        match err {
+            CheckInvocationError::TargetDidNotAllowed {
+                target: Some(t),
+                allowed: a,
+            } => {
+                assert_eq!(t, target);
+                assert_eq!(a, allowed);
+            }
+            other => panic!("expected TargetDidNotAllowed, got {:?}", other),
+        }
+    }
+
+    /// AC: invocation with input violating `input_schema` narrowing is
+    /// rejected.
+    #[test]
+    fn check_invocation_rejects_input_violating_input_schema() {
+        // Caveat narrows input to require a string property `name`.
+        let schema = json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {"name": {"type": "string"}}
+        });
+        let caveats = InvocationCaveats {
+            input_schema: Some(schema),
+            ..InvocationCaveats::empty()
+        };
+        // Input is missing the `name` required property.
+        let bad_input = json!({"other": "field"});
+        let err = caveats
+            .check_invocation_local(&bad_input, Amount::new(0), None, None)
+            .expect_err("input missing required field must reject");
+        match err {
+            CheckInvocationError::InputSchemaViolation { message } => {
+                assert!(
+                    message.contains("name") || message.to_lowercase().contains("required"),
+                    "expected schema-violation reason, got: {message}"
+                );
+            }
+            other => panic!("expected InputSchemaViolation, got {:?}", other),
+        }
+    }
+
+    /// Sanity: input that satisfies the caveat schema passes.
+    #[test]
+    fn check_invocation_admits_input_satisfying_schema() {
+        let schema = json!({
+            "type": "object",
+            "required": ["name"],
+            "properties": {"name": {"type": "string"}}
+        });
+        let caveats = InvocationCaveats {
+            input_schema: Some(schema),
+            ..InvocationCaveats::empty()
+        };
+        let good_input = json!({"name": "alice"});
+        caveats
+            .check_invocation_local(&good_input, Amount::new(0), None, None)
+            .expect("schema-conforming input must pass");
+    }
+
+    /// `amount_max_per_call` rejects estimates exceeding the cap.
+    #[test]
+    fn check_invocation_rejects_amount_max_per_call_exceeded() {
+        let caveats = InvocationCaveats {
+            amount_max_per_call: Some(Amount::new(50)),
+            ..InvocationCaveats::empty()
+        };
+        let err = caveats
+            .check_invocation_local(&json!({}), Amount::new(51), None, None)
+            .expect_err("cost above cap must reject");
+        match err {
+            CheckInvocationError::AmountMaxPerCallExceeded {
+                estimated_cost,
+                cap,
+            } => {
+                assert_eq!(estimated_cost, Amount::new(51));
+                assert_eq!(cap, Amount::new(50));
+            }
+            other => panic!("expected AmountMaxPerCallExceeded, got {:?}", other),
+        }
+    }
+
+    /// `allowed_adapters` rejects adapters not in the list.
+    #[test]
+    fn check_invocation_rejects_adapter_not_in_allowed_list() {
+        let allowed: Vec<PaymentAdapterRef> = vec!["stripe".to_owned()];
+        let caveats = InvocationCaveats {
+            allowed_adapters: Some(allowed.clone()),
+            ..InvocationCaveats::empty()
+        };
+        let other: PaymentAdapterRef = "venmo".to_owned();
+        let err = caveats
+            .check_invocation_local(&json!({}), Amount::new(0), Some(&other), None)
+            .expect_err("disallowed adapter must reject");
+        match err {
+            CheckInvocationError::AdapterNotAllowed {
+                negotiated: Some(n),
+                allowed: a,
+            } => {
+                assert_eq!(n, other);
+                assert_eq!(a, allowed);
+            }
+            other => panic!("expected AdapterNotAllowed, got {:?}", other),
+        }
+    }
+
+    /// All slugs render as the §5.4.4 strings the SDKs depend on.
+    #[test]
+    fn check_invocation_error_slugs() {
+        let e1 = CheckInvocationError::InputSchemaViolation {
+            message: "x".to_owned(),
+        };
+        assert_eq!(e1.slug(), "input.schema-violation");
+
+        let e2 = CheckInvocationError::AmountMaxPerCallExceeded {
+            estimated_cost: Amount::new(2),
+            cap: Amount::new(1),
+        };
+        assert_eq!(e2.slug(), "authorization.denied");
+
+        let e3 = CheckInvocationError::AdapterNotAllowed {
+            negotiated: None,
+            allowed: vec![],
+        };
+        assert_eq!(e3.slug(), "authorization.adapter-not-allowed");
+
+        let e4 = CheckInvocationError::TargetDidNotAllowed {
+            target: None,
+            allowed: vec![],
+        };
+        assert_eq!(e4.slug(), "authorization.denied");
     }
 }

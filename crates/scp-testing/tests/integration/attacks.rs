@@ -931,6 +931,7 @@ async fn ucan_expired_token_rejected() {
         presenting_agent_did: audience_did,
         clock_skew_tolerance_secs: 0, // No tolerance to ensure expiry is detected
         clock: &scp_primitives::SystemClock,
+        caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
     };
 
     let result = validate_ucan(&token, &required_cap, &mut ctx);
@@ -1032,6 +1033,7 @@ async fn ucan_nonce_replay_rejected() {
             presenting_agent_did: audience_did,
             clock_skew_tolerance_secs: 300,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
         };
         let result = validate_ucan(&token, &required_cap, &mut ctx);
         assert!(
@@ -1052,6 +1054,7 @@ async fn ucan_nonce_replay_rejected() {
             presenting_agent_did: audience_did,
             clock_skew_tolerance_secs: 300,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
         };
         let result = validate_ucan(&token, &required_cap, &mut ctx);
         assert!(result.is_err(), "replayed nonce should be rejected");
@@ -1569,6 +1572,7 @@ async fn ucan_kid_scope_mismatch_rejected() {
         presenting_agent_did: &issuer_did,
         clock_skew_tolerance_secs: 300,
         clock: &scp_primitives::SystemClock,
+        caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
     };
 
     let result = validate_ucan(&token, &required_cap, &mut ctx);
@@ -1628,6 +1632,7 @@ async fn ucan_kid_scope_mismatch_rejected() {
         presenting_agent_did: &issuer_did,
         clock_skew_tolerance_secs: 300,
         clock: &scp_primitives::SystemClock,
+        caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
     };
 
     let result_2 = validate_ucan(&token, &required_cap_2, &mut ctx_2);

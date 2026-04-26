@@ -213,6 +213,28 @@ pub enum InvocationError {
         /// payload is neither `&'static str` nor `String`.
         panic_message: String,
     },
+
+    /// SCP-OUT-021 — a §7.3.8 invocation caveat rejected the call after
+    /// input schema validation. Carries a class-specific slug
+    /// (`authorization.cumulative-exceeded`, `authorization.rate-exceeded`,
+    /// `authorization.adapter-not-allowed`, `input.schema-violation`,
+    /// `authorization.denied`, …) so the SDK error envelope can surface
+    /// the precise rule that fired.
+    ///
+    /// Maps to either
+    /// [`scp_protocol::CODE_AUTHORIZATION_DENIED`] (`SCP-TOOL-6110`) for
+    /// the `authorization.*` slugs, or to
+    /// [`scp_protocol::CODE_INPUT_VIOLATION`] (`SCP-TOOL-6120`) for the
+    /// `input.schema-violation` slug — the dispatcher in
+    /// [`super::manager::outlets::invocation_error_to_context`] performs
+    /// the slug→code routing.
+    #[error("caveat violation ({slug}): {message}")]
+    CaveatViolation {
+        /// The §5.4.4 slug for the violated caveat rule.
+        slug: &'static str,
+        /// Human-readable diagnostic.
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1745,6 +1767,13 @@ where
         timeout_ms,
         executor,
         handler_panic_sink,
+        // SCP-OUT-021 caveat hook: the free `invoke_outlet` does not own
+        // a CaveatCounterStore — it is a thin wrapper for direct callers
+        // that bypass the `ContextManager` entry point. Caveat enforcement
+        // is the manager wrapper's responsibility (see
+        // `ContextManager::invoke_outlet_with_economy`); direct callers
+        // get post-input schema enforcement only.
+        None,
     )
     .await
     {
@@ -1820,6 +1849,36 @@ pub(crate) struct InvokeExecuteOutcome {
     pub execution_time_ms: u64,
 }
 
+/// SCP-OUT-021 — caveat post-input check hook.
+///
+/// Invoked by [`invoke_outlet_execute_and_validate`] after the outlet's
+/// input schema validation passes but BEFORE the executor runs. The hook
+/// owns the synchronous local checks
+/// ([`InvocationCaveats::check_invocation_local`](scp_protocol::trust::caveats::InvocationCaveats::check_invocation_local))
+/// AND the asynchronous counter-store calls
+/// (`max_calls`, `amount_max_cumulative`, `rate_window`) — combining both
+/// into one closure preserves the §7.3.8 ordering invariant: synchronous
+/// caveats first (so a fast rejection does not consume counter capacity),
+/// counter-store next (atomic per-UCAN CAS).
+///
+/// On failure the hook returns [`InvocationError`] (typically
+/// [`InvocationError::InputValidationFailed`] or a manager-mapped
+/// authorization error); on success it returns `Ok(())` and the executor
+/// proceeds.
+///
+/// The hook receives a borrowed reference to the input `serde_json::Value`
+/// so the same value the executor will see (and the input hash will be
+/// computed from) is what the schema check observes. The hook MUST NOT
+/// mutate the input.
+pub type CaveatPostInputCheck<'a> = Box<
+    dyn FnOnce(
+            &serde_json::Value,
+        )
+            -> std::pin::Pin<Box<dyn Future<Output = Result<(), InvocationError>> + Send + 'a>>
+        + Send
+        + 'a,
+>;
+
 /// Runs steps 1-6 of outlet invocation without any economy state.
 ///
 /// This helper is the off-lock execution half of outlet invocation. It
@@ -1833,6 +1892,13 @@ pub(crate) struct InvokeExecuteOutcome {
 /// The free [`invoke_outlet`] function also delegates to this helper after
 /// running economy pre-check / escrow authorization, so the execution
 /// path is shared between the two entry points.
+///
+/// # SCP-OUT-021 caveat hook
+///
+/// The optional `caveat_post_input_check` argument runs §7.3.8 post-input
+/// caveat enforcement immediately after step 4 (input schema validation)
+/// and before the executor is dispatched. The hook must surface caveat
+/// failures as [`InvocationError`] values.
 ///
 /// # Panic guard (SCP-OUT-028)
 ///
@@ -1854,7 +1920,7 @@ pub(crate) struct InvokeExecuteOutcome {
 /// timeout, executor failure, or recovered handler panic. Cancellation is
 /// not supported by this variant — see the inline timeout-plus-select!
 /// path in [`invoke_outlet_with_cancellation`] instead.
-#[allow(clippy::too_many_arguments)] // 9 parameters mirror `invoke_outlet`; lower bound imposed by the execution contract + SCP-OUT-028 panic sink.
+#[allow(clippy::too_many_arguments)] // 10 parameters mirror `invoke_outlet`; lower bound imposed by the execution contract + SCP-OUT-028 panic sink + SCP-OUT-021 caveat hook.
 pub(crate) async fn invoke_outlet_execute_and_validate<F, Fut>(
     context: &ContextHandle,
     registry: &OutletRegistry,
@@ -1865,6 +1931,7 @@ pub(crate) async fn invoke_outlet_execute_and_validate<F, Fut>(
     timeout_ms: Option<u32>,
     executor: F,
     handler_panic_sink: Option<&dyn HandlerPanicSink>,
+    caveat_post_input_check: Option<CaveatPostInputCheck<'_>>,
 ) -> Result<InvokeExecuteOutcome, InvocationError>
 where
     F: FnOnce(serde_json::Value) -> Fut,
@@ -1902,6 +1969,16 @@ where
     // 4. Validate input against the outlet's input schema.
     validate_value_against_schema(&input, &registration.schema.input_schema)
         .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
+
+    // 4b. SCP-OUT-021 — post-input caveat enforcement (§7.3.8). Runs the
+    // synchronous local checks plus the counter-store CAS for max_calls /
+    // amount_max_cumulative / rate_window. Failures here are the §7.3.8
+    // post-input gate; the caller surfaces them as Authorization-class
+    // errors with the slug from `CheckInvocationError::slug` /
+    // `CounterExhausted::kind`.
+    if let Some(check) = caveat_post_input_check {
+        check(&input).await?;
+    }
 
     // 4a. Compute the input hash up-front from the value the executor will
     // see. Doing this before execution lets the hash be recorded even if the
@@ -3427,6 +3504,7 @@ mod tests {
             presenting_agent_did: "did:dht:z6MkMember",
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
         };
 
         // validate_outlet_invocation_ucan expects outlet_call:calculator,

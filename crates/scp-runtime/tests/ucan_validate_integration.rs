@@ -82,6 +82,7 @@ fn build_context<'a, S: std::hash::BuildHasher>(
         presenting_agent_did,
         clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         clock: &SYSTEM_CLOCK,
+        caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
     }
 }
 

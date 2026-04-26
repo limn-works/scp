@@ -221,6 +221,27 @@ pub enum UcanError {
     /// Capability URI parsing failed.
     #[error("invalid capability URI: {0}")]
     InvalidCapabilityUri(String),
+
+    /// SCP-OUT-021: a child delegation's invocation caveats failed
+    /// the per-field [`InvocationCaveats::narrow`] check at Step 7b
+    /// (attenuation). Carries the structured
+    /// [`AttenuationViolation`](crate::trust::caveats::AttenuationViolation)
+    /// so SDK consumers can match on the exact rule that fired.
+    ///
+    /// Maps to error code [`crate::CODE_AUTHORIZATION_ATTENUATION`]
+    /// (`SCP-TOOL-6114`) with the per-violation slug from
+    /// [`crate::trust::caveats::AttenuationViolation::slug`].
+    #[error("caveat attenuation violation: {0}")]
+    CaveatAttenuationViolation(crate::trust::caveats::AttenuationViolation),
+
+    /// SCP-OUT-021: the presenting token's invocation caveats failed
+    /// the Step 11b time-box check (`valid_from` / `valid_until` /
+    /// `hours_of_day` / `days_of_week`).
+    ///
+    /// Maps to error code [`crate::CODE_AUTHORIZATION_DENIED`]
+    /// (`SCP-TOOL-6110`) with slug `authorization.time-box-violation`.
+    #[error("caveat time-box violation: {0}")]
+    CaveatTimeBoxViolation(String),
 }
 
 // ---------------------------------------------------------------------------

@@ -459,6 +459,7 @@ fn validate_outlet_ucan(
             clock_skew_tolerance_secs:
                 scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
         };
 
         scp_core::context::tools::validate_outlet_invocation_ucan(
@@ -663,6 +664,7 @@ pub fn py_outlet_invoke(
                     spending_ucan_token.as_ref(),
                     None,
                     executor,
+                    None,
                     None,
                 )
                 .await

@@ -224,6 +224,7 @@ pub fn py_ucan_validate(
             presenting_agent_did: agent_did,
             clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
+            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
         };
 
         validate_ucan(&parsed_token, &required_cap, &mut ctx).map_err(ScpPyError::from)

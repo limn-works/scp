@@ -11,7 +11,8 @@ pub mod participation_service;
 pub use crate::store::caveat_counters::CaveatCounters;
 pub use crate::store::trust::ProtocolRepositoryTrustBridge;
 pub use caveat_counter_store::{
-    CaveatCounterStore, CounterError, CounterExhausted, prune_expired_window_entries,
+    CaveatCounterApi, CaveatCounterStore, CounterError, CounterExhausted,
+    prune_expired_window_entries,
 };
 
 // Re-export the pure CaveatKind enum (defined in scp-protocol) so callers can

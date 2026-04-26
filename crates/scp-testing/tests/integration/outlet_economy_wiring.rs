@@ -473,6 +473,7 @@ async fn invoke_outlet_with_economy_deducts_budget_and_records_velocity() {
             None,
             |input: serde_json::Value| async move { Ok(serde_json::json!({"echoed": input})) },
             None,
+            None,
         )
         .await
         .expect("invoke_outlet_with_economy must succeed for free-budget paid outlet");
@@ -576,6 +577,7 @@ async fn invoke_outlet_with_economy_rejects_insufficient_budget() {
             |_input: serde_json::Value| async move {
                 panic!("executor must NOT run when the pre-check rejects on budget")
             },
+            None,
             None,
         )
         .await;

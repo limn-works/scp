@@ -371,6 +371,7 @@ fn run_validate_ucan(
         clock_skew_tolerance_secs:
             scp_protocol::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         clock: &clock,
+        caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
     };
 
     validate_ucan(token, required_capability, &mut ctx).map_err(|e| e.to_string())?;
@@ -1103,6 +1104,7 @@ mod tests {
             clock_skew_tolerance_secs:
                 scp_protocol::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &clock,
+            caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
         };
 
         validate_ucan(token, &required_capability, &mut ctx).map_err(|e| e.to_string())

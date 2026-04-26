@@ -379,6 +379,54 @@ impl<S: Storage> Clone for CaveatCounterStore<S> {
 }
 
 // ---------------------------------------------------------------------------
+// CaveatCounterApi — type-erased trait for FFI/manager wiring
+// ---------------------------------------------------------------------------
+
+/// SCP-OUT-021: type-erased API surface for [`CaveatCounterStore`].
+///
+/// `CaveatCounterStore<S>` is generic over the [`Storage`] implementor —
+/// useful for compile-time storage choice, awkward when the manager
+/// wrapper wants to hold "*some* counter store" without leaking the
+/// storage type into every call site. Boxing the store as
+/// `Arc<dyn CaveatCounterApi>` removes the generic parameter from the
+/// manager API while preserving every operation `CaveatCounterStore`
+/// exposes.
+///
+/// All methods mirror the inherent methods on [`CaveatCounterStore`].
+/// The trait is `Send + Sync` because invocation enforcement runs from
+/// async tasks shared across executors (napi, uniffi, etc.).
+pub trait CaveatCounterApi: Send + Sync {
+    /// See [`CaveatCounterStore::check_and_increment`].
+    fn check_and_increment<'a>(
+        &'a self,
+        context_id: &'a str,
+        ucan_cid: &'a str,
+        kind: scp_protocol::trust::CaveatKind,
+        amount: u64,
+        cap: u64,
+        window_secs: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CounterError>> + Send + 'a>>;
+}
+
+impl<S: Storage + 'static> CaveatCounterApi for CaveatCounterStore<S> {
+    fn check_and_increment<'a>(
+        &'a self,
+        context_id: &'a str,
+        ucan_cid: &'a str,
+        kind: scp_protocol::trust::CaveatKind,
+        amount: u64,
+        cap: u64,
+        window_secs: u32,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CounterError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.check_and_increment(context_id, ucan_cid, kind, amount, cap, window_secs)
+                .await
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Sliding-window pruning helper
 // ---------------------------------------------------------------------------
 
