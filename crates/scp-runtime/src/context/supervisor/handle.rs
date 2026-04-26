@@ -85,6 +85,96 @@ impl SupervisorHandle {
         self.supervisor.local_dids.load_full()
     }
 
+    /// Find the first context where both `member_a` and `member_b` are
+    /// members. Returns `None` if no such context exists.
+    ///
+    /// Cross-context read used by trust-recovery's `notify_contact`
+    /// path (spec §9.12 step 5): the recovering DID's actor must
+    /// dispatch a recovery notification through any context shared
+    /// with the contact DID. The supervisor performs this enumeration
+    /// because no individual actor sees its peers' membership state —
+    /// it is the only legal cross-context membership read in the
+    /// post-actor-model dispatch.
+    ///
+    /// # Implementation
+    ///
+    /// During Phase 2A migration the per-context `Mutex<PerContextState>`
+    /// map is the authoritative membership store. Once Phase 2A
+    /// finalization deletes the map and replaces it with one
+    /// `ContextActor` per context, this method becomes a fan-out over
+    /// the actor map asking each actor's mailbox for membership state
+    /// (or reads a supervisor-scoped membership index maintained by
+    /// the actors). The signature here is stable across that
+    /// transition.
+    ///
+    /// # Lock discipline
+    ///
+    /// Collects `(key, Arc)` pairs under DashMap's shard locks first,
+    /// then drops the shard locks before locking individual per-context
+    /// `Mutex`es. Holding a DashMap `Ref` across `.await` would deadlock
+    /// any concurrent shard access.
+    pub async fn find_shared_context(
+        &self,
+        member_a: &str,
+        member_b: &str,
+    ) -> Option<String> {
+        let entries: Vec<(String, Arc<tokio::sync::Mutex<crate::context::state::PerContextState>>)> =
+            self
+                .supervisor
+                .contexts_arc()
+                .iter()
+                .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+                .collect();
+        for (context_id, arc) in entries {
+            let ctx = arc.lock().await;
+            if ctx.membership.contains(member_a) && ctx.membership.contains(member_b) {
+                return Some(context_id);
+            }
+        }
+        None
+    }
+
+    /// Dispatch a `TrustRecoveryCommand::RecoverySendNotification`
+    /// through the supervisor's mailbox routing — used by
+    /// trust-recovery's cross-context `notify_contact` path after the
+    /// shared context has been found via [`Self::find_shared_context`].
+    ///
+    /// Routes through
+    /// [`Supervisor::dispatch_trust_recovery_command`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_command),
+    /// which dispatches via the per-context actor mailbox when one is
+    /// registered or falls through to the legacy lock-shaped fallback
+    /// otherwise. The reply is awaited inline so the caller observes
+    /// the full per-actor outcome.
+    ///
+    /// # Errors
+    ///
+    /// - Any [`ContextError`] surfaced through the dispatched
+    ///   [`Supervisor::dispatch_trust_recovery_command`](crate::context::supervisor::Supervisor::dispatch_trust_recovery_command)
+    ///   call (e.g. [`ContextError::NotInitialized`] if no providers
+    ///   attached).
+    /// - Any [`ContextError`] surfaced via the per-actor reply on the
+    ///   embedded oneshot channel.
+    /// - [`ContextError::TransportFailed`] if the reply channel is
+    ///   closed before a response arrives (actor panicked or shut down
+    ///   between dispatch and reply).
+    pub async fn dispatch_recovery_send_notification(
+        &self,
+        payload: crate::context::actor::commands::RecoverySendNotificationPayload,
+    ) -> Result<(), ContextError> {
+        use crate::context::actor::commands::TrustRecoveryCommand;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = TrustRecoveryCommand::RecoverySendNotification {
+            payload: Box::new(payload),
+            reply: reply_tx,
+        };
+        self.supervisor.dispatch_trust_recovery_command(cmd).await?;
+        reply_rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "dispatch_recovery_send_notification: oneshot reply channel closed".to_owned(),
+            )
+        })?
+    }
+
     /// Look up the registered standing-context peer DID for `peer_did`.
     /// Returns `None` if the peer has no registered standing context.
     ///

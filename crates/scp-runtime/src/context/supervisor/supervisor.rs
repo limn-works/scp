@@ -1311,11 +1311,10 @@ impl Supervisor {
         // multiple 32-byte hashes + a variable-length Ed25519 signature
         // vector; the per-variant locals cross clippy's 16-KB stack-
         // future budget.
-        if let Some(ctx_id) = Self::trust_recovery_command_context_id(&cmd) {
-            if let Some(actor) = self.lookup(ctx_id) {
-                return Self::dispatch_via_mailbox(&actor, ContextCommand::TrustRecovery(cmd))
-                    .await;
-            }
+        if let Some(ctx_id) = Self::trust_recovery_command_context_id(&cmd)
+            && let Some(actor) = self.lookup(ctx_id)
+        {
+            return Self::dispatch_via_mailbox(&actor, ContextCommand::TrustRecovery(cmd)).await;
         }
         Ok(Box::pin(handlers::trust_recovery::dispatch_from_shim(self, cmd)).await)
     }

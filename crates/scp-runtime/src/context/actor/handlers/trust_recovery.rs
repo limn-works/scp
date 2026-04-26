@@ -23,7 +23,8 @@ use scp_protocol::context::ContextError;
 use tokio::sync::oneshot;
 
 use crate::context::actor::commands::{
-    CreateGovernanceCheckpointPayload, RecoverySendNotificationPayload, TrustRecoveryCommand,
+    CreateGovernanceCheckpointPayload, RecoveryNotifyContactPayload,
+    RecoverySendNotificationPayload, TrustRecoveryCommand,
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
@@ -87,21 +88,8 @@ async fn dispatch_inner(
         TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
             handle_recovery_send_notification(state, deps, *payload, reply).await
         }
-        TrustRecoveryCommand::RecoveryNotifyContact { reply, .. } => {
-            // Cross-context fan-out cannot run inside an actor's
-            // mailbox turn — the supervisor's
-            // `dispatch_trust_recovery_command` intercepts this variant
-            // before the per-context actor lookup. Reaching this arm
-            // means the supervisor routing is misconfigured.
-            let err = ContextError::NotImplemented(
-                "TrustRecoveryCommand::RecoveryNotifyContact is cross-context — must be \
-                 routed through Supervisor::dispatch_trust_recovery_command, not via the \
-                 per-context actor mailbox."
-                    .to_owned(),
-            );
-            let sketch = outcome_error_sketch(&err);
-            let _ = reply.send(Err(err));
-            Outcome::err(sketch)
+        TrustRecoveryCommand::RecoveryNotifyContact { payload, reply } => {
+            handle_recovery_notify_contact(state, deps, *payload, reply).await
         }
     }
 }
@@ -130,181 +118,219 @@ async fn dispatch_from_shim_inner(
     supervisor: &Supervisor,
     cmd: TrustRecoveryCommand,
 ) -> Outcome<()> {
-    use crate::context::actor::commands::RecoveryNotifyContactPayload;
-    use crate::context::trust_recovery_helpers as helpers;
-
     match cmd {
         TrustRecoveryCommand::Placeholder { reply } => reply_not_implemented(reply),
-
         TrustRecoveryCommand::RecoveryNotifyContact { payload, reply } => {
-            let p: RecoveryNotifyContactPayload = *payload;
-            let recovering_did = p.recovering_did.clone();
-            let signing_key = p.signing_key.to_signing_key();
-            let notify_fut = async {
-                helpers::recovery_notify_contact(
-                    supervisor,
-                    &p.recovering_did,
-                    &p.contact_did,
-                    &p.payload,
-                    &signing_key,
-                )
-                .await
-            };
-
-            let (outcome, reply_result) =
-                match tokio::time::timeout(HANDLER_TIMEOUT, notify_fut).await {
-                    Ok(Ok(())) => (Outcome::ok(()), Ok(())),
-                    Ok(Err(e)) => {
-                        let sketch = outcome_error_sketch(&e);
-                        (Outcome::err(sketch), Err(e))
-                    }
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "recovery_notify_contact exceeded {HANDLER_TIMEOUT:?} budget for recovering_did {recovering_did}"
-                        ));
-                        let sketch = outcome_error_sketch(&err);
-                        (Outcome::err(sketch), Err(err))
-                    }
-                };
-            let _ = reply.send(reply_result);
-            outcome
+            shim_handle_recovery_notify_contact(supervisor, *payload, reply).await
         }
-
-        // Per-context variants: route through the legacy lock-shaped
-        // helpers (`*_legacy`) which lock the per-context Arc on the
-        // supervisor and operate on the legacy `state::PerContextState`.
-        // Fallback exists because trust_recovery is the first migrated
-        // domain in Phase 2A — most contexts have no actor registered
-        // yet. Once Phase 2A finalization (after all 10 domains
-        // migrate) removes the `Mutex<PerContextState>` map, the
-        // legacy variants are deleted and the supervisor returns
-        // `ContextNotRegistered` for any per-context command without a
-        // registered actor.
         TrustRecoveryCommand::CreateGovernanceCheckpoint { payload, reply } => {
-            let p: CreateGovernanceCheckpointPayload = *payload;
-            let context_id = p.context_id.clone();
-            let create_fut = helpers::create_governance_checkpoint_legacy(
-                supervisor,
-                &p.context_id,
-                p.checkpoint_seq,
-                p.merkle_root,
-                p.event_count,
-                p.last_event_hash,
-                p.state_snapshot_hash,
-                &p.creator_did,
-                p.creator_signature,
-            );
-
-            let (outcome, reply_result) =
-                match tokio::time::timeout(HANDLER_TIMEOUT, create_fut).await {
-                    Ok(Ok(checkpoint)) => (Outcome::ok_mutated(()), Ok(checkpoint)),
-                    Ok(Err(e)) => {
-                        let sketch = outcome_error_sketch(&e);
-                        (Outcome::err_mutated(sketch), Err(e))
-                    }
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "create_governance_checkpoint exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        let sketch = outcome_error_sketch(&err);
-                        (Outcome::err_mutated(sketch), Err(err))
-                    }
-                };
-            let _ = reply.send(reply_result);
-            outcome
+            shim_handle_create_governance_checkpoint(supervisor, *payload, reply).await
         }
-
         TrustRecoveryCommand::AddCheckpointCosignature {
             context_id,
             checkpoint,
             cosignature,
             reply,
         } => {
-            let mut checkpoint = *checkpoint;
-            let add_fut = helpers::add_checkpoint_cosignature_legacy(
+            shim_handle_add_checkpoint_cosignature(
                 supervisor,
                 &context_id,
-                &mut checkpoint,
+                *checkpoint,
                 *cosignature,
-            );
-
-            let (outcome, reply_result) =
-                match tokio::time::timeout(HANDLER_TIMEOUT, add_fut).await {
-                    Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok((checkpoint, status))),
-                    Ok(Err(e)) => {
-                        let sketch = outcome_error_sketch(&e);
-                        (Outcome::err(sketch), Err(e))
-                    }
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "add_checkpoint_cosignature exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        let sketch = outcome_error_sketch(&err);
-                        (Outcome::err(sketch), Err(err))
-                    }
-                };
-            let _ = reply.send(reply_result);
-            outcome
+                reply,
+            )
+            .await
         }
-
         TrustRecoveryCommand::RecoveryAdvanceEpoch { context_id, reply } => {
-            let advance_fut = helpers::recovery_advance_epoch_legacy(supervisor, &context_id);
-
-            let (outcome, reply_result) =
-                match tokio::time::timeout(HANDLER_TIMEOUT, advance_fut).await {
-                    Ok(Ok(epoch)) => (Outcome::ok_mutated(()), Ok(epoch)),
-                    Ok(Err(e)) => {
-                        let sketch = outcome_error_sketch(&e);
-                        (Outcome::err_mutated(sketch), Err(e))
-                    }
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "recovery_advance_epoch exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        let sketch = outcome_error_sketch(&err);
-                        (Outcome::err_mutated(sketch), Err(err))
-                    }
-                };
-            let _ = reply.send(reply_result);
-            outcome
+            shim_handle_recovery_advance_epoch(supervisor, &context_id, reply).await
         }
-
         TrustRecoveryCommand::RecoverySendNotification { payload, reply } => {
-            let p: RecoverySendNotificationPayload = *payload;
-            let context_id = p.context_id.clone();
-            let signing_key = p.signing_key.to_signing_key();
-
-            let send_fut = async {
-                helpers::recovery_send_notification_legacy(
-                    supervisor,
-                    &p.context_id,
-                    &p.sender_did,
-                    &p.payload,
-                    p.sequence,
-                    &signing_key,
-                )
-                .await
-            };
-
-            let (outcome, reply_result) =
-                match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {
-                    Ok(Ok(())) => (Outcome::ok(()), Ok(())),
-                    Ok(Err(e)) => {
-                        let sketch = outcome_error_sketch(&e);
-                        (Outcome::err(sketch), Err(e))
-                    }
-                    Err(_elapsed) => {
-                        let err = ContextError::TransportTimeout(format!(
-                            "recovery_send_notification exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-                        ));
-                        let sketch = outcome_error_sketch(&err);
-                        (Outcome::err(sketch), Err(err))
-                    }
-                };
-            let _ = reply.send(reply_result);
-            outcome
+            shim_handle_recovery_send_notification(supervisor, *payload, reply).await
         }
     }
+}
+
+/// Shim-path handler for `RecoveryNotifyContact`. Routes through the
+/// legacy `recovery_notify_contact_legacy` which scans the supervisor's
+/// per-context `Mutex<PerContextState>` map to find a shared context
+/// and then dispatches the recovery notification through
+/// `Supervisor::dispatch_trust_recovery_command`.
+async fn shim_handle_recovery_notify_contact(
+    supervisor: &Supervisor,
+    payload: crate::context::actor::commands::RecoveryNotifyContactPayload,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    use crate::context::trust_recovery_helpers_legacy as helpers;
+    let recovering_did = payload.recovering_did.clone();
+    let signing_key = payload.signing_key.to_signing_key();
+    let notify_fut = async {
+        helpers::recovery_notify_contact_legacy(
+            supervisor,
+            &payload.recovering_did,
+            &payload.contact_did,
+            &payload.payload,
+            &signing_key,
+        )
+        .await
+    };
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, notify_fut).await {
+        Ok(Ok(())) => (Outcome::ok(()), Ok(())),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "recovery_notify_contact exceeded {HANDLER_TIMEOUT:?} budget for recovering_did {recovering_did}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
+    };
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Shim-path handler for `CreateGovernanceCheckpoint`. Routes through
+/// the legacy lock-shaped helper that locks the per-context
+/// `Mutex<PerContextState>` from the supervisor's contexts map.
+async fn shim_handle_create_governance_checkpoint(
+    supervisor: &Supervisor,
+    p: CreateGovernanceCheckpointPayload,
+    reply: oneshot::Sender<
+        Result<scp_protocol::context::governance::ContextCheckpoint, ContextError>,
+    >,
+) -> Outcome<()> {
+    use crate::context::trust_recovery_helpers_legacy as helpers;
+    let context_id = p.context_id.clone();
+    let create_fut = helpers::create_governance_checkpoint_legacy(
+        supervisor,
+        &p.context_id,
+        p.checkpoint_seq,
+        p.merkle_root,
+        p.event_count,
+        p.last_event_hash,
+        p.state_snapshot_hash,
+        &p.creator_did,
+        p.creator_signature,
+    );
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, create_fut).await {
+        Ok(Ok(checkpoint)) => (Outcome::ok_mutated(()), Ok(checkpoint)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "create_governance_checkpoint exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Shim-path handler for `AddCheckpointCosignature`.
+async fn shim_handle_add_checkpoint_cosignature(
+    supervisor: &Supervisor,
+    context_id: &str,
+    mut checkpoint: scp_protocol::context::governance::ContextCheckpoint,
+    cosignature: scp_protocol::context::governance::CosignedCheckpoint,
+    reply: oneshot::Sender<
+        Result<
+            (
+                scp_protocol::context::governance::ContextCheckpoint,
+                scp_protocol::context::governance::CheckpointAttestationStatus,
+            ),
+            ContextError,
+        >,
+    >,
+) -> Outcome<()> {
+    use crate::context::trust_recovery_helpers_legacy as helpers;
+    let add_fut =
+        helpers::add_checkpoint_cosignature_legacy(supervisor, context_id, &mut checkpoint, cosignature);
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, add_fut).await {
+        Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok((checkpoint, status))),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "add_checkpoint_cosignature exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
+    };
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Shim-path handler for `RecoveryAdvanceEpoch`.
+async fn shim_handle_recovery_advance_epoch(
+    supervisor: &Supervisor,
+    context_id: &str,
+    reply: oneshot::Sender<Result<u64, ContextError>>,
+) -> Outcome<()> {
+    use crate::context::trust_recovery_helpers_legacy as helpers;
+    let advance_fut = helpers::recovery_advance_epoch_legacy(supervisor, context_id);
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, advance_fut).await {
+        Ok(Ok(epoch)) => (Outcome::ok_mutated(()), Ok(epoch)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "recovery_advance_epoch exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Shim-path handler for `RecoverySendNotification`.
+async fn shim_handle_recovery_send_notification(
+    supervisor: &Supervisor,
+    p: RecoverySendNotificationPayload,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    use crate::context::trust_recovery_helpers_legacy as helpers;
+    let context_id = p.context_id.clone();
+    let signing_key = p.signing_key.to_signing_key();
+    let send_fut = async {
+        helpers::recovery_send_notification_legacy(
+            supervisor,
+            &p.context_id,
+            &p.sender_did,
+            &p.payload,
+            p.sequence,
+            &signing_key,
+        )
+        .await
+    };
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {
+        Ok(Ok(())) => (Outcome::ok(()), Ok(())),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "recovery_send_notification exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
+    };
+    let _ = reply.send(reply_result);
+    outcome
 }
 
 /// Handle [`TrustRecoveryCommand::CreateGovernanceCheckpoint`] —
@@ -320,18 +346,23 @@ async fn handle_create_governance_checkpoint(
 ) -> Outcome<()> {
     let context_id = p.context_id.clone();
 
-    let create_fut = crate::context::trust_recovery_helpers::create_governance_checkpoint(
-        state,
-        deps,
-        &p.context_id,
-        p.checkpoint_seq,
-        p.merkle_root,
-        p.event_count,
-        p.last_event_hash,
-        p.state_snapshot_hash,
-        &p.creator_did,
-        p.creator_signature,
-    );
+    // Helper is synchronous — no await inside its body. Wrap in
+    // `async {}` so the 30s timeout still applies (event log pruning
+    // could in principle do disk I/O via the provider).
+    let create_fut = async {
+        crate::context::trust_recovery_helpers::create_governance_checkpoint(
+            state,
+            deps,
+            &p.context_id,
+            p.checkpoint_seq,
+            p.merkle_root,
+            p.event_count,
+            p.last_event_hash,
+            p.state_snapshot_hash,
+            &p.creator_did,
+            p.creator_signature,
+        )
+    };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, create_fut).await {
         Ok(Ok(checkpoint)) => (Outcome::ok_mutated(()), Ok(checkpoint)),
@@ -371,12 +402,14 @@ async fn handle_add_checkpoint_cosignature(
         >,
     >,
 ) -> Outcome<()> {
-    let add_fut = crate::context::trust_recovery_helpers::add_checkpoint_cosignature(
-        state,
-        deps,
-        &mut checkpoint,
-        cosignature,
-    );
+    let add_fut = async {
+        crate::context::trust_recovery_helpers::add_checkpoint_cosignature(
+            state,
+            deps,
+            &mut checkpoint,
+            cosignature,
+        )
+    };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, add_fut).await {
         Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok((checkpoint, status))),
@@ -407,11 +440,9 @@ async fn handle_recovery_advance_epoch(
     context_id: &str,
     reply: oneshot::Sender<Result<u64, ContextError>>,
 ) -> Outcome<()> {
-    let advance_fut = crate::context::trust_recovery_helpers::recovery_advance_epoch(
-        state,
-        deps,
-        context_id,
-    );
+    let advance_fut = async {
+        crate::context::trust_recovery_helpers::recovery_advance_epoch(state, deps, context_id)
+    };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, advance_fut).await {
         Ok(Ok(epoch)) => (Outcome::ok_mutated(()), Ok(epoch)),
@@ -459,7 +490,6 @@ async fn handle_recovery_send_notification(
             p.sequence,
             &signing_key,
         )
-        .await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, send_fut).await {
@@ -471,6 +501,52 @@ async fn handle_recovery_send_notification(
         Err(_elapsed) => {
             let err = ContextError::TransportTimeout(format!(
                 "recovery_send_notification exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`TrustRecoveryCommand::RecoveryNotifyContact`] — actor-
+/// shape entry. Cross-context fan-out: looks up the shared context
+/// via [`SupervisorHandle::find_shared_context`](crate::context::supervisor::handle::SupervisorHandle::find_shared_context)
+/// and dispatches a `RecoverySendNotification` through the
+/// supervisor's mailbox-routing path. The actor that handles this
+/// command does not need to be a member of the shared context — any
+/// actor with an `ActorDeps` bundle can drive the cross-context
+/// lookup. Reports `Outcome::ok(())` on success (no per-context state
+/// mutation in this actor).
+async fn handle_recovery_notify_contact(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    p: RecoveryNotifyContactPayload,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let recovering_did = p.recovering_did.clone();
+    let signing_key = p.signing_key.to_signing_key();
+
+    let notify_fut = crate::context::trust_recovery_helpers::recovery_notify_contact(
+        state,
+        deps,
+        &p.recovering_did,
+        &p.contact_did,
+        &p.payload,
+        &signing_key,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, notify_fut).await {
+        Ok(Ok(())) => (Outcome::ok(()), Ok(())),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "recovery_notify_contact exceeded {HANDLER_TIMEOUT:?} budget for recovering_did {recovering_did}"
             ));
             let sketch = outcome_error_sketch(&err);
             (Outcome::err(sketch), Err(err))

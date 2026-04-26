@@ -1,5 +1,5 @@
 //! Trust-recovery helpers — actor-shape signatures
-//! (ADR-049 Phase 2A.1, trust_recovery domain migration).
+//! (ADR-049 Phase 2A.1, `trust_recovery` domain migration).
 //!
 //! # Purpose
 //!
@@ -33,13 +33,18 @@
 //! the runtime (DID resolver + clock only) and are not exercised through
 //! the actor mailbox.
 
-// Module-level allow — the legacy lock-shim helpers below preserve the
-// hold-lock-across-await pattern from the pre-migration body verbatim,
-// so narrowing changes lock-ordering semantics. Allowing the lint
-// crate-locally on this module keeps the legacy hoist byte-identical.
-#![allow(clippy::significant_drop_tightening)]
-
-use std::sync::Arc;
+// Module-level allow:
+//
+// `needless_pass_by_ref_mut` — actor-shape helpers take
+// `&mut PerContextState` even when they do not mutate the state, so
+// that callers (the actor handler dispatch path) hold a `&mut`
+// borrow across awaits without forcing `PerContextState: Sync`. The
+// `EpochGraceStore` field carries a `Box<dyn FnMut(...) + Send>`
+// which is intentionally `Send + !Sync` (see
+// `crypto::mls::epoch_grace::EpochGraceStore` doc comment); a `&`
+// borrow across an await would require `Sync` and break this
+// contract.
+#![allow(clippy::needless_pass_by_ref_mut)]
 
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
@@ -49,10 +54,7 @@ use scp_protocol::context::governance::{
 
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
-use crate::context::manager_methods;
-use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT;
 use crate::context::state::{context_id_to_bytes, require_active};
-use crate::context::supervisor::Supervisor;
 
 // ---------------------------------------------------------------------------
 // 1. create_governance_checkpoint
@@ -70,7 +72,7 @@ use crate::context::supervisor::Supervisor;
 /// flags this as `mutated: true` only because pruning has external side
 /// effects worth coalescing into the actor's persist tick.
 #[allow(clippy::too_many_arguments)]
-pub async fn create_governance_checkpoint(
+pub fn create_governance_checkpoint(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -143,7 +145,7 @@ pub async fn create_governance_checkpoint(
 /// the caller-owned `checkpoint` argument is mutated, and only after
 /// validation succeeds (the candidate-vector pattern preserves
 /// transactional integrity).
-pub async fn add_checkpoint_cosignature(
+pub fn add_checkpoint_cosignature(
     state: &mut PerContextState,
     _deps: &ActorDeps,
     checkpoint: &mut ContextCheckpoint,
@@ -199,7 +201,7 @@ pub async fn add_checkpoint_cosignature(
 /// on the actor's mailbox between awaits, but the ordering of mailbox
 /// commands means a `LifecycleControl::Pause` would have already
 /// completed by the time we resume here. Re-checking is defense-in-depth.
-pub async fn recovery_advance_epoch(
+pub fn recovery_advance_epoch(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -279,7 +281,7 @@ pub async fn recovery_advance_epoch(
 /// through `deps.crypto` (still supervisor-scoped during the migration
 /// window); transport delivery via `deps.transport`. Does NOT mutate
 /// `state`.
-pub async fn recovery_send_notification(
+pub fn recovery_send_notification(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -332,104 +334,63 @@ pub async fn recovery_send_notification(
 }
 
 // ---------------------------------------------------------------------------
-// 5. recovery_notify_contact (cross-context — supervisor-shaped)
+// 5. recovery_notify_contact (cross-context — actor-shape)
 // ---------------------------------------------------------------------------
 
 /// Sends a recovery notification to a contact DID by finding shared
 /// contexts between the recovering DID and the contact DID
 /// (spec §9.12 step 5 — context not yet known).
 ///
-/// # Cross-context fan-out
+/// # Cross-context fan-out via `SupervisorHandle`
 ///
-/// This helper is intrinsically cross-context: it scans every context
-/// the supervisor manages to find the first one where both the
-/// recovering DID and the contact DID are members. The actor model
-/// forbids one actor reaching another's state directly — but this
-/// scan is a read-only enumeration that legitimately belongs to the
-/// supervisor. It therefore retains the `&Supervisor` parameter.
+/// This helper is cross-context but stays actor-shape: the
+/// shared-context lookup goes through
+/// [`SupervisorHandle::find_shared_context`], the only narrow
+/// capability the actor's `deps.supervisor` exposes for cross-context
+/// membership reads. The actor making the call cannot reach the
+/// target context's actor directly (capability-reduced handle, see
+/// ADR-049 §2 / plan §`ActorDeps` and `SupervisorHandle`). Once the
+/// shared context is identified, the notification dispatches through
+/// [`SupervisorHandle::dispatch_recovery_send_notification`] which
+/// routes a `RecoverySendNotification` command to the target
+/// context's actor mailbox (or falls through to the legacy lock-
+/// shaped handler if no actor is registered yet).
 ///
-/// Once the shared context is found, the notification is dispatched
-/// through the supervisor's `dispatch_trust_recovery_command` mailbox
-/// path, which routes a `RecoverySendNotification` command to the
-/// target context's actor. This preserves the per-actor mailbox
-/// discipline for the actual mutation (envelope creation + transport
-/// send), while the cross-context lookup remains supervisor-scoped.
+/// # `state` parameter
 ///
-/// # Migration trajectory
-///
-/// Phase 2A keeps the supervisor-side scan over the `contexts: Arc<DashMap<...>>`
-/// map (the per-context `Mutex<PerContextState>`s still exist during
-/// the helper-migration window). Once Phase 2A finalization deletes
-/// the `Mutex<PerContextState>` map and replaces it with one
-/// `ContextActor` per context, this scan becomes a fan-out over the
-/// actor map asking each actor's mailbox for membership state. That
-/// rewrite lands with Phase 2A finalization (after all 10 helper
-/// domains migrate); the structural shape here remains correct
-/// across the transition.
+/// `state` is unused on the success path — the only state-reading
+/// happens inside the target context's actor when the dispatched
+/// command arrives there. The parameter is present for signature
+/// uniformity across the `trust_recovery` domain (every actor-shape
+/// helper takes `(&mut PerContextState, &ActorDeps, ...)`).
 pub async fn recovery_notify_contact(
-    supervisor: &Supervisor,
+    _state: &mut PerContextState,
+    deps: &ActorDeps,
     recovering_did: &str,
     contact_did: &str,
     payload: &[u8],
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<(), ContextError> {
-    let contexts = supervisor.contexts_arc();
-    // Find a context where both the recovering DID and the contact DID
-    // are members. The first matching context is used for delivery.
-    // Collect (key, Arc) pairs first to release DashMap shard locks
-    // before awaiting per-context Mutexes. Holding a DashMap Ref across
-    // .await would deadlock any concurrent shard access.
-    let shared_context_id = {
-        let entries: Vec<(String, Arc<tokio::sync::Mutex<crate::context::state::PerContextState>>)> =
-            contexts
-                .iter()
-                .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
-                .collect();
-        let mut found = None;
-        for (context_id, arc) in entries {
-            let ctx = arc.lock().await;
-            if ctx.membership.contains(recovering_did) && ctx.membership.contains(contact_did) {
-                found = Some(context_id);
-                break;
-            }
-        }
-        found
-    };
+    use crate::context::actor::commands::{RecoverySendNotificationPayload, SigningKeyBytes};
+
+    let shared_context_id = deps
+        .supervisor
+        .find_shared_context(recovering_did, contact_did)
+        .await;
 
     match shared_context_id {
         Some(context_id) => {
-            // Dispatch a `RecoverySendNotification` command through the
-            // supervisor's mailbox routing. When an actor exists for the
-            // target context, the command crosses the actor mailbox and
-            // the per-context state-owning helper above runs inside the
-            // actor's dispatch turn. When no actor is registered (legacy
-            // shim window), the supervisor's fallback path will pick up
-            // the per-context Arc directly.
-            //
             // Contact notifications use sequence=4 (step 5 in recovery).
-            use crate::context::actor::commands::{
-                RecoverySendNotificationPayload, SigningKeyBytes, TrustRecoveryCommand,
-            };
-            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            let payload_box = Box::new(RecoverySendNotificationPayload {
+            let send_payload = RecoverySendNotificationPayload {
                 context_id,
                 sender_did: recovering_did.to_owned(),
                 payload: payload.to_vec(),
                 sequence: 4,
                 signing_key: SigningKeyBytes::from_signing_key(signing_key),
-            });
-            let cmd = TrustRecoveryCommand::RecoverySendNotification {
-                payload: payload_box,
-                reply: reply_tx,
             };
-            supervisor.dispatch_trust_recovery_command(cmd).await?;
-            reply_rx
+            deps.supervisor
+                .dispatch_recovery_send_notification(send_payload)
                 .await
-                .map_err(|_| {
-                    ContextError::TransportFailed(
-                        "recovery_notify_contact: oneshot reply channel closed".to_owned(),
-                    )
-                })?
         }
         None => Err(ContextError::TransportFailed(format!(
             "no shared context found between {recovering_did} and {contact_did}"
@@ -437,263 +398,6 @@ pub async fn recovery_notify_contact(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Legacy lock-shaped helpers (Phase 2A.1 fallback path)
-// ---------------------------------------------------------------------------
-//
-// These helpers preserve the pre-migration body shape — they take
-// `&Supervisor`, lock the per-context `Mutex<PerContextState>` from the
-// supervisor's `contexts: Arc<DashMap<...>>` map, and operate on the
-// legacy lock-shaped `state::PerContextState` type. They exist as a
-// fallback for [`Supervisor::dispatch_trust_recovery_command`] when no
-// `ContextActor` is registered for a context — the common case during
-// the helper-migration window before every context's actor is wired.
-//
-// Once Phase 2A finalization deletes the
-// `Mutex<PerContextState>` map and every context has a `ContextActor`,
-// these legacy helpers are deleted and the supervisor's dispatcher
-// returns `ContextNotRegistered` for any per-context command without a
-// registered actor.
-
-/// Legacy lock-shaped variant of [`create_governance_checkpoint`].
-/// Operates on the supervisor's per-context `Mutex<PerContextState>`
-/// rather than actor-owned state.
-#[allow(clippy::too_many_arguments)]
-pub async fn create_governance_checkpoint_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-    checkpoint_seq: u64,
-    merkle_root: [u8; 32],
-    event_count: u64,
-    last_event_hash: [u8; 32],
-    state_snapshot_hash: [u8; 32],
-    creator_did: &DID,
-    creator_signature: Vec<u8>,
-) -> Result<ContextCheckpoint, ContextError> {
-    let clock = supervisor
-        .clock_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let event_log = supervisor
-        .event_log_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
-        .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-    let guard = ctx_arc.lock().await;
-    let ctx = &*guard;
-    require_active(&ctx.handle)?;
-
-    let (_, min_count) = ctx.governance.engine.checkpoint_cosignature_requirements();
-    let attestation_status = if min_count == 0 {
-        CheckpointAttestationStatus::FullyAttested
-    } else {
-        CheckpointAttestationStatus::PartiallyAttested
-    };
-
-    // Capture pruning policy before dropping the lock.
-    let pruning_policy = ctx.governance.pruning_policy.clone();
-
-    let created_at = clock.now_secs();
-
-    let checkpoint = ContextCheckpoint {
-        checkpoint_seq,
-        merkle_root,
-        event_count,
-        last_event_hash,
-        state_snapshot_hash,
-        created_at,
-        creator_did: creator_did.clone(),
-        creator_signature,
-        cosignatures: Vec::new(),
-        attestation_status,
-    };
-
-    if let Some(ref policy) = pruning_policy {
-        let context_id_bytes = context_id_to_bytes(context_id);
-        if event_log
-            .prune_before_checkpoint(&context_id_bytes, event_count, policy)
-            .is_some_and(|pruned| pruned > 0)
-        {
-            tracing::info!(
-                context_id = %context_id,
-                checkpoint_seq = checkpoint_seq,
-                "pruned event log entries after governance checkpoint"
-            );
-        }
-    }
-
-    Ok(checkpoint)
-}
-
-/// Legacy lock-shaped variant of [`add_checkpoint_cosignature`].
-pub async fn add_checkpoint_cosignature_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-    checkpoint: &mut ContextCheckpoint,
-    cosignature: CosignedCheckpoint,
-) -> Result<CheckpointAttestationStatus, ContextError> {
-    use sha2::Digest as _;
-
-    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
-        .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-    let guard = ctx_arc.lock().await;
-    let ctx = &*guard;
-
-    let mut candidate = checkpoint.cosignatures.clone();
-    candidate.push(cosignature);
-
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(checkpoint.merkle_root);
-    hasher.update(checkpoint.checkpoint_seq.to_be_bytes());
-    hasher.update(checkpoint.event_count.to_be_bytes());
-    let checkpoint_hash: [u8; 32] = hasher.finalize().into();
-
-    let status = ctx
-        .governance
-        .engine
-        .validate_checkpoint_cosignatures(&candidate, &checkpoint_hash)
-        .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
-
-    checkpoint.cosignatures = candidate;
-    checkpoint.attestation_status = status.clone();
-    Ok(status)
-}
-
-/// Legacy lock-shaped variant of [`recovery_advance_epoch`].
-pub async fn recovery_advance_epoch_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-) -> Result<u64, ContextError> {
-    let crypto = supervisor
-        .crypto_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let transport = supervisor
-        .transport_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let event_log = supervisor
-        .event_log_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let context_id_bytes = context_id_to_bytes(context_id);
-
-    // 1. Validate the context exists and is active (lock scoped).
-    //    Capture generation for confused-deputy detection on reacquire.
-    let ctx_gen = {
-        let (guard, generation) = manager_methods::lock_context(supervisor, context_id).await?;
-        let ctx = &*guard;
-        require_active(&ctx.handle)?;
-        generation
-    };
-
-    // 2. Perform the MLS epoch advance (Update + self-Commit).
-    let epoch_output = crypto.advance_epoch(&context_id_bytes)?;
-
-    // 2b. Broadcast the MLS Commit.
-    if !epoch_output.commit_bytes.is_empty() {
-        let routing_id = scp_protocol::context::context_routing_id(context_id);
-        if let Err(e) = transport.send_message(&routing_id, &epoch_output.commit_bytes) {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to broadcast recovery epoch advance MLS Commit"
-            );
-        }
-    }
-
-    // 3. Increment bookkeeping counter and manage grace store.
-    let new_epoch = {
-        let mut guard = manager_methods::relock_context(supervisor, &ctx_gen).await?;
-        let ctx = &mut *guard;
-        require_active(&ctx.handle)?;
-        let old_epoch = ctx.epoch.mls_epoch;
-        ctx.epoch.mls_epoch = old_epoch.saturating_add(1);
-        let _expired = ctx.epoch.grace_store.add_epoch(old_epoch);
-        ctx.epoch.mls_epoch
-    };
-
-    // 4. Emit epoch advancement event to event log.
-    if let Err(e) = event_log.append_context_event(
-        &context_id_bytes,
-        "recovery/epoch_advanced",
-        "system:recovery",
-    ) {
-        tracing::warn!(
-            context_id = %context_id,
-            error = %e,
-            "failed to append recovery epoch advancement event to event log"
-        );
-    }
-    {
-        if let Ok(mut guard) = manager_methods::relock_context(supervisor, &ctx_gen).await {
-            let ctx = &mut *guard;
-            ctx.checkpoint_events_since += 1;
-        }
-    }
-
-    // 5. Persist if configured (best-effort).
-    if manager_methods::has_persistence(supervisor)
-        && let Ok(guard) = manager_methods::relock_context(supervisor, &ctx_gen).await
-    {
-        let ctx = &*guard;
-        let snapshot = manager_methods::snapshot_context(ctx);
-        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
-    }
-
-    Ok(new_epoch)
-}
-
-/// Legacy lock-shaped variant of [`recovery_send_notification`].
-pub async fn recovery_send_notification_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-    sender_did: &str,
-    payload: &[u8],
-    sequence: u64,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> Result<(), ContextError> {
-    let crypto = supervisor
-        .crypto_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let transport = supervisor
-        .transport_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let clock = supervisor
-        .clock_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let context_id_bytes = context_id_to_bytes(context_id);
-
-    let current_epoch = {
-        if let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) {
-            let ctx = arc.lock().await;
-            ctx.epoch.mls_epoch
-        } else {
-            0
-        }
-    };
-
-    let timestamp = clock.now_millis();
-    let params = scp_protocol::envelope::inner::InnerEnvelopeParams {
-        version: scp_protocol::envelope::SCP_PROTOCOL_VERSION,
-        context_id,
-        sender_did,
-        epoch: current_epoch,
-        generation: 0,
-        sequence,
-        timestamp,
-        message_type: scp_protocol::envelope::inner::MessageType::Recovery,
-        payload,
-        provenance: None,
-        signing_key_id: scp_protocol::identity::SigningKeyId::Active,
-    };
-
-    let inner = crate::envelope::inner::sign::create_inner_envelope_raw(&params, signing_key)
-        .map_err(|e| ContextError::CryptoFailed(e.to_string()))?;
-
-    let routing_id = scp_protocol::context::context_routing_id(context_id);
-    let encrypted = crypto.seal(&context_id_bytes, &inner, &routing_id, 300)?;
-
-    transport.send_message(&routing_id, &encrypted)?;
-
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
