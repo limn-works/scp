@@ -692,15 +692,10 @@ impl WasmIdentity {
         self.custody_type.clone()
     }
 
-    /// Returns the hex-encoded Ed25519 verifying-key bytes for the
-    /// **identity key** (VM `#0`, the DID-deriving key), or `null` if this
-    /// handle was constructed from a bare DID string without live key
-    /// material.
-    ///
-    /// Under a deterministic `seed`, this value is byte-identical across
-    /// every bridge (ADR-046). See the `verifying_key_hex` field docs
-    /// for why `#0` rather than `#active` is exposed here. Stable across
-    /// `identity_rotate_key`, since rotation replaces only `#active`.
+    /// Returns the hex-encoded Ed25519 verifying-key bytes for the `#0`
+    /// identity key. See the `verifying_key_hex` field doc for the full
+    /// contract (cross-bridge parity, rotation invariance, `null` for
+    /// `from_did` handles).
     #[must_use]
     #[wasm_bindgen(getter, js_name = "verifyingKey")]
     pub fn verifying_key(&self) -> Option<String> {
@@ -1498,7 +1493,11 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
 ///
 /// # Errors
 ///
-/// Returns `[SCP-IDENT-1009]` if the identity already has an agent key.
+/// - `[SCP-IDENT-1002]` — the input DID is not in the local identity
+///   registry.
+/// - `[SCP-IDENT-1009]` — the identity already has an agent key.
+/// - `[SCP-IDENT-1028]` — the registry entry is a `Resolved` handle
+///   without retained key material.
 #[wasm_bindgen]
 pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsError> {
     if identity.has_agent_key {
@@ -1535,7 +1534,7 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
         AgentKeyMutationStatus::NotFound => {
             return Err(ScpWasmError::Identity {
                 message: format!("identity not found in registry: {did}"),
-                code: codes::IDENT_1009.to_owned(),
+                code: codes::IDENT_1002.to_owned(),
             }
             .into_js());
         }
@@ -1579,8 +1578,12 @@ enum AgentKeyMutationStatus {
 ///
 /// # Errors
 ///
-/// Returns `[SCP-IDENT-1011]` if the identity has no agent key to rotate.
-/// Returns `[SCP-IDENT-1010]` if the new public key is empty.
+/// - `[SCP-IDENT-1002]` — the input DID is not in the local identity
+///   registry.
+/// - `[SCP-IDENT-1010]` — the new public key is empty.
+/// - `[SCP-IDENT-1011]` — the identity has no agent key to rotate.
+/// - `[SCP-IDENT-1028]` — the registry entry is a `Resolved` handle
+///   without retained key material.
 #[wasm_bindgen]
 pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsError> {
     if !identity.has_agent_key {
@@ -1616,7 +1619,7 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
         AgentKeyMutationStatus::NotFound => {
             return Err(ScpWasmError::Identity {
                 message: format!("identity not found in registry: {did}"),
-                code: codes::IDENT_1011.to_owned(),
+                code: codes::IDENT_1002.to_owned(),
             }
             .into_js());
         }
@@ -1697,9 +1700,8 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
 ///   registry. Only identities created via [`identity_create`] /
 ///   [`identity_create_with_agent_key`] can be rotated; bare DIDs constructed
 ///   via [`WasmIdentity::from_did`] carry no retained key material.
-/// - `[SCP-IDENT-1028]` — the registry entry is a [`IdentityRecord::Resolved`]
-///   handle without retained signing-key material; rotation requires a
-///   [`IdentityRecord::Local`] record.
+/// - `[SCP-IDENT-1028]` — the registry entry is a `Resolved` handle without
+///   retained signing-key material; rotation requires a `Local` record.
 #[wasm_bindgen]
 pub fn identity_rotate_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsError> {
     rotate_active_key_inner(identity).map_err(ScpWasmError::into_js)
@@ -1773,7 +1775,11 @@ fn rotate_active_key_inner(identity: &WasmIdentity) -> Result<WasmIdentity, ScpW
 ///
 /// # Errors
 ///
-/// Returns `[SCP-IDENT-1011]` if the identity has no agent key to remove.
+/// - `[SCP-IDENT-1002]` — the input DID is not in the local identity
+///   registry.
+/// - `[SCP-IDENT-1011]` — the identity has no agent key to remove.
+/// - `[SCP-IDENT-1028]` — the registry entry is a `Resolved` handle
+///   without retained key material.
 #[wasm_bindgen]
 pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, JsError> {
     if !identity.has_agent_key {
@@ -1808,7 +1814,7 @@ pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
         AgentKeyMutationStatus::NotFound => {
             return Err(ScpWasmError::Identity {
                 message: format!("identity not found in registry: {did}"),
-                code: codes::IDENT_1011.to_owned(),
+                code: codes::IDENT_1002.to_owned(),
             }
             .into_js());
         }
@@ -3716,17 +3722,6 @@ mod tests {
         })
     }
 
-    /// Reads the current `#0` identity-key public bytes for `did` out of
-    /// the registry. Test-only.
-    fn snapshot_identity_pub(did: &str) -> [u8; 32] {
-        IDENTITY_REGISTRY.with(|reg| {
-            reg.borrow().get(did).map_or_else(
-                || panic!("expected entry for {did}"),
-                IdentityRecord::public_key_bytes,
-            )
-        })
-    }
-
     fn handle_for(did: &str, identity_pub_bytes: [u8; 32]) -> WasmIdentity {
         WasmIdentity {
             did: did.to_owned(),
@@ -3754,9 +3749,14 @@ mod tests {
             Some(hex::encode(identity_pub_bytes)),
             "rotate_key MUST preserve the #0 verifying-key snapshot"
         );
+        let registry_pub = IDENTITY_REGISTRY.with(|reg| {
+            reg.borrow().get(&did).map_or_else(
+                || panic!("expected entry for {did}"),
+                IdentityRecord::public_key_bytes,
+            )
+        });
         assert_eq!(
-            snapshot_identity_pub(&did),
-            identity_pub_bytes,
+            registry_pub, identity_pub_bytes,
             "rotate_key MUST NOT mutate the #0 identity key in the registry"
         );
 
