@@ -15,6 +15,7 @@ mod commit_retry;
 mod governance;
 mod lifecycle;
 mod messaging;
+mod outlet_catalog_rotation;
 mod queries;
 mod trust_recovery;
 

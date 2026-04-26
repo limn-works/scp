@@ -3150,6 +3150,177 @@ pub fn amplification_error_to_context(err: &OutletAmplificationError) -> Context
 }
 
 // ===========================================================================
+// SCP-OUT-041c — Catalog-rotation dwell-time validator
+// ===========================================================================
+//
+// §5.4.4 round-5: a registration update whose `message_catalog` differs from
+// the prior registration's catalog AND whose own event-log append time is
+// within 24 hours (86_400 s) of the prior registration's event-log append
+// time is rejected with `OutletErrorClass::Protocol::CatalogRotationTooFrequent`
+// (slug `protocol.catalog-rotation-too-frequent`).
+//
+// The dwell clock is the **event-log append time** — a protocol-enforced,
+// verifiably-ordered clock per §7.3.1 — NOT the operator-declared
+// `OutletRegistration::registered_at` field. The latter is a `u64` the
+// operator can set arbitrarily; using it would let a cooperating operator
+// back-date a registration to bypass the 24h dwell floor. The validator
+// looks up the prior registration's append time via
+// `ContextEventLogProvider::append_time_for`, which sources the timestamp
+// from the runtime-set append-time on the matching event-log entry.
+//
+// The "new registration's append time" is the **prospective** append time
+// — i.e., the value the runtime would stamp on the about-to-be-appended
+// `OutletRegistered` event. Validation runs BEFORE the new event is
+// appended so a rejected update produces no event-log entry. The runtime
+// passes the current Unix-seconds value (`SystemTime::now`); tests inject a
+// synthetic value to exercise the boundaries.
+//
+// See SCP-OUT-041c.
+
+/// §5.4.4 round-5 catalog-rotation dwell-time floor (24 hours, in seconds).
+///
+/// A registration update whose event-log append time is within this many
+/// seconds of the prior registration's event-log append time is rejected
+/// with [`OutletError`] under
+/// [`OutletErrorClass::Protocol`] / `CODE_PROTOCOL_VIOLATION` /
+/// `protocol.catalog-rotation-too-frequent`. Not configurable per spec —
+/// the constant is the rule.
+pub const CATALOG_ROTATION_DWELL_SECS: u64 = 86_400;
+
+/// Outcome of [`validate_catalog_rotation_dwell_time`] when validation
+/// fails — surfaces the typed `OutletError` envelope under
+/// [`OutletErrorClass::Protocol`] (`SCP-TOOL-6100` /
+/// `protocol.catalog-rotation-too-frequent`) plus the elapsed-seconds
+/// delta so callers can render a precise diagnostic without
+/// re-running the comparison.
+#[derive(Debug, Clone)]
+pub struct CatalogRotationDwellRejection {
+    /// The typed envelope that gets wrapped by callers as
+    /// [`ContextError::OutletInvocation`].
+    pub envelope: scp_protocol::context::outlets::errors::OutletError,
+    /// Seconds elapsed between `prior_append_time_secs` and
+    /// `new_append_time_secs`. Always `< CATALOG_ROTATION_DWELL_SECS` when
+    /// produced.
+    #[allow(dead_code)]
+    pub elapsed_secs: u64,
+}
+
+/// §5.4.4 round-5 catalog-rotation dwell-time validator.
+///
+/// Returns `Ok(())` when the registration update is permitted to proceed.
+/// Returns `Err(CatalogRotationDwellRejection)` when the update violates
+/// the 24-hour minimum dwell time on `message_catalog` edits.
+///
+/// The validator only fires on a **catalog-modifying** update:
+///
+/// 1. There is a prior registration of the same outlet, and
+/// 2. `prior_message_catalog != new_message_catalog`.
+///
+/// When the catalog is unchanged the update is not subject to the dwell
+/// floor at all (re-registration that does not edit the catalog is the
+/// expected mechanism for advancing `outlet_message_key` past an MLS
+/// epoch boundary, and the spec deliberately does not throttle it).
+///
+/// # Trusted clock
+///
+/// `prior_append_time_secs` MUST come from
+/// [`ContextEventLogProvider::append_time_for`](crate::context::builder::ContextEventLogProvider::append_time_for)
+/// applied to the prior registration's event-log id. `new_append_time_secs`
+/// is the prospective append time of the about-to-be-appended new
+/// `OutletRegistered` event — the runtime passes
+/// `SystemTime::now() since UNIX_EPOCH`. Never use
+/// `OutletRegistration::registered_at` (operator-declared) for either side
+/// — that field is unauthenticated against the dwell rule.
+///
+/// # Errors
+///
+/// Returns [`CatalogRotationDwellRejection`] when the new append time is
+/// within [`CATALOG_ROTATION_DWELL_SECS`] of the prior append time AND the
+/// catalog has changed. The `OutletError` envelope inside the rejection is
+/// pre-built with code [`error_codes::CODE_PROTOCOL_VIOLATION`] and slug
+/// [`error_codes::SLUG_PROTOCOL_CATALOG_ROTATION_TOO_FREQUENT`].
+pub fn validate_catalog_rotation_dwell_time(
+    prior_message_catalog: &[scp_protocol::context::outlets::MessageTemplate],
+    new_message_catalog: &[scp_protocol::context::outlets::MessageTemplate],
+    prior_append_time_secs: u64,
+    new_append_time_secs: u64,
+) -> Result<(), Box<CatalogRotationDwellRejection>> {
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_PROTOCOL_VIOLATION, SLUG_PROTOCOL_CATALOG_ROTATION_TOO_FREQUENT,
+    };
+    use scp_protocol::context::outlets::errors::{OutletError, OutletErrorClass, RetryPolicy};
+
+    // 1. The validator is silent when the catalog is unchanged. Re-
+    //    registration that preserves `message_catalog` is the expected
+    //    mechanism for refreshing `outlet_message_key` past an MLS epoch
+    //    boundary and is intentionally not subject to the dwell floor.
+    if prior_message_catalog == new_message_catalog {
+        return Ok(());
+    }
+
+    // 2. Compute the elapsed delta on the trusted clock. Saturating to
+    //    avoid underflow if a buggy provider reports a future timestamp
+    //    for the prior — saturate-to-zero conservatively triggers the
+    //    rejection path (the safer fail-closed behavior).
+    let elapsed_secs = new_append_time_secs.saturating_sub(prior_append_time_secs);
+
+    if elapsed_secs >= CATALOG_ROTATION_DWELL_SECS {
+        return Ok(());
+    }
+
+    // 3. Build the typed envelope. The OutletError envelope is the §5.4.4
+    //    canonical error surface; `from_invocation_error_template` enforces
+    //    the §5.4.4 6100-6199 sub-block and slug regex.
+    //
+    //    A construction failure here would indicate the registry constants
+    //    drifted out of the §5.4.4 sub-block — a hard invariant break. We
+    //    materialize a minimal-but-complete fallback envelope rather than
+    //    panicking so the runtime can still surface the rejection.
+    let envelope = OutletError::from_invocation_error_template(
+        OutletErrorClass::Protocol,
+        CODE_PROTOCOL_VIOLATION,
+        SLUG_PROTOCOL_CATALOG_ROTATION_TOO_FREQUENT,
+        RetryPolicy::Never,
+    )
+    .unwrap_or_else(|_| {
+        use scp_protocol::context::outlets::errors::{
+            PAD_NONCE_LEN, REGISTRATION_EVENT_ID_LEN, WIRE_MESSAGE_LEN,
+        };
+        OutletError {
+            code: CODE_PROTOCOL_VIOLATION.to_owned(),
+            slug: SLUG_PROTOCOL_CATALOG_ROTATION_TOO_FREQUENT.to_owned(),
+            class: OutletErrorClass::Protocol,
+            message: [0u8; WIRE_MESSAGE_LEN],
+            retry: RetryPolicy::Never,
+            detail: None,
+            source_chain: Vec::new(),
+            pad_nonce: [0u8; PAD_NONCE_LEN],
+            registration_event_id: [0u8; REGISTRATION_EVENT_ID_LEN],
+            unknown_fields: std::collections::BTreeMap::new(),
+        }
+    });
+
+    Err(Box::new(CatalogRotationDwellRejection {
+        envelope,
+        elapsed_secs,
+    }))
+}
+
+/// Wraps a [`CatalogRotationDwellRejection`] as a [`ContextError`] suitable
+/// for surfacing through `execute_register_outlet`.
+///
+/// Mirrors [`amplification_error_to_context`] for the SCP-OUT-029 error
+/// class: the typed envelope flows through
+/// [`ContextError::OutletInvocation`] so callers downstream of the
+/// governance dispatcher receive a single canonical error surface.
+#[must_use]
+pub fn catalog_rotation_dwell_rejection_to_context(
+    rejection: Box<CatalogRotationDwellRejection>,
+) -> ContextError {
+    ContextError::OutletInvocation(Box::new(rejection.envelope))
+}
+
+// ===========================================================================
 // SCP-OUT-029 — Cross-context error wrapping with ContextHop pseudonymization
 // ===========================================================================
 //

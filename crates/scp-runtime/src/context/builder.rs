@@ -190,6 +190,38 @@ pub trait ContextEventLogProvider: Send + Sync {
         ))
     }
 
+    /// Returns the Unix-epoch-seconds append time of the entry whose
+    /// per-entry hash equals `entry_hash`, or `None` if no matching entry
+    /// exists in this context's log.
+    ///
+    /// This is the §5.4.4 round-5 trusted clock used by the catalog-rotation
+    /// dwell-time validator (SCP-OUT-041c). The append time is set by the
+    /// runtime at the moment of `append_event`; an operator cannot forge it
+    /// the way they can forge the operator-declared
+    /// [`OutletRegistration::registered_at`](scp_protocol::context::outlets::OutletRegistration::registered_at).
+    ///
+    /// The default implementation derives the lookup from
+    /// [`event_log_entries`](Self::event_log_entries) so providers do not
+    /// need to override unless they want to hit a more efficient index.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::EventLogFailed`] if the underlying provider
+    /// does not support entry reading. Returning `Ok(None)` means the
+    /// provider can read entries but the requested hash is not present.
+    fn append_time_for(
+        &self,
+        context_id: &[u8; 32],
+        entry_hash: &[u8; 32],
+    ) -> Result<Option<u64>, ContextError> {
+        let entries = self.event_log_entries(context_id)?;
+        Ok(entries.and_then(|list| {
+            list.into_iter()
+                .find(|entry| &entry.hash == entry_hash)
+                .map(|entry| entry.timestamp)
+        }))
+    }
+
     // -- Export/import for context state portability (#363) -------------------
 
     /// Exports the event log entries for a context as serialized bytes

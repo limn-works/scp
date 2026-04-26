@@ -3130,6 +3130,7 @@ impl ContextManager {
     /// (or a `cost_formula`) is rejected with
     /// [`ContextError::PermissionDenied`] carrying error code
     /// `SCP-TOOL-6102`, and no event is emitted.
+    #[allow(clippy::too_many_lines)] // SCP-OUT-041c added the dwell-time check + SCP-OUT-041a added the message-key pinning; the registration lifecycle is intentionally one cohesive function.
     pub(super) async fn execute_register_outlet(
         &self,
         context_id: &str,
@@ -3146,6 +3147,93 @@ impl ContextManager {
         }
 
         let context_id_bytes = context_id_to_bytes(context_id);
+
+        // SCP-OUT-041c (§5.4.4 round-5): if this is a registration update —
+        // i.e., the outlet_id is already present in registered_outlets —
+        // and the message_catalog has changed, the §5.4.4 catalog-rotation
+        // dwell-time floor (24 h) must be enforced against the prior
+        // registration's event-log append time. The prior catalog and the
+        // candidate `registration_event_id` set are read out of the locked
+        // per-context state here; the event-log append-time lookup
+        // happens outside the lock so a provider that takes its own
+        // internal mutex on read paths does not deadlock against the
+        // governance lock.
+        let dwell_state: Option<(
+            Vec<[u8; 32]>,
+            Vec<scp_protocol::context::outlets::MessageTemplate>,
+        )> = {
+            let ctx_arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let guard = ctx_arc.lock().await;
+            let ctx = &*guard;
+
+            // Find the most-recent prior `OutletRegistration` for the same
+            // outlet_id. `registered_outlets.iter().rfind` returns the
+            // last (newest) push — matching the SCP-OUT-041b receiver
+            // LRU semantics that treat the most recent registration as
+            // the "prior" for the next update.
+            ctx.governance
+                .registered_outlets
+                .iter()
+                .rfind(|r| r.outlet_id == registration.outlet_id)
+                .map(|prior_reg| {
+                    let candidates: Vec<[u8; 32]> = ctx
+                        .governance
+                        .pinned_outlet_message_keys
+                        .keys()
+                        .filter(|(oid, _)| oid == &prior_reg.outlet_id)
+                        .map(|(_, reg_event_id)| *reg_event_id)
+                        .collect();
+                    (candidates, prior_reg.message_catalog.clone())
+                })
+        };
+
+        // Resolve the prior registration's event-log append time by
+        // selecting the candidate `registration_event_id` whose event-log
+        // entry has the newest append time. The lock is already dropped,
+        // so this lookup may take provider-internal locks safely.
+        if let Some((candidates, prior_catalog)) = dwell_state {
+            let mut prior_append_time: Option<u64> = None;
+            for cand in &candidates {
+                if let Ok(Some(ts)) = self.event_log.append_time_for(&context_id_bytes, cand)
+                    && prior_append_time.is_none_or(|prev| ts > prev)
+                {
+                    prior_append_time = Some(ts);
+                }
+            }
+
+            // Run the SCP-OUT-041c dwell-time validator. The validator is
+            // silent when `message_catalog` is unchanged (re-registration
+            // that does not edit the catalog is the expected mechanism
+            // for advancing `outlet_message_key` past an MLS epoch
+            // boundary — see SCP-OUT-041a — and is intentionally not
+            // throttled). Rejection produces a typed `OutletError`
+            // envelope under `OutletErrorClass::Protocol` /
+            // `CODE_PROTOCOL_VIOLATION` /
+            // `protocol.catalog-rotation-too-frequent`, surfaced as
+            // `ContextError::OutletInvocation` so callers see the
+            // canonical typed error surface (no `PermissionDenied`
+            // string fallback). No event is appended for a rejected
+            // update.
+            if let Some(prior_ts) = prior_append_time {
+                let now_secs = self.clock.now_secs();
+                if let Err(rejection) =
+                    crate::context::manager::outlets::validate_catalog_rotation_dwell_time(
+                        &prior_catalog,
+                        &registration.message_catalog,
+                        prior_ts,
+                        now_secs,
+                    )
+                {
+                    return Err(
+                        crate::context::manager::outlets::catalog_rotation_dwell_rejection_to_context(
+                            rejection,
+                        ),
+                    );
+                }
+            }
+        }
 
         let snapshot = {
             let ctx_arc = self
