@@ -72,7 +72,13 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // to the runtime pipeline — AC22. The negative meta-assertion
 // `out008_no_tool_symbols_in_outlet_assertion_table` counts toward the
 // meta_tests deduction below, not the active-assertion floor.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 52;
+//
+// Raised 52 -> 53 by SCP-OUT-042c: adds
+// `admin_removal_emits_induced_rotations` pinning the §6.2.0.1
+// round-6 atomic admin-removal salt-rotation invariant. The single
+// `#[test]` adds 2 inner asserts but contributes 1 to the
+// total_tests count.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 53;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -434,6 +440,36 @@ fn leave_context_calls_rotate_sender_key() {
     assert!(
         fn_body_contains(MANAGER_SRC, "leave_context", "rotate_sender_key"),
         "leave_context must call rotate_sender_key (§9.16.4)"
+    );
+}
+
+// SCP-OUT-042c — atomic admin-removal salt rotation. Per spec §6.2.0.1
+// round-6 "Atomic removal+rotation — local-side semantics", the
+// `RemoveMember` handler MUST emit one `InterfaceSaltRotated` per
+// active interface as a sibling commit-batch entry. This assertion
+// pins the wiring so a future refactor cannot silently regress to
+// the round-5 best-effort pattern that admitted the BLOCKER-2 /
+// MAJOR-3 covert-channel race.
+#[test]
+fn admin_removal_emits_induced_rotations() {
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "execute_remove_member",
+            "emit_admin_removal_with_rotations"
+        ),
+        "execute_remove_member must call \
+         governance::admin_removal::emit_admin_removal_with_rotations \
+         (§6.2.0.1 round-6 atomic admin-removal salt rotation, SCP-OUT-042c)"
+    );
+    // Defense in depth — the handler MUST also append the rotation
+    // events to the local event log as sibling commit-batch entries
+    // (§6.2.0.1 "Commit atomicity"). The append uses the
+    // `InterfaceSaltRotated` event-name constant.
+    assert!(
+        fn_body_contains(MANAGER_SRC, "execute_remove_member", "InterfaceSaltRotated"),
+        "execute_remove_member must append InterfaceSaltRotated events \
+         alongside the RemoveMember commit (§6.2.0.1 commit atomicity)"
     );
 }
 

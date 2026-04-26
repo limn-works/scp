@@ -542,11 +542,31 @@ pub enum GovernanceAction {
     ///
     /// Session-approved name (B1): corresponds to
     /// [`EnforcementSeverity::RemoveMember`](crate::trust::consequence::EnforcementSeverity::RemoveMember).
+    ///
+    /// # Round-6 induced rotations (SCP-OUT-042c)
+    ///
+    /// When the removed member holds the admin role and active outlet
+    /// interfaces exist, this action MUST carry one
+    /// [`InterfaceSaltRotated`](crate::context::outlets::interface::InterfaceSaltRotated)
+    /// per active interface in `induced_rotations`. The rotations and
+    /// the `RemoveMember` commit atomically as sibling entries within
+    /// the same MLS commit batch — see spec §6.2.0.1 round-6 "Atomic
+    /// removal+rotation". An empty `induced_rotations` field when active
+    /// interfaces exist is a governance-action validation failure.
+    /// Non-admin removals and admin removals on contexts with no active
+    /// interfaces carry an empty vector (the field is `#[serde(default)]`
+    /// for backwards compatibility).
     RemoveMember {
         /// The DID of the member to eject.
         did: DID,
         /// Optional reason for ejection.
         reason: Option<String>,
+        /// Round-6 atomic salt-rotation rider. One entry per active
+        /// outlet interface the context holds at proposal time when the
+        /// removed member is an admin; empty otherwise. See spec
+        /// §6.2.0.1 round-6 "Atomic removal+rotation".
+        #[serde(default)]
+        induced_rotations: Vec<crate::context::outlets::interface::InterfaceSaltRotated>,
     },
     /// Change a member's role.
     ChangeRole {
@@ -2100,6 +2120,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: bob(),
                 reason: Some("inactive".to_owned()),
+                induced_rotations: Vec::new(),
             },
             GovernanceAction::ChangeRole {
                 did: bob(),
@@ -2666,6 +2687,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: bob(),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             GovernanceAction::ChangeRole {
                 did: bob(),

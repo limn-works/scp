@@ -180,7 +180,7 @@ pub fn generate_mls_operations(
             did: did.clone(),
             role: role.clone(),
         }),
-        GovernanceAction::RemoveMember { did, reason } => Some(MlsOperation::RemoveMember {
+        GovernanceAction::RemoveMember { did, reason, .. } => Some(MlsOperation::RemoveMember {
             did: did.clone(),
             reason: reason.clone(),
         }),
@@ -591,6 +591,7 @@ mod tests {
         let action = GovernanceAction::RemoveMember {
             did: bob(),
             reason: Some("inactive".to_owned()),
+            induced_rotations: Vec::new(),
         };
         assert_eq!(classify_action(&action), MlsImpact::MembershipChange);
     }
@@ -728,6 +729,7 @@ mod tests {
         let action = GovernanceAction::RemoveMember {
             did: bob(),
             reason: Some("inactive".to_owned()),
+            induced_rotations: Vec::new(),
         };
         let proposal = approved_proposal(action, Some(5));
 
@@ -1022,6 +1024,7 @@ mod tests {
         let action = GovernanceAction::RemoveMember {
             did: bob(),
             reason: None,
+            induced_rotations: Vec::new(),
         };
         let proposal = approved_proposal(action, Some(5));
         assert!(requires_mls_coordination(&proposal));
@@ -1112,6 +1115,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: bob(),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             Some(3),
         )];
@@ -1334,6 +1338,7 @@ mod tests {
         let action = GovernanceAction::RemoveMember {
             did: bob(),
             reason: Some("violation".to_owned()),
+            induced_rotations: Vec::new(),
         };
         let proposal = approved_proposal(action, Some(5));
 

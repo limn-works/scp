@@ -3222,6 +3222,7 @@ async fn import_context_rejects_forged_approved_proposals() {
         action: GovernanceAction::RemoveMember {
             did: victim.clone(),
             reason: Some("forged".to_owned()),
+            induced_rotations: Vec::new(),
         },
         status: ProposalStatus::Approved,
         created_at: 0,

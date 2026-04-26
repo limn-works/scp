@@ -1451,6 +1451,7 @@ mod tests {
         let action = GovernanceAction::RemoveMember {
             did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
             reason: None,
+            induced_rotations: Vec::new(),
         };
         assert!(validate_governance_action_strings(&action).is_ok());
     }
@@ -1462,6 +1463,7 @@ mod tests {
         let action = GovernanceAction::RemoveMember {
             did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
             reason: Some(String::new()),
+            induced_rotations: Vec::new(),
         };
         assert!(validate_governance_action_strings(&action).is_ok());
     }
@@ -1473,6 +1475,7 @@ mod tests {
         let action = GovernanceAction::RemoveMember {
             did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
             reason: Some("   ".to_owned()),
+            induced_rotations: Vec::new(),
         };
         assert!(validate_governance_action_strings(&action).is_err());
     }
@@ -1484,6 +1487,7 @@ mod tests {
         let action = GovernanceAction::RemoveMember {
             did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
             reason: Some("\t".to_owned()),
+            induced_rotations: Vec::new(),
         };
         assert!(validate_governance_action_strings(&action).is_err());
     }
@@ -1515,6 +1519,7 @@ mod tests {
         let action = GovernanceAction::RemoveMember {
             did: scp_primitives::DID("did:dht:z6MkTest".to_owned()),
             reason: Some("bad\0actor".to_owned()),
+            induced_rotations: Vec::new(),
         };
         let err = validate_governance_action_strings(&action).unwrap_err();
         assert!(err.message.contains("control character"));

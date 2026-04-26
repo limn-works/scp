@@ -153,6 +153,7 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
         GovernanceAction::RemoveMember {
             did: bob(),
             reason: Some("inactive".to_owned()),
+            induced_rotations: Vec::new(),
         },
         GovernanceAction::ChangeRole {
             did: bob(),
@@ -857,10 +858,12 @@ async fn conflict_detection() {
     let remove_a = GovernanceAction::RemoveMember {
         did: bob(),
         reason: None,
+        induced_rotations: Vec::new(),
     };
     let remove_b = GovernanceAction::RemoveMember {
         did: alice(),
         reason: None,
+        induced_rotations: Vec::new(),
     };
     assert!(
         actions_conflict(&remove_a, &alice(), &remove_b, &bob()),
@@ -956,10 +959,12 @@ async fn non_conflicting_actions() {
     let remove_a = GovernanceAction::RemoveMember {
         did: bob(),
         reason: None,
+        induced_rotations: Vec::new(),
     };
     let remove_b = GovernanceAction::RemoveMember {
         did: dave(),
         reason: None,
+        induced_rotations: Vec::new(),
     };
     assert!(
         !actions_conflict(&remove_a, &alice(), &remove_b, &carol()),

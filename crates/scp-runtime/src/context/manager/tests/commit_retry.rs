@@ -40,6 +40,7 @@ fn approved_remove_proposal(context_id: &str, target_did: &str) -> GovernancePro
         action: GovernanceAction::RemoveMember {
             did: target_did.into(),
             reason: None,
+            induced_rotations: Vec::new(),
         },
         status: ProposalStatus::Approved,
         created_at: 1000,

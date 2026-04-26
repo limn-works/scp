@@ -2006,6 +2006,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: bob(),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             GovernanceAction::ChangeRole {
                 did: bob(),

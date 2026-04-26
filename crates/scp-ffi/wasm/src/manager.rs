@@ -6036,6 +6036,7 @@ mod tests {
         roundtrip(&GovernanceAction::RemoveMember {
             did: DID("did:dht:z123".to_owned()),
             reason: Some("inactive".to_owned()),
+            induced_rotations: Vec::new(),
         });
     }
 

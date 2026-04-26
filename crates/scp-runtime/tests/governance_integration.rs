@@ -960,6 +960,7 @@ async fn ac10_remove_member_action() {
             GovernanceAction::RemoveMember {
                 did: bob(),
                 reason: Some("test removal".into()),
+                induced_rotations: Vec::new(),
             },
             &sk_alice,
         )
@@ -1482,6 +1483,7 @@ fn ac13_actions_conflict_remove_member_vs_change_role() {
     let action_a = GovernanceAction::RemoveMember {
         did: bob(),
         reason: None,
+        induced_rotations: Vec::new(),
     };
     let action_b = GovernanceAction::ChangeRole {
         did: bob(),
@@ -1499,10 +1501,12 @@ fn ac13_actions_conflict_mutual_removal() {
     let action_a = GovernanceAction::RemoveMember {
         did: bob(),
         reason: None,
+        induced_rotations: Vec::new(),
     };
     let action_b = GovernanceAction::RemoveMember {
         did: alice(),
         reason: None,
+        induced_rotations: Vec::new(),
     };
     assert!(
         actions_conflict(&action_a, &alice(), &action_b, &bob()),

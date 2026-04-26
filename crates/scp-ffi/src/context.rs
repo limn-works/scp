@@ -4942,6 +4942,7 @@ mod tests {
             scp_core::context::governance::GovernanceAction::RemoveMember {
                 did: scp_identity::DID(target.to_owned()),
                 reason: Some("test removal".to_owned()),
+                induced_rotations: Vec::new(),
             },
             creator,
         );
@@ -5082,6 +5083,7 @@ mod tests {
         let action = scp_core::context::governance::GovernanceAction::RemoveMember {
             did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
             reason: Some("bad\0actor".to_owned()),
+            induced_rotations: Vec::new(),
         };
         let err = validate_governance_action_strings(&action).unwrap_err();
         assert!(
@@ -5187,6 +5189,7 @@ mod tests {
         let action = scp_core::context::governance::GovernanceAction::RemoveMember {
             did: scp_identity::DID("did:dht:z6MkTest".to_owned()),
             reason: None,
+            induced_rotations: Vec::new(),
         };
         assert!(validate_governance_action_strings(&action).is_ok());
     }

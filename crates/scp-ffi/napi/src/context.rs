@@ -4003,6 +4003,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: DID(target.to_owned()),
                 reason: Some("test removal".to_owned()),
+                induced_rotations: Vec::new(),
             },
             creator,
         );

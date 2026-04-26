@@ -848,6 +848,7 @@ mod tests {
         let remove = GovernanceAction::RemoveMember {
             did: did("did:dht:alice"),
             reason: None,
+            induced_rotations: Vec::new(),
         };
         let change = GovernanceAction::ChangeRole {
             did: did("did:dht:alice"),
@@ -873,10 +874,12 @@ mod tests {
         let a = GovernanceAction::RemoveMember {
             did: did("did:dht:bob"),
             reason: None,
+            induced_rotations: Vec::new(),
         };
         let b = GovernanceAction::RemoveMember {
             did: did("did:dht:alice"),
             reason: None,
+            induced_rotations: Vec::new(),
         };
         assert!(actions_conflict(
             &a,
@@ -891,10 +894,12 @@ mod tests {
         let a = GovernanceAction::RemoveMember {
             did: did("did:dht:carol"),
             reason: None,
+            induced_rotations: Vec::new(),
         };
         let b = GovernanceAction::RemoveMember {
             did: did("did:dht:dave"),
             reason: None,
+            induced_rotations: Vec::new(),
         };
         assert!(!actions_conflict(
             &a,
@@ -910,10 +915,12 @@ mod tests {
         let a = GovernanceAction::RemoveMember {
             did: did("did:dht:carol"),
             reason: Some("spam".to_owned()),
+            induced_rotations: Vec::new(),
         };
         let b = GovernanceAction::RemoveMember {
             did: did("did:dht:carol"),
             reason: Some("inactive".to_owned()),
+            induced_rotations: Vec::new(),
         };
         assert!(actions_conflict(
             &a,
@@ -1330,6 +1337,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             3,
         );
@@ -1339,6 +1347,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             7,
         );
@@ -1366,6 +1375,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             3,
         );
@@ -1375,6 +1385,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             7,
         );
@@ -1393,6 +1404,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             5,
         );
@@ -1402,6 +1414,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             5,
         );
@@ -1429,6 +1442,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             3,
         );
@@ -1438,6 +1452,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             7,
         );
@@ -1775,6 +1790,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             3,
         );
@@ -1784,6 +1800,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             7,
         );
@@ -1811,6 +1828,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             3,
         );
@@ -1820,6 +1838,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             7,
         );
@@ -2065,6 +2084,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:bob"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             3,
         );
@@ -2074,6 +2094,7 @@ mod tests {
             GovernanceAction::RemoveMember {
                 did: did("did:dht:alice"),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             7,
         );

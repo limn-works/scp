@@ -603,6 +603,276 @@ pub struct InterfaceRevoked {
 }
 
 // ---------------------------------------------------------------------------
+// InterfaceSaltRotated (SCP-OUT-042c — admin-removal salt rotation)
+// ---------------------------------------------------------------------------
+
+/// Domain separator string (UTF-8 bytes) for the
+/// `SCP-OUTLET-IKM-ROTATE-V1:` preimage. Registered in spec §9.18.2.
+///
+/// The trailing colon is part of the on-wire prefix per the §9.18.2
+/// registration table — every other separator in §9.18.2 ends in a colon
+/// and the §6.2.0.1 byte spec includes the colon literal.
+pub const IKM_ROTATE_DOMAIN_SEPARATOR: &[u8] = b"SCP-OUTLET-IKM-ROTATE-V1:";
+
+/// Rotation event emitted on every active interface a context holds when
+/// an admin is removed via governance `RemoveMember`-with-admin-role
+/// (spec §6.2.0.1 round-6 "Admin-removal salt rotation").
+///
+/// The removed admin retains prior knowledge of the committed
+/// `(ikm_a, ikm_b)` and could continue computing
+/// `HMAC(hop_salt, raw_context_id)` to reverse pseudonyms for hops they
+/// no longer have a right to observe. To close this, on any admin
+/// removal the governance engine emits one `InterfaceSaltRotated` per
+/// active interface, atomic with the `RemoveMember` commit. Both sides
+/// publish fresh IKMs; both contexts re-derive `hop_salt` from the new
+/// pair. The removed admin's HMAC computations no longer match wire
+/// pseudonyms.
+///
+/// # Field semantics
+///
+/// - `interface_id` — the prior `InterfaceEstablished`'s `offer_id`,
+///   binding this rotation to a specific interface.
+/// - `new_ikm_local` — fresh exporter output at `epoch_local` under the
+///   §6.2.0.1 step-1 peer-suffixed label
+///   (`scp-context-hop-salt-v1:` || `peer_context_id`).
+/// - `new_ikm_local_sig` — Ed25519 signature over the
+///   `SCP-OUTLET-IKM-ROTATE-V1:` preimage under the signing admin's
+///   `#active` key. Computed by [`sign_interface_rotation`].
+/// - `epoch_local` — local context's MLS epoch counter at rotation time.
+/// - `trigger_removal_did` — the removed admin's DID (audit trail). Also
+///   verified against the cited removal event's target DID.
+/// - `removal_event_id` — event-log id of the `RemoveMember` (or
+///   equivalent admin-removal) event that justifies this rotation. MUST
+///   reference a prior event in the same local event log whose body is
+///   an admin-removal action targeting `trigger_removal_did` and whose
+///   epoch is equal to or one less than `epoch_local`.
+///
+/// # Zeroization
+///
+/// `ZeroizeOnDrop` is derived so the 32-byte `new_ikm_local` is zeroed
+/// when the struct is dropped. The IKM is committed verbatim into the
+/// public event log alongside the epoch counter, so it is not a
+/// long-term secret — but in-memory zeroization closes the residual
+/// memory-disclosure surface during the rotation pipeline. Other fields
+/// (interface ids, signatures, the public DID string) are zeroized
+/// alongside, which is harmless for their lifecycle.
+///
+/// # Wire format
+///
+/// JSON-serialized when persisted into the event log alongside
+/// `RemoveMember` (the runtime's event-log adapter signs over
+/// canonical-JCS bytes). The struct is also `MessagePack`-round-trippable
+/// for cross-implementation conformance.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, zeroize::Zeroize, zeroize::ZeroizeOnDrop,
+)]
+pub struct InterfaceSaltRotated {
+    /// The prior `InterfaceEstablished`'s `offer_id` — binds this
+    /// rotation to a specific interface (predicate (a) of the §6.2.0.1
+    /// rotation-signature preimage).
+    pub interface_id: [u8; 32],
+    /// Fresh exporter output at `epoch_local`, labeled per §6.2.0.1 step
+    /// 1 (`scp-context-hop-salt-v1:` || `peer_context_id`). Persisted
+    /// verbatim so verifiers can re-derive the post-rotation `hop_salt`
+    /// without retaining MLS epoch secrets.
+    pub new_ikm_local: [u8; 32],
+    /// Remaining admin's Ed25519 signature over the
+    /// `SCP-OUTLET-IKM-ROTATE-V1:` preimage. Verified at event-log
+    /// append time per the §6.2.0.1 verifier rule.
+    #[zeroize(skip)]
+    pub new_ikm_local_sig: Ed25519Signature,
+    /// Local context's MLS epoch counter at rotation time. Verifier
+    /// resolves the signing admin's `#active` key against the role
+    /// registry at this epoch.
+    pub epoch_local: u64,
+    /// The removed admin's DID — audit trail. Verifier checks that the
+    /// cited `removal_event_id` references an admin-removal event whose
+    /// target DID equals this value.
+    #[zeroize(skip)]
+    pub trigger_removal_did: DID,
+    /// Event-log id of the `RemoveMember` (or equivalent admin-removal)
+    /// event that justifies this rotation. Verifier rejects when this id
+    /// does not reference a prior, valid admin-removal event targeting
+    /// `trigger_removal_did` within the same or prior epoch — slug
+    /// `authorization.salt-rotation-unjustified` (`SCP-TOOL-6115`).
+    pub removal_event_id: [u8; 32],
+}
+
+/// Computes the canonical `SCP-OUTLET-IKM-ROTATE-V1:` preimage and
+/// signs it with `signer` under the §6.2.0.1 round-6 rotation-signature
+/// rule (admin-removal salt rotation).
+///
+/// The preimage is:
+///
+/// ```text
+/// SHA-256(
+///     "SCP-OUTLET-IKM-ROTATE-V1:"
+///     || len_be32(interface_id) || interface_id
+///     || len_be32(context_local_id) || context_local_id
+///     || len_be32(context_peer_id) || context_peer_id
+///     || epoch_local_be                               // 8 bytes BE u64
+///     || new_ikm_local                                 // 32 bytes
+///     || len_be32(trigger_removal_did) || trigger_removal_did
+///     || len_be32(removal_event_id) || removal_event_id
+/// )
+/// ```
+///
+/// Length-prefixed variable-length fields prevent concatenation
+/// ambiguity (e.g., `("ab", "cd")` vs `("a", "bcd")`). The 32-byte
+/// fixed-width fields (`interface_id`, `new_ikm_local`,
+/// `removal_event_id`) are length-prefixed in the spec text for
+/// uniformity.
+///
+/// Note that `interface_id` is `[u8; 32]` — the spec's `len_be32(interface_id)` is
+/// a fixed `0x00000020`. The signed bytes match the spec verbatim.
+///
+/// The `context_local_id` is the signer's own context id; the
+/// `context_peer_id` is the other side. The pair is NOT canonicalized
+/// here — the rotation preimage is per-side (each side signs with its
+/// own ordering) so peers reciprocally rotate with `(local, peer)`
+/// swapped on the other side per §6.2.0.1 "Atomic removal+rotation —
+/// peer-side semantics".
+#[must_use]
+#[allow(clippy::similar_names, clippy::too_many_arguments)]
+pub fn sign_interface_rotation(
+    signer: &ed25519_dalek::SigningKey,
+    interface_id: &[u8; 32],
+    context_local_id: &ContextId,
+    context_peer_id: &ContextId,
+    epoch_local: u64,
+    new_ikm_local: &[u8; 32],
+    trigger_removal_did: &DID,
+    removal_event_id: &[u8; 32],
+) -> Ed25519Signature {
+    use ed25519_dalek::Signer;
+    let preimage = rotation_preimage_hash(
+        interface_id,
+        context_local_id,
+        context_peer_id,
+        epoch_local,
+        new_ikm_local,
+        trigger_removal_did,
+        removal_event_id,
+    );
+    signer.sign(&preimage).to_bytes().to_vec()
+}
+
+/// Verifies that `sig` authenticates the canonical
+/// `SCP-OUTLET-IKM-ROTATE-V1:` preimage under `verifying_key`.
+///
+/// Mirrors [`sign_interface_rotation`] — same byte layout, same hash.
+/// Returns `Ok(())` on cryptographic success, [`RotationVerifyError`]
+/// on length-mismatch or verification failure.
+///
+/// # Errors
+///
+/// - [`RotationVerifyError::InvalidLength`] when `sig.len()` is not 64.
+/// - [`RotationVerifyError::VerificationFailed`] when the cryptographic
+///   verification returns an error. Maps to the §6.2.0.1 round-6
+///   verifier-rule rejection slug `authorization.salt-rotation-unjustified`
+///   (`SCP-TOOL-6115`) when fired at event-log append time alongside the
+///   removal-event-binding checks.
+#[allow(clippy::similar_names, clippy::too_many_arguments)]
+pub fn verify_interface_rotation(
+    verifying_key: &ed25519_dalek::VerifyingKey,
+    sig: &Ed25519Signature,
+    interface_id: &[u8; 32],
+    context_local_id: &ContextId,
+    context_peer_id: &ContextId,
+    epoch_local: u64,
+    new_ikm_local: &[u8; 32],
+    trigger_removal_did: &DID,
+    removal_event_id: &[u8; 32],
+) -> Result<(), RotationVerifyError> {
+    use ed25519_dalek::Verifier;
+    if sig.len() != ed25519_dalek::SIGNATURE_LENGTH {
+        return Err(RotationVerifyError::InvalidLength {
+            expected: ed25519_dalek::SIGNATURE_LENGTH,
+            actual: sig.len(),
+        });
+    }
+    let mut sig_bytes = [0u8; ed25519_dalek::SIGNATURE_LENGTH];
+    sig_bytes.copy_from_slice(sig);
+    let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    let preimage = rotation_preimage_hash(
+        interface_id,
+        context_local_id,
+        context_peer_id,
+        epoch_local,
+        new_ikm_local,
+        trigger_removal_did,
+        removal_event_id,
+    );
+    verifying_key.verify(&preimage, &signature).map_err(|e| {
+        RotationVerifyError::VerificationFailed {
+            reason: e.to_string(),
+        }
+    })
+}
+
+/// Failure modes for [`verify_interface_rotation`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum RotationVerifyError {
+    /// Signature byte length is not 64.
+    #[error("rotation signature must be {expected} bytes, got {actual}")]
+    InvalidLength {
+        /// Expected length (always 64 for Ed25519).
+        expected: usize,
+        /// Actual length supplied by the caller.
+        actual: usize,
+    },
+    /// Cryptographic verification failed — the signature does not
+    /// authenticate the canonical preimage under the supplied key.
+    #[error("rotation signature verification failed: {reason}")]
+    VerificationFailed {
+        /// Human-readable reason for diagnostic logging. Wire-level
+        /// rejection uses `authorization.salt-rotation-unjustified`.
+        reason: String,
+    },
+}
+
+/// Computes the SHA-256 digest of the §6.2.0.1
+/// `SCP-OUTLET-IKM-ROTATE-V1:` preimage. The digest is the input to
+/// Ed25519 sign/verify in [`sign_interface_rotation`] and
+/// [`verify_interface_rotation`].
+#[must_use]
+#[allow(clippy::similar_names)]
+fn rotation_preimage_hash(
+    interface_id: &[u8; 32],
+    context_local_id: &ContextId,
+    context_peer_id: &ContextId,
+    epoch_local: u64,
+    new_ikm_local: &[u8; 32],
+    trigger_removal_did: &DID,
+    removal_event_id: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(IKM_ROTATE_DOMAIN_SEPARATOR);
+    // Fixed-width 32-byte interface_id: len_be32 = 32.
+    hasher.update(32u32.to_be_bytes());
+    hasher.update(interface_id);
+    // Variable-length context ids — length-prefixed.
+    let local_len = u32::try_from(context_local_id.len()).unwrap_or(u32::MAX);
+    let peer_len = u32::try_from(context_peer_id.len()).unwrap_or(u32::MAX);
+    hasher.update(local_len.to_be_bytes());
+    hasher.update(context_local_id.as_bytes());
+    hasher.update(peer_len.to_be_bytes());
+    hasher.update(context_peer_id.as_bytes());
+    // Fixed-width epoch / IKM.
+    hasher.update(epoch_local.to_be_bytes());
+    hasher.update(new_ikm_local);
+    // Variable-length DID — length-prefixed.
+    let did_str = trigger_removal_did.as_ref();
+    let did_len = u32::try_from(did_str.len()).unwrap_or(u32::MAX);
+    hasher.update(did_len.to_be_bytes());
+    hasher.update(did_str.as_bytes());
+    // Fixed-width 32-byte removal_event_id: len_be32 = 32.
+    hasher.update(32u32.to_be_bytes());
+    hasher.update(removal_event_id);
+    hasher.finalize().into()
+}
+
+// ---------------------------------------------------------------------------
 // RateLimit
 // ---------------------------------------------------------------------------
 

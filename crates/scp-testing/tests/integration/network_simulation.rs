@@ -1500,6 +1500,7 @@ async fn application_layer_demo() {
             GovernanceAction::RemoveMember {
                 did: charlie.clone(),
                 reason: Some("demo: testing governance removal".to_owned()),
+                induced_rotations: Vec::new(),
             },
             &alice_signing_key,
         )

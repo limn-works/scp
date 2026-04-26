@@ -481,6 +481,7 @@ async fn unanimity_context_single_rejection_defeats_proposal() {
     let action = GovernanceAction::RemoveMember {
         did: bob.clone(),
         reason: Some("test removal".to_owned()),
+        induced_rotations: Vec::new(),
     };
 
     let (proposal, _, _) = manager
@@ -2008,6 +2009,7 @@ async fn governance_dispatch_returns_typed_results() {
         action: GovernanceAction::RemoveMember {
             did: "did:key:new".into(),
             reason: None,
+            induced_rotations: Vec::new(),
         },
         status: ProposalStatus::Approved,
         created_at: 1000,
@@ -2597,6 +2599,7 @@ async fn scp274_single_admin_full_lifecycle() {
             GovernanceAction::RemoveMember {
                 did: "did:key:target".into(),
                 reason: Some("test".into()),
+                induced_rotations: Vec::new(),
             },
             &signing_key,
         )
@@ -2668,6 +2671,7 @@ async fn scp274_threshold_full_lifecycle() {
             GovernanceAction::RemoveMember {
                 did: "did:key:target".into(),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             &creator_sk,
         )
@@ -2776,6 +2780,7 @@ async fn scp274_unanimity_full_lifecycle() {
             GovernanceAction::RemoveMember {
                 did: "did:key:target".into(),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             &creator_sk,
         )
@@ -2836,6 +2841,7 @@ async fn scp274_rejected_proposal_does_not_execute() {
             GovernanceAction::RemoveMember {
                 did: "did:key:target".into(),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             &creator_sk,
         )
@@ -2897,6 +2903,7 @@ async fn scp274_governance_events_in_log() {
             GovernanceAction::RemoveMember {
                 did: "did:key:target".into(),
                 reason: None,
+                induced_rotations: Vec::new(),
             },
             &creator_sk,
         )
@@ -2983,6 +2990,7 @@ async fn scp274_exercises_seven_action_variants() {
         GovernanceAction::RemoveMember {
             did: "did:key:target".into(),
             reason: None,
+            induced_rotations: Vec::new(),
         },
         &["did:key:admin"],
     );
@@ -4666,6 +4674,7 @@ async fn mls_integration_epoch_coordinator_records_coordination() {
     let action2 = super::GovernanceAction::RemoveMember {
         did: "did:key:member-a".into(),
         reason: Some("done".to_owned()),
+        induced_rotations: Vec::new(),
     };
     let proposal2 = make_approved_proposal(&admin_did, "test-ctx", action2);
     manager
@@ -4862,6 +4871,7 @@ async fn mls_integration_resolve_conflict_lifts_freeze() {
         action: super::GovernanceAction::RemoveMember {
             did: other_did.clone(),
             reason: None,
+            induced_rotations: Vec::new(),
         },
         status: super::ProposalStatus::Approved,
         created_at: 900,
@@ -4877,6 +4887,7 @@ async fn mls_integration_resolve_conflict_lifts_freeze() {
         action: super::GovernanceAction::RemoveMember {
             did: admin_did.clone(),
             reason: None,
+            induced_rotations: Vec::new(),
         },
         status: super::ProposalStatus::Approved,
         created_at: 900,
@@ -5363,6 +5374,7 @@ async fn test_remove_member_sender_key_before_mls_removal() {
         GovernanceAction::RemoveMember {
             did: "did:key:target".into(),
             reason: None,
+            induced_rotations: Vec::new(),
         },
         &["did:key:admin"],
     );
@@ -6223,6 +6235,7 @@ async fn pending_removal_blocks_proposal() {
             action: GovernanceAction::RemoveMember {
                 did: alice.clone(),
                 reason: Some("test".into()),
+                induced_rotations: Vec::new(),
             },
             created_at: 0,
             voting_deadline: u64::MAX,
@@ -6381,6 +6394,7 @@ async fn sender_key_before_mls_removal_ordering() {
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("ordering test".into()),
+        induced_rotations: Vec::new(),
     };
     let result = manager
         .propose_governance_action("order-ctx", &admin, action, &key_admin)
@@ -6942,6 +6956,7 @@ async fn remaining_members_keys_after_removal() {
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("selective removal".into()),
+        induced_rotations: Vec::new(),
     };
     manager
         .propose_governance_action("remain-ctx", &admin, action, &key_admin)
@@ -8948,6 +8963,7 @@ async fn test_remaining_members_unaffected_after_removal() {
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: bob.clone(),
         reason: Some("test removal".into()),
+        induced_rotations: Vec::new(),
     };
     manager
         .propose_governance_action("remain2-ctx", &admin, action, &key_admin)
@@ -9707,6 +9723,7 @@ async fn rotate_sender_key_called_after_remove_member() {
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("rotation test".into()),
+        induced_rotations: Vec::new(),
     };
     let result = manager
         .propose_governance_action("rotate-ctx", &admin, action, &key_admin)
@@ -9778,6 +9795,7 @@ async fn rotate_sender_key_error_propagates() {
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("error test".into()),
+        induced_rotations: Vec::new(),
     };
     let result = manager
         .propose_governance_action("rotate-err-ctx", &admin, action, &key_admin)
@@ -10707,6 +10725,7 @@ async fn rotate_sender_key_not_called_when_remove_member_fails() {
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("rotation skip test".into()),
+        induced_rotations: Vec::new(),
     };
     let result = manager
         .propose_governance_action("no-rotate-ctx", &admin, action, &key_admin)
@@ -10881,6 +10900,7 @@ async fn governance_action_stores_actor_did() {
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: target.clone(),
         reason: Some("actor_did test".into()),
+        induced_rotations: Vec::new(),
     };
     manager
         .propose_governance_action("gov-actor-ctx", &admin, action, &key_admin)
@@ -12139,6 +12159,7 @@ async fn test_warning_count_trigger_fires_behavioral() {
     let action1 = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: target.clone(),
         reason: Some("warning 1".into()),
+        induced_rotations: Vec::new(),
     };
     let _ = manager
         .propose_governance_action("warn-ctx", &admin, action1, &key_admin)
@@ -12168,6 +12189,7 @@ async fn test_warning_count_trigger_fires_behavioral() {
     let action2 = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: target.clone(),
         reason: Some("warning 2".into()),
+        induced_rotations: Vec::new(),
     };
     let _ = manager
         .propose_governance_action("warn-ctx", &admin, action2, &key_admin)
@@ -12229,6 +12251,7 @@ async fn test_participation_actions_against_populated() {
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: target.clone(),
         reason: Some("test action".into()),
+        induced_rotations: Vec::new(),
     };
     let _ = manager
         .propose_governance_action("part-act-ctx", &admin, action, &key_admin)
@@ -12600,6 +12623,7 @@ async fn eligibility_check_uses_context_manager_clock() {
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: "did:key:member".into(),
         reason: Some("clock test".into()),
+        induced_rotations: Vec::new(),
     };
     let result = manager
         .propose_governance_action("clock-ctx", &admin, action, &key_admin)
@@ -14224,6 +14248,7 @@ async fn test_sender_key_failure_still_removes_from_mls() {
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: alice.clone(),
         reason: Some("H9 test".into()),
+        induced_rotations: Vec::new(),
     };
     let result = manager
         .propose_governance_action("sk-fail-ctx", &admin, action, &key_admin)
