@@ -6,17 +6,16 @@
 #![allow(clippy::significant_drop_tightening)]
 
 //! Trust-recovery helpers with explicit-collaborator signatures
-//! (ADR-049 §12c.3).
+//! (ADR-049 commit 12).
 //!
 //! # Purpose
 //!
 //! This module hoists the trust-recovery-domain methods that the actor
 //! handlers in [`crate::context::actor::handlers::trust_recovery`] currently
-//! reach via `view.manager().X(...)`. The hoist is a **pre-work** commit for
-//! the actor handler body migration (later ADR-049 commits): handler bodies
-//! cannot take `&ContextManager` — they take `&ActorDeps` and
-//! `&mut PerContextState` — so the methods they call must accept explicit
-//! collaborators rather than reaching through `self`.
+//! reach via `view.manager().X(...)`. After ADR-049 commit 12
+//! (ContextManager deletion) every helper takes `&Supervisor`; Phase 2
+//! of the post-review-round-1 plan will retarget the handler-side
+//! helpers to `&mut PerContextState + &ActorDeps`.
 //!
 //! This file is the trust-recovery counterpart to
 //! [`crate::context::messaging_helpers`] (12b.1, 12c.1, 12c.1b) and

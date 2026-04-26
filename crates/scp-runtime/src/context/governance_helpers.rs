@@ -6,17 +6,16 @@
 #![allow(clippy::significant_drop_tightening)]
 
 //! Governance helpers with explicit-collaborator signatures
-//! (ADR-049 §12c.3b).
+//! (ADR-049 commit 12).
 //!
 //! # Purpose
 //!
 //! This module hoists the governance-domain methods that the actor handlers
 //! in [`crate::context::actor::handlers::governance`] currently reach via
-//! `view.manager().X(...)`. The hoist is a **pre-work** commit for the
-//! actor handler body migration (later ADR-049 commits): handler bodies
-//! cannot take `&ContextManager` — they take `&ActorDeps` and
-//! `&mut PerContextState` — so the methods they call must accept explicit
-//! collaborators rather than reaching through `self`.
+//! `view.manager().X(...)`. After ADR-049 commit 12 (ContextManager
+//! deletion) every helper takes `&Supervisor`; Phase 2 of the
+//! post-review-round-1 plan will retarget the handler-side helpers to
+//! `&mut PerContextState + &ActorDeps`.
 //!
 //! This file is the governance counterpart to
 //! [`crate::context::messaging_helpers`] (12b.1, 12c.1, 12c.1b),
@@ -5301,7 +5300,7 @@ pub async fn acknowledge_commit_fault(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::start_governance_timeout_task`](crate::context::supervisor::Supervisor::start_governance_timeout_task)
-/// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 ///
 /// The task runs a 60-second interval loop that:
 /// 1. Checks active proposals for timeout expiry via `resolve()`.
@@ -5537,7 +5536,7 @@ pub async fn start_governance_timeout_task(supervisor: &Supervisor, context_id: 
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::governance_event_label`](crate::context::supervisor::Supervisor::governance_event_label)
-/// (ADR-049 commit 12c.9g.3.5). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 ///
 /// Used when appending governance events to the Merkle event log. Each
 /// variant maps to a deterministic string label so event consumers can
@@ -5564,7 +5563,7 @@ pub const fn governance_event_label(event: &GovernanceEvent) -> &'static str {
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::check_commit_fault`](crate::context::supervisor::Supervisor::check_commit_fault)
-/// (ADR-049 commit 12c.9g.3.5). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 ///
 /// Called by every governance executor that mutates context state. While
 /// the marker is set, the context is fail-closed: no further mutations
@@ -5595,7 +5594,7 @@ pub fn check_commit_fault(ctx: &PerContextState) -> Result<(), ContextError> {
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::translate_timeout_events`](crate::context::supervisor::Supervisor::translate_timeout_events)
-/// (ADR-049 commit 12c.9g.3.5). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 pub fn translate_timeout_events(
     result_events: &[GovernanceEvent],
     mls_epoch: u64,
@@ -5675,7 +5674,7 @@ pub fn translate_timeout_events(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::evaluate_periodic_consequences`](crate::context::supervisor::Supervisor::evaluate_periodic_consequences)
-/// (ADR-049 commit 12c.9g.3.5). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 ///
 /// Time-based rules (e.g., "if no messages in 1 hour, downgrade role") must
 /// fire even when no user action occurs. Evaluates all members on every
@@ -5780,7 +5779,7 @@ enum CommitRetryOutcomeKind {
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::process_pending_commits_static`](crate::context::supervisor::Supervisor::process_pending_commits_static)
-/// (ADR-049 commit 12c.9g.3.5). The legacy `_static` suffix is dropped
+/// (ADR-049 commit 12). The legacy `_static` suffix is dropped
 /// because the free function form has no `&self` ambiguity.
 /// Byte-identical behavior.
 ///

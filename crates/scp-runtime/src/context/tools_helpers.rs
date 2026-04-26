@@ -7,17 +7,16 @@
 #![allow(clippy::significant_drop_tightening)]
 
 //! Tools-domain helpers with explicit-collaborator signatures
-//! (ADR-049 §12c.4).
+//! (ADR-049 commit 12).
 //!
 //! # Purpose
 //!
 //! This module hoists the tools-domain methods that the actor handler in
 //! [`crate::context::actor::handlers::tools`] currently reaches via
-//! `view.manager().X(...)`. The hoist is a **pre-work** commit for the
-//! actor handler body migration (later ADR-049 commits): handler bodies
-//! cannot take `&ContextManager` — they take `&ActorDeps` and
-//! `&mut PerContextState` — so the methods they call must accept explicit
-//! collaborators rather than reaching through `self`.
+//! `view.manager().X(...)`. After ADR-049 commit 12 (ContextManager
+//! deletion) every helper takes `&Supervisor`; Phase 2 of the
+//! post-review-round-1 plan will retarget the handler-side helpers to
+//! `&mut PerContextState + &ActorDeps`.
 //!
 //! This file is the tools counterpart to
 //! [`crate::context::messaging_helpers`] (12b.1, 12c.1, 12c.1b),
@@ -95,7 +94,7 @@ use crate::economy::integration::PreparedAction;
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::try_consume_hard_rate_limit`](crate::context::tools_helpers::try_consume_hard_rate_limit)
-/// (ADR-049 commit 12c.4). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 #[must_use]
 pub async fn try_consume_hard_rate_limit(
     supervisor: &Supervisor,
@@ -123,7 +122,7 @@ pub async fn try_consume_hard_rate_limit(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::refund_hard_rate_limit`](crate::context::tools_helpers::refund_hard_rate_limit)
-/// (ADR-049 commit 12c.4). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 pub async fn refund_hard_rate_limit(supervisor: &Supervisor, context_id: &str, did: &DID) {
     // ADR-049 commit 12c.9g.2 — returns `()` so an unpopulated attach
     // slot degrades to a no-op with a tracing error for observability.

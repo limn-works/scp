@@ -459,7 +459,7 @@ async fn handle_import_context(
     // across the delegated await. `Box::pin` the inner future so the
     // hoisted `lifecycle_helpers::import_context` body's 12 KB+ locals
     // do not inflate `handle_import_context`'s own future past clippy's
-    // 16 KB stack budget (ADR-049 commit 12c.2).
+    // 16 KB stack budget (ADR-049 commit 12).
     let import_fut = Box::pin(crate::context::lifecycle_helpers::import_context(
         supervisor, *export,
     ));

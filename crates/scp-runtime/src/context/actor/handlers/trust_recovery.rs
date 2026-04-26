@@ -76,7 +76,7 @@ pub async fn dispatch(
 /// during the commits-10-to-11 migration window — deleted in commit 12
 /// when the shim dissolves.
 ///
-/// # Supervisor receiver (ADR-049 commit 12c.9d)
+/// # Supervisor receiver (ADR-049 commit 12)
 pub(crate) async fn dispatch_from_shim(
     supervisor: &Supervisor,
     cmd: TrustRecoveryCommand,

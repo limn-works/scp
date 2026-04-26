@@ -83,7 +83,7 @@ pub async fn dispatch(
 /// when the shim dissolves and the actor's `run()` loop is the only
 /// caller of [`dispatch`].
 ///
-/// # Supervisor receiver (ADR-049 commit 12c.9d)
+/// # Supervisor receiver (ADR-049 commit 12)
 pub(crate) async fn dispatch_from_shim(
     supervisor: &Supervisor,
     cmd: TtlCloseCommand,

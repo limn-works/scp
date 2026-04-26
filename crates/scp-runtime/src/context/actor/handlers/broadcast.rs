@@ -74,7 +74,7 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// directing the caller to the generic
 /// [`dispatch_from_shim_with_custody`] path instead.
 ///
-/// # Supervisor receiver (ADR-049 commit 12c.9c)
+/// # Supervisor receiver (ADR-049 commit 12)
 ///
 /// Takes `&Supervisor` so the delegated
 /// [`broadcast_helpers`](crate::context::broadcast_helpers) free

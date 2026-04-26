@@ -6,17 +6,16 @@
 #![allow(clippy::significant_drop_tightening)]
 
 //! Standing-context helpers with explicit-collaborator signatures
-//! (ADR-049 §12c.4).
+//! (ADR-049 commit 12).
 //!
 //! # Purpose
 //!
 //! This module hoists the standing-domain methods that the actor handler
 //! in [`crate::context::actor::handlers::standing`] currently reaches via
-//! `view.manager().X(...)`. The hoist is a **pre-work** commit for the
-//! actor handler body migration (later ADR-049 commits): handler bodies
-//! cannot take `&ContextManager` — they take `&ActorDeps` and
-//! `&mut PerContextState` — so the methods they call must accept explicit
-//! collaborators rather than reaching through `self`.
+//! `view.manager().X(...)`. After ADR-049 commit 12 (ContextManager
+//! deletion) every helper takes `&Supervisor`; Phase 2 of the
+//! post-review-round-1 plan will retarget the handler-side helpers to
+//! `&mut PerContextState + &ActorDeps`.
 //!
 //! This file is the standing counterpart to
 //! [`crate::context::messaging_helpers`] (12b.1, 12c.1, 12c.1b),
@@ -84,7 +83,7 @@ use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT
 ///
 /// Hoisted body of the legacy
 /// [`crate::context::standing_helpers::generate_standing_context_id`]
-/// free function (ADR-049 commit 12c.4). The legacy free function remains
+/// free function (ADR-049 commit 12). The legacy free function remains
 /// as a thin re-export so test code importing the legacy path keeps
 /// working through the shim window.
 pub fn generate_standing_context_id(local_did: &DID, peer_did: &DID) -> String {

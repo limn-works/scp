@@ -244,7 +244,7 @@ struct ContextCryptoState {
 
 /// Owned per-context MLS crypto state moved out of
 /// [`MlsCryptoProvider::contexts`] by [`MlsCryptoProvider::take_crypto_state`]
-/// (ADR-049 commit 12b.2a).
+/// (ADR-049 commit 12).
 ///
 /// Mirrors the private [`ContextCryptoState`] struct above — one public
 /// `pub` field per legacy field, plus the `send_sequence` counter so
@@ -370,21 +370,21 @@ struct PendingJoinState {
 pub struct MlsCryptoProvider {
     /// The local member's DID (e.g., `"did:dht:z6Mk..."`).
     local_did: String,
-    /// Injected MLS primitive backend (ADR-049 commit 12c.9f). Production
+    /// Injected MLS primitive backend (ADR-049 commit 12). Production
     /// callers receive a [`ProductionMlsBackend`] from
     /// [`MlsCryptoProvider::new`]; tests inject failure-driven mocks via
     /// [`MlsCryptoProvider::with_backends`]. The provider's orchestration
     /// methods route every inline `OpenMLS` primitive through this trait —
     /// state still lives on the provider's lock-free containers below.
     mls_backend: Arc<dyn MlsBackend>,
-    /// Injected HPKE primitive backend (ADR-049 commit 12c.9f). Same
+    /// Injected HPKE primitive backend (ADR-049 commit 12). Same
     /// injection contract as `mls_backend` — production wires
     /// [`ProductionHpkeBackend`]; tests can substitute mocks for fail
     /// injection on the wrapping-key seal/unseal path.
     hpke_backend: Arc<dyn HpkeBackend>,
     /// Per-context crypto state, keyed by the 32-byte context ID.
     ///
-    /// Lock-free [`DashMap`] — the actor refactor (ADR-049 commit 12c.9f)
+    /// Lock-free [`DashMap`] — the actor refactor (ADR-049 commit 12)
     /// removed the `std::sync::Mutex<HashMap<...>>` wrapper. State that
     /// migrates onto [`crate::context::actor::ContextActor`] via
     /// [`Self::take_crypto_state`] is removed from this map and recorded
@@ -432,7 +432,7 @@ pub struct MlsCryptoProvider {
     pending_joins: ArcSwapOption<PendingJoinState>,
     /// Contexts whose crypto state has been destructively moved into a
     /// [`crate::context::actor::ContextActor`] via
-    /// [`Self::take_crypto_state`] (ADR-049 commit 12b.2a).
+    /// [`Self::take_crypto_state`] (ADR-049 commit 12).
     ///
     /// Tracked separately from [`Self::contexts`] so [`Self::with_context`]
     /// can distinguish "context was never created" (returns the legacy
@@ -515,7 +515,7 @@ impl MlsCryptoProvider {
     }
 
     /// Borrowed reference to the injected MLS primitive backend
-    /// (ADR-049 commit 12c.9f). Helper functions outside the provider
+    /// (ADR-049 commit 12). Helper functions outside the provider
     /// that need the same backend (e.g. handler code in
     /// `handlers/messaging.rs` once the deletion ladder lands) can
     /// borrow through this accessor.
@@ -525,7 +525,7 @@ impl MlsCryptoProvider {
     }
 
     /// Borrowed reference to the injected HPKE primitive backend
-    /// (ADR-049 commit 12c.9f). See [`Self::mls_backend`].
+    /// (ADR-049 commit 12). See [`Self::mls_backend`].
     #[must_use]
     pub fn hpke_backend(&self) -> &Arc<dyn HpkeBackend> {
         &self.hpke_backend
@@ -534,7 +534,7 @@ impl MlsCryptoProvider {
     /// Destructively move the per-context MLS crypto state out of this
     /// provider and return it as an [`OwnedMlsCryptoState`] the caller
     /// can hand to a [`crate::context::actor::ContextActor`] at spawn
-    /// time (ADR-049 commit 12b.2a).
+    /// time (ADR-049 commit 12).
     ///
     /// After `Ok` return:
     /// - `self.contexts[context_id]` is absent (`HashMap::remove`d).
@@ -631,7 +631,7 @@ impl MlsCryptoProvider {
     ///   if the context was never created (or its state was evicted).
     /// - [`ContextError::CryptoFailed`] with
     ///   `"context state owned by actor"` if the state was destructively
-    ///   moved via [`Self::take_crypto_state`] (ADR-049 commit 12b.2a).
+    ///   moved via [`Self::take_crypto_state`] (ADR-049 commit 12).
     ///   Callers seeing this error must route through the actor's
     ///   mailbox — the provider no longer owns the state.
     fn with_context<F, R>(&self, context_id: &[u8; 32], f: F) -> Result<R, ContextError>

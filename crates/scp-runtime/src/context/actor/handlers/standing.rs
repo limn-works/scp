@@ -82,7 +82,7 @@ pub async fn dispatch(
 /// [`Supervisor::dispatch_standing_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_standing_command)
 /// during the commits-11-to-11.5 migration window.
 ///
-/// # Supervisor receiver (ADR-049 commit 12c.9d)
+/// # Supervisor receiver (ADR-049 commit 12)
 pub(crate) async fn dispatch_from_shim(
     supervisor: &Supervisor,
     cmd: StandingCommand,

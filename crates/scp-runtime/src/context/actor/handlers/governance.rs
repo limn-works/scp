@@ -373,7 +373,7 @@ async fn handle_vote_on_proposal(
     };
 
     // Box::pin — governance futures cross clippy's 16 KB stack budget
-    // (ADR-049 commit 12c.2). See sibling `handle_propose_governance_action`.
+    // (ADR-049 commit 12). See sibling `handle_propose_governance_action`.
     let (outcome, reply_result) =
         match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, vote_fut)).await {
             Ok(Ok(tuple)) => (Outcome::ok_mutated(()), Ok(tuple)),

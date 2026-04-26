@@ -6,17 +6,16 @@
 #![allow(clippy::significant_drop_tightening)]
 
 //! Broadcast-domain helpers with explicit-collaborator signatures
-//! (ADR-049 §12c.4).
+//! (ADR-049 commit 12).
 //!
 //! # Purpose
 //!
 //! This module hoists the broadcast-domain methods that the actor handler
 //! in [`crate::context::actor::handlers::broadcast`] currently reaches via
-//! `view.manager().X(...)`. The hoist is a **pre-work** commit for the
-//! actor handler body migration (later ADR-049 commits): handler bodies
-//! cannot take `&ContextManager` — they take `&ActorDeps` and
-//! `&mut PerContextState` — so the methods they call must accept explicit
-//! collaborators rather than reaching through `self`.
+//! `view.manager().X(...)`. After ADR-049 commit 12 (ContextManager
+//! deletion) every helper takes `&Supervisor`; Phase 2 of the
+//! post-review-round-1 plan will retarget the handler-side helpers to
+//! `&mut PerContextState + &ActorDeps`.
 //!
 //! This file is the broadcast counterpart to
 //! [`crate::context::messaging_helpers`] (12b.1, 12c.1, 12c.1b),
@@ -52,7 +51,7 @@
 //! the outer shim in a later ADR-049 commit when the actor handler
 //! body owns the broadcast path directly.
 //!
-//! # Supervisor receiver (ADR-049 commit 12c.9c)
+//! # Supervisor receiver (ADR-049 commit 12)
 //!
 //! Every hoisted helper now takes `supervisor: &Supervisor`. The prior
 //! `mgr: &ContextManager` shape is retired in this commit — every
@@ -106,7 +105,7 @@ use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::subscribe_broadcast`](crate::context::broadcast_helpers::subscribe_broadcast)
-/// (ADR-049 commit 12c.4). See the legacy method's doc comment for the
+/// (ADR-049 commit 12). See the legacy method's doc comment for the
 /// full semantics. Byte-identical behavior.
 ///
 /// # Errors
@@ -213,7 +212,7 @@ where
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::unsubscribe_broadcast`](crate::context::broadcast_helpers::unsubscribe_broadcast)
-/// (ADR-049 commit 12c.4). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 ///
 /// # Errors
 ///
@@ -302,7 +301,7 @@ pub async fn unsubscribe_broadcast(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::publish_broadcast`](crate::context::broadcast_helpers::publish_broadcast)
-/// (ADR-049 commit 12c.4). See the legacy method's doc comment for the
+/// (ADR-049 commit 12). See the legacy method's doc comment for the
 /// full semantics. Byte-identical behavior.
 ///
 /// # Errors
@@ -445,7 +444,7 @@ pub async fn publish_broadcast(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::publish_broadcast_content`](crate::context::broadcast_helpers::publish_broadcast_content)
-/// (ADR-049 commit 12c.4). Serializes the `BroadcastContent` with the
+/// (ADR-049 commit 12). Serializes the `BroadcastContent` with the
 /// magic prefix and delegates to [`publish_broadcast`]. Byte-identical
 /// behavior.
 ///
@@ -485,7 +484,7 @@ pub async fn publish_broadcast_content(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::block_broadcast_subscriber`](crate::context::broadcast_helpers::block_broadcast_subscriber)
-/// (ADR-049 commit 12c.4). See the legacy method's doc comment for the
+/// (ADR-049 commit 12). See the legacy method's doc comment for the
 /// full semantics. Byte-identical behavior.
 ///
 /// # Errors
@@ -564,7 +563,7 @@ pub async fn block_broadcast_subscriber(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::unblock_broadcast_subscriber`](crate::context::broadcast_helpers::unblock_broadcast_subscriber)
-/// (ADR-049 commit 12c.4). See the legacy method's doc comment for the
+/// (ADR-049 commit 12). See the legacy method's doc comment for the
 /// full semantics. Byte-identical behavior.
 ///
 /// # Errors
@@ -644,7 +643,7 @@ pub async fn unblock_broadcast_subscriber(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::handle_broadcast_key_request`](crate::context::broadcast_helpers::handle_broadcast_key_request)
-/// (ADR-049 commit 12c.4). See the legacy method's doc comment for the
+/// (ADR-049 commit 12). See the legacy method's doc comment for the
 /// full semantics including the defense-in-depth `local_dids` check.
 /// Byte-identical behavior.
 ///
@@ -694,7 +693,7 @@ pub async fn handle_broadcast_key_request(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::broadcast_subscriber_count`](crate::context::broadcast_helpers::broadcast_subscriber_count)
-/// (ADR-049 commit 12c.4). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 pub async fn broadcast_subscriber_count(
     supervisor: &Supervisor,
     context_id: &str,
@@ -714,7 +713,7 @@ pub async fn broadcast_subscriber_count(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::is_broadcast_subscriber`](crate::context::broadcast_helpers::is_broadcast_subscriber)
-/// (ADR-049 commit 12c.4). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 pub async fn is_broadcast_subscriber(supervisor: &Supervisor, context_id: &str, did: &str) -> bool {
     let Ok(arc) = manager_methods::get_context_arc(supervisor, context_id) else {
         return false;
@@ -735,7 +734,7 @@ pub async fn is_broadcast_subscriber(supervisor: &Supervisor, context_id: &str, 
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::broadcast_admission`](crate::context::broadcast_helpers::broadcast_admission)
-/// (ADR-049 commit 12c.4). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 pub async fn broadcast_admission(
     supervisor: &Supervisor,
     context_id: &str,

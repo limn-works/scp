@@ -73,7 +73,7 @@ pub async fn dispatch(
 /// Shim-callable dispatch. Used by
 /// [`Supervisor::dispatch_tools_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_tools_command).
 ///
-/// # Supervisor receiver (ADR-049 commit 12c.9d)
+/// # Supervisor receiver (ADR-049 commit 12)
 pub(crate) async fn dispatch_from_shim(supervisor: &Supervisor, cmd: ToolsCommand) -> Outcome<()> {
     dispatch_inner(supervisor, cmd).await
 }

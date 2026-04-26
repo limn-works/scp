@@ -6,17 +6,16 @@
 // byte-identical to the legacy behavior.
 #![allow(clippy::significant_drop_tightening)]
 
-//! Economy helpers with explicit-collaborator signatures (ADR-049 §12c.3).
+//! Economy helpers with explicit-collaborator signatures (ADR-049 commit 12).
 //!
 //! # Purpose
 //!
 //! This module hoists the economy-domain method that the actor handler in
 //! [`crate::context::actor::handlers::economy`] currently reaches via
-//! `view.manager().X(...)`. The hoist is a **pre-work** commit for the
-//! actor handler body migration (later ADR-049 commits): handler bodies
-//! cannot take `&ContextManager` — they take `&ActorDeps` and
-//! `&mut PerContextState` — so the methods they call must accept explicit
-//! collaborators rather than reaching through `self`.
+//! `view.manager().X(...)`. After ADR-049 commit 12 (ContextManager
+//! deletion) every helper takes `&Supervisor`; Phase 2 of the
+//! post-review-round-1 plan will retarget the handler-side helpers to
+//! `&mut PerContextState + &ActorDeps`.
 //!
 //! This file is the economy counterpart to
 //! [`crate::context::messaging_helpers`] (12b.1, 12c.1, 12c.1b),
@@ -29,7 +28,7 @@
 //! [`verify_payment_receipts`] is **behavior-preserving by construction**.
 //! Its body is a verbatim copy of the legacy inherent method's body with
 //! `self.payment_adapter` replaced by
-//! `supervisor.payment_adapter_ref()` (ADR-049 commit 12c.9c).
+//! `supervisor.payment_adapter_ref()` (ADR-049 commit 12).
 //!
 //! The legacy inherent method on
 //! [`Supervisor`](crate::context::supervisor::Supervisor) remains as
@@ -37,7 +36,7 @@
 //! ADR-049 commit when the actor handler body owns the economy path
 //! directly.
 //!
-//! # Supervisor receiver (ADR-049 commit 12c.9c)
+//! # Supervisor receiver (ADR-049 commit 12)
 //!
 //! [`verify_payment_receipts`] takes `supervisor: &Supervisor`. The
 //! payment adapter is lifted onto the supervisor by
@@ -50,7 +49,7 @@
 //!
 //! [`verify_payment_receipts`].
 //!
-//! # Escrow primitives hoisted (ADR-049 commit 12c.9g.1)
+//! # Escrow primitives hoisted (ADR-049 commit 12)
 //!
 //! [`authorize_paid_action`], [`complete_paid_action`], and
 //! [`void_paid_action`] are the three-phase escrow primitives reached
@@ -134,7 +133,7 @@ pub async fn verify_payment_receipts(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::authorize_paid_action`](crate::context::supervisor::Supervisor::authorize_paid_action)
-/// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 ///
 /// Evaluates cost, checks spending UCAN, checks budget, and calls
 /// `adapter.authorize` to create an escrow hold. The caller performs the
@@ -238,7 +237,7 @@ pub async fn authorize_paid_action(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::complete_paid_action`](crate::context::supervisor::Supervisor::complete_paid_action)
-/// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 ///
 /// Calls `adapter.capture`, verifies the receipt, stores it in the event
 /// log, and records budget spend.
@@ -308,7 +307,7 @@ pub async fn complete_paid_action(
 ///
 /// Hoisted body of the legacy
 /// [`ContextManager::void_paid_action`](crate::context::supervisor::Supervisor::void_paid_action)
-/// (ADR-049 commit 12c.9g.1). Byte-identical behavior.
+/// (ADR-049 commit 12). Byte-identical behavior.
 ///
 /// Calls `adapter.void` to release the escrow hold. Best-effort —
 /// logs but does not propagate void failures.

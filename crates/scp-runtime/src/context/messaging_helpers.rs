@@ -7,11 +7,10 @@
 //! `crate::context::messaging_helpers`. Commit 12b.1 hoisted six pure
 //! [`PerContextState`]-scoped helpers. Commit 12c.1 extends the hoist to
 //! the two top-level messaging methods [`send_message`] and
-//! [`deliver_incoming`]. The hoist is a **pre-work** commit for the actor
-//! handler body migration (commit 12c.2 of ADR-049): handler bodies
-//! cannot take `&ContextManager` — they take `&ActorDeps` and
-//! `&mut PerContextState` — so the helpers they call must accept
-//! explicit collaborators rather than reaching through `self`.
+//! [`deliver_incoming`]. After ADR-049 commit 12 (ContextManager
+//! deletion) every helper takes `&Supervisor`; Phase 2 of the
+//! post-review-round-1 plan will retarget the handler-side helpers to
+//! `&mut PerContextState + &ActorDeps`.
 //!
 //! # Behavior preservation
 //!
@@ -21,7 +20,7 @@
 //! `deliver_incoming` outer methods still exist (and still drive the
 //! production send/receive path); they are now one-line forwarders that
 //! call [`send_message`] / [`deliver_incoming`] with their own fields as
-//! arguments. The outer methods are deleted in commit 12f once every
+//! arguments. The outer methods are deleted in commit 12 once every
 //! handler has migrated off them.
 //!
 //! # Module-internal helpers
@@ -2086,7 +2085,7 @@ pub async fn deliver_message_and_drain_buffered(
 }
 
 // ===========================================================================
-// send_pseudonym_announcement (hoisted from ContextManager — ADR-049 commit 12)
+// send_pseudonym_announcement (hoisted out of the deleted `ContextManager` — ADR-049 commit 12)
 // ===========================================================================
 
 /// Sends a pseudonym announcement MLS message so other members can map the

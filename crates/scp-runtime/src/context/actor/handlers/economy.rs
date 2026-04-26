@@ -57,7 +57,7 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// `deps` is accepted for symmetry — the economy handler does not yet
 /// touch deps during the shim period. Commit 12 rewires these paths.
 ///
-/// # Supervisor receiver (ADR-049 commit 12c.9c)
+/// # Supervisor receiver (ADR-049 commit 12)
 ///
 /// Takes `&Supervisor` so the delegated
 /// [`economy_helpers::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts)

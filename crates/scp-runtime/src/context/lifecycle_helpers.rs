@@ -8,7 +8,7 @@
 #![allow(clippy::significant_drop_tightening)]
 
 //! Lifecycle + TTL / close helpers with explicit-collaborator signatures
-//! (ADR-049 §12c.2).
+//! (ADR-049 commit 12).
 //!
 //! # Purpose
 //!
@@ -16,11 +16,10 @@
 //! actor handlers in
 //! [`crate::context::actor::handlers::lifecycle`] /
 //! [`crate::context::actor::handlers::ttl_close`] currently reach via
-//! `view.manager().X(...)`. The hoist is a **pre-work** commit for the
-//! actor handler body migration (later ADR-049 commits): handler bodies
-//! cannot take `&ContextManager` — they take `&ActorDeps` and
-//! `&mut PerContextState` — so the methods they call must accept explicit
-//! collaborators rather than reaching through `self`.
+//! `view.manager().X(...)`. After ADR-049 commit 12 (ContextManager
+//! deletion) every helper takes `&Supervisor`; Phase 2 of the
+//! post-review-round-1 plan will retarget the handler-side helpers to
+//! `&mut PerContextState + &ActorDeps`.
 //!
 //! This file is the lifecycle / `ttl_close` counterpart to
 //! [`crate::context::messaging_helpers`] (commits 12b.1, 12c.1, 12c.1b).
@@ -109,7 +108,7 @@ use crate::context::supervisor::Supervisor;
 use crate::context::ttl::{self, CloseResult, TtlExtension, TtlTimer};
 
 /// Shared expectation message for `Supervisor::with_providers()`
-/// inside helpers (ADR-049 commit 12c.9d).
+/// inside helpers (ADR-049 commit 12).
 // Phase 1 fix-up of ADR-049 (post-review-round-1): per-helper
 // `ATTACHED_EXPECT` constants consolidated to the single
 // `PROVIDER_NOT_INITIALIZED` definition in `manager_methods`. The
@@ -2001,7 +2000,7 @@ pub async fn spawn_ttl_timer(
 }
 
 // ---------------------------------------------------------------------------
-// load_persisted_context_state — hoisted from ContextManager (ADR-049 commit 12)
+// load_persisted_context_state — hoisted out of the deleted `ContextManager` (ADR-049 commit 12)
 // ---------------------------------------------------------------------------
 
 /// Loads a persisted context snapshot and optional broadcast state.
@@ -2076,7 +2075,7 @@ fn restore_event_log_best_effort(supervisor: &Supervisor, context_id: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// restore_context — hoisted from ContextManager (ADR-049 commit 12)
+// restore_context — hoisted out of the deleted `ContextManager` (ADR-049 commit 12)
 // ---------------------------------------------------------------------------
 
 /// Restores a context into the supervisor from persisted state.
@@ -2335,7 +2334,7 @@ pub async fn restore_context(
 }
 
 // ---------------------------------------------------------------------------
-// restore_all_contexts — hoisted from ContextManager (ADR-049 commit 12)
+// restore_all_contexts — hoisted out of the deleted `ContextManager` (ADR-049 commit 12)
 // ---------------------------------------------------------------------------
 
 /// Restore every persisted context that's in `Active` state.
@@ -2395,7 +2394,7 @@ pub async fn restore_all_contexts(supervisor: &Supervisor) -> Result<Vec<String>
 
 // ---------------------------------------------------------------------------
 // flush_all_contexts / flush_all_contexts_sync / shutdown_all_contexts
-// (hoisted from ContextManager, ADR-049 commit 12)
+// (hoisted out of the deleted `ContextManager`, ADR-049 commit 12)
 // ---------------------------------------------------------------------------
 
 /// Per-context lock-acquisition budget used by [`flush_all_contexts`].

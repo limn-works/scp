@@ -67,7 +67,7 @@ use zeroize::Zeroizing;
 // ---------------------------------------------------------------------------
 
 /// The shared per-context state map — `Arc`-wrapped so the manager,
-/// the supervisor (ADR-049 commit 12c.9b), and spawned background
+/// the supervisor (ADR-049 commit 12), and spawned background
 /// tasks all hold equivalent clones of the same `DashMap`. The
 /// per-entry `Arc<Mutex<PerContextState>>` is the contract the manager
 /// exposes via `ContextManager::contexts_arc`; the alias is
@@ -1388,7 +1388,7 @@ impl Supervisor {
     /// Spawn a new `ContextActor` task that owns drained
     /// [`PerContextState`](crate::context::actor::PerContextState) +
     /// [`ActorDeps`](crate::context::actor::ActorDeps) directly
-    /// (ADR-049 commit 12b.2a).
+    /// (ADR-049 commit 12).
     ///
     /// This is the post-refactor spawn path: the supervisor's caller
     /// drains state from the legacy `ContextManager` and

@@ -110,7 +110,7 @@ pub async fn dispatch(
 /// This entry point exists to avoid that churn — it takes only the
 /// supervisor, the send tracker, and the command.
 ///
-/// # Supervisor receiver (ADR-049 commit 12c.9c)
+/// # Supervisor receiver (ADR-049 commit 12)
 ///
 /// Takes `&Supervisor` so the hoisted
 /// [`messaging_helpers`](crate::context::messaging_helpers) free
