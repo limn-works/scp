@@ -30,6 +30,18 @@ PROTECTED_SUFFIXES=(
 
 tool_json=$(cat)
 
+# Claude Code's PreToolUse matcher is treated as substring/regex and can fire
+# this hook on tools other than Edit/Write/MultiEdit (e.g. Bash). Those payloads
+# have no `tool_input.file_path`, so the jq -er below would fail and the script
+# would fail-closed with non-JSON stderr — which Claude Code's hook-output
+# validator then rejects. Validate our preconditions explicitly and no-op
+# otherwise.
+tool_name=$(printf '%s' "$tool_json" | jq -r '.tool_name // ""')
+case "$tool_name" in
+    Edit|Write|MultiEdit) ;;
+    *) exit 0 ;;
+esac
+
 paths=$(
     printf '%s' "$tool_json" \
         | jq -er '
