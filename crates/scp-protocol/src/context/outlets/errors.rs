@@ -807,6 +807,101 @@ impl OutletError {
     ) -> [u8; WIRE_MESSAGE_LEN] {
         compute_wire_message(outlet_message_key, catalog_key)
     }
+
+    /// Constructs an [`OutletError`] for the **runtime → `ContextError`
+    /// seam** (SCP-OUT-027).
+    ///
+    /// This constructor is **not** for §5.4.4 wire emission. Use
+    /// [`Self::new`] for that path — it enforces catalog-key registration
+    /// against the outlet's pinned `message_catalog` and computes a real
+    /// `HMAC-SHA-256(outlet_message_key, catalog_key)`.
+    ///
+    /// At the runtime → `ContextError` seam the typed envelope escapes via
+    /// `Result<_, ContextError>` to in-process Rust and FFI callers, never
+    /// onto the §5.4.4 wire. The runtime does **not** have the per-outlet
+    /// `outlet_message_key` / `registration_event_id` here, so this
+    /// constructor synthesizes deterministic placeholders:
+    ///
+    /// - `outlet_message_key` is treated as the **all-zero key** (length-32),
+    ///   so `message = HMAC-SHA-256([0; 32], slug)[..32]`. The HMAC value is
+    ///   deterministic-but-non-secret — receivers MUST NOT rely on it for
+    ///   reverse-lookup on this path. Wire emission re-derives a real HMAC
+    ///   at the SCP-OUT-029 cross-context wrap seam (where the real key is
+    ///   in scope).
+    /// - `registration_event_id` is `[0; 32]` — sentinel for "no registration
+    ///   event was joined to this error".
+    /// - `pad_nonce` is fresh-per-call from a CSPRNG (`rand::random()`),
+    ///   matching the §5.4.4 round-5 unconditional emission rule.
+    /// - `catalog_key` is derived directly from `slug` (the slug regex is a
+    ///   strict subset of the catalog-key regex per §5.4.4).
+    /// - `detail` is `None` and `source_chain` is `Vec::new()` — both
+    ///   shape-conformant for any class.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletErrorConstructionFailed`] only if `code` or `slug`
+    /// fail their respective regex checks. The catalog-membership check is
+    /// **not** applied (no real `message_catalog` exists at this seam).
+    pub fn from_invocation_error_template(
+        class: OutletErrorClass,
+        code: impl Into<String>,
+        slug: impl Into<String>,
+        retry: RetryPolicy,
+    ) -> Result<Self, OutletErrorConstructionFailed> {
+        let code = code.into();
+        let slug = slug.into();
+
+        // 1. code regex check (§5.4.4 6100-6199 sub-block).
+        if !validate_outlet_error_code(&code) {
+            return Err(OutletErrorConstructionFailed::MalformedCode { code });
+        }
+
+        // 2. slug regex check (§5.4.4 catalog-key regex).
+        if !validate_catalog_key(&slug) {
+            return Err(OutletErrorConstructionFailed::MalformedSlug { slug });
+        }
+
+        // 3. derive a catalog-key from the slug (slug regex ⊆ catalog-key
+        //    regex per §5.4.4) — used only for the placeholder HMAC.
+        let catalog_key = CatalogKey::try_new(slug.clone())
+            .map_err(|_| OutletErrorConstructionFailed::MalformedSlug { slug: slug.clone() })?;
+
+        // 4. placeholder HMAC under the all-zero key (deterministic, public).
+        let zero_key = [0u8; OUTLET_MESSAGE_KEY_LEN];
+        let message = compute_wire_message(&zero_key, &catalog_key);
+
+        // 5. fresh CSPRNG pad_nonce (§5.4.4 round-5 unconditional emission).
+        let pad_nonce: [u8; PAD_NONCE_LEN] = rand::random();
+
+        Ok(Self {
+            code,
+            slug,
+            class,
+            message,
+            retry,
+            detail: None,
+            source_chain: Vec::new(),
+            pad_nonce,
+            registration_event_id: [0u8; REGISTRATION_EVENT_ID_LEN],
+            unknown_fields: BTreeMap::new(),
+        })
+    }
+}
+
+impl std::fmt::Display for OutletError {
+    /// Renders `<code> (<slug>): <class>` — the human-readable rendering
+    /// of the §5.4.4 envelope. The `message` HMAC is opaque to callers and
+    /// is NOT rendered here (it requires an out-of-band catalog lookup
+    /// against the emitting outlet's `outlet_message_key`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{code} ({slug}): {class}",
+            code = self.code,
+            slug = self.slug,
+            class = self.class.as_wire(),
+        )
+    }
 }
 
 /// Internal helper — computes the §5.4.4 round-5 HMAC over a catalog key.

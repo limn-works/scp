@@ -39,6 +39,7 @@ pub use governance::{
 };
 pub use membership::{MemberInfo, MembershipState};
 pub use nesting::{compute_ceiling_intersection, validate_child_ttl, validate_nesting_depth};
+pub use outlets::errors::OutletError;
 pub use params::{
     BridgeCapability, BridgeDirectionality, BridgeMetadata, Capability, CeilingPolicy, ContextMode,
     ContextParams, FieldVisibility, GovernanceModel, MemoryScope, MetadataVisibilityPolicy,
@@ -430,6 +431,41 @@ pub enum ContextError {
         /// Total number of send attempts.
         attempts: u32,
     },
+
+    /// A typed §5.4.4 outlet invocation error escaped to the runtime
+    /// `Result<…, ContextError>` seam (SCP-OUT-027).
+    ///
+    /// The wrapped [`OutletError`] preserves the §5.4.4 envelope shape
+    /// (`code`, `slug`, `class`, `retry`, `detail`, `pad_nonce`,
+    /// `registration_event_id`) so SDKs and bridges can dispatch on the
+    /// typed structure rather than parsing free-form `PermissionDenied`
+    /// strings.
+    ///
+    /// `OutletError` is `Box`-wrapped to keep `ContextError` compact —
+    /// the typed envelope is ~264 bytes (HMAC + nonce + registration id)
+    /// and inlining it inflates every `Result<_, ContextError>` return
+    /// across the runtime. Boxing keeps the variant payload at one
+    /// pointer (clippy `result_large_err`).
+    ///
+    /// At this seam the runtime does NOT have access to the per-outlet
+    /// `outlet_message_key` / `registration_event_id` — wire-form
+    /// HMAC transmission is out of scope at the `Result<…, ContextError>`
+    /// boundary (which is consumed by FFI translators and Rust callers,
+    /// never serialized as a §5.4.4 wire envelope here). The
+    /// `OutletError` is therefore constructed via
+    /// [`OutletError::from_invocation_error_template`], which synthesizes
+    /// deterministic placeholder values for those fields. Cross-context
+    /// wire emission happens at a separate seam (SCP-OUT-029
+    /// `wrap_cross_context_error`) where the real per-outlet key is in
+    /// scope.
+    #[error("{0}")]
+    OutletInvocation(Box<OutletError>),
+}
+
+impl From<OutletError> for ContextError {
+    fn from(error: OutletError) -> Self {
+        Self::OutletInvocation(Box::new(error))
+    }
 }
 
 // ---------------------------------------------------------------------------

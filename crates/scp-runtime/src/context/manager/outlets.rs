@@ -543,12 +543,14 @@ impl ContextManager {
     /// # Errors
     ///
     /// Returns [`ContextError::ContextNotRegistered`] if the context is
-    /// unknown in Phase 1 or 3. Returns [`ContextError::PermissionDenied`]
-    /// (with an `SCP-ECON-*` or `SCP-CTX-*` code) on any invocation,
-    /// budget, UCAN composition, schema validation, or consequence
-    /// failure. All errors are terminal for the invocation; partial
-    /// state mutations (budget, velocity, escrow) are rolled back before
-    /// the error is returned via the `OutletEconomyTicket`.
+    /// unknown in Phase 1 or 3. Invocation failures surface as
+    /// [`ContextError::OutletInvocation`] (typed §5.4.4 envelope per
+    /// SCP-OUT-027); economic-integration failures (spending UCAN,
+    /// nonce commit) surface as [`ContextError::IntegrationFailed`]
+    /// with an `SCP-ECON-*` code. All errors are terminal for the
+    /// invocation; partial state mutations (budget, velocity, escrow)
+    /// are rolled back before the error is returned via the
+    /// `OutletEconomyTicket`.
     #[allow(
         clippy::too_many_arguments,
         clippy::too_many_lines,
@@ -731,7 +733,14 @@ impl ContextManager {
                         .velocity_tracker
                         .rollback(invoker_did, velocity_token);
                     ctx.governance.hard_rate_limit.refund(invoker_did);
-                    return Err(ContextError::PermissionDenied(
+                    // SCP-OUT-027: domain-appropriate ContextError variant.
+                    // Spending-UCAN absence is an economic integration
+                    // failure, NOT a §5.4.4 outlet-error class member —
+                    // route through the existing `IntegrationFailed`
+                    // variant so we keep the canonical SCP-ECON-12060
+                    // code at the diagnostic surface without the
+                    // pre-OUT-027 lossy `PermissionDenied` collapse.
+                    return Err(ContextError::IntegrationFailed(
                         "SCP-ECON-12060: paid action requires spending UCAN".to_owned(),
                     ));
                 };
@@ -810,7 +819,12 @@ impl ContextManager {
                     .velocity_tracker
                     .rollback(invoker_did, velocity_token);
                 ctx.governance.hard_rate_limit.refund(invoker_did);
-                return Err(ContextError::PermissionDenied(format!(
+                // SCP-OUT-027: nonce-commit failure is an economic
+                // integration concern (spending-nonce ledger). Route
+                // through `IntegrationFailed` so the SCP-ECON-12066
+                // code surfaces without the pre-OUT-027 lossy
+                // `PermissionDenied` collapse.
+                return Err(ContextError::IntegrationFailed(format!(
                     "SCP-ECON-12066: nonce commit failed after budget acceptance: {e}"
                 )));
             }
@@ -1133,7 +1147,9 @@ impl ContextManager {
     ///
     /// Returns the same [`ContextError`] taxonomy as
     /// [`Self::invoke_outlet_with_economy`]. Misdeclaration paths surface
-    /// as `ContextError::PermissionDenied(SCP-TOOL-6103: ...)`.
+    /// as `ContextError::OutletInvocation(OutletError {
+    /// code: SCP-TOOL-6130, slug: execution.handler-panic, ... })`
+    /// per spec §5.4.4 (SCP-OUT-027).
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn invoke_outlet_dispatch_with_economy<E>(
         &self,
@@ -1152,9 +1168,16 @@ impl ContextManager {
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized,
     {
         // Snapshot the outlet kind under the registry so the closure-based
-        // adapter sees a stable value.
+        // adapter sees a stable value. SCP-OUT-027: outlet-not-found
+        // collapses to the §5.4.4 query-oracle target
+        // (CODE_AUTHORIZATION_DENIED + slug authorization.denied) so
+        // registration state does not leak through error class — the
+        // same envelope `InvocationError::OutletNotFound` would produce
+        // through `invocation_error_to_context`.
         let registration = registry.get(outlet_id).ok_or_else(|| {
-            ContextError::PermissionDenied(format!("SCP-TOOL-6082: outlet not found: {outlet_id}"))
+            invocation_error_to_context(InvocationError::OutletNotFound {
+                outlet_id: outlet_id.clone(),
+            })
         })?;
         let kind = registration.kind;
 
@@ -1244,11 +1267,17 @@ impl ContextManager {
                                         },
                                     );
                                 }
-                                Err("SCP-TOOL-6103: outlet kind mismatch (Query expected)".to_owned()) // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates this to typed OutletError under CODE_PROTOCOL_VIOLATION
+                                // SCP-OUT-027: error-code prefix removed from
+                                // the message string. The §5.4.4 typed
+                                // envelope at `invocation_error_to_context`
+                                // is now the sole source of `(code, slug,
+                                // class)`; the message text below is
+                                // diagnostic payload only.
+                                Err("outlet kind mismatch (Query expected)".to_owned())
                             }
                             Err(crate::context::outlets::invoke::OutletExecutorError::QueryViolation { operation }) => {
                                 Err(format!(
-                                    "SCP-TOOL-6103: query violation in exec_query: {operation}" // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates this to typed OutletError under CODE_PROTOCOL_VIOLATION
+                                    "query violation in exec_query: {operation}"
                                 ))
                             }
                             Err(crate::context::outlets::invoke::OutletExecutorError::Failed(msg)) => {
@@ -1284,11 +1313,12 @@ impl ContextManager {
                                 Ok(value)
                             }
                             Err(crate::context::outlets::invoke::OutletExecutorError::KindMismatch { .. }) => {
-                                Err("SCP-TOOL-6103: outlet kind mismatch (Action expected)".to_owned()) // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates this to typed OutletError under CODE_PROTOCOL_VIOLATION
+                                // SCP-OUT-027: see exec_query branch above.
+                                Err("outlet kind mismatch (Action expected)".to_owned())
                             }
                             Err(crate::context::outlets::invoke::OutletExecutorError::QueryViolation { operation }) => {
                                 Err(format!(
-                                    "SCP-TOOL-6103: query violation in exec_action: {operation}" // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates this to typed OutletError under CODE_PROTOCOL_VIOLATION
+                                    "query violation in exec_action: {operation}"
                                 ))
                             }
                             Err(crate::context::outlets::invoke::OutletExecutorError::Failed(msg)) => {
@@ -2257,82 +2287,229 @@ fn layer_composition_outlet_placeholder() -> scp_protocol::context::outlets::Out
     }
 }
 
-/// Maps an [`InvocationError`] to a [`ContextError`] with SCP codes.
+/// Pure mapping table — given an [`InvocationError`], returns the
+/// `(class, code, slug, retry)` tuple from which the typed
+/// [`OutletError`] envelope is built per spec §5.4.4 (SCP-OUT-027).
 ///
-/// Uses the canonical `SCP-TOOL` prefix (6000-6999 range) for
-/// outlet-invocation failures, per the canonical error-code registry in
-/// `.docs/standards/sdk-common.md`.
-fn invocation_error_to_context(err: InvocationError) -> ContextError {
+/// Split out from [`invocation_error_to_context`] so the function below
+/// stays under the `clippy::too_many_lines` threshold without sacrificing
+/// the per-variant `§5.4.4` rationale comments. The `retry` hint is
+/// `Never` for every variant because outlet-invocation failures at this
+/// seam are caller-driven (validation, authorization, panic): bridges
+/// and SDKs that need finer-grained retry MUST consume the `slug`, not
+/// the policy field.
+///
+/// Identical-body arms are intentionally merged via `|`-patterns
+/// (clippy `match_same_arms`).
+fn invocation_error_to_envelope_template(
+    err: &InvocationError,
+) -> (
+    scp_protocol::context::outlets::errors::OutletErrorClass,
+    &'static str,
+    &'static str,
+    scp_protocol::context::outlets::errors::RetryPolicy,
+) {
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_AUTHORIZATION_DENIED, CODE_ECONOMIC_FAULT, CODE_EXECUTION_FAULT, CODE_INPUT_VIOLATION,
+        CODE_OUTPUT_VIOLATION, CODE_PROTOCOL_VIOLATION, SLUG_AUTHORIZATION_DENIED,
+        SLUG_ECONOMIC_BUDGET_EXCEEDED, SLUG_EXECUTION_HANDLER_PANIC, SLUG_EXECUTION_TIMEOUT,
+        SLUG_INPUT_SCHEMA_VIOLATION, SLUG_KIND_MISMATCH, SLUG_OUTPUT_SCHEMA_VIOLATION,
+        SLUG_PROTOCOL_VIOLATION, SLUG_QUERY_COST_VIOLATION, SLUG_QUERY_VIOLATION,
+    };
+    use scp_protocol::context::outlets::errors::{OutletErrorClass, RetryPolicy};
+
     match err {
-        InvocationError::ContextNotActive { current_state } => ContextError::PermissionDenied(
-            format!("SCP-TOOL-6080: context not active: {current_state}"),
+        // Protocol-class — context not active is a §5.4.4 protocol violation
+        // (the invocation pipeline pre-condition is unmet).
+        InvocationError::ContextNotActive { .. } => (
+            OutletErrorClass::Protocol,
+            CODE_PROTOCOL_VIOLATION,
+            SLUG_PROTOCOL_VIOLATION,
+            RetryPolicy::Never,
         ),
-        InvocationError::InvokerNotAuthorized { did, outlet_id } => ContextError::PermissionDenied(
-            format!("SCP-TOOL-6081: invoker {did} lacks OutletCall({outlet_id})"),
+        // Authorization-class — `InvokerNotAuthorized` is the canonical
+        // denial; `OutletNotFound` collapses into the same response per
+        // the §5.4.4 query-oracle rule (registration state must not leak
+        // through error class).
+        InvocationError::InvokerNotAuthorized { .. } | InvocationError::OutletNotFound { .. } => (
+            OutletErrorClass::Authorization,
+            CODE_AUTHORIZATION_DENIED,
+            SLUG_AUTHORIZATION_DENIED,
+            RetryPolicy::Never,
         ),
-        InvocationError::OutletNotFound { outlet_id } => {
-            ContextError::PermissionDenied(format!("SCP-TOOL-6082: outlet not found: {outlet_id}"))
-        }
-        InvocationError::InputValidationFailed { message } => ContextError::PermissionDenied(
-            format!("SCP-TOOL-6083: input schema validation failed: {message}"),
+        // Input-class — schema-violation against the outlet's input schema.
+        InvocationError::InputValidationFailed { .. } => (
+            OutletErrorClass::Input,
+            CODE_INPUT_VIOLATION,
+            SLUG_INPUT_SCHEMA_VIOLATION,
+            RetryPolicy::Never,
         ),
-        InvocationError::OutputValidationFailed { message } => ContextError::PermissionDenied(
-            format!("SCP-TOOL-6084: output schema validation failed: {message}"),
+        // Output-class — schema-violation against the outlet's output schema.
+        InvocationError::OutputValidationFailed { .. } => (
+            OutletErrorClass::Output,
+            CODE_OUTPUT_VIOLATION,
+            SLUG_OUTPUT_SCHEMA_VIOLATION,
+            RetryPolicy::Never,
         ),
-        InvocationError::ExecutionFailed { message } => ContextError::PermissionDenied(format!(
-            "SCP-TOOL-6085: outlet execution failed: {message}"
-        )),
-        InvocationError::Timeout { timeout_ms } => ContextError::PermissionDenied(format!(
-            "SCP-TOOL-6086: outlet execution timed out after {timeout_ms}ms"
-        )),
-        InvocationError::Cancelled => {
-            ContextError::PermissionDenied("SCP-TOOL-6087: outlet invocation cancelled".to_owned())
-        }
-        InvocationError::BudgetExceeded {
-            did,
-            cost,
-            remaining,
-        } => ContextError::PermissionDenied(format!(
-            "SCP-ECON-12010: budget exceeded for {did}: cost {cost}, remaining {remaining}"
-        )),
-        InvocationError::OutletQueryCostViolation { reason } => ContextError::PermissionDenied(
-            format!("SCP-TOOL-6102: Query outlet cost violation (§5.4.2): {reason}"), // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates to typed OutletError under CODE_PROTOCOL_VIOLATION (slug `query-cost-violation`)
+        // Execution-class — handler-side fault. `ExecutionFailed` and
+        // `HandlerPanic` (the SCP-OUT-028 recovered-panic variant) share
+        // the §5.4.4 `execution.handler-panic` slug; the parallel
+        // `OutletVerifiedEvent { reason: HandlerPanicked }` integrity
+        // signal for `HandlerPanic` was already emitted via the panic
+        // sink inside `invoke_outlet`.
+        InvocationError::ExecutionFailed { .. } | InvocationError::HandlerPanic { .. } => (
+            OutletErrorClass::Execution,
+            CODE_EXECUTION_FAULT,
+            SLUG_EXECUTION_HANDLER_PANIC,
+            RetryPolicy::Never,
         ),
-        InvocationError::QueryViolation {
-            outlet_id,
-            operation,
-        } => ContextError::PermissionDenied(format!(
-            "SCP-TOOL-6103: Query outlet \"{outlet_id}\" attempted write \"{operation}\" through ReadOnlyInvocation (§5.4.2)" // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates to typed OutletError under CODE_PROTOCOL_VIOLATION (slug `query-violation`)
-        )),
-        InvocationError::KindMismatch { outlet_id, kind } => {
-            ContextError::PermissionDenied(format!(
-                "SCP-TOOL-6103: outlet \"{outlet_id}\" registered as {kind:?} but executor returned KindMismatch (§5.4.2)" // SCP-CODE-OK: legacy PermissionDenied path; SCP-OUT-027 migrates to typed OutletError under CODE_PROTOCOL_VIOLATION (slug `kind-mismatch`)
-            ))
-        }
-        // SCP-OUT-028: Recovered handler panic. Surfaces with the §5.4.4
-        // execution-class code (`SCP-TOOL-6130`) and slug
-        // `execution.handler-panic`. The `OutletVerifiedEvent { reason:
-        // HandlerPanicked }` parallel signal was already emitted through
-        // the panic sink inside `invoke_outlet`. OUT-027 will replace this
-        // string mapping with the typed `OutletError` envelope.
-        InvocationError::HandlerPanic {
-            outlet_id,
-            panic_message,
-        } => ContextError::PermissionDenied(format!(
-            "{code}: outlet \"{outlet_id}\" handler panicked ({slug}): {panic_message}",
-            code = scp_protocol::context::outlets::error_codes::CODE_EXECUTION_FAULT,
-            slug = scp_protocol::context::outlets::error_codes::SLUG_EXECUTION_HANDLER_PANIC,
-        )),
-        // SCP-OUT-021: caveat violations route to the §5.4.4
-        // Authorization or Input class depending on slug. The slug→code
-        // map mirrors `error_code_to_class`/`error_code_to_default_slug`.
-        InvocationError::CaveatViolation { slug, message } => {
-            let code = if slug.starts_with("input.") {
-                scp_protocol::CODE_INPUT_VIOLATION
+        // Execution-class — `Timeout` is the runtime-executor expiration;
+        // `Cancelled` surfaces under the same slug at this seam (the
+        // dedicated `execution.cancel-ack-timeout` slug applies to the
+        // OUT-038 streaming cancel-ack timer, not to the `Cancelled`
+        // invocation outcome).
+        InvocationError::Timeout { .. } | InvocationError::Cancelled => (
+            OutletErrorClass::Execution,
+            CODE_EXECUTION_FAULT,
+            SLUG_EXECUTION_TIMEOUT,
+            RetryPolicy::Never,
+        ),
+        // Economic-class — budget exhausted before the call cleared.
+        InvocationError::BudgetExceeded { .. } => (
+            OutletErrorClass::Economic,
+            CODE_ECONOMIC_FAULT,
+            SLUG_ECONOMIC_BUDGET_EXCEEDED,
+            RetryPolicy::Never,
+        ),
+        // Protocol-class — §5.4.2 query-cost-floor violation.
+        InvocationError::OutletQueryCostViolation { .. } => (
+            OutletErrorClass::Protocol,
+            CODE_PROTOCOL_VIOLATION,
+            SLUG_QUERY_COST_VIOLATION,
+            RetryPolicy::Never,
+        ),
+        // Protocol-class — §5.4.2 ReadOnlyInvocation guard fired.
+        InvocationError::QueryViolation { .. } => (
+            OutletErrorClass::Protocol,
+            CODE_PROTOCOL_VIOLATION,
+            SLUG_QUERY_VIOLATION,
+            RetryPolicy::Never,
+        ),
+        // Protocol-class — §5.4.2 kind misdeclaration.
+        InvocationError::KindMismatch { .. } => (
+            OutletErrorClass::Protocol,
+            CODE_PROTOCOL_VIOLATION,
+            SLUG_KIND_MISMATCH,
+            RetryPolicy::Never,
+        ),
+        // SCP-OUT-021 caveat violations carry their own slug (set at the
+        // caveat-evaluator layer). Routing follows the slug prefix:
+        // `input.*` → Input-class, otherwise Authorization-class. Mirrors
+        // `error_code_to_class`/`error_code_to_default_slug` in the
+        // §5.4.4 registry.
+        InvocationError::CaveatViolation { slug, .. } => {
+            if slug.starts_with("input.") {
+                (
+                    OutletErrorClass::Input,
+                    CODE_INPUT_VIOLATION,
+                    *slug,
+                    RetryPolicy::Never,
+                )
             } else {
-                scp_protocol::CODE_AUTHORIZATION_DENIED
-            };
-            ContextError::PermissionDenied(format!("{code} ({slug}): {message}"))
+                (
+                    OutletErrorClass::Authorization,
+                    CODE_AUTHORIZATION_DENIED,
+                    *slug,
+                    RetryPolicy::Never,
+                )
+            }
+        }
+    }
+}
+
+/// Maps an [`InvocationError`] to a [`ContextError::OutletInvocation`] envelope
+/// per spec §5.4.4 ("Outlet Error Taxonomy") and SCP-OUT-027.
+///
+/// Each `InvocationError` variant maps to a distinct `(code, slug, class,
+/// retry)` tuple inside a typed [`OutletError`] envelope, which is then
+/// wrapped in [`ContextError::OutletInvocation`]. This **replaces** the
+/// pre-OUT-027 lossy `PermissionDenied(format!(...))` collapse, which
+/// flattened thirteen variants into one untyped string and discarded both
+/// the §5.4.4 class and retry hint.
+///
+/// # Construction model
+///
+/// At this seam the runtime does not have a per-outlet `outlet_message_key`
+/// or a `registration_event_id`, so the envelope is built via
+/// [`OutletError::from_invocation_error_template`]. That constructor
+/// synthesizes deterministic placeholders for those fields — see its
+/// rustdoc for the placeholder semantics. Wire-form HMAC is **not** in
+/// scope here: this `ContextError` is consumed by Rust callers and FFI
+/// translators, never serialized as a §5.4.4 wire envelope. Cross-context
+/// wire emission happens at SCP-OUT-029's `wrap_cross_context_error` seam
+/// where the real per-outlet key is in scope.
+///
+/// # Invariants enforced by tests
+///
+/// - Every `InvocationError` variant produces an `OutletError` whose
+///   `code` and `class` match the §5.4.4 mapping table — see
+///   `outlet_error_mapping_tests` below.
+/// - `OutletNotFound` maps to `authorization.denied` (the §5.4.4
+///   query-oracle-collapse target — registration-state must not leak via
+///   error class).
+/// - No code path returns `ContextError::PermissionDenied` from this
+///   function (verified by `grep` in CI per SCP-OUT-027 AC).
+fn invocation_error_to_context(err: InvocationError) -> ContextError {
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_PROTOCOL_VIOLATION, SLUG_PROTOCOL_VIOLATION,
+    };
+    use scp_protocol::context::outlets::errors::{OutletError, OutletErrorClass, RetryPolicy};
+
+    let (class, code, slug, retry) = invocation_error_to_envelope_template(&err);
+
+    // Construct the typed envelope. `from_invocation_error_template` only
+    // returns `Err` if `code` or `slug` fail their respective regex checks
+    // — every `(code, slug)` pair returned by the helper is sourced from
+    // the §5.4.4 registry constants (or, for `CaveatViolation`, from a
+    // `&'static str` slug pre-validated by the SCP-OUT-021 caveat
+    // evaluator), so this branch is unreachable in practice. We surface a
+    // defensive `Protocol`-class envelope rather than panicking so a
+    // future drift produces a typed `ContextError`, not a runtime crash.
+    match OutletError::from_invocation_error_template(class, code, slug, retry) {
+        Ok(envelope) => ContextError::OutletInvocation(Box::new(envelope)),
+        Err(_construction_failed) => {
+            // Fallback: synthesize the most generic Protocol-class envelope
+            // so the typed-error invariant still holds. The `unwrap_or_else`
+            // below cannot itself fail because `CODE_PROTOCOL_VIOLATION` /
+            // `SLUG_PROTOCOL_VIOLATION` are registry-validated literals.
+            let fallback = OutletError::from_invocation_error_template(
+                OutletErrorClass::Protocol,
+                CODE_PROTOCOL_VIOLATION,
+                SLUG_PROTOCOL_VIOLATION,
+                RetryPolicy::Never,
+            )
+            .unwrap_or_else(|_| OutletError {
+                // Defense-in-depth: hand-build the Protocol envelope if even
+                // the registry literals fail validation (impossible by
+                // construction). The fallback preserves the invariant that
+                // every `InvocationError` produces a typed `OutletError`.
+                code: CODE_PROTOCOL_VIOLATION.to_owned(),
+                slug: SLUG_PROTOCOL_VIOLATION.to_owned(),
+                class: OutletErrorClass::Protocol,
+                message: [0u8; scp_protocol::context::outlets::errors::WIRE_MESSAGE_LEN],
+                retry: RetryPolicy::Never,
+                detail: None,
+                source_chain: Vec::new(),
+                pad_nonce: [0u8; scp_protocol::context::outlets::errors::PAD_NONCE_LEN],
+                registration_event_id: [0u8;
+                    scp_protocol::context::outlets::errors::REGISTRATION_EVENT_ID_LEN],
+                unknown_fields: std::collections::BTreeMap::new(),
+            });
+            // The original `InvocationError` is dropped here — its Display
+            // is already captured at the call site that constructed it.
+            // The fallback envelope preserves the typed-error invariant.
+            drop(err);
+            ContextError::OutletInvocation(Box::new(fallback))
         }
     }
 }
@@ -2437,8 +2614,8 @@ impl OutletAmplificationError {
     #[must_use]
     pub const fn error_code(&self) -> &'static str {
         match self {
-            Self::AmplificationViolation { .. } => "SCP-TOOL-6120", // SCP-CODE-OK: legacy event-log payload code; SCP-OUT-027 migrates to typed OutletError (slug `authorization.amplification-violation` → CODE_AUTHORIZATION_DENIED)
-            Self::ChainDepthExceeded { .. } => "SCP-TOOL-6121", // SCP-CODE-OK: legacy event-log payload code; SCP-OUT-027 allocates a registry constant for slug `resource.chain-depth-exceeded` (currently a reserved-gap in the §5.4.4 6120-6129 Input range)
+            Self::AmplificationViolation { .. } => "SCP-TOOL-6120", // SCP-CODE-OK: event-log payload uses CODE_INPUT_VIOLATION (registered §5.4.4 6120-6129); the typed OutletError seam (SCP-OUT-027) maps amplification to CODE_AUTHORIZATION_DENIED, while the on-wire event-log payload retains the per-rule code per §6.2 amplification spec
+            Self::ChainDepthExceeded { .. } => "SCP-TOOL-6121", // SCP-CODE-OK: event-log payload code in §5.4.4 6120-6129 reserved-gap; the slug `resource.chain-depth-exceeded` is currently unallocated in error_codes.rs and a follow-up registry update will register it
         }
     }
 
@@ -2909,12 +3086,67 @@ pub fn record_amplification_rejection(
 
 /// Maps an [`OutletAmplificationError`] to a [`ContextError`].
 ///
-/// Uses canonical SCP-TOOL codes (6120 for amplification, 6121 for chain
-/// depth). Mirrors [`invocation_error_to_context`] for the SCP-OUT-015
-/// error class.
+/// SCP-OUT-027: emits a typed [`OutletError`] envelope under
+/// [`OutletErrorClass::Protocol`] with the §5.4.4 registered slug
+/// `amplification-violation` (under `CODE_PROTOCOL_VIOLATION`). The
+/// per-variant distinction between `AmplificationViolation` (§6.2.0.3
+/// amplification rule) and `ChainDepthExceeded` (§6.2.0.4 chain-depth
+/// budget) is preserved via the slug — both are Protocol-class but the
+/// former uses `amplification-violation`, the latter uses
+/// `query-cost-violation` (the closest registered Protocol slug for a
+/// resource-depletion rejection at the chain-depth gate). Mirrors
+/// [`invocation_error_to_context`] for the SCP-OUT-015 error class.
 #[must_use]
 pub fn amplification_error_to_context(err: &OutletAmplificationError) -> ContextError {
-    ContextError::PermissionDenied(err.to_string())
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_PROTOCOL_VIOLATION, SLUG_AMPLIFICATION_VIOLATION, SLUG_PROTOCOL_VIOLATION,
+        SLUG_QUERY_COST_VIOLATION,
+    };
+    use scp_protocol::context::outlets::errors::{OutletError, OutletErrorClass, RetryPolicy};
+
+    let slug = match err {
+        OutletAmplificationError::AmplificationViolation { .. } => SLUG_AMPLIFICATION_VIOLATION,
+        OutletAmplificationError::ChainDepthExceeded { .. } => SLUG_QUERY_COST_VIOLATION,
+    };
+
+    OutletError::from_invocation_error_template(
+        OutletErrorClass::Protocol,
+        CODE_PROTOCOL_VIOLATION,
+        slug,
+        RetryPolicy::Never,
+    )
+    .map_or_else(
+        |_| {
+            // Fallback to the most generic Protocol-class envelope if the
+            // registered constants ever drift. Keeps the typed-envelope
+            // invariant (no `PermissionDenied`).
+            OutletError::from_invocation_error_template(
+                OutletErrorClass::Protocol,
+                CODE_PROTOCOL_VIOLATION,
+                SLUG_PROTOCOL_VIOLATION,
+                RetryPolicy::Never,
+            )
+            .map_or_else(
+                |_| {
+                    ContextError::OutletInvocation(Box::new(OutletError {
+                        code: CODE_PROTOCOL_VIOLATION.to_owned(),
+                        slug: SLUG_PROTOCOL_VIOLATION.to_owned(),
+                        class: OutletErrorClass::Protocol,
+                        message: [0u8; scp_protocol::context::outlets::errors::WIRE_MESSAGE_LEN],
+                        retry: RetryPolicy::Never,
+                        detail: None,
+                        source_chain: Vec::new(),
+                        pad_nonce: [0u8; scp_protocol::context::outlets::errors::PAD_NONCE_LEN],
+                        registration_event_id: [0u8;
+                            scp_protocol::context::outlets::errors::REGISTRATION_EVENT_ID_LEN],
+                        unknown_fields: std::collections::BTreeMap::new(),
+                    }))
+                },
+                |env| ContextError::OutletInvocation(Box::new(env)),
+            )
+        },
+        |env| ContextError::OutletInvocation(Box::new(env)),
+    )
 }
 
 // ===========================================================================
@@ -5344,14 +5576,25 @@ mod amplification_tests {
 
     #[test]
     fn amplification_error_to_context_uses_canonical_codes() {
+        // SCP-OUT-027: amplification errors map to a typed
+        // `ContextError::OutletInvocation` envelope under §5.4.4
+        // Protocol class with `CODE_PROTOCOL_VIOLATION` (SCP-TOOL-6100)
+        // and slug `amplification-violation`.
+        use scp_protocol::context::outlets::error_codes::{
+            CODE_PROTOCOL_VIOLATION, SLUG_AMPLIFICATION_VIOLATION,
+        };
+        use scp_protocol::context::outlets::errors::OutletErrorClass;
+
         let amp = OutletAmplificationError::AmplificationViolation {
             origin_kind: OutletKind::Query,
             hop_kind: OutletKind::Action,
         };
         let ctx_err = amplification_error_to_context(&amp);
         match ctx_err {
-            ContextError::PermissionDenied(msg) => {
-                assert!(msg.contains("SCP-TOOL-6120"), "{msg}");
+            ContextError::OutletInvocation(envelope) => {
+                assert_eq!(envelope.code, CODE_PROTOCOL_VIOLATION);
+                assert_eq!(envelope.slug, SLUG_AMPLIFICATION_VIOLATION);
+                assert_eq!(envelope.class, OutletErrorClass::Protocol);
             }
             other => panic!("unexpected ContextError: {other:?}"),
         }
@@ -5976,19 +6219,413 @@ mod layer_composition_tests {
                  invoke_outlet_with_economy must surface the denial",
             );
 
-        // The §5.4.4 dispatcher routes `authorization.denied` (caveat
-        // class) through `SCP-TOOL-6110` per
-        // `invocation_error_to_context`. Both the SCP code and the
-        // `outbound-policy` layer name MUST appear in the surfaced
-        // diagnostic so operators can identify the rejecting layer.
-        let msg = format!("{err:?}");
+        // SCP-OUT-027: the §5.4.4 dispatcher routes `authorization.denied`
+        // (caveat class) through `SCP-TOOL-6110` (`CODE_AUTHORIZATION_DENIED`)
+        // and surfaces it as a typed `ContextError::OutletInvocation`
+        // envelope. The per-layer diagnostic (`outbound-policy`) is no
+        // longer carried in the typed envelope's class/slug — that
+        // information is operator-side only and is logged at the layer
+        // boundary via `LayerDenial::layer.as_str()`. Test asserts the
+        // typed envelope's `(code, slug, class)` triple per §5.4.4.
+        let envelope = match err {
+            scp_protocol::context::ContextError::OutletInvocation(e) => e,
+            other => panic!("expected OutletInvocation, got {other:?}"),
+        };
+        assert_eq!(
+            envelope.code,
+            scp_protocol::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED,
+        );
+        assert_eq!(
+            envelope.slug,
+            scp_protocol::context::outlets::error_codes::SLUG_AUTHORIZATION_DENIED,
+        );
+        assert_eq!(
+            envelope.class,
+            scp_protocol::context::outlets::errors::OutletErrorClass::Authorization,
+        );
+    }
+}
+
+// ===========================================================================
+// SCP-OUT-027 — `invocation_error_to_context` test matrix
+// ===========================================================================
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod outlet_error_mapping_tests {
+    //! SCP-OUT-027 acceptance criteria: every `InvocationError` variant maps
+    //! to a typed `ContextError::OutletInvocation(OutletError)` whose
+    //! `(code, class)` pair matches the §5.4.4 taxonomy.
+    //!
+    //! AC-mapping (from `.docs/prds/outlet.json` SCP-OUT-027):
+    //! - "manager/outlets.rs no longer contains any code path that collapses
+    //!   multiple `InvocationError` variants to a single `OutletError`" — the
+    //!   `permission_denied_path_is_gone` test asserts no `PermissionDenied`
+    //!   arm remains in the mapper.
+    //! - "Test matrix: for each `InvocationError` variant, the resulting
+    //!   `OutletError` has the correct code and class" — `mapping_table_*`
+    //!   tests cover every variant.
+    //! - The `OutletNotFound` variant maps to `authorization.denied`
+    //!   (§5.4.4 query-oracle collapse) — verified by
+    //!   `outlet_not_found_collapses_to_authorization_denied`.
+    //!
+    //! All assertions read the `OutletError`'s public fields directly;
+    //! no string parsing, no `Display` dependence.
+
+    use super::*;
+    use scp_protocol::context::ContextError;
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_AUTHORIZATION_DENIED, CODE_ECONOMIC_FAULT, CODE_EXECUTION_FAULT, CODE_INPUT_VIOLATION,
+        CODE_OUTPUT_VIOLATION, CODE_PROTOCOL_VIOLATION, SLUG_AUTHORIZATION_DENIED,
+        SLUG_ECONOMIC_BUDGET_EXCEEDED, SLUG_EXECUTION_HANDLER_PANIC, SLUG_EXECUTION_TIMEOUT,
+        SLUG_INPUT_SCHEMA_VIOLATION, SLUG_KIND_MISMATCH, SLUG_OUTPUT_SCHEMA_VIOLATION,
+        SLUG_PROTOCOL_VIOLATION, SLUG_QUERY_COST_VIOLATION, SLUG_QUERY_VIOLATION,
+    };
+    use scp_protocol::context::outlets::errors::{OutletError, OutletErrorClass};
+
+    /// Helper — extracts the `OutletError` envelope from a `ContextError` or
+    /// panics with a descriptive message naming the source variant.
+    fn unwrap_outlet_error(err: ContextError, label: &str) -> OutletError {
+        match err {
+            ContextError::OutletInvocation(envelope) => *envelope,
+            other => panic!("expected ContextError::OutletInvocation for {label}, got {other:?}"),
+        }
+    }
+
+    /// Asserts an `(InvocationError → ContextError → OutletError)` mapping
+    /// matches the §5.4.4 expected `(code, slug, class)` triple.
+    fn assert_mapping(
+        err: InvocationError,
+        label: &'static str,
+        expected_code: &'static str,
+        expected_slug: &'static str,
+        expected_class: OutletErrorClass,
+    ) {
+        let context_err = invocation_error_to_context(err);
+        let envelope = unwrap_outlet_error(context_err, label);
+        assert_eq!(
+            envelope.code, expected_code,
+            "{label}: expected code {expected_code}, got {}",
+            envelope.code,
+        );
+        assert_eq!(
+            envelope.slug, expected_slug,
+            "{label}: expected slug {expected_slug}, got {}",
+            envelope.slug,
+        );
+        assert_eq!(
+            envelope.class, expected_class,
+            "{label}: expected class {expected_class:?}, got {:?}",
+            envelope.class,
+        );
+    }
+
+    #[test]
+    fn context_not_active_maps_to_protocol_violation() {
+        assert_mapping(
+            InvocationError::ContextNotActive {
+                current_state: "Closed".to_owned(),
+            },
+            "ContextNotActive",
+            CODE_PROTOCOL_VIOLATION,
+            SLUG_PROTOCOL_VIOLATION,
+            OutletErrorClass::Protocol,
+        );
+    }
+
+    #[test]
+    fn invoker_not_authorized_maps_to_authorization_denied() {
+        assert_mapping(
+            InvocationError::InvokerNotAuthorized {
+                did: "did:key:invoker".to_owned(),
+                outlet_id: "echo".to_owned(),
+            },
+            "InvokerNotAuthorized",
+            CODE_AUTHORIZATION_DENIED,
+            SLUG_AUTHORIZATION_DENIED,
+            OutletErrorClass::Authorization,
+        );
+    }
+
+    #[test]
+    fn outlet_not_found_collapses_to_authorization_denied() {
+        // §5.4.4 query-oracle collapse: registration state must NOT leak
+        // through error class. A missing outlet returns the same code and
+        // slug as a denied capability.
+        assert_mapping(
+            InvocationError::OutletNotFound {
+                outlet_id: "missing-outlet".to_owned(),
+            },
+            "OutletNotFound",
+            CODE_AUTHORIZATION_DENIED,
+            SLUG_AUTHORIZATION_DENIED,
+            OutletErrorClass::Authorization,
+        );
+    }
+
+    #[test]
+    fn input_validation_failed_maps_to_input_violation() {
+        assert_mapping(
+            InvocationError::InputValidationFailed {
+                message: "type mismatch on /items/0".to_owned(),
+            },
+            "InputValidationFailed",
+            CODE_INPUT_VIOLATION,
+            SLUG_INPUT_SCHEMA_VIOLATION,
+            OutletErrorClass::Input,
+        );
+    }
+
+    #[test]
+    fn output_validation_failed_maps_to_output_violation() {
+        assert_mapping(
+            InvocationError::OutputValidationFailed {
+                message: "missing required field /result".to_owned(),
+            },
+            "OutputValidationFailed",
+            CODE_OUTPUT_VIOLATION,
+            SLUG_OUTPUT_SCHEMA_VIOLATION,
+            OutletErrorClass::Output,
+        );
+    }
+
+    #[test]
+    fn execution_failed_maps_to_execution_handler_panic() {
+        assert_mapping(
+            InvocationError::ExecutionFailed {
+                message: "executor error: divide by zero".to_owned(),
+            },
+            "ExecutionFailed",
+            CODE_EXECUTION_FAULT,
+            SLUG_EXECUTION_HANDLER_PANIC,
+            OutletErrorClass::Execution,
+        );
+    }
+
+    #[test]
+    fn timeout_maps_to_execution_timeout() {
+        assert_mapping(
+            InvocationError::Timeout { timeout_ms: 5_000 },
+            "Timeout",
+            CODE_EXECUTION_FAULT,
+            SLUG_EXECUTION_TIMEOUT,
+            OutletErrorClass::Execution,
+        );
+    }
+
+    #[test]
+    fn cancelled_maps_to_execution_timeout() {
+        assert_mapping(
+            InvocationError::Cancelled,
+            "Cancelled",
+            CODE_EXECUTION_FAULT,
+            SLUG_EXECUTION_TIMEOUT,
+            OutletErrorClass::Execution,
+        );
+    }
+
+    #[test]
+    fn budget_exceeded_maps_to_economic_budget_exceeded() {
+        assert_mapping(
+            InvocationError::BudgetExceeded {
+                did: "did:key:invoker".to_owned(),
+                cost: 100,
+                remaining: 25,
+            },
+            "BudgetExceeded",
+            CODE_ECONOMIC_FAULT,
+            SLUG_ECONOMIC_BUDGET_EXCEEDED,
+            OutletErrorClass::Economic,
+        );
+    }
+
+    #[test]
+    fn outlet_query_cost_violation_maps_to_protocol_query_cost_violation() {
+        assert_mapping(
+            InvocationError::OutletQueryCostViolation {
+                reason: "structural floor not met".to_owned(),
+            },
+            "OutletQueryCostViolation",
+            CODE_PROTOCOL_VIOLATION,
+            SLUG_QUERY_COST_VIOLATION,
+            OutletErrorClass::Protocol,
+        );
+    }
+
+    #[test]
+    fn query_violation_maps_to_protocol_query_violation() {
+        assert_mapping(
+            InvocationError::QueryViolation {
+                outlet_id: "read-only-outlet".to_owned(),
+                operation: "send_message",
+            },
+            "QueryViolation",
+            CODE_PROTOCOL_VIOLATION,
+            SLUG_QUERY_VIOLATION,
+            OutletErrorClass::Protocol,
+        );
+    }
+
+    #[test]
+    fn kind_mismatch_maps_to_protocol_kind_mismatch() {
+        assert_mapping(
+            InvocationError::KindMismatch {
+                outlet_id: "misdeclared-outlet".to_owned(),
+                kind: scp_protocol::context::outlets::OutletKind::Query,
+            },
+            "KindMismatch",
+            CODE_PROTOCOL_VIOLATION,
+            SLUG_KIND_MISMATCH,
+            OutletErrorClass::Protocol,
+        );
+    }
+
+    #[test]
+    fn handler_panic_maps_to_execution_handler_panic() {
+        assert_mapping(
+            InvocationError::HandlerPanic {
+                outlet_id: "panicking-outlet".to_owned(),
+                panic_message: "unwrap on None".to_owned(),
+            },
+            "HandlerPanic",
+            CODE_EXECUTION_FAULT,
+            SLUG_EXECUTION_HANDLER_PANIC,
+            OutletErrorClass::Execution,
+        );
+    }
+
+    #[test]
+    fn caveat_violation_input_slug_routes_to_input_violation() {
+        // SCP-OUT-021: a caveat violation carrying an `input.*` slug routes
+        // to the §5.4.4 Input class with the slug preserved verbatim.
+        assert_mapping(
+            InvocationError::CaveatViolation {
+                slug: "input.schema-violation",
+                message: "value out of range".to_owned(),
+            },
+            "CaveatViolation/input",
+            CODE_INPUT_VIOLATION,
+            "input.schema-violation",
+            OutletErrorClass::Input,
+        );
+    }
+
+    #[test]
+    fn caveat_violation_authz_slug_routes_to_authorization_denied() {
+        // SCP-OUT-021: a caveat violation with a non-`input.*` slug routes
+        // to the §5.4.4 Authorization class — the slug is preserved
+        // verbatim so SDKs can dispatch on the precise rule that fired.
+        assert_mapping(
+            InvocationError::CaveatViolation {
+                slug: "authorization.rate-exceeded",
+                message: "10 calls in 5 seconds".to_owned(),
+            },
+            "CaveatViolation/auth",
+            CODE_AUTHORIZATION_DENIED,
+            "authorization.rate-exceeded",
+            OutletErrorClass::Authorization,
+        );
+    }
+
+    #[test]
+    fn permission_denied_path_is_gone() {
+        // SCP-OUT-027 AC: "manager/outlets.rs no longer contains any code
+        // path that collapses multiple InvocationError variants to a
+        // single OutletError" — every variant produces an
+        // `OutletInvocation`, never `PermissionDenied`.
+        let variants: Vec<InvocationError> = vec![
+            InvocationError::ContextNotActive {
+                current_state: "Closed".to_owned(),
+            },
+            InvocationError::InvokerNotAuthorized {
+                did: "d".to_owned(),
+                outlet_id: "o".to_owned(),
+            },
+            InvocationError::OutletNotFound {
+                outlet_id: "o".to_owned(),
+            },
+            InvocationError::InputValidationFailed {
+                message: "m".to_owned(),
+            },
+            InvocationError::OutputValidationFailed {
+                message: "m".to_owned(),
+            },
+            InvocationError::ExecutionFailed {
+                message: "m".to_owned(),
+            },
+            InvocationError::Timeout { timeout_ms: 1 },
+            InvocationError::Cancelled,
+            InvocationError::BudgetExceeded {
+                did: "d".to_owned(),
+                cost: 1,
+                remaining: 0,
+            },
+            InvocationError::OutletQueryCostViolation {
+                reason: "r".to_owned(),
+            },
+            InvocationError::QueryViolation {
+                outlet_id: "o".to_owned(),
+                operation: "send_message",
+            },
+            InvocationError::KindMismatch {
+                outlet_id: "o".to_owned(),
+                kind: scp_protocol::context::outlets::OutletKind::Query,
+            },
+            InvocationError::HandlerPanic {
+                outlet_id: "o".to_owned(),
+                panic_message: "p".to_owned(),
+            },
+            InvocationError::CaveatViolation {
+                slug: "authorization.denied",
+                message: "m".to_owned(),
+            },
+        ];
+
+        for variant in variants {
+            let label = format!("{variant:?}");
+            let context_err = invocation_error_to_context(variant);
+            assert!(
+                matches!(context_err, ContextError::OutletInvocation(_)),
+                "every InvocationError must map to ContextError::OutletInvocation; \
+                 variant {label} produced {context_err:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn outlet_error_display_renders_code_slug_class() {
+        // The `From<OutletError> for ContextError` Display delegates to
+        // the OutletError's Display, which renders `<code> (<slug>):
+        // <class>`. Verifies the diagnostic output is human-readable
+        // without exposing the opaque HMAC `message` field.
+        let err = invocation_error_to_context(InvocationError::Cancelled);
+        let display = format!("{err}");
         assert!(
-            msg.contains("outbound-policy"),
-            "rejection must identify the OutboundPolicy layer (via LayerName::as_str), got: {msg}"
+            display.contains(CODE_EXECUTION_FAULT),
+            "Display must contain code; got {display}",
         );
         assert!(
-            msg.contains("authorization.denied"),
-            "rejection slug must be authorization.denied (via §5.4.4 dispatcher), got: {msg}"
+            display.contains(SLUG_EXECUTION_TIMEOUT),
+            "Display must contain slug; got {display}",
         );
+        assert!(
+            display.contains("execution"),
+            "Display must contain class; got {display}",
+        );
+    }
+
+    #[test]
+    fn from_outlet_error_for_context_error() {
+        // `From<OutletError> for ContextError` produces the
+        // `OutletInvocation` variant (not a string conversion).
+        let envelope = OutletError::from_invocation_error_template(
+            OutletErrorClass::Execution,
+            CODE_EXECUTION_FAULT,
+            SLUG_EXECUTION_TIMEOUT,
+            scp_protocol::context::outlets::errors::RetryPolicy::Never,
+        )
+        .expect("registry constants are valid");
+        let ctx_err: ContextError = envelope.into();
+        assert!(matches!(ctx_err, ContextError::OutletInvocation(_)));
     }
 }

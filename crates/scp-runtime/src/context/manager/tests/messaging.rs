@@ -2925,13 +2925,22 @@ async fn outlet_call_output_validation_failure_voids_escrow_and_refunds_budget()
         )
         .await;
 
-    // The manager wraps the OutputValidationFailed inner error as a
-    // PermissionDenied(SCP-TOOL-6084: ...) ContextError.
+    // SCP-OUT-027: the manager surfaces output-validation failures as a
+    // typed `ContextError::OutletInvocation(OutletError)` envelope under
+    // the §5.4.4 Output class (`SCP-TOOL-6140`, slug
+    // `output.schema-violation`).
     let err = result.expect_err("output validation failure must propagate");
-    let err_msg = err.to_string();
-    assert!(
-        err_msg.contains("SCP-TOOL-6084") && err_msg.contains("output schema validation failed"),
-        "expected SCP-TOOL-6084 output schema failure, got: {err_msg}"
+    let envelope = match err {
+        scp_protocol::context::ContextError::OutletInvocation(e) => e,
+        other => panic!("expected OutletInvocation, got {other:?}"),
+    };
+    assert_eq!(
+        envelope.code,
+        scp_protocol::context::outlets::error_codes::CODE_OUTPUT_VIOLATION,
+    );
+    assert_eq!(
+        envelope.slug,
+        scp_protocol::context::outlets::error_codes::SLUG_OUTPUT_SCHEMA_VIOLATION,
     );
 
     // Adapter call sequence assertions: authorize → void, no capture.
@@ -5223,21 +5232,8 @@ async fn manager_dispatch_query_outlet_misdeclared_emits_signal() {
     let mut reg = test_outlet_registration("ro-tool");
     reg.kind = OutletKind::Query;
     reg.cost = None; // Query outlets must have cost == None || amount == 0
-    reg.schema.input_schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "q": {"type": "number"},
-            "scope": {"type": "string"}
-        }
-    });
-    reg.schema.output_schema = serde_json::json!({
-        "type": "object",
-        "properties": {
-            "ok": {"type": "boolean"},
-            "data": {"type": ["object", "null"]}
-        }
-    });
-    // test vector matches the new schemas
+    reg.schema.input_schema = serde_json::json!({"type": "object", "properties": {"q": {"type": "number"}, "scope": {"type": "string"}}});
+    reg.schema.output_schema = serde_json::json!({"type": "object", "properties": {"ok": {"type": "boolean"}, "data": {"type": ["object", "null"]}}});
     reg.test_vectors = vec![scp_protocol::context::outlets::registry::OutletTestVector {
         input: serde_json::json!({"q": 1, "scope": "a"}),
         expected_output: serde_json::json!({"ok": true, "data": null}),
@@ -5279,11 +5275,15 @@ async fn manager_dispatch_query_outlet_misdeclared_emits_signal() {
         result.is_err(),
         "manager dispatch must fail for Query outlet with only exec_action"
     );
+    // SCP-OUT-027: typed envelope under §5.4.4 Execution class.
     let err = result.unwrap_err();
-    let err_str = err.to_string();
-    assert!(
-        err_str.contains("SCP-TOOL-6103"),
-        "expected SCP-TOOL-6103 in {err_str}"
+    let envelope = match err {
+        scp_protocol::context::ContextError::OutletInvocation(e) => e,
+        other => panic!("expected OutletInvocation, got {other:?}"),
+    };
+    assert_eq!(
+        envelope.code,
+        scp_protocol::context::outlets::error_codes::CODE_EXECUTION_FAULT
     );
 
     let drained = sink.drain();
