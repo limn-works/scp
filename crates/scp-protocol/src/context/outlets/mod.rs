@@ -42,6 +42,7 @@
 //! - [`OutletErrorCode`] -- Error code enum. (Re-exported from [`lifecycle`].)
 //! - [`OutletCancel`] -- Cancellation request. (Re-exported from [`lifecycle`].)
 
+pub mod error_codes;
 pub mod errors;
 pub mod hash;
 pub mod integrity;

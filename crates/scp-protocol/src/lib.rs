@@ -62,3 +62,17 @@ pub use context::outlets::errors::{
     OutletErrorClass, OutletErrorConstructionFailed, PAD_NONCE_LEN, REGISTRATION_EVENT_ID_LEN,
     RelayUrlKind, RetryPolicy, WIRE_MESSAGE_LEN, validate_catalog_key, validate_outlet_error_code,
 };
+
+// SCP-OUT-025: compact §5.4.4 6100-6199 code allocation + per-class slug
+// taxonomy. `error_code_to_class`, `error_code_to_default_slug`,
+// `error_code_to_retry_policy`, `slug_to_class`, and `validate_slug` are the
+// public lookup functions; the `CODE_*` and `SLUG_*` constants name the
+// allocated codes and slugs.
+pub use context::outlets::error_codes::{
+    ALL_CODES, CODE_AUTHORIZATION_ATTENUATION, CODE_AUTHORIZATION_DENIED,
+    CODE_AUTHORIZATION_SALT_ROTATION, CODE_ECONOMIC_FAULT, CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
+    CODE_EXECUTION_CREDIT, CODE_EXECUTION_CREDIT_STALL, CODE_EXECUTION_FAULT,
+    CODE_GOVERNANCE_FAULT, CODE_INPUT_VIOLATION, CODE_OUTPUT_VIOLATION, CODE_PROTOCOL_SESSION,
+    CODE_PROTOCOL_VIOLATION, CODE_TRANSPORT_FAULT, SlugError, error_code_to_class,
+    error_code_to_default_slug, error_code_to_retry_policy, slug_to_class, validate_slug,
+};
