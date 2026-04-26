@@ -73,6 +73,18 @@ pub const IDENT_1026: &str = "SCP-IDENT-1026";
 pub const IDENT_1027: &str = "SCP-IDENT-1027";
 /// Identity key handle error.
 pub const IDENT_1028: &str = "SCP-IDENT-1028";
+/// Identity operation not yet implemented in this bridge.
+///
+/// Used when a bridge cannot honour an operation that other bridges
+/// implement — typically because the WASM target lacks a dependency
+/// the native bridges have (network DID resolver, server APIs, etc.)
+/// or because a forward-secure protocol step (e.g. spec §3.7
+/// pre-rotation commitment) is not yet wired in this target.
+///
+/// The error message must point callers to (a) the tracking issue
+/// for the port and (b) any existing alternative with similar
+/// semantics, so callers know what to do instead of guessing.
+pub const IDENT_1029: &str = "SCP-IDENT-1029";
 /// SCPID challenge expired.
 pub const IDENT_1030: &str = "SCP-IDENT-1030";
 /// SCPID audience mismatch.

@@ -1238,8 +1238,9 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "broadcast_publish_assets",
     "broadcast_handle_key_request",
     "broadcast_unblock",
-    // Identity (7)
+    // Identity (8)
     "identity_link_attestations",
+    "identity_rotate_key",
     "identity_create_with_agent_key",
     "identity_execute_recovery",
     "identity_execute_custody_migration",

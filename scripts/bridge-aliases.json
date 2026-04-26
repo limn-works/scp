@@ -2485,6 +2485,23 @@
       "wasm": [
         "context_governance_list_proposals"
       ]
+    },
+    {
+      "canonical": "identity_rotate_key",
+      "category": "identity",
+      "wasm_required": true,
+      "pyo3": [
+        "identity_rotate_key"
+      ],
+      "uniffi": [
+        "rotate_key"
+      ],
+      "napi": [
+        "rotate_key"
+      ],
+      "wasm": [
+        "identity_rotate_key"
+      ]
     }
   ],
   "exemptions": {
