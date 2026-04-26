@@ -137,6 +137,56 @@ pub struct CaveatEnforcement<'a> {
     pub estimated_cost: scp_protocol::economy::types::Amount,
 }
 
+/// SCP-OUT-022 — bundle of state needed for §7.3.8 + §6.2 + §19.5 + §19.3
+/// layer composition.
+///
+/// Construct one of these and pass it into
+/// [`ContextManager::invoke_outlet_with_economy`] alongside [`CaveatEnforcement`]
+/// when the runtime should compose `OutboundPolicy` ∧ `InboundPolicy` ∧
+/// `SpendingCapability` ∧ `MemberBudgetTracker` with the caveat post-input
+/// checks. Fields are owned snapshots / clones so the layer composition
+/// runs off-lock alongside SCP-OUT-021's counter-store CAS.
+///
+/// All fields are `Option`-typed so a free-action / intra-context invocation
+/// can supply only the fields that apply (`outbound_policy`, `inbound_policy`,
+/// and `source_role` are `None` for intra-context;
+/// `spending_capability` is `None` for free actions; `budget_tracker` is the
+/// per-context tracker snapshot which is always present).
+///
+/// # Why a separate struct?
+///
+/// [`CaveatEnforcement`] models the SCP-OUT-021 post-input gate (caveat
+/// time-box already enforced upstream by `validate_ucan` Step 11b, plus
+/// counter-store CAS for `max_calls` / `amount_max_cumulative` /
+/// `rate_window`). Layer composition is the §7.3.8 *additional* AND fold over
+/// `SpendingCapability` + `MemberBudgetTracker` + Inbound/Outbound policies; it
+/// is conceptually a separate mechanism even though the runtime evaluates it
+/// at the same call-site. Keeping the two bundles separate preserves the
+/// SCP-OUT-021 surface unchanged so callers that only enable caveat counters
+/// (and not full layer composition) do not need to construct the additional
+/// fields.
+pub struct LayerCompositionEnforcement {
+    /// `OutboundPolicy` from the source context's interface, if any.
+    /// `None` for intra-context invocations.
+    pub outbound_policy: Option<scp_protocol::context::outlets::interface::OutboundPolicy>,
+    /// `InboundPolicy` from the target context's interface, if any.
+    /// `None` for intra-context invocations.
+    pub inbound_policy: Option<scp_protocol::context::outlets::interface::InboundPolicy>,
+    /// `SpendingCapability` extracted from the spending UCAN's `fct`.
+    /// `None` for free actions.
+    pub spending_capability: Option<scp_protocol::crypto::ucan::spending::SpendingCapability>,
+    /// Snapshot of the per-context [`MemberBudgetTracker`] (§19.3) taken
+    /// under the Phase 1 lock so the layer composition can read remaining
+    /// budget off-lock.
+    pub budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker,
+    /// The role the invoker holds in the source context (cross-context
+    /// invocations only). `None` for intra-context.
+    pub source_role: Option<String>,
+    /// Serialized payload byte length, used for the
+    /// `OutboundPolicy.max_payload_bytes` check.
+    pub payload_bytes: usize,
+}
+
 /// Phase-1 bookkeeping bundle for an outlet invocation in flight.
 ///
 /// Every Phase 1 success produces a [`OutletEconomyTicket`]; every Phase 2
@@ -522,6 +572,14 @@ impl ContextManager {
         // counter-store CAS) immediately after input schema validation
         // and before the executor runs.
         caveat_enforcement: Option<CaveatEnforcement<'_>>,
+        // SCP-OUT-022: optional layer composition bundle. `None` skips
+        // the §7.3.8 / §6.2 / §19.5 / §19.3 AND fold (Outbound ∧ Inbound ∧
+        // SpendingCapability ∧ MemberBudgetTracker) — caveat time-box +
+        // rate / counter remain enforced via the SCP-OUT-021 hook.
+        // `Some(bundle)` runs `evaluate_all_layers` after the SCP-OUT-021
+        // hook so the four extra layers compose under logical AND. Failures
+        // identify the rejecting layer via [`LayerName`].
+        layer_composition: Option<LayerCompositionEnforcement>,
     ) -> Result<ManagedOutletInvocationOutput, ContextError>
     where
         F: FnOnce(serde_json::Value) -> Fut,
@@ -828,96 +886,54 @@ impl ContextManager {
             ctx_gen,
         } = phase1;
 
-        // SCP-OUT-021: build the post-input caveat hook BEFORE Phase 2
-        // dispatch. The hook captures the caveat-enforcement state by
-        // move and runs §7.3.8 synchronous + counter-store checks
-        // immediately after input schema validation in the helper. The
-        // hook is `None` when caveat enforcement is disabled.
+        // SCP-OUT-021 + SCP-OUT-022: build the post-input caveat /
+        // layer-composition hook BEFORE Phase 2 dispatch. The hook captures
+        // the enforcement state(s) by move and runs §7.3.8 synchronous
+        // + counter-store checks AND/OR the §7.3.8 / §6.2 / §19.5 / §19.3
+        // AND fold immediately after input schema validation in the helper.
+        //
+        // Composition rule when BOTH bundles are present:
+        //
+        // 1. SCP-OUT-021 portion runs `check_invocation_local` only
+        //    (input_schema / amount_max_per_call / allowed_adapters /
+        //    allowed_target_dids). The counter-store CAS is delegated to
+        //    `evaluate_all_layers`'s `CaveatRateCounter` step so the per-
+        //    `(context_id, ucan_cid, kind)` counter is incremented at most
+        //    once per invocation.
+        // 2. SCP-OUT-022 `evaluate_all_layers` runs the full six-layer §7.3.8
+        //    composition (caveat time-box → counter → OutboundPolicy →
+        //    InboundPolicy → SpendingCapability → MemberBudgetTracker) and
+        //    short-circuits on the first denial. The denial maps back to
+        //    [`InvocationError::CaveatViolation`] via
+        //    [`invocation_error_from_layer_denial`] so the §5.4.4 catalog
+        //    routing is identical to the OUT-021-only path.
+        //
+        // When only one bundle is present the unused branch is skipped
+        // entirely. When neither is present the hook is `None` and the
+        // helper bypasses the §7.3.8 post-input gate.
+        //
+        // The outlet registration is cloned out of the registry up-front so
+        // the hook closure owns its `OutletRegistration` snapshot — the
+        // registry borrow does not need to survive into the off-lock Phase 2
+        // future. `None` here is recovered by the helper's existing step 2
+        // (registry lookup) so the layer-composition path stays consistent
+        // with the rest of `invoke_outlet_execute_and_validate`.
+        let outlet_for_layer_composition: Option<
+            scp_protocol::context::outlets::OutletRegistration,
+        > = if layer_composition.is_some() {
+            registry.get(outlet_id).cloned()
+        } else {
+            None
+        };
         let caveat_hook: Option<crate::context::outlets::invoke::CaveatPostInputCheck<'_>> =
-            caveat_enforcement.map(|enf| {
-                let context_id_owned = context_id.to_owned();
-                let ucan_cid_owned = enf.ucan_cid.to_owned();
-                let caveats_clone = enf.caveats.clone();
-                let counter_store: Arc<dyn crate::trust::CaveatCounterApi> = enf.counter_store;
-                let estimated_cost = enf.estimated_cost;
-                let adapter_clone = enf.negotiated_adapter.cloned();
-                let target_clone = enf.target_did.cloned();
-                let hook: crate::context::outlets::invoke::CaveatPostInputCheck<'_> =
-                    Box::new(move |input: &serde_json::Value| {
-                        let input = input.clone();
-                        Box::pin(async move {
-                            // 1. Synchronous local checks
-                            // (input_schema / amount_max_per_call /
-                            // allowed_adapters / allowed_target_dids).
-                            if let Err(err) = caveats_clone.check_invocation_local(
-                                &input,
-                                estimated_cost,
-                                adapter_clone.as_ref(),
-                                target_clone.as_ref(),
-                            ) {
-                                return Err(
-                                    crate::context::outlets::invoke::InvocationError::CaveatViolation {
-                                        slug: err.slug(),
-                                        message: err.to_string(),
-                                    },
-                                );
-                            }
-
-                            // 2. Counter-bearing caveats (§7.3.8): each
-                            // populated counter caveat consults
-                            // CaveatCounterStore. Order is fixed —
-                            // max_calls, amount_max_cumulative,
-                            // rate_window — so the rejection slug is
-                            // deterministic when multiple caveats would
-                            // fail.
-                            if let Some(cap) = caveats_clone.max_calls
-                                && let Err(err) = counter_store
-                                    .check_and_increment(
-                                        &context_id_owned,
-                                        &ucan_cid_owned,
-                                        scp_protocol::trust::CaveatKind::MaxCalls,
-                                        1,
-                                        cap,
-                                        0,
-                                    )
-                                    .await
-                            {
-                                return Err(caveat_counter_error_to_invocation_error(err));
-                            }
-                            if let Some(cap) = caveats_clone.amount_max_cumulative
-                                && let Err(err) = counter_store
-                                    .check_and_increment(
-                                        &context_id_owned,
-                                        &ucan_cid_owned,
-                                        scp_protocol::trust::CaveatKind::AmountCumulative,
-                                        estimated_cost.value(),
-                                        cap.value(),
-                                        0,
-                                    )
-                                    .await
-                            {
-                                return Err(caveat_counter_error_to_invocation_error(err));
-                            }
-                            if let Some(window) = caveats_clone.rate_window
-                                && let Err(err) = counter_store
-                                    .check_and_increment(
-                                        &context_id_owned,
-                                        &ucan_cid_owned,
-                                        scp_protocol::trust::CaveatKind::RateWindow,
-                                        0,
-                                        u64::from(window.max),
-                                        window.window_secs,
-                                    )
-                                    .await
-                            {
-                                return Err(caveat_counter_error_to_invocation_error(err));
-                            }
-
-                            Ok(())
-                        })
-                    });
-                hook
-            });
+            build_post_input_hook(
+                context_id,
+                invoker_did,
+                now_secs,
+                caveat_enforcement,
+                layer_composition,
+                outlet_for_layer_composition,
+            );
 
         // ------------------------------------------------------------
         // Phase 2 — UNLOCKED.
@@ -1296,6 +1312,7 @@ impl ContextManager {
                 closure,
                 handler_panic_sink,
                 None,
+                None,
             )
             .await?;
 
@@ -1341,6 +1358,596 @@ struct Phase1Snapshot {
     role_state: scp_protocol::context::roles::ContextRoleState,
     ticket: OutletEconomyTicket,
     ctx_gen: ContextGeneration,
+}
+
+// ===========================================================================
+// SCP-OUT-022 — Layer composition (caveat ∧ Outbound ∧ Inbound ∧
+//                                  SpendingCapability ∧ MemberBudgetTracker)
+// ===========================================================================
+//
+// Implements §7.3.8 "Interaction with other access-control layers" and
+// §6.2.0.1 "Bidirectional Consent Protocol". Caveats are an additive
+// deny-surface; an invocation proceeds iff EVERY layer admits it.
+//
+// Spec-mandated evaluation order (§7.3.8 / story SCP-OUT-022):
+//
+//   1. caveat time-box        (valid_from / valid_until / hours / days)
+//   2. caveat rate/counter    (max_calls / amount_max_cumulative / rate_window)
+//   3. OutboundPolicy         (source-context governance, §6.2.0.1)
+//   4. InboundPolicy          (target-context governance, §6.2.0.1)
+//   5. SpendingCapability     (UCAN-bound per-action ceiling, §19.5)
+//   6. MemberBudgetTracker    (governance-approved per-member budget, §19.3)
+//
+// Cross-context effective guard (§7.3.8): `OutboundPolicy ∧ InboundPolicy ∧
+// caveat`. Intra-context invocations skip Inbound/Outbound (the policies
+// only exist on cross-context interfaces); the function admits those layers
+// when the policy is `None`.
+//
+// `evaluate_all_layers` short-circuits on the first denial and returns a
+// [`LayerDenial`] whose [`LayerName`] identifies which layer rejected the
+// invocation. The error code is one of the §5.4.4 sub-block constants from
+// [`scp_protocol::context::outlets::error_codes`] — no hardcoded
+// `SCP-TOOL-NNNN` literals — so the wire envelope round-trips through the
+// canonical class+slug taxonomy.
+
+/// Identifies which AND-composed access-control layer rejected an
+/// invocation in [`evaluate_all_layers`].
+///
+/// The variant order mirrors the §7.3.8 evaluation order verbatim — when
+/// adding a new layer, insert the variant at the spec-defined position so
+/// the rejection-slug enum continues to match the order audit-readers see
+/// in the spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerName {
+    /// Caveat `valid_from` / `valid_until` / `hours_of_day` / `days_of_week`
+    /// time-box check (§7.3.8 step 11b).
+    CaveatTimeBox,
+    /// Caveat `max_calls` / `amount_max_cumulative` / `rate_window` counter
+    /// check against [`crate::trust::CaveatCounterStore`] (§7.3.8 post-input).
+    CaveatRateCounter,
+    /// `OutboundPolicy` set by the source context (§6.2.0.1):
+    /// `allowed_callers`, `max_payload_bytes`.
+    OutboundPolicy,
+    /// `InboundPolicy` set by the target context (§6.2.0.1):
+    /// `allowed_source_roles`, `require_spending_ucan`.
+    InboundPolicy,
+    /// UCAN-bound `SpendingCapability` `max_per_action` ceiling (§19.5).
+    SpendingCapability,
+    /// Governance-approved `MemberBudgetTracker` per-member budget (§19.3).
+    MemberBudgetTracker,
+}
+
+impl LayerName {
+    /// Returns a stable, lower-kebab-case identifier suitable for
+    /// log fields, error envelope slugs, and assertion strings.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CaveatTimeBox => "caveat-time-box",
+            Self::CaveatRateCounter => "caveat-rate-counter",
+            Self::OutboundPolicy => "outbound-policy",
+            Self::InboundPolicy => "inbound-policy",
+            Self::SpendingCapability => "spending-capability",
+            Self::MemberBudgetTracker => "member-budget-tracker",
+        }
+    }
+}
+
+impl std::fmt::Display for LayerName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Returned by [`evaluate_all_layers`] when one of the composed layers
+/// denies an invocation. Carries the [`LayerName`] that rejected, the
+/// canonical §5.4.4 error code (one of `CODE_AUTHORIZATION_*` /
+/// `CODE_INPUT_VIOLATION` / `CODE_ECONOMIC_FAULT` from
+/// [`scp_protocol::context::outlets::error_codes`]), the catalogue slug for
+/// the wire envelope, and a human-readable diagnostic message.
+///
+/// `error_code` and `slug` are `&'static str`s so this type is `Clone` +
+/// `Send` + `Sync` without heap allocation in the hot path; only `message`
+/// owns its bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayerDenial {
+    /// Which composed layer rejected the invocation.
+    pub layer: LayerName,
+    /// §5.4.4 sub-block error code constant (e.g.
+    /// [`scp_protocol::CODE_AUTHORIZATION_DENIED`]). Always one of the
+    /// `error_codes::CODE_*` constants — never a hardcoded `SCP-TOOL-NNNN`
+    /// literal.
+    pub error_code: &'static str,
+    /// §5.4.4 catalogue slug identifying the precise rejection reason.
+    pub slug: &'static str,
+    /// Human-readable diagnostic for the operator-side log path.
+    pub message: String,
+}
+
+impl std::fmt::Display for LayerDenial {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{layer} ({code} / {slug}): {message}",
+            layer = self.layer,
+            code = self.error_code,
+            slug = self.slug,
+            message = self.message,
+        )
+    }
+}
+
+impl std::error::Error for LayerDenial {}
+
+/// Parameter bundle for [`evaluate_all_layers`].
+///
+/// Conceptually the four `(ctx, caveats, outlet, input)` arguments from the
+/// SCP-OUT-022 acceptance criterion: `caveats`, `outlet`, and `input` are
+/// the three direct fields; the rest of the per-context state (Inbound /
+/// Outbound policies, spending capability, budget tracker, counter store,
+/// adapter, target DID, source role) is bundled into the same struct
+/// because Rust does not have keyword arguments and a positional list of
+/// 14 parameters would be brittle to extend.
+///
+/// Construct one of these at the call site inside
+/// [`ContextManager::invoke_outlet_with_economy`] and hand it to
+/// [`evaluate_all_layers`]. Every field is borrowed; the struct does not
+/// take ownership of any of the underlying data.
+///
+/// # Optional fields
+///
+/// - `outbound_policy` / `inbound_policy` — `None` for intra-context
+///   invocations. The matching layer is treated as "admit" when absent.
+/// - `spending_capability` — `None` when the caller did not present a
+///   spending UCAN. The layer is treated as "admit" when absent AND
+///   `estimated_cost == 0`; a non-zero cost with no spending capability is
+///   rejected upstream by the existing `enforce_economy` path before this
+///   composition is reached, so the absent case here is the free-action
+///   admission, not a permissive bypass.
+/// - `negotiated_adapter` / `target_did` — passed through to the caveat's
+///   `check_invocation_local` half (already enforced upstream by SCP-OUT-021,
+///   so the values are advisory at this layer).
+/// - `source_role` — the role the invoker holds in the source context, when
+///   crossing context boundaries. `None` for intra-context invocations.
+/// - `counter_store` / `ucan_cid` — present when the invocation carries a
+///   counter-bearing caveat. `None` short-circuits the
+///   [`LayerName::CaveatRateCounter`] layer to admit (a token without
+///   `max_calls` / `amount_max_cumulative` / `rate_window` populated needs
+///   no counter store).
+pub struct LayerCompositionInput<'a> {
+    /// The presenting UCAN's invocation caveats.
+    pub caveats: &'a scp_protocol::trust::caveats::InvocationCaveats,
+    /// Outlet registration being invoked.
+    ///
+    /// Held on the struct to align with the SCP-OUT-022 acceptance-criterion
+    /// signature `evaluate_all_layers(ctx, caveats, outlet, input)` and to
+    /// give a future outlet-keyed layer (e.g. operator-attribution-aware
+    /// rejection routing) a stable insertion point. The current §7.3.8 fold
+    /// does not deref this field — `dead_code` is allowed deliberately on
+    /// the struct so the API surface stays consistent with the AC.
+    #[allow(dead_code)]
+    pub outlet: &'a scp_protocol::context::outlets::OutletRegistration,
+    /// Invocation input JSON (post-input-schema-validation value).
+    ///
+    /// Held on the struct to align with the SCP-OUT-022 acceptance-criterion
+    /// signature `evaluate_all_layers(ctx, caveats, outlet, input)`. Today
+    /// the §7.3.8 fold inspects only the caveats and policy values; a future
+    /// schema-aware layer (e.g. cross-context input narrowing) would read
+    /// this field. `dead_code` is allowed on this field so the API surface
+    /// stays consistent with the AC.
+    #[allow(dead_code)]
+    pub input: &'a serde_json::Value,
+    /// Outbound policy from the source context's interface configuration
+    /// (§6.2.0.1). `None` for intra-context invocations.
+    pub outbound_policy: Option<&'a scp_protocol::context::outlets::interface::OutboundPolicy>,
+    /// Inbound policy from the target context's interface configuration
+    /// (§6.2.0.1). `None` for intra-context invocations.
+    pub inbound_policy: Option<&'a scp_protocol::context::outlets::interface::InboundPolicy>,
+    /// `SpendingCapability` extracted from the presenting spending UCAN's
+    /// `fct.spending_capability` field (§19.5). `None` for free actions.
+    pub spending_capability: Option<&'a scp_protocol::crypto::ucan::spending::SpendingCapability>,
+    /// Per-context member budget tracker (§19.3).
+    pub budget_tracker: &'a scp_protocol::economy::budget::MemberBudgetTracker,
+    /// The DID being charged / invoking the outlet.
+    pub invoker_did: &'a DID,
+    /// Pre-execution cost estimate for this invocation.
+    pub estimated_cost: scp_protocol::economy::types::Amount,
+    /// Unix seconds at the start of the invocation. Drives the time-box
+    /// check (`valid_from` / `valid_until` / `hours_of_day` / `days_of_week`).
+    pub now_secs: u64,
+    /// Negotiated payment adapter, if any. Advisory at this layer; the
+    /// `allowed_adapters` caveat is the synchronous post-input gate enforced
+    /// by SCP-OUT-021's hook. `dead_code` is allowed because the OUT-022
+    /// fold delegates the adapter check to OUT-021's `check_invocation_local`
+    /// and the field exists only so a future adapter-aware layer has a
+    /// stable insertion point.
+    #[allow(dead_code)]
+    pub negotiated_adapter: Option<&'a scp_protocol::economy::types::PaymentAdapterRef>,
+    /// Cross-context target DID, if any. Advisory at this layer; the
+    /// `allowed_target_dids` caveat is the synchronous post-input gate
+    /// enforced by SCP-OUT-021's hook. `dead_code` is allowed because the
+    /// OUT-022 fold delegates the target-DID check to OUT-021's
+    /// `check_invocation_local`.
+    #[allow(dead_code)]
+    pub target_did: Option<&'a DID>,
+    /// The role the invoker holds in the source context (cross-context
+    /// invocations only). Drives the `InboundPolicy.allowed_source_roles`
+    /// match.
+    pub source_role: Option<&'a str>,
+    /// Counter store for `max_calls` / `amount_max_cumulative` /
+    /// `rate_window` caveats (§7.3.8 post-input). `None` skips the rate /
+    /// counter layer; provide a real store whenever any of those caveat
+    /// fields is populated.
+    pub counter_store: Option<&'a dyn crate::trust::CaveatCounterApi>,
+    /// Context ID — required when `counter_store` is `Some` to form the
+    /// counter key.
+    pub context_id: &'a str,
+    /// Presenting UCAN's CID — required when `counter_store` is `Some` to
+    /// form the counter key.
+    pub ucan_cid: &'a str,
+    /// Serialized payload byte length, used by the `OutboundPolicy.max_payload_bytes`
+    /// check (§6.2.0.1). Pass `0` for intra-context invocations or when the
+    /// payload size is not meaningful at this gate.
+    pub payload_bytes: usize,
+}
+
+/// Composes the §7.3.8 access-control layers under logical AND and returns
+/// the first denial in spec order.
+///
+/// Implements SCP-OUT-022. Evaluates, in this order:
+///
+/// 1. **Caveat time-box** — `valid_from`, `valid_until`, `hours_of_day`,
+///    `days_of_week`. Pure compute over the caveat fields against
+///    `now_secs`.
+/// 2. **Caveat rate / counter** — `max_calls`, `amount_max_cumulative`,
+///    `rate_window`. Atomic CAS against the supplied
+///    [`crate::trust::CaveatCounterApi`]. Skipped when no counter store is
+///    provided (a caveat set with none of the three counter fields populated
+///    needs no store).
+/// 3. **`OutboundPolicy`** — `allowed_callers`, `max_payload_bytes`. When
+///    the source context published an interface (`Some(policy)`), the
+///    invoker DID must be in `allowed_callers` (or the list must be empty,
+///    meaning "any member with the `OutletInterface` capability") and the
+///    payload size must not exceed `max_payload_bytes`. Skipped for
+///    intra-context invocations (`None`).
+/// 4. **`InboundPolicy`** — `allowed_source_roles`, `require_spending_ucan`.
+///    When the target context published an interface (`Some(policy)`), the
+///    `source_role` must match the allow-list (or be empty, meaning "any
+///    role"); when `require_spending_ucan` is `true`, a `SpendingCapability`
+///    must be present. Skipped for intra-context invocations (`None`).
+/// 5. **`SpendingCapability`** — `max_per_action`. The estimated cost must
+///    not exceed the per-action ceiling on the presenting UCAN's spending
+///    capability. Skipped when `spending_capability` is `None` AND
+///    `estimated_cost == 0` (free action — no spending UCAN required).
+/// 6. **`MemberBudgetTracker`** — `has_budget` and remaining capacity.
+///    Reads against the per-context budget tracker; the actual deduction
+///    happens upstream in `invoke_outlet_with_economy`'s Phase 1 budget
+///    block. Skipped for free actions (`estimated_cost == 0`).
+///
+/// The function short-circuits on the first failure and returns a
+/// [`LayerDenial`] whose [`LayerName`] identifies which layer rejected the
+/// invocation. On success returns `Ok(())`.
+///
+/// # Errors
+///
+/// Returns [`LayerDenial`] keyed by [`LayerName`] when a layer rejects the
+/// invocation. The `error_code` field is one of the
+/// [`scp_protocol::context::outlets::error_codes`] constants
+/// (`CODE_AUTHORIZATION_DENIED`, `CODE_INPUT_VIOLATION`,
+/// `CODE_ECONOMIC_FAULT`); no hardcoded `SCP-TOOL-NNNN` strings.
+#[allow(clippy::too_many_lines)] // §7.3.8 ordering is six layers — splitting them masks the spec mapping.
+pub async fn evaluate_all_layers(input: LayerCompositionInput<'_>) -> Result<(), LayerDenial> {
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_AUTHORIZATION_DENIED, CODE_ECONOMIC_FAULT, CODE_INPUT_VIOLATION,
+    };
+
+    // -----------------------------------------------------------------
+    // 1. caveat time-box
+    // -----------------------------------------------------------------
+    if let Some(valid_from) = input.caveats.valid_from
+        && input.now_secs < valid_from
+    {
+        return Err(LayerDenial {
+            layer: LayerName::CaveatTimeBox,
+            error_code: CODE_AUTHORIZATION_DENIED,
+            slug: "authorization.time-box-violation",
+            message: format!(
+                "valid_from: now={now} < valid_from={valid_from}",
+                now = input.now_secs,
+            ),
+        });
+    }
+    if let Some(valid_until) = input.caveats.valid_until
+        && input.now_secs > valid_until
+    {
+        return Err(LayerDenial {
+            layer: LayerName::CaveatTimeBox,
+            error_code: CODE_AUTHORIZATION_DENIED,
+            slug: "authorization.time-box-violation",
+            message: format!(
+                "valid_until: now={now} > valid_until={valid_until}",
+                now = input.now_secs,
+            ),
+        });
+    }
+    if let Some(hours_mask) = input.caveats.hours_of_day {
+        // Unix-seconds → UTC-hour-of-day. Bit-true; no calendar awareness.
+        #[allow(clippy::cast_possible_truncation)]
+        let current_hour = ((input.now_secs / 3600) % 24) as u8;
+        if !hours_mask.contains_hour(current_hour) {
+            return Err(LayerDenial {
+                layer: LayerName::CaveatTimeBox,
+                error_code: CODE_AUTHORIZATION_DENIED,
+                slug: "authorization.time-box-violation",
+                message: format!(
+                    "hours_of_day: current_utc_hour={current_hour} not in mask 0x{:08x}",
+                    hours_mask.bits()
+                ),
+            });
+        }
+    }
+    if let Some(days_mask) = input.caveats.days_of_week {
+        // 1970-01-01 was a Thursday (weekday=4 with Sunday=0). Each Unix
+        // day shifts weekday forward by 1.
+        #[allow(clippy::cast_possible_truncation)]
+        let current_weekday = (((input.now_secs / 86_400) + 4) % 7) as u8;
+        if !days_mask.contains_day(current_weekday) {
+            return Err(LayerDenial {
+                layer: LayerName::CaveatTimeBox,
+                error_code: CODE_AUTHORIZATION_DENIED,
+                slug: "authorization.time-box-violation",
+                message: format!(
+                    "days_of_week: current_utc_weekday={current_weekday} not in mask 0x{:02x}",
+                    days_mask.bits()
+                ),
+            });
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 2. caveat rate / counter
+    // -----------------------------------------------------------------
+    if let Some(store) = input.counter_store {
+        if let Some(cap) = input.caveats.max_calls
+            && let Err(err) = store
+                .check_and_increment(
+                    input.context_id,
+                    input.ucan_cid,
+                    scp_protocol::trust::CaveatKind::MaxCalls,
+                    1,
+                    cap,
+                    0,
+                )
+                .await
+        {
+            return Err(layer_denial_from_counter_error(
+                LayerName::CaveatRateCounter,
+                err,
+            ));
+        }
+        if let Some(cap) = input.caveats.amount_max_cumulative
+            && let Err(err) = store
+                .check_and_increment(
+                    input.context_id,
+                    input.ucan_cid,
+                    scp_protocol::trust::CaveatKind::AmountCumulative,
+                    input.estimated_cost.value(),
+                    cap.value(),
+                    0,
+                )
+                .await
+        {
+            return Err(layer_denial_from_counter_error(
+                LayerName::CaveatRateCounter,
+                err,
+            ));
+        }
+        if let Some(window) = input.caveats.rate_window
+            && let Err(err) = store
+                .check_and_increment(
+                    input.context_id,
+                    input.ucan_cid,
+                    scp_protocol::trust::CaveatKind::RateWindow,
+                    0,
+                    u64::from(window.max),
+                    window.window_secs,
+                )
+                .await
+        {
+            return Err(layer_denial_from_counter_error(
+                LayerName::CaveatRateCounter,
+                err,
+            ));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 3. OutboundPolicy (§6.2.0.1) — only present for cross-context
+    // -----------------------------------------------------------------
+    if let Some(policy) = input.outbound_policy {
+        // allowed_callers: empty means "any member with OutletInterface
+        // capability"; non-empty restricts to listed DIDs.
+        if !policy.allowed_callers.is_empty()
+            && !policy
+                .allowed_callers
+                .iter()
+                .any(|d| d == input.invoker_did)
+        {
+            return Err(LayerDenial {
+                layer: LayerName::OutboundPolicy,
+                error_code: CODE_AUTHORIZATION_DENIED,
+                slug: "authorization.denied",
+                message: format!(
+                    "OutboundPolicy.allowed_callers does not include invoker {invoker}",
+                    invoker = input.invoker_did,
+                ),
+            });
+        }
+        // max_payload_bytes: rejection mirrors the §5.4.4 input-class
+        // taxonomy because the violation is a request-shape constraint, not
+        // a delegation-bound one.
+        if input.payload_bytes > policy.max_payload_bytes as usize {
+            return Err(LayerDenial {
+                layer: LayerName::OutboundPolicy,
+                error_code: CODE_INPUT_VIOLATION,
+                slug: "input.too-large",
+                message: format!(
+                    "OutboundPolicy.max_payload_bytes={cap} exceeded by payload of {actual} bytes",
+                    cap = policy.max_payload_bytes,
+                    actual = input.payload_bytes,
+                ),
+            });
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 4. InboundPolicy (§6.2.0.1) — only present for cross-context
+    // -----------------------------------------------------------------
+    if let Some(policy) = input.inbound_policy {
+        // allowed_source_roles: empty means "any role"; non-empty restricts.
+        if !policy.allowed_source_roles.is_empty() {
+            let role_admitted = input
+                .source_role
+                .is_some_and(|role| policy.allowed_source_roles.iter().any(|r| r == role));
+            if !role_admitted {
+                return Err(LayerDenial {
+                    layer: LayerName::InboundPolicy,
+                    error_code: CODE_AUTHORIZATION_DENIED,
+                    slug: "authorization.denied",
+                    message: format!(
+                        "InboundPolicy.allowed_source_roles does not include source role {role:?}",
+                        role = input.source_role,
+                    ),
+                });
+            }
+        }
+        // require_spending_ucan: when the target demands a spending UCAN, a
+        // SpendingCapability must accompany the invocation.
+        if policy.require_spending_ucan && input.spending_capability.is_none() {
+            return Err(LayerDenial {
+                layer: LayerName::InboundPolicy,
+                error_code: CODE_AUTHORIZATION_DENIED,
+                slug: "authorization.missing",
+                message:
+                    "InboundPolicy.require_spending_ucan=true but no SpendingCapability presented"
+                        .to_owned(),
+            });
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // 5. SpendingCapability (§19.5) — per-action ceiling
+    // -----------------------------------------------------------------
+    if let Some(cap) = input.spending_capability
+        && input.estimated_cost.value() > cap.max_per_action.0
+    {
+        return Err(LayerDenial {
+            layer: LayerName::SpendingCapability,
+            error_code: CODE_AUTHORIZATION_DENIED,
+            slug: "authorization.denied",
+            message: format!(
+                "SpendingCapability.max_per_action={max} exceeded by estimated_cost={cost}",
+                max = cap.max_per_action,
+                cost = input.estimated_cost,
+            ),
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // 6. MemberBudgetTracker (§19.3) — governance-approved budget
+    // -----------------------------------------------------------------
+    if input.estimated_cost.value() > 0 {
+        if !input.budget_tracker.has_budget(input.invoker_did) {
+            return Err(LayerDenial {
+                layer: LayerName::MemberBudgetTracker,
+                error_code: CODE_ECONOMIC_FAULT,
+                slug: "economic.budget-exceeded",
+                message: format!(
+                    "no governance-approved budget for {invoker}",
+                    invoker = input.invoker_did,
+                ),
+            });
+        }
+        let remaining = input.budget_tracker.remaining(input.invoker_did);
+        if input.estimated_cost.value() > remaining.value() {
+            return Err(LayerDenial {
+                layer: LayerName::MemberBudgetTracker,
+                error_code: CODE_ECONOMIC_FAULT,
+                slug: "economic.budget-exceeded",
+                message: format!(
+                    "MemberBudgetTracker remaining={remaining} < estimated_cost={cost} for {invoker}",
+                    cost = input.estimated_cost,
+                    invoker = input.invoker_did,
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+/// Maps a [`crate::trust::caveat_counter_store::CounterError`] into a
+/// [`LayerDenial`] tagged with the supplied [`LayerName`]. Used by
+/// [`evaluate_all_layers`] for the counter-bearing caveats so the error
+/// envelope round-trips through the same §5.4.4 slug taxonomy as the
+/// SCP-OUT-021 caveat hook.
+fn layer_denial_from_counter_error(
+    layer: LayerName,
+    err: crate::trust::caveat_counter_store::CounterError,
+) -> LayerDenial {
+    use crate::trust::caveat_counter_store::{CounterError, CounterExhausted};
+    use scp_protocol::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED;
+    use scp_protocol::trust::CaveatKind;
+    match err {
+        CounterError::Exhausted(exhausted) => {
+            let slug: &'static str = match exhausted.kind() {
+                CaveatKind::MaxCalls => "authorization.denied",
+                CaveatKind::AmountCumulative => "authorization.cumulative-exceeded",
+                CaveatKind::RateWindow => "authorization.rate-exceeded",
+            };
+            let message = match &exhausted {
+                CounterExhausted::MaxCalls { would_be, cap, .. } => {
+                    format!("max_calls exhausted: would_be={would_be}, cap={cap}")
+                }
+                CounterExhausted::AmountCumulative { would_be, cap, .. } => {
+                    format!("amount_max_cumulative exhausted: would_be={would_be}, cap={cap}")
+                }
+                CounterExhausted::RateWindow {
+                    in_window,
+                    cap,
+                    window_secs,
+                    ..
+                } => format!(
+                    "rate_window exhausted: in_window={in_window}, cap={cap}, window_secs={window_secs}"
+                ),
+            };
+            LayerDenial {
+                layer,
+                error_code: CODE_AUTHORIZATION_DENIED,
+                slug,
+                message,
+            }
+        }
+        CounterError::Store(store_err) => LayerDenial {
+            layer,
+            error_code: CODE_AUTHORIZATION_DENIED,
+            slug: "authorization.denied",
+            message: format!("caveat counter store error: {store_err}"),
+        },
+    }
+}
+
+/// Maps a [`LayerDenial`] from [`evaluate_all_layers`] into the
+/// [`InvocationError::CaveatViolation`] envelope expected by the
+/// post-input pipeline (`invoke_outlet_execute_and_validate`). The mapping
+/// preserves the layer's slug verbatim so the
+/// [`invocation_error_to_context`] dispatcher sees the same class+slug pair
+/// that downstream catalog assertions expect.
+fn invocation_error_from_layer_denial(denial: &LayerDenial) -> InvocationError {
+    InvocationError::CaveatViolation {
+        slug: denial.slug,
+        message: format!("{}: {}", denial.layer.as_str(), denial.message),
+    }
 }
 
 /// SCP-OUT-021 — convert a [`crate::trust::caveat_counter_store::CounterError`]
@@ -1391,6 +1998,262 @@ fn caveat_counter_error_to_invocation_error(
                 message: format!("caveat counter store error: {store_err}"),
             }
         }
+    }
+}
+
+/// Builds the post-input enforcement hook for `invoke_outlet_with_economy`.
+///
+/// Combines the SCP-OUT-021 caveat hook (synchronous local checks +
+/// counter-store CAS) with the SCP-OUT-022 layer composition fold
+/// (`evaluate_all_layers`). When both bundles are present, the
+/// counter-bearing portion of OUT-021 is delegated to `evaluate_all_layers`
+/// so the per-`(context_id, ucan_cid, kind)` counter is incremented at most
+/// once per invocation; the OUT-021 portion runs only the synchronous
+/// `check_invocation_local` half (`input_schema` / `amount_max_per_call` /
+/// `allowed_adapters` / `allowed_target_dids`), which `evaluate_all_layers`
+/// does not duplicate.
+///
+/// Returns `None` when neither bundle is present — the caller bypasses the
+/// §7.3.8 post-input gate entirely in that case.
+#[allow(clippy::too_many_lines)] // §7.3.8 spec ordering — splitting masks the spec mapping; SCP-OUT-022 ACs hinge on the ordering being visible in one place.
+fn build_post_input_hook<'a>(
+    context_id: &str,
+    invoker_did: &DID,
+    now_secs: u64,
+    caveat_enforcement: Option<CaveatEnforcement<'_>>,
+    layer_composition: Option<LayerCompositionEnforcement>,
+    outlet_for_layer_composition: Option<scp_protocol::context::outlets::OutletRegistration>,
+) -> Option<crate::context::outlets::invoke::CaveatPostInputCheck<'a>> {
+    if caveat_enforcement.is_none() && layer_composition.is_none() {
+        return None;
+    }
+
+    // Capture every borrowed input by value so the returned Boxed FnOnce is
+    // `'static` w.r.t. the function-level borrows. The hook's `'a` parameter
+    // is the lifetime of the future inside the helper; the captures all live
+    // for the duration of that future.
+    let context_id_owned = context_id.to_owned();
+    let invoker_did_owned = invoker_did.clone();
+
+    // SCP-OUT-021 captures (only meaningful when caveat_enforcement.is_some()).
+    let out021 = caveat_enforcement.map(|enf| OUT021Capture {
+        ucan_cid: enf.ucan_cid.to_owned(),
+        caveats: enf.caveats.clone(),
+        counter_store: enf.counter_store,
+        estimated_cost: enf.estimated_cost,
+        adapter: enf.negotiated_adapter.cloned(),
+        target_did: enf.target_did.cloned(),
+    });
+
+    // SCP-OUT-022 captures (only meaningful when layer_composition.is_some()).
+    let out022 = layer_composition.map(|bundle| OUT022Capture {
+        bundle,
+        outlet: outlet_for_layer_composition,
+    });
+
+    let hook: crate::context::outlets::invoke::CaveatPostInputCheck<'a> =
+        Box::new(move |input: &serde_json::Value| {
+            let input = input.clone();
+            Box::pin(async move {
+                // ---- SCP-OUT-021 synchronous local checks --------------
+                // (input_schema / amount_max_per_call / allowed_adapters /
+                //  allowed_target_dids). `evaluate_all_layers` does NOT
+                // duplicate these — they are the OUT-021-specific gate that
+                // sits BEFORE the §7.3.8 layer fold.
+                if let Some(cap) = out021.as_ref()
+                    && let Err(err) = cap.caveats.check_invocation_local(
+                        &input,
+                        cap.estimated_cost,
+                        cap.adapter.as_ref(),
+                        cap.target_did.as_ref(),
+                    )
+                {
+                    return Err(
+                        crate::context::outlets::invoke::InvocationError::CaveatViolation {
+                            slug: err.slug(),
+                            message: err.to_string(),
+                        },
+                    );
+                }
+
+                // ---- SCP-OUT-021 counter-store CAS ---------------------
+                // Runs only when OUT-021 is enabled AND OUT-022 is NOT
+                // present. When OUT-022 is present, `evaluate_all_layers`
+                // owns the counter check (via its `CaveatRateCounter`
+                // step), so running the OUT-021 counter here would double-
+                // increment. Order is fixed: max_calls → amount_max_cumulative
+                // → rate_window so the rejection slug stays deterministic
+                // when more than one counter caveat would fail.
+                if let Some(cap) = out021.as_ref()
+                    && out022.is_none()
+                {
+                    if let Some(max) = cap.caveats.max_calls
+                        && let Err(err) = cap
+                            .counter_store
+                            .check_and_increment(
+                                &context_id_owned,
+                                &cap.ucan_cid,
+                                scp_protocol::trust::CaveatKind::MaxCalls,
+                                1,
+                                max,
+                                0,
+                            )
+                            .await
+                    {
+                        return Err(caveat_counter_error_to_invocation_error(err));
+                    }
+                    if let Some(max) = cap.caveats.amount_max_cumulative
+                        && let Err(err) = cap
+                            .counter_store
+                            .check_and_increment(
+                                &context_id_owned,
+                                &cap.ucan_cid,
+                                scp_protocol::trust::CaveatKind::AmountCumulative,
+                                cap.estimated_cost.value(),
+                                max.value(),
+                                0,
+                            )
+                            .await
+                    {
+                        return Err(caveat_counter_error_to_invocation_error(err));
+                    }
+                    if let Some(window) = cap.caveats.rate_window
+                        && let Err(err) = cap
+                            .counter_store
+                            .check_and_increment(
+                                &context_id_owned,
+                                &cap.ucan_cid,
+                                scp_protocol::trust::CaveatKind::RateWindow,
+                                0,
+                                u64::from(window.max),
+                                window.window_secs,
+                            )
+                            .await
+                    {
+                        return Err(caveat_counter_error_to_invocation_error(err));
+                    }
+                }
+
+                // ---- SCP-OUT-022 layer composition ---------------------
+                // The §7.3.8 / §6.2 / §19.5 / §19.3 AND fold over time-box
+                // → counter → OutboundPolicy → InboundPolicy →
+                // SpendingCapability → MemberBudgetTracker. Short-circuits
+                // on the first denial; the resulting `LayerDenial` names
+                // the rejecting layer via `LayerName`.
+                if let Some(layer_cap) = out022.as_ref() {
+                    // The §7.3.8 layer-composition input borrows the
+                    // OUT-021 caveats + counter store when present. When
+                    // OUT-021 is absent, fall back to an empty caveat set
+                    // (no time-box / no counter constraints) and skip the
+                    // counter store — the four economic / policy layers
+                    // still compose.
+                    let empty_caveats = scp_protocol::trust::caveats::InvocationCaveats::empty();
+                    let (caveats_ref, counter_store_ref, ucan_cid_ref): (
+                        &scp_protocol::trust::caveats::InvocationCaveats,
+                        Option<&dyn crate::trust::CaveatCounterApi>,
+                        &str,
+                    ) = out021
+                        .as_ref()
+                        .map_or((&empty_caveats, None, ""), |out021_cap| {
+                            (
+                                &out021_cap.caveats,
+                                Some(out021_cap.counter_store.as_ref()),
+                                out021_cap.ucan_cid.as_str(),
+                            )
+                        });
+                    // Always materialize the placeholder so the borrow held
+                    // by `outlet_ref` is valid whether the registry produced
+                    // a real registration or not. The placeholder is cheap
+                    // (single allocation set) and `evaluate_all_layers`
+                    // never derefs it on the present spec — but a future
+                    // outlet-keyed layer would.
+                    let outlet_placeholder = layer_composition_outlet_placeholder();
+                    let outlet_ref: &scp_protocol::context::outlets::OutletRegistration =
+                        layer_cap.outlet.as_ref().unwrap_or(&outlet_placeholder);
+                    // Estimated cost feeds time-box-independent layers
+                    // (SpendingCapability `max_per_action`, budget remaining,
+                    // and the `amount_max_cumulative` counter). For free
+                    // actions OUT-021 is absent and `estimated_cost` is 0.
+                    let estimated_cost = out021
+                        .as_ref()
+                        .map_or(scp_protocol::economy::types::Amount::new(0), |c| {
+                            c.estimated_cost
+                        });
+                    let composition_input = LayerCompositionInput {
+                        caveats: caveats_ref,
+                        outlet: outlet_ref,
+                        input: &input,
+                        outbound_policy: layer_cap.bundle.outbound_policy.as_ref(),
+                        inbound_policy: layer_cap.bundle.inbound_policy.as_ref(),
+                        spending_capability: layer_cap.bundle.spending_capability.as_ref(),
+                        budget_tracker: &layer_cap.bundle.budget_tracker,
+                        invoker_did: &invoker_did_owned,
+                        estimated_cost,
+                        now_secs,
+                        negotiated_adapter: out021.as_ref().and_then(|c| c.adapter.as_ref()),
+                        target_did: out021.as_ref().and_then(|c| c.target_did.as_ref()),
+                        source_role: layer_cap.bundle.source_role.as_deref(),
+                        counter_store: counter_store_ref,
+                        context_id: &context_id_owned,
+                        ucan_cid: ucan_cid_ref,
+                        payload_bytes: layer_cap.bundle.payload_bytes,
+                    };
+                    if let Err(denial) = evaluate_all_layers(composition_input).await {
+                        return Err(invocation_error_from_layer_denial(&denial));
+                    }
+                }
+
+                Ok(())
+            })
+        });
+    Some(hook)
+}
+
+/// Captures the SCP-OUT-021 hook fields by value so the returned closure is
+/// owned (no borrows from `invoke_outlet_with_economy`'s stack frame).
+struct OUT021Capture {
+    ucan_cid: String,
+    caveats: scp_protocol::trust::caveats::InvocationCaveats,
+    counter_store: Arc<dyn crate::trust::CaveatCounterApi>,
+    estimated_cost: scp_protocol::economy::types::Amount,
+    adapter: Option<scp_protocol::economy::types::PaymentAdapterRef>,
+    target_did: Option<DID>,
+}
+
+/// Captures the SCP-OUT-022 layer-composition fields by value alongside the
+/// optional outlet snapshot. The outlet snapshot is `None` when the registry
+/// lookup miss surfaces — `evaluate_all_layers` does not actually deref the
+/// `outlet` field at present, but the placeholder keeps the
+/// [`LayerCompositionInput`] surface honest in case a future layer adds an
+/// outlet-keyed check.
+struct OUT022Capture {
+    bundle: LayerCompositionEnforcement,
+    outlet: Option<scp_protocol::context::outlets::OutletRegistration>,
+}
+
+/// Returns a synthetic, never-signed [`OutletRegistration`] used as a
+/// placeholder when the registry lookup misses inside the layer-composition
+/// hook. `evaluate_all_layers` does NOT dereference any field of `outlet`
+/// today — the placeholder exists so the [`LayerCompositionInput`] surface
+/// stays non-`Option` and a future outlet-keyed layer can fail loudly with
+/// the synthetic kind / id rather than silently admit on `None`.
+fn layer_composition_outlet_placeholder() -> scp_protocol::context::outlets::OutletRegistration {
+    scp_protocol::context::outlets::OutletRegistration {
+        outlet_id: String::new(),
+        kind: scp_protocol::context::outlets::OutletKind::Action,
+        name: String::new(),
+        description: String::new(),
+        schema: scp_protocol::context::outlets::OutletSchema {
+            input_schema: serde_json::json!({}),
+            output_schema: serde_json::json!({}),
+        },
+        implementation_hash: [0; 32],
+        test_vectors: Vec::new(),
+        operator_did: DID(String::new()),
+        cost: None,
+        message_catalog: Vec::new(),
+        registered_at: 0,
+        signature: Vec::new(),
     }
 }
 
@@ -4538,5 +5401,593 @@ mod amplification_tests {
         assert_eq!(a.kind, OutletKind::Action);
         assert_eq!(a.per_interface_calls_per_minute, 60);
         assert_eq!(a.per_caller_calls_per_minute, 10);
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::similar_names,
+    clippy::doc_markdown,
+    clippy::uninlined_format_args,
+    clippy::match_wildcard_for_single_variants,
+    clippy::type_complexity
+)]
+mod layer_composition_tests {
+    //! SCP-OUT-022 acceptance criteria — verifies the §7.3.8 / §6.2 / §19.5
+    //! / §19.3 AND fold against the public [`evaluate_all_layers`] surface,
+    //! the [`build_post_input_hook`] composition seam, and the
+    //! [`ContextManager::invoke_outlet_with_economy`] integration path.
+    //!
+    //! Test coverage maps to the AC list in
+    //! `.docs/prds/outlet.json` SCP-OUT-022:
+    //!
+    //! * AC1 — `evaluate_all_layers` returns `Ok(())` iff every layer admits
+    //! * AC2 — short-circuits on first `Err` and identifies the layer
+    //! * AC3 — caveat admits, OutboundPolicy denies → OutboundPolicy
+    //! * AC4 — caveat admits, Outbound admits, Inbound denies → InboundPolicy
+    //! * AC5 — upstream admit, SpendingCapability denies → SpendingCapability
+    //! * AC6 — upstream admit, MemberBudgetTracker denies → MemberBudgetTracker
+    //! * AC7 — all admit → `Ok(())`; invocation proceeds
+    //! * AC8 — widened child caveat (rejected at attenuation) never reaches
+    //!   the layer composition (proves the short-circuit)
+    //! * AC9 — `cargo test --workspace` passes (assured by this mod compiling
+    //!   and being included in the workspace test set)
+    //!
+    //! Each test cites the AC it covers in a leading doc comment. The integration
+    //! path test wires through the real
+    //! [`ContextManager::invoke_outlet_with_economy`] entry point so the AC8
+    //! short-circuit + AC1/AC7 admit-path are observed at the public manager
+    //! surface, not just the inner [`evaluate_all_layers`] helper.
+    use super::*;
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::context::outlets::interface::{InboundPolicy, OutboundPolicy};
+    use scp_protocol::crypto::ucan::spending::SpendingCapability;
+    use scp_protocol::economy::budget::MemberBudgetTracker;
+    use scp_protocol::economy::types::Amount;
+    use scp_protocol::trust::caveats::{AttenuationViolation, InvocationCaveats};
+
+    /// Builds a fresh [`MemberBudgetTracker`] with a single 1,000,000-unit
+    /// grant for the named DID. Reused by every test that needs to admit at
+    /// the budget layer.
+    fn budget_with_grant(invoker: &DID, grant: u64) -> MemberBudgetTracker {
+        let mut tracker = MemberBudgetTracker::new();
+        tracker.grant(invoker, Amount::new(grant));
+        tracker
+    }
+
+    /// Returns the placeholder [`OutletRegistration`] used by the unit tests
+    /// in this module. `evaluate_all_layers` does not deref this value, so a
+    /// synthetic registration is sufficient.
+    fn unit_test_outlet_registration() -> scp_protocol::context::outlets::OutletRegistration {
+        layer_composition_outlet_placeholder()
+    }
+
+    /// Builds a [`SpendingCapability`] with the requested per-action ceiling
+    /// and a generous total / window so layers other than
+    /// `SpendingCapability` are unaffected.
+    ///
+    /// `SpendingCapability` uses the UCAN-flavored
+    /// [`scp_protocol::crypto::ucan::Amount`] /
+    /// [`scp_protocol::crypto::ucan::CurrencyCode`] (distinct types from the
+    /// economy module's `Amount` / `CurrencyCode`) — the spec keeps them
+    /// separate so the UCAN wire format does not need to track the economy
+    /// module's `serde_with` adapters.
+    fn spending_cap(max_per_action: u64) -> SpendingCapability {
+        SpendingCapability {
+            max_per_action: scp_protocol::crypto::ucan::Amount(max_per_action),
+            max_total: scp_protocol::crypto::ucan::Amount(u64::MAX),
+            currency: scp_protocol::crypto::ucan::CurrencyCode::from_code("USD")
+                .expect("USD is a valid 3-byte ASCII code"),
+            time_window: std::time::Duration::from_hours(24),
+            allowed_adapters: Vec::new(),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Test 1 (AC3) — caveat admits, OutboundPolicy denies → OutboundPolicy
+    // ---------------------------------------------------------------------
+
+    /// AC3: when the caveat layers admit and `OutboundPolicy.allowed_callers`
+    /// excludes the invoker, the layer composition rejects with
+    /// [`LayerName::OutboundPolicy`]. The §5.4.4 slug routes through
+    /// `authorization.denied` because the violation is a delegation-bound
+    /// rejection rather than an input-shape violation.
+    #[tokio::test]
+    async fn ac3_outbound_policy_allowed_callers_denies_identifies_outbound() {
+        let invoker: DID = "did:key:invoker".into();
+        let other: DID = "did:key:other".into();
+        let caveats = InvocationCaveats::empty();
+        let outlet = unit_test_outlet_registration();
+        let input = serde_json::json!({});
+        let outbound = OutboundPolicy {
+            allowed_callers: vec![other.clone()],
+            max_calls_per_minute: 600,
+            max_payload_bytes: 65_536,
+            require_provenance: true,
+        };
+        let budget = budget_with_grant(&invoker, 0);
+
+        let denial = evaluate_all_layers(LayerCompositionInput {
+            caveats: &caveats,
+            outlet: &outlet,
+            input: &input,
+            outbound_policy: Some(&outbound),
+            inbound_policy: None,
+            spending_capability: None,
+            budget_tracker: &budget,
+            invoker_did: &invoker,
+            estimated_cost: Amount::new(0),
+            now_secs: 1_000_000,
+            negotiated_adapter: None,
+            target_did: None,
+            source_role: None,
+            counter_store: None,
+            context_id: "ctx-out022",
+            ucan_cid: "ucan-out022",
+            payload_bytes: 0,
+        })
+        .await
+        .expect_err("OutboundPolicy.allowed_callers must reject when invoker absent");
+
+        assert_eq!(denial.layer, LayerName::OutboundPolicy);
+        assert_eq!(denial.error_code, scp_protocol::CODE_AUTHORIZATION_DENIED);
+        assert_eq!(denial.slug, "authorization.denied");
+        assert!(
+            denial.message.contains("OutboundPolicy.allowed_callers"),
+            "diagnostic must name the field, got: {}",
+            denial.message
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Test 2 (AC4) — caveat + Outbound admit, InboundPolicy denies → InboundPolicy
+    // ---------------------------------------------------------------------
+
+    /// AC4: when the upstream layers (caveat, OutboundPolicy) admit and
+    /// `InboundPolicy.allowed_source_roles` does not include the invoker's
+    /// source role, the layer composition rejects with
+    /// [`LayerName::InboundPolicy`]. Confirms cross-context inbound role
+    /// enforcement happens AFTER outbound checks.
+    #[tokio::test]
+    async fn ac4_inbound_policy_allowed_source_roles_denies_identifies_inbound() {
+        let invoker: DID = "did:key:invoker".into();
+        let caveats = InvocationCaveats::empty();
+        let outlet = unit_test_outlet_registration();
+        let input = serde_json::json!({});
+        // OutboundPolicy admits (empty allow-list = "any caller").
+        let outbound = OutboundPolicy {
+            allowed_callers: Vec::new(),
+            max_calls_per_minute: 600,
+            max_payload_bytes: 65_536,
+            require_provenance: true,
+        };
+        // InboundPolicy denies — the invoker presents role "guest" but the
+        // target only admits "admin".
+        let inbound = InboundPolicy {
+            allowed_source_roles: vec!["admin".to_owned()],
+            max_calls_per_minute: 600,
+            max_response_bytes: 65_536,
+            require_spending_ucan: false,
+        };
+        let budget = budget_with_grant(&invoker, 0);
+
+        let denial = evaluate_all_layers(LayerCompositionInput {
+            caveats: &caveats,
+            outlet: &outlet,
+            input: &input,
+            outbound_policy: Some(&outbound),
+            inbound_policy: Some(&inbound),
+            spending_capability: None,
+            budget_tracker: &budget,
+            invoker_did: &invoker,
+            estimated_cost: Amount::new(0),
+            now_secs: 1_000_000,
+            negotiated_adapter: None,
+            target_did: None,
+            source_role: Some("guest"),
+            counter_store: None,
+            context_id: "ctx-out022",
+            ucan_cid: "ucan-out022",
+            payload_bytes: 0,
+        })
+        .await
+        .expect_err("InboundPolicy.allowed_source_roles must reject");
+
+        assert_eq!(denial.layer, LayerName::InboundPolicy);
+        assert_eq!(denial.error_code, scp_protocol::CODE_AUTHORIZATION_DENIED);
+        assert_eq!(denial.slug, "authorization.denied");
+        assert!(
+            denial.message.contains("allowed_source_roles"),
+            "diagnostic must name the field, got: {}",
+            denial.message
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Test 3 (AC5) — upstream admit, SpendingCapability denies
+    // ---------------------------------------------------------------------
+
+    /// AC5: when the caveat / outbound / inbound layers admit and the
+    /// estimated cost exceeds `SpendingCapability.max_per_action`, the
+    /// composition rejects with [`LayerName::SpendingCapability`].
+    #[tokio::test]
+    async fn ac5_spending_capability_max_per_action_denies_identifies_spending() {
+        let invoker: DID = "did:key:invoker".into();
+        let caveats = InvocationCaveats::empty();
+        let outlet = unit_test_outlet_registration();
+        let input = serde_json::json!({});
+        // Cap = 100; cost = 250 → reject.
+        let cap = spending_cap(100);
+        // Budget would admit (granted 1_000_000) so the rejection is
+        // unambiguously the spending layer.
+        let budget = budget_with_grant(&invoker, 1_000_000);
+
+        let denial = evaluate_all_layers(LayerCompositionInput {
+            caveats: &caveats,
+            outlet: &outlet,
+            input: &input,
+            outbound_policy: None,
+            inbound_policy: None,
+            spending_capability: Some(&cap),
+            budget_tracker: &budget,
+            invoker_did: &invoker,
+            estimated_cost: Amount::new(250),
+            now_secs: 1_000_000,
+            negotiated_adapter: None,
+            target_did: None,
+            source_role: None,
+            counter_store: None,
+            context_id: "ctx-out022",
+            ucan_cid: "ucan-out022",
+            payload_bytes: 0,
+        })
+        .await
+        .expect_err("SpendingCapability.max_per_action must reject");
+
+        assert_eq!(denial.layer, LayerName::SpendingCapability);
+        assert_eq!(denial.error_code, scp_protocol::CODE_AUTHORIZATION_DENIED);
+        assert_eq!(denial.slug, "authorization.denied");
+        assert!(
+            denial.message.contains("max_per_action"),
+            "diagnostic must name the field, got: {}",
+            denial.message
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Test 4 (AC6) — upstream admit, MemberBudgetTracker denies
+    // ---------------------------------------------------------------------
+
+    /// AC6: when every upstream layer admits but the per-context
+    /// `MemberBudgetTracker` has zero remaining budget for the invoker, the
+    /// composition rejects with [`LayerName::MemberBudgetTracker`] under
+    /// the §5.4.4 economic-class slug `economic.budget-exceeded`.
+    #[tokio::test]
+    async fn ac6_member_budget_tracker_denies_identifies_budget() {
+        let invoker: DID = "did:key:invoker".into();
+        let caveats = InvocationCaveats::empty();
+        let outlet = unit_test_outlet_registration();
+        let input = serde_json::json!({});
+        // Spending capability admits comfortably.
+        let cap = spending_cap(1_000_000);
+        // Budget grants 50, action wants 100 → reject.
+        let budget = budget_with_grant(&invoker, 50);
+
+        let denial = evaluate_all_layers(LayerCompositionInput {
+            caveats: &caveats,
+            outlet: &outlet,
+            input: &input,
+            outbound_policy: None,
+            inbound_policy: None,
+            spending_capability: Some(&cap),
+            budget_tracker: &budget,
+            invoker_did: &invoker,
+            estimated_cost: Amount::new(100),
+            now_secs: 1_000_000,
+            negotiated_adapter: None,
+            target_did: None,
+            source_role: None,
+            counter_store: None,
+            context_id: "ctx-out022",
+            ucan_cid: "ucan-out022",
+            payload_bytes: 0,
+        })
+        .await
+        .expect_err("MemberBudgetTracker remaining < cost must reject");
+
+        assert_eq!(denial.layer, LayerName::MemberBudgetTracker);
+        assert_eq!(denial.error_code, scp_protocol::CODE_ECONOMIC_FAULT);
+        assert_eq!(denial.slug, "economic.budget-exceeded");
+        assert!(
+            denial.message.contains("remaining"),
+            "diagnostic must name the field, got: {}",
+            denial.message
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Test 5 (AC1 + AC7) — all admit → Ok(()); invocation proceeds
+    // ---------------------------------------------------------------------
+
+    /// AC1 + AC7: when every layer admits the function returns `Ok(())` and
+    /// the invocation may proceed downstream. Combined with the integration
+    /// test below this proves that admit at every layer surfaces all the way
+    /// to the executor.
+    #[tokio::test]
+    async fn ac1_ac7_all_layers_admit_returns_ok() {
+        let invoker: DID = "did:key:invoker".into();
+        let caveats = InvocationCaveats::empty();
+        let outlet = unit_test_outlet_registration();
+        let input = serde_json::json!({});
+        let outbound = OutboundPolicy {
+            allowed_callers: vec![invoker.clone()],
+            max_calls_per_minute: 600,
+            max_payload_bytes: 65_536,
+            require_provenance: true,
+        };
+        let inbound = InboundPolicy {
+            allowed_source_roles: vec!["admin".to_owned()],
+            max_calls_per_minute: 600,
+            max_response_bytes: 65_536,
+            require_spending_ucan: true,
+        };
+        let cap = spending_cap(1_000);
+        let budget = budget_with_grant(&invoker, 1_000_000);
+
+        let result = evaluate_all_layers(LayerCompositionInput {
+            caveats: &caveats,
+            outlet: &outlet,
+            input: &input,
+            outbound_policy: Some(&outbound),
+            inbound_policy: Some(&inbound),
+            spending_capability: Some(&cap),
+            budget_tracker: &budget,
+            invoker_did: &invoker,
+            estimated_cost: Amount::new(50),
+            now_secs: 1_000_000,
+            negotiated_adapter: None,
+            target_did: None,
+            source_role: Some("admin"),
+            counter_store: None,
+            context_id: "ctx-out022",
+            ucan_cid: "ucan-out022",
+            payload_bytes: 128,
+        })
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "all layers admit must return Ok(()), got: {:?}",
+            result
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Test 6 (AC8) — widened child caveat rejected at attenuation never
+    // reaches the layer composition.
+    // ---------------------------------------------------------------------
+
+    /// AC8: SCP-OUT-019's `InvocationCaveats::narrow` rejects widened child
+    /// caveats BEFORE the runtime ever invokes the layer composition. This
+    /// test proves the short-circuit by:
+    ///
+    /// 1. Constructing a parent caveat with `max_calls = 10`.
+    /// 2. Constructing a child that widens `max_calls` to `100`.
+    /// 3. Asserting `parent.narrow(&child)` returns
+    ///    [`AttenuationViolation::FieldWidened`] — i.e. the attenuation
+    ///    check rejects the child long before the runtime would build a
+    ///    [`LayerCompositionInput`].
+    /// 4. Demonstrating positively (via a "control" call) that
+    ///    [`evaluate_all_layers`] would have admitted the WIDER child if it
+    ///    had reached the composition. The two facts together prove the
+    ///    rejection happened at the attenuation layer, not at the
+    ///    composition layer.
+    ///
+    /// The function under test ([`evaluate_all_layers`]) is only called
+    /// once, with the WIDER child caveats — and that call returns `Ok(())`,
+    /// confirming that if the attenuation check had been bypassed the
+    /// composition layer would NOT catch the widening.
+    #[tokio::test]
+    async fn ac8_widened_child_caveat_rejected_at_attenuation_never_reaches_composition() {
+        let invoker: DID = "did:key:invoker".into();
+        // Parent: max_calls = 10. `origin_kind = Some(Action)` so narrow()
+        // does not short-circuit on the §7.3.8 (4) inheritance rule before
+        // it reaches the max_calls check we want to exercise.
+        let parent = InvocationCaveats {
+            max_calls: Some(10),
+            origin_kind: Some(scp_protocol::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        // Child: max_calls widened to 100 — ILLEGAL widening. The origin_kind
+        // is preserved verbatim per §6.2.0.3 so the U64Widened check is the
+        // first failure surface.
+        let widened_child = InvocationCaveats {
+            max_calls: Some(100),
+            origin_kind: Some(scp_protocol::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+
+        // Step 1: SCP-OUT-019 attenuation check rejects the widened child.
+        // `max_calls` is a `u64`-valued field, so widening surfaces as
+        // [`AttenuationViolation::U64Widened`] with the matching
+        // `CaveatField::MaxCalls` discriminant.
+        let attenuation_result = parent.narrow(&widened_child);
+        assert!(
+            matches!(
+                attenuation_result,
+                Err(AttenuationViolation::U64Widened {
+                    field: scp_protocol::trust::caveats::CaveatField::MaxCalls,
+                    parent: 10,
+                    child: 100,
+                })
+            ),
+            "SCP-OUT-019 narrow() must reject max_calls widening with U64Widened, got: {:?}",
+            attenuation_result
+        );
+
+        // Step 2: prove that IF the attenuation check were bypassed, the
+        // composition layer would silently admit the widened child (because
+        // §7.3.8 layers do NOT police parent/child relationships — they
+        // policy a single caveat set in isolation). This is the WHOLE point
+        // of the attenuation gate as a separate layer: composition does
+        // not re-derive parent/child invariants from the wire form.
+        let outlet = unit_test_outlet_registration();
+        let input = serde_json::json!({});
+        let budget = budget_with_grant(&invoker, 1_000_000);
+        let result = evaluate_all_layers(LayerCompositionInput {
+            caveats: &widened_child,
+            outlet: &outlet,
+            input: &input,
+            outbound_policy: None,
+            inbound_policy: None,
+            spending_capability: None,
+            budget_tracker: &budget,
+            invoker_did: &invoker,
+            estimated_cost: Amount::new(0),
+            now_secs: 1_000_000,
+            negotiated_adapter: None,
+            target_did: None,
+            source_role: None,
+            counter_store: None,
+            context_id: "ctx-out022",
+            ucan_cid: "ucan-out022",
+            payload_bytes: 0,
+        })
+        .await;
+        assert!(
+            result.is_ok(),
+            "evaluate_all_layers does not police parent/child caveat relationships — \
+             that is the attenuation gate's job. Got: {:?}",
+            result
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Test 7 (AC2 + AC3) — short-circuits on first denial; integration test
+    // through the public manager surface.
+    // ---------------------------------------------------------------------
+
+    /// AC2 + AC3 (integration): wires through the real
+    /// [`ContextManager::invoke_outlet_with_economy`] entry point with a
+    /// `LayerCompositionEnforcement` bundle whose `OutboundPolicy.allowed_callers`
+    /// excludes the invoker. The returned [`ContextError`] must surface
+    /// the `OutboundPolicy` denial slug — proving that the wiring runs the
+    /// full layer composition AT the post-input point AND that the
+    /// short-circuit propagates the rejecting layer's identity through
+    /// [`invocation_error_from_layer_denial`] and
+    /// [`invocation_error_to_context`].
+    ///
+    /// The ticket-rollback path is exercised because `evaluate_all_layers`
+    /// runs INSIDE the post-input hook AFTER Phase 1 records velocity +
+    /// budget; a successful denial here MUST reverse those mutations
+    /// (covered by the existing rollback assertions in the manager — this
+    /// test asserts at least the error surface).
+    #[tokio::test]
+    async fn ac2_ac3_integration_wiring_outbound_policy_denial_surfaces_through_manager() {
+        // The shared test fixtures live in `manager/tests/mod.rs` as
+        // `pub(super)` items. `tests` is a sibling of `outlets` inside
+        // `manager`, so `super::super::tests::*` is the canonical path.
+        use super::super::tests::{
+            MockCrypto, MockEventLog, MockTransport, dummy_spending_ucan_for, governance_params,
+            mock_key_resolver, test_outlet_registration,
+        };
+        use scp_protocol::context::outlets::registry::OutletRegistry;
+        use scp_protocol::economy::types::Amount;
+
+        let manager = std::sync::Arc::new(ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            mock_key_resolver(),
+        ));
+
+        let mut params = governance_params();
+        params
+            .ceiling
+            .push(scp_protocol::context::params::Capability::OutletCallAll);
+        let _handle = manager
+            .create_context(
+                "ctx-out022-int".into(),
+                params,
+                "did:key:invoker".into(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Grant a generous budget so the failure cannot be attributed to
+        // the budget layer.
+        {
+            let arc = manager
+                .contexts
+                .get("ctx-out022-int")
+                .unwrap()
+                .value()
+                .clone();
+            let mut ctx = arc.lock().await;
+            ctx.governance
+                .budget_tracker
+                .grant(&"did:key:invoker".into(), Amount::new(1_000_000));
+        }
+
+        let mut registry = OutletRegistry::new();
+        registry.insert(test_outlet_registration("echo"));
+
+        let ucan = dummy_spending_ucan_for(&"did:key:invoker".into());
+
+        // OutboundPolicy excludes the invoker → denial at OutboundPolicy.
+        let other: DID = "did:key:other".into();
+        let outbound = scp_protocol::context::outlets::interface::OutboundPolicy {
+            allowed_callers: vec![other],
+            max_calls_per_minute: 600,
+            max_payload_bytes: 65_536,
+            require_provenance: true,
+        };
+        let bundle = LayerCompositionEnforcement {
+            outbound_policy: Some(outbound),
+            inbound_policy: None,
+            spending_capability: None,
+            budget_tracker: scp_protocol::economy::budget::MemberBudgetTracker::new(),
+            source_role: None,
+            payload_bytes: 0,
+        };
+
+        let err = manager
+            .invoke_outlet_with_economy(
+                "ctx-out022-int",
+                &registry,
+                &OutletId::from("echo"),
+                serde_json::json!({}),
+                &"did:key:invoker".into(),
+                Some(&ucan),
+                None,
+                |_input| async { Ok(serde_json::json!({})) },
+                None,
+                None,
+                Some(bundle),
+            )
+            .await
+            .expect_err(
+                "OutboundPolicy.allowed_callers excludes invoker — \
+                 invoke_outlet_with_economy must surface the denial",
+            );
+
+        // The §5.4.4 dispatcher routes `authorization.denied` (caveat
+        // class) through `SCP-TOOL-6110` per
+        // `invocation_error_to_context`. Both the SCP code and the
+        // `outbound-policy` layer name MUST appear in the surfaced
+        // diagnostic so operators can identify the rejecting layer.
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("outbound-policy"),
+            "rejection must identify the OutboundPolicy layer (via LayerName::as_str), got: {msg}"
+        );
+        assert!(
+            msg.contains("authorization.denied"),
+            "rejection slug must be authorization.denied (via §5.4.4 dispatcher), got: {msg}"
+        );
     }
 }

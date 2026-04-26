@@ -1880,6 +1880,7 @@ async fn outlet_call_escalation_via_managed_wrapper() {
             |_input| async { Ok(serde_json::json!({})) },
             None,
             None,
+            None,
         )
         .await;
     assert!(
@@ -2016,6 +2017,7 @@ async fn caveat_max_calls_rejects_after_cap_reached() {
                         target_did: None,
                         estimated_cost: Amount::new(0),
                     }),
+                    None,
                 )
                 .await
         }
@@ -2077,6 +2079,7 @@ async fn caveat_amount_max_cumulative_rejects_when_exhausted() {
                         target_did: None,
                         estimated_cost: Amount::new(estimated),
                     }),
+                    None,
                 )
                 .await
         }
@@ -2141,6 +2144,7 @@ async fn caveat_rate_window_rejects_when_full() {
                         target_did: None,
                         estimated_cost: Amount::new(0),
                     }),
+                    None,
                 )
                 .await
         }
@@ -2439,6 +2443,7 @@ async fn outlet_call_respects_hard_rate_limit() {
                 |_input| async { Ok(serde_json::json!({})) },
                 None,
                 None,
+                None,
             )
             .await;
         assert!(
@@ -2459,6 +2464,7 @@ async fn outlet_call_respects_hard_rate_limit() {
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
+            None,
             None,
             None,
         )
@@ -2546,6 +2552,7 @@ async fn outlet_call_failure_refunds_hard_rate_limit_token() {
                 |_input| async { Err::<serde_json::Value, _>("executor failed".to_owned()) },
                 None,
                 None,
+                None,
             )
             .await;
     }
@@ -2563,6 +2570,7 @@ async fn outlet_call_failure_refunds_hard_rate_limit_token() {
             None,
             None,
             |_input| async { Err::<serde_json::Value, _>("executor failed".to_owned()) },
+            None,
             None,
             None,
         )
@@ -2913,6 +2921,7 @@ async fn outlet_call_output_validation_failure_voids_escrow_and_refunds_budget()
             |_input| async { Ok(serde_json::json!("not an object")) },
             None,
             None,
+            None,
         )
         .await;
 
@@ -3104,6 +3113,7 @@ async fn outlet_call_happy_path_captures_escrow_and_deducts_budget() {
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({"result": 42})) },
+            None,
             None,
             None,
         )
@@ -4344,6 +4354,7 @@ async fn outlet_call_fabricated_spending_ucan_rejected_by_signature() {
             |_input| async { Ok(serde_json::json!({})) },
             None,
             None,
+            None,
         )
         .await;
 
@@ -4404,6 +4415,7 @@ async fn outlet_call_spending_ucan_iss_must_match_invoker() {
             |_input| async { Ok(serde_json::json!({})) },
             None,
             None,
+            None,
         )
         .await;
 
@@ -4447,6 +4459,7 @@ async fn outlet_call_spending_ucan_replay_via_nonce_tracker() {
             |_input| async { Ok(serde_json::json!({})) },
             None,
             None,
+            None,
         )
         .await;
     assert!(
@@ -4465,6 +4478,7 @@ async fn outlet_call_spending_ucan_replay_via_nonce_tracker() {
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
+            None,
             None,
             None,
         )
@@ -4561,6 +4575,7 @@ async fn outlet_call_spending_ucan_expired() {
             |_input| async { Ok(serde_json::json!({})) },
             None,
             None,
+            None,
         )
         .await;
 
@@ -4614,6 +4629,7 @@ async fn outlet_call_spending_ucan_revoked() {
             |_input| async { Ok(serde_json::json!({})) },
             None,
             None,
+            None,
         )
         .await;
 
@@ -4665,6 +4681,7 @@ async fn outlet_call_happy_path_with_valid_spending_ucan() {
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
+            None,
             None,
             None,
         )

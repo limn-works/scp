@@ -546,6 +546,13 @@ pub async fn outlet_invoke(
             executor,
             None,
             None,
+            // SCP-OUT-022 layer composition is opt-in via the higher-level
+            // interface invocation path; the NAPI bridge surface does not
+            // yet expose OutboundPolicy / InboundPolicy / SpendingCapability
+            // / MemberBudgetTracker bundles for direct invocation.
+            // Cross-context invocations that require composition route
+            // through `invoke_cross_context` instead.
+            None,
         )
         .await
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
