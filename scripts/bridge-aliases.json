@@ -2749,6 +2749,194 @@
       "wasm": [
         "mcp_get_stdio_allowlist"
       ]
+    },
+    {
+      "canonical": "tool_interface_expose",
+      "category": "tools",
+      "wasm_required": true,
+      "pyo3": [
+        "tool_interface_expose"
+      ],
+      "uniffi": [
+        "tool_interface_expose"
+      ],
+      "napi": [
+        "tool_interface_expose"
+      ],
+      "wasm": [
+        "tool_interface_expose"
+      ]
+    },
+    {
+      "canonical": "tool_interface_accept",
+      "category": "tools",
+      "wasm_required": true,
+      "pyo3": [
+        "tool_interface_accept"
+      ],
+      "uniffi": [
+        "tool_interface_accept"
+      ],
+      "napi": [
+        "tool_interface_accept"
+      ],
+      "wasm": [
+        "tool_interface_accept"
+      ]
+    },
+    {
+      "canonical": "tool_interface_revoke",
+      "category": "tools",
+      "wasm_required": true,
+      "pyo3": [
+        "tool_interface_revoke"
+      ],
+      "uniffi": [
+        "tool_interface_revoke"
+      ],
+      "napi": [
+        "tool_interface_revoke"
+      ],
+      "wasm": [
+        "tool_interface_revoke"
+      ]
+    },
+    {
+      "canonical": "broadcast_subscriber_count",
+      "category": "broadcast",
+      "wasm_required": true,
+      "pyo3": [
+        "broadcast_subscriber_count"
+      ],
+      "uniffi": [
+        "broadcast_subscriber_count"
+      ],
+      "napi": [
+        "context_broadcast_subscriber_count"
+      ],
+      "wasm": [
+        "broadcast_subscriber_count"
+      ]
+    },
+    {
+      "canonical": "broadcast_is_subscriber",
+      "category": "broadcast",
+      "wasm_required": true,
+      "pyo3": [
+        "broadcast_is_subscriber"
+      ],
+      "uniffi": [
+        "broadcast_is_subscriber"
+      ],
+      "napi": [
+        "context_is_broadcast_subscriber"
+      ],
+      "wasm": [
+        "broadcast_is_subscriber"
+      ]
+    },
+    {
+      "canonical": "broadcast_admission",
+      "category": "broadcast",
+      "wasm_required": true,
+      "pyo3": [
+        "broadcast_admission"
+      ],
+      "uniffi": [
+        "broadcast_admission"
+      ],
+      "napi": [
+        "context_broadcast_admission"
+      ],
+      "wasm": [
+        "broadcast_admission"
+      ]
+    },
+    {
+      "canonical": "identity_create_link_attestation",
+      "category": "identity",
+      "wasm_required": true,
+      "pyo3": [
+        "create_identity_link_attestation"
+      ],
+      "uniffi": [
+        "identity_create_link_attestation"
+      ],
+      "napi": [
+        "identity_create_link_attestation"
+      ],
+      "wasm": [
+        "identity_create_link_attestation"
+      ],
+      "_note": "WASM diverges from native bridges in attestation signer key. PyO3/NAPI/UniFFI sign with core_id.active_signing_key (#active per spec §3.5.1; crates/scp-ffi/src/identity.rs and equivalents in napi/uniffi). WASM identity_create_link_attestation (crates/scp-ffi/wasm/src/identity.rs:2632) signs with signing_key_bytes (#0 identity key per spec §3.5.2). Cross-bridge verification must know the issuer bridge to choose the correct verification key. Symmetry harness must NOT treat these as byte-equivalent operations. Tracked for spec-vs-impl reconciliation (align WASM to #active or formally document #0 per spec §3.5.2); see ADR-048 §7 + .docs/lessons/per-sdk-idiom-not-cross-language-dogma.md."
+    },
+    {
+      "canonical": "node_start_in_memory",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "node_start_in_memory"
+      ],
+      "uniffi": [
+        "node_start_in_memory"
+      ],
+      "napi": [
+        "node_start_in_memory"
+      ],
+      "wasm": [
+        "node_start_in_memory"
+      ]
+    },
+    {
+      "canonical": "node_start_local",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "node_start_local"
+      ],
+      "uniffi": [
+        "node_start_local"
+      ],
+      "napi": [
+        "node_start_local"
+      ],
+      "wasm": [
+        "node_start_local"
+      ]
+    },
+    {
+      "canonical": "relay_start_in_memory",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "relay_start_in_memory"
+      ],
+      "uniffi": [
+        "relay_start_in_memory"
+      ],
+      "napi": [
+        "relay_start_in_memory"
+      ],
+      "wasm": [
+        "relay_start_in_memory"
+      ]
+    },
+    {
+      "canonical": "relay_start_local",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "relay_start_local"
+      ],
+      "uniffi": [
+        "relay_start_local"
+      ],
+      "napi": [
+        "relay_start_local"
+      ],
+      "wasm": [
+        "relay_start_local"
+      ]
     }
   ],
   "exemptions": {
@@ -2833,6 +3021,22 @@
       {
         "canonical": "mcp_get_stdio_allowlist",
         "reason": "MCP requires stdio/process spawning or HTTP transport for SSE; WASM has no scp-platform / no stdio per ADR-034. MCP is server/desktop-only."
+      },
+      {
+        "canonical": "node_start_in_memory",
+        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no transport per ADR-034."
+      },
+      {
+        "canonical": "node_start_local",
+        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no transport per ADR-034."
+      },
+      {
+        "canonical": "relay_start_in_memory",
+        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no transport per ADR-034."
+      },
+      {
+        "canonical": "relay_start_local",
+        "reason": "Application Node and Relay binaries are server-side; WASM has no scp-platform / no transport per ADR-034."
       }
     ]
   }
