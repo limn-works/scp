@@ -832,6 +832,10 @@ impl Supervisor {
         key_package_store: crate::context::supervisor::key_package_actor::KeyPackageStoreHandle,
     ) -> Result<crate::context::actor::deps::ActorDeps, ContextError> {
         use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED;
+        let crypto =
+            Arc::clone(self.crypto_ref().ok_or_else(|| {
+                ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned())
+            })?);
         let transport =
             Arc::clone(self.transport_ref().ok_or_else(|| {
                 ContextError::NotInitialized(PROVIDER_NOT_INITIALIZED.to_owned())
@@ -852,6 +856,7 @@ impl Supervisor {
         let handle = crate::context::supervisor::handle::SupervisorHandle::wrap(Arc::clone(self));
 
         Ok(crate::context::actor::deps::ActorDeps {
+            crypto,
             transport,
             persistence,
             event_log,
@@ -1294,12 +1299,46 @@ impl Supervisor {
         &self,
         cmd: TrustRecoveryCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12 — trust-recovery handler takes `&Supervisor`.
-        // `Box::pin` — CreateGovernanceCheckpoint's payload carries
+        // Phase 2A.1 of ADR-049 — trust_recovery is the first migrated
+        // helper domain. Route per-context variants to the per-context
+        // actor mailbox when one is registered; otherwise fall back to
+        // the legacy lock-shaped helper path inside
+        // `dispatch_from_shim`. The cross-context
+        // `RecoveryNotifyContact` variant has no `context_id` to look
+        // up — it always flows through the legacy fan-out path.
+        //
+        // `Box::pin` — `CreateGovernanceCheckpoint`'s payload carries
         // multiple 32-byte hashes + a variable-length Ed25519 signature
         // vector; the per-variant locals cross clippy's 16-KB stack-
         // future budget.
+        if let Some(ctx_id) = Self::trust_recovery_command_context_id(&cmd) {
+            if let Some(actor) = self.lookup(ctx_id) {
+                return Self::dispatch_via_mailbox(&actor, ContextCommand::TrustRecovery(cmd))
+                    .await;
+            }
+        }
         Ok(Box::pin(handlers::trust_recovery::dispatch_from_shim(self, cmd)).await)
+    }
+
+    /// Extract the `context_id` borrow from a [`TrustRecoveryCommand`]
+    /// when one is present. Returns `None` for variants that cannot be
+    /// routed through a per-context actor mailbox
+    /// (`Placeholder`, `RecoveryNotifyContact`).
+    fn trust_recovery_command_context_id(cmd: &TrustRecoveryCommand) -> Option<&str> {
+        match cmd {
+            TrustRecoveryCommand::Placeholder { .. }
+            | TrustRecoveryCommand::RecoveryNotifyContact { .. } => None,
+            TrustRecoveryCommand::CreateGovernanceCheckpoint { payload, .. } => {
+                Some(payload.context_id.as_str())
+            }
+            TrustRecoveryCommand::AddCheckpointCosignature { context_id, .. }
+            | TrustRecoveryCommand::RecoveryAdvanceEpoch { context_id, .. } => {
+                Some(context_id.as_str())
+            }
+            TrustRecoveryCommand::RecoverySendNotification { payload, .. } => {
+                Some(payload.context_id.as_str())
+            }
+        }
     }
 
     /// Helper: acquire the per-context lock, run the query handler

@@ -803,7 +803,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // The ContextManager increments the epoch counter, places the old
         // epoch into the grace window, and emits an event log entry.
         let result = Self::block_on_async(
-            crate::context::trust_recovery_helpers::recovery_advance_epoch(
+            crate::context::trust_recovery_helpers::recovery_advance_epoch_legacy(
                 &self.manager,
                 context_id,
             ),
@@ -822,7 +822,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
                 match serde_json::to_vec(&scoped_payload) {
                     Ok(payload_bytes) => {
                         let notify_result = Self::block_on_async(
-                            crate::context::trust_recovery_helpers::recovery_send_notification(
+                            crate::context::trust_recovery_helpers::recovery_send_notification_legacy(
                                 &self.manager,
                                 context_id,
                                 key_rotation.did_after.as_ref(),
@@ -901,7 +901,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // Distribute the revocation via the context manager's recovery
         // notification channel so all members receive and merge it.
         let result = Self::block_on_async(
-            crate::context::trust_recovery_helpers::recovery_send_notification(
+            crate::context::trust_recovery_helpers::recovery_send_notification_legacy(
                 &self.manager,
                 context_id,
                 key_rotation.did_after.as_ref(),
@@ -952,7 +952,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // Send the key-package-rotation notification via the recovery
         // notification channel. This records the event and alerts members.
         let result = Self::block_on_async(
-            crate::context::trust_recovery_helpers::recovery_send_notification(
+            crate::context::trust_recovery_helpers::recovery_send_notification_legacy(
                 &self.manager,
                 context_id,
                 sender_did,
@@ -1130,7 +1130,7 @@ impl RecoveryBackend for ProductionRecoveryBackend {
         // derived from "identity-private-state" since PSK rotation is
         // identity-scoped, not context-scoped.
         let result = Self::block_on_async(
-            crate::context::trust_recovery_helpers::recovery_send_notification(
+            crate::context::trust_recovery_helpers::recovery_send_notification_legacy(
                 &self.manager,
                 "identity-private-state",
                 "system",

@@ -102,6 +102,7 @@ use crate::context::supervisor::handle::SupervisorHandle;
 use crate::context::supervisor::key_package_actor::KeyPackageStoreHandle;
 use crate::crypto::hpke_backend::HpkeBackend;
 use crate::crypto::mls::backend::MlsBackend;
+use crate::crypto::mls::provider::MlsCryptoProvider;
 use crate::crypto::mls::storage_adapter::OpenMlsStorageAdapter;
 use crate::economy::adapter::PaymentAdapterDyn;
 
@@ -122,6 +123,22 @@ use crate::economy::adapter::PaymentAdapterDyn;
 /// handler ever needs to re-dispatch through the handle set it should
 /// hold its own clones of the individual handles.
 pub struct ActorDeps {
+    /// MLS crypto provider — owns the per-context MLS group + sender-key
+    /// state map. Legacy: `ContextManager::crypto`. Held on
+    /// [`Supervisor`](crate::context::supervisor::Supervisor) directly
+    /// during the helper-migration window; cloned into each actor's
+    /// `ActorDeps` at spawn time so handler bodies can call
+    /// [`MlsCryptoProvider::seal`] / `open` / `advance_epoch` without
+    /// reaching back through `&Supervisor`.
+    ///
+    /// Added in Phase 2A.1 of ADR-049 (trust_recovery domain migration)
+    /// — first migrated handler that needs MLS provider state. Will
+    /// remain populated through the rest of Phase 2A; eventually the
+    /// `MlsCryptoProvider` dissolves (plan §"MlsCryptoProvider
+    /// dissolution") and per-context crypto state moves entirely onto
+    /// [`crate::context::actor::state::ContextCryptoState`] inside
+    /// [`crate::context::actor::state::PerContextState`].
+    pub crypto: Arc<MlsCryptoProvider>,
     /// Transport provider (relay, subscription, publish).
     pub transport: Arc<dyn ContextTransportProvider>,
     /// Context snapshot persistence backend.

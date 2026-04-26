@@ -460,7 +460,14 @@ impl ContextActor {
                 handlers::economy::dispatch_from_shim(supervisor, sub).await
             }
             ContextCommand::TrustRecovery(sub) => {
-                Box::pin(handlers::trust_recovery::dispatch_from_shim(supervisor, sub)).await
+                // Phase 2A.1 — trust_recovery domain migrated to
+                // state-owning shape. Per-context variants flow through
+                // `handlers::trust_recovery::dispatch(state, deps, sub)`;
+                // the cross-context `RecoveryNotifyContact` variant is
+                // intercepted on the supervisor before this arm
+                // executes (it never reaches the per-context actor
+                // mailbox).
+                Box::pin(handlers::trust_recovery::dispatch(state, deps, sub)).await
             }
             ContextCommand::Standing(sub) => {
                 Box::pin(handlers::standing::dispatch_from_shim(supervisor, sub)).await
