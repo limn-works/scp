@@ -58,6 +58,7 @@ openmls = { workspace = true }
 openmls_traits = { workspace = true }
 serde_json = { workspace = true }
 rmp-serde = { workspace = true }
+rmpv = { workspace = true }
 tempfile = "3"
 x25519-dalek = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }

@@ -2325,3 +2325,226 @@ fn conf_047_outlet_registration_v2_catalog_and_description_hashes() {
     }
     println!("  PASS: SCP-OUT-040 catalog_hash + description_hash V2 preimage commitment verified");
 }
+
+// ===========================================================================
+// §26 OutletError Wire Format Conformance — SCP-OUT-026
+// ===========================================================================
+
+/// CONF-048: `OutletError` `MessagePack` tag-indexed wire format with forward-compat
+/// Layer: Bridge | Tier: Core | Spec: §5.4.4 | ADR-049 §4 | Story: SCP-OUT-026
+///
+/// Cross-crate validation that the §5.4.4 `MessagePack` wire format is
+/// **tag-indexed** (numeric string tags, not positional) and **forward-compat**
+/// (unknown tags round-trip byte-identical via the `unknown_fields` flatten
+/// slot). The test exercises the wire boundary an SDK consumer would face when
+/// receiving an envelope from a peer running a future protocol revision —
+/// hand-crafted `MessagePack` bytes never touch the Rust-side `Serialize` impl.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn conf_048_outlet_error_messagepack_forward_compat() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::context::outlets::errors::{
+        CatalogKey, DetailBody, OUTLET_MESSAGE_KEY_LEN, OutletError, OutletErrorClass,
+        PAD_NONCE_LEN, REGISTRATION_EVENT_ID_LEN, RetryPolicy,
+    };
+
+    println!("=== CONF-048: OutletError MessagePack tag-indexed wire format ===");
+
+    // ----- Fixtures (deterministic) -----
+    let outlet_message_key: [u8; OUTLET_MESSAGE_KEY_LEN] = [0x42; OUTLET_MESSAGE_KEY_LEN];
+    let pad_nonce: [u8; PAD_NONCE_LEN] = [0x55; PAD_NONCE_LEN];
+    let registration_event_id: [u8; REGISTRATION_EVENT_ID_LEN] = [0xAB; REGISTRATION_EVENT_ID_LEN];
+    let outlet_id: OutletId = "outlet-conf-048".to_owned();
+    let catalog_key = CatalogKey::try_new("authorization.denied").expect("catalog key valid");
+    let registered = vec![catalog_key.clone()];
+    let wire_message = OutletError::compute_wire_message(&outlet_message_key, &catalog_key);
+
+    // Step 1: Build a canonical envelope via the constructor as the
+    // ground-truth (tag/value bindings derived from the §5.4.4 declaration
+    // order and byte widths).
+    print_step(
+        1,
+        "Build a canonical OutletError envelope via OutletError::new",
+    );
+    let canonical = OutletError::new(
+        &outlet_id,
+        &outlet_message_key,
+        registration_event_id,
+        &catalog_key,
+        &registered,
+        OutletErrorClass::Authorization,
+        "SCP-TOOL-6110",
+        "authorization.denied",
+        RetryPolicy::Never,
+        Some(DetailBody::Authorization {
+            capability: "outlet_query:test".to_owned(),
+        }),
+        pad_nonce,
+    )
+    .expect("constructor must succeed for canonical inputs");
+    let canonical_bytes = rmp_serde::to_vec_named(&canonical).expect("Rust-side serialize");
+
+    // Hand-craft the same envelope as a `MessagePack` map of primitive `rmpv`
+    // values. The order matches what `to_vec_named` emits (declared fields in
+    // struct-declaration order, then `unknown_fields` BTreeMap entries in
+    // lex-order). For an envelope with no unknown fields the two byte
+    // sequences must coincide.
+    let build_pairs = |extra: Option<(&str, rmpv::Value)>| -> Vec<(rmpv::Value, rmpv::Value)> {
+        let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = vec![
+            (
+                rmpv::Value::String("1".into()),
+                rmpv::Value::String("SCP-TOOL-6110".into()),
+            ),
+            (
+                rmpv::Value::String("2".into()),
+                rmpv::Value::String("authorization.denied".into()),
+            ),
+            (
+                rmpv::Value::String("3".into()),
+                rmpv::Value::String("authorization".into()),
+            ),
+            (
+                rmpv::Value::String("4".into()),
+                rmpv::Value::Binary(wire_message.to_vec()),
+            ),
+            (
+                rmpv::Value::String("5".into()),
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::String("policy".into()),
+                    rmpv::Value::String("never".into()),
+                )]),
+            ),
+            (
+                rmpv::Value::String("6".into()),
+                rmpv::Value::Map(vec![
+                    (
+                        rmpv::Value::String("shape".into()),
+                        rmpv::Value::String("authorization".into()),
+                    ),
+                    (
+                        rmpv::Value::String("capability".into()),
+                        rmpv::Value::String("outlet_query:test".into()),
+                    ),
+                ]),
+            ),
+            (
+                rmpv::Value::String("8".into()),
+                rmpv::Value::Array(Vec::new()),
+            ),
+            (
+                rmpv::Value::String("11".into()),
+                rmpv::Value::Binary(pad_nonce.to_vec()),
+            ),
+            (
+                rmpv::Value::String("12".into()),
+                rmpv::Value::Binary(registration_event_id.to_vec()),
+            ),
+        ];
+        if let Some((tag, value)) = extra {
+            // Lex-sort the new key into the existing field-order so the
+            // re-serialized bytes match the hand-crafted bytes.
+            let entry = (rmpv::Value::String(tag.into()), value);
+            let pos = pairs
+                .iter()
+                .position(|(k, _)| match k {
+                    rmpv::Value::String(s) => s.as_str().is_some_and(|existing| existing > tag),
+                    _ => false,
+                })
+                .unwrap_or(pairs.len());
+            pairs.insert(pos, entry);
+        }
+        pairs
+    };
+
+    print_step(
+        2,
+        "Hand-crafted MessagePack map (no unknown fields) matches the Rust-side encoding byte-for-byte",
+    );
+    let hand_crafted_bare = rmp_serde::to_vec_named(&rmpv::Value::Map(build_pairs(None)))
+        .expect("hand-crafted map serialize");
+    assert_eq!(
+        hand_crafted_bare, canonical_bytes,
+        "hand-crafted MessagePack map must encode byte-identically to OutletError's Serialize"
+    );
+
+    // Step 3: hand-crafted envelope with extra tag "99" -> "future-value"
+    // round-trips through `unknown_fields` byte-identically.
+    print_step(
+        3,
+        "Hand-crafted envelope with extra tag 99 -> \"future-value\" round-trips byte-identical via unknown_fields",
+    );
+    let hand_crafted_with_99 = rmp_serde::to_vec_named(&rmpv::Value::Map(build_pairs(Some((
+        "99",
+        rmpv::Value::String("future-value".into()),
+    )))))
+    .expect("hand-crafted future-tag map serialize");
+    let envelope: OutletError = rmp_serde::from_slice(&hand_crafted_with_99)
+        .expect("hand-crafted envelope with tag 99 must deserialize");
+    assert!(
+        envelope.unknown_fields.contains_key("99"),
+        "tag-99 must be preserved in unknown_fields, got {:?}",
+        envelope.unknown_fields
+    );
+    match envelope.unknown_fields.get("99") {
+        Some(rmpv::Value::String(s)) => assert_eq!(s.as_str(), Some("future-value")),
+        other => panic!("expected unknown_fields[\"99\"] to be String, got {other:?}"),
+    }
+    let re_serialized = rmp_serde::to_vec_named(&envelope).expect("re-serialize");
+    assert_eq!(
+        re_serialized, hand_crafted_with_99,
+        "byte-identical round-trip required by §5.4.4 forward-compat invariant"
+    );
+
+    // Step 4: field-order independence — reversing the encoding's field
+    // order yields a distinct byte sequence but a semantically-identical
+    // envelope (tag-indexed wire format).
+    print_step(
+        4,
+        "Field-order-reversed envelope deserializes to the same OutletError (tag-indexed, not positional)",
+    );
+    let canonical_pairs = build_pairs(None);
+    let mut reversed_pairs = canonical_pairs.clone();
+    reversed_pairs.reverse();
+    let reversed_bytes = rmp_serde::to_vec_named(&rmpv::Value::Map(reversed_pairs))
+        .expect("reversed-order serialize");
+    assert_ne!(
+        reversed_bytes, canonical_bytes,
+        "test setup precondition: reversed encoding must differ byte-wise from canonical"
+    );
+    let from_reversed: OutletError =
+        rmp_serde::from_slice(&reversed_bytes).expect("reversed-order deserialize");
+    let from_canonical: OutletError =
+        rmp_serde::from_slice(&canonical_bytes).expect("canonical-order deserialize");
+    assert_eq!(
+        from_reversed, from_canonical,
+        "reversed and canonical encodings must produce equal OutletError values"
+    );
+
+    // Step 5: required-field rejection — an envelope missing tag 4
+    // (`message`) must fail wire-layer deserialization with a meaningful
+    // error. `message` is required per §5.4.4 (no Option wrapper).
+    print_step(
+        5,
+        "Envelope missing tag 4 (message) is rejected at the wire boundary",
+    );
+    let mut without_message = canonical_pairs;
+    without_message.retain(|(k, _)| match k {
+        rmpv::Value::String(s) => s.as_str() != Some("4"),
+        _ => true,
+    });
+    let truncated_bytes = rmp_serde::to_vec_named(&rmpv::Value::Map(without_message))
+        .expect("truncated-map serialize");
+    let result: Result<OutletError, rmp_serde::decode::Error> =
+        rmp_serde::from_slice(&truncated_bytes);
+    let decode_err =
+        result.expect_err("envelope missing required tag 4 (message) must be rejected");
+    let display = decode_err.to_string();
+    assert!(
+        display.contains('4') || display.to_ascii_lowercase().contains("missing"),
+        "decode error must surface the missing tag-4 field; got: {display}"
+    );
+
+    println!(
+        "  PASS: §5.4.4 OutletError wire format is tag-indexed, forward-compatible, and rejects missing required fields"
+    );
+}

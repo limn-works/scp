@@ -1743,4 +1743,193 @@ mod tests {
             assert_eq!(body.kind(), back.kind());
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Forward-compat / required-field / order-independence — SCP-OUT-026
+    // -----------------------------------------------------------------------
+
+    /// Builds a `MessagePack` map of the §5.4.4 [`OutletError`] envelope by hand
+    /// from primitive `rmpv` values.
+    ///
+    /// The hand-crafted form bypasses [`OutletError`]'s [`Serialize`] entirely
+    /// — driving the SCP-OUT-026 forward-compat AC ("a serialized envelope
+    /// with an unknown field tag deserializes cleanly"). Field order matches
+    /// what [`rmp_serde::to_vec_named`] would emit on a Rust-side round trip:
+    /// declared fields (`1`, `2`, `3`, `4`, `5`, `6`, `8`, `11`, `12`) in
+    /// struct-declaration order, then any extra `flatten` map entries in
+    /// `BTreeMap<String, _>` lex-order (`"99"` lex-sorts after the declared
+    /// numeric tags). This ordering is the byte-equality precondition that the
+    /// `forward_compat_hand_crafted_tag_99_byte_identical_round_trip` test
+    /// asserts.
+    fn build_envelope_map_with_extra_tag(
+        extra_tag: Option<(&str, rmpv::Value)>,
+    ) -> Vec<(rmpv::Value, rmpv::Value)> {
+        let key = CatalogKey::try_new("authorization.denied").unwrap();
+        let wire_message = OutletError::compute_wire_message(&fixed_outlet_message_key(), &key);
+        let mut pairs: Vec<(rmpv::Value, rmpv::Value)> = vec![
+            (
+                rmpv::Value::String("1".into()),
+                rmpv::Value::String("SCP-TOOL-6110".into()),
+            ),
+            (
+                rmpv::Value::String("2".into()),
+                rmpv::Value::String("authorization.denied".into()),
+            ),
+            (
+                rmpv::Value::String("3".into()),
+                rmpv::Value::String("authorization".into()),
+            ),
+            (
+                rmpv::Value::String("4".into()),
+                rmpv::Value::Binary(wire_message.to_vec()),
+            ),
+            (
+                rmpv::Value::String("5".into()),
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::String("policy".into()),
+                    rmpv::Value::String("never".into()),
+                )]),
+            ),
+            (
+                rmpv::Value::String("6".into()),
+                rmpv::Value::Map(vec![
+                    (
+                        rmpv::Value::String("shape".into()),
+                        rmpv::Value::String("authorization".into()),
+                    ),
+                    (
+                        rmpv::Value::String("capability".into()),
+                        rmpv::Value::String("outlet_query:test".into()),
+                    ),
+                ]),
+            ),
+            (
+                rmpv::Value::String("8".into()),
+                rmpv::Value::Array(Vec::new()),
+            ),
+            (
+                rmpv::Value::String("11".into()),
+                rmpv::Value::Binary(fixed_pad_nonce().to_vec()),
+            ),
+            (
+                rmpv::Value::String("12".into()),
+                rmpv::Value::Binary(fixed_registration_event_id().to_vec()),
+            ),
+        ];
+        if let Some((tag, value)) = extra_tag {
+            // Lex-sort the new key into the existing field-order so the
+            // re-serialized bytes match the hand-crafted bytes (BTreeMap
+            // `unknown_fields` iterates in lex order; "99" sorts after the
+            // declared numeric tags).
+            let entry = (rmpv::Value::String(tag.into()), value);
+            let pos = pairs
+                .iter()
+                .position(|(k, _)| match k {
+                    rmpv::Value::String(s) => s.as_str().is_some_and(|existing| existing > tag),
+                    _ => false,
+                })
+                .unwrap_or(pairs.len());
+            pairs.insert(pos, entry);
+        }
+        pairs
+    }
+
+    #[test]
+    fn forward_compat_hand_crafted_tag_99_byte_identical_round_trip() {
+        // SCP-OUT-026 AC: a hand-crafted MessagePack envelope carrying an
+        // extra field at numeric tag "99" -> "future-value" deserializes
+        // cleanly into [`OutletError`]; the unknown tag is preserved in
+        // `unknown_fields`; re-serializing the deserialized struct produces
+        // the EXACT bytes that were fed in (byte-equality round-trip).
+        //
+        // The hand-crafted form bypasses Rust-side `Serialize` — it is the
+        // wire shape an SDK would receive from a peer running a future
+        // protocol revision. Byte-equality on round-trip is the §5.4.4
+        // forward-compat invariant.
+        let pairs = build_envelope_map_with_extra_tag(Some((
+            "99",
+            rmpv::Value::String("future-value".into()),
+        )));
+        let hand_crafted = rmp_serde::to_vec_named(&rmpv::Value::Map(pairs)).unwrap();
+
+        // Deserialize — the unknown tag must be captured.
+        let envelope: OutletError = rmp_serde::from_slice(&hand_crafted)
+            .expect("hand-crafted envelope with tag 99 must deserialize");
+        assert!(
+            envelope.unknown_fields.contains_key("99"),
+            "tag-99 must round-trip into unknown_fields, got {:?}",
+            envelope.unknown_fields
+        );
+        match envelope.unknown_fields.get("99") {
+            Some(rmpv::Value::String(s)) => {
+                assert_eq!(s.as_str(), Some("future-value"));
+            }
+            other => panic!("expected tag-99 to be String(\"future-value\"), got {other:?}"),
+        }
+
+        // Re-serialize — the bytes must match the hand-crafted input exactly.
+        let re_serialized = rmp_serde::to_vec_named(&envelope).expect("re-serialize must succeed");
+        assert_eq!(
+            re_serialized, hand_crafted,
+            "byte-identical round-trip required by §5.4.4 forward-compat invariant"
+        );
+    }
+
+    #[test]
+    fn forward_compat_field_order_reversed_deserializes_identically() {
+        // SCP-OUT-026 AC: an envelope whose field order is reversed
+        // (relative to declaration order) deserializes into the SAME
+        // [`OutletError`] as the canonical-order form. MessagePack maps are
+        // tag-indexed (the §5.4.4 wire format uses numeric string tags, NOT
+        // positional ordering); a reversed encoding must be semantically
+        // equivalent.
+        let canonical_pairs = build_envelope_map_with_extra_tag(None);
+        let mut reversed_pairs = canonical_pairs.clone();
+        reversed_pairs.reverse();
+
+        let canonical_bytes = rmp_serde::to_vec_named(&rmpv::Value::Map(canonical_pairs)).unwrap();
+        let reversed_bytes = rmp_serde::to_vec_named(&rmpv::Value::Map(reversed_pairs)).unwrap();
+
+        // The two byte sequences differ — they encode the same map with
+        // different key ordering — but both must deserialize into envelopes
+        // whose typed contents compare equal.
+        assert_ne!(
+            canonical_bytes, reversed_bytes,
+            "test setup precondition: reversed pairs must produce distinct bytes"
+        );
+
+        let canonical: OutletError = rmp_serde::from_slice(&canonical_bytes)
+            .expect("canonical-order envelope must deserialize");
+        let reversed: OutletError = rmp_serde::from_slice(&reversed_bytes)
+            .expect("reversed-order envelope must deserialize");
+
+        assert_eq!(
+            canonical, reversed,
+            "tag-indexed wire format must yield identical envelopes regardless of field order"
+        );
+    }
+
+    #[test]
+    fn wire_layer_rejects_missing_message_tag_4() {
+        // SCP-OUT-026 AC: an envelope that omits tag 4 (the `message` field
+        // — the §5.4.4 `HMAC-SHA-256(outlet_message_key, catalog_key)[..32]`
+        // wire form) MUST fail deserialization with a meaningful error.
+        // `message` is a required field per §5.4.4 — there is no
+        // `Option`/`default` escape; the receiver structurally rejects.
+        let err = build_authorization_error();
+        let truncated = serialize_and_drop_tag(&err, "4");
+        let result: Result<OutletError, rmp_serde::decode::Error> =
+            rmp_serde::from_slice(&truncated);
+        let decode_err =
+            result.expect_err("expected wire-layer rejection of missing tag-4 message");
+
+        // The error must mention the missing field name so SDK consumers can
+        // diagnose. `rmp_serde` surfaces the missing field name verbatim
+        // through serde's "missing field" path.
+        let display = decode_err.to_string();
+        assert!(
+            display.contains('4') || display.to_ascii_lowercase().contains("missing"),
+            "decode error must indicate the missing tag-4 field; got: {display}"
+        );
+    }
 }
