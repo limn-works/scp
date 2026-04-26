@@ -475,6 +475,16 @@ pub struct OutletUpdatedEvent {
 ///   so the on-wire string matches the spec's `query_misdeclaration` slug
 ///   (with the canonical kebab-case rendering used elsewhere in the
 ///   `OutletErrorClass` slug taxonomy — §5.4.4).
+/// - [`OutletVerifiedReason::HandlerPanicked`] — the outlet's executor panicked
+///   inside `exec_query` / `exec_action`. The runtime catches the panic via
+///   `std::panic::catch_unwind`, recovers, and emits this signal as the §5.4.2
+///   parallel of `QueryMisdeclaration`. Per ADR-049 §148 "Every `OutletExecutor`
+///   is wrapped in `catch_unwind`. A panic inside an executor maps to
+///   `SCP-TOOL-6130` (handler-panic) with an operator-attributable
+///   integrity-failure signal." Wire form: `"handler-panicked"`. The signal
+///   attributes the failure to the outlet's `operator_did` — panics are a
+///   protocol-visible signal of operator-side defect, not an SDK-internal bug.
+///   See SCP-OUT-028.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum OutletVerifiedReason {
@@ -486,6 +496,12 @@ pub enum OutletVerifiedReason {
     /// `KindMismatch`). Operator-attributable per spec §5.4.2 — wired by the
     /// `ReadOnlyInvocation` deny-list (SCP-OUT-013).
     QueryMisdeclaration,
+    /// The outlet's executor panicked inside `exec_query` / `exec_action`.
+    /// The runtime catches the panic via `std::panic::catch_unwind`, recovers,
+    /// and surfaces the failure as `SCP-TOOL-6130` `execution.handler-panic`.
+    /// Operator-attributable per spec §5.4.2 / ADR-049 §148 — wired by the
+    /// `invoke_outlet` panic guard (SCP-OUT-028).
+    HandlerPanicked,
 }
 
 /// Event payload for a `ToolVerified` event in the context event log.

@@ -543,6 +543,7 @@ pub async fn outlet_invoke(
             spending_ucan_token.as_ref(),
             None,
             executor,
+            None,
         )
         .await
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;

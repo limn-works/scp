@@ -629,6 +629,7 @@ async fn phase2_end_to_end_integration() {
         None,
         calculator_executor,
         None::<&mut scp_runtime::context::outlets::invoke::OutletEconomyContext<'_>>,
+        None,
     )
     .await
     .expect("outlet invocation should succeed");

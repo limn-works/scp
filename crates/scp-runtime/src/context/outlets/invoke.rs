@@ -13,12 +13,19 @@
 
 use std::future::Future;
 use std::hash::BuildHasher;
+use std::panic::AssertUnwindSafe;
 use std::time::Duration;
+
+use futures::FutureExt;
 
 use crate::context::ContextHandle;
 use scp_primitives::DID;
 use scp_protocol::context::ContextState;
 use scp_protocol::context::outlets::OutletId;
+use scp_protocol::context::outlets::error_codes::{
+    CODE_EXECUTION_FAULT, SLUG_EXECUTION_HANDLER_PANIC,
+};
+use scp_protocol::context::outlets::errors::MESSAGE_MAX_BYTES;
 use scp_protocol::context::outlets::lifecycle::{
     DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, OutletInvokedEvent, OutletStatus, sha256_json,
 };
@@ -168,6 +175,43 @@ pub enum InvocationError {
         outlet_id: String,
         /// The registered kind that drove dispatch.
         kind: scp_protocol::context::outlets::OutletKind,
+    },
+
+    /// The outlet's executor panicked inside `exec_query` / `exec_action`
+    /// (SCP-OUT-028).
+    ///
+    /// Recovered by the [`std::panic::catch_unwind`] guard the runtime
+    /// applies around every executor call (ADR-049 §148: "Every
+    /// `OutletExecutor` is wrapped in `catch_unwind`. A panic inside an
+    /// executor maps to `SCP-TOOL-6130` (handler-panic) with an
+    /// operator-attributable integrity-failure signal.").
+    ///
+    /// Per spec §5.4.2 / §5.4.4, panics are protocol-visible signals
+    /// attributable to the outlet's `operator_did` — not SDK-internal
+    /// bugs. The runtime emits a parallel
+    /// `OutletVerifiedEvent { integrity_ok: false, reason: HandlerPanicked }`
+    /// alongside this error so participation records (§7.3.2) can
+    /// attribute the failure.
+    ///
+    /// On the wire (post-OUT-027), this maps to
+    /// `OutletError { code: SCP-TOOL-6130, slug: "execution.handler-panic",
+    /// class: Execution, retry: Never, ... }`.
+    ///
+    /// The `panic_message` is truncated to `MESSAGE_MAX_BYTES` (1 KiB)
+    /// at a UTF-8 boundary so it is safe to surface in
+    /// `OutletError.message`.
+    #[error(
+        "outlet \"{outlet_id}\" handler panicked ({code}, {slug}): {panic_message}",
+        code = scp_protocol::context::outlets::error_codes::CODE_EXECUTION_FAULT,
+        slug = scp_protocol::context::outlets::error_codes::SLUG_EXECUTION_HANDLER_PANIC,
+    )]
+    HandlerPanic {
+        /// The outlet whose executor panicked.
+        outlet_id: String,
+        /// Stringified panic payload, truncated to `MESSAGE_MAX_BYTES`
+        /// bytes at a UTF-8 boundary. `"<unknown panic payload>"` when the
+        /// payload is neither `&'static str` nor `String`.
+        panic_message: String,
     },
 }
 
@@ -366,6 +410,250 @@ impl QueryMisdeclarationSink for InMemoryQueryMisdeclarationSink {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.push(event);
+    }
+}
+
+/// Sink for `OutletVerifiedEvent { integrity_ok: false, reason:
+/// HandlerPanicked }` signals (SCP-OUT-028).
+///
+/// Receives a parallel `OutletVerified` event whenever the runtime's
+/// `catch_unwind` guard around an executor call recovers a panic (ADR-049
+/// §148). The signal is operator-attributable per spec §5.4.2 — panics are
+/// protocol-visible signals of an outlet operator's defect, NOT SDK-internal
+/// bugs (the SDK is the entity that catches the panic).
+///
+/// Implementations are typically a `Vec<OutletVerifiedEvent>` collected by
+/// the runtime and surfaced to the manager for event-log emission. The trait
+/// is `Send + Sync` so the sink can be shared across `tokio::spawn`-ed
+/// executor tasks.
+///
+/// This is a parallel sink to [`QueryMisdeclarationSink`] — both surface
+/// `OutletVerifiedEvent { integrity_ok: false, .. }` records but with
+/// distinct `reason` discriminants (`QueryMisdeclaration` vs
+/// `HandlerPanicked`). Two sinks rather than one shared trait keeps the
+/// runtime contract crisp: a caller wires only the panic guard or only the
+/// misdeclaration guard, not both.
+pub trait HandlerPanicSink: Send + Sync {
+    /// Records an integrity-failure signal for a handler panic.
+    /// Implementations must be non-blocking — emission happens inline with
+    /// the recovered panic and must not stall the invocation.
+    fn record(&self, event: scp_protocol::context::outlets::OutletVerifiedEvent);
+}
+
+/// In-memory [`HandlerPanicSink`] backed by a `Mutex<Vec<_>>`. Used by
+/// tests and by callers that want to introspect the panic-attribution
+/// stream without wiring a richer event-log path.
+#[derive(Debug, Default)]
+pub struct InMemoryHandlerPanicSink {
+    inner: std::sync::Mutex<Vec<scp_protocol::context::outlets::OutletVerifiedEvent>>,
+}
+
+impl InMemoryHandlerPanicSink {
+    /// Creates an empty sink.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Drains all collected events, leaving the sink empty.
+    #[must_use]
+    pub fn drain(&self) -> Vec<scp_protocol::context::outlets::OutletVerifiedEvent> {
+        // `Mutex::lock` only fails on poisoning; recover by reading whatever
+        // was last in the guard so a panic on one thread does not lose the
+        // signal events from another.
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *guard)
+    }
+
+    /// Returns a snapshot of the currently-collected events without
+    /// draining.
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<scp_protocol::context::outlets::OutletVerifiedEvent> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.clone()
+    }
+}
+
+impl HandlerPanicSink for InMemoryHandlerPanicSink {
+    fn record(&self, event: scp_protocol::context::outlets::OutletVerifiedEvent) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.push(event);
+    }
+}
+
+/// Converts a `catch_unwind` panic payload to a printable message,
+/// truncated to [`MESSAGE_MAX_BYTES`] (1 KiB) at a UTF-8 character boundary.
+///
+/// Matches the §5.4.4 `OutletError.message` size cap (1 KiB pre-HMAC catalog
+/// template) so the panic payload, once mapped onto a typed `OutletError`
+/// envelope by OUT-027, stays within wire bounds without a second
+/// truncation pass.
+///
+/// `catch_unwind` returns `Box<dyn Any + Send>`; standard panic payloads
+/// are either `&'static str` (`panic!("literal")`) or `String`
+/// (`panic!("{x}")`). Anything else is opaque — we surface a fixed
+/// placeholder rather than `Debug`-printing arbitrary user types.
+#[allow(clippy::borrowed_box)] // takes &Box<dyn Any> because that's exactly what catch_unwind hands us; downcast_ref needs the boxed payload.
+fn panic_payload_to_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    let raw: &str = if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<unknown panic payload>"
+    };
+    truncate_at_utf8_boundary(raw, MESSAGE_MAX_BYTES)
+}
+
+/// Truncates `s` to at most `max_bytes` bytes, splitting on a UTF-8
+/// character boundary so the returned `String` is always valid UTF-8.
+///
+/// Used by [`panic_payload_to_message`] to bound panic messages by the
+/// §5.4.4 `OutletError.message` cap. A naive `&s[..max_bytes]` would panic
+/// when `max_bytes` lands inside a multi-byte UTF-8 codepoint; this helper
+/// walks back to the previous codepoint boundary instead.
+fn truncate_at_utf8_boundary(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_owned();
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s[..cut].to_owned()
+}
+
+/// Builds the `OutletVerifiedEvent { integrity_ok: false, reason:
+/// HandlerPanicked }` signal for a recovered panic.
+///
+/// Mirrors the `QueryMisdeclaration` event construction — the parallel
+/// §5.4.2 operator-attributable signal — with `reason: HandlerPanicked`
+/// and `passed/failed = 0/1` so participation records (§7.3.2) attribute
+/// exactly one integrity failure to the outlet's `operator_did`.
+fn handler_panic_event(
+    outlet_id: &OutletId,
+) -> scp_protocol::context::outlets::OutletVerifiedEvent {
+    scp_protocol::context::outlets::OutletVerifiedEvent {
+        outlet_id: outlet_id.clone(),
+        passed: 0,
+        failed: 1,
+        integrity_ok: false,
+        reason: Some(scp_protocol::context::outlets::OutletVerifiedReason::HandlerPanicked),
+    }
+}
+
+/// Runs an outlet executor (closure + future) under a
+/// [`std::panic::catch_unwind`] guard so a panic inside `exec_query` /
+/// `exec_action` is recovered into an [`InvocationError::HandlerPanic`]
+/// envelope (SCP-OUT-028 / ADR-049 §148).
+///
+/// The guard wraps **both** the synchronous closure call (which constructs
+/// the future) AND every poll of the resulting future. Panics during
+/// future construction, during the executor's async body, during a
+/// `.await` resume, or during the terminal value drop are all caught and
+/// converted. Async runtimes (tokio) do not themselves panic-protect
+/// spawned futures; without this guard a misbehaving operator handler
+/// would unwind through `invoke_outlet` and abort the SCP runtime.
+///
+/// **Operator attribution.** Panics are NOT SDK-internal bugs: the SDK is
+/// the entity that catches them. Per spec §5.4.2 the panic is recorded as
+/// an operator-attributable [`scp_protocol::context::outlets::OutletVerifiedEvent`]
+/// with `reason: HandlerPanicked`, mirroring the `QueryMisdeclaration`
+/// parallel signal. Participation records (§7.3.2) consume the event to
+/// attribute the failure to the outlet's `operator_did`. The runtime
+/// emits the event through `handler_panic_sink` when one is wired; in
+/// either case it logs at `warn` level so operators see the panic in
+/// their telemetry.
+///
+/// **Truncation.** The recovered panic payload is converted to a UTF-8
+/// string via [`panic_payload_to_message`] and truncated to
+/// `MESSAGE_MAX_BYTES` (1 KiB, matching the §5.4.4
+/// `OutletError.message` pre-HMAC cap). OUT-027 maps this directly onto
+/// the typed `OutletError` envelope (`code: SCP-TOOL-6130`, `slug:
+/// "execution.handler-panic"`, `class: Execution`, `retry: Never`).
+async fn run_executor_with_panic_guard<F, Fut>(
+    executor: F,
+    input: serde_json::Value,
+    outlet_id: &OutletId,
+    handler_panic_sink: Option<&dyn HandlerPanicSink>,
+) -> Result<Result<serde_json::Value, String>, InvocationError>
+where
+    F: FnOnce(serde_json::Value) -> Fut,
+    Fut: Future<Output = Result<serde_json::Value, String>>,
+{
+    // Step A — synchronously construct the future, catching panics raised
+    // BEFORE the first poll (e.g. closures that panic during pre-await
+    // setup). `std::panic::catch_unwind` is sync-only, so the future
+    // construction is captured here under the same payload-decoding rules
+    // as the async path.
+    let fut = match std::panic::catch_unwind(AssertUnwindSafe(|| executor(input))) {
+        Ok(fut) => fut,
+        Err(payload) => {
+            return Err(panic_to_invocation_error(
+                &payload,
+                outlet_id,
+                handler_panic_sink,
+            ));
+        }
+    };
+
+    // Step B — poll the future under `futures::FutureExt::catch_unwind`,
+    // catching panics during any `.await` resume or during the body. The
+    // `AssertUnwindSafe` is sound because the executor surface contract
+    // (§5.4.2) treats the executor as a black box — the runtime does not
+    // share mutable state with the executor across the panic boundary.
+    match AssertUnwindSafe(fut).catch_unwind().await {
+        Ok(executor_result) => Ok(executor_result),
+        Err(payload) => Err(panic_to_invocation_error(
+            &payload,
+            outlet_id,
+            handler_panic_sink,
+        )),
+    }
+}
+
+/// Converts a recovered panic payload into the typed
+/// [`InvocationError::HandlerPanic`] envelope and emits the parallel
+/// `OutletVerifiedEvent { reason: HandlerPanicked }` (§5.4.2) through
+/// `handler_panic_sink` and a `warn`-level tracing event.
+///
+/// Shared between the sync (closure) and async (poll) panic-recovery
+/// branches of [`run_executor_with_panic_guard`] and the cancellation-
+/// path's inline `select!` so emission and truncation are identical
+/// regardless of when the panic fired.
+///
+/// Takes the payload by reference: the helper only needs to inspect it
+/// (string downcasts in [`panic_payload_to_message`], record the §5.4.2
+/// signal). Callers may drop the original `Box` after calling.
+#[allow(clippy::borrowed_box)] // matches `panic_payload_to_message` which downcasts the boxed payload directly.
+fn panic_to_invocation_error(
+    payload: &Box<dyn std::any::Any + Send>,
+    outlet_id: &OutletId,
+    handler_panic_sink: Option<&dyn HandlerPanicSink>,
+) -> InvocationError {
+    let panic_message = panic_payload_to_message(payload);
+    tracing::warn!(
+        outlet_id = %outlet_id,
+        code = CODE_EXECUTION_FAULT,
+        slug = SLUG_EXECUTION_HANDLER_PANIC,
+        panic_message = %panic_message,
+        "outlet executor panicked — recovered via catch_unwind (operator-attributable, §5.4.2)"
+    );
+    if let Some(sink) = handler_panic_sink {
+        sink.record(handler_panic_event(outlet_id));
+    }
+    InvocationError::HandlerPanic {
+        outlet_id: outlet_id.clone(),
+        panic_message,
     }
 }
 
@@ -1013,7 +1301,7 @@ pub struct DispatchedOutletOutcome {
 /// the underlying closure-based pipeline.
 ///
 /// [`OutletKind`]: scp_protocol::context::outlets::OutletKind
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // mirrors the existing `invoke_outlet` arity exactly so the dispatcher is interchangeable
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // mirrors the existing `invoke_outlet` arity exactly so the dispatcher is interchangeable; SCP-OUT-028 adds the panic sink at the end of the parameter list.
 pub async fn invoke_outlet_dispatch<E, S>(
     context: &ContextHandle,
     registry: &OutletRegistry,
@@ -1025,6 +1313,7 @@ pub async fn invoke_outlet_dispatch<E, S>(
     executor: &E,
     misdeclaration_sink: Option<&dyn QueryMisdeclarationSink>,
     economy: Option<&mut OutletEconomyContext<'_, S>>,
+    handler_panic_sink: Option<&dyn HandlerPanicSink>,
 ) -> Result<DispatchedOutletOutcome, InvocationError>
 where
     E: OutletExecutor + ?Sized,
@@ -1155,6 +1444,8 @@ where
     // Delegate to the closure-based pipeline so capability checks, schema
     // validation, escrow, budget, etc. all run as before. The closure
     // converts the trait error into the existing `String` error surface.
+    // SCP-OUT-028: forward the handler-panic sink so panics inside
+    // `exec_query` / `exec_action` emit the §5.4.2 attribution event.
     let result = invoke_outlet(
         context,
         registry,
@@ -1165,6 +1456,7 @@ where
         timeout_ms,
         dispatch,
         economy,
+        handler_panic_sink,
     )
     .await;
 
@@ -1323,8 +1615,20 @@ pub struct OutletEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
 /// Returns [`InvocationError`] on protocol-level validation failures,
 /// budget exceeded, or UCAN composition failures.
 ///
+/// # Panic guard (SCP-OUT-028)
+///
+/// The executor invocation runs inside [`run_executor_with_panic_guard`].
+/// A panic in `exec_query` / `exec_action` is recovered into
+/// [`InvocationError::HandlerPanic`] (`SCP-TOOL-6130`,
+/// `execution.handler-panic`) and a parallel
+/// `OutletVerifiedEvent { reason: HandlerPanicked }` is emitted through
+/// `handler_panic_sink` (and `tracing::warn!` always) per spec §5.4.2 —
+/// the operator-attributable signal that mirrors `QueryMisdeclaration`.
+/// No panic escapes `invoke_outlet`.
+///
 /// See ADR-010 acceptance criterion 3 (`invoke_outlet`).
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Full economy + escrow lifecycle
+/// See SCP-OUT-028 / ADR-049 §148 for the panic guard.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Full economy + escrow lifecycle + SCP-OUT-028 panic sink
 pub async fn invoke_outlet<F, Fut, S: BuildHasher>(
     context: &ContextHandle,
     registry: &OutletRegistry,
@@ -1335,6 +1639,7 @@ pub async fn invoke_outlet<F, Fut, S: BuildHasher>(
     timeout_ms: Option<u32>,
     executor: F,
     mut economy: Option<&mut OutletEconomyContext<'_, S>>,
+    handler_panic_sink: Option<&dyn HandlerPanicSink>,
 ) -> Result<
     (
         serde_json::Value,
@@ -1427,7 +1732,9 @@ where
 
     // 5-6. Execute the outlet with timeout and validate the output. Delegates
     // to the shared `invoke_outlet_execute_and_validate` helper so the manager
-    // wrapper can share the exact same execution path.
+    // wrapper can share the exact same execution path. SCP-OUT-028: the
+    // helper applies the `catch_unwind` panic guard internally and forwards
+    // `handler_panic_sink` for OutletVerified attribution.
     let outcome = match invoke_outlet_execute_and_validate(
         context,
         registry,
@@ -1437,6 +1744,7 @@ where
         invoker_did,
         timeout_ms,
         executor,
+        handler_panic_sink,
     )
     .await
     {
@@ -1526,13 +1834,27 @@ pub(crate) struct InvokeExecuteOutcome {
 /// running economy pre-check / escrow authorization, so the execution
 /// path is shared between the two entry points.
 ///
+/// # Panic guard (SCP-OUT-028)
+///
+/// The executor invocation runs inside [`run_executor_with_panic_guard`]
+/// which wraps the closure call AND the resulting future in
+/// [`std::panic::catch_unwind`]. A panic inside `exec_query` /
+/// `exec_action` is recovered into [`InvocationError::HandlerPanic`]
+/// (mapping to `SCP-TOOL-6130`, `execution.handler-panic`) and emits a
+/// parallel
+/// `OutletVerifiedEvent { integrity_ok: false, reason: HandlerPanicked }`
+/// through `handler_panic_sink` per spec §5.4.2 (operator-attributable
+/// integrity-failure signal). Panics are protocol-visible signals
+/// attributable to the outlet's `operator_did` — NOT SDK-internal bugs.
+/// See ADR-049 §148.
+///
 /// # Errors
 ///
 /// Returns [`InvocationError`] on state, capability, schema validation,
-/// timeout, or executor failure. Cancellation is not supported by this
-/// variant — see the inline timeout-plus-select! path in
-/// [`invoke_outlet_with_cancellation`] instead.
-#[allow(clippy::too_many_arguments)] // 8 parameters mirror `invoke_outlet`; lower bound imposed by the execution contract.
+/// timeout, executor failure, or recovered handler panic. Cancellation is
+/// not supported by this variant — see the inline timeout-plus-select!
+/// path in [`invoke_outlet_with_cancellation`] instead.
+#[allow(clippy::too_many_arguments)] // 9 parameters mirror `invoke_outlet`; lower bound imposed by the execution contract + SCP-OUT-028 panic sink.
 pub(crate) async fn invoke_outlet_execute_and_validate<F, Fut>(
     context: &ContextHandle,
     registry: &OutletRegistry,
@@ -1542,6 +1864,7 @@ pub(crate) async fn invoke_outlet_execute_and_validate<F, Fut>(
     invoker_did: &DID,
     timeout_ms: Option<u32>,
     executor: F,
+    handler_panic_sink: Option<&dyn HandlerPanicSink>,
 ) -> Result<InvokeExecuteOutcome, InvocationError>
 where
     F: FnOnce(serde_json::Value) -> Fut,
@@ -1588,13 +1911,26 @@ where
     let input_hash = sha256_json(&input);
 
     // 5. Execute the outlet with timeout.
+    //
+    // SCP-OUT-028: the executor closure + future are wrapped in
+    // `catch_unwind` via `run_executor_with_panic_guard`. A panic in
+    // `exec_query`/`exec_action` is recovered into
+    // `InvocationError::HandlerPanic` and emits the §5.4.2 parallel
+    // `OutletVerifiedEvent { reason: HandlerPanicked }` through
+    // `handler_panic_sink` — the panic does not escape `invoke_outlet`.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
     let timeout_duration = Duration::from_millis(u64::from(effective_timeout));
-    let execution_result = tokio::time::timeout(timeout_duration, executor(input)).await;
+    let guarded = run_executor_with_panic_guard(executor, input, outlet_id, handler_panic_sink);
+    let execution_result = tokio::time::timeout(timeout_duration, guarded).await;
     let output = match execution_result {
-        Ok(Ok(output)) => output,
-        Ok(Err(exec_err)) => {
+        Ok(Ok(Ok(output))) => output,
+        Ok(Ok(Err(exec_err))) => {
             return Err(InvocationError::ExecutionFailed { message: exec_err });
+        }
+        Ok(Err(panic_err)) => {
+            // The panic guard already emitted the warn-level log and the
+            // `OutletVerified` signal; surface the typed envelope.
+            return Err(panic_err);
         }
         Err(_elapsed) => {
             return Err(InvocationError::Timeout {
@@ -1737,6 +2073,22 @@ pub(crate) fn build_outlet_event(
     }
 }
 
+/// Outcome of the executor-vs-cancellation `tokio::select!` race inside
+/// [`invoke_outlet_with_cancellation`].
+///
+/// Hoisted to module scope so the `items_after_statements` clippy lint is
+/// satisfied — `tokio::select!` cannot drive a typed sum across `.await`
+/// boundaries from within a function body without an explicit type
+/// declared up-front.
+///
+/// `Executor`'s outer `Result` carries the `catch_unwind` outcome (panic
+/// payload on `Err`); the inner `Result<Value, String>` is the executor's
+/// own success/failure.
+enum SelectOutcome {
+    Executor(Result<Result<serde_json::Value, String>, Box<dyn std::any::Any + Send>>),
+    Cancelled,
+}
+
 /// Invokes an outlet with cancellation support.
 ///
 /// Same as [`invoke_outlet`] but accepts a cancellation future. If the
@@ -1746,11 +2098,22 @@ pub(crate) fn build_outlet_event(
 /// Cancellation is best-effort: if the outlet completes before the cancel
 /// signal, the successful result is returned.
 ///
+/// # Panic guard (SCP-OUT-028)
+///
+/// The executor closure call and the resulting future are wrapped in
+/// [`std::panic::catch_unwind`] (sync) and
+/// `futures::FutureExt::catch_unwind` (async). A panic recovers into
+/// [`InvocationError::HandlerPanic`] and emits the parallel §5.4.2
+/// `OutletVerifiedEvent { reason: HandlerPanicked }` through
+/// `handler_panic_sink`. The cancellation branch and timeout branch are
+/// unaffected — they continue to surface `Cancelled` / `Timeout`.
+///
 /// # Errors
 ///
 /// Returns [`InvocationError`] on protocol-level validation failures,
-/// timeout, cancellation, budget exceeded, or UCAN composition failures.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // H6 escrow rollback on output validation adds lines; splitting would fragment the escrow lifecycle.
+/// timeout, cancellation, budget exceeded, UCAN composition failures, or
+/// recovered handler panic.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // H6 escrow rollback on output validation adds lines; splitting would fragment the escrow lifecycle. SCP-OUT-028 adds the panic-sink parameter.
 pub async fn invoke_outlet_with_cancellation<F, Fut, C, CFut, S: BuildHasher>(
     context: &ContextHandle,
     registry: &OutletRegistry,
@@ -1762,6 +2125,7 @@ pub async fn invoke_outlet_with_cancellation<F, Fut, C, CFut, S: BuildHasher>(
     executor: F,
     cancellation: C,
     mut economy: Option<&mut OutletEconomyContext<'_, S>>,
+    handler_panic_sink: Option<&dyn HandlerPanicSink>,
 ) -> Result<
     (
         serde_json::Value,
@@ -1855,23 +2219,62 @@ where
     // across a helper boundary cannot carry the pinned `&mut` futures out
     // of scope — the cancellation-free path delegates to
     // `invoke_outlet_execute_and_validate` instead.
+    //
+    // SCP-OUT-028: the synchronous call to `executor(input)` runs inside
+    // `std::panic::catch_unwind` so a panic during future construction is
+    // recovered. The returned future is then wrapped in
+    // `futures::FutureExt::catch_unwind` so panics during polls and
+    // `.await` resumes are also recovered. Both branches funnel through
+    // `panic_to_invocation_error` for the §5.4.2 attribution emission.
+    // Distinguishing executor outcome vs. cancellation uses a typed
+    // `SelectOutcome` rather than a sentinel string — adversarial executors
+    // could otherwise emit a `"cancelled"` string and short-circuit
+    // observability.
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
     let timeout_duration = Duration::from_millis(u64::from(effective_timeout));
-    let exec_fut = executor(input);
+    let exec_fut = match std::panic::catch_unwind(AssertUnwindSafe(|| executor(input))) {
+        Ok(fut) => fut,
+        Err(payload) => {
+            void_escrow_and_rollback(
+                escrow.as_ref(),
+                escrow_parts.as_ref(),
+                action_cost,
+                &mut economy,
+                invoker_did,
+            )
+            .await;
+            return Err(panic_to_invocation_error(
+                &payload,
+                outlet_id,
+                handler_panic_sink,
+            ));
+        }
+    };
+    // SCP-OUT-028: `SelectOutcome` is module-scoped (above) — hoisting
+    // satisfies clippy's `items_after_statements` and keeps
+    // `tokio::select!` typed.
+    let exec_fut = AssertUnwindSafe(exec_fut).catch_unwind();
     let cancel_fut = cancellation();
     tokio::pin!(exec_fut);
     tokio::pin!(cancel_fut);
     let execution_result = tokio::time::timeout(timeout_duration, async {
         tokio::select! {
-            result = &mut exec_fut => result,
-            () = &mut cancel_fut => Err("cancelled".to_owned()),
+            result = &mut exec_fut => SelectOutcome::Executor(result),
+            () = &mut cancel_fut => SelectOutcome::Cancelled,
         }
     })
     .await;
-    let exec_result = match execution_result {
-        Ok(Ok(output)) => Ok(output),
-        Ok(Err(msg)) if msg == "cancelled" => Err(InvocationError::Cancelled),
-        Ok(Err(exec_err)) => Err(InvocationError::ExecutionFailed { message: exec_err }),
+    let exec_result: Result<serde_json::Value, InvocationError> = match execution_result {
+        Ok(SelectOutcome::Executor(Ok(Ok(output)))) => Ok(output),
+        Ok(SelectOutcome::Executor(Ok(Err(exec_err)))) => {
+            Err(InvocationError::ExecutionFailed { message: exec_err })
+        }
+        Ok(SelectOutcome::Executor(Err(payload))) => Err(panic_to_invocation_error(
+            &payload,
+            outlet_id,
+            handler_panic_sink,
+        )),
+        Ok(SelectOutcome::Cancelled) => Err(InvocationError::Cancelled),
         Err(_elapsed) => Err(InvocationError::Timeout {
             timeout_ms: effective_timeout,
         }),
@@ -2461,6 +2864,7 @@ mod tests {
             None,
             add_executor,
             None::<&mut OutletEconomyContext<'_>>,
+            None,
         )
         .await;
 
@@ -2497,6 +2901,7 @@ mod tests {
             None,
             add_executor,
             None::<&mut OutletEconomyContext<'_>>,
+            None,
         )
         .await;
 
@@ -2531,6 +2936,7 @@ mod tests {
             None,
             add_executor,
             None::<&mut OutletEconomyContext<'_>>,
+            None,
         )
         .await;
 
@@ -2563,6 +2969,7 @@ mod tests {
             None,
             add_executor,
             None::<&mut OutletEconomyContext<'_>>,
+            None,
         )
         .await;
 
@@ -2596,6 +3003,7 @@ mod tests {
             None,
             add_executor,
             None::<&mut OutletEconomyContext<'_>>,
+            None,
         )
         .await;
 
@@ -2634,6 +3042,7 @@ mod tests {
             Some(50), // 50ms timeout -- will expire before the 5s sleep.
             slow_executor,
             None::<&mut OutletEconomyContext<'_>>,
+            None,
         )
         .await;
 
@@ -2678,6 +3087,7 @@ mod tests {
             slow_executor,
             cancel,
             None::<&mut OutletEconomyContext<'_>>,
+            None,
         )
         .await;
 
@@ -2715,6 +3125,7 @@ mod tests {
             None,
             failing_executor,
             None::<&mut OutletEconomyContext<'_>>,
+            None,
         )
         .await;
 
@@ -2753,6 +3164,7 @@ mod tests {
             None,
             bad_output_executor,
             None::<&mut OutletEconomyContext<'_>>,
+            None,
         )
         .await;
 
@@ -2787,6 +3199,7 @@ mod tests {
             None,
             add_executor,
             None::<&mut OutletEconomyContext<'_>>,
+            None,
         )
         .await
         .unwrap();
@@ -2827,6 +3240,7 @@ mod tests {
             None,
             add_executor,
             None::<&mut OutletEconomyContext<'_>>,
+            None,
         )
         .await;
 
@@ -2910,6 +3324,7 @@ mod tests {
             Some(999_999), // Above MAX_TIMEOUT_MS
             add_executor,
             None::<&mut OutletEconomyContext<'_>>,
+            None,
         )
         .await;
 
@@ -3150,6 +3565,7 @@ mod tests {
             None,
             add_executor,
             Some(&mut economy),
+            None,
         )
         .await;
         assert!(
@@ -3515,6 +3931,7 @@ mod tests {
             &executor,
             None,
             None,
+            None,
         )
         .await
         .expect("dispatch should succeed");
@@ -3560,6 +3977,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             &executor,
+            None,
             None,
             None,
         )
@@ -3620,6 +4038,7 @@ mod tests {
             None,
             &executor,
             Some(&sink),
+            None,
             None,
         )
         .await;
@@ -3789,6 +4208,7 @@ mod tests {
             &executor,
             Some(&sink),
             None,
+            None,
         )
         .await;
 
@@ -3834,6 +4254,305 @@ mod tests {
 
         // The doctest in the module header (compile_fail) is the
         // first-class compile-time deny.
+    }
+
+    // =======================================================================
+    // SCP-OUT-028 tests — handler-panic catch_unwind guard
+    //
+    // The four ACs are exercised end-to-end:
+    //
+    // - AC4 (panic recovery + envelope shape): a `panic!("boom")` executor
+    //   produces `InvocationError::HandlerPanic { panic_message: "boom", .. }`,
+    //   no panic escapes `invoke_outlet`, and the rendered display string
+    //   carries the `SCP-TOOL-6130` code and `execution.handler-panic` slug
+    //   — verifying the `OutletError` shape that AC2 calls out (typed
+    //   envelope mapping is OUT-027).
+    // - AC5 (event observability): the in-memory `HandlerPanicSink` records
+    //   exactly one `OutletVerifiedEvent { integrity_ok: false, reason:
+    //   HandlerPanicked }` per panic.
+    // - AC6 (1 KiB truncation): a panic message of 2 KiB produces a
+    //   recovered `panic_message` of exactly 1024 bytes, on a UTF-8
+    //   boundary.
+    // - AC1 (closure-side panic): a closure that panics BEFORE returning
+    //   the future is also recovered — proves the synchronous
+    //   `catch_unwind` wraps the executor call, not just the future polls.
+    // =======================================================================
+
+    /// AC4: an executor that panics with `panic!("boom")` is recovered into
+    /// `InvocationError::HandlerPanic` carrying the panic payload, with no
+    /// panic escaping `invoke_outlet`.
+    #[tokio::test]
+    async fn invoke_outlet_panicking_executor_recovers_to_handler_panic_error() {
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+
+        // Executor panics on its first poll. `catch_unwind` MUST recover.
+        let panicking_executor = |_input: serde_json::Value| async {
+            panic!("boom");
+            // unreachable; satisfies the closure's return type for the
+            // compiler so the explicit `Result` ascription resolves.
+            #[allow(unreachable_code)]
+            Ok::<serde_json::Value, String>(serde_json::json!({}))
+        };
+
+        let sink = super::InMemoryHandlerPanicSink::new();
+        let result = invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &"calculator".to_owned(),
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            panicking_executor,
+            None::<&mut OutletEconomyContext<'_>>,
+            Some(&sink),
+        )
+        .await;
+
+        // AC4: no panic escaped — we got a structured error back.
+        assert!(result.is_err(), "panic must be recovered into an error");
+        let err = result.unwrap_err();
+        match &err {
+            InvocationError::HandlerPanic {
+                outlet_id,
+                panic_message,
+            } => {
+                assert_eq!(outlet_id, "calculator");
+                assert_eq!(panic_message, "boom");
+            }
+            other => panic!("expected HandlerPanic, got {other:?}"),
+        }
+        // AC2: rendered string carries the OUT-025 code + slug constants
+        // — proving the envelope shape (`SCP-TOOL-6130` / `execution.handler-panic`)
+        // is the canonical reference per the spec §5.4.4 Execution-class.
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains(scp_protocol::context::outlets::error_codes::CODE_EXECUTION_FAULT,),
+            "Display must carry SCP-TOOL-6130: {rendered}"
+        );
+        assert!(
+            rendered.contains(
+                scp_protocol::context::outlets::error_codes::SLUG_EXECUTION_HANDLER_PANIC,
+            ),
+            "Display must carry execution.handler-panic slug: {rendered}"
+        );
+    }
+
+    /// AC5: the `HandlerPanicSink` test subscriber observes exactly one
+    /// `OutletVerifiedEvent { integrity_ok: false, reason: HandlerPanicked }`
+    /// per recovered panic, mirroring §5.4.2's parallel signal taxonomy.
+    #[tokio::test]
+    async fn invoke_outlet_panic_emits_outlet_verified_event_to_sink() {
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+
+        let panicking_executor = |_input: serde_json::Value| async {
+            panic!("operator-side defect");
+            #[allow(unreachable_code)]
+            Ok::<serde_json::Value, String>(serde_json::json!({}))
+        };
+
+        let sink = super::InMemoryHandlerPanicSink::new();
+        let _ = invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &"calculator".to_owned(),
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            panicking_executor,
+            None::<&mut OutletEconomyContext<'_>>,
+            Some(&sink),
+        )
+        .await;
+
+        let drained = sink.drain();
+        assert_eq!(drained.len(), 1, "exactly one signal emitted per panic");
+        let event = &drained[0];
+        assert_eq!(event.outlet_id, "calculator");
+        assert!(!event.integrity_ok, "integrity_ok must be false");
+        assert_eq!(event.passed, 0);
+        assert_eq!(event.failed, 1);
+        assert_eq!(
+            event.reason,
+            Some(scp_protocol::context::outlets::OutletVerifiedReason::HandlerPanicked),
+            "reason must be HandlerPanicked"
+        );
+    }
+
+    /// AC6: a panic message larger than `MESSAGE_MAX_BYTES` (1 KiB) is
+    /// truncated to exactly 1024 bytes at a UTF-8 boundary so it fits the
+    /// §5.4.4 `OutletError.message` cap on the wire (post-OUT-027).
+    #[tokio::test]
+    async fn invoke_outlet_panic_message_truncated_to_one_kib() {
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+
+        // Build a 2 KiB ASCII payload. ASCII bytes are 1-byte codepoints
+        // so the truncation lands cleanly at the cap; we additionally
+        // pin the UTF-8-boundary path with a separate test below.
+        let huge_payload: String = "x".repeat(2048);
+        let captured = huge_payload.clone();
+        let panicking_executor = move |_input: serde_json::Value| {
+            let payload = captured.clone();
+            async move {
+                panic!("{payload}");
+                #[allow(unreachable_code)]
+                Ok::<serde_json::Value, String>(serde_json::json!({}))
+            }
+        };
+
+        let result = invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &"calculator".to_owned(),
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            panicking_executor,
+            None::<&mut OutletEconomyContext<'_>>,
+            None::<&dyn super::HandlerPanicSink>,
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        match err {
+            InvocationError::HandlerPanic { panic_message, .. } => {
+                assert_eq!(
+                    panic_message.len(),
+                    scp_protocol::context::outlets::errors::MESSAGE_MAX_BYTES,
+                    "panic_message must be truncated to MESSAGE_MAX_BYTES"
+                );
+                // Truncation respects UTF-8: the result is valid UTF-8
+                // (the type system already pins this — `String` is valid
+                // UTF-8 by construction).
+                assert!(
+                    panic_message.chars().all(|c| c == 'x'),
+                    "truncated payload must preserve original byte values"
+                );
+            }
+            other => panic!("expected HandlerPanic, got {other:?}"),
+        }
+    }
+
+    /// AC1 (closure-side guard): a closure that panics BEFORE returning
+    /// the future — i.e., during `executor(input)` itself — is also
+    /// recovered. This proves the panic guard wraps both the synchronous
+    /// closure call AND the future polls.
+    #[tokio::test]
+    async fn invoke_outlet_panic_in_closure_construction_recovers() {
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+
+        // The closure body runs synchronously when `executor(input)` is
+        // called. Panicking here does NOT enter an async future at all —
+        // it must still be caught by the outer `catch_unwind`.
+        let pre_future_panic = |_input: serde_json::Value| {
+            panic!("pre-poll panic");
+            #[allow(unreachable_code)]
+            async move {
+                Ok::<serde_json::Value, String>(serde_json::json!({}))
+            }
+        };
+
+        let sink = super::InMemoryHandlerPanicSink::new();
+        let result = invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &"calculator".to_owned(),
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            pre_future_panic,
+            None::<&mut OutletEconomyContext<'_>>,
+            Some(&sink),
+        )
+        .await;
+
+        match result {
+            Err(InvocationError::HandlerPanic {
+                outlet_id,
+                panic_message,
+            }) => {
+                assert_eq!(outlet_id, "calculator");
+                assert_eq!(panic_message, "pre-poll panic");
+            }
+            other => panic!("expected HandlerPanic, got {other:?}"),
+        }
+        let drained = sink.drain();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(
+            drained[0].reason,
+            Some(scp_protocol::context::outlets::OutletVerifiedReason::HandlerPanicked),
+        );
+    }
+
+    /// SCP-OUT-028 helper coverage: `truncate_at_utf8_boundary` walks back
+    /// to the previous UTF-8 codepoint boundary instead of slicing through
+    /// a multi-byte codepoint. A naive `&s[..max_bytes]` would `panic!`
+    /// when the cut lands inside a 2-byte codepoint.
+    #[test]
+    fn truncate_at_utf8_boundary_respects_multi_byte_codepoints() {
+        // 4-byte string `"é"` is 2 bytes in UTF-8 (`\xC3\xA9`). Cutting at
+        // 1 byte would split the codepoint; the helper must back up to 0.
+        let s = "é";
+        let truncated = super::truncate_at_utf8_boundary(s, 1);
+        assert_eq!(truncated, "");
+        assert_eq!(truncated.len(), 0);
+
+        // Cutting at the codepoint boundary returns the full string when
+        // `max_bytes >= s.len()`.
+        let s = "héllo";
+        let truncated = super::truncate_at_utf8_boundary(s, 1024);
+        assert_eq!(truncated, "héllo");
+
+        // A mid-codepoint cut walks back to the boundary.
+        let truncated = super::truncate_at_utf8_boundary("héllo", 2);
+        assert_eq!(truncated, "h"); // `é` starts at byte 1 (2 bytes); cut at 2 lands inside.
+    }
+
+    /// SCP-OUT-028 helper coverage: opaque (non-string) panic payloads
+    /// surface a fixed placeholder so adversarial executors cannot leak
+    /// arbitrary `Debug` output through the runtime envelope.
+    #[test]
+    fn panic_payload_to_message_handles_opaque_payloads() {
+        // `panic_any(42_i32)` produces a non-string payload. Convert via
+        // `catch_unwind` so the path matches what the runtime sees.
+        let payload: Box<dyn std::any::Any + Send> = std::panic::catch_unwind(|| {
+            std::panic::panic_any(42_i32);
+        })
+        .unwrap_err();
+        let msg = super::panic_payload_to_message(&payload);
+        assert_eq!(msg, "<unknown panic payload>");
+
+        // `&'static str` panics serialize verbatim.
+        let payload: Box<dyn std::any::Any + Send> = std::panic::catch_unwind(|| {
+            panic!("static literal");
+        })
+        .unwrap_err();
+        let msg = super::panic_payload_to_message(&payload);
+        assert_eq!(msg, "static literal");
+
+        // `String` panics serialize verbatim too.
+        let payload: Box<dyn std::any::Any + Send> = std::panic::catch_unwind(|| {
+            let s = String::from("formatted");
+            panic!("{s}");
+        })
+        .unwrap_err();
+        let msg = super::panic_payload_to_message(&payload);
+        assert_eq!(msg, "formatted");
     }
 }
 

@@ -38,6 +38,7 @@ scp-platform = { path = "../scp-platform", version = "=0.1.0-beta.1" }
 scp-identity = { path = "../scp-identity", version = "=0.1.0-beta.1" }
 scp-event-log = { path = "../scp-event-log", version = "=0.1.0-beta.1" }
 async-trait = { workspace = true }
+futures = "0.3"
 aes = { workspace = true }
 aes-gcm = { workspace = true }
 rand = { workspace = true }

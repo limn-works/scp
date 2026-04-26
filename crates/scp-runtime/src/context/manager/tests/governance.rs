@@ -6454,6 +6454,7 @@ async fn budget_exceeded_on_outlet_call() {
         None,
         |_| async move { Ok(serde_json::json!({"result": 3, "status": "ok"})) },
         Some(&mut economy),
+        None,
     )
     .await;
     assert!(
@@ -7943,6 +7944,7 @@ async fn outlet_call_deducts_budget() {
             None,
             |input| async move { Ok(input) },
             Some(&mut economy),
+            None,
         )
         .await;
         assert!(
@@ -7978,6 +7980,7 @@ async fn outlet_call_deducts_budget() {
             None,
             |input| async move { Ok(input) },
             Some(&mut economy),
+            None,
         )
         .await;
         assert!(result2.is_ok(), "second invocation should succeed");
@@ -8658,6 +8661,7 @@ async fn test_outlet_call_rejected_insufficient_budget() {
         None,
         |_| async move { Ok(serde_json::json!({"result": 3, "status": "ok"})) },
         Some(&mut economy),
+        None,
     )
     .await;
     assert!(

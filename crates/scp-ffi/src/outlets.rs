@@ -663,6 +663,7 @@ pub fn py_outlet_invoke(
                     spending_ucan_token.as_ref(),
                     None,
                     executor,
+                    None,
                 )
                 .await
         })

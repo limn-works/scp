@@ -121,6 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None, // default timeout
         executor,
         None::<&mut scp_runtime::context::outlets::invoke::OutletEconomyContext<'_>>,
+        None,
     )
     .await
     .map_err(|e| e.to_string())?;

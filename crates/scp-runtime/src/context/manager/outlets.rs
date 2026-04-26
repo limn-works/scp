@@ -462,6 +462,7 @@ impl ContextManager {
         spending_ucan: Option<&UcanToken>,
         timeout_ms: Option<u32>,
         executor: F,
+        handler_panic_sink: Option<&dyn crate::context::outlets::invoke::HandlerPanicSink>,
     ) -> Result<ManagedOutletInvocationOutput, ContextError>
     where
         F: FnOnce(serde_json::Value) -> Fut,
@@ -785,6 +786,7 @@ impl ContextManager {
             invoker_did,
             timeout_ms,
             executor,
+            handler_panic_sink,
         )
         .await
         {
@@ -977,6 +979,7 @@ impl ContextManager {
         timeout_ms: Option<u32>,
         executor: &E,
         misdeclaration_sink: Option<&dyn crate::context::outlets::invoke::QueryMisdeclarationSink>,
+        handler_panic_sink: Option<&dyn crate::context::outlets::invoke::HandlerPanicSink>,
     ) -> Result<DispatchedManagedOutletInvocationOutput, ContextError>
     where
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized,
@@ -1140,6 +1143,7 @@ impl ContextManager {
                 spending_ucan,
                 timeout_ms,
                 closure,
+                handler_panic_sink,
             )
             .await?;
 
@@ -1239,6 +1243,20 @@ fn invocation_error_to_context(err: InvocationError) -> ContextError {
                 "SCP-TOOL-6103: outlet \"{outlet_id}\" registered as {kind:?} but executor returned KindMismatch (§5.4.2)"
             ))
         }
+        // SCP-OUT-028: Recovered handler panic. Surfaces with the §5.4.4
+        // execution-class code (`SCP-TOOL-6130`) and slug
+        // `execution.handler-panic`. The `OutletVerifiedEvent { reason:
+        // HandlerPanicked }` parallel signal was already emitted through
+        // the panic sink inside `invoke_outlet`. OUT-027 will replace this
+        // string mapping with the typed `OutletError` envelope.
+        InvocationError::HandlerPanic {
+            outlet_id,
+            panic_message,
+        } => ContextError::PermissionDenied(format!(
+            "{code}: outlet \"{outlet_id}\" handler panicked ({slug}): {panic_message}",
+            code = scp_protocol::context::outlets::error_codes::CODE_EXECUTION_FAULT,
+            slug = scp_protocol::context::outlets::error_codes::SLUG_EXECUTION_HANDLER_PANIC,
+        )),
     }
 }
 

@@ -1878,6 +1878,7 @@ async fn outlet_call_escalation_via_managed_wrapper() {
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
+            None,
         )
         .await;
     assert!(
@@ -2183,6 +2184,7 @@ async fn outlet_call_respects_hard_rate_limit() {
                 Some(&ucan),
                 None,
                 |_input| async { Ok(serde_json::json!({})) },
+                None,
             )
             .await;
         assert!(
@@ -2203,6 +2205,7 @@ async fn outlet_call_respects_hard_rate_limit() {
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
+            None,
         )
         .await;
     assert!(result.is_err(), "11th tool invoke should be rate-limited");
@@ -2286,6 +2289,7 @@ async fn outlet_call_failure_refunds_hard_rate_limit_token() {
                 None,
                 None,
                 |_input| async { Err::<serde_json::Value, _>("executor failed".to_owned()) },
+                None,
             )
             .await;
     }
@@ -2303,6 +2307,7 @@ async fn outlet_call_failure_refunds_hard_rate_limit_token() {
             None,
             None,
             |_input| async { Err::<serde_json::Value, _>("executor failed".to_owned()) },
+            None,
         )
         .await;
     assert!(result.is_err(), "11th failing invoke should still error");
@@ -2649,6 +2654,7 @@ async fn outlet_call_output_validation_failure_voids_escrow_and_refunds_budget()
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!("not an object")) },
+            None,
         )
         .await;
 
@@ -2840,6 +2846,7 @@ async fn outlet_call_happy_path_captures_escrow_and_deducts_budget() {
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({"result": 42})) },
+            None,
         )
         .await;
     assert!(
@@ -4076,6 +4083,7 @@ async fn outlet_call_fabricated_spending_ucan_rejected_by_signature() {
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
+            None,
         )
         .await;
 
@@ -4134,6 +4142,7 @@ async fn outlet_call_spending_ucan_iss_must_match_invoker() {
             Some(&attacker_ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
+            None,
         )
         .await;
 
@@ -4175,6 +4184,7 @@ async fn outlet_call_spending_ucan_replay_via_nonce_tracker() {
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
+            None,
         )
         .await;
     assert!(
@@ -4193,6 +4203,7 @@ async fn outlet_call_spending_ucan_replay_via_nonce_tracker() {
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
+            None,
         )
         .await;
 
@@ -4285,6 +4296,7 @@ async fn outlet_call_spending_ucan_expired() {
             Some(&expired_ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
+            None,
         )
         .await;
 
@@ -4336,6 +4348,7 @@ async fn outlet_call_spending_ucan_revoked() {
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
+            None,
         )
         .await;
 
@@ -4387,6 +4400,7 @@ async fn outlet_call_happy_path_with_valid_spending_ucan() {
             Some(&ucan),
             None,
             |_input| async { Ok(serde_json::json!({})) },
+            None,
         )
         .await;
 
@@ -4871,6 +4885,7 @@ async fn manager_dispatch_routes_action_outlet_through_exec_action() {
             None,
             &executor,
             None,
+            None,
         )
         .await
         .expect("dispatch should succeed");
@@ -4972,6 +4987,7 @@ async fn manager_dispatch_query_outlet_misdeclared_emits_signal() {
             None,
             &executor,
             Some(&sink),
+            None,
         )
         .await;
 
