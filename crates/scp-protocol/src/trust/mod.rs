@@ -329,6 +329,69 @@ pub struct AttestationReference {
 }
 
 // ---------------------------------------------------------------------------
+// CaveatKind — counter store dispatch (§7.3.8)
+// ---------------------------------------------------------------------------
+
+/// Counter-bearing caveat kinds tracked by the runtime `CaveatCounterStore`.
+///
+/// Per §7.3.8, three of the [`caveats::InvocationCaveats`] fields require
+/// cumulative state across invocations of the same UCAN delegation: an
+/// absolute call cap, a cumulative-amount ceiling, and a sliding-window
+/// rate cap. The runtime's `CaveatCounterStore` (sibling of `NonceTracker`,
+/// §9.5) stores per-`(ucan_cid, kind)` `u64` counters and a sliding-window
+/// timestamp ring buffer so racing invocations cannot double-spend a cap.
+///
+/// This enum lives in `scp-protocol` (not `scp-runtime`) so FFI-bridge code,
+/// caveat-narrowing helpers, and counter-store implementations all reference
+/// the same fixed-cardinality variant set. Adding a new variant here is a
+/// breaking protocol change; the variant set tracks the §7.3.8 caveat fields
+/// that bear cumulative state.
+///
+/// See `.docs/specs/07-trust-validation-and-capabilities.md` §7.3.8 and
+/// SCP-OUT-020.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CaveatKind {
+    /// Absolute invocation cap from `InvocationCaveats::max_calls`.
+    ///
+    /// Each successful invocation increments the counter by 1; once the
+    /// counter reaches the cap, subsequent invocations fail.
+    MaxCalls,
+    /// Cumulative-amount ceiling from `InvocationCaveats::amount_max_cumulative`.
+    ///
+    /// Each invocation adds the per-invocation cost to the counter; once the
+    /// counter exceeds the cap, subsequent invocations fail.
+    AmountCumulative,
+    /// Sliding-window rate cap from `InvocationCaveats::rate_window`.
+    ///
+    /// The store tracks invocation timestamps in a ring buffer keyed by
+    /// `window_secs`; an invocation is admitted iff the count of timestamps
+    /// within `[now - window_secs, now]` is strictly less than `RateWindow::max`.
+    RateWindow,
+}
+
+impl CaveatKind {
+    /// Returns a stable string slug for the variant.
+    ///
+    /// Used for structured error fields and storage diagnostics. The slugs
+    /// match the §7.3.8 caveat field names verbatim so error messages line
+    /// up with the spec vocabulary.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxCalls => "maxCalls",
+            Self::AmountCumulative => "amountMaxCumulative",
+            Self::RateWindow => "rateWindow",
+        }
+    }
+}
+
+impl std::fmt::Display for CaveatKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TrustInput
 // ---------------------------------------------------------------------------
 
