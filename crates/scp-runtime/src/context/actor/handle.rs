@@ -143,6 +143,53 @@ impl ContextActorHandle {
         }
     }
 
+    /// Submits a pre-built command to the actor's mailbox with a
+    /// caller-supplied send-side timeout. **Does NOT wait for the
+    /// reply.** Reply consumption is the caller's responsibility — the
+    /// caller embedded a `oneshot::Sender` inside `cmd` and holds the
+    /// matching `Receiver`.
+    ///
+    /// This is the spec-shape entry point per ADR-049 §"Mailbox
+    /// parameters" / master plan §"Mailbox parameters". Used by the
+    /// `Supervisor::dispatch_*_command` mailbox-routing path that
+    /// constructs each command's reply-bearing oneshot, sends through
+    /// the mailbox, then awaits the receiver itself.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] — mailbox full for the full
+    ///   `timeout` window; the command was never delivered. The text
+    ///   describes which condition (full vs. closed) the caller hit so
+    ///   higher-level logging / metrics can disambiguate.
+    /// - [`ContextError::ActorBusy`] (text contains "closed") — the
+    ///   inbox receiver was already dropped (actor has terminated).
+    ///   Callers typically respond by fetching a fresh handle.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping the future mid-flight aborts the in-flight mailbox
+    /// send. If the send had not yet reached the actor, the command is
+    /// discarded. Once enqueued, the actor processes the command to
+    /// completion regardless of caller cancellation — the embedded
+    /// reply oneshot's receiver-drop is the only cancellation vector
+    /// for the actor-side outcome (plan §"Cancel-safety check").
+    pub async fn send_with_timeout(
+        &self,
+        cmd: ContextCommand,
+        timeout: std::time::Duration,
+    ) -> Result<(), ContextError> {
+        match tokio::time::timeout(timeout, self.inbox.send(cmd)).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_closed)) => Err(ContextError::ActorBusy(
+                "actor inbox is closed — actor has terminated".to_owned(),
+            )),
+            Err(_elapsed) => Err(ContextError::ActorBusy(format!(
+                "mailbox full for {} seconds",
+                timeout.as_secs()
+            ))),
+        }
+    }
+
     /// Submits `LifecycleControlCommand::Pause` to the actor and awaits
     /// the ack. See [`Self::send`] for error semantics.
     ///

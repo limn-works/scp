@@ -1046,11 +1046,27 @@ impl Supervisor {
         ctx_id: &str,
         cmd: MessagingCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // Resolve the per-context Arc via the supervisor's lifted
-        // `manager_methods::get_context_arc_pub`. `ContextNotRegistered`
-        // surfaces directly to the caller — messaging commands have no
-        // soft-default: a missing context can't encrypt or decrypt a
-        // message.
+        // ADR-049 Phase 2A item 5: route through the per-context
+        // ContextActor's mailbox if one is registered. The actor's
+        // run() loop inside its tokio task observes the inbound
+        // command, dispatches it (still via dispatch_from_shim during
+        // the helper-migration window), and replies on the embedded
+        // oneshot. Keeps the actor model in the dispatch path so a
+        // future session can flip handler bodies onto `&mut state`
+        // without touching this method again.
+        //
+        // The mailbox path serializes commands per-context and applies
+        // the 30-second mailbox-send timeout from
+        // `ContextActorHandle::send_with_timeout`.
+        if let Some(actor) = self.lookup(ctx_id) {
+            return Self::dispatch_messaging_via_mailbox(&actor, cmd).await;
+        }
+
+        // Legacy fallback: no actor registered for this context. The
+        // direct take-and-merge path below holds the per-context
+        // Mutex<PerContextState> and calls dispatch_from_shim
+        // synchronously. Removed when the lifecycle path migrates to
+        // spawn an actor on every create/join/import.
         let arc = crate::context::manager_methods::get_context_arc_pub(self, ctx_id)?;
 
         // Phase A: take the tracker out under a brief lock. See the
@@ -2659,6 +2675,150 @@ impl Supervisor {
             unsupported_features,
         )
         .await;
+    }
+
+    // -----------------------------------------------------------------
+    // ADR-049 Phase 2A — mailbox-routing helpers (item 5)
+    // -----------------------------------------------------------------
+
+    /// Send a `MessagingCommand` to the actor's mailbox using the
+    /// [`ContextActorHandle::send_with_timeout`] entry point and await
+    /// the actor's reply. Used by [`Self::dispatch_command`] when an
+    /// actor is registered for the target context.
+    ///
+    /// The reply oneshot is constructed inside this helper and
+    /// embedded into the command before sending. This decouples the
+    /// caller from the per-variant reply-shape — one helper per
+    /// command sub-enum suffices.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ActorBusy`] from the mailbox send (full,
+    ///   closed, or timeout).
+    /// - The handler's typed error returned through the reply oneshot.
+    ///
+    /// `Outcome { mutated: false }` is returned for any error path —
+    /// the actor's `dispatch_state` synthesizes a non-mutated outcome
+    /// when the handler short-circuits before touching state.
+    async fn dispatch_messaging_via_mailbox(
+        actor: &ContextActorHandle,
+        cmd: MessagingCommand,
+    ) -> Result<Outcome<()>, ContextError> {
+        // Variants whose typed reply is `Result<(), ContextError>`
+        // share the same plumbing — extract the reply, build a
+        // dispatch-internal oneshot, splice into the command, send,
+        // forward.
+        match cmd {
+            MessagingCommand::SendMessage { payload, reply: caller_reply } => {
+                let (tx, rx) = tokio::sync::oneshot::channel::<Result<(), ContextError>>();
+                let cmd = MessagingCommand::SendMessage { payload, reply: tx };
+                actor
+                    .send_with_timeout(
+                        ContextCommand::Messaging(cmd),
+                        crate::context::actor::SEND_TIMEOUT,
+                    )
+                    .await?;
+                let result = rx.await.unwrap_or_else(|_| {
+                    Err(ContextError::ActorBusy(
+                        "actor dropped reply channel before replying".to_owned(),
+                    ))
+                });
+                let outcome = if result.is_ok() {
+                    Outcome::ok_mutated(())
+                } else {
+                    // ContextError is !Clone — synthesize a category-
+                    // preserving copy for the Outcome sink. The
+                    // authoritative typed error rides on caller_reply.
+                    Outcome::err_mutated(ContextError::ActorBusy(
+                        "send_message via mailbox returned typed error".to_owned(),
+                    ))
+                };
+                let _ = caller_reply.send(result);
+                Ok(outcome)
+            }
+            MessagingCommand::DeliverIncoming { context_id, envelope_bytes, reply: caller_reply } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = MessagingCommand::DeliverIncoming { context_id, envelope_bytes, reply: tx };
+                actor
+                    .send_with_timeout(
+                        ContextCommand::Messaging(cmd),
+                        crate::context::actor::SEND_TIMEOUT,
+                    )
+                    .await?;
+                let result = rx.await.unwrap_or_else(|_| {
+                    Err(ContextError::ActorBusy(
+                        "actor dropped reply channel before replying".to_owned(),
+                    ))
+                });
+                let outcome = match &result {
+                    Ok(_) => Outcome::ok_mutated(()),
+                    Err(ContextError::ActorBusy(msg)) => {
+                        Outcome::err_mutated(ContextError::ActorBusy(msg.clone()))
+                    }
+                    Err(_) => Outcome::err_mutated(ContextError::ActorBusy(
+                        "deliver_incoming failed via mailbox".to_owned(),
+                    )),
+                };
+                let _ = caller_reply.send(result);
+                Ok(outcome)
+            }
+            MessagingCommand::DrainEvents { context_id, reply: caller_reply } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = MessagingCommand::DrainEvents { context_id, reply: tx };
+                actor
+                    .send_with_timeout(
+                        ContextCommand::Messaging(cmd),
+                        crate::context::actor::SEND_TIMEOUT,
+                    )
+                    .await?;
+                let result = rx.await.unwrap_or_else(|_| {
+                    Err(ContextError::ActorBusy(
+                        "actor dropped reply channel before replying".to_owned(),
+                    ))
+                });
+                let outcome = if result.is_ok() {
+                    Outcome::ok_mutated(())
+                } else {
+                    Outcome::err_mutated(ContextError::ActorBusy(
+                        "drain_events failed via mailbox".to_owned(),
+                    ))
+                };
+                let _ = caller_reply.send(result);
+                Ok(outcome)
+            }
+            MessagingCommand::SendPseudonymAnnouncement { payload, reply: caller_reply } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let cmd = MessagingCommand::SendPseudonymAnnouncement { payload, reply: tx };
+                actor
+                    .send_with_timeout(
+                        ContextCommand::Messaging(cmd),
+                        crate::context::actor::SEND_TIMEOUT,
+                    )
+                    .await?;
+                let result = rx.await.unwrap_or_else(|_| {
+                    Err(ContextError::ActorBusy(
+                        "actor dropped reply channel before replying".to_owned(),
+                    ))
+                });
+                let outcome = if result.is_ok() {
+                    Outcome::ok_mutated(())
+                } else {
+                    Outcome::err_mutated(ContextError::ActorBusy(
+                        "send_pseudonym_announcement failed via mailbox".to_owned(),
+                    ))
+                };
+                let _ = caller_reply.send(result);
+                Ok(outcome)
+            }
+            MessagingCommand::Placeholder { reply } => {
+                let _ = reply.send(Err(ContextError::NotImplemented(
+                    "MessagingCommand::Placeholder via mailbox".to_owned(),
+                )));
+                Ok(Outcome::err(ContextError::NotImplemented(
+                    "MessagingCommand::Placeholder via mailbox".to_owned(),
+                )))
+            }
+        }
     }
 }
 
