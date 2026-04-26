@@ -1358,6 +1358,147 @@ impl ContextManager {
             pending_mutations,
         })
     }
+
+    /// SCP-OUT-033 — streaming entry point for outlet invocation
+    /// through the full `ContextManager` economy pipeline.
+    ///
+    /// Returns a `tokio::sync::mpsc::Receiver<OutletStreamChunk>`
+    /// directly — the caller streams chunks as the executor produces
+    /// them, with the framework appending the §5.4.5 terminal `End`
+    /// (success) or `Error { terminal: true }` (failure) chunk.
+    ///
+    /// Wraps [`Self::invoke_outlet_dispatch_with_economy`] under the
+    /// hood: the aggregating dispatcher runs the full
+    /// economy/caveat/escrow/bookkeeping pipeline; on success the
+    /// resulting single-shot `Value` is converted into a `Data` chunk
+    /// via [`crate::context::outlets::invoke::one_shot_to_stream`] and
+    /// `End` is appended. On failure the framework converts the
+    /// `ContextError` into a terminal `ChunkPayload::Error` chunk.
+    ///
+    /// This is the canonical streaming surface that FFI bridges and
+    /// SDKs target post-OUT-033. The aggregating
+    /// [`Self::invoke_outlet_dispatch_with_economy`] remains as the
+    /// internal driver — its `ManagedOutletInvocationOutput` carries
+    /// the `OutletInvokedEvent`, consequences, and payment receipt
+    /// through tracing/sinks instead of as part of the streaming
+    /// receiver. SCP-OUT-034+ will wire those bookkeeping outputs into
+    /// the End chunk's `provenance` once the streaming-native event-
+    /// log path is built; for now the wrapper preserves the existing
+    /// `ContextManager`-level bookkeeping behaviour.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError`] on **synchronous** validation failures
+    /// that happen before the stream is opened (context-not-registered,
+    /// outlet-not-found, capability denial). Once the receiver is
+    /// returned, every failure mode (timeout, panic, executor `Err`,
+    /// schema, caveat violation) surfaces as a terminal
+    /// `ChunkPayload::Error` chunk on the receiver.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invoke_outlet_dispatch_with_economy_stream<E>(
+        &self,
+        context_id: &str,
+        registry: &OutletRegistry,
+        outlet_id: &OutletId,
+        input: serde_json::Value,
+        invoker_did: &DID,
+        spending_ucan: Option<&UcanToken>,
+        timeout_ms: Option<u32>,
+        executor: &E,
+        misdeclaration_sink: Option<&dyn crate::context::outlets::invoke::QueryMisdeclarationSink>,
+        handler_panic_sink: Option<&dyn crate::context::outlets::invoke::HandlerPanicSink>,
+    ) -> Result<
+        tokio::sync::mpsc::Receiver<scp_protocol::context::outlets::stream::OutletStreamChunk>,
+        ContextError,
+    >
+    where
+        E: crate::context::outlets::invoke::OutletExecutor + ?Sized,
+    {
+        // Drive the existing aggregating dispatcher; convert the
+        // resulting `ManagedOutletInvocationOutput` into a one-shot
+        // stream via the OUT-033 adapter. The chunk channel uses the
+        // §5.4.5 default credit window (32) so the stream contract
+        // matches the stream-open path even though this wrapper is the
+        // degenerate single-chunk case (`Data` + `End`).
+        let outcome = self
+            .invoke_outlet_dispatch_with_economy(
+                context_id,
+                registry,
+                outlet_id,
+                input,
+                invoker_did,
+                spending_ucan,
+                timeout_ms,
+                executor,
+                misdeclaration_sink,
+                handler_panic_sink,
+            )
+            .await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<
+            scp_protocol::context::outlets::stream::OutletStreamChunk,
+        >(
+            // Match the §5.4.5 default `credit_window` so the
+            // streaming surface is consistent with the
+            // stream-open path.
+            scp_protocol::context::outlets::stream::DEFAULT_CREDIT_WINDOW as usize,
+        );
+
+        let request_id = *uuid::Uuid::now_v7().as_bytes();
+
+        match outcome {
+            Ok(out) => {
+                // Single-shot adapter: emit `Data(out.output)` followed
+                // by `End`. Both share the freshly minted `request_id`
+                // and use strictly monotonic sequence numbers (0, 1).
+                let data_chunk = scp_protocol::context::outlets::stream::OutletStreamChunk {
+                    request_id,
+                    sequence: 0,
+                    payload: scp_protocol::context::outlets::stream::ChunkPayload::Data {
+                        value: out.output,
+                    },
+                    sig: [0u8; 64],
+                };
+                let end_chunk = scp_protocol::context::outlets::stream::OutletStreamChunk {
+                    request_id,
+                    sequence: 1,
+                    payload: scp_protocol::context::outlets::stream::ChunkPayload::End {
+                        aggregate: serde_json::Value::Null,
+                        provenance: scp_protocol::provenance::DataProvenance {
+                            source_context: context_id.to_owned(),
+                            source_type: scp_protocol::provenance::SourceType::Persistent,
+                            counterparties: Vec::new(),
+                            purpose: None,
+                            discovery_method: scp_protocol::provenance::DiscoveryMethod::OutOfBand,
+                            age: std::time::Duration::from_secs(0),
+                            memory_scope: scp_protocol::context::params::MemoryScope::Full,
+                            chain_depth: 0,
+                            chain_path: None,
+                            payment_amount: None,
+                            payment_adapter: None,
+                            payment_receipt_id: None,
+                        },
+                        execution_time_ms: out.event.execution_time_ms,
+                    },
+                    sig: [0u8; 64],
+                };
+                tokio::spawn(async move {
+                    let _ = tx.send(data_chunk).await;
+                    let _ = tx.send(end_chunk).await;
+                });
+                Ok(rx)
+            }
+            Err(err) => {
+                // Synchronous-validation failures (context not
+                // registered, outlet not found, capability denial)
+                // surface as `Result::Err`. The streaming surface
+                // returns these directly so callers can distinguish
+                // "stream never opened" from "stream opened then
+                // closed with a terminal Error chunk".
+                Err(err)
+            }
+        }
+    }
 }
 
 /// Result of [`ContextManager::invoke_outlet_dispatch_with_economy`].

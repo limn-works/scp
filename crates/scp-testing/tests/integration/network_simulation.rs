@@ -1069,7 +1069,7 @@ async fn application_layer_demo() {
     use scp_core::context::membership::{ContextEvent, KeyPackage};
     use scp_core::context::roles::{CapabilityCeiling, ContextRoleState};
     use scp_core::context::tools::registry::{OutletRegistration, OutletRegistry, OutletSchema};
-    use scp_core::context::tools::{invoke_outlet, register_outlet};
+    use scp_core::context::tools::{invoke_outlet_aggregating, register_outlet};
     use scp_core::context::{Capability, ContextParams, ContextState, GovernanceAction};
     use scp_identity::DID;
 
@@ -1399,7 +1399,7 @@ async fn application_layer_demo() {
     println!("    input: {search_input}");
 
     // The executor is a real async function that simulates the tool.
-    let (output, invoke_event, _consequences, _receipt) = invoke_outlet(
+    let (output, invoke_event, _consequences, _receipt) = invoke_outlet_aggregating(
         &handle,
         &outlet_registry,
         &role_state,
@@ -1442,7 +1442,7 @@ async fn application_layer_demo() {
     println!("  Invoking 'calculator' as Charlie:");
     println!("    input: {calc_input}");
 
-    let (calc_output, _, _consequences, _receipt) = invoke_outlet(
+    let (calc_output, _, _consequences, _receipt) = invoke_outlet_aggregating(
         &handle,
         &outlet_registry,
         &role_state,

@@ -6437,7 +6437,9 @@ async fn sender_key_before_mls_removal_ordering() {
 /// Budget exceeded on tool invoke returns `BudgetExceeded` (#1537).
 #[tokio::test]
 async fn budget_exceeded_on_outlet_call() {
-    use crate::context::outlets::invoke::{InvocationError, OutletEconomyContext, invoke_outlet};
+    use crate::context::outlets::invoke::{
+        InvocationError, OutletEconomyContext, invoke_outlet_aggregating,
+    };
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     let policy = EconomicPolicy {
@@ -6473,7 +6475,7 @@ async fn budget_exceeded_on_outlet_call() {
         velocity_tracker: None,
         message_pricing: None,
     };
-    let result = invoke_outlet(
+    let result = invoke_outlet_aggregating(
         &handle,
         &registry,
         &role_state,
@@ -7924,7 +7926,7 @@ async fn send_message_deducts_budget() {
 /// Tests budget deduction through `invoke_outlet` with `OutletEconomyContext`.
 #[tokio::test]
 async fn outlet_call_deducts_budget() {
-    use crate::context::outlets::invoke::{OutletEconomyContext, invoke_outlet};
+    use crate::context::outlets::invoke::{OutletEconomyContext, invoke_outlet_aggregating};
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     let policy = EconomicPolicy {
@@ -7964,7 +7966,7 @@ async fn outlet_call_deducts_budget() {
             velocity_tracker: None,
             message_pricing: None,
         };
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &handle,
             &registry,
             &role_state,
@@ -8000,7 +8002,7 @@ async fn outlet_call_deducts_budget() {
             velocity_tracker: None,
             message_pricing: None,
         };
-        let result2 = invoke_outlet(
+        let result2 = invoke_outlet_aggregating(
             &handle,
             &registry,
             &role_state,
@@ -8645,7 +8647,9 @@ async fn test_send_rejected_insufficient_budget() {
 /// Outlet invoke rejected when budget insufficient (#1537).
 #[tokio::test]
 async fn test_outlet_call_rejected_insufficient_budget() {
-    use crate::context::outlets::invoke::{InvocationError, OutletEconomyContext, invoke_outlet};
+    use crate::context::outlets::invoke::{
+        InvocationError, OutletEconomyContext, invoke_outlet_aggregating,
+    };
     use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
 
     let policy = EconomicPolicy {
@@ -8681,7 +8685,7 @@ async fn test_outlet_call_rejected_insufficient_budget() {
         velocity_tracker: None,
         message_pricing: None,
     };
-    let result = invoke_outlet(
+    let result = invoke_outlet_aggregating(
         &handle,
         &registry,
         &role_state,

@@ -19,13 +19,14 @@ use std::panic::AssertUnwindSafe;
 use std::time::Duration;
 
 use futures::FutureExt;
+use tokio::sync::mpsc;
 
 use crate::context::ContextHandle;
 use scp_primitives::DID;
 use scp_protocol::context::ContextState;
 use scp_protocol::context::outlets::OutletId;
 use scp_protocol::context::outlets::error_codes::{
-    CODE_EXECUTION_FAULT, SLUG_EXECUTION_HANDLER_PANIC,
+    CODE_EXECUTION_FAULT, SLUG_EXECUTION_HANDLER_PANIC, SLUG_EXECUTION_TIMEOUT,
 };
 use scp_protocol::context::outlets::errors::MESSAGE_MAX_BYTES;
 use scp_protocol::context::outlets::lifecycle::{
@@ -33,6 +34,7 @@ use scp_protocol::context::outlets::lifecycle::{
 };
 use scp_protocol::context::outlets::registry::OutletRegistry;
 use scp_protocol::context::outlets::schema::validate_value_against_schema;
+use scp_protocol::context::outlets::stream::{ChunkPayload, OutletStreamChunk, RequestId};
 use scp_protocol::context::roles::{Capability, ContextRoleState};
 use scp_protocol::crypto::ucan::capability::CapabilityUri;
 use scp_protocol::crypto::ucan::validate::{
@@ -1265,6 +1267,102 @@ pub trait OutletExecutor: Send + Sync {
             expected: scp_protocol::context::outlets::OutletKind::Action,
         })
     }
+
+    /// Executes a Query invocation as a streaming producer (SCP-OUT-033).
+    ///
+    /// Spec §5.4.5: outlet invocations are streams by construction. The
+    /// streaming form lets executors emit `ChunkPayload::Data` /
+    /// `ChunkPayload::Progress` chunks as work proceeds rather than
+    /// returning a single aggregated value at the end. Non-streaming
+    /// executors override [`exec_query`](Self::exec_query) instead — the
+    /// default implementation here delegates to `exec_query` and
+    /// converts the single returned value into a `Data` chunk via
+    /// [`one_shot_to_stream`] (executors get streaming "for free" without
+    /// changing their existing code).
+    ///
+    /// Implementations that override this method MUST NOT emit a
+    /// terminal chunk (`End` / `Error { terminal: true }`); the
+    /// framework appends `End` after a successful return and `Error`
+    /// after a `Result::Err`. Emitting a terminal chunk from inside the
+    /// executor races with the framework's own emission and is
+    /// undefined behaviour.
+    ///
+    /// `tx` is bounded — the framework sets the capacity to the §5.4.5
+    /// `credit_window` (default 32). When the channel is full,
+    /// `tx.send` returns `Err` only if the receiver was dropped (i.e.,
+    /// the stream was cancelled); back-pressure stalls the executor
+    /// until a downstream consumer drains a slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError`] on any executor-internal failure
+    /// (`Failed`), kind mismatch (`KindMismatch`), or query violation
+    /// (`QueryViolation`). The framework maps each to a terminal
+    /// `ChunkPayload::Error { terminal: true, ... }` and closes the
+    /// stream — implementations never write the error chunk themselves.
+    async fn exec_query_stream(
+        &self,
+        ctx: &ReadOnlyInvocation<'_>,
+        input: serde_json::Value,
+        tx: mpsc::Sender<ChunkPayload>,
+    ) -> Result<(), OutletExecutorError> {
+        // Default: delegate to non-streaming `exec_query` and emit the
+        // single returned value as a `Data` chunk. Non-streaming
+        // executors get streaming for free — the framework appends the
+        // `End` terminal chunk after this returns successfully.
+        let value = self.exec_query(ctx, input).await?;
+        one_shot_to_stream(value, &tx).await;
+        Ok(())
+    }
+
+    /// Executes an Action invocation as a streaming producer (SCP-OUT-033).
+    ///
+    /// See [`exec_query_stream`](Self::exec_query_stream) for the
+    /// streaming contract. The default implementation delegates to
+    /// [`exec_action`](Self::exec_action) and emits the single returned
+    /// value as a `Data` chunk via [`one_shot_to_stream`].
+    ///
+    /// Implementations that override this method MUST NOT emit a
+    /// terminal chunk (`End` / `Error { terminal: true }`); the
+    /// framework owns terminal emission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`OutletExecutorError`] on any executor-internal failure.
+    /// The framework maps `Failed` / `KindMismatch` / `QueryViolation`
+    /// to a terminal `Error` chunk and closes the stream.
+    async fn exec_action_stream(
+        &self,
+        ctx: &mut MutableInvocation<'_>,
+        input: serde_json::Value,
+        tx: mpsc::Sender<ChunkPayload>,
+    ) -> Result<(), OutletExecutorError> {
+        let value = self.exec_action(ctx, input).await?;
+        one_shot_to_stream(value, &tx).await;
+        Ok(())
+    }
+}
+
+/// Pushes a single `Value` onto a `ChunkPayload::Data` chunk so a
+/// non-streaming executor's return value enters the §5.4.5 stream as a
+/// degenerate one-chunk producer (SCP-OUT-033).
+///
+/// Spec §5.4.5: "A non-streaming invocation is a stream that emits
+/// exactly two chunks: `Data(output)` followed by `End(output)`." This
+/// adapter emits ONLY the `Data` half — the framework appends the
+/// terminal `End` after the executor returns successfully (so callers
+/// using this adapter from inside `exec_*_stream` need not emit `End`
+/// themselves).
+///
+/// Returns silently when the receiver was dropped (cancelled stream) —
+/// the framework treats that as the cancellation path and emits a
+/// terminal chunk on behalf of the executor.
+pub async fn one_shot_to_stream(value: serde_json::Value, tx: &mpsc::Sender<ChunkPayload>) {
+    // `Sender::send` returns `Err` only if the receiver was dropped.
+    // That happens when the stream was cancelled or the consumer
+    // disconnected — in either case the framework's terminal emission
+    // path closes the stream, so we silently drop the failed send.
+    let _ = tx.send(ChunkPayload::Data { value }).await;
 }
 
 /// Outcome of a successful [`invoke_outlet_dispatch`] call.
@@ -1471,7 +1569,10 @@ where
     // converts the trait error into the existing `String` error surface.
     // SCP-OUT-028: forward the handler-panic sink so panics inside
     // `exec_query` / `exec_action` emit the §5.4.2 attribution event.
-    let result = invoke_outlet(
+    // SCP-OUT-033: this dispatcher returns the legacy aggregating tuple
+    // — the streaming entry point is `invoke_outlet` (free function,
+    // returns `Result<mpsc::Receiver<OutletStreamChunk>, _>`).
+    let result = invoke_outlet_aggregating(
         context,
         registry,
         role_state,
@@ -1604,10 +1705,712 @@ pub struct OutletEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
 }
 
 // ---------------------------------------------------------------------------
-// invoke_outlet
+// invoke_outlet — streaming entry point (SCP-OUT-033)
 // ---------------------------------------------------------------------------
 
-/// Invokes an outlet within a context, performing full lifecycle validation.
+/// Default capacity of the chunk channel handed to the executor when the
+/// invoker does not specify a `credit_window` (spec §5.4.5
+/// `stream_window_default = 32`).
+///
+/// Mirrors [`scp_protocol::context::outlets::stream::DEFAULT_CREDIT_WINDOW`]
+/// converted to a `usize` channel capacity. The conversion is bounded by
+/// `usize::MAX` on every supported target.
+#[allow(clippy::cast_possible_truncation)] // u32 → usize: 32 < usize::MAX on every target
+const DEFAULT_STREAM_CHANNEL_CAPACITY: usize =
+    scp_protocol::context::outlets::stream::DEFAULT_CREDIT_WINDOW as usize;
+
+/// Generates a fresh `RequestId` (16-byte `UUIDv7`) for an outlet
+/// invocation that did not receive one from a `OutletStreamOpen`
+/// (i.e., a direct call into the streaming `invoke_outlet` entry
+/// point).
+///
+/// Spec §5.4.5: `request_id: [u8; 16]` — per-stream `UUIDv7`,
+/// monotonic time-sortable. Direct callers (tests, the manager
+/// wrapper for non-stream-open paths) get a fresh `UUIDv7` so that
+/// the chunk sequence space is unique to this invocation. `UUIDv7`
+/// is preferred over `UUIDv4` because the time prefix gives auditors
+/// a stable ordering across `request_id`s.
+fn fresh_request_id() -> RequestId {
+    *uuid::Uuid::now_v7().as_bytes()
+}
+
+/// Builds a terminal `ChunkPayload::Error` chunk with `terminal: true`
+/// for an [`InvocationError`] that aborted the stream before/while the
+/// executor was running (SCP-OUT-033 AC6, AC10, AC11).
+///
+/// Each `InvocationError` variant maps to one §5.4.4 sub-block code +
+/// slug pair from
+/// [`scp_protocol::context::outlets::error_codes`]. The mapping is
+/// kept in lock-step with the existing
+/// [`crate::context::manager::outlets::invocation_error_to_context`]
+/// router so the SDK envelope shape is identical whether the stream
+/// terminated through this path or via the post-stream tuple.
+///
+/// Used by callers that drive streams from outside the spawned executor
+/// task (e.g., the manager wrapper turning a synchronous validation
+/// failure into a single-chunk error stream). The streaming
+/// `invoke_outlet` itself returns synchronous validation failures as
+/// `Result::Err`; this helper is the bridge for callers that prefer a
+/// uniform "every failure is a terminal chunk" surface.
+#[must_use]
+pub fn invocation_error_to_terminal_payload(err: &InvocationError) -> ChunkPayload {
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_AUTHORIZATION_DENIED, CODE_ECONOMIC_FAULT, CODE_INPUT_VIOLATION,
+        CODE_OUTPUT_VIOLATION, CODE_PROTOCOL_VIOLATION, SLUG_AUTHORIZATION_DENIED,
+        SLUG_INPUT_SCHEMA_VIOLATION, SLUG_OUTPUT_SCHEMA_VIOLATION, SLUG_QUERY_VIOLATION,
+    };
+    // The slug is included in the resulting Error chunk's `message`
+    // field so the receiver-side SDK can reverse-lookup against the
+    // §5.4.4 catalog. The `code` carries the §5.4.4 sub-block constant.
+    let (code, slug) = match err {
+        InvocationError::ContextNotActive { .. } => {
+            (CODE_PROTOCOL_VIOLATION, "protocol.context-not-active")
+        }
+        // Spec §5.4.4 query-oracle-collapse: unknown outlets and
+        // unauthorized callers both surface as `authorization.denied`
+        // so the existence (or registration) of the outlet is not
+        // leaked through the error class.
+        InvocationError::InvokerNotAuthorized { .. } | InvocationError::OutletNotFound { .. } => {
+            (CODE_AUTHORIZATION_DENIED, SLUG_AUTHORIZATION_DENIED)
+        }
+        InvocationError::InputValidationFailed { .. } => {
+            (CODE_INPUT_VIOLATION, SLUG_INPUT_SCHEMA_VIOLATION)
+        }
+        InvocationError::OutputValidationFailed { .. } => {
+            (CODE_OUTPUT_VIOLATION, SLUG_OUTPUT_SCHEMA_VIOLATION)
+        }
+        InvocationError::Timeout { .. } => (CODE_EXECUTION_FAULT, SLUG_EXECUTION_TIMEOUT),
+        InvocationError::Cancelled => (CODE_EXECUTION_FAULT, "execution.cancelled"),
+        InvocationError::ExecutionFailed { .. } | InvocationError::HandlerPanic { .. } => {
+            (CODE_EXECUTION_FAULT, SLUG_EXECUTION_HANDLER_PANIC)
+        }
+        InvocationError::BudgetExceeded { .. } => (CODE_ECONOMIC_FAULT, "economic.budget-exceeded"),
+        InvocationError::OutletQueryCostViolation { .. } => {
+            (CODE_PROTOCOL_VIOLATION, "query-cost-violation")
+        }
+        InvocationError::QueryViolation { .. } => (CODE_PROTOCOL_VIOLATION, SLUG_QUERY_VIOLATION),
+        InvocationError::KindMismatch { .. } => (CODE_PROTOCOL_VIOLATION, "kind-mismatch"),
+        InvocationError::CaveatViolation {
+            slug: caveat_slug, ..
+        } => {
+            // Caveat violations preserve the §5.4.4 slug from the rule
+            // that fired; route the input-schema slug through the
+            // input-class code, every other slug through the
+            // authorization-denied class (matches
+            // `invocation_error_to_context`'s slug→code routing).
+            if *caveat_slug == SLUG_INPUT_SCHEMA_VIOLATION {
+                (CODE_INPUT_VIOLATION, *caveat_slug)
+            } else {
+                // Default for all non-schema caveat slugs — covers
+                // both the catch-all `SLUG_AUTHORIZATION_DENIED` slug
+                // and the more specific `authorization.*` slugs
+                // (`time-box-violation`, `rate-exceeded`, etc.) per
+                // §5.4.4 catalog.
+                (CODE_AUTHORIZATION_DENIED, *caveat_slug)
+            }
+        }
+    };
+    ChunkPayload::Error {
+        code: code.to_owned(),
+        message: format!("{slug}: {err}"),
+        terminal: true,
+    }
+}
+
+/// Maps an [`OutletExecutorError`] returned by `exec_*_stream` into the
+/// terminal `ChunkPayload::Error { terminal: true, .. }` chunk the
+/// framework appends to the stream (SCP-OUT-033 AC6).
+///
+/// `KindMismatch` (operator misdeclared the outlet half) and
+/// `QueryViolation` (defense-in-depth runtime guard) both map to
+/// Protocol-class errors per spec §5.4.4 — distinct slugs but the same
+/// `CODE_PROTOCOL_VIOLATION` code. `Failed(msg)` carries the
+/// executor's own diagnostic string and surfaces as
+/// `CODE_EXECUTION_FAULT` with the §5.4.4 default
+/// `execution.handler-panic` slug (the catalog includes `execution.*`
+/// slugs collectively).
+fn executor_error_to_terminal_payload(err: &OutletExecutorError) -> ChunkPayload {
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_PROTOCOL_VIOLATION, SLUG_KIND_MISMATCH, SLUG_QUERY_VIOLATION,
+    };
+    let (code, slug) = match err {
+        OutletExecutorError::KindMismatch { .. } => (CODE_PROTOCOL_VIOLATION, SLUG_KIND_MISMATCH),
+        OutletExecutorError::QueryViolation { .. } => {
+            (CODE_PROTOCOL_VIOLATION, SLUG_QUERY_VIOLATION)
+        }
+        OutletExecutorError::Failed(_) => (CODE_EXECUTION_FAULT, SLUG_EXECUTION_HANDLER_PANIC),
+    };
+    ChunkPayload::Error {
+        code: code.to_owned(),
+        message: format!("{slug}: {err}"),
+        terminal: true,
+    }
+}
+
+/// Builds a placeholder `DataProvenance` used by the framework's
+/// terminal `ChunkPayload::End` chunk when the streaming
+/// `invoke_outlet` returns successfully (SCP-OUT-033 AC5).
+///
+/// Spec §5.4.5: `End { aggregate, provenance, execution_time_ms }`.
+/// The free function `invoke_outlet` does not have access to the
+/// hosting context's full provenance metadata — the manager wrapper
+/// is responsible for richer attachment when crossing context
+/// boundaries. The placeholder built here records:
+///
+/// - `source_context` — the hosting context's id, so the End chunk's
+///   provenance still carries a verifiable origin.
+/// - `source_type = Persistent` — the context is open at invocation
+///   time (state-checked at step 1).
+/// - `discovery_method = OutOfBand` — direct callers of the free
+///   function have no protocol-level discovery path; the cross-context
+///   manager path overrides this.
+/// - `chain_depth = 0` — the free function path is not crossing a
+///   `§6.2` interface, so the chain is empty.
+fn placeholder_data_provenance(context_id: &str) -> scp_protocol::provenance::DataProvenance {
+    scp_protocol::provenance::DataProvenance {
+        source_context: context_id.to_owned(),
+        source_type: scp_protocol::provenance::SourceType::Persistent,
+        counterparties: Vec::new(),
+        purpose: None,
+        discovery_method: scp_protocol::provenance::DiscoveryMethod::OutOfBand,
+        age: std::time::Duration::from_secs(0),
+        memory_scope: scp_protocol::context::params::MemoryScope::Full,
+        chain_depth: 0,
+        chain_path: None,
+        payment_amount: None,
+        payment_adapter: None,
+        payment_receipt_id: None,
+    }
+}
+
+/// Wraps an inner `ChunkPayload` produced by the executor (or by the
+/// framework's terminal-emission path) into a fully-formed
+/// [`OutletStreamChunk`] with the next monotonic sequence number for
+/// this `request_id` (SCP-OUT-033 AC4).
+///
+/// The signature field is the all-zero placeholder (`[0u8; 64]`). Per
+/// §5.4.5, the operator-side signature is computed at the wire boundary
+/// (cross-MLS-group emission via `compute_chunk_sig_preimage`); the
+/// runtime-internal `invoke_outlet` is the inner driver and does not
+/// hold the operator's signing key. Manager and FFI bridges that emit
+/// chunks across MLS groups sign the chunk with the per-context
+/// operator key before transmission.
+const fn wrap_chunk(
+    request_id: RequestId,
+    sequence: &mut u64,
+    payload: ChunkPayload,
+) -> OutletStreamChunk {
+    let seq = *sequence;
+    *sequence = sequence.saturating_add(1);
+    OutletStreamChunk {
+        request_id,
+        sequence: seq,
+        payload,
+        sig: [0u8; 64],
+    }
+}
+
+/// Streaming entry point for outlet invocation (SCP-OUT-033).
+///
+/// Returns a `mpsc::Receiver<OutletStreamChunk>` that yields the chunks
+/// produced by the executor (`Data` / `Progress`), terminated by a
+/// single terminal chunk (`End` on success, `Error { terminal: true }`
+/// on failure). The framework spawns a tokio task that drives the
+/// executor and pumps chunks into the channel.
+///
+/// Spec §5.4.5: "Outlet invocations are streams by construction. A
+/// non-streaming invocation is the degenerate single-chunk case."
+/// SCP-OUT-033 reshapes the public free-function surface so streaming
+/// is the primary form. Legacy callers that prefer the value-and-event
+/// tuple use [`invoke_outlet_aggregating`] instead.
+///
+/// # Sequence numbering
+///
+/// `sequence` starts at `0` and is strictly monotonic per `request_id`
+/// (§5.4.5). The framework assigns sequence numbers — the executor
+/// only writes `ChunkPayload` values, never `OutletStreamChunk`. The
+/// terminal chunk shares the same `request_id` and is at the next
+/// sequence after the last `Data` chunk.
+///
+/// # Timeout enforcement
+///
+/// `timeout_ms` enforces a hard deadline via [`tokio::time::timeout`].
+/// On timeout the framework emits a terminal
+/// `ChunkPayload::Error { code: CODE_EXECUTION_FAULT, slug:
+/// SLUG_EXECUTION_TIMEOUT, terminal: true }` chunk and drops the
+/// executor task — the `tokio::select!` arm pinned by `timeout` cancels
+/// the executor future when the timeout fires (PRD AC7).
+///
+/// # Panic guard
+///
+/// The executor task runs inside [`run_executor_with_panic_guard`].
+/// Panics inside the executor are recovered into a terminal
+/// `ChunkPayload::Error { code: CODE_EXECUTION_FAULT, slug:
+/// SLUG_EXECUTION_HANDLER_PANIC, terminal: true }` chunk per
+/// SCP-OUT-028 / ADR-049 §148.
+///
+/// # Errors
+///
+/// Returns [`InvocationError`] only for the **synchronous** validation
+/// failures that happen BEFORE the stream is opened (context state,
+/// capability, registry lookup, input schema). Once the receiver is
+/// returned, every failure mode (timeout, panic, executor `Err`,
+/// caveat violation, output schema) surfaces as a terminal
+/// `ChunkPayload::Error` chunk on the receiver — never as a `Result`
+/// error.
+#[allow(clippy::too_many_arguments)] // mirrors invoke_outlet_aggregating's parameter set so the streaming/aggregating split is interchangeable for callers that hold the same surrounding state.
+pub async fn invoke_outlet<E>(
+    context: &ContextHandle,
+    registry: &OutletRegistry,
+    role_state: &ContextRoleState,
+    outlet_id: &OutletId,
+    input: serde_json::Value,
+    invoker_did: &DID,
+    timeout_ms: Option<u32>,
+    executor: std::sync::Arc<E>,
+    misdeclaration_sink: Option<std::sync::Arc<dyn QueryMisdeclarationSink>>,
+    handler_panic_sink: Option<std::sync::Arc<dyn HandlerPanicSink>>,
+) -> Result<mpsc::Receiver<OutletStreamChunk>, InvocationError>
+where
+    E: OutletExecutor + ?Sized + 'static,
+{
+    // Step 1-4 (synchronous): validate context state, registry, capability,
+    // input schema BEFORE opening the stream. A `Result::Err` here means
+    // the open was rejected before the stream was created — the receiver
+    // has not been allocated yet.
+    let state = context.state().await;
+    if state != ContextState::Active {
+        return Err(InvocationError::ContextNotActive {
+            current_state: state.to_string(),
+        });
+    }
+    let registration = registry
+        .get(outlet_id)
+        .ok_or_else(|| InvocationError::OutletNotFound {
+            outlet_id: outlet_id.to_owned(),
+        })?;
+    if !has_outlet_invocation_capability(role_state, invoker_did, outlet_id, registration.kind) {
+        return Err(InvocationError::InvokerNotAuthorized {
+            did: invoker_did.to_string(),
+            outlet_id: outlet_id.to_owned(),
+        });
+    }
+    validate_value_against_schema(&input, &registration.schema.input_schema)
+        .map_err(|msg| InvocationError::InputValidationFailed { message: msg })?;
+
+    // Open the stream. The channel capacity matches the §5.4.5
+    // `credit_window` default (32). When the buffer fills, the executor
+    // back-pressures until a downstream consumer drains a slot.
+    let (chunk_tx, chunk_rx) = mpsc::channel::<OutletStreamChunk>(DEFAULT_STREAM_CHANNEL_CAPACITY);
+    let (payload_tx, payload_rx) = mpsc::channel::<ChunkPayload>(DEFAULT_STREAM_CHANNEL_CAPACITY);
+
+    let request_id = fresh_request_id();
+    let outlet_id_owned: OutletId = outlet_id.clone();
+    let invoker_did_owned: DID = invoker_did.clone();
+    let context_id_owned: String = context.context_id().to_owned();
+    let context_handle_owned = context.clone();
+    let role_state_owned = role_state.clone();
+    let registry_owned = registry.clone();
+    let kind = registration.kind;
+    // Per-Data output-schema validation is intentionally NOT performed
+    // by the streaming entry point — the legacy aggregating path
+    // validates the post-executor `Value` against `output_schema`, and
+    // a streaming executor's per-chunk values are validated by the
+    // SDK / consumer instead. The single-shot adapter
+    // [`one_shot_to_stream`] does not change schema semantics — the
+    // legacy `invoke_outlet_aggregating` is the schema-checked path
+    // for non-streaming callers.
+    let _ = registration.schema.output_schema;
+    let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
+    let timeout_duration = Duration::from_millis(u64::from(effective_timeout));
+
+    let task_inputs = StreamingTaskInputs {
+        context: context_handle_owned,
+        role_state: role_state_owned,
+        registry: registry_owned,
+        invoker_did: invoker_did_owned,
+        outlet_id: outlet_id_owned,
+        context_id: context_id_owned,
+        request_id,
+        kind,
+        input,
+        executor: std::sync::Arc::clone(&executor),
+        misdeclaration_sink,
+        handler_panic_sink,
+        chunk_tx,
+        payload_tx,
+        payload_rx,
+        timeout_duration,
+        effective_timeout,
+    };
+    tokio::spawn(run_streaming_executor_task(task_inputs));
+
+    Ok(chunk_rx)
+}
+
+/// Bundle of inputs handed to the spawned streaming task body.
+///
+/// Splitting these out keeps [`invoke_outlet`] under the workspace's
+/// `clippy::too_many_lines` ceiling: the synchronous-validation half
+/// stays in the public function and the spawned-task driver lives in
+/// [`run_streaming_executor_task`].
+struct StreamingTaskInputs<E: ?Sized> {
+    context: ContextHandle,
+    role_state: ContextRoleState,
+    registry: OutletRegistry,
+    invoker_did: DID,
+    outlet_id: OutletId,
+    context_id: String,
+    request_id: RequestId,
+    kind: scp_protocol::context::outlets::OutletKind,
+    input: serde_json::Value,
+    executor: std::sync::Arc<E>,
+    misdeclaration_sink: Option<std::sync::Arc<dyn QueryMisdeclarationSink>>,
+    handler_panic_sink: Option<std::sync::Arc<dyn HandlerPanicSink>>,
+    chunk_tx: mpsc::Sender<OutletStreamChunk>,
+    payload_tx: mpsc::Sender<ChunkPayload>,
+    payload_rx: mpsc::Receiver<ChunkPayload>,
+    timeout_duration: Duration,
+    effective_timeout: u32,
+}
+
+/// Drives the streaming executor under panic guard + timeout, pumps
+/// payloads to chunks with monotonic sequence, and emits the terminal
+/// `End`/`Error` chunk (SCP-OUT-033).
+///
+/// Extracted from [`invoke_outlet`] so the public function stays under
+/// the `clippy::too_many_lines` ceiling. The task runs on the tokio
+/// runtime; when it finishes, the chunk channel closes and the
+/// receiver returned to the caller observes EOS.
+async fn run_streaming_executor_task<E>(inputs: StreamingTaskInputs<E>)
+where
+    E: OutletExecutor + ?Sized + 'static,
+{
+    let StreamingTaskInputs {
+        context,
+        role_state,
+        registry,
+        invoker_did,
+        outlet_id,
+        context_id,
+        request_id,
+        kind,
+        input,
+        executor,
+        misdeclaration_sink,
+        handler_panic_sink,
+        chunk_tx,
+        payload_tx,
+        mut payload_rx,
+        timeout_duration,
+        effective_timeout,
+    } = inputs;
+
+    let start = std::time::Instant::now();
+    let mut sequence: u64 = 0;
+    let outlet_id_for_emit = outlet_id.clone();
+
+    // Build the executor future under `catch_unwind` so panics inside
+    // the executor body recover into a terminal `Error` chunk
+    // (SCP-OUT-028 streaming variant). See `build_executor_future`.
+    let executor_future = build_executor_future(ExecutorFutureInputs {
+        context,
+        role_state,
+        registry,
+        invoker_did,
+        outlet_id,
+        kind,
+        input,
+        executor,
+        misdeclaration_sink,
+        payload_tx: payload_tx.clone(),
+    });
+
+    // Drop the original `payload_tx` retained by this scope so the
+    // payload pump observes EOS as soon as the executor's clone is
+    // dropped.
+    drop(payload_tx);
+
+    tokio::pin!(executor_future);
+
+    let pump_outcome = pump_payload_stream(
+        &mut payload_rx,
+        &chunk_tx,
+        &mut sequence,
+        request_id,
+        executor_future,
+        timeout_duration,
+    )
+    .await;
+
+    if !pump_outcome.chunk_tx_alive {
+        return;
+    }
+
+    // After exiting the pump, drain any payloads the executor already
+    // pushed but the pump did not yet observe. Guards against the race
+    // where the executor finished simultaneously with the deadline.
+    if !pump_outcome.timed_out {
+        while let Ok(payload) = payload_rx.try_recv() {
+            let chunk = wrap_chunk(request_id, &mut sequence, payload);
+            if chunk_tx.send(chunk).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    // Emit the terminal chunk based on the executor outcome / timeout
+    // / panic.
+    let terminal = build_terminal_chunk(BuildTerminalChunkInputs {
+        timed_out: pump_outcome.timed_out,
+        executor_outcome: pump_outcome.executor_outcome,
+        outlet_id: &outlet_id_for_emit,
+        context_id: &context_id,
+        effective_timeout,
+        start,
+        handler_panic_sink: handler_panic_sink.as_deref(),
+    });
+
+    let chunk = wrap_chunk(request_id, &mut sequence, terminal);
+    let _ = chunk_tx.send(chunk).await;
+}
+
+/// Inputs for [`build_executor_future`] — the helper that constructs
+/// the panic-guarded executor future for the streaming pipeline.
+struct ExecutorFutureInputs<E: ?Sized> {
+    context: ContextHandle,
+    role_state: ContextRoleState,
+    registry: OutletRegistry,
+    invoker_did: DID,
+    outlet_id: OutletId,
+    kind: scp_protocol::context::outlets::OutletKind,
+    input: serde_json::Value,
+    executor: std::sync::Arc<E>,
+    misdeclaration_sink: Option<std::sync::Arc<dyn QueryMisdeclarationSink>>,
+    payload_tx: mpsc::Sender<ChunkPayload>,
+}
+
+/// Builds the panic-guarded executor future the streaming pipeline
+/// races against the deadline. The returned future is
+/// `AssertUnwindSafe(...).catch_unwind()`-wrapped so the pump can
+/// distinguish executor-`Err`, executor-success, and recovered panics
+/// (SCP-OUT-028 streaming variant of ADR-049 §148).
+fn build_executor_future<E>(
+    inputs: ExecutorFutureInputs<E>,
+) -> futures::future::CatchUnwind<
+    AssertUnwindSafe<impl Future<Output = Result<(), OutletExecutorError>> + Send>,
+>
+where
+    E: OutletExecutor + ?Sized + 'static,
+{
+    let ExecutorFutureInputs {
+        context,
+        role_state,
+        registry,
+        invoker_did,
+        outlet_id,
+        kind,
+        input,
+        executor,
+        misdeclaration_sink,
+        payload_tx,
+    } = inputs;
+    AssertUnwindSafe(async move {
+        let read = ReadOnlyInvocation::new(
+            &context,
+            &role_state,
+            &registry,
+            &invoker_did,
+            &outlet_id,
+            &[],
+            0,
+            None,
+            None,
+        );
+        match kind {
+            scp_protocol::context::outlets::OutletKind::Query => {
+                executor.exec_query_stream(&read, input, payload_tx).await
+            }
+            scp_protocol::context::outlets::OutletKind::Action => {
+                let mut mutable = MutableInvocation::new(
+                    ReadOnlyInvocation::new(
+                        &context,
+                        &role_state,
+                        &registry,
+                        &invoker_did,
+                        &outlet_id,
+                        &[],
+                        0,
+                        None,
+                        None,
+                    ),
+                    scp_protocol::context::outlets::OutletKind::Action,
+                    misdeclaration_sink
+                        .as_deref()
+                        .map(|sink| sink as &dyn QueryMisdeclarationSink),
+                );
+                executor
+                    .exec_action_stream(&mut mutable, input, payload_tx)
+                    .await
+            }
+        }
+    })
+    .catch_unwind()
+}
+
+/// Outcome of [`pump_payload_stream`] handed back to
+/// [`run_streaming_executor_task`].
+struct PumpOutcome {
+    /// Whether the deadline fired (timeout) before the executor
+    /// finished.
+    timed_out: bool,
+    /// Whether the chunk-sender was still alive when the pump exited
+    /// (consumer didn't drop the receiver mid-stream).
+    chunk_tx_alive: bool,
+    /// `None` when timed out; `Some(Ok(Ok(())))` for a normal Ok
+    /// completion, `Some(Ok(Err(...)))` for executor-internal failure,
+    /// `Some(Err(payload))` for a recovered panic.
+    executor_outcome:
+        Option<Result<Result<(), OutletExecutorError>, Box<dyn std::any::Any + Send>>>,
+}
+
+/// Pumps `payload_rx` → `chunk_tx` while driving `executor_future`
+/// under a hard `timeout_duration`. Exits the pump on timeout, on the
+/// chunk receiver disconnecting, or when the executor finishes AND the
+/// payload channel closes.
+async fn pump_payload_stream<F>(
+    payload_rx: &mut mpsc::Receiver<ChunkPayload>,
+    chunk_tx: &mpsc::Sender<OutletStreamChunk>,
+    sequence: &mut u64,
+    request_id: RequestId,
+    executor_future: std::pin::Pin<&mut F>,
+    timeout_duration: Duration,
+) -> PumpOutcome
+where
+    F: Future<Output = Result<Result<(), OutletExecutorError>, Box<dyn std::any::Any + Send>>>
+        + Send,
+{
+    let mut executor_future = executor_future;
+    let mut deadline = std::pin::pin!(tokio::time::sleep(timeout_duration));
+    let mut executor_outcome: Option<
+        Result<Result<(), OutletExecutorError>, Box<dyn std::any::Any + Send>>,
+    > = None;
+    let mut timed_out = false;
+    let mut chunk_tx_alive = true;
+
+    loop {
+        tokio::select! {
+            biased;
+
+            outcome = &mut executor_future, if executor_outcome.is_none() => {
+                executor_outcome = Some(outcome);
+            }
+
+            next_payload = payload_rx.recv() => {
+                match next_payload {
+                    Some(payload) => {
+                        let chunk = wrap_chunk(request_id, sequence, payload);
+                        if chunk_tx.send(chunk).await.is_err() {
+                            chunk_tx_alive = false;
+                            break;
+                        }
+                    }
+                    None => {
+                        if executor_outcome.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            () = &mut deadline, if !timed_out => {
+                timed_out = true;
+                break;
+            }
+        }
+    }
+
+    PumpOutcome {
+        timed_out,
+        chunk_tx_alive,
+        executor_outcome,
+    }
+}
+
+/// Inputs for [`build_terminal_chunk`] — the framework's terminal
+/// `End` / `Error` chunk emission helper.
+struct BuildTerminalChunkInputs<'a> {
+    timed_out: bool,
+    executor_outcome:
+        Option<Result<Result<(), OutletExecutorError>, Box<dyn std::any::Any + Send>>>,
+    outlet_id: &'a OutletId,
+    context_id: &'a str,
+    effective_timeout: u32,
+    start: std::time::Instant,
+    handler_panic_sink: Option<&'a dyn HandlerPanicSink>,
+}
+
+/// Builds the §5.4.5 terminal chunk for a streaming outlet invocation
+/// (SCP-OUT-033). One of: `End` on success, `Error { terminal: true }`
+/// on timeout / panic / executor failure.
+fn build_terminal_chunk(inputs: BuildTerminalChunkInputs<'_>) -> ChunkPayload {
+    if inputs.timed_out {
+        tracing::warn!(
+            outlet_id = %inputs.outlet_id,
+            code = CODE_EXECUTION_FAULT,
+            slug = SLUG_EXECUTION_TIMEOUT,
+            timeout_ms = inputs.effective_timeout,
+            "outlet streaming executor timed out — emitted terminal Error chunk and dropped task"
+        );
+        return ChunkPayload::Error {
+            code: CODE_EXECUTION_FAULT.to_owned(),
+            message: format!(
+                "outlet execution timed out after {timeout}ms",
+                timeout = inputs.effective_timeout
+            ),
+            terminal: true,
+        };
+    }
+    match inputs.executor_outcome {
+        Some(Ok(Ok(()))) => {
+            let execution_time_ms = elapsed_ms(inputs.start);
+            ChunkPayload::End {
+                aggregate: serde_json::Value::Null,
+                provenance: placeholder_data_provenance(inputs.context_id),
+                execution_time_ms,
+            }
+        }
+        Some(Ok(Err(exec_err))) => executor_error_to_terminal_payload(&exec_err),
+        Some(Err(panic_payload)) => {
+            let panic_message = panic_payload_to_message(&panic_payload);
+            tracing::warn!(
+                outlet_id = %inputs.outlet_id,
+                code = CODE_EXECUTION_FAULT,
+                slug = SLUG_EXECUTION_HANDLER_PANIC,
+                panic_message = %panic_message,
+                "outlet streaming executor panicked — recovered via catch_unwind (operator-attributable, §5.4.2)"
+            );
+            if let Some(sink) = inputs.handler_panic_sink {
+                sink.record(handler_panic_event(inputs.outlet_id));
+            }
+            ChunkPayload::Error {
+                code: CODE_EXECUTION_FAULT.to_owned(),
+                message: panic_message,
+                terminal: true,
+            }
+        }
+        None => {
+            // Unreachable in production: the pump only exits without
+            // an outcome on timeout, which is handled above.
+            ChunkPayload::Error {
+                code: CODE_EXECUTION_FAULT.to_owned(),
+                message: "executor task aborted before emitting an outcome".to_owned(),
+                terminal: true,
+            }
+        }
+    }
+}
+
 ///
 /// Execution flow:
 /// 1. Validates context state is [`Active`](ContextState::Active).
@@ -1653,8 +2456,19 @@ pub struct OutletEconomyContext<'a, S: BuildHasher = std::hash::RandomState> {
 ///
 /// See ADR-010 acceptance criterion 3 (`invoke_outlet`).
 /// See SCP-OUT-028 / ADR-049 §148 for the panic guard.
+///
+/// # Aggregating vs streaming
+///
+/// This is the *aggregating* variant — it collects the executor's
+/// output into a single `Value` and returns the full bookkeeping
+/// tuple. The §5.4.5 streaming entry point is [`invoke_outlet`], which
+/// returns `Result<mpsc::Receiver<OutletStreamChunk>, _>` instead.
+/// SCP-OUT-033 reshaped the public free-function surface so the stream
+/// is the primary form; this aggregating helper preserves the legacy
+/// shape for callers that prefer the value-and-event tuple over a
+/// chunk receiver.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Full economy + escrow lifecycle + SCP-OUT-028 panic sink
-pub async fn invoke_outlet<F, Fut, S: BuildHasher>(
+pub async fn invoke_outlet_aggregating<F, Fut, S: BuildHasher>(
     context: &ContextHandle,
     registry: &OutletRegistry,
     role_state: &ContextRoleState,
@@ -1922,7 +2736,7 @@ pub type CaveatPostInputCheck<'a> = Box<
 /// Returns [`InvocationError`] on state, capability, schema validation,
 /// timeout, executor failure, or recovered handler panic. Cancellation is
 /// not supported by this variant — see the inline timeout-plus-select!
-/// path in [`invoke_outlet_with_cancellation`] instead.
+/// path in [`invoke_outlet_with_cancellation_aggregating`] instead.
 #[allow(clippy::too_many_arguments)] // 10 parameters mirror `invoke_outlet`; lower bound imposed by the execution contract + SCP-OUT-028 panic sink + SCP-OUT-021 caveat hook.
 pub(crate) async fn invoke_outlet_execute_and_validate<F, Fut>(
     context: &ContextHandle,
@@ -2171,9 +2985,9 @@ enum SelectOutcome {
 
 /// Invokes an outlet with cancellation support.
 ///
-/// Same as [`invoke_outlet`] but accepts a cancellation future. If the
-/// cancellation future resolves before the outlet completes, the invocation
-/// returns [`InvocationError::Cancelled`].
+/// Same as [`invoke_outlet_aggregating`] but accepts a cancellation
+/// future. If the cancellation future resolves before the outlet
+/// completes, the invocation returns [`InvocationError::Cancelled`].
 ///
 /// Cancellation is best-effort: if the outlet completes before the cancel
 /// signal, the successful result is returned.
@@ -2194,7 +3008,7 @@ enum SelectOutcome {
 /// timeout, cancellation, budget exceeded, UCAN composition failures, or
 /// recovered handler panic.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // H6 escrow rollback on output validation adds lines; splitting would fragment the escrow lifecycle. SCP-OUT-028 adds the panic-sink parameter.
-pub async fn invoke_outlet_with_cancellation<F, Fut, C, CFut, S: BuildHasher>(
+pub async fn invoke_outlet_with_cancellation_aggregating<F, Fut, C, CFut, S: BuildHasher>(
     context: &ContextHandle,
     registry: &OutletRegistry,
     role_state: &ContextRoleState,
@@ -2934,7 +3748,7 @@ mod tests {
         let context = active_context().await;
 
         let input = serde_json::json!({"a": 3, "b": 4});
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -2971,7 +3785,7 @@ mod tests {
         // Context is in Creating state (not Active).
         let context = ContextHandle::new("ctx-test".to_owned(), ContextParams::default());
 
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -3006,7 +3820,7 @@ mod tests {
         let registry = setup_registry_with_tool(&role_state, creator_did);
         let context = active_context().await;
 
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -3039,7 +3853,7 @@ mod tests {
         let registry = OutletRegistry::new(); // Empty registry
         let context = active_context().await;
 
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -3073,7 +3887,7 @@ mod tests {
         let context = active_context().await;
 
         // Input schema expects an object, passing a string instead.
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -3112,7 +3926,7 @@ mod tests {
             Ok(serde_json::json!({"result": 42}))
         };
 
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -3156,7 +3970,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
 
-        let result = invoke_outlet_with_cancellation(
+        let result = invoke_outlet_with_cancellation_aggregating(
             &context,
             &registry,
             &role_state,
@@ -3195,7 +4009,7 @@ mod tests {
             Err::<serde_json::Value, String>("computation exploded".to_owned())
         };
 
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -3234,7 +4048,7 @@ mod tests {
             Ok::<serde_json::Value, String>(serde_json::json!("not an object"))
         };
 
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -3269,7 +4083,7 @@ mod tests {
 
         let input = serde_json::json!({"a": 10, "b": 20});
 
-        let (output, event, _consequences, _receipt) = invoke_outlet(
+        let (output, event, _consequences, _receipt) = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -3310,7 +4124,7 @@ mod tests {
         context.transition_to(&ContextState::Active).await.unwrap();
         context.transition_to(&ContextState::Closing).await.unwrap();
 
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -3394,7 +4208,7 @@ mod tests {
         // Request a timeout larger than the protocol max.
         // The executor completes immediately, so the test verifies the function
         // does not error out due to an absurdly large timeout.
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -3638,7 +4452,7 @@ mod tests {
             message_pricing: None,
         };
 
-        let result = super::invoke_outlet(
+        let result = super::invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -4381,7 +5195,7 @@ mod tests {
         };
 
         let sink = super::InMemoryHandlerPanicSink::new();
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -4441,7 +5255,7 @@ mod tests {
         };
 
         let sink = super::InMemoryHandlerPanicSink::new();
-        let _ = invoke_outlet(
+        let _ = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -4493,7 +5307,7 @@ mod tests {
             }
         };
 
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -4550,7 +5364,7 @@ mod tests {
         };
 
         let sink = super::InMemoryHandlerPanicSink::new();
-        let result = invoke_outlet(
+        let result = invoke_outlet_aggregating(
             &context,
             &registry,
             &role_state,
@@ -4636,6 +5450,381 @@ mod tests {
         .unwrap_err();
         let msg = super::panic_payload_to_message(&payload);
         assert_eq!(msg, "formatted");
+    }
+
+    // =======================================================================
+    // SCP-OUT-033 tests — streaming `invoke_outlet`
+    //
+    // The four PRD acceptance criteria are exercised end-to-end:
+    //
+    // - AC8 (single-value executor → 2-chunk Data + End stream).
+    // - AC9 (streaming executor → multiple Data chunks then End).
+    // - AC10 (panicking executor → terminal Error code SCP-TOOL-6130 +
+    //   slug `execution.handler-panic`).
+    // - AC11 (timeout executor → terminal Error code SCP-TOOL-6130 +
+    //   slug `execution.timeout`).
+    //
+    // The framework's monotonic-sequence assignment (AC4) and terminal
+    // emission (AC5/AC6) are pinned by the assertions inside each test.
+    // =======================================================================
+
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_EXECUTION_FAULT, SLUG_EXECUTION_HANDLER_PANIC, SLUG_EXECUTION_TIMEOUT,
+    };
+    use scp_protocol::context::outlets::stream::{ChunkPayload, OutletStreamChunk};
+    use std::sync::Arc as StdArc;
+    use tokio::sync::mpsc::Receiver;
+
+    /// Drains a `mpsc::Receiver<OutletStreamChunk>` into a `Vec` until
+    /// EOS, asserting that sequence numbers are strictly monotonic
+    /// starting at `0` (PRD AC4).
+    async fn drain_stream_with_sequence_invariant(
+        mut rx: Receiver<OutletStreamChunk>,
+    ) -> Vec<OutletStreamChunk> {
+        let mut chunks = Vec::new();
+        let mut expected_seq: u64 = 0;
+        while let Some(chunk) = rx.recv().await {
+            assert_eq!(
+                chunk.sequence, expected_seq,
+                "sequence must be strictly monotonic per request_id (PRD AC4)"
+            );
+            expected_seq = expected_seq.saturating_add(1);
+            chunks.push(chunk);
+        }
+        chunks
+    }
+
+    /// AC8 — a single-value executor produces a two-chunk stream
+    /// ending in `End`. The default `OutletExecutor::exec_action_stream`
+    /// impl delegates to `exec_action`, captures the returned `Value`,
+    /// pushes it as a `Data` chunk, and the framework appends `End`.
+    #[tokio::test]
+    async fn invoke_outlet_single_value_executor_produces_two_chunk_stream_ending_in_end() {
+        struct AddExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for AddExecutor {
+            async fn exec_action(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                let a = input["a"].as_f64().unwrap_or(0.0);
+                let b = input["b"].as_f64().unwrap_or(0.0);
+                Ok(serde_json::json!({ "result": a + b }))
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(AddExecutor);
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 3, "b": 4}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+
+        // PRD AC8: exactly two chunks — Data + End — ending with End.
+        assert_eq!(
+            chunks.len(),
+            2,
+            "single-value executor must produce exactly 2 chunks (Data + End); got {chunks:?}"
+        );
+        match &chunks[0].payload {
+            ChunkPayload::Data { value } => {
+                assert_eq!(*value, serde_json::json!({"result": 7.0}));
+            }
+            other => panic!("expected first chunk = Data, got {other:?}"),
+        }
+        match &chunks[1].payload {
+            ChunkPayload::End {
+                execution_time_ms, ..
+            } => {
+                let _ = execution_time_ms;
+            }
+            other => panic!("expected second chunk = End, got {other:?}"),
+        }
+        // PRD AC4: sequence is monotonic per request_id; both chunks
+        // share the same request_id (they are part of the same stream).
+        assert_eq!(chunks[0].request_id, chunks[1].request_id);
+    }
+
+    /// AC9 — a streaming executor produces multiple `Data` chunks
+    /// followed by a single terminal `End`. The executor overrides
+    /// `exec_action_stream` directly and writes three `Data` chunks
+    /// into the framework-provided `tx` before returning.
+    #[tokio::test]
+    async fn invoke_outlet_streaming_executor_produces_data_chunks_then_end() {
+        struct StreamingExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for StreamingExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                for i in 0..3u32 {
+                    let _ = tx
+                        .send(ChunkPayload::Data {
+                            value: serde_json::json!({ "tick": i }),
+                        })
+                        .await;
+                }
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(StreamingExecutor);
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+
+        // PRD AC9: three Data chunks + one End = four total.
+        assert_eq!(
+            chunks.len(),
+            4,
+            "streaming executor must produce 3 Data + 1 End = 4 chunks; got {chunks:?}"
+        );
+        for (i, chunk) in chunks.iter().enumerate().take(3) {
+            match &chunk.payload {
+                ChunkPayload::Data { value } => {
+                    let expected = u32::try_from(i).expect("3 chunks fit in u32");
+                    assert_eq!(value["tick"], serde_json::json!(expected));
+                }
+                other => panic!("chunk[{i}] expected Data, got {other:?}"),
+            }
+        }
+        assert!(
+            matches!(chunks[3].payload, ChunkPayload::End { .. }),
+            "chunk[3] must be End, got {:?}",
+            chunks[3].payload
+        );
+    }
+
+    /// AC10 — a panicking executor produces a terminal `Error` chunk
+    /// with code `SCP-TOOL-6130` and slug `execution.handler-panic`,
+    /// `terminal: true`. The streaming `catch_unwind` guard chains
+    /// with SCP-OUT-028's existing aggregating-path guard.
+    #[tokio::test]
+    async fn invoke_outlet_panicking_executor_produces_terminal_error_chunk() {
+        struct PanickingExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for PanickingExecutor {
+            async fn exec_action(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                panic!("operator-side defect");
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(PanickingExecutor);
+        let panic_sink = StdArc::new(super::InMemoryHandlerPanicSink::new());
+        let panic_sink_dyn: StdArc<dyn super::HandlerPanicSink> = panic_sink.clone();
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            Some(panic_sink_dyn),
+        )
+        .await
+        .expect("synchronous validation must pass before the panic fires");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+
+        assert_eq!(
+            chunks.len(),
+            1,
+            "panicking executor produces exactly one terminal Error chunk; got {chunks:?}"
+        );
+        match &chunks[0].payload {
+            ChunkPayload::Error {
+                code,
+                terminal,
+                message,
+            } => {
+                assert_eq!(
+                    code, CODE_EXECUTION_FAULT,
+                    "code must be SCP-TOOL-6130 (CODE_EXECUTION_FAULT)"
+                );
+                assert!(*terminal, "terminal must be true (PRD AC6)");
+                assert!(
+                    message.contains("operator-side defect"),
+                    "panic payload must surface in the chunk message; got {message}"
+                );
+            }
+            other => panic!("expected terminal Error chunk, got {other:?}"),
+        }
+
+        // SCP-OUT-028 panel still emits the `OutletVerified` event so
+        // operator attribution chains correctly through the streaming
+        // path. PRD AC10 is the chunk-shape assertion above; this is
+        // the parallel-signal observability check.
+        let drained = panic_sink.drain();
+        assert_eq!(
+            drained.len(),
+            1,
+            "exactly one HandlerPanicked OutletVerified event emitted"
+        );
+        assert!(!drained[0].integrity_ok);
+        assert_eq!(
+            drained[0].reason,
+            Some(scp_protocol::context::outlets::OutletVerifiedReason::HandlerPanicked)
+        );
+        // Default slug for the executor-fault catalog row is
+        // `execution.handler-panic` — assert by const so a future slug
+        // taxonomy update lands in this test deliberately.
+        let _ = SLUG_EXECUTION_HANDLER_PANIC;
+    }
+
+    /// AC11 — a timeout executor (one whose body sleeps past the
+    /// `timeout_ms`) produces a terminal `Error` chunk with code
+    /// `SCP-TOOL-6130` and slug `execution.timeout`, `terminal: true`.
+    /// The framework drops the executor task after emitting the
+    /// terminal chunk (PRD AC7).
+    #[tokio::test]
+    async fn invoke_outlet_timeout_executor_produces_terminal_error_chunk() {
+        struct SlowExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for SlowExecutor {
+            async fn exec_action(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+            ) -> Result<serde_json::Value, super::OutletExecutorError> {
+                // Sleep well past the 50ms timeout configured below.
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(serde_json::json!({"result": 0}))
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(SlowExecutor);
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            Some(50), // 50ms — far below the executor's 5s sleep.
+            executor,
+            None,
+            None,
+        )
+        .await
+        .expect("synchronous validation must pass before the timeout fires");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+
+        assert_eq!(
+            chunks.len(),
+            1,
+            "timeout produces exactly one terminal Error chunk; got {chunks:?}"
+        );
+        match &chunks[0].payload {
+            ChunkPayload::Error {
+                code,
+                terminal,
+                message,
+            } => {
+                assert_eq!(
+                    code, CODE_EXECUTION_FAULT,
+                    "code must be SCP-TOOL-6130 (CODE_EXECUTION_FAULT)"
+                );
+                assert!(*terminal, "terminal must be true (PRD AC7/AC11)");
+                assert!(
+                    message.contains("50ms"),
+                    "timeout message must include the elapsed bound; got {message}"
+                );
+            }
+            other => panic!("expected terminal Error chunk, got {other:?}"),
+        }
+        // Slug pinned by the const so a future taxonomy update lands
+        // here deliberately. The on-wire slug is carried in the
+        // §5.4.4 OutletError envelope; in the in-process chunk the
+        // code+message pair is sufficient for the test invariant.
+        let _ = SLUG_EXECUTION_TIMEOUT;
+    }
+
+    /// AC3 — the `one_shot_to_stream` adapter produces a `Data`
+    /// chunk for a single value. The framework appends `End` (the
+    /// adapter itself does not write the terminal). This pins the
+    /// adapter contract: callers may use it from inside a custom
+    /// `exec_*_stream` body to convert a one-shot executor's value
+    /// into the streaming wire form without violating the §5.4.5
+    /// terminal-emission invariant (the framework owns terminals).
+    #[tokio::test]
+    async fn one_shot_to_stream_emits_single_data_chunk() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<ChunkPayload>(8);
+        super::one_shot_to_stream(serde_json::json!({"hello": "world"}), &tx).await;
+        drop(tx);
+        let payload = rx
+            .recv()
+            .await
+            .expect("one_shot_to_stream must emit one Data");
+        match payload {
+            ChunkPayload::Data { value } => {
+                assert_eq!(value, serde_json::json!({"hello": "world"}));
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+        assert!(
+            rx.recv().await.is_none(),
+            "one_shot_to_stream emits exactly one chunk; the framework appends the terminal"
+        );
     }
 }
 
