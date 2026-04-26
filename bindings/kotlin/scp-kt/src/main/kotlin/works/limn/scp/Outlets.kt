@@ -342,6 +342,10 @@ sealed class OutletError(message: String, val code: String) : RuntimeException(m
     class Validation(message: String, code: String = "SCP-VALID-7010") : OutletError(message, code)
     class Unauthorized(message: String, code: String = "SCP-PERM-3020") : OutletError(message, code)
     class Bridge(message: String, code: String = "SCP-TOOL-6000") : OutletError(message, code)
+
+    /** Companion object exposes the §5.4.4 [`new`] keyword-only factory
+     *  (defined as a Kotlin extension in `Errors.kt`). */
+    companion object
 }
 
 // ---------------------------------------------------------------------------

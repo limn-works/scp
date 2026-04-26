@@ -5,28 +5,63 @@
  * to one category in the cross-SDK error hierarchy defined in
  * `.docs/standards/sdk-common.md`.
  *
- * Error codes follow the `SCP-{CATEGORY}-{NUMBER}` format:
+ * §5.4.4 sealed `OutletError` hierarchy
+ * --------------------------------------
  *
- * | Category prefix | Range       | Category            |
- * |-----------------|-------------|---------------------|
- * | `SCP-IDENT-`    | 1000-1999   | Identity errors     |
- * | `SCP-CTX-`      | 2000-2999   | Context errors      |
- * | `SCP-PERM-`     | 3000-3999   | Permission errors   |
- * | `SCP-CRYPTO-`   | 4000-4999   | Crypto errors       |
- * | `SCP-TRANS-`    | 5000-5999   | Transport errors    |
- * | `SCP-TOOL-`     | 6000-6999   | Tool errors         |
- * | `SCP-VALID-`    | 7000-7999   | Validation errors   |
- * | `SCP-STORAGE-`  | 8000-8999   | Storage errors      |
- * | `SCP-ATTEST-`   | 9000-9999   | Attestation errors  |
- * | `SCP-MCP-`      | 10000-10999 | MCP errors          |
- * | `SCP-GOV-`      | 11000-11999 | Governance errors   |
- * | `SCP-ECON-`     | 12000-12999 | Economy errors      |
+ * The §5.4.4 envelope is rendered as a sealed TypeScript class hierarchy
+ * rooted at `OutletError`. Each `OutletErrorClass` variant maps to one of
+ * eight concrete subclasses with a static `code` discriminator and a
+ * runtime type-guard:
  *
- * See ADR-022 in `.docs/adrs/phase-4.md`.
+ *   * `OutletProtocolError`     (named to avoid collision with MLS protocol
+ *                                error symbols elsewhere in the SDK)
+ *   * `AuthorizationError`
+ *   * `InputError`
+ *   * `ExecutionError`
+ *   * `OutputError`
+ *   * `EconomicError`
+ *   * `OutletTransportError`    (suffixed `Outlet` to coexist with the legacy
+ *                                top-level `TransportError` category class)
+ *   * `OutletGovernanceError`
+ *
+ * Branded newtypes (`Credit`, `CatalogKey`, `OutletId`) are nominal at the
+ * type level — passing a raw `number`/`string` where the brand is expected
+ * fails to type-check. Runtime factories validate inputs and throw
+ * `InvalidGrant` (under `OutletProtocolError`) on out-of-range data.
+ *
+ * Construction
+ * ~~~~~~~~~~~~
+ *
+ * `OutletError.new(opts)` is an options-object factory — the adjacent
+ * string fields `outletId` and `catalogKey` are positional-swap-resistant
+ * because the only construction path is named-field. A positional shape is
+ * not exposed.
+ *
+ * `instanceof` survival across the napi-rs FFI boundary is preserved by
+ * (a) class inheritance via standard `extends` chains and (b) a class-tag
+ * field (`scpClassTag`) that the runtime guard `OutletError.isAuthorizationError`
+ * checks if `instanceof` returns `false` (e.g., when an error crossed a
+ * realm boundary in a worker). The factory-fallback path is exercised by
+ * the conformance test.
+ *
+ * PII redaction
+ * ~~~~~~~~~~~~~
+ *
+ * `redactPii(message)` strips emails and DIDs before surfacing the raw
+ * `message` to developer-facing logs:
+ *
+ *   * email regex `/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/` →
+ *     `[redacted]`;
+ *   * DID regex   `/did:(dht|web|key):[A-Za-z0-9._-]+/`              →
+ *     `[redacted]`.
+ *
+ * Conformance fixtures include both regex matches.
  */
 
+import { Buffer } from "node:buffer";
+
 // ---------------------------------------------------------------------------
-// ScpError — root of the error hierarchy
+// Root SCP error hierarchy (legacy categories, retained verbatim).
 // ---------------------------------------------------------------------------
 
 /**
@@ -40,20 +75,12 @@
 export class ScpError extends Error {
   readonly code: string;
 
-  constructor(
-    message: string,
-    /** Stable error code, e.g. `"SCP-CTX-2001"`. */
-    code: string,
-  ) {
+  constructor(message: string, code: string) {
     super(message);
     this.name = "ScpError";
     this.code = code;
   }
 }
-
-// ---------------------------------------------------------------------------
-// Subclasses — one per error category
-// ---------------------------------------------------------------------------
 
 /** DID creation, resolution, key rotation failures. */
 export class IdentityError extends ScpError {
@@ -71,13 +98,7 @@ export class ContextError extends ScpError {
   }
 }
 
-/**
- * UCAN capability validation failures.
- *
- * Named `UcanPermissionError` to avoid shadowing the global `PermissionError`
- * in environments that define it (consistent with Python SDK naming convention
- * per `.docs/standards/sdk-common.md`).
- */
+/** UCAN capability validation failures. */
 export class UcanPermissionError extends ScpError {
   constructor(message: string, code: string) {
     super(message, code);
@@ -85,10 +106,7 @@ export class UcanPermissionError extends ScpError {
   }
 }
 
-/**
- * @deprecated Use `UcanPermissionError` instead. This alias exists for
- * backward compatibility during the rename transition.
- */
+/** @deprecated Use `UcanPermissionError`. */
 export const PermissionError = UcanPermissionError;
 
 /** Encryption, decryption, signature failures. */
@@ -104,34 +122,6 @@ export class TransportError extends ScpError {
   constructor(message: string, code: string) {
     super(message, code);
     this.name = "TransportError";
-  }
-}
-
-/** Outlet registration, invocation, verification failures.
- *
- * Error-code prefix remains `SCP-TOOL-*` (§9.18 — registered namespace);
- * only the class vocabulary is outlet-renamed.
- */
-export class OutletError extends ScpError {
-  constructor(message: string, code: string) {
-    super(message, code);
-    this.name = "OutletError";
-  }
-}
-
-/** Referenced outlet does not exist in the context's registry. */
-export class OutletNotFoundError extends OutletError {
-  constructor(message: string, code = "SCP-TOOL-6100") {
-    super(message, code);
-    this.name = "OutletNotFoundError";
-  }
-}
-
-/** Outlet invocation failed during execution. */
-export class OutletExecutionError extends OutletError {
-  constructor(message: string, code = "SCP-TOOL-6200") {
-    super(message, code);
-    this.name = "OutletExecutionError";
   }
 }
 
@@ -167,7 +157,7 @@ export class McpError extends ScpError {
   }
 }
 
-/** Governance proposal, vote, or dispatch failures (SCP-GOV-* range). */
+/** Governance proposal / vote / dispatch failures (SCP-GOV-* range). */
 export class GovernanceError extends ScpError {
   constructor(message: string, code: string) {
     super(message, code);
@@ -175,7 +165,7 @@ export class GovernanceError extends ScpError {
   }
 }
 
-/** Economy / payment / spending UCAN / budget failures (SCP-ECON-* range). */
+/** Economy / payment / spending UCAN / budget failures (SCP-ECON-*). */
 export class EconomyError extends ScpError {
   constructor(message: string, code: string) {
     super(message, code);
@@ -185,16 +175,8 @@ export class EconomyError extends ScpError {
 
 /**
  * The browser (WASM) bridge cannot enforce a paid context's economic policy
- * because `scp-runtime`'s `enforce_economy` pipeline (payment adapter, budget
- * tracker, velocity tracker, hard rate limit token bucket) does not compile
- * to `wasm32` per ADR-034. Creating a paid context — or running a
- * `SetEconomicPolicy` governance action with a paid policy — from the WASM
- * bridge is rejected fail-closed with `SCP-ECON-12095`.
- *
- * To create paid contexts, use a native (Python / Node.js / Swift / Kotlin)
- * client whose bridge does run `enforce_economy`.
- *
- * Subclass of [`EconomyError`].
+ * because `scp-runtime`'s `enforce_economy` pipeline does not compile to
+ * `wasm32` per ADR-034. Subclass of [`EconomyError`].
  */
 export class EconomicPolicyUnsupportedOnWasm extends EconomyError {
   constructor(message: string, code: string) {
@@ -204,17 +186,8 @@ export class EconomicPolicyUnsupportedOnWasm extends EconomyError {
 }
 
 /**
- * The browser (WASM) bridge cannot cryptographically validate a spending
- * UCAN against a payment adapter, budget tracker, velocity tracker, or hard
- * rate limit token bucket because `scp-runtime`'s `enforce_economy` pipeline
- * does not compile to `wasm32` per ADR-034. Joining or sending into a paid
- * context from the WASM bridge is rejected fail-closed with
- * `SCP-ECON-12096`, regardless of whether `spending_ucan_jwt` is supplied.
- *
- * To join or send messages in paid contexts, use a native (Python / Node.js
- * / Swift / Kotlin) client whose bridge does run `enforce_economy`.
- *
- * Subclass of [`EconomyError`].
+ * The browser (WASM) bridge cannot validate a spending UCAN. Subclass of
+ * [`EconomyError`].
  */
 export class WasmCannotValidateSpendingUcan extends EconomyError {
   constructor(message: string, code: string) {
@@ -224,16 +197,590 @@ export class WasmCannotValidateSpendingUcan extends EconomyError {
 }
 
 // ---------------------------------------------------------------------------
-// Error parsing — bridge error message to typed ScpError
+// §5.4.4 Outlet error sealed hierarchy
 // ---------------------------------------------------------------------------
 
+/** Wire-form `OutletErrorClass` discriminant. */
+export type OutletErrorClassWire =
+  | "protocol"
+  | "authorization"
+  | "input"
+  | "execution"
+  | "output"
+  | "economic"
+  | "transport"
+  | "governance";
+
+const OUTLET_ERROR_CLASSES: ReadonlySet<OutletErrorClassWire> = new Set([
+  "protocol",
+  "authorization",
+  "input",
+  "execution",
+  "output",
+  "economic",
+  "transport",
+  "governance",
+]);
+
+const CATALOG_KEY_RE = /^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$/;
+const CATALOG_KEY_MAX_BYTES = 256;
+
+// --- Branded newtypes -----------------------------------------------------
+
 /**
- * Error code prefix to ScpError subclass mapping.
+ * Branded numeric newtype for an Outlet credit grant.
  *
- * The napi-rs bridge encodes errors as `"[{code}] {category} error: {message}"`.
- * The WASM bridge encodes errors as `"[{code}] {message}"`.
- * Both include a bracketed code prefix that this function parses.
+ * Use `Credit(raw)` (the factory below) to construct. Passing a raw `number`
+ * where `Credit` is expected fails to type-check. Round-5 used per-language
+ * `RangeError` for out-of-range input; round-6 unified the rejection error
+ * to `InvalidGrant` under the `OutletError` hierarchy.
  */
+export type Credit = number & { readonly __brand: "Credit" };
+
+const CREDIT_MAX = 0xff_ff_ff_ff;
+
+/**
+ * Construct a `Credit` from a raw number; throws `InvalidGrant` on
+ * `raw <= 0` or `raw > 2^32 - 1`.
+ */
+export function Credit(raw: number): Credit {
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0 || raw > CREDIT_MAX) {
+    throw new InvalidGrant(typeof raw === "number" ? raw : 0);
+  }
+  return raw as Credit;
+}
+
+/**
+ * Branded string newtype for §5.4.4 catalog keys (`message_catalog` keys
+ * and slugs share the same regex). Use `CatalogKey(raw)` to construct.
+ */
+export type CatalogKey = string & { readonly __brand: "CatalogKey" };
+
+/**
+ * Construct a `CatalogKey`; throws `OutletProtocolError` (slug
+ * `protocol.malformed-catalog-key`) on regex / length failure.
+ */
+export function CatalogKey(raw: string): CatalogKey {
+  if (typeof raw !== "string" || raw.length === 0) {
+    throw new OutletProtocolError(
+      `catalog key must be a non-empty string, got ${typeof raw}`,
+      "SCP-TOOL-6100",
+      { slug: "protocol.malformed-catalog-key", retry: { policy: "never" } },
+    );
+  }
+  if (Buffer.byteLength(raw, "utf-8") > CATALOG_KEY_MAX_BYTES) {
+    throw new OutletProtocolError(
+      `catalog key exceeds ${CATALOG_KEY_MAX_BYTES} bytes`,
+      "SCP-TOOL-6100",
+      { slug: "protocol.malformed-catalog-key", retry: { policy: "never" } },
+    );
+  }
+  if (!CATALOG_KEY_RE.test(raw)) {
+    throw new OutletProtocolError(
+      `malformed catalog key: ${JSON.stringify(raw)}`,
+      "SCP-TOOL-6100",
+      { slug: "protocol.malformed-catalog-key", retry: { policy: "never" } },
+    );
+  }
+  return raw as CatalogKey;
+}
+
+// `OutletId` is defined as a branded type in `./outlets.ts`. We re-use
+// that type here rather than re-declaring it to avoid a duplicate-export
+// collision on the package barrel.
+import type { OutletId } from "./outlets";
+
+/**
+ * Construct an `OutletId` from a raw string. Throws `ValidationError`
+ * on empty input. Round-6 / OUT-031: typed wrapper for the outlet-id
+ * argument to `OutletError.new`.
+ */
+export function makeOutletId(raw: string): OutletId {
+  if (typeof raw !== "string" || raw.length === 0) {
+    throw new ValidationError("outletId must be non-empty string", "SCP-VALID-7000");
+  }
+  return raw as OutletId;
+}
+
+export type { OutletId };
+
+// --- RetryPolicy + ContextHop ---------------------------------------------
+
+/** §5.4.4 tag-5 retry guidance — wire-shape discriminated union. */
+export type RetryPolicy =
+  | { readonly policy: "never" }
+  | { readonly policy: "immediate" }
+  | { readonly policy: "after"; readonly delayMs: number }
+  | { readonly policy: "with-backoff"; readonly minMs: number; readonly maxMs: number };
+
+/** §5.4.4 tag-8 source-chain entry. */
+export interface ContextHop {
+  readonly contextId: string;
+  readonly hopIndex: number;
+  readonly wrappedCode: string;
+}
+
+// --- Per-class detail schemas --------------------------------------------
+
+export type OutletErrorDetail =
+  | { readonly rule: string }
+  | { readonly capability: string }
+  | { readonly fieldPath: string; readonly violation: string }
+  | { readonly elapsedMs: number }
+  | { readonly panicLocationHash: string }
+  | { readonly needed: number; readonly currency: string }
+  | { readonly adapterId: string }
+  | { readonly retryAfterSecs: number }
+  | { readonly relayUrlKind: "wss" | "ws-loopback" | "unknown" }
+  | { readonly action: string }
+  | Record<string, never>;
+
+/** Per-class detail-shape conformance — wire-layer rejection. */
+function validateDetailShape(class_: OutletErrorClassWire, detail: unknown): void {
+  if (detail === undefined || detail === null) return;
+  if (typeof detail !== "object" || Array.isArray(detail)) {
+    throw new ValidationError(
+      `OutletError.detail must be object, got ${typeof detail}`,
+      "SCP-VALID-7000",
+    );
+  }
+  const keys = Object.keys(detail).sort();
+  const matches = (expected: string[]): boolean =>
+    keys.length === expected.length && keys.every((k, i) => k === expected[i]);
+  let ok = false;
+  if (class_ === "protocol") {
+    ok = matches(["rule"]);
+  } else if (class_ === "authorization") {
+    ok = matches(["capability"]);
+  } else if (class_ === "governance") {
+    ok = matches(["action"]);
+  } else if (class_ === "input" || class_ === "output") {
+    ok = matches(["fieldPath", "violation"]);
+  } else if (class_ === "execution") {
+    ok = keys.length === 0 || matches(["elapsedMs"]) || matches(["panicLocationHash"]);
+  } else if (class_ === "economic") {
+    ok = matches(["adapterId"]) || matches(["currency", "needed"]);
+  } else if (class_ === "transport") {
+    ok = matches(["retryAfterSecs"]) || matches(["relayUrlKind"]);
+  }
+  if (!ok) {
+    throw new ValidationError(
+      `OutletError.detail shape mismatch for class "${class_}"`,
+      "SCP-VALID-7000",
+    );
+  }
+}
+
+// --- PII redaction --------------------------------------------------------
+
+const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
+const DID_RE = /did:(dht|web|key):[A-Za-z0-9._-]+/g;
+
+/** Redact emails and DIDs before surfacing `message` to logs. */
+export function redactPii(message: string): string {
+  if (typeof message !== "string") return message as unknown as string;
+  return message.replace(EMAIL_RE, "[redacted]").replace(DID_RE, "[redacted]");
+}
+
+// --- Options-object input for `OutletError.new` ---------------------------
+
+export interface OutletErrorNewOpts {
+  readonly outletId: OutletId;
+  readonly catalogKey: CatalogKey;
+  readonly class: OutletErrorClassWire;
+  readonly code?: string;
+  readonly slug?: string;
+  readonly retry?: RetryPolicy;
+  readonly detail?: OutletErrorDetail;
+  readonly sourceChain?: readonly ContextHop[];
+  readonly padNonce?: Uint8Array;
+  readonly registrationEventId?: Uint8Array;
+}
+
+// --- OutletError base + concrete subclasses ------------------------------
+
+/**
+ * Base class for the §5.4.4 sealed outlet-error hierarchy.
+ *
+ * Concrete subclasses each carry a static `code` and a static `class` tag;
+ * legacy callers may still construct `new OutletError(message, code)`
+ * directly, in which case the instance is treated as a generic outlet-class
+ * error (no `class` discriminant is set).
+ */
+export class OutletError extends ScpError {
+  /** Static class-tag string used by the runtime guards. */
+  static readonly scpClassTag: string = "OutletError";
+
+  /** Wire-form `OutletErrorClass` for this concrete subclass. Empty on the
+   *  abstract-ish base. Subclasses override to one of the eight values. */
+  readonly classWire: OutletErrorClassWire | null;
+
+  readonly slug: string | undefined;
+  readonly retry: RetryPolicy | undefined;
+  readonly detail: OutletErrorDetail | undefined;
+  readonly sourceChain: readonly ContextHop[];
+  readonly padNonce: Uint8Array | undefined;
+  readonly registrationEventId: Uint8Array | undefined;
+
+  constructor(
+    message: string,
+    code: string,
+    extra?: {
+      classWire?: OutletErrorClassWire | null;
+      slug?: string | undefined;
+      retry?: RetryPolicy | undefined;
+      detail?: OutletErrorDetail | undefined;
+      sourceChain?: readonly ContextHop[];
+      padNonce?: Uint8Array | undefined;
+      registrationEventId?: Uint8Array | undefined;
+    },
+  ) {
+    super(redactPii(message), code);
+    this.name = "OutletError";
+    this.classWire = extra?.classWire ?? null;
+    this.slug = extra?.slug;
+    this.retry = extra?.retry;
+    this.detail = extra?.detail;
+    this.sourceChain = extra?.sourceChain ?? [];
+    this.padNonce = extra?.padNonce;
+    this.registrationEventId = extra?.registrationEventId;
+  }
+
+  /**
+   * Construct a typed concrete subclass from a keyword-only options object.
+   * `outletId` and `catalogKey` are adjacent string arguments — the
+   * options-object shape eliminates the round-6 swap-risk.
+   */
+  static new(opts: OutletErrorNewOpts): OutletError {
+    if (!OUTLET_ERROR_CLASSES.has(opts.class)) {
+      throw new ValidationError(
+        `unknown OutletErrorClass: ${JSON.stringify(opts.class)}`,
+        "SCP-VALID-7000",
+      );
+    }
+    if (typeof opts.catalogKey !== "string" || !CATALOG_KEY_RE.test(opts.catalogKey)) {
+      throw new OutletProtocolError(
+        `catalogKey ${JSON.stringify(opts.catalogKey)} is not a valid CatalogKey`,
+        "SCP-TOOL-6100",
+        { slug: "protocol.malformed-catalog-key", retry: { policy: "never" } },
+      );
+    }
+    if (typeof opts.outletId !== "string" || opts.outletId.length === 0) {
+      throw new ValidationError("outletId must be a non-empty string", "SCP-VALID-7000");
+    }
+    if (opts.detail !== undefined) {
+      validateDetailShape(opts.class, opts.detail);
+    }
+    const Ctor = CLASS_CTOR[opts.class];
+    return new Ctor(redactPii(opts.catalogKey), opts.code ?? Ctor.defaultCode, {
+      classWire: opts.class,
+      slug: opts.slug ?? opts.catalogKey,
+      retry: opts.retry ?? { policy: "never" },
+      detail: opts.detail,
+      sourceChain: opts.sourceChain ?? [],
+      padNonce: opts.padNonce,
+      registrationEventId: opts.registrationEventId,
+    });
+  }
+
+  /** Serialize to a wire-form object. */
+  toWire(): Record<string, unknown> {
+    const out: Record<string, unknown> = {
+      code: this.code,
+      slug: this.slug,
+      class: this.classWire,
+      message: this.message,
+      retry: this.retry ?? { policy: "never" },
+      sourceChain: this.sourceChain,
+    };
+    if (this.detail !== undefined) out.detail = this.detail;
+    if (this.padNonce !== undefined) out.padNonce = bytesToHex(this.padNonce);
+    if (this.registrationEventId !== undefined)
+      out.registrationEventId = bytesToHex(this.registrationEventId);
+    return out;
+  }
+
+  /** Deserialize from a wire-form object — re-types into the right subclass. */
+  static fromWire(value: Record<string, unknown>): OutletError {
+    const class_ = String(value.class ?? "").toLowerCase() as OutletErrorClassWire;
+    if (!OUTLET_ERROR_CLASSES.has(class_)) {
+      throw new ValidationError(
+        `unknown OutletErrorClass on wire: ${JSON.stringify(value.class)}`,
+        "SCP-VALID-7000",
+      );
+    }
+    if (value.detail !== undefined) {
+      validateDetailShape(class_, value.detail);
+    }
+    const Ctor = CLASS_CTOR[class_];
+    const padNonce = typeof value.padNonce === "string" ? hexToBytes(value.padNonce) : undefined;
+    const regId =
+      typeof value.registrationEventId === "string"
+        ? hexToBytes(value.registrationEventId)
+        : undefined;
+    return new Ctor(String(value.message ?? ""), String(value.code ?? Ctor.defaultCode), {
+      classWire: class_,
+      slug: value.slug !== undefined ? String(value.slug) : undefined,
+      retry: (value.retry ?? { policy: "never" }) as RetryPolicy,
+      detail: value.detail as OutletErrorDetail | undefined,
+      sourceChain: (value.sourceChain ?? []) as readonly ContextHop[],
+      padNonce,
+      registrationEventId: regId,
+    });
+  }
+
+  // --- Runtime type guards (factory-fallback path) ----------------------
+
+  static isOutletError(err: unknown): err is OutletError {
+    if (err instanceof OutletError) return true;
+    // Realm-crossing fallback: any object whose `scpClassTag` matches one
+    // of the known outlet-hierarchy class tags is treated as an
+    // `OutletError`.
+    if (err === null || typeof err !== "object") return false;
+    const tag = (err as { scpClassTag?: unknown }).scpClassTag;
+    return (
+      typeof tag === "string" &&
+      (tag === "OutletError" ||
+        tag === "OutletProtocolError" ||
+        tag === "AuthorizationError" ||
+        tag === "InputError" ||
+        tag === "ExecutionError" ||
+        tag === "OutputError" ||
+        tag === "EconomicError" ||
+        tag === "OutletTransportError" ||
+        tag === "OutletGovernanceError" ||
+        tag === "InvalidGrant")
+    );
+  }
+  static isOutletProtocolError(err: unknown): err is OutletProtocolError {
+    return err instanceof OutletProtocolError || hasScpClassTag(err, "OutletProtocolError");
+  }
+  static isAuthorizationError(err: unknown): err is AuthorizationError {
+    return err instanceof AuthorizationError || hasScpClassTag(err, "AuthorizationError");
+  }
+  static isInputError(err: unknown): err is InputError {
+    return err instanceof InputError || hasScpClassTag(err, "InputError");
+  }
+  static isExecutionError(err: unknown): err is ExecutionError {
+    return err instanceof ExecutionError || hasScpClassTag(err, "ExecutionError");
+  }
+  static isOutputError(err: unknown): err is OutputError {
+    return err instanceof OutputError || hasScpClassTag(err, "OutputError");
+  }
+  static isEconomicError(err: unknown): err is EconomicError {
+    return err instanceof EconomicError || hasScpClassTag(err, "EconomicError");
+  }
+  static isOutletTransportError(err: unknown): err is OutletTransportError {
+    return err instanceof OutletTransportError || hasScpClassTag(err, "OutletTransportError");
+  }
+  static isOutletGovernanceError(err: unknown): err is OutletGovernanceError {
+    return err instanceof OutletGovernanceError || hasScpClassTag(err, "OutletGovernanceError");
+  }
+  static isInvalidGrant(err: unknown): err is InvalidGrant {
+    return err instanceof InvalidGrant || hasScpClassTag(err, "InvalidGrant");
+  }
+}
+
+function hasScpClassTag(err: unknown, tag: string): boolean {
+  if (err === null || typeof err !== "object") return false;
+  const candidate = (err as { scpClassTag?: unknown }).scpClassTag;
+  return typeof candidate === "string" && candidate === tag;
+}
+
+type OutletErrorCtor = (new (
+  message: string,
+  code: string,
+  extra?: ConstructorParameters<typeof OutletError>[2],
+) => OutletError) & { defaultCode: string };
+
+/** §5.4.4 `Protocol` class — registration / validation / classification. */
+export class OutletProtocolError extends OutletError {
+  static readonly scpClassTag: string = "OutletProtocolError";
+  static readonly defaultCode: string = "SCP-TOOL-6100";
+  constructor(
+    message: string,
+    code: string = OutletProtocolError.defaultCode,
+    extra?: ConstructorParameters<typeof OutletError>[2],
+  ) {
+    super(message, code, { ...extra, classWire: extra?.classWire ?? "protocol" });
+    this.name = "OutletProtocolError";
+    (this as unknown as { scpClassTag: string }).scpClassTag = "OutletProtocolError";
+  }
+}
+
+/** §5.4.4 `Authorization` class. */
+export class AuthorizationError extends OutletError {
+  static readonly scpClassTag: string = "AuthorizationError";
+  static readonly defaultCode: string = "SCP-TOOL-6110";
+  constructor(
+    message: string,
+    code: string = AuthorizationError.defaultCode,
+    extra?: ConstructorParameters<typeof OutletError>[2],
+  ) {
+    super(message, code, { ...extra, classWire: extra?.classWire ?? "authorization" });
+    this.name = "AuthorizationError";
+    (this as unknown as { scpClassTag: string }).scpClassTag = "AuthorizationError";
+  }
+}
+
+/** §5.4.4 `Input` class. */
+export class InputError extends OutletError {
+  static readonly scpClassTag: string = "InputError";
+  static readonly defaultCode: string = "SCP-TOOL-6120";
+  constructor(
+    message: string,
+    code: string = InputError.defaultCode,
+    extra?: ConstructorParameters<typeof OutletError>[2],
+  ) {
+    super(message, code, { ...extra, classWire: extra?.classWire ?? "input" });
+    this.name = "InputError";
+    (this as unknown as { scpClassTag: string }).scpClassTag = "InputError";
+  }
+}
+
+/** §5.4.4 `Execution` class. */
+export class ExecutionError extends OutletError {
+  static readonly scpClassTag: string = "ExecutionError";
+  static readonly defaultCode: string = "SCP-TOOL-6130";
+  constructor(
+    message: string,
+    code: string = ExecutionError.defaultCode,
+    extra?: ConstructorParameters<typeof OutletError>[2],
+  ) {
+    super(message, code, { ...extra, classWire: extra?.classWire ?? "execution" });
+    this.name = "ExecutionError";
+    (this as unknown as { scpClassTag: string }).scpClassTag = "ExecutionError";
+  }
+}
+
+/** §5.4.4 `Output` class. */
+export class OutputError extends OutletError {
+  static readonly scpClassTag: string = "OutputError";
+  static readonly defaultCode: string = "SCP-TOOL-6140";
+  constructor(
+    message: string,
+    code: string = OutputError.defaultCode,
+    extra?: ConstructorParameters<typeof OutletError>[2],
+  ) {
+    super(message, code, { ...extra, classWire: extra?.classWire ?? "output" });
+    this.name = "OutputError";
+    (this as unknown as { scpClassTag: string }).scpClassTag = "OutputError";
+  }
+}
+
+/** §5.4.4 `Economic` class. */
+export class EconomicError extends OutletError {
+  static readonly scpClassTag: string = "EconomicError";
+  static readonly defaultCode: string = "SCP-TOOL-6150";
+  constructor(
+    message: string,
+    code: string = EconomicError.defaultCode,
+    extra?: ConstructorParameters<typeof OutletError>[2],
+  ) {
+    super(message, code, { ...extra, classWire: extra?.classWire ?? "economic" });
+    this.name = "EconomicError";
+    (this as unknown as { scpClassTag: string }).scpClassTag = "EconomicError";
+  }
+}
+
+/**
+ * §5.4.4 `Transport` class. Suffixed `Outlet` to disambiguate from the
+ * top-level `TransportError` legacy category class.
+ */
+export class OutletTransportError extends OutletError {
+  static readonly scpClassTag: string = "OutletTransportError";
+  static readonly defaultCode: string = "SCP-TOOL-6160";
+  constructor(
+    message: string,
+    code: string = OutletTransportError.defaultCode,
+    extra?: ConstructorParameters<typeof OutletError>[2],
+  ) {
+    super(message, code, { ...extra, classWire: extra?.classWire ?? "transport" });
+    this.name = "OutletTransportError";
+    (this as unknown as { scpClassTag: string }).scpClassTag = "OutletTransportError";
+  }
+}
+
+/** §5.4.4 `Governance` class. */
+export class OutletGovernanceError extends OutletError {
+  static readonly scpClassTag: string = "OutletGovernanceError";
+  static readonly defaultCode: string = "SCP-TOOL-6170";
+  constructor(
+    message: string,
+    code: string = OutletGovernanceError.defaultCode,
+    extra?: ConstructorParameters<typeof OutletError>[2],
+  ) {
+    super(message, code, { ...extra, classWire: extra?.classWire ?? "governance" });
+    this.name = "OutletGovernanceError";
+    (this as unknown as { scpClassTag: string }).scpClassTag = "OutletGovernanceError";
+  }
+}
+
+/**
+ * Round-6 unified zero-credit-grant rejection. Lives under
+ * `OutletProtocolError` so all four SDKs surface the same exception class
+ * (replaces the per-language `RangeError` / `ValueError` /
+ * `IllegalArgumentException` inconsistency that round-5 shipped).
+ */
+export class InvalidGrant extends OutletProtocolError {
+  static override readonly scpClassTag: string = "InvalidGrant";
+  static override readonly defaultCode = "SCP-TOOL-6101";
+  readonly grant: number;
+  constructor(grant: number) {
+    super(`invalid grant ${grant}: must be in (0, 2^32 - 1]`, InvalidGrant.defaultCode, {
+      slug: "protocol.invalid-grant",
+      retry: { policy: "never" },
+    });
+    this.name = "InvalidGrant";
+    (this as unknown as { scpClassTag: string }).scpClassTag = "InvalidGrant";
+    this.grant = grant;
+  }
+}
+
+const CLASS_CTOR: Record<OutletErrorClassWire, OutletErrorCtor> = {
+  protocol: OutletProtocolError as unknown as OutletErrorCtor,
+  authorization: AuthorizationError as unknown as OutletErrorCtor,
+  input: InputError as unknown as OutletErrorCtor,
+  execution: ExecutionError as unknown as OutletErrorCtor,
+  output: OutputError as unknown as OutletErrorCtor,
+  economic: EconomicError as unknown as OutletErrorCtor,
+  transport: OutletTransportError as unknown as OutletErrorCtor,
+  governance: OutletGovernanceError as unknown as OutletErrorCtor,
+};
+
+// --- Legacy aliases for pre-OUT-031 code ---------------------------------
+
+/**
+ * Pre-OUT-031 leaf class — referenced outlet does not exist. Now an alias
+ * for `OutletProtocolError` so existing call-sites keep compiling.
+ */
+export class OutletNotFoundError extends OutletProtocolError {
+  constructor(message: string, code = "SCP-TOOL-6100") {
+    super(message, code);
+    this.name = "OutletNotFoundError";
+    (this as unknown as { scpClassTag: string }).scpClassTag = "OutletNotFoundError";
+  }
+}
+
+/**
+ * Pre-OUT-031 leaf class — execution failure. Now an alias for
+ * `ExecutionError` so existing call-sites keep compiling. The pre-redesign
+ * default code `SCP-TOOL-6200` lies outside the §5.4.4 6100-6199 sub-block;
+ * round-6 ``OutletError.new()`` does not emit this code, but the legacy
+ * shim retains it for back-compat with stored logs.
+ */
+export class OutletExecutionError extends ExecutionError {
+  constructor(message: string, code = "SCP-TOOL-6200") {
+    super(message, code);
+    this.name = "OutletExecutionError";
+    (this as unknown as { scpClassTag: string }).scpClassTag = "OutletExecutionError";
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bridge error parser
+// ---------------------------------------------------------------------------
+
 type ScpErrorConstructor = new (message: string, code: string) => ScpError;
 
 const ERROR_PREFIX_MAP: ReadonlyArray<readonly [string, ScpErrorConstructor]> = [
@@ -242,7 +789,7 @@ const ERROR_PREFIX_MAP: ReadonlyArray<readonly [string, ScpErrorConstructor]> = 
   ["SCP-PERM-", UcanPermissionError],
   ["SCP-CRYPTO-", CryptoError],
   ["SCP-TRANS-", TransportError],
-  ["SCP-TOOL-", OutletError],
+  ["SCP-TOOL-", OutletProtocolError],
   ["SCP-VALID-", ValidationError],
   ["SCP-STORAGE-", StorageError],
   ["SCP-ATTEST-", AttestationError],
@@ -251,17 +798,6 @@ const ERROR_PREFIX_MAP: ReadonlyArray<readonly [string, ScpErrorConstructor]> = 
   ["SCP-ECON-", EconomyError],
 ];
 
-/**
- * Per-code overrides used when a specific error code maps to a more
- * specific subclass than its category prefix would suggest. The map is
- * checked BEFORE the prefix walk so a single ECON code can resolve to
- * `EconomicPolicyUnsupportedOnWasm` rather than the generic
- * `EconomyError`.
- *
- * Today this only carries the C2 fail-closed gate codes (SCP-ECON-12095
- * and SCP-ECON-12096). Add new entries when a code needs an inheritance-
- * specific subclass that the bracketed prefix alone cannot select.
- */
 const ERROR_CODE_OVERRIDES: ReadonlyMap<string, ScpErrorConstructor> = new Map<
   string,
   ScpErrorConstructor
@@ -273,33 +809,50 @@ const ERROR_CODE_OVERRIDES: ReadonlyMap<string, ScpErrorConstructor> = new Map<
 /**
  * Parses a bridge error message and constructs the appropriate `ScpError`
  * subclass.
- *
- * Bridge errors follow the format `"[SCP-CATEGORY-NUMBER] description"`.
- * If the error message does not match any known prefix, a generic `ScpError`
- * is returned. Specific error codes may be promoted to a finer-grained
- * subclass via [`ERROR_CODE_OVERRIDES`].
- *
- * @param error - The raw error from the bridge layer (Error, string, or unknown).
- * @returns A typed `ScpError` subclass instance.
  */
 export function mapBridgeError(error: unknown): ScpError {
   const message = error instanceof Error ? error.message : String(error);
-
-  // Try to extract the bracketed error code: "[SCP-IDENT-1001]"
   const codeMatch = /\[([A-Z]+-[A-Z]+-\d+)\]/.exec(message);
   const code = codeMatch?.[1] ?? "SCP-UNKNOWN-0000";
 
-  // Code-specific override (e.g. C2 fail-closed gate).
   const Override = ERROR_CODE_OVERRIDES.get(code);
   if (Override !== undefined) {
     return new Override(message, code);
   }
-
   for (const [prefix, ErrorClass] of ERROR_PREFIX_MAP) {
     if (code.startsWith(prefix)) {
       return new ErrorClass(message, code);
     }
   }
-
   return new ScpError(message, code);
 }
+
+// ---------------------------------------------------------------------------
+// Hex helpers (used by toWire / fromWire)
+// ---------------------------------------------------------------------------
+
+function bytesToHex(bytes: Uint8Array): string {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i] ?? 0;
+    out += b.toString(16).padStart(2, "0");
+  }
+  return out;
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  if (hex.length % 2 !== 0) {
+    throw new ValidationError("hex string has odd length", "SCP-VALID-7000");
+  }
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const byte = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    if (Number.isNaN(byte)) {
+      throw new ValidationError("invalid hex digit", "SCP-VALID-7000");
+    }
+    out[i] = byte;
+  }
+  return out;
+}
+
+// (Buffer is imported at the top of the file.)

@@ -293,10 +293,15 @@ def _translate_bridge_error(exc: Exception) -> Exception:
     """Translate a ``_scp_core`` bridge exception to an SDK exception."""
     sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
     message = str(exc)
-    if sdk_cls is OutletError:
-        if "not found" in message.lower():
+    # Pre-OUT-031: ``OutletError`` was a concrete class; the bridge mapped
+    # ``ToolError`` and ``OutletError`` here. Post-OUT-031 ``OutletError`` is
+    # abstract and the map points at ``OutletProtocolError``. Walk the issubclass
+    # chain so the legacy ``not found`` / ``execution`` heuristics keep firing.
+    if isinstance(sdk_cls, type) and issubclass(sdk_cls, OutletError):
+        lowered = message.lower()
+        if "not found" in lowered:
             return OutletNotFoundError(message)
-        if "execution" in message.lower() or "failed" in message.lower():
+        if "execution" in lowered or "failed" in lowered:
             return OutletExecutionError(message)
     return sdk_cls(message)
 

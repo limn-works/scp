@@ -134,13 +134,66 @@ public func newSessionId(now: Date = Date()) -> SessionId {
 
 /// Outlet registration, invocation, or verification errors.
 ///
+/// The §5.4.4 sealed error taxonomy is rendered as Swift `enum` cases with
+/// associated values per `OutletErrorClass` variant — the eight new cases
+/// (`protocol(_:)`, `authorization(_:)`, ...) carry the typed envelope per
+/// SCP-OUT-031. The pre-redesign cases (`notFound`, `executionFailed`,
+/// `validation`, `unauthorized`, `bridge`) are preserved verbatim so
+/// existing call sites keep compiling.
+///
 /// Error-code prefix remains `SCP-TOOL-*` (§9.18 — registered namespace).
 public enum OutletError: Error, Sendable, Equatable {
+    // Pre-OUT-031 cases (legacy back-compat).
     case notFound(message: String, code: String)
     case executionFailed(message: String, code: String)
     case validation(message: String, code: String)
     case unauthorized(message: String, code: String)
     case bridge(message: String, code: String)
+
+    // §5.4.4 sealed-hierarchy cases — one per `OutletErrorClass` variant.
+    case `protocol`(OutletEnvelope)
+    case authorization(OutletEnvelope)
+    case input(OutletEnvelope)
+    case execution(OutletEnvelope)
+    case output(OutletEnvelope)
+    case economic(OutletEnvelope)
+    case transport(OutletEnvelope)
+    case governance(OutletEnvelope)
+
+    // Round-6 unified zero-grant rejection — surfaces under the
+    // `protocol(_:)` case so all four SDKs share an `OutletError`-rooted
+    // exception class for the `Credit` zero-rejection rule.
+    case invalidGrant(Credit)
+
+    /// Constructs a typed `OutletError` from a keyword-only options struct
+    /// (§5.4.4 round-6 swap-risk fix). Swift's labeled-argument idiom is
+    /// already unambiguous, but the labelled variant is the only path
+    /// emitted from the SDK so call sites are uniform across SDKs.
+    public static func new(
+        outletId: OutletId,
+        catalogKey: CatalogKey,
+        class: OutletErrorClass,
+        retry: RetryPolicy = .never,
+        detail: OutletErrorDetail? = nil
+    ) throws -> OutletError {
+        let envelope = try OutletEnvelope.makeForCreation(
+            outletId: outletId,
+            catalogKey: catalogKey,
+            classWire: `class`,
+            retry: retry,
+            detail: detail
+        )
+        switch `class` {
+        case .protocol: return .protocol(envelope)
+        case .authorization: return .authorization(envelope)
+        case .input: return .input(envelope)
+        case .execution: return .execution(envelope)
+        case .output: return .output(envelope)
+        case .economic: return .economic(envelope)
+        case .transport: return .transport(envelope)
+        case .governance: return .governance(envelope)
+        }
+    }
 }
 
 // MARK: - Streaming & caveats (§5.4.5, §7.3.8)
