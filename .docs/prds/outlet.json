@@ -1987,7 +1987,7 @@
       "gate": "gate-streaming",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-protocol/src/context/outlets/stream.rs",
         "crates/scp-protocol/src/context/outlets/mod.rs",
