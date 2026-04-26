@@ -135,7 +135,7 @@ This section was originally drafted (commit `efc58ecfd`, 2026-04-25) with a univ
 
 - **TypeScript** (`bindings/typescript/src/scp.ts`): pure helpers MAY be exposed as `SCP` methods or as module-level exports — the choice is TS-local ergonomic. When exposed as methods on `SCP`, the method body routes to a module-level NAPI export, NOT to a method on the underlying `napi-rs` `Scp` class (which does not exist for pure helpers per §1). The class shape is decoration over a free-function FFI.
 
-- **Swift** (`bindings/swift/Sources/SCP/`): pure helpers and per-object methods are both free `pub fn` at the FFI layer. UniFFI does not expose a mechanism to collapse `#[uniffi::Object]` receivers into methods on an unrelated outer object without hand-written shims on both sides. Per ADR-021, UniFFI's generator constraints govern the Swift surface.
+- **Swift** (`bindings/swift/Sources/SCP/`): per-object UniFFI-generated wrappers retained alongside `Scp.swift`. Per ADR-021, UniFFI's generator constraints prevent collapsing `#[uniffi::Object]` receivers into methods on an unrelated outer class without hand-written shims on both sides — so the SDK surface follows the generator's natural shape. Pure helpers surface as free top-level functions; per-object methods stay on their `#[uniffi::Object]` types. The FFI Rust layer for these helpers is governed by §1 (free `pub fn`) and is unaffected by this Swift-side shape choice.
 
 - **WASM** (`crates/scp-ffi/wasm/src/`, consumed by browser TypeScript): pure helpers are free `#[wasm_bindgen] pub fn` exports. ADR-034 prohibits the full `BridgeInstance` surface in WASM; the wasm-bindgen idiom favors free function exports for stateless utilities.
 
