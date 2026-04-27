@@ -59,6 +59,14 @@ class McpAllowlistTest {
     @AfterEach
     fun tearDown() {
         if (!this::scp.isInitialized) return
+        shutdownInstance(scp)
+    }
+
+    /// Shuts down [instance] using a fresh [CoroutineBridge] over the
+    /// stub native bindings. Centralizes the cleanup pattern so changes
+    /// to dispatcher wiring or shutdown timeout land in one place. See
+    /// [ConformanceStubBindings] for the no-op shutdown surface.
+    private fun shutdownInstance(instance: SCP) {
         runBlocking {
             val bridge =
                 works.limn.scp.bridge.CoroutineBridge(
@@ -66,7 +74,7 @@ class McpAllowlistTest {
                     ioDispatcher = kotlinx.coroutines.Dispatchers.IO,
                     cpuDispatcher = kotlinx.coroutines.Dispatchers.Default,
                 )
-            scp.shutdown(bridge, 1.seconds)
+            instance.shutdown(bridge, 1.seconds)
         }
     }
 
@@ -100,15 +108,7 @@ class McpAllowlistTest {
             // Default allow set is identical on each fresh instance.
             assertEquals(aState.allowed.toSet(), bState.allowed.toSet())
         } finally {
-            runBlocking {
-                val bridge =
-                    works.limn.scp.bridge.CoroutineBridge(
-                        nativeBindings = works.limn.scp.conformance.ConformanceStubBindings(),
-                        ioDispatcher = kotlinx.coroutines.Dispatchers.IO,
-                        cpuDispatcher = kotlinx.coroutines.Dispatchers.Default,
-                    )
-                other.shutdown(bridge, 1.seconds)
-            }
+            shutdownInstance(other)
         }
     }
 }
