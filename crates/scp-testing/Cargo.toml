@@ -76,6 +76,10 @@ name = "outlet_error_conformance"
 path = "tests/integration/outlet_error_conformance.rs"
 
 [[test]]
+name = "cross_context_error_wrapping"
+path = "tests/integration/cross_context_error_wrapping.rs"
+
+[[test]]
 name = "encrypted_relay_roundtrip"
 path = "tests/integration/encrypted_relay_roundtrip.rs"
 

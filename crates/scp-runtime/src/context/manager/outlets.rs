@@ -4457,12 +4457,30 @@ pub struct CrossContextStreamCompletion {
     pub stream_manifest_hash: [u8; 32],
 }
 
+/// Membership-test closure used by the bridge wrap-view (SCP-OUT-029).
+///
+/// Returns `true` iff the source observer is a member of the given context
+/// id. Owned (`Arc`) so the closure can be cloned into the spawned bridge
+/// task. Implementations capture the source context's
+/// `GovernanceState::active_members` set.
+pub type BridgeMemberClosure = std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+/// Hop-salt-lookup closure used by the bridge wrap-view (SCP-OUT-029).
+///
+/// Returns the per-pair `hop_salt: [u8; 32]` for the source observer's
+/// interface with the given peer context id, or `None` if no salt is
+/// known. Owned (`Arc`) so the closure can be cloned into the spawned
+/// bridge task. Implementations look up
+/// `derive_hop_salt_from_committed_ikms` from the per-context
+/// `InterfaceEstablished` event log entries (§6.2.0.1 step 4).
+pub type BridgeHopSaltClosure = std::sync::Arc<dyn Fn(&str) -> Option<[u8; 32]> + Send + Sync>;
+
 /// Inputs to [`invoke_outlet_cross_context`].
 ///
 /// Owned values mirror the `OutletStreamOpen` wire layout (§5.4.5) plus the
 /// cross-context bridge's source/target context identifiers and operator
 /// signing keys.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct CrossContextInvokeInputs {
     /// Source (invoker's) context id. Re-issued chunks bind this id into
     /// their per-chunk signature preimage (§5.4.5).
@@ -4491,7 +4509,7 @@ pub struct CrossContextInvokeInputs {
     /// Source-context operator's signing key. The bridge re-signs every
     /// re-issued chunk with this key so source-context members verify
     /// chunks against the same operator they trust for direct outlets.
-    pub source_operator_key: Box<ed25519_dalek::SigningKey>,
+    pub source_operator_key: std::sync::Arc<ed25519_dalek::SigningKey>,
     /// `aggregate_schema` to validate `End.aggregate` against, if any
     /// (§5.4.5). Falls back to `output_schema` per the spec rule.
     pub aggregate_schema: Option<serde_json::Value>,
@@ -4500,33 +4518,213 @@ pub struct CrossContextInvokeInputs {
     pub output_schema: serde_json::Value,
     /// Caller-side invoker DID, recorded into both events.
     pub invoker_did: String,
+    // ---------------------------------------------------------------
+    // SCP-OUT-029 — wrap-view inputs for terminal-error envelopes
+    // ---------------------------------------------------------------
+    /// Membership predicate for the source observer (§5.4.4). Drives
+    /// per-hop pseudonymization in [`wrap_cross_context_error`]: hops
+    /// the observer is a member of stay raw, others are HMAC-pseudonymized
+    /// under the per-pair `hop_salt`.
+    pub source_member_of_context: BridgeMemberClosure,
+    /// Per-pair `hop_salt` lookup for the source observer (§6.2.0.1).
+    /// Returns the 32-byte salt for the observer's interface with a
+    /// given peer context, or `None` if no salt is established. The
+    /// wrap function falls back to an all-zero salt when `None` so the
+    /// on-wire 32-byte pseudonym shape is preserved.
+    pub source_hop_salts: BridgeHopSaltClosure,
+    /// Source observer's UCAN-validated stems on the innermost outlet
+    /// id. Drives §5.4.4 round-3 oracle collapse — callers without any
+    /// stem see the collapsed `authorization.denied` slug.
+    pub source_outer_caller_stems: OuterCallerStems,
+    /// Innermost outlet's [`OutletKind`], when known. `None` triggers
+    /// stem-based collapse for callers without any matching stem.
+    pub inner_outlet_kind: Option<OutletKind>,
+    /// `min(ContextParams::max_chain_depth, MAX_TRAIL_PAD_DEPTH)` —
+    /// the §5.4.4 round-5 trail-pad cap (≤ 16 by protocol invariant).
+    pub max_padded_trail_depth: u8,
+}
+
+impl std::fmt::Debug for CrossContextInvokeInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Closures are not `Debug`; we render every other field and
+        // mark the closures as opaque so log output stays useful and
+        // structurally complete.
+        f.debug_struct("CrossContextInvokeInputs")
+            .field("source_context_id", &self.source_context_id)
+            .field("target_context_id", &self.target_context_id)
+            .field("outlet_id", &self.outlet_id)
+            .field("source_caveats_binding", &self.source_caveats_binding)
+            .field("target_caveats_binding", &self.target_caveats_binding)
+            .field("chain_depth", &self.chain_depth)
+            .field("stream_epoch", &self.stream_epoch)
+            .field("source_operator_key", &"<SigningKey>")
+            .field("aggregate_schema", &self.aggregate_schema)
+            .field("output_schema", &self.output_schema)
+            .field("invoker_did", &self.invoker_did)
+            .field("source_member_of_context", &"<closure>")
+            .field("source_hop_salts", &"<closure>")
+            .field("source_outer_caller_stems", &self.source_outer_caller_stems)
+            .field("inner_outlet_kind", &self.inner_outlet_kind)
+            .field("max_padded_trail_depth", &self.max_padded_trail_depth)
+            .finish()
+    }
+}
+
+/// Wraps a fresh terminal [`OutletError`] envelope through SCP-OUT-029
+/// `wrap_cross_context_error` for the source observer, recording the
+/// target-context boundary the error just crossed.
+///
+/// Used by [`synth_bridge_failure_chunk`] and
+/// [`synth_output_violation_chunk`] to guarantee every terminal Error
+/// chunk emitted by `run_cross_context_bridge` carries a typed
+/// envelope with a §5.4.4 `ContextHop` chain, HMAC pseudonymization,
+/// trail-padding, and oracle-collapse rules — instead of a free-form
+/// string.
+///
+/// # Inputs
+///
+/// - `inputs` — the bridge's `CrossContextInvokeInputs`. Supplies the
+///   source observer's membership / hop-salt closures, stems, kind hint,
+///   and `max_padded_trail_depth`.
+/// - `class` — root [`OutletErrorClass`] for the inner error
+///   (§5.4.4 tag 3).
+/// - `code` — `SCP-TOOL-NNNN` per the §5.4.4 6100-6199 sub-block.
+/// - `slug` — slug per the §5.4.4 catalog-key regex.
+/// - `retry` — [`RetryPolicy`] hint.
+///
+/// # Construction model
+///
+/// At the bridge seam the runtime does not have the per-outlet
+/// `outlet_message_key` / `registration_event_id` — the in-process
+/// realization of §6.2.0.5 captures the structural invariants
+/// (envelope shape, hop chain, pseudonymization, oracle collapse) that
+/// the production wire path (with real keying material in scope)
+/// preserves. The inner envelope is constructed via
+/// [`OutletError::from_invocation_error_template`] (placeholder
+/// `outlet_message_key = [0; 32]`, `registration_event_id = [0; 32]`,
+/// fresh CSPRNG `pad_nonce`); the outer hop is then prepended via
+/// [`wrap_cross_context_error`] with `caller_ctx = target_context_id`
+/// and the source observer's view.
+fn wrap_terminal_error_envelope(
+    inputs: &CrossContextInvokeInputs,
+    class: OutletErrorClass,
+    code: &str,
+    slug: &str,
+    retry: scp_protocol::context::outlets::errors::RetryPolicy,
+) -> OutletError {
+    // 1. Build the innermost envelope using the runtime → ContextError
+    //    seam constructor. `from_invocation_error_template` validates
+    //    code/slug against §5.4.4 regex and synthesizes deterministic
+    //    placeholders for `outlet_message_key`/`registration_event_id`.
+    //    On a malformed code/slug we fall back to the §5.4.4 round-3
+    //    collapse target (SCP-TOOL-6110 / authorization.denied) so the
+    //    bridge always emits a structurally valid envelope.
+    let inner = OutletError::from_invocation_error_template(class, code, slug, retry)
+        .unwrap_or_else(|_| {
+            // Collapse target — guaranteed to pass the regex check by
+            // construction, so this `unwrap_or_else` cannot recurse.
+            OutletError::from_invocation_error_template(
+                OutletErrorClass::Authorization,
+                COLLAPSED_AUTHORIZATION_DENIED_CODE,
+                COLLAPSED_AUTHORIZATION_DENIED_SLUG,
+                scp_protocol::context::outlets::errors::RetryPolicy::Never,
+            )
+            .unwrap_or_else(|_| unreachable!(
+                "collapse target SCP-TOOL-6110/authorization.denied is regex-valid by construction"
+            ))
+        });
+
+    // 2. Build the wrap view from the source observer's perspective.
+    //    The observer is `source_context_id`; the new hop being added
+    //    represents the `target_context_id` boundary the error just
+    //    crossed coming back through the bridge.
+    let pad_nonce: [u8; PAD_NONCE_LEN] = rand::random();
+    let view = OutletErrorWrapView {
+        observer_ctx: &inputs.source_context_id,
+        member_of_context: inputs.source_member_of_context.as_ref(),
+        hop_salts: inputs.source_hop_salts.as_ref(),
+        outer_caller_stems: inputs.source_outer_caller_stems,
+        inner_outlet_kind: inputs.inner_outlet_kind,
+        pad_nonce,
+        max_padded_trail_depth: inputs.max_padded_trail_depth,
+    };
+
+    // 3. Prepend the target-context hop. Per §5.4.4 the wrap function
+    //    applies HMAC pseudonymization (when the observer is not a
+    //    member of `target_context_id`), oracle collapse (when the
+    //    observer holds no disambiguating stem on the inner outlet),
+    //    and trail-length padding (when any hop is opaque to the
+    //    observer).
+    wrap_cross_context_error(&inputs.target_context_id, inner, &view)
+}
+
+/// Serializes a wrapped [`OutletError`] envelope into the
+/// [`ChunkPayload::Error.message`](scp_protocol::context::outlets::stream::ChunkPayload::Error)
+/// field as hex-encoded canonical `MessagePack` (§5.4.4 wire form).
+///
+/// The wire schema for `ChunkPayload::Error` keeps `message: String`
+/// (§5.4.5); to carry the typed §5.4.4 envelope through the chunk
+/// payload, we `MessagePack`-encode the envelope and hex-encode the
+/// bytes so the result is a valid UTF-8 String. Receivers reverse the
+/// encoding to recover the typed envelope.
+///
+/// On the (unreachable in practice) `MessagePack` encode failure path
+/// we emit an empty string. The envelope is constructed entirely from
+/// in-memory typed values whose wire schemas are exercised by every
+/// outlet error fixture, so the `Err` branch is dead code.
+fn serialize_wrapped_envelope_to_message(envelope: &OutletError) -> String {
+    rmp_serde::to_vec_named(envelope).map_or_else(|_| String::new(), hex::encode)
 }
 
 /// Synthesizes a terminal cross-context bridge-failure chunk per §5.4.4
 /// (`transport.cross-context-bridge-failure`, `SCP-TOOL-6160`).
+///
+/// Constructs a typed [`OutletError`] envelope, prepends a `ContextHop`
+/// for the target boundary via [`wrap_cross_context_error`], and serializes
+/// it into the chunk's `message` field. SCP-OUT-029 wires the typed envelope
+/// into the §6.2.0.5 cross-context bridge so terminal errors carry the
+/// §5.4.4 wire form (chain, pseudonymization, oracle collapse, trail-pad).
 fn synth_bridge_failure_chunk(
     request_id: &scp_protocol::context::outlets::stream::RequestId,
     sequence: u64,
-    source_context_id: &str,
-    outlet_id: &str,
-    source_caveats_binding: &[u8; 32],
-    source_operator_key: &ed25519_dalek::SigningKey,
+    inputs: &CrossContextInvokeInputs,
     message: &str,
 ) -> scp_protocol::context::outlets::stream::OutletStreamChunk {
-    use scp_protocol::context::outlets::error_codes::CODE_TRANSPORT_FAULT;
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_TRANSPORT_FAULT, SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE,
+    };
+    use scp_protocol::context::outlets::errors::RetryPolicy;
     use scp_protocol::context::outlets::stream::{ChunkPayload, OutletStreamChunk, sign_chunk};
+
+    let envelope = wrap_terminal_error_envelope(
+        inputs,
+        OutletErrorClass::Transport,
+        CODE_TRANSPORT_FAULT,
+        SLUG_TRANSPORT_CROSS_CONTEXT_BRIDGE_FAILURE,
+        RetryPolicy::WithBackoff {
+            min: std::time::Duration::from_secs(1),
+            max: std::time::Duration::from_secs(30),
+        },
+    );
+    // Bind the wrapped envelope's outermost code into the ChunkPayload
+    // so the on-wire `code` field reflects any §5.4.4 round-3 collapse
+    // (e.g., the source observer holds no stem → outer code becomes
+    // SCP-TOOL-6110). The original payload-level `message` field
+    // carries the full typed envelope as hex-encoded MessagePack.
+    let envelope_message = serialize_wrapped_envelope_to_message(&envelope);
+    let _ = message; // kept for future telemetry plumbing
     let payload = ChunkPayload::Error {
-        code: CODE_TRANSPORT_FAULT.to_owned(),
-        message: message.to_owned(),
+        code: envelope.code,
+        message: envelope_message,
         terminal: true,
     };
     let sig = sign_chunk(
-        source_operator_key,
-        source_context_id,
-        outlet_id,
+        &inputs.source_operator_key,
+        &inputs.source_context_id,
+        &inputs.outlet_id,
         request_id,
         sequence,
-        source_caveats_binding,
+        &inputs.source_caveats_binding,
         &payload,
     )
     .unwrap_or([0u8; 64]);
@@ -4540,29 +4738,45 @@ fn synth_bridge_failure_chunk(
 
 /// Synthesizes a terminal output-violation chunk per §5.4.4
 /// (`output.schema-violation`, `SCP-TOOL-6140`).
+///
+/// Constructs a typed [`OutletError`] envelope, prepends a `ContextHop`
+/// for the target boundary via [`wrap_cross_context_error`], and serializes
+/// it into the chunk's `message` field. SCP-OUT-029 wires the typed envelope
+/// into the §6.2.0.5 cross-context bridge so terminal errors carry the
+/// §5.4.4 wire form (chain, pseudonymization, oracle collapse, trail-pad).
 fn synth_output_violation_chunk(
     request_id: &scp_protocol::context::outlets::stream::RequestId,
     sequence: u64,
-    source_context_id: &str,
-    outlet_id: &str,
-    source_caveats_binding: &[u8; 32],
-    source_operator_key: &ed25519_dalek::SigningKey,
+    inputs: &CrossContextInvokeInputs,
     message: &str,
 ) -> scp_protocol::context::outlets::stream::OutletStreamChunk {
-    use scp_protocol::context::outlets::error_codes::CODE_OUTPUT_VIOLATION;
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_OUTPUT_VIOLATION, SLUG_OUTPUT_SCHEMA_VIOLATION,
+    };
+    use scp_protocol::context::outlets::errors::RetryPolicy;
     use scp_protocol::context::outlets::stream::{ChunkPayload, OutletStreamChunk, sign_chunk};
+
+    let envelope = wrap_terminal_error_envelope(
+        inputs,
+        OutletErrorClass::Output,
+        CODE_OUTPUT_VIOLATION,
+        SLUG_OUTPUT_SCHEMA_VIOLATION,
+        RetryPolicy::Never,
+    );
+    let envelope_message = serialize_wrapped_envelope_to_message(&envelope);
+    let _ = message; // kept for future telemetry plumbing
     let payload = ChunkPayload::Error {
-        code: CODE_OUTPUT_VIOLATION.to_owned(),
-        message: message.to_owned(),
+        code: envelope.code,
+        message: envelope_message,
         terminal: true,
     };
     let sig = sign_chunk(
-        source_operator_key,
-        source_context_id,
-        outlet_id,
+        &inputs.source_operator_key,
+        &inputs.source_context_id,
+        &inputs.outlet_id,
         request_id,
         sequence,
-        source_caveats_binding,
+        &inputs.source_caveats_binding,
         &payload,
     )
     .unwrap_or([0u8; 64]);
@@ -4748,20 +4962,6 @@ async fn run_cross_context_bridge(
 ) {
     use scp_protocol::context::outlets::stream::{ChunkPayload, OutletStreamChunk, sign_chunk};
 
-    let CrossContextInvokeInputs {
-        source_context_id,
-        target_context_id,
-        outlet_id,
-        source_caveats_binding,
-        target_caveats_binding: _, // re-pin: bridge converts target → source
-        chain_depth,
-        stream_epoch,
-        source_operator_key,
-        aggregate_schema,
-        output_schema,
-        invoker_did,
-    } = inputs;
-
     let mut next_seq: u64 = 0;
     let mut forwarded: Vec<OutletStreamChunk> = Vec::new();
     let mut chunks_billed: u32 = 0;
@@ -4773,19 +4973,16 @@ async fn run_cross_context_bridge(
 
         // Validate per-chunk payload BEFORE re-signing so a failure
         // produces a terminal Error chunk (still re-signed under the
-        // source operator) and the bridge stops.
-        if let Some(msg) =
-            validate_chunk_payload(&orig.payload, &output_schema, aggregate_schema.as_ref())
-        {
-            let terminal = synth_output_violation_chunk(
-                &request_id,
-                seq,
-                &source_context_id,
-                &outlet_id,
-                &source_caveats_binding,
-                &source_operator_key,
-                &msg,
-            );
+        // source operator) and the bridge stops. The terminal envelope
+        // is wrapped via SCP-OUT-029 `wrap_cross_context_error` so the
+        // chunk carries a typed §5.4.4 envelope with a `ContextHop`
+        // chain, HMAC pseudonymization, and oracle-collapse rules.
+        if let Some(msg) = validate_chunk_payload(
+            &orig.payload,
+            &inputs.output_schema,
+            inputs.aggregate_schema.as_ref(),
+        ) {
+            let terminal = synth_output_violation_chunk(&request_id, seq, &inputs, &msg);
             chunks_billed = chunks_billed.saturating_add(0); // terminal Error doesn't bill
             forwarded.push(terminal.clone());
             let _ = tx.send(terminal).await;
@@ -4799,15 +4996,39 @@ async fn run_cross_context_bridge(
         // this implementation does not model — the structural
         // invariants `aggregate_schema validated`, `chunk type
         // preserved`, `bridge does not buffer`, `sequence monotonic`
-        // are all enforced here regardless).
-        let new_payload = orig.payload.clone();
+        // are all enforced here regardless). For executor-emitted
+        // terminal Error chunks (the target outlet itself returned
+        // an error), we still wrap the typed envelope via
+        // SCP-OUT-029 so the source observer sees the full
+        // `ContextHop` trail through the bridge.
+        let new_payload = match &orig.payload {
+            ChunkPayload::Error {
+                code,
+                terminal: true,
+                ..
+            } => {
+                // Re-wrap an executor-emitted terminal error so the
+                // chain records the target boundary and oracle
+                // collapse / pseudonymization apply at the source
+                // observer's view.
+                let (class, slug, retry) = classify_executor_error(code);
+                let envelope = wrap_terminal_error_envelope(&inputs, class, code, slug, retry);
+                let envelope_message = serialize_wrapped_envelope_to_message(&envelope);
+                ChunkPayload::Error {
+                    code: envelope.code,
+                    message: envelope_message,
+                    terminal: true,
+                }
+            }
+            other => other.clone(),
+        };
         let sig = sign_chunk(
-            &source_operator_key,
-            &source_context_id,
-            &outlet_id,
+            &inputs.source_operator_key,
+            &inputs.source_context_id,
+            &inputs.outlet_id,
             &request_id,
             seq,
-            &source_caveats_binding,
+            &inputs.source_caveats_binding,
             &new_payload,
         )
         .unwrap_or([0u8; 64]);
@@ -4839,10 +5060,7 @@ async fn run_cross_context_bridge(
         let terminal = synth_bridge_failure_chunk(
             &request_id,
             seq,
-            &source_context_id,
-            &outlet_id,
-            &source_caveats_binding,
-            &source_operator_key,
+            &inputs,
             "executor stream ended without terminal chunk",
         );
         forwarded.push(terminal.clone());
@@ -4852,16 +5070,105 @@ async fn run_cross_context_bridge(
     // Suppress unused-binding warnings — these inputs are reserved for
     // production wiring (MLS-epoch keying and the target-side event log
     // dispatch) which lives behind the §6.2.0.5 production seam.
-    let _ = (chain_depth, stream_epoch, target_context_id);
+    let _ = (
+        inputs.chain_depth,
+        inputs.stream_epoch,
+        &inputs.target_context_id,
+    );
 
     let completion = build_completion(
         &forwarded,
         chunks_billed,
         &request_id,
-        &outlet_id,
-        &invoker_did,
+        &inputs.outlet_id,
+        &inputs.invoker_did,
     );
     let _ = event_tx.send(completion);
+}
+
+/// Maps an executor-emitted terminal-error `code` (§5.4.4 6100-6199)
+/// to the `(class, slug, retry)` triple used to construct the wrapped
+/// [`OutletError`] envelope at the bridge seam.
+///
+/// Used by [`run_cross_context_bridge`] to re-wrap an executor-emitted
+/// terminal Error chunk through SCP-OUT-029 `wrap_cross_context_error`.
+/// Unknown codes fall back to the §5.4.4 round-3 collapse target
+/// (`SCP-TOOL-6110` / `authorization.denied`) so the envelope is always
+/// well-formed.
+fn classify_executor_error(
+    code: &str,
+) -> (
+    OutletErrorClass,
+    &'static str,
+    scp_protocol::context::outlets::errors::RetryPolicy,
+) {
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_AUTHORIZATION_DENIED, CODE_ECONOMIC_FAULT, CODE_EXECUTION_CREDIT_STALL,
+        CODE_EXECUTION_FAULT, CODE_GOVERNANCE_FAULT, CODE_INPUT_VIOLATION, CODE_OUTPUT_VIOLATION,
+        CODE_PROTOCOL_VIOLATION, CODE_TRANSPORT_FAULT, SLUG_AUTHORIZATION_DENIED,
+        SLUG_ECONOMIC_INSUFFICIENT_FUNDS, SLUG_EXECUTION_CREDIT_STALL,
+        SLUG_EXECUTION_HANDLER_PANIC, SLUG_GOVERNANCE_OUTLET_DEREGISTERED,
+        SLUG_INPUT_SCHEMA_VIOLATION, SLUG_OUTPUT_SCHEMA_VIOLATION, SLUG_PROTOCOL_VIOLATION,
+        SLUG_TRANSPORT_RELAY_UNAVAILABLE,
+    };
+    use scp_protocol::context::outlets::errors::RetryPolicy;
+    let backoff = || RetryPolicy::WithBackoff {
+        min: std::time::Duration::from_secs(1),
+        max: std::time::Duration::from_secs(30),
+    };
+    match code {
+        c if c == CODE_PROTOCOL_VIOLATION => (
+            OutletErrorClass::Protocol,
+            SLUG_PROTOCOL_VIOLATION,
+            RetryPolicy::Never,
+        ),
+        c if c == CODE_AUTHORIZATION_DENIED => (
+            OutletErrorClass::Authorization,
+            SLUG_AUTHORIZATION_DENIED,
+            RetryPolicy::Never,
+        ),
+        c if c == CODE_INPUT_VIOLATION => (
+            OutletErrorClass::Input,
+            SLUG_INPUT_SCHEMA_VIOLATION,
+            RetryPolicy::Never,
+        ),
+        c if c == CODE_EXECUTION_FAULT => (
+            OutletErrorClass::Execution,
+            SLUG_EXECUTION_HANDLER_PANIC,
+            RetryPolicy::Never,
+        ),
+        c if c == CODE_EXECUTION_CREDIT_STALL => (
+            OutletErrorClass::Execution,
+            SLUG_EXECUTION_CREDIT_STALL,
+            backoff(),
+        ),
+        c if c == CODE_OUTPUT_VIOLATION => (
+            OutletErrorClass::Output,
+            SLUG_OUTPUT_SCHEMA_VIOLATION,
+            RetryPolicy::Never,
+        ),
+        c if c == CODE_ECONOMIC_FAULT => (
+            OutletErrorClass::Economic,
+            SLUG_ECONOMIC_INSUFFICIENT_FUNDS,
+            RetryPolicy::Never,
+        ),
+        c if c == CODE_TRANSPORT_FAULT => (
+            OutletErrorClass::Transport,
+            SLUG_TRANSPORT_RELAY_UNAVAILABLE,
+            backoff(),
+        ),
+        c if c == CODE_GOVERNANCE_FAULT => (
+            OutletErrorClass::Governance,
+            SLUG_GOVERNANCE_OUTLET_DEREGISTERED,
+            RetryPolicy::Never,
+        ),
+        // Unknown code — collapse to §5.4.4 round-3 target.
+        _ => (
+            OutletErrorClass::Authorization,
+            COLLAPSED_AUTHORIZATION_DENIED_SLUG,
+            RetryPolicy::Never,
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -4925,6 +5232,14 @@ mod cross_context_chunk_bridge_tests {
         source_op_key: SigningKey,
         with_aggregate_schema: bool,
     ) -> CrossContextInvokeInputs {
+        // SCP-OUT-029 wrap-view defaults: full visibility (membership of
+        // every named context, both stems on the inner outlet) so the
+        // legacy bridge tests observe un-pseudonymized chains and stable
+        // codes. Tests asserting collapse / pseudonymization construct
+        // their own inputs with restricted closures.
+        let member_of: BridgeMemberClosure =
+            std::sync::Arc::new(|c: &str| matches!(c, "ctx-source" | "ctx-target"));
+        let hop_salts: BridgeHopSaltClosure = std::sync::Arc::new(|_: &str| Some([0xEE; 32]));
         CrossContextInvokeInputs {
             source_context_id: "ctx-source".to_owned(),
             target_context_id: "ctx-target".to_owned(),
@@ -4933,7 +5248,7 @@ mod cross_context_chunk_bridge_tests {
             target_caveats_binding: [0xCD; 32],
             chain_depth: 3,
             stream_epoch: 7,
-            source_operator_key: Box::new(source_op_key),
+            source_operator_key: std::sync::Arc::new(source_op_key),
             aggregate_schema: if with_aggregate_schema {
                 Some(aggregate_schema())
             } else {
@@ -4941,6 +5256,14 @@ mod cross_context_chunk_bridge_tests {
             },
             output_schema: output_schema(),
             invoker_did: "did:dht:z6MkInvoker".to_owned(),
+            source_member_of_context: member_of,
+            source_hop_salts: hop_salts,
+            source_outer_caller_stems: OuterCallerStems {
+                holds_query: true,
+                holds_call: true,
+            },
+            inner_outlet_kind: Some(OutletKind::Action),
+            max_padded_trail_depth: MAX_TRAIL_PAD_DEPTH,
         }
     }
 

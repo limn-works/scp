@@ -125,7 +125,17 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // that contradicts the AC1 spirit (every surface either streams natively
 // via the runtime free function OR is an explicitly-named one-shot
 // collapse). Seven `#[test]` items, +7 to the active count.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 63;
+//
+// Raised 63 -> 64 by SCP-OUT-029 cross-context wrap remediation: adds
+// `cross_context_bridge_wraps_errors` pinning the runtime cross-context
+// bridge body to call `wrap_cross_context_error` so terminal Error
+// chunks carry the §5.4.4 typed envelope (ContextHop chain, HMAC
+// pseudonymization, oracle collapse, trail padding) instead of free-form
+// strings. Prior to this, `synth_output_violation_chunk` /
+// `synth_bridge_failure_chunk` were ghost code — exported but the
+// production return path bypassed them. One `#[test]` item, +1 to the
+// active count.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 64;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -861,6 +871,72 @@ fn invoke_outlet_with_economy_releases_lock_before_executor() {
         "invoke_outlet_with_economy must use lock_context (Phase 1) and \
          relock_context (Phase 3) for per-context locking with generation check"
     );
+}
+
+// --- SCP-OUT-029 cross-context error wrapping ---
+//
+// `wrap_cross_context_error` must be reachable from the production
+// cross-context bridge return path. Prior audit caught this function
+// as ghost code (0 production callers; only test references). With
+// SCP-OUT-029 wired, `run_cross_context_bridge` MUST call the wrap
+// helper for every terminal Error chunk it emits — directly or via
+// the `synth_*_chunk` helpers, which themselves now route through
+// `wrap_terminal_error_envelope -> wrap_cross_context_error`. This
+// assertion pins the wiring so a future refactor cannot silently
+// regress to free-form code+message synthesis without a §5.4.4
+// `ContextHop` chain.
+#[test]
+fn cross_context_bridge_wraps_errors() {
+    // Path 1: `run_cross_context_bridge` body must reference the
+    // wrap path (either via the synth helpers OR a direct call to
+    // wrap_terminal_error_envelope OR wrap_cross_context_error).
+    let bridge_body = extract_fn_body(MANAGER_SRC, "run_cross_context_bridge")
+        .expect("run_cross_context_bridge body must exist");
+    assert!(
+        bridge_body.contains("synth_output_violation_chunk")
+            || bridge_body.contains("wrap_terminal_error_envelope")
+            || bridge_body.contains("wrap_cross_context_error"),
+        "run_cross_context_bridge must wire terminal-Error chunks through \
+         wrap_cross_context_error (directly or via synth_* / \
+         wrap_terminal_error_envelope helpers)"
+    );
+    assert!(
+        bridge_body.contains("synth_bridge_failure_chunk")
+            || bridge_body.contains("wrap_terminal_error_envelope")
+            || bridge_body.contains("wrap_cross_context_error"),
+        "run_cross_context_bridge must wrap mid-stream-disconnect terminals \
+         through wrap_cross_context_error"
+    );
+
+    // Path 2: the synth helpers (if retained) MUST call the wrap
+    // helper. This guards against a future refactor that re-introduces
+    // free-form code+message synthesis under the same name.
+    if let Some(synth_out) = extract_fn_body(MANAGER_SRC, "synth_output_violation_chunk") {
+        assert!(
+            synth_out.contains("wrap_terminal_error_envelope")
+                || synth_out.contains("wrap_cross_context_error"),
+            "synth_output_violation_chunk must call wrap_terminal_error_envelope \
+             or wrap_cross_context_error to attach a ContextHop chain"
+        );
+    }
+    if let Some(synth_bridge) = extract_fn_body(MANAGER_SRC, "synth_bridge_failure_chunk") {
+        assert!(
+            synth_bridge.contains("wrap_terminal_error_envelope")
+                || synth_bridge.contains("wrap_cross_context_error"),
+            "synth_bridge_failure_chunk must call wrap_terminal_error_envelope \
+             or wrap_cross_context_error to attach a ContextHop chain"
+        );
+    }
+
+    // Path 3: the wrap helper itself (if retained) MUST call the
+    // SCP-OUT-029 `wrap_cross_context_error` to apply oracle collapse,
+    // pseudonymization, and trail padding.
+    if let Some(wrap_helper) = extract_fn_body(MANAGER_SRC, "wrap_terminal_error_envelope") {
+        assert!(
+            wrap_helper.contains("wrap_cross_context_error"),
+            "wrap_terminal_error_envelope must call wrap_cross_context_error"
+        );
+    }
 }
 
 // --- Content key rotation (#1548) ---
