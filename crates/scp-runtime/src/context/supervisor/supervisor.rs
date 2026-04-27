@@ -1163,10 +1163,10 @@ impl Supervisor {
     ) -> Result<Outcome<()>, ContextError> {
         // ADR-049 Phase 2A item 5 — try the actor mailbox first for
         // variants whose context_id is visible without unboxing.
-        if let Some(ctx_id) = Self::lifecycle_command_context_id(&cmd) {
-            if let Some(actor) = self.lookup(ctx_id) {
-                return Self::dispatch_via_mailbox(&actor, ContextCommand::Lifecycle(cmd)).await;
-            }
+        if let Some(ctx_id) = Self::lifecycle_command_context_id(&cmd)
+            && let Some(actor) = self.lookup(ctx_id)
+        {
+            return Self::dispatch_via_mailbox(&actor, ContextCommand::Lifecycle(cmd)).await;
         }
         // Direct-shim fallback: lifecycle handler takes `&Supervisor`.
         // `Box::pin` — the combined size of the rebuilt handle,
@@ -1203,10 +1203,10 @@ impl Supervisor {
         cmd: TtlCloseCommand,
     ) -> Result<Outcome<()>, ContextError> {
         // ADR-049 Phase 2A item 5 — try the actor mailbox first.
-        if let Some(ctx_id) = Self::ttl_close_command_context_id(&cmd) {
-            if let Some(actor) = self.lookup(ctx_id) {
-                return Self::dispatch_via_mailbox(&actor, ContextCommand::TtlClose(cmd)).await;
-            }
+        if let Some(ctx_id) = Self::ttl_close_command_context_id(&cmd)
+            && let Some(actor) = self.lookup(ctx_id)
+        {
+            return Self::dispatch_via_mailbox(&actor, ContextCommand::TtlClose(cmd)).await;
         }
         // Direct-shim fallback.
         Ok(handlers::ttl_close::dispatch_from_shim(self, cmd).await)
@@ -1247,10 +1247,10 @@ impl Supervisor {
         cmd: GovernanceCommand,
     ) -> Result<Outcome<()>, ContextError> {
         // ADR-049 Phase 2A item 5 — try the actor mailbox first.
-        if let Some(ctx_id) = Self::governance_command_context_id(&cmd) {
-            if let Some(actor) = self.lookup(ctx_id) {
-                return Self::dispatch_via_mailbox(&actor, ContextCommand::Governance(cmd)).await;
-            }
+        if let Some(ctx_id) = Self::governance_command_context_id(&cmd)
+            && let Some(actor) = self.lookup(ctx_id)
+        {
+            return Self::dispatch_via_mailbox(&actor, ContextCommand::Governance(cmd)).await;
         }
         // Direct-shim fallback. `Box::pin` — see the matching comment
         // on `handlers::governance::dispatch` for the 16-KB stack-
@@ -1449,9 +1449,7 @@ impl Supervisor {
         // state-carrying actor via [`ContextActor::new`].
         let inbox = rx;
         tokio::spawn(async move {
-            crate::context::actor::ContextActor::new_skeleton(ctx_id, inbox)
-                .run()
-                .await;
+            Box::pin(crate::context::actor::ContextActor::new_skeleton(ctx_id, inbox).run()).await;
         });
 
         handle
@@ -1531,9 +1529,7 @@ impl Supervisor {
         // actor's scope.
         let inbox = rx;
         tokio::spawn(async move {
-            crate::context::actor::ContextActor::new(state, deps, inbox)
-                .run()
-                .await;
+            Box::pin(crate::context::actor::ContextActor::new(state, deps, inbox).run()).await;
         });
 
         handle
@@ -1559,10 +1555,10 @@ impl Supervisor {
         cmd: StandingCommand,
     ) -> Result<Outcome<()>, ContextError> {
         // ADR-049 Phase 2A item 5 — try the actor mailbox first.
-        if let Some(ctx_id) = Self::standing_command_context_id(&cmd) {
-            if let Some(actor) = self.lookup(ctx_id) {
-                return Self::dispatch_via_mailbox(&actor, ContextCommand::Standing(cmd)).await;
-            }
+        if let Some(ctx_id) = Self::standing_command_context_id(&cmd)
+            && let Some(actor) = self.lookup(ctx_id)
+        {
+            return Self::dispatch_via_mailbox(&actor, ContextCommand::Standing(cmd)).await;
         }
         // Direct-shim fallback.
         Ok(Box::pin(handlers::standing::dispatch_from_shim(self, cmd)).await)
@@ -1590,10 +1586,10 @@ impl Supervisor {
         cmd: ToolsCommand,
     ) -> Result<Outcome<()>, ContextError> {
         // ADR-049 Phase 2A item 5 — try the actor mailbox first.
-        if let Some(ctx_id) = Self::tools_command_context_id(&cmd) {
-            if let Some(actor) = self.lookup(ctx_id) {
-                return Self::dispatch_via_mailbox(&actor, ContextCommand::Tools(cmd)).await;
-            }
+        if let Some(ctx_id) = Self::tools_command_context_id(&cmd)
+            && let Some(actor) = self.lookup(ctx_id)
+        {
+            return Self::dispatch_via_mailbox(&actor, ContextCommand::Tools(cmd)).await;
         }
         // Direct-shim fallback.
         Ok(handlers::tools::dispatch_from_shim(self, cmd).await)
@@ -1621,10 +1617,10 @@ impl Supervisor {
         cmd: BroadcastCommand,
     ) -> Result<Outcome<()>, ContextError> {
         // ADR-049 Phase 2A item 5 — try the actor mailbox first.
-        if let Some(ctx_id) = Self::broadcast_command_context_id(&cmd) {
-            if let Some(actor) = self.lookup(ctx_id) {
-                return Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(cmd)).await;
-            }
+        if let Some(ctx_id) = Self::broadcast_command_context_id(&cmd)
+            && let Some(actor) = self.lookup(ctx_id)
+        {
+            return Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(cmd)).await;
         }
         // Direct-shim fallback.
         Ok(Box::pin(handlers::broadcast::dispatch_from_shim(self, cmd)).await)
@@ -2802,7 +2798,7 @@ impl Supervisor {
     /// is not visible without unboxing). Used by
     /// [`Self::dispatch_lifecycle_command`] to decide whether to route
     /// through an actor's mailbox.
-    fn lifecycle_command_context_id(cmd: &LifecycleCommand) -> Option<&str> {
+    const fn lifecycle_command_context_id(cmd: &LifecycleCommand) -> Option<&str> {
         match cmd {
             LifecycleCommand::ExportContext { context_id, .. }
             | LifecycleCommand::GenerateContextAccessKey { context_id, .. }
@@ -2824,7 +2820,7 @@ impl Supervisor {
     /// Only variants with a literal `context_id` field are routed via
     /// the mailbox; boxed-payload variants stay on the direct-shim path
     /// until a follow-on Phase 2 chunk destructures them.
-    fn broadcast_command_context_id(cmd: &BroadcastCommand) -> Option<&str> {
+    const fn broadcast_command_context_id(cmd: &BroadcastCommand) -> Option<&str> {
         match cmd {
             BroadcastCommand::HandleBroadcastKeyRequest { context_id, .. }
             | BroadcastCommand::BroadcastSubscriberCount { context_id, .. }
@@ -2845,7 +2841,7 @@ impl Supervisor {
     /// carry it inside boxed payloads. Boxed-payload variants route via
     /// the direct-shim path until a follow-on Phase 2 chunk destructures
     /// them.
-    fn ttl_close_command_context_id(cmd: &TtlCloseCommand) -> Option<&str> {
+    const fn ttl_close_command_context_id(cmd: &TtlCloseCommand) -> Option<&str> {
         match cmd {
             TtlCloseCommand::ExtendTtl { context_id, .. } => Some(context_id.as_str()),
             _ => None,
@@ -2856,7 +2852,7 @@ impl Supervisor {
     /// Most variants have a `context_id` string field; a few carry it
     /// in opaque boxed payloads (those return `None` and route via
     /// the direct-shim path).
-    fn governance_command_context_id(cmd: &GovernanceCommand) -> Option<&str> {
+    const fn governance_command_context_id(cmd: &GovernanceCommand) -> Option<&str> {
         match cmd {
             GovernanceCommand::GetProposal { context_id, .. }
             | GovernanceCommand::ListProposals { context_id, .. }
@@ -2883,12 +2879,12 @@ impl Supervisor {
     /// Phase 2A leaves StandingCommand on the direct-shim path; the
     /// mailbox-routing extension lands when standing-pair sagas land in
     /// a follow-on Phase 2 chunk.
-    fn standing_command_context_id(_cmd: &StandingCommand) -> Option<&str> {
+    const fn standing_command_context_id(_cmd: &StandingCommand) -> Option<&str> {
         None
     }
 
     /// Extract the target context_id from a [`ToolsCommand`].
-    fn tools_command_context_id(cmd: &ToolsCommand) -> Option<&str> {
+    const fn tools_command_context_id(cmd: &ToolsCommand) -> Option<&str> {
         match cmd {
             ToolsCommand::TryConsumeHardRateLimit { context_id, .. }
             | ToolsCommand::RefundHardRateLimit { context_id, .. } => Some(context_id.as_str()),

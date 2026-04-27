@@ -192,6 +192,66 @@ impl SupervisorHandle {
             .cloned()
     }
 
+    /// Return or create the standing context for `local_did` and `peer_did`.
+    ///
+    /// Transitional Phase 2A surface for the standing actor handler:
+    /// the helper can route through the capability-reduced handle
+    /// without receiving `&Supervisor` directly. The implementation
+    /// delegates to the legacy lock-shaped helper until standing-pair
+    /// creation is decomposed into a saga in Phase 2C.
+    pub(crate) async fn standing_context(
+        &self,
+        local_did: &DID,
+        peer_did: &DID,
+    ) -> Result<String, ContextError> {
+        let expected_context_id =
+            crate::context::standing_helpers::generate_standing_context_id(local_did, peer_did);
+        let context_id = crate::context::standing_helpers_legacy::standing_context_legacy(
+            &self.supervisor,
+            local_did,
+            peer_did,
+        )
+        .await?;
+        debug_assert_eq!(context_id, expected_context_id);
+        Ok(context_id)
+    }
+
+    /// Number of supervisor-tracked standing peers.
+    #[must_use]
+    pub(crate) fn standing_context_count(&self) -> usize {
+        self.supervisor.standing_contexts.load().len()
+    }
+
+    /// Whether `peer_did` is registered as a standing peer.
+    #[must_use]
+    pub(crate) fn has_standing_context(&self, peer_did: &DID) -> bool {
+        self.supervisor
+            .standing_contexts
+            .load()
+            .contains_key(peer_did.as_ref())
+    }
+
+    /// Register `peer_did` in the supervisor standing-context index.
+    pub(crate) async fn register_standing_context(&self, peer_did: DID) {
+        let _guard = self.supervisor.write_lock.lock().await;
+        let snapshot = self.supervisor.standing_contexts.load_full();
+        let mut updated: std::collections::HashMap<String, DID> = (*snapshot).clone();
+        updated.insert(peer_did.to_string(), peer_did);
+        self.supervisor
+            .standing_contexts
+            .store(std::sync::Arc::new(updated));
+    }
+
+    /// Reconnect all standing contexts through the supervisor fallback.
+    ///
+    /// Transitional Phase 2A surface; the legacy helper still scans the
+    /// supervisor context map because standing commands are not keyed to
+    /// a single actor until the standing-pair saga lands.
+    pub(crate) async fn reconnect_all_standing(&self) -> Result<usize, ContextError> {
+        crate::context::standing_helpers_legacy::reconnect_all_standing_legacy(&self.supervisor)
+            .await
+    }
+
     /// Look up this identity's wrapping public key. Returns `None` if
     /// the identity has not set a wrapping keypair yet.
     ///
