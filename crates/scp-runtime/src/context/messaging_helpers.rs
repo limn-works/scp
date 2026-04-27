@@ -841,7 +841,12 @@ pub async fn send_message(
         // patch the outer rollback only touched the budget, silently
         // leaking the velocity entry and the hard-rate-limit token.
         if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
+            crate::context::economy_helpers_legacy::void_paid_action_legacy(
+                supervisor,
+                a,
+                &context_id,
+            )
+            .await;
         }
         crate::context::economy_logic::rollback_economy_ticket(
             supervisor,
@@ -1221,7 +1226,7 @@ pub async fn authorize_send_payment(
     context_id: &str,
     sender_did: &DID,
 ) -> Result<Option<crate::context::economy_logic::PaidActionAuthorization>, ContextError> {
-    crate::context::economy_helpers::authorize_paid_action(
+    crate::context::economy_helpers_legacy::authorize_paid_action_legacy(
         supervisor,
         scp_protocol::economy::types::PaidActionType::MessageSend,
         sender_did,
@@ -1270,7 +1275,7 @@ pub async fn capture_send_payment(
     // `NotInitialized` error the inherent forwarder did, so the
     // observable contract is preserved.
     if let Some(a) = auth
-        && let Err(e) = crate::context::economy_helpers::complete_paid_action(
+        && let Err(e) = crate::context::economy_helpers_legacy::complete_paid_action_legacy(
             supervisor, a, sender_did, context_id,
         )
         .await

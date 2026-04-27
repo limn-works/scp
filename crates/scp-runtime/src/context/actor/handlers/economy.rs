@@ -2,43 +2,20 @@
 //! [`EconomyCommand`](crate::context::actor::commands::EconomyCommand)
 //! and spec §19 / plan row 10 of the commit ladder.
 //!
-//! # Commit 10 scope
+//! # Phase 2A.3 — actor-shape dispatch
 //!
-//! Migrates the dispatch shape: the handler takes
-//! `&Arc<ContextManager>` + [`ActorDeps`] + [`EconomyCommand`], returns
-//! `Outcome<()>`.
-//!
-//! The underlying byte-identical implementation still lives on
-//! [`ContextManager::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts).
-//! The shim wraps the delegated call in [`tokio::time::timeout`] with a
-//! 30s budget per ADR-049 §7. The method never returns an error (the
-//! vector of per-receipt results already embeds
-//! [`ReceiptVerificationError`](crate::economy::receipt::ReceiptVerificationError)
-//! variants for each failed receipt), so the handler surfaces timeout
-//! as a synthetic single-element `NoVerifierForAdapter` result
-//! covering every input receipt — legible and matches the per-receipt
-//! error convention.
-//!
-//! Economy's other public-surface methods (`authorize_paid_action`,
-//! `complete_paid_action`, `void_paid_action`) are `pub(super)` —
-//! invoked by the messaging path, not by FFI bridges. They migrate
-//! implicitly with the messaging / lifecycle handlers, not as
-//! dedicated commands.
-//!
-//! # ADR-049 commit 12c.7 — direct dispatch
-//!
-//! Prior to 12c.7 the handler took a `MutationStateView<'_>` borrow
-//! adapter that bundled an `Arc<ContextManager>` reference plus a
-//! mutable scratch send-sequence tracker (the economy path never read
-//! the tracker, but the adapter was uniform across handlers). 12c.7
-//! deletes the adapter: the supervisor passes the
-//! `&Arc<ContextManager>` directly and no scratch tracker is allocated.
+//! The handler's primary entry point [`dispatch`] takes
+//! `(&mut PerContextState, &ActorDeps, EconomyCommand)` and routes to
+//! actor-shaped helpers in [`crate::context::economy_helpers`]. The shim
+//! entry point is retained during Phase 2A and routes through
+//! [`crate::context::economy_helpers_legacy`].
 
 use std::time::Duration;
 
 use crate::context::actor::commands::EconomyCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
+use crate::context::actor::state::PerContextState;
 use crate::context::supervisor::Supervisor;
 use crate::economy::receipt::ReceiptVerificationError;
 use scp_protocol::context::ContextError;
@@ -48,29 +25,14 @@ use tokio::sync::oneshot;
 /// timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch an [`EconomyCommand`] against an attached supervisor + deps
-/// bundle.
-///
-/// Plan-conforming dispatch signature: matches the post-refactor actor
-/// `run()` loop's call shape
-/// (`handlers::economy::dispatch(supervisor, &self.deps, cmd).await`).
-/// `deps` is accepted for symmetry — the economy handler does not yet
-/// touch deps during the shim period. Commit 12 rewires these paths.
-///
-/// # Supervisor receiver (ADR-049 commit 12)
-///
-/// Takes `&Supervisor` so the delegated
-/// [`economy_helpers::verify_payment_receipts`](crate::context::economy_helpers::verify_payment_receipts)
-/// call can read the lifted `payment_adapter` slot directly off the
-/// supervisor. Prior revisions threaded `&Arc<ContextManager>` and
-/// called `manager.payment_adapter_ref()`; after 12c.9a the adapter
-/// lives on the supervisor.
+/// Dispatch an [`EconomyCommand`] against actor-owned state and
+/// capability-reduced dependencies.
 pub async fn dispatch(
-    supervisor: &Supervisor,
-    _deps: &ActorDeps,
+    state: &mut PerContextState,
+    deps: &ActorDeps,
     cmd: EconomyCommand,
 ) -> Outcome<()> {
-    dispatch_inner(supervisor, cmd).await
+    dispatch_inner(state, deps, cmd).await
 }
 
 /// Shim-callable dispatch. Used by
@@ -81,14 +43,27 @@ pub(crate) async fn dispatch_from_shim(
     supervisor: &Supervisor,
     cmd: EconomyCommand,
 ) -> Outcome<()> {
-    dispatch_inner(supervisor, cmd).await
+    dispatch_from_shim_inner(supervisor, cmd).await
 }
 
-async fn dispatch_inner(supervisor: &Supervisor, cmd: EconomyCommand) -> Outcome<()> {
+async fn dispatch_inner(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    cmd: EconomyCommand,
+) -> Outcome<()> {
     match cmd {
         EconomyCommand::Placeholder { reply } => reply_not_implemented(reply),
         EconomyCommand::VerifyPaymentReceipts { receipts, reply } => {
-            handle_verify_payment_receipts(supervisor, *receipts, reply).await
+            handle_verify_payment_receipts(state, deps, *receipts, reply).await
+        }
+    }
+}
+
+async fn dispatch_from_shim_inner(supervisor: &Supervisor, cmd: EconomyCommand) -> Outcome<()> {
+    match cmd {
+        EconomyCommand::Placeholder { reply } => reply_not_implemented(reply),
+        EconomyCommand::VerifyPaymentReceipts { receipts, reply } => {
+            shim_handle_verify_payment_receipts(supervisor, *receipts, reply).await
         }
     }
 }
@@ -99,12 +74,13 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: EconomyCommand) -> Outcome
 /// per-context state; it calls the configured payment adapter's
 /// `verify_dyn` method per receipt and collates results.
 async fn handle_verify_payment_receipts(
-    supervisor: &Supervisor,
+    state: &mut PerContextState,
+    deps: &ActorDeps,
     receipts: Vec<crate::economy::adapter::PaymentReceipt>,
     reply: crate::context::actor::commands::VerifyPaymentReceiptsReply,
 ) -> Outcome<()> {
     let verify_fut =
-        crate::context::economy_helpers::verify_payment_receipts(supervisor, &receipts);
+        crate::context::economy_helpers::verify_payment_receipts(state, deps, &receipts);
 
     let results = match tokio::time::timeout(HANDLER_TIMEOUT, verify_fut).await {
         Ok(vec) => vec,
@@ -129,6 +105,32 @@ async fn handle_verify_payment_receipts(
 
     let _ = reply.send(results);
     // Verify payment receipts is a pure read — mutated=false.
+    Outcome::ok(())
+}
+
+async fn shim_handle_verify_payment_receipts(
+    supervisor: &Supervisor,
+    receipts: Vec<crate::economy::adapter::PaymentReceipt>,
+    reply: crate::context::actor::commands::VerifyPaymentReceiptsReply,
+) -> Outcome<()> {
+    let verify_fut = crate::context::economy_helpers_legacy::verify_payment_receipts_legacy(
+        supervisor, &receipts,
+    );
+
+    let results = match tokio::time::timeout(HANDLER_TIMEOUT, verify_fut).await {
+        Ok(vec) => vec,
+        Err(_elapsed) => receipts
+            .iter()
+            .map(|r| {
+                Err(ReceiptVerificationError::NoVerifierForAdapter {
+                    receipt_id: r.receipt_id,
+                    adapter_id: r.adapter_id.clone(),
+                })
+            })
+            .collect(),
+    };
+
+    let _ = reply.send(results);
     Outcome::ok(())
 }
 

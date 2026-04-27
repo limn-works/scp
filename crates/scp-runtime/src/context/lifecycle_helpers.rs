@@ -952,7 +952,7 @@ pub async fn join_context(
 
     // Phase 2: Authorize payment (escrow hold) BEFORE any crypto mutation.
     // If authorization fails, rollback the ticket — no MLS state was touched.
-    let auth = match crate::context::economy_helpers::authorize_paid_action(
+    let auth = match crate::context::economy_helpers_legacy::authorize_paid_action_legacy(
         supervisor,
         scp_protocol::economy::types::PaidActionType::ContextJoin,
         &member_did,
@@ -980,7 +980,12 @@ pub async fn join_context(
         Ok(output) => output,
         Err(e) => {
             if let Some(a) = auth {
-                crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
+                crate::context::economy_helpers_legacy::void_paid_action_legacy(
+                    supervisor,
+                    a,
+                    &context_id,
+                )
+                .await;
             }
             crate::context::economy_logic::rollback_economy_ticket(
                 supervisor,
@@ -998,7 +1003,12 @@ pub async fn join_context(
         let _ = crypto.remove_member(&context_id_bytes, &member_did);
         let _ = crypto.remove_member_sender_key(&context_id_bytes, &member_did);
         if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
+            crate::context::economy_helpers_legacy::void_paid_action_legacy(
+                supervisor,
+                a,
+                &context_id,
+            )
+            .await;
         }
         crate::context::economy_logic::rollback_economy_ticket(
             supervisor,
@@ -1044,7 +1054,12 @@ pub async fn join_context(
         let _ = crypto.remove_member(&context_id_bytes, &member_did);
         let _ = crypto.remove_member_sender_key(&context_id_bytes, &member_did);
         if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
+            crate::context::economy_helpers_legacy::void_paid_action_legacy(
+                supervisor,
+                a,
+                &context_id,
+            )
+            .await;
         }
         crate::context::economy_logic::rollback_economy_ticket(
             supervisor,
@@ -1063,7 +1078,12 @@ pub async fn join_context(
         let _ = crypto.remove_member(&context_id_bytes, &member_did);
         let _ = crypto.remove_member_sender_key(&context_id_bytes, &member_did);
         if let Some(a) = auth {
-            crate::context::economy_helpers::void_paid_action(supervisor, a, &context_id).await;
+            crate::context::economy_helpers_legacy::void_paid_action_legacy(
+                supervisor,
+                a,
+                &context_id,
+            )
+            .await;
         }
         crate::context::economy_logic::rollback_economy_ticket(
             supervisor,
@@ -1215,7 +1235,7 @@ pub async fn capture_join_payment(
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
 ) {
     if let Some(a) = auth
-        && let Err(e) = crate::context::economy_helpers::complete_paid_action(
+        && let Err(e) = crate::context::economy_helpers_legacy::complete_paid_action_legacy(
             supervisor, a, member_did, context_id,
         )
         .await

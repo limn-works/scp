@@ -32,6 +32,7 @@ pub mod app_sandbox;
 pub(crate) mod broadcast_helpers;
 pub mod builder;
 pub(crate) mod economy_helpers;
+pub(crate) mod economy_helpers_legacy;
 pub(crate) mod economy_logic;
 pub mod export_import;
 pub mod governance;
