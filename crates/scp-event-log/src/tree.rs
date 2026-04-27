@@ -211,6 +211,77 @@ pub fn append_unsigned_event(log: &mut EventLog, event: &Event) -> Result<u64, E
     Ok(leaf_index)
 }
 
+/// SCP-OUT-034 — wire-rejection variant of [`append`].
+///
+/// Also verifies the `chunks_billed` field on an `OutletInvokedEvent`
+/// against a caller-supplied reference count derived from the chunk
+/// manifest + cancel-ack-seq (§5.4.5 wire-layer rejection rule).
+///
+/// The runtime computes `reference_chunks_billed` via
+/// `scp_runtime::context::outlets::stream::compute_chunks_billed_ref`
+/// (or the equivalent
+/// `scp_runtime::context::outlets::dispatch::reference_chunks_billed`)
+/// from the recorded chunk manifest and the cancel-ack-seq the
+/// per-stream tracker captured at terminal-chunk emission. This
+/// helper rejects the append at log-insert time when `recorded !=
+/// reference`, matching §5.4.5: "An `OutletInvokedEvent` whose
+/// recorded `chunks_billed` does not match the value derivable from
+/// the manifest root, the sealed chunk sequence, and the cancel-ack
+/// sequence is a wire-layer rejection — the event is refused at
+/// log-insert time, not accepted-and-flagged."
+///
+/// `recorded` is the value carried on the event being appended;
+/// `reference` is the runtime's recomputed count. Equal values fall
+/// through to the standard [`append`] path; unequal values surface as
+/// [`EventLogError::ChunksBilledMismatch`] without touching the log.
+///
+/// # Errors
+///
+/// Returns [`EventLogError::ChunksBilledMismatch`] if `recorded !=
+/// reference`. Otherwise returns the same errors as [`append`].
+pub fn append_with_chunks_billed_check(
+    log: &mut EventLog,
+    event: &Event,
+    recorded_chunks_billed: u32,
+    reference_chunks_billed: u32,
+) -> Result<u64, EventLogError> {
+    if recorded_chunks_billed != reference_chunks_billed {
+        return Err(EventLogError::ChunksBilledMismatch {
+            recorded: recorded_chunks_billed,
+            reference: reference_chunks_billed,
+        });
+    }
+    append(log, event)
+}
+
+/// SCP-OUT-034 — unsigned-append variant of
+/// [`append_with_chunks_billed_check`].
+///
+/// Same semantics as [`append_with_chunks_billed_check`] but delegates
+/// to [`append_unsigned_event`] after the wire-rejection check passes.
+/// Used by FFI bridges and runtime paths that cannot synchronously
+/// produce a signature.
+///
+/// # Errors
+///
+/// Returns [`EventLogError::ChunksBilledMismatch`] if `recorded !=
+/// reference`. Otherwise returns the same errors as
+/// [`append_unsigned_event`].
+pub fn append_unsigned_with_chunks_billed_check(
+    log: &mut EventLog,
+    event: &Event,
+    recorded_chunks_billed: u32,
+    reference_chunks_billed: u32,
+) -> Result<u64, EventLogError> {
+    if recorded_chunks_billed != reference_chunks_billed {
+        return Err(EventLogError::ChunksBilledMismatch {
+            recorded: recorded_chunks_billed,
+            reference: reference_chunks_billed,
+        });
+    }
+    append_unsigned_event(log, event)
+}
+
 /// Returns the current Merkle root hash.
 ///
 /// - If the log is empty, returns `SHA-256("")` per spec §25.8 Vector 15.
@@ -622,6 +693,72 @@ mod tests {
     use super::*;
     use crate::EventPayload;
     use crate::test_helpers::{did_from_pubkey, leaf_hash_from_event, sign_event, test_keypair};
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-034 — chunks_billed wire-rejection at log-insert time
+    // -----------------------------------------------------------------------
+
+    /// PRD AC23 — the wire-rejection helper rejects an
+    /// `OutletInvokedEvent` whose recorded `chunks_billed` does not
+    /// match the runtime's reference count derived from the chunk
+    /// manifest + cancel-ack-seq.
+    #[test]
+    fn append_with_chunks_billed_check_rejects_mismatch() {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let mut log = EventLog::new("ctx-test".to_owned());
+
+        let event = sign_event(
+            EventType::OutletInvoked,
+            &did,
+            1_000_000,
+            0,
+            b"placeholder".to_vec(),
+            GENESIS_PREV_HASH,
+            &signing_key,
+        );
+
+        // Recorded = 99, reference (e.g. derived from manifest) = 8 →
+        // rejected with ChunksBilledMismatch and the log is NOT
+        // touched.
+        let result = append_with_chunks_billed_check(&mut log, &event, 99, 8);
+        match result {
+            Err(EventLogError::ChunksBilledMismatch {
+                recorded,
+                reference,
+            }) => {
+                assert_eq!(recorded, 99);
+                assert_eq!(reference, 8);
+            }
+            other => panic!("expected ChunksBilledMismatch, got {other:?}"),
+        }
+        // Log untouched.
+        assert_eq!(event_count(&log), 0);
+    }
+
+    /// PRD AC23 — equal `recorded` and `reference` falls through to
+    /// the standard `append` path.
+    #[test]
+    fn append_with_chunks_billed_check_accepts_match() {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let mut log = EventLog::new("ctx-test".to_owned());
+
+        let event = sign_event(
+            EventType::OutletInvoked,
+            &did,
+            1_000_000,
+            0,
+            b"placeholder".to_vec(),
+            GENESIS_PREV_HASH,
+            &signing_key,
+        );
+
+        let idx = append_with_chunks_billed_check(&mut log, &event, 8, 8)
+            .expect("matching chunks_billed should append");
+        assert_eq!(idx, 0);
+        assert_eq!(event_count(&log), 1);
+    }
 
     // -----------------------------------------------------------------------
     // append updates tree and root correctly

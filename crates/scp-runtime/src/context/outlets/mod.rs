@@ -17,6 +17,7 @@
 //! single executor-returned `Value` into the §5.4.5 two-chunk
 //! `Data + End` degenerate stream.
 
+pub mod dispatch;
 pub mod errors;
 pub mod invoke;
 pub mod message_key;

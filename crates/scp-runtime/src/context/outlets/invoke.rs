@@ -3933,6 +3933,107 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// SCP-OUT-034 streaming dispatch hooks — wires CreditTracker + StreamEscrow
+// + CancelAckTracker + StreamAdmissionTracker into the per-chunk pump.
+// ---------------------------------------------------------------------------
+
+/// Per-chunk gate result for the SCP-OUT-034 pump.
+///
+/// Consulted under the shared session lock. `Forward` is the happy
+/// path (decrement credit, optionally accrue escrow). `Stall` arms
+/// the credit-stall timer. `DropAboveCancelAck` silently drops the
+/// chunk per §5.4.5 cancel-ack ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamGateOutcome {
+    /// Chunk passes the gate — caller forwards it and advances seq.
+    Forward,
+    /// Credit exhausted. Caller arms the stall timer and parks the
+    /// chunk until a fresh grant arrives.
+    Stall,
+    /// Cancel-ack ceiling exceeded. Caller drops without billing.
+    DropAboveCancelAck,
+}
+
+/// Applies the SCP-OUT-034 per-chunk gate using the shared session
+/// trackers.
+///
+/// Called from the streaming pump for each upstream chunk. Terminal
+/// chunks (`End` / terminal `Error`) bypass the gate. Non-terminal
+/// chunks:
+///
+/// 1. Compare `chunk.sequence` against
+///    [`super::stream::CancelAckTracker::billing_ceiling`] —
+///    chunks above the ceiling return [`StreamGateOutcome::DropAboveCancelAck`].
+/// 2. Call [`super::stream::CreditTracker::try_consume`]. On
+///    [`super::stream::OutOfCredit::Exhausted`], stamp
+///    `credit_stall_armed_at` to the current `Instant` and return
+///    [`StreamGateOutcome::Stall`].
+/// 3. Otherwise return [`StreamGateOutcome::Forward`].
+///
+/// The function takes a single mutex guard window so the
+/// (consume → ceiling → bill) decision is atomic with respect to
+/// concurrent grant / cancel deliveries on
+/// [`super::stream::CreditTracker::grant_with_identity`] /
+/// [`super::stream::CancelAckTracker::record_cancel`].
+#[must_use]
+pub fn apply_stream_chunk_gate(
+    credit: &mut super::stream::CreditTracker,
+    cancel_ack: &super::stream::CancelAckTracker,
+    credit_stall_armed_at: &mut Option<std::time::Instant>,
+    chunk: &OutletStreamChunk,
+) -> StreamGateOutcome {
+    if chunk.payload.is_terminal() {
+        return StreamGateOutcome::Forward;
+    }
+    let ceiling = cancel_ack.billing_ceiling();
+    if chunk.sequence > ceiling {
+        return StreamGateOutcome::DropAboveCancelAck;
+    }
+    if credit.try_consume().is_err() {
+        if credit_stall_armed_at.is_none() {
+            *credit_stall_armed_at = Some(std::time::Instant::now());
+        }
+        return StreamGateOutcome::Stall;
+    }
+    StreamGateOutcome::Forward
+}
+
+/// Accrues a Data chunk in the per-stream [`super::stream::StreamEscrow`].
+///
+/// Bills only when the chunk's sequence is at or below the cancel-ack
+/// ceiling. Progress / End / Error chunks and chunks above the ceiling
+/// are NOT billed (§5.4.5).
+pub const fn accrue_data_chunk_if_billable(
+    escrow: &mut super::stream::StreamEscrow,
+    cancel_ack: &super::stream::CancelAckTracker,
+    chunk: &OutletStreamChunk,
+) {
+    if !matches!(chunk.payload, ChunkPayload::Data { .. }) {
+        return;
+    }
+    let ceiling = cancel_ack.billing_ceiling();
+    if chunk.sequence <= ceiling {
+        escrow.accrue_one_chunk();
+    }
+}
+
+/// Releases the §5.4.5 round-5 admission counters for a stream that
+/// terminated. Called by the pump on terminal-chunk emission.
+///
+/// Decrements per-invoker, per-origin-invoker, and per-outlet counters
+/// atomically under the admission tracker's critical section. Idempotent
+/// on a never-admitted triple (matches
+/// [`super::stream::StreamAdmissionTracker::release`] semantics).
+pub fn release_stream_admission(
+    admission: &mut super::stream::StreamAdmissionTracker,
+    invoker_did: &str,
+    origin_invoker_did: &str,
+    outlet_id: &str,
+) {
+    admission.release(invoker_did, origin_invoker_did, outlet_id);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -6597,6 +6698,405 @@ mod tests {
         let recomputed =
             scp_protocol::context::outlets::stream::compute_chunk_manifest_root(&chunks).unwrap();
         assert_eq!(event.stream_manifest_hash, recomputed);
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-034 integration tests — open_stream_session end-to-end with
+    // the full credit / escrow / cancel-ack / admission wiring.
+    // -----------------------------------------------------------------------
+
+    use crate::context::outlets::stream::{
+        AdmissionCaps as RuntimeAdmissionCaps,
+        StreamAdmissionTracker as RuntimeStreamAdmissionTracker,
+        StreamIdentity as RuntimeStreamIdentity,
+    };
+
+    /// Helper: build the canonical OUT-034 admission caps (defaults from
+    /// `ContextParams`).
+    fn out034_admission_caps() -> super::super::stream::AdmissionCaps {
+        super::super::stream::AdmissionCaps {
+            per_invoker: 8,
+            per_origin_invoker: 16,
+            per_outlet: 128,
+        }
+    }
+
+    /// Helper: build a fresh OUT-034 stream identity for tests.
+    fn out034_identity(outlet_id: &str) -> super::super::stream::StreamIdentity {
+        super::super::stream::StreamIdentity {
+            context_id: "ctx-invoke-test".to_owned(),
+            outlet_id: outlet_id.to_owned(),
+            stream_epoch: 1,
+            caveats_binding: [0xAB; 32],
+        }
+    }
+
+    /// Helper: build OUT-034 [`OpenStreamParams`] for an Action outlet
+    /// with the supplied per-chunk cost + balance + caveats.
+    fn out034_open_params(
+        outlet_id: &str,
+        invoker_did: &str,
+        cost_per_chunk: scp_protocol::economy::types::Amount,
+        available_balance: scp_protocol::economy::types::Amount,
+        declared_estimated: Option<u32>,
+        credit_window: u32,
+        verifying_key: ed25519_dalek::VerifyingKey,
+    ) -> super::super::dispatch::OpenStreamParams {
+        super::super::dispatch::OpenStreamParams {
+            identity: out034_identity(outlet_id),
+            caps: out034_admission_caps(),
+            invoker_did: invoker_did.to_owned(),
+            origin_invoker_did: invoker_did.to_owned(),
+            cost_per_chunk,
+            available_balance,
+            declared_estimated_chunk_count: declared_estimated,
+            credit_window,
+            caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
+            invoker_pk: verifying_key,
+            stream_credit_stall_secs: 1,
+            stream_cancel_ack_secs: 1,
+        }
+    }
+
+    /// Test 1 — 10 Data chunks + End → chunks_billed = 10, escrow billed
+    /// 10 * cost, refund = (estimated - 10) * cost.
+    #[tokio::test]
+    async fn out034_integration_ten_data_plus_end_bills_ten() {
+        struct TenDataExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for TenDataExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                for i in 0..10u32 {
+                    let _ = tx
+                        .send(ChunkPayload::Data {
+                            value: serde_json::json!({ "tick": i }),
+                        })
+                        .await;
+                }
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(TenDataExecutor);
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let admission = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+        let params = out034_open_params(
+            &outlet_id_owned,
+            creator_did,
+            scp_protocol::economy::types::Amount::new(7),
+            scp_protocol::economy::types::Amount::new(1000),
+            Some(20),
+            32,
+            signing.verifying_key(),
+        );
+        let cost_per_chunk_value = params.cost_per_chunk.value();
+
+        let mut handle = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            params,
+            StdArc::clone(&admission),
+        )
+        .await
+        .expect("OUT-034 open should succeed");
+
+        let rx = handle.receiver().expect("receiver");
+        let summary_rx = handle.close_summary().expect("summary");
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+        let summary = summary_rx.await.expect("summary publishes");
+
+        // PRD AC24: 10 Data chunks + End = chunks_billed = 10, billed
+        // amount = 10 * cost.
+        assert_eq!(summary.billed_count, 10, "ten Data chunks billed");
+        assert_eq!(
+            summary.billed_amount.value(),
+            10 * cost_per_chunk_value,
+            "billed amount = 10 * cost_per_chunk"
+        );
+        // Refund covers the unspent escrow.
+        let reserved = cost_per_chunk_value * 20; // estimated 20 chunks
+        assert_eq!(
+            summary.refund_amount.value(),
+            reserved - 10 * cost_per_chunk_value,
+            "refund covers the unspent escrow"
+        );
+        // chunks_billed must match the manifest reference count.
+        super::super::dispatch::verify_summary_chunks_billed(&summary)
+            .expect("chunks_billed matches manifest reference");
+        // Manifest contains 10 Data + 1 End = 11 chunks.
+        assert_eq!(chunks.len(), 11);
+
+        // Admission counters released on terminal-chunk emission.
+        let admission_guard = admission.lock().expect("admission lock");
+        assert_eq!(admission_guard.count_per_invoker(creator_did), 0);
+        assert_eq!(admission_guard.count_per_outlet(&outlet_id_owned), 0);
+        drop(admission_guard);
+    }
+
+    /// Test 2 — Mid-stream OutletCancel at next-to-emit seq = 5 →
+    /// cancel_ack_seq = 5, chunks at seq > 5 NOT billed, refund covers
+    /// the unbilled portion (PRD AC25).
+    #[tokio::test]
+    async fn out034_integration_mid_stream_cancel_at_seq_5_bills_five() {
+        // Executor that emits 8 Data chunks then End.
+        struct EightDataExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for EightDataExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                for i in 0..8u32 {
+                    let _ = tx
+                        .send(ChunkPayload::Data {
+                            value: serde_json::json!({ "tick": i }),
+                        })
+                        .await;
+                    // Yield so the cancel can land between chunks.
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(EightDataExecutor);
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let admission = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+        let params = out034_open_params(
+            &outlet_id_owned,
+            creator_did,
+            scp_protocol::economy::types::Amount::new(10),
+            scp_protocol::economy::types::Amount::new(1000),
+            Some(8),
+            32,
+            signing.verifying_key(),
+        );
+        let cost_per_chunk_value = params.cost_per_chunk.value();
+
+        let mut handle = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            params,
+            StdArc::clone(&admission),
+        )
+        .await
+        .expect("OUT-034 open should succeed");
+
+        let mut rx = handle.receiver().expect("receiver");
+        let summary_rx = handle.close_summary().expect("summary");
+
+        // Drain the first 4 chunks, then deliver an OutletCancel with
+        // next_seq = 4 (so chunks 0..=4 are billable — 5 Data chunks
+        // total).
+        let mut received_count: u32 = 0;
+        for _ in 0..4u32 {
+            if rx.recv().await.is_some() {
+                received_count = received_count.saturating_add(1);
+            }
+        }
+        // At this point received_count chunks have been forwarded; the
+        // runtime's next-to-emit cursor is at 4. Apply cancel at
+        // seq=4 so chunks 0..=4 (5 chunks) are billable but seq 5,6,7
+        // are above the ceiling.
+        let _ = received_count;
+        let recorded_seq = handle.apply_outlet_cancel(4);
+        assert_eq!(
+            recorded_seq,
+            Some(4),
+            "cancel-ack-seq recorded at next-to-emit cursor"
+        );
+
+        // Drain remaining chunks until the stream closes.
+        while rx.recv().await.is_some() {}
+        let summary = summary_rx.await.expect("summary publishes");
+
+        // PRD AC25: chunks at seq <= 4 (5 Data chunks) are billable;
+        // chunks above 4 are NOT billed.
+        assert!(
+            summary.billed_count <= 5,
+            "billed_count should be at most 5 (got {})",
+            summary.billed_count
+        );
+        assert!(
+            summary.billed_count >= 1,
+            "at least one chunk delivered before cancel (got {})",
+            summary.billed_count
+        );
+        // The recorded billed_count equals the manifest reference.
+        super::super::dispatch::verify_summary_chunks_billed(&summary)
+            .expect("chunks_billed matches manifest");
+        // Refund covers the unbilled portion.
+        let reserved = cost_per_chunk_value * 8;
+        let billed = summary.billed_amount.value();
+        assert_eq!(
+            summary.refund_amount.value(),
+            reserved - billed,
+            "refund = reserved - billed"
+        );
+        assert_eq!(summary.cancel_ack_seq, Some(4));
+
+        // Admission released on terminal.
+        let admission_guard = admission.lock().expect("admission lock");
+        assert_eq!(admission_guard.count_per_invoker(creator_did), 0);
+        drop(admission_guard);
+    }
+
+    /// Test 3 — Credit stall after 3 Data chunks → SCP-TOOL-6133
+    /// terminal Error chunk emitted, chunks_billed = 3, admission slot
+    /// released (PRD AC26).
+    #[tokio::test]
+    async fn out034_integration_credit_stall_after_three_emits_6133() {
+        // Executor that emits 5 Data chunks but the credit window is
+        // only 3 — after the 3rd chunk the pump stalls and the credit
+        // stall timer fires.
+        struct FiveDataExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for FiveDataExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                for i in 0..5u32 {
+                    let _ = tx
+                        .send(ChunkPayload::Data {
+                            value: serde_json::json!({ "tick": i }),
+                        })
+                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(FiveDataExecutor);
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let admission = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+        // credit_window = 3 + stream_credit_stall_secs = 1 (set by
+        // out034_open_params). estimated must be bounded by
+        // min(credit_window, caveats.max_calls) per §5.4.5; with
+        // credit_window=3 and no caveats.max_calls cap, estimated must
+        // be <= 3.
+        let params = out034_open_params(
+            &outlet_id_owned,
+            creator_did,
+            scp_protocol::economy::types::Amount::new(10),
+            scp_protocol::economy::types::Amount::new(1000),
+            Some(3),
+            3,
+            signing.verifying_key(),
+        );
+
+        let mut handle = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            params,
+            StdArc::clone(&admission),
+        )
+        .await
+        .expect("OUT-034 open should succeed");
+
+        let rx = handle.receiver().expect("receiver");
+        let summary_rx = handle.close_summary().expect("summary");
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+        let summary = summary_rx.await.expect("summary publishes");
+
+        // PRD AC26: chunks_billed = 3 after the credit stall fires.
+        assert_eq!(summary.billed_count, 3, "three Data chunks billed");
+
+        // Manifest reference matches.
+        super::super::dispatch::verify_summary_chunks_billed(&summary)
+            .expect("chunks_billed matches manifest");
+
+        // Terminal chunk is the framework-generated SCP-TOOL-6133.
+        let terminal = chunks.last().expect("terminal chunk");
+        match &terminal.payload {
+            ChunkPayload::Error {
+                code, terminal: t, ..
+            } => {
+                assert!(*t, "terminal flag set");
+                assert_eq!(
+                    code,
+                    scp_protocol::context::outlets::error_codes::CODE_EXECUTION_CREDIT_STALL,
+                    "credit-stall code"
+                );
+            }
+            other => panic!("expected terminal Error{{credit-stall}}, got {other:?}"),
+        }
+
+        // Admission slot released.
+        let admission_guard = admission.lock().expect("admission lock");
+        assert_eq!(admission_guard.count_per_invoker(creator_did), 0);
+        drop(admission_guard);
+    }
+
+    // Bind the imports introduced for the OUT-034 integration tests so
+    // they survive the test mod's `#[allow(unused_imports)]` guards on
+    // module compilation.
+    #[allow(dead_code)]
+    fn _out034_test_type_anchors() {
+        let _: Option<RuntimeAdmissionCaps> = None;
+        let _: Option<RuntimeStreamAdmissionTracker> = None;
+        let _: Option<RuntimeStreamIdentity> = None;
     }
 }
 

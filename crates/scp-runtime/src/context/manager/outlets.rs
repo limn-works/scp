@@ -1537,6 +1537,98 @@ impl ContextManager {
             }
         }
     }
+
+    /// SCP-OUT-034 — opens a §5.4.5 streaming session with full
+    /// admission, escrow, and tracker wiring.
+    ///
+    /// This is the §5.4.5 `OutletStreamOpen` acceptance entry point: it
+    /// runs the round-5 5-step admission sequence
+    /// ([`StreamAdmissionTracker::try_admit`]), reserves escrow at open
+    /// ([`StreamEscrow::reserve_at_open`]), pins the stream identity,
+    /// initialises [`CreditTracker`] + [`CancelAckTracker`], launches
+    /// the underlying executor pump via
+    /// [`crate::context::outlets::invoke::invoke_outlet`], and spawns a
+    /// wrapping pump task that consults the trackers in lockstep with
+    /// chunk emission.
+    ///
+    /// The returned [`StreamSessionHandle`] exposes the chunk receiver
+    /// plus the [`StreamSessionHandle::apply_credit_grant`] /
+    /// [`StreamSessionHandle::apply_outlet_cancel`] input methods that
+    /// the FFI layer wires into `OutletStreamCredit` / `OutletCancel`
+    /// reception.
+    ///
+    /// On synchronous open-time rejection (admission cap, escrow
+    /// overflow, insufficient balance, estimate-bound), returns
+    /// [`OpenStreamRejection`] — the caller MUST translate via
+    /// [`OpenStreamRejection::to_invocation_error`] +
+    /// [`invocation_error_to_context`] for the §5.4.4 typed envelope.
+    ///
+    /// # Errors
+    ///
+    /// See [`OpenStreamRejection`] for the open-time rejection
+    /// taxonomy. Once the handle is returned, every failure mode
+    /// (timeout, credit-stall, cancel-ack-timeout, executor panic,
+    /// schema) surfaces as a terminal `ChunkPayload::Error` chunk on
+    /// the receiver — never as a `Result` error.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_outlet_stream<E>(
+        &self,
+        context_id: &str,
+        registry: &OutletRegistry,
+        role_state: &scp_protocol::context::roles::ContextRoleState,
+        outlet_id: &OutletId,
+        input: serde_json::Value,
+        invoker_did: &DID,
+        timeout_ms: Option<u32>,
+        executor: std::sync::Arc<E>,
+        misdeclaration_sink: Option<
+            std::sync::Arc<dyn crate::context::outlets::invoke::QueryMisdeclarationSink>,
+        >,
+        handler_panic_sink: Option<
+            std::sync::Arc<dyn crate::context::outlets::invoke::HandlerPanicSink>,
+        >,
+        invoked_event_sink: Option<
+            std::sync::Arc<dyn crate::context::outlets::invoke::OutletInvokedEventSink>,
+        >,
+        params: crate::context::outlets::dispatch::OpenStreamParams,
+        admission: std::sync::Arc<
+            std::sync::Mutex<crate::context::outlets::stream::StreamAdmissionTracker>,
+        >,
+    ) -> Result<
+        crate::context::outlets::dispatch::StreamSessionHandle,
+        crate::context::outlets::dispatch::OpenStreamRejection,
+    >
+    where
+        E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
+    {
+        // Snapshot the per-context handle so we can hand the underlying
+        // executor pump a stable ContextHandle.
+        let handle_snapshot = {
+            let (guard, _ctx_gen) = self.lock_context(context_id).await.map_err(|_| {
+                crate::context::outlets::dispatch::OpenStreamRejection::AdmissionRateLimited {
+                    slug: scp_protocol::context::outlets::error_codes::SLUG_TRANSPORT_RATE_LIMITED,
+                }
+            })?;
+            guard.handle.clone()
+        };
+
+        crate::context::outlets::dispatch::open_stream_session(
+            &handle_snapshot,
+            registry,
+            role_state,
+            outlet_id,
+            input,
+            invoker_did,
+            timeout_ms,
+            executor,
+            misdeclaration_sink,
+            handler_panic_sink,
+            invoked_event_sink,
+            params,
+            admission,
+        )
+        .await
+    }
 }
 
 /// Result of [`ContextManager::invoke_outlet_dispatch_with_economy`].
@@ -2587,23 +2679,62 @@ fn invocation_error_to_envelope_template(
         // `input.*` → Input-class, otherwise Authorization-class. Mirrors
         // `error_code_to_class`/`error_code_to_default_slug` in the
         // §5.4.4 registry.
-        InvocationError::CaveatViolation { slug, .. } => {
-            if slug.starts_with("input.") {
-                (
-                    OutletErrorClass::Input,
-                    CODE_INPUT_VIOLATION,
-                    *slug,
-                    RetryPolicy::Never,
-                )
-            } else {
-                (
-                    OutletErrorClass::Authorization,
-                    CODE_AUTHORIZATION_DENIED,
-                    *slug,
-                    RetryPolicy::Never,
-                )
-            }
-        }
+        InvocationError::CaveatViolation { slug, .. } => caveat_violation_to_envelope(slug),
+    }
+}
+
+/// Routes a `CaveatViolation` slug to its `(class, code, slug, retry)`
+/// envelope template per the §5.4.4 prefix mapping.
+///
+/// `input.*` → Input-class, `transport.*` → Transport-class with
+/// `WithBackoff`, `economic.*` → Economic-class, anything else falls
+/// through to Authorization-class. SCP-OUT-034 added the `transport.*`
+/// and `economic.*` branches for stream-admission and escrow-open
+/// rejections.
+fn caveat_violation_to_envelope(
+    slug: &'static str,
+) -> (
+    scp_protocol::context::outlets::errors::OutletErrorClass,
+    &'static str,
+    &'static str,
+    scp_protocol::context::outlets::errors::RetryPolicy,
+) {
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_AUTHORIZATION_DENIED, CODE_ECONOMIC_FAULT, CODE_INPUT_VIOLATION, CODE_TRANSPORT_FAULT,
+    };
+    use scp_protocol::context::outlets::errors::{OutletErrorClass, RetryPolicy};
+
+    if slug.starts_with("input.") {
+        (
+            OutletErrorClass::Input,
+            CODE_INPUT_VIOLATION,
+            slug,
+            RetryPolicy::Never,
+        )
+    } else if slug.starts_with("transport.") {
+        (
+            OutletErrorClass::Transport,
+            CODE_TRANSPORT_FAULT,
+            slug,
+            RetryPolicy::WithBackoff {
+                min: std::time::Duration::from_secs(1),
+                max: std::time::Duration::from_secs(30),
+            },
+        )
+    } else if slug.starts_with("economic.") {
+        (
+            OutletErrorClass::Economic,
+            CODE_ECONOMIC_FAULT,
+            slug,
+            RetryPolicy::Never,
+        )
+    } else {
+        (
+            OutletErrorClass::Authorization,
+            CODE_AUTHORIZATION_DENIED,
+            slug,
+            RetryPolicy::Never,
+        )
     }
 }
 
