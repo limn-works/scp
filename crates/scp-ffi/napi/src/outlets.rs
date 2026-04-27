@@ -1486,6 +1486,250 @@ pub async fn outlet_get(handle: &NapiContextHandle, outlet_id: String) -> napi::
 }
 
 // ---------------------------------------------------------------------------
+// SCP-OUT-041d — outlet_error_new + outlet_catalog_rotation_validator
+// ---------------------------------------------------------------------------
+
+/// Constructs an [`OutletError`] envelope at the FFI boundary using the
+/// pinned per-outlet `outlet_message_key` (§5.4.4 round-5, SCP-OUT-041a/d).
+///
+/// Returns the envelope as a JSON string. The HMAC happens inside this
+/// bridge so the SDK never sees the raw `outlet_message_key`.
+///
+/// All hex inputs are case-insensitive. `class_str` is the wire-form
+/// `OutletErrorClass` (`"protocol"`, `"authorization"`, …); `retry_str`
+/// is the wire-form retry policy.
+#[napi(js_name = "outletErrorNew")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned values.
+#[allow(clippy::too_many_arguments)] // Mirrors the §5.4.4 OutletErrorNewOpts fields.
+#[allow(clippy::too_many_lines)] // 11-field options-object validation surface.
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return.
+pub async fn outlet_error_new(
+    handle: &NapiContextHandle,
+    outlet_id: String,
+    registration_event_id_hex: String,
+    catalog_key: String,
+    class_str: String,
+    code: String,
+    slug: String,
+    retry_str: String,
+    pad_nonce_hex: String,
+    detail_json: Option<String>,
+    source_chain_json: Option<String>,
+) -> napi::Result<String> {
+    use scp_core::context::outlets::OutletId;
+    use scp_core::context::outlets::errors::{
+        CatalogKey, ContextHop, DetailBody, OutletError, OutletErrorClass, OutletErrorNewOpts,
+        PAD_NONCE_LEN, REGISTRATION_EVENT_ID_LEN, RetryPolicy,
+    };
+
+    crate::napi_check_handle!(handle);
+    validate_outlet_id(&outlet_id).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    crate::runtime::ensure_registered(handle)?;
+
+    let context_id = handle.context_id();
+
+    let reg_event_id_vec = hex::decode(&registration_event_id_hex).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("invalid registration_event_id_hex: {e}"),
+            code: codes::VALID_7000.to_owned(),
+        })
+    })?;
+    let reg_event_id: [u8; REGISTRATION_EVENT_ID_LEN] =
+        reg_event_id_vec.as_slice().try_into().map_err(|_| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("registration_event_id must be {REGISTRATION_EVENT_ID_LEN} bytes"),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })?;
+
+    let pad_nonce_vec = hex::decode(&pad_nonce_hex).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("invalid pad_nonce_hex: {e}"),
+            code: codes::VALID_7000.to_owned(),
+        })
+    })?;
+    let pad_nonce: [u8; PAD_NONCE_LEN] = pad_nonce_vec.as_slice().try_into().map_err(|_| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("pad_nonce must be {PAD_NONCE_LEN} bytes"),
+            code: codes::VALID_7000.to_owned(),
+        })
+    })?;
+
+    let class: OutletErrorClass =
+        serde_json::from_value(serde_json::Value::String(class_str.clone())).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("invalid OutletErrorClass {class_str:?}: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })?;
+
+    let retry: RetryPolicy = serde_json::from_value(serde_json::Value::String(retry_str.clone()))
+        .or_else(|_| serde_json::from_str::<RetryPolicy>(&retry_str))
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("invalid retry policy {retry_str:?}: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })?;
+
+    let catalog_key_typed = CatalogKey::try_new(&catalog_key).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("invalid catalog_key: {e}"),
+            code: codes::VALID_7000.to_owned(),
+        })
+    })?;
+
+    let detail: Option<DetailBody> = match detail_json.as_deref() {
+        None => None,
+        Some(s) => Some(serde_json::from_str::<DetailBody>(s).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("invalid detail_json: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })?),
+    };
+
+    let source_chain: Vec<ContextHop> = match source_chain_json.as_deref() {
+        None => Vec::new(),
+        Some(s) => serde_json::from_str::<Vec<ContextHop>>(s).map_err(|e| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!("invalid source_chain_json: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })?,
+    };
+
+    let outlet_id_typed = OutletId::from(outlet_id.as_str());
+
+    let manager = crate::runtime::context_manager()?;
+    let pinned_key: [u8; 32] = manager
+        .pinned_outlet_message_key_for(&context_id, &outlet_id_typed, &reg_event_id)
+        .await
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("pinned key lookup failed: {e}"),
+                code: codes::CTX_2000.to_owned(),
+            })
+        })?
+        .ok_or_else(|| {
+            napi::Error::from(ScpNapiError::Validation {
+                message: format!(
+                    "no pinned outlet_message_key for outlet {outlet_id}, registration {registration_event_id_hex}"
+                ),
+                code: codes::VALID_7000.to_owned(),
+            })
+        })?;
+
+    // Snapshot the registered catalog keys for membership check.
+    let registered_keys: Vec<CatalogKey> = crate::runtime::with_context(&context_id, |rt| {
+        let registration =
+            rt.outlet_registry
+                .get(&outlet_id)
+                .ok_or_else(|| ScpNapiError::Tool {
+                    message: format!("outlet '{outlet_id}' not found in context '{context_id}'"),
+                    code: codes::TOOL_6002.to_owned(),
+                })?;
+        let mut keys: Vec<CatalogKey> = Vec::with_capacity(registration.message_catalog.len());
+        for tpl in &registration.message_catalog {
+            let k = CatalogKey::try_new(tpl.key.clone()).map_err(|e| ScpNapiError::Tool {
+                message: format!(
+                    "outlet '{outlet_id}' has malformed catalog key {:?}: {e}",
+                    tpl.key
+                ),
+                code: codes::TOOL_6002.to_owned(),
+            })?;
+            keys.push(k);
+        }
+        Ok(keys)
+    })
+    .map_err(napi::Error::from)?;
+
+    let envelope = OutletError::new(OutletErrorNewOpts {
+        outlet_id: &outlet_id_typed,
+        outlet_message_key: &pinned_key,
+        registration_event_id: reg_event_id,
+        catalog_key: &catalog_key_typed,
+        registered_keys: &registered_keys,
+        class,
+        code: &code,
+        slug: &slug,
+        retry,
+        detail,
+        source_chain,
+        pad_nonce,
+    })
+    .map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("OutletError construction failed: {e}"),
+            code: codes::VALID_7000.to_owned(),
+        })
+    })?;
+
+    serde_json::to_string(&envelope).map_err(|e| {
+        napi::Error::from(ScpNapiError::Context {
+            message: e.to_string(),
+            code: codes::CTX_2000.to_owned(),
+        })
+    })
+}
+
+/// SCP-OUT-041d catalog-rotation dwell-time validator bridge.
+///
+/// Pure-function wrapper around the SCP-OUT-041c
+/// `validate_catalog_rotation_dwell_time` runtime helper. Returns the
+/// empty string on success; a JSON-serialized `OutletError` envelope
+/// otherwise.
+#[napi(js_name = "outletCatalogRotationValidator")]
+#[allow(clippy::needless_pass_by_value)] // napi-rs requires owned String.
+#[allow(clippy::unused_async)] // napi-rs requires async for Promise return.
+pub async fn outlet_catalog_rotation_validator(
+    prior_catalog_json: String,
+    new_catalog_json: String,
+    prior_append_time_secs: i64,
+    new_append_time_secs: i64,
+) -> napi::Result<String> {
+    use scp_core::context::outlets::MessageTemplate;
+
+    let prior: Vec<MessageTemplate> = serde_json::from_str(&prior_catalog_json).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("invalid prior_catalog_json: {e}"),
+            code: codes::VALID_7000.to_owned(),
+        })
+    })?;
+    let new_cat: Vec<MessageTemplate> = serde_json::from_str(&new_catalog_json).map_err(|e| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!("invalid new_catalog_json: {e}"),
+            code: codes::VALID_7000.to_owned(),
+        })
+    })?;
+
+    let prior_t = u64::try_from(prior_append_time_secs).map_err(|_| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: "prior_append_time_secs must be non-negative".to_owned(),
+            code: codes::VALID_7000.to_owned(),
+        })
+    })?;
+    let new_t = u64::try_from(new_append_time_secs).map_err(|_| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: "new_append_time_secs must be non-negative".to_owned(),
+            code: codes::VALID_7000.to_owned(),
+        })
+    })?;
+
+    match scp_core::context::manager::validate_catalog_rotation_dwell_time(
+        &prior, &new_cat, prior_t, new_t,
+    ) {
+        Ok(()) => Ok(String::new()),
+        Err(rejection) => serde_json::to_string(&rejection.envelope).map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: e.to_string(),
+                code: codes::CTX_2000.to_owned(),
+            })
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
