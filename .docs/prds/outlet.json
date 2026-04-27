@@ -490,7 +490,7 @@
       "gate": "gate-rename",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/python/scp_sdk/tools.py",
         "bindings/python/scp_sdk/__init__.py",
