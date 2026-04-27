@@ -1308,6 +1308,309 @@ pub fn outlet_interface_revoke(context: &WasmContextHandle, interface_id_hex: St
 }
 
 // ---------------------------------------------------------------------------
+// SCP-OUT-041d — outlet_error_new + outlet_catalog_rotation_validator
+// ---------------------------------------------------------------------------
+
+/// Pins a per-outlet `outlet_message_key` (§5.4.4 round-5,
+/// SCP-OUT-041a/d) for use by `outletErrorNew`.
+///
+/// The WASM bridge mirrors the runtime's
+/// `GovernanceState::pinned_outlet_message_keys` map locally because
+/// scp-runtime cannot compile to wasm32. Callers (typically the SDK
+/// receiver layer that derives the key from MLS exporter material at
+/// registration acceptance time) MUST pin the key here so the
+/// envelope-construction path can compute the §5.4.4 wire-message
+/// HMAC at the FFI boundary.
+#[wasm_bindgen(js_name = outletStoreMessageKey)]
+pub fn outlet_store_message_key(
+    context: &WasmContextHandle,
+    outlet_id: String,
+    registration_event_id_hex: String,
+    outlet_message_key_hex: String,
+) -> Result<(), JsError> {
+    let context_id = context.context_id();
+    validate_outlet_id(&outlet_id).map_err(|e| ScpWasmError::from(e).into_js())?;
+
+    let reg_event_id_vec = hex::decode(&registration_event_id_hex).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("invalid registration_event_id_hex: {e}"),
+            code: codes::VALID_7000.to_owned(),
+        }
+        .into_js()
+    })?;
+    let reg_event_id: [u8; 32] = reg_event_id_vec.as_slice().try_into().map_err(|_| {
+        ScpWasmError::Validation {
+            message: "registration_event_id must be 32 bytes".to_owned(),
+            code: codes::VALID_7000.to_owned(),
+        }
+        .into_js()
+    })?;
+
+    let key_vec = hex::decode(&outlet_message_key_hex).map_err(|e| {
+        ScpWasmError::Validation {
+            message: format!("invalid outlet_message_key_hex: {e}"),
+            code: codes::VALID_7000.to_owned(),
+        }
+        .into_js()
+    })?;
+    let outlet_message_key: [u8; 32] = key_vec.as_slice().try_into().map_err(|_| {
+        ScpWasmError::Validation {
+            message: "outlet_message_key must be 32 bytes".to_owned(),
+            code: codes::VALID_7000.to_owned(),
+        }
+        .into_js()
+    })?;
+
+    with_manager(|mgr| {
+        mgr.store_outlet_message_key(&context_id, &outlet_id, reg_event_id, outlet_message_key)
+    })
+    .map_err(ScpWasmError::into_js)
+}
+
+/// SCP-OUT-041d outlet_error_new bridge (WASM).
+///
+/// Constructs an `OutletError` envelope at the FFI boundary using the
+/// pinned per-outlet `outlet_message_key`. Returns the envelope as a
+/// JSON string. The HMAC happens inside this bridge so the SDK never
+/// sees the raw key.
+#[wasm_bindgen(js_name = outletErrorNew)]
+#[allow(clippy::too_many_arguments)] // 11-field §5.4.4 OutletErrorNewOpts.
+#[allow(clippy::too_many_lines)] // Per-field validation surface.
+pub fn outlet_error_new(
+    context: &WasmContextHandle,
+    outlet_id: String,
+    registration_event_id_hex: String,
+    catalog_key: String,
+    class_str: String,
+    code: String,
+    slug: String,
+    retry_str: String,
+    pad_nonce_hex: String,
+    detail_json: Option<String>,
+    source_chain_json: Option<String>,
+) -> Promise {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::context::outlets::errors::{
+        CatalogKey, ContextHop, DetailBody, OutletError, OutletErrorClass, OutletErrorNewOpts,
+        PAD_NONCE_LEN, REGISTRATION_EVENT_ID_LEN, RetryPolicy,
+    };
+
+    let context_id = context.context_id();
+    future_to_promise(async move {
+        validate_outlet_id(&outlet_id).map_err(|e| ScpWasmError::from(e).into_js())?;
+
+        let reg_event_id_vec = hex::decode(&registration_event_id_hex).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("invalid registration_event_id_hex: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            }
+            .into_js()
+        })?;
+        let reg_event_id: [u8; REGISTRATION_EVENT_ID_LEN] =
+            reg_event_id_vec.as_slice().try_into().map_err(|_| {
+                ScpWasmError::Validation {
+                    message: format!(
+                        "registration_event_id must be {REGISTRATION_EVENT_ID_LEN} bytes"
+                    ),
+                    code: codes::VALID_7000.to_owned(),
+                }
+                .into_js()
+            })?;
+
+        let pad_nonce_vec = hex::decode(&pad_nonce_hex).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("invalid pad_nonce_hex: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            }
+            .into_js()
+        })?;
+        let pad_nonce: [u8; PAD_NONCE_LEN] = pad_nonce_vec.as_slice().try_into().map_err(|_| {
+            ScpWasmError::Validation {
+                message: format!("pad_nonce must be {PAD_NONCE_LEN} bytes"),
+                code: codes::VALID_7000.to_owned(),
+            }
+            .into_js()
+        })?;
+
+        let class: OutletErrorClass =
+            serde_json::from_value(serde_json::Value::String(class_str.clone())).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("invalid OutletErrorClass {class_str:?}: {e}"),
+                    code: codes::VALID_7000.to_owned(),
+                }
+                .into_js()
+            })?;
+
+        let retry: RetryPolicy =
+            serde_json::from_value(serde_json::Value::String(retry_str.clone()))
+                .or_else(|_| serde_json::from_str::<RetryPolicy>(&retry_str))
+                .map_err(|e| {
+                    ScpWasmError::Validation {
+                        message: format!("invalid retry policy {retry_str:?}: {e}"),
+                        code: codes::VALID_7000.to_owned(),
+                    }
+                    .into_js()
+                })?;
+
+        let catalog_key_typed = CatalogKey::try_new(&catalog_key).map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("invalid catalog_key: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            }
+            .into_js()
+        })?;
+
+        let detail: Option<DetailBody> = match detail_json.as_deref() {
+            None => None,
+            Some(s) => Some(serde_json::from_str::<DetailBody>(s).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("invalid detail_json: {e}"),
+                    code: codes::VALID_7000.to_owned(),
+                }
+                .into_js()
+            })?),
+        };
+
+        let source_chain: Vec<ContextHop> = match source_chain_json.as_deref() {
+            None => Vec::new(),
+            Some(s) => serde_json::from_str::<Vec<ContextHop>>(s).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("invalid source_chain_json: {e}"),
+                    code: codes::VALID_7000.to_owned(),
+                }
+                .into_js()
+            })?,
+        };
+
+        let outlet_id_typed = OutletId::from(outlet_id.as_str());
+
+        // Snapshot from manager: pinned key + registered catalog keys.
+        let (pinned_key, registered_keys): ([u8; 32], Vec<CatalogKey>) =
+            with_manager(|mgr| {
+                let pinned = mgr
+                    .pinned_outlet_message_key_for(&context_id, &outlet_id, &reg_event_id)?
+                    .ok_or_else(|| ScpWasmError::Validation {
+                        message: format!(
+                            "no pinned outlet_message_key for outlet {outlet_id}, registration {registration_event_id_hex}"
+                        ),
+                        code: codes::VALID_7000.to_owned(),
+                    })?;
+                let catalog_keys = mgr.outlet_catalog_keys(&context_id, &outlet_id)?;
+                Ok((pinned, catalog_keys))
+            })
+            .map_err(ScpWasmError::into_js)?;
+
+        let envelope = OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id_typed,
+            outlet_message_key: &pinned_key,
+            registration_event_id: reg_event_id,
+            catalog_key: &catalog_key_typed,
+            registered_keys: &registered_keys,
+            class,
+            code: &code,
+            slug: &slug,
+            retry,
+            detail,
+            source_chain,
+            pad_nonce,
+        })
+        .map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("OutletError construction failed: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            }
+            .into_js()
+        })?;
+
+        let json = serde_json::to_string(&envelope).map_err(|e| {
+            ScpWasmError::Context {
+                message: e.to_string(),
+                code: codes::CTX_2000.to_owned(),
+            }
+            .into_js()
+        })?;
+
+        Ok(JsValue::from_str(&json))
+    })
+}
+
+/// SCP-OUT-041d catalog-rotation dwell-time validator bridge (WASM).
+///
+/// Pure-function wrapper that mirrors the SCP-OUT-041c semantics in
+/// WASM. WASM cannot depend on scp-runtime; we re-implement the
+/// 24-hour dwell rule locally against `MessageTemplate` from
+/// scp-protocol. Returns the empty string on success; a JSON-serialized
+/// `OutletError` envelope otherwise.
+#[wasm_bindgen(js_name = outletCatalogRotationValidator)]
+pub fn outlet_catalog_rotation_validator(
+    prior_catalog_json: String,
+    new_catalog_json: String,
+    prior_append_time_secs: u64,
+    new_append_time_secs: u64,
+) -> Promise {
+    use scp_protocol::context::outlets::MessageTemplate;
+    use scp_protocol::context::outlets::error_codes::{
+        CODE_PROTOCOL_VIOLATION, SLUG_PROTOCOL_CATALOG_ROTATION_TOO_FREQUENT,
+    };
+    use scp_protocol::context::outlets::errors::{OutletError, OutletErrorClass, RetryPolicy};
+
+    /// §5.4.4 round-5 24h dwell floor — re-declared here to avoid the
+    /// scp-runtime dependency. Identical to
+    /// `scp_runtime::context::manager::CATALOG_ROTATION_DWELL_SECS`.
+    const CATALOG_ROTATION_DWELL_SECS: u64 = 86_400;
+
+    future_to_promise(async move {
+        let prior: Vec<MessageTemplate> =
+            serde_json::from_str(&prior_catalog_json).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("invalid prior_catalog_json: {e}"),
+                    code: codes::VALID_7000.to_owned(),
+                }
+                .into_js()
+            })?;
+        let new_cat: Vec<MessageTemplate> =
+            serde_json::from_str(&new_catalog_json).map_err(|e| {
+                ScpWasmError::Validation {
+                    message: format!("invalid new_catalog_json: {e}"),
+                    code: codes::VALID_7000.to_owned(),
+                }
+                .into_js()
+            })?;
+
+        if prior == new_cat {
+            return Ok(JsValue::from_str(""));
+        }
+        let elapsed_secs = new_append_time_secs.saturating_sub(prior_append_time_secs);
+        if elapsed_secs >= CATALOG_ROTATION_DWELL_SECS {
+            return Ok(JsValue::from_str(""));
+        }
+
+        let envelope = OutletError::from_invocation_error_template(
+            OutletErrorClass::Protocol,
+            CODE_PROTOCOL_VIOLATION,
+            SLUG_PROTOCOL_CATALOG_ROTATION_TOO_FREQUENT,
+            RetryPolicy::Never,
+        )
+        .map_err(|e| {
+            ScpWasmError::Validation {
+                message: format!("envelope construction failed: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            }
+            .into_js()
+        })?;
+
+        let json = serde_json::to_string(&envelope).map_err(|e| {
+            ScpWasmError::Context {
+                message: e.to_string(),
+                code: codes::CTX_2000.to_owned(),
+            }
+            .into_js()
+        })?;
+        Ok(JsValue::from_str(&json))
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

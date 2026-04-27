@@ -305,6 +305,17 @@ pub(crate) struct PerContextState {
     pruning_policy: Option<String>,
     /// Whether the economic policy is locked (§19.3, ADR-033).
     economic_policy_locked: bool,
+    /// Pinned per-outlet `outlet_message_key` values keyed by
+    /// `(outlet_id, registration_event_id)` (§5.4.4 round-5,
+    /// SCP-OUT-041a/d).
+    ///
+    /// The WASM bridge mirrors the scp-runtime
+    /// `GovernanceState::pinned_outlet_message_keys` map locally so
+    /// `outlet_error_new` can compute
+    /// `HMAC-SHA-256(outlet_message_key, catalog_key)[..32]` at the
+    /// FFI boundary — the SDK never sees the raw key. WASM cannot
+    /// depend on scp-runtime (tokio) so the map lives here.
+    pinned_outlet_message_keys: HashMap<(String, [u8; 32]), [u8; 32]>,
     /// Hard rate limit configuration (D4, §19.7) as an opaque JSON blob.
     ///
     /// The WASM bridge does not run the runtime-side
@@ -1123,6 +1134,7 @@ pub(crate) fn make_bare_per_context_state(context_id: &str, creator_did: &str) -
         resolved_proposals: HashMap::new(),
         pruning_policy: None,
         economic_policy_locked: false,
+        pinned_outlet_message_keys: HashMap::new(),
         hard_rate_limit_config: None,
         consequence_rules: Vec::new(),
         cooldown_until: HashMap::new(),
@@ -1339,6 +1351,7 @@ impl WasmContextManager {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
+            pinned_outlet_message_keys: HashMap::new(),
             hard_rate_limit_config: None,
             consequence_rules,
             cooldown_until: HashMap::new(),
@@ -1886,6 +1899,53 @@ impl WasmContextManager {
         Ok(outlet_id)
     }
 
+    /// Pins an `outlet_message_key` for a given
+    /// `(outlet_id, registration_event_id)` triple per §5.4.4 round-5
+    /// (SCP-OUT-041a/d).
+    ///
+    /// The WASM bridge mirrors the scp-runtime
+    /// `GovernanceState::pinned_outlet_message_keys` map locally so
+    /// `outlet_error_new` can compute the §5.4.4 wire-message HMAC at
+    /// the FFI boundary without exposing the raw key to the SDK.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is unknown.
+    pub fn store_outlet_message_key(
+        &mut self,
+        context_id: &str,
+        outlet_id: &str,
+        registration_event_id: [u8; 32],
+        outlet_message_key: [u8; 32],
+    ) -> Result<(), ScpWasmError> {
+        let ctx = self.require_active_context_mut(context_id)?;
+        ctx.pinned_outlet_message_keys.insert(
+            (outlet_id.to_owned(), registration_event_id),
+            outlet_message_key,
+        );
+        Ok(())
+    }
+
+    /// Returns the pinned 32-byte `outlet_message_key` for the given
+    /// `(outlet_id, registration_event_id)` triple per §5.4.4 round-5
+    /// (SCP-OUT-041a/d), or `None` if no key is pinned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is unknown.
+    pub fn pinned_outlet_message_key_for(
+        &self,
+        context_id: &str,
+        outlet_id: &str,
+        registration_event_id: &[u8; 32],
+    ) -> Result<Option<[u8; 32]>, ScpWasmError> {
+        let ctx = self.require_active_context(context_id)?;
+        Ok(ctx
+            .pinned_outlet_message_keys
+            .get(&(outlet_id.to_owned(), *registration_event_id))
+            .copied())
+    }
+
     /// Checks whether a tool exists in the context's registry.
     ///
     /// # Errors
@@ -1894,6 +1954,41 @@ impl WasmContextManager {
     pub fn tool_exists(&self, context_id: &str, outlet_id: &str) -> Result<bool, ScpWasmError> {
         let ctx = self.require_active_context(context_id)?;
         Ok(ctx.outlet_registry.get(outlet_id).is_some())
+    }
+
+    /// Returns the registered catalog keys (every `MessageTemplate.key`) for
+    /// the named outlet, used by SCP-OUT-041d `outlet_error_new` to enforce
+    /// `OutletErrorConstructionFailed::UnregisteredMessageKey`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context is unknown or no outlet is registered.
+    pub fn outlet_catalog_keys(
+        &self,
+        context_id: &str,
+        outlet_id: &str,
+    ) -> Result<Vec<scp_protocol::context::outlets::errors::CatalogKey>, ScpWasmError> {
+        use scp_protocol::context::outlets::errors::CatalogKey;
+        let ctx = self.require_active_context(context_id)?;
+        let registration =
+            ctx.outlet_registry
+                .get(outlet_id)
+                .ok_or_else(|| ScpWasmError::Validation {
+                    message: format!("outlet not found: {outlet_id}"),
+                    code: codes::TOOL_6002.to_owned(),
+                })?;
+        let mut keys: Vec<CatalogKey> = Vec::with_capacity(registration.message_catalog.len());
+        for tpl in &registration.message_catalog {
+            let k = CatalogKey::try_new(tpl.key.clone()).map_err(|e| ScpWasmError::Validation {
+                message: format!(
+                    "outlet '{outlet_id}' has malformed catalog key {:?}: {e}",
+                    tpl.key
+                ),
+                code: codes::TOOL_6002.to_owned(),
+            })?;
+            keys.push(k);
+        }
+        Ok(keys)
     }
 
     /// Returns the registered [`OutletKind`] for a registered outlet.
@@ -5587,6 +5682,11 @@ impl WasmContextManager {
             hard_rate_limit_config: snap.hard_rate_limit_config.clone(),
             consequence_rules: snap.consequence_rules.clone(),
             cooldown_until: snap.cooldown_until.clone(),
+            // Imported snapshots do not carry pinned outlet message keys —
+            // they are derived per-registration from MLS exporter material
+            // (§5.4.4 round-5) and re-pinned via `outletStoreMessageKey`
+            // after the import path re-establishes the registration.
+            pinned_outlet_message_keys: HashMap::new(),
             // Imported contexts do not carry MLS state — they must re-establish
             // encryption via join_context_encrypted after import.
             crypto: None,
@@ -6788,6 +6888,7 @@ mod tests {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
+            pinned_outlet_message_keys: HashMap::new(),
             hard_rate_limit_config: None,
             consequence_rules: Vec::new(),
             cooldown_until: HashMap::new(),
@@ -6899,6 +7000,7 @@ mod tests {
             resolved_proposals: HashMap::new(),
             pruning_policy: None,
             economic_policy_locked: false,
+            pinned_outlet_message_keys: HashMap::new(),
             hard_rate_limit_config: None,
             consequence_rules: Vec::new(),
             cooldown_until: HashMap::new(),
@@ -7158,6 +7260,7 @@ mod tests {
             governance_freeze: false,
             pruning_policy: None,
             economic_policy_locked: false,
+            pinned_outlet_message_keys: HashMap::new(),
             hard_rate_limit_config: None,
         }
     }
