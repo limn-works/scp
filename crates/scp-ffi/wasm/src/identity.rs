@@ -1643,14 +1643,8 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
     // with IDENT_1028 via the shared helper.
     let did = identity.did.clone();
     let agent_bytes = zeroize::Zeroizing::new(agent_key.to_bytes());
-    with_local_record_mut(&did, "add an agent key", |record| {
-        if let IdentityRecord::Local {
-            agent_signing_key_bytes,
-            ..
-        } = record
-        {
-            *agent_signing_key_bytes = Some(agent_bytes);
-        }
+    with_local_record_mut(&did, "add an agent key", |fields| {
+        *fields.agent_signing_key_bytes = Some(agent_bytes);
     })
     .map_err(ScpWasmError::into_js)?;
 
@@ -1666,46 +1660,67 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
 }
 
 /// Outcome of a registry mutation that writes to a `Local`-only field.
-/// Exists so callers can distinguish "DID not in registry" from
-/// "DID in registry but the record is a `Resolved` handle that cannot
-/// host key material."
-enum AgentKeyMutationStatus {
+/// Used by [`with_local_record_mut`] (and previously by ad-hoc
+/// match arms in the agent-key write paths, hence the legacy name).
+/// Lets callers distinguish "DID not in registry" from "DID in
+/// registry but the record is a `Resolved` handle that cannot host
+/// key material."
+enum LocalRecordMutationStatus {
     Updated,
     NotFound,
     NotLocal,
 }
 
-/// Looks up `did` and applies `mutate` to the matched
-/// `IdentityRecord::Local`. Returns `Ok(())` on success; refuses with
-/// `IDENT_1002` if the DID is absent and with `IDENT_1028`
-/// (interpolating `op_description` into the message) if the entry is
-/// a `Resolved` handle without retained signing-key material.
+/// Looks up `did` and applies `mutate` directly to the matched
+/// `IdentityRecord::Local` fields. Returns `Ok(())` on success;
+/// refuses with `IDENT_1002` if the DID is absent and with
+/// `IDENT_1028` (interpolating `op_description` into the message) if
+/// the entry is a `Resolved` handle without retained signing-key
+/// material.
+///
+/// `mutate` receives a mutable reference to the unpacked `Local`
+/// fields via [`LocalRecordFieldsMut`]. The helper performs the
+/// variant pattern match once; callers do not re-match.
 ///
 /// Callers wrap into `JsError` at the FFI boundary via
 /// `ScpWasmError::into_js`.
 fn with_local_record_mut(
     did: &str,
     op_description: &str,
-    mutate: impl FnOnce(&mut IdentityRecord),
+    mutate: impl FnOnce(LocalRecordFieldsMut<'_>),
 ) -> Result<(), ScpWasmError> {
     let status = IDENTITY_REGISTRY.with(|reg| {
         let mut map = reg.borrow_mut();
         match map.get_mut(did) {
-            Some(record @ IdentityRecord::Local { .. }) => {
-                mutate(record);
-                AgentKeyMutationStatus::Updated
+            Some(IdentityRecord::Local {
+                signing_key_bytes,
+                active_signing_key_bytes,
+                pre_rotation_signing_key_bytes,
+                public_key_bytes,
+                custody_type,
+                agent_signing_key_bytes,
+            }) => {
+                mutate(LocalRecordFieldsMut {
+                    signing_key_bytes,
+                    active_signing_key_bytes,
+                    pre_rotation_signing_key_bytes,
+                    public_key_bytes,
+                    custody_type,
+                    agent_signing_key_bytes,
+                });
+                LocalRecordMutationStatus::Updated
             }
-            Some(IdentityRecord::Resolved { .. }) => AgentKeyMutationStatus::NotLocal,
-            None => AgentKeyMutationStatus::NotFound,
+            Some(IdentityRecord::Resolved { .. }) => LocalRecordMutationStatus::NotLocal,
+            None => LocalRecordMutationStatus::NotFound,
         }
     });
     match status {
-        AgentKeyMutationStatus::Updated => Ok(()),
-        AgentKeyMutationStatus::NotFound => Err(ScpWasmError::Identity {
+        LocalRecordMutationStatus::Updated => Ok(()),
+        LocalRecordMutationStatus::NotFound => Err(ScpWasmError::Identity {
             message: format!("identity not found in registry: {did}"),
             code: codes::IDENT_1002.to_owned(),
         }),
-        AgentKeyMutationStatus::NotLocal => Err(ScpWasmError::Identity {
+        LocalRecordMutationStatus::NotLocal => Err(ScpWasmError::Identity {
             message: format!(
                 "identity '{did}' was resolved from a DID string without local \
                  key material — cannot {op_description}"
@@ -1713,6 +1728,21 @@ fn with_local_record_mut(
             code: codes::IDENT_1028.to_owned(),
         }),
     }
+}
+
+/// Borrowed view of the `IdentityRecord::Local` fields, passed by
+/// [`with_local_record_mut`] to its callback so callers don't have to
+/// re-pattern-match. The shape mirrors the variant fields exactly so
+/// adding a new field forces every caller to either touch it or
+/// destructure with `..`.
+#[allow(dead_code)]
+struct LocalRecordFieldsMut<'a> {
+    signing_key_bytes: &'a mut zeroize::Zeroizing<[u8; 32]>,
+    active_signing_key_bytes: &'a mut zeroize::Zeroizing<[u8; 32]>,
+    pre_rotation_signing_key_bytes: &'a mut zeroize::Zeroizing<[u8; 32]>,
+    public_key_bytes: &'a mut [u8; 32],
+    custody_type: &'a mut String,
+    agent_signing_key_bytes: &'a mut Option<zeroize::Zeroizing<[u8; 32]>>,
 }
 
 /// Rotates the agent signing key for an identity (ADR-039).
@@ -1745,14 +1775,8 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     // shared helper. `Resolved` records refuse with IDENT_1028.
     let did = identity.did.clone();
     let agent_bytes = zeroize::Zeroizing::new(agent_key.to_bytes());
-    with_local_record_mut(&did, "rotate an agent key", |record| {
-        if let IdentityRecord::Local {
-            agent_signing_key_bytes,
-            ..
-        } = record
-        {
-            *agent_signing_key_bytes = Some(agent_bytes);
-        }
+    with_local_record_mut(&did, "rotate an agent key", |fields| {
+        *fields.agent_signing_key_bytes = Some(agent_bytes);
     })
     .map_err(ScpWasmError::into_js)?;
 
@@ -1841,17 +1865,11 @@ fn rotate_active_key_inner(identity: &WasmIdentity) -> Result<WasmIdentity, ScpW
     let new_active_bytes = zeroize::Zeroizing::new(new_active.to_bytes());
 
     let did = identity.did.clone();
-    with_local_record_mut(&did, "rotate the active signing key", |record| {
-        if let IdentityRecord::Local {
-            active_signing_key_bytes,
-            ..
-        } = record
-        {
-            // In-place replacement: the old `Zeroizing<[u8; 32]>` is
-            // dropped and zeroed when the new value is assigned, so no
-            // unprotected copy of the previous active key persists.
-            *active_signing_key_bytes = new_active_bytes;
-        }
+    with_local_record_mut(&did, "rotate the active signing key", |fields| {
+        // In-place replacement: the old `Zeroizing<[u8; 32]>` is
+        // dropped and zeroed when the new value is assigned, so no
+        // unprotected copy of the previous active key persists.
+        *fields.active_signing_key_bytes = new_active_bytes;
     })?;
 
     Ok(WasmIdentity {
@@ -1892,14 +1910,8 @@ pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     // refuses with IDENT_1028 for `Resolved` records and IDENT_1002 for
     // unknown DIDs.
     let did = identity.did.clone();
-    with_local_record_mut(&did, "remove an agent key", |record| {
-        if let IdentityRecord::Local {
-            agent_signing_key_bytes,
-            ..
-        } = record
-        {
-            *agent_signing_key_bytes = None;
-        }
+    with_local_record_mut(&did, "remove an agent key", |fields| {
+        *fields.agent_signing_key_bytes = None;
     })
     .map_err(ScpWasmError::into_js)?;
 
