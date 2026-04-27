@@ -464,7 +464,12 @@ impl ContextActor {
                 Box::pin(handlers::broadcast::dispatch_from_shim(supervisor, sub)).await
             }
             ContextCommand::Economy(sub) => {
-                handlers::economy::dispatch_from_shim(supervisor, sub).await
+                // Phase 2A.3 — economy domain migrated to the
+                // actor-shape handler. Supervisor dispatch still falls
+                // back to `dispatch_from_shim` for callers that do not
+                // have a target context actor during the migration
+                // window.
+                handlers::economy::dispatch(state, deps, sub).await
             }
             ContextCommand::TrustRecovery(sub) => {
                 // Phase 2A.1 — trust_recovery domain migrated to
