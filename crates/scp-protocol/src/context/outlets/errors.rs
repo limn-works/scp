@@ -799,6 +799,8 @@ impl OutletError {
     ///   message cap is on the catalog template; catalog keys are bounded
     ///   the same way.
     pub fn new(opts: OutletErrorNewOpts<'_>) -> Result<Self, OutletErrorConstructionFailed> {
+        use super::error_codes::{SlugError, error_code_to_class, slug_to_class, validate_slug};
+
         let OutletErrorNewOpts {
             outlet_id: _,
             outlet_message_key,
@@ -821,12 +823,49 @@ impl OutletError {
             return Err(OutletErrorConstructionFailed::MalformedCode { code });
         }
 
-        // 2. slug regex check (§5.4.4 catalog-key regex).
-        if !validate_catalog_key(&slug) {
+        // 2. slug regex check (§5.4.4 catalog-key regex). SCP-OUT-025: the
+        //    slug regex is enforced via the registry's typed entry point
+        //    `validate_slug` — the production caller for this helper. The
+        //    underlying byte scanner is shared with `validate_catalog_key`
+        //    so the regex semantics are identical, but routing the call
+        //    through `validate_slug` pins the registry as the single source
+        //    of truth for §5.4.4 slug validation.
+        if let Err(SlugError::Malformed { slug }) = validate_slug(&slug) {
             return Err(OutletErrorConstructionFailed::MalformedSlug { slug });
         }
 
-        // 3. message-length cap on the catalog-key plaintext.
+        // 3. defense-in-depth: caller-supplied class must match the §5.4.4
+        //    registry mapping for the code AND for the slug. SCP-OUT-025
+        //    wires the registry helpers into `OutletError::new` so a drift
+        //    between the caller's `class` argument and the registry-defined
+        //    class for the supplied code/slug is caught at construction
+        //    time rather than leaking through to the wire.
+        //
+        //    Reserved codes / unrecognized slugs return `None` from the
+        //    registry — for those we skip the cross-check (the regex pass
+        //    above already rejected malformed inputs; a registry miss here
+        //    means the code/slug is well-formed but not yet tabulated, and
+        //    the catalog-membership check below remains the gate).
+        if let Some(expected) = error_code_to_class(&code)
+            && expected != class
+        {
+            return Err(OutletErrorConstructionFailed::ClassCodeMismatch {
+                code_or_slug: code.clone(),
+                expected,
+                actual: class,
+            });
+        }
+        if let Some(expected) = slug_to_class(&slug)
+            && expected != class
+        {
+            return Err(OutletErrorConstructionFailed::ClassCodeMismatch {
+                code_or_slug: slug.clone(),
+                expected,
+                actual: class,
+            });
+        }
+
+        // 4. message-length cap on the catalog-key plaintext.
         if catalog_key.as_str().len() > MESSAGE_MAX_BYTES {
             return Err(OutletErrorConstructionFailed::MessageTooLong {
                 actual: catalog_key.as_str().len(),
@@ -921,15 +960,30 @@ impl OutletError {
     ///
     /// # Errors
     ///
-    /// Returns [`OutletErrorConstructionFailed`] only if `code` or `slug`
-    /// fail their respective regex checks. The catalog-membership check is
-    /// **not** applied (no real `message_catalog` exists at this seam).
+    /// Returns [`OutletErrorConstructionFailed`] when:
+    ///
+    /// - `code` fails its regex check
+    ///   ([`OutletErrorConstructionFailed::MalformedCode`]).
+    /// - `slug` fails its regex check
+    ///   ([`OutletErrorConstructionFailed::MalformedSlug`]).
+    /// - `class` disagrees with the §5.4.4 registry mapping for `code` or
+    ///   `slug` ([`OutletErrorConstructionFailed::ClassCodeMismatch`]).
+    ///   SCP-OUT-025 wires
+    ///   [`error_code_to_class`](super::error_codes::error_code_to_class) and
+    ///   [`slug_to_class`](super::error_codes::slug_to_class) into this
+    ///   construction path so a runtime mapping-table drift is rejected at
+    ///   the seam rather than leaking through to the typed `ContextError`.
+    ///
+    /// The catalog-membership check is **not** applied (no real
+    /// `message_catalog` exists at this seam).
     pub fn from_invocation_error_template(
         class: OutletErrorClass,
         code: impl Into<String>,
         slug: impl Into<String>,
         retry: RetryPolicy,
     ) -> Result<Self, OutletErrorConstructionFailed> {
+        use super::error_codes::{SlugError, error_code_to_class, slug_to_class, validate_slug};
+
         let code = code.into();
         let slug = slug.into();
 
@@ -938,12 +992,41 @@ impl OutletError {
             return Err(OutletErrorConstructionFailed::MalformedCode { code });
         }
 
-        // 2. slug regex check (§5.4.4 catalog-key regex).
-        if !validate_catalog_key(&slug) {
+        // 2. slug regex check (§5.4.4 catalog-key regex). SCP-OUT-025: route
+        //    the runtime → ContextError seam through the registry's typed
+        //    `validate_slug` so wire-bound and runtime-bound construction
+        //    paths share the same canonical entry point.
+        if let Err(SlugError::Malformed { slug }) = validate_slug(&slug) {
             return Err(OutletErrorConstructionFailed::MalformedSlug { slug });
         }
 
-        // 3. derive a catalog-key from the slug (slug regex ⊆ catalog-key
+        // 3. defense-in-depth class/code/slug consistency check via the
+        //    §5.4.4 registry — same invariant as `OutletError::new`. The
+        //    runtime mapping table (`invocation_error_to_envelope_template`)
+        //    sources every `(class, code, slug)` triple from registry
+        //    constants, so a registry mismatch here means the table drifted
+        //    out of sync with the §5.4.4 taxonomy and must be fixed at the
+        //    table, not papered over at the construction site.
+        if let Some(expected) = error_code_to_class(&code)
+            && expected != class
+        {
+            return Err(OutletErrorConstructionFailed::ClassCodeMismatch {
+                code_or_slug: code.clone(),
+                expected,
+                actual: class,
+            });
+        }
+        if let Some(expected) = slug_to_class(&slug)
+            && expected != class
+        {
+            return Err(OutletErrorConstructionFailed::ClassCodeMismatch {
+                code_or_slug: slug.clone(),
+                expected,
+                actual: class,
+            });
+        }
+
+        // 4. derive a catalog-key from the slug (slug regex ⊆ catalog-key
         //    regex per §5.4.4) — used only for the placeholder HMAC.
         let catalog_key = CatalogKey::try_new(slug.clone())
             .map_err(|_| OutletErrorConstructionFailed::MalformedSlug { slug: slug.clone() })?;
@@ -1103,6 +1186,28 @@ pub enum OutletErrorConstructionFailed {
         "OutletError envelope missing tag-11 pad_nonce (§5.4.4 round-5 unconditional emission)"
     )]
     MissingPadNonce,
+    /// Defense-in-depth: caller-supplied [`OutletErrorClass`] does not match
+    /// the class that the §5.4.4 registry assigns to the supplied `code` (or
+    /// `slug`). SCP-OUT-025 wires the registry helpers
+    /// [`error_code_to_class`](super::error_codes::error_code_to_class) and
+    /// [`slug_to_class`](super::error_codes::slug_to_class) into
+    /// [`OutletError::new`] so a code/class or slug/class drift at any
+    /// construction site (runtime emitter, FFI bridge, SDK) is rejected
+    /// before the envelope leaves the SDK boundary.
+    #[error(
+        "OutletError class/code/slug mismatch — supplied class {actual:?} disagrees with the §5.4.4 registry mapping {expected:?} for code/slug \"{code_or_slug}\""
+    )]
+    ClassCodeMismatch {
+        /// The code or slug whose registry-assigned class disagrees with
+        /// the caller-supplied class. The string is whichever surface
+        /// triggered the mismatch (`code` for the code/class check,
+        /// `slug` for the slug/class check).
+        code_or_slug: String,
+        /// The class the §5.4.4 registry assigns to `code_or_slug`.
+        expected: OutletErrorClass,
+        /// The class the caller supplied.
+        actual: OutletErrorClass,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -1426,6 +1531,237 @@ mod tests {
             res,
             Err(OutletErrorConstructionFailed::MalformedSlug { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-025 — registry-driven class/code/slug consistency at
+    // OutletError::new (defense-in-depth). The §5.4.4 registry helpers
+    // `error_code_to_class`, `slug_to_class`, and `validate_slug` are
+    // wired into the construction path so a class/code or class/slug
+    // drift is rejected at the construction site, not on the wire.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn constructor_rejects_class_mismatch_for_registered_code() {
+        // SCP-OUT-025: code 6110 maps to OutletErrorClass::Authorization
+        // per the §5.4.4 registry. Constructing with a non-Authorization
+        // `class` value MUST be rejected as ClassCodeMismatch — even when
+        // the slug regex passes and the catalog key is registered.
+        let outlet_id: OutletId = "x".to_owned();
+        let key = CatalogKey::try_new("authorization.denied").unwrap();
+        let registered = registered();
+        let res = OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &key,
+            registered_keys: &registered,
+            // Mismatch: 6110 is the Authorization-class code per the registry,
+            // but the caller-supplied class is Input.
+            class: OutletErrorClass::Input,
+            code: "SCP-TOOL-6110",
+            slug: "authorization.denied",
+            retry: RetryPolicy::Never,
+            detail: None,
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        });
+        match res {
+            Err(OutletErrorConstructionFailed::ClassCodeMismatch {
+                code_or_slug,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(code_or_slug, "SCP-TOOL-6110");
+                assert_eq!(expected, OutletErrorClass::Authorization);
+                assert_eq!(actual, OutletErrorClass::Input);
+            }
+            other => panic!("expected ClassCodeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constructor_rejects_class_mismatch_for_registered_slug() {
+        // SCP-OUT-025: slug `transport.relay-unavailable` maps to
+        // OutletErrorClass::Transport per slug_to_class. Constructing
+        // with a non-Transport class MUST be rejected with the slug
+        // (not the code) as the diagnostic surface.
+        let outlet_id: OutletId = "x".to_owned();
+        // Register an extra catalog key for this fixture.
+        let key = CatalogKey::try_new("transport.relay-unavailable").unwrap();
+        let registered: Vec<CatalogKey> = vec![
+            CatalogKey::try_new("authorization.denied").unwrap(),
+            key.clone(),
+        ];
+        let res = OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &key,
+            registered_keys: &registered,
+            // The Transport-class slug paired with the Transport-class code
+            // (6160) but a mismatched Authorization class. The slug check
+            // (which runs after the code check) surfaces the diagnostic.
+            class: OutletErrorClass::Authorization,
+            code: "SCP-TOOL-6160",
+            slug: "transport.relay-unavailable",
+            retry: RetryPolicy::WithBackoff {
+                min: Duration::from_secs(1),
+                max: Duration::from_secs(30),
+            },
+            detail: None,
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        });
+        match res {
+            Err(OutletErrorConstructionFailed::ClassCodeMismatch {
+                code_or_slug,
+                expected,
+                actual,
+            }) => {
+                // Code 6160 is Transport — the code check rejects first.
+                assert_eq!(code_or_slug, "SCP-TOOL-6160");
+                assert_eq!(expected, OutletErrorClass::Transport);
+                assert_eq!(actual, OutletErrorClass::Authorization);
+            }
+            other => panic!("expected ClassCodeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constructor_rejects_class_mismatch_when_slug_only_disagrees() {
+        // SCP-OUT-025: when the code is reserved/unregistered (so
+        // `error_code_to_class` returns None) but the slug is in the
+        // registry, the slug-based check still catches the mismatch.
+        // 6180 is in the §5.4.4 reserved range — `error_code_to_class`
+        // returns None, so the slug check is the only gate.
+        let outlet_id: OutletId = "x".to_owned();
+        let key = CatalogKey::try_new("execution.handler-panic").unwrap();
+        let registered: Vec<CatalogKey> = vec![key.clone()];
+        let res = OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &key,
+            registered_keys: &registered,
+            class: OutletErrorClass::Authorization,
+            // 6180 is reserved per §5.4.4 — no registry class.
+            code: "SCP-TOOL-6180", // SCP-CODE-OK: SCP-OUT-025 reserved-range fixture (slug-only mismatch).
+            slug: "execution.handler-panic",
+            retry: RetryPolicy::Never,
+            detail: None,
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        });
+        match res {
+            Err(OutletErrorConstructionFailed::ClassCodeMismatch {
+                code_or_slug,
+                expected,
+                actual,
+            }) => {
+                assert_eq!(code_or_slug, "execution.handler-panic");
+                assert_eq!(expected, OutletErrorClass::Execution);
+                assert_eq!(actual, OutletErrorClass::Authorization);
+            }
+            other => panic!("expected ClassCodeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constructor_accepts_class_matching_registry() {
+        // Positive control: code 6130 / slug `execution.handler-panic` /
+        // class Execution all agree per the §5.4.4 registry. The
+        // class/code/slug consistency check passes; construction
+        // succeeds.
+        let outlet_id: OutletId = "x".to_owned();
+        let key = CatalogKey::try_new("execution.handler-panic").unwrap();
+        let registered: Vec<CatalogKey> = vec![key.clone()];
+        let env = OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &key,
+            registered_keys: &registered,
+            class: OutletErrorClass::Execution,
+            code: "SCP-TOOL-6130",
+            slug: "execution.handler-panic",
+            retry: RetryPolicy::Never,
+            detail: None,
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        })
+        .expect("registry-aligned construction must succeed");
+        assert_eq!(env.class, OutletErrorClass::Execution);
+        assert_eq!(env.code, "SCP-TOOL-6130");
+        assert_eq!(env.slug, "execution.handler-panic");
+    }
+
+    #[test]
+    fn constructor_rejects_uppercase_slug_via_validate_slug() {
+        // SCP-OUT-025: the §5.4.4 slug regex check is now routed through
+        // `validate_slug`. An uppercase slug must be rejected with
+        // MalformedSlug — the same surface as before, but driven by the
+        // registry's typed entry point.
+        let outlet_id: OutletId = "x".to_owned();
+        let key = CatalogKey::try_new("authorization.denied").unwrap();
+        let registered = registered();
+        let res = OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &key,
+            registered_keys: &registered,
+            class: OutletErrorClass::Authorization,
+            code: "SCP-TOOL-6110",
+            slug: "AUTHORIZATION.DENIED", // uppercase — fails §5.4.4 regex
+            retry: RetryPolicy::Never,
+            detail: None,
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        });
+        assert!(matches!(
+            res,
+            Err(OutletErrorConstructionFailed::MalformedSlug { slug }) if slug == "AUTHORIZATION.DENIED"
+        ));
+    }
+
+    #[test]
+    fn constructor_rejects_slug_missing_class_prefix_when_registry_disagrees() {
+        // SCP-OUT-025: a slug with no class prefix (e.g. "denied") still
+        // passes the regex but is not in the registry. This documents
+        // the regex/registry split: regex-pass + registry-miss is allowed
+        // (so SCP-OUT-021 caveat slugs ahead of registration round-trip),
+        // but a slug whose registry entry disagrees with the supplied
+        // class is rejected.
+        //
+        // Here we use `query-cost-violation` (Protocol class per registry)
+        // with a non-Protocol class.
+        let outlet_id: OutletId = "x".to_owned();
+        let key = CatalogKey::try_new("protocol.query-cost-violation").unwrap();
+        let registered: Vec<CatalogKey> = vec![key.clone()];
+        let res = OutletError::new(OutletErrorNewOpts {
+            outlet_id: &outlet_id,
+            outlet_message_key: &fixed_outlet_message_key(),
+            registration_event_id: fixed_registration_event_id(),
+            catalog_key: &key,
+            registered_keys: &registered,
+            class: OutletErrorClass::Authorization,
+            code: "SCP-TOOL-6100",
+            slug: "query-cost-violation", // Protocol-class per registry
+            retry: RetryPolicy::Never,
+            detail: None,
+            source_chain: Vec::new(),
+            pad_nonce: fixed_pad_nonce(),
+        });
+        match res {
+            Err(OutletErrorConstructionFailed::ClassCodeMismatch {
+                expected, actual, ..
+            }) => {
+                assert_eq!(expected, OutletErrorClass::Protocol);
+                assert_eq!(actual, OutletErrorClass::Authorization);
+            }
+            other => panic!("expected ClassCodeMismatch, got {other:?}"),
+        }
     }
 
     #[test]

@@ -32,6 +32,9 @@
 //! [`MESSAGE_KEY_LRU_CAPACITY`]: super::message_key::MESSAGE_KEY_LRU_CAPACITY
 //! [`OutletErrorConstructionFailed::UnregisteredMessageKey`]: scp_protocol::context::outlets::errors::OutletErrorConstructionFailed::UnregisteredMessageKey
 
+use scp_protocol::context::outlets::error_codes::{
+    SlugError, error_code_to_class, slug_to_class, validate_slug,
+};
 use scp_protocol::context::outlets::errors::{
     CatalogKey, OutletError, OutletErrorConstructionFailed,
 };
@@ -107,6 +110,40 @@ pub fn verify_outlet_error(
     lru: &OutletMessageKeyLru,
     registered_keys: &[CatalogKey],
 ) -> Result<VerifiedOutletError, OutletErrorConstructionFailed> {
+    // Step 0 (SCP-OUT-025): wire-layer slug regex check. Decoding via
+    // serde permits any String value through the `slug` field; the
+    // §5.4.4 regex is enforced here so a malformed slug is rejected at
+    // the receiver boundary before any HMAC work runs. Symmetric with
+    // `OutletError::new`'s construction-time check on the emitter side.
+    if let Err(SlugError::Malformed { slug }) = validate_slug(&envelope.slug) {
+        return Err(OutletErrorConstructionFailed::MalformedSlug { slug });
+    }
+
+    // Step 0b (SCP-OUT-025): defense-in-depth class/code/slug consistency
+    // check via the §5.4.4 registry. A wire envelope whose `class` field
+    // disagrees with `error_code_to_class(envelope.code)` or
+    // `slug_to_class(envelope.slug)` is rejected as a wire-layer
+    // ClassCodeMismatch — preventing an operator from emitting
+    // syntactically valid but semantically inconsistent envelopes.
+    if let Some(expected) = error_code_to_class(&envelope.code)
+        && expected != envelope.class
+    {
+        return Err(OutletErrorConstructionFailed::ClassCodeMismatch {
+            code_or_slug: envelope.code.clone(),
+            expected,
+            actual: envelope.class,
+        });
+    }
+    if let Some(expected) = slug_to_class(&envelope.slug)
+        && expected != envelope.class
+    {
+        return Err(OutletErrorConstructionFailed::ClassCodeMismatch {
+            code_or_slug: envelope.slug.clone(),
+            expected,
+            actual: envelope.class,
+        });
+    }
+
     // Step 1: registration_event_id must hit the LRU. The §5.4.4 round-6
     // miss-path is non-negotiable: a miss is rejected so the operator
     // cannot fabricate envelopes under never-registered keys.
@@ -439,5 +476,91 @@ mod tests {
         let registered = registered_keys();
         verify_outlet_error(&env_at_e, &lru, &registered).expect("E verifies");
         verify_outlet_error(&env_at_e_plus_1, &lru, &registered).expect("E+1 verifies");
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-025 — registry-driven wire-deserialization checks.
+    //
+    // The receiver MUST run the §5.4.4 registry through every wire envelope:
+    //
+    // - `validate_slug` rejects malformed slugs at the boundary (Step 0).
+    // - `error_code_to_class` and `slug_to_class` reject envelopes whose
+    //   `class` field disagrees with the registry mapping (Step 0b).
+    //
+    // Both checks run before any HMAC work so a malformed envelope cannot
+    // even probe the LRU side channel.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn verify_rejects_envelope_with_uppercase_slug() {
+        // SCP-OUT-025: a wire envelope whose `slug` field is uppercase
+        // fails the §5.4.4 regex. Construction-time it could not have been
+        // emitted by `OutletError::new` — but the wire path is exposed to
+        // operator-fabricated envelopes whose serde decode bypasses
+        // construction. `verify_outlet_error` MUST reject malformed slugs
+        // via `validate_slug` before any HMAC reverse runs.
+        let outlet_message_key = [0x42; OUTLET_MESSAGE_KEY_LEN];
+        let registration_event_id = [0xE1; REGISTRATION_EVENT_ID_LEN];
+        let mut envelope = build_envelope(
+            "outlet-test",
+            &outlet_message_key,
+            registration_event_id,
+            "authorization.denied",
+        );
+        // Tamper with the slug field after construction — mimics a
+        // wire-deserialized envelope whose serde decode permitted any
+        // String through the slug slot.
+        envelope.slug = "AUTHORIZATION.DENIED".to_owned();
+
+        let mut lru = OutletMessageKeyLru::new();
+        lru.insert(registration_event_id, outlet_message_key);
+        let registered = registered_keys();
+        let result = verify_outlet_error(&envelope, &lru, &registered);
+        match result {
+            Err(OutletErrorConstructionFailed::MalformedSlug { slug }) => {
+                assert_eq!(slug, "AUTHORIZATION.DENIED");
+            }
+            other => panic!("expected MalformedSlug, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_rejects_wire_envelope_with_class_code_mismatch() {
+        // SCP-OUT-025: a wire envelope whose `class` field disagrees
+        // with `error_code_to_class(envelope.code)` is rejected as
+        // ClassCodeMismatch. Models an operator-fabricated envelope
+        // that sets the class field to mislead receivers about which
+        // sealed-class branch to dispatch on.
+        let outlet_message_key = [0x42; OUTLET_MESSAGE_KEY_LEN];
+        let registration_event_id = [0xE1; REGISTRATION_EVENT_ID_LEN];
+        let mut envelope = build_envelope(
+            "outlet-test",
+            &outlet_message_key,
+            registration_event_id,
+            "authorization.denied",
+        );
+        // Tamper: code stays 6110 (Authorization per registry) but
+        // overwrite the class to Input — the wire-layer mismatch must
+        // be rejected.
+        envelope.class = scp_protocol::context::outlets::errors::OutletErrorClass::Input;
+
+        let mut lru = OutletMessageKeyLru::new();
+        lru.insert(registration_event_id, outlet_message_key);
+        let registered = registered_keys();
+        let result = verify_outlet_error(&envelope, &lru, &registered);
+        match result {
+            Err(OutletErrorConstructionFailed::ClassCodeMismatch {
+                code_or_slug,
+                expected,
+                actual,
+            }) => {
+                use scp_protocol::context::outlets::errors::OutletErrorClass;
+                // The code check fires first (envelope.code = 6110).
+                assert_eq!(code_or_slug, "SCP-TOOL-6110");
+                assert_eq!(expected, OutletErrorClass::Authorization);
+                assert_eq!(actual, OutletErrorClass::Input);
+            }
+            other => panic!("expected ClassCodeMismatch, got {other:?}"),
+        }
     }
 }

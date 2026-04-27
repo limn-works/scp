@@ -3326,13 +3326,22 @@ fn invocation_error_to_envelope_template(
 }
 
 /// Routes a `CaveatViolation` slug to its `(class, code, slug, retry)`
-/// envelope template per the §5.4.4 prefix mapping.
+/// envelope template per the §5.4.4 registry.
 ///
-/// `input.*` → Input-class, `transport.*` → Transport-class with
-/// `WithBackoff`, `economic.*` → Economic-class, anything else falls
-/// through to Authorization-class. SCP-OUT-034 added the `transport.*`
-/// and `economic.*` branches for stream-admission and escrow-open
-/// rejections.
+/// SCP-OUT-025: the dispatch consults the §5.4.4 registry's
+/// [`slug_to_class`] (the source of truth for the slug → class mapping)
+/// rather than hand-rolled prefix string matching. The `(class, code,
+/// retry)` triple is then derived from the registry-assigned class,
+/// keeping caveat-rejected envelopes byte-aligned with the registry.
+///
+/// Slugs not registered in the §5.4.4 taxonomy collapse to the
+/// Authorization-class catch-all (`SCP-TOOL-6110` / `RetryPolicy::Never`)
+/// so an SCP-OUT-021 caveat that surfaces a slug outside the registered
+/// vocabulary still produces a typed envelope. The runtime tests verify
+/// every caveat slug the evaluator emits is in the registry, so this
+/// fallback is defensive.
+///
+/// [`slug_to_class`]: scp_protocol::context::outlets::error_codes::slug_to_class
 fn caveat_violation_to_envelope(
     slug: &'static str,
 ) -> (
@@ -3343,18 +3352,35 @@ fn caveat_violation_to_envelope(
 ) {
     use scp_protocol::context::outlets::error_codes::{
         CODE_AUTHORIZATION_DENIED, CODE_ECONOMIC_FAULT, CODE_INPUT_VIOLATION, CODE_TRANSPORT_FAULT,
+        slug_to_class,
     };
     use scp_protocol::context::outlets::errors::{OutletErrorClass, RetryPolicy};
 
-    if slug.starts_with("input.") {
-        (
+    // Registry-driven dispatch (SCP-OUT-025). Falls back to prefix matching
+    // only for slugs not yet tabulated in the §5.4.4 registry — this
+    // preserves backwards compatibility with caveat slugs that round-trip
+    // through SCP-OUT-021 ahead of being tabulated, while ensuring every
+    // tabulated slug is routed via the canonical mapping.
+    let class = slug_to_class(slug).unwrap_or_else(|| {
+        if slug.starts_with("input.") {
+            OutletErrorClass::Input
+        } else if slug.starts_with("transport.") {
+            OutletErrorClass::Transport
+        } else if slug.starts_with("economic.") {
+            OutletErrorClass::Economic
+        } else {
+            OutletErrorClass::Authorization
+        }
+    });
+
+    match class {
+        OutletErrorClass::Input => (
             OutletErrorClass::Input,
             CODE_INPUT_VIOLATION,
             slug,
             RetryPolicy::Never,
-        )
-    } else if slug.starts_with("transport.") {
-        (
+        ),
+        OutletErrorClass::Transport => (
             OutletErrorClass::Transport,
             CODE_TRANSPORT_FAULT,
             slug,
@@ -3362,21 +3388,28 @@ fn caveat_violation_to_envelope(
                 min: std::time::Duration::from_secs(1),
                 max: std::time::Duration::from_secs(30),
             },
-        )
-    } else if slug.starts_with("economic.") {
-        (
+        ),
+        OutletErrorClass::Economic => (
             OutletErrorClass::Economic,
             CODE_ECONOMIC_FAULT,
             slug,
             RetryPolicy::Never,
-        )
-    } else {
-        (
+        ),
+        // Authorization, Protocol, Execution, Output, Governance — caveat
+        // violations fall under the §5.4.4 query-oracle-collapse target
+        // (Authorization-class denial). The registry-driven branch above
+        // routes to the most accurate class; any other class collapses to
+        // Authorization to preserve the §5.4.4 oracle property.
+        OutletErrorClass::Authorization
+        | OutletErrorClass::Protocol
+        | OutletErrorClass::Execution
+        | OutletErrorClass::Output
+        | OutletErrorClass::Governance => (
             OutletErrorClass::Authorization,
             CODE_AUTHORIZATION_DENIED,
             slug,
             RetryPolicy::Never,
-        )
+        ),
     }
 }
 
@@ -6284,6 +6317,13 @@ mod wrap_cross_context_error_tests {
 
     fn build_inner_amplification_error() -> OutletError {
         let outlet_id: OutletId = "outlet-amp".to_owned();
+        // SCP-OUT-025: `authorization.amplification-violation` is the
+        // amplification slug whose canonical §5.4.4 mapping is
+        // `OutletErrorClass::Authorization` / `SCP-TOOL-6110` per the
+        // registry. Prior to OUT-025 this fixture used code 6120 (Input)
+        // which silently disagreed with the declared Authorization
+        // class — caught now by the registry's class/code consistency
+        // check inside `OutletError::new`.
         let key = CatalogKey::try_new("authorization.amplification-violation").unwrap();
         let registered = registered();
         OutletError::new(OutletErrorNewOpts {
@@ -6293,7 +6333,7 @@ mod wrap_cross_context_error_tests {
             catalog_key: &key,
             registered_keys: &registered,
             class: OutletErrorClass::Authorization,
-            code: "SCP-TOOL-6120",
+            code: "SCP-TOOL-6110",
             slug: "authorization.amplification-violation",
             retry: RetryPolicy::Never,
             detail: None,

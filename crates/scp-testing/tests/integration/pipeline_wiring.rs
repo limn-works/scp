@@ -78,6 +78,20 @@ const WASM_MANAGER_FOR_OUT033_SRC: &str =
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
 
+// SCP-OUT-025 registry-callers assertion sources. The §5.4.4 registry helpers
+// `error_code_to_class`, `slug_to_class`, and `validate_slug` live in
+// `scp_protocol::context::outlets::error_codes`. Prior to OUT-025 these
+// helpers had zero production callers — only test/comment references — so
+// the registry was dead-data on the production code path. The assertion
+// below pins the wiring so a future refactor that drops the registry hooks
+// is caught structurally.
+const PROTOCOL_ERRORS_SRC: &str =
+    include_str!("../../../../crates/scp-protocol/src/context/outlets/errors.rs");
+const RUNTIME_OUTLET_ERRORS_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/outlets/errors.rs");
+const RUNTIME_OUTLETS_MANAGER_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/manager/outlets.rs");
+
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
@@ -156,7 +170,18 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // the `ContextManager`. The single `#[test]` item runs N inner
 // assertions over a constant-table of (method, substring) tuples but
 // contributes 1 to the total_tests count.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 66;
+//
+// Raised 66 -> 67 by SCP-OUT-025 registry-callers wiring: adds
+// `out025_registry_callers_present` pinning the production callers of
+// the §5.4.4 error-code registry helpers `error_code_to_class`,
+// `slug_to_class`, and `validate_slug`. Prior audit caught the registry
+// as dead-data — the helpers existed and were exported, but every
+// production reference lived in module rustdoc comments. OUT-025
+// remediation wires the helpers into `OutletError::new`,
+// `OutletError::from_invocation_error_template`, the receiver-side
+// `verify_outlet_error`, and the runtime caveat-violation envelope
+// dispatcher. One `#[test]` item, +1 to the active count.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 67;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -1076,6 +1101,79 @@ fn context_manager_exposes_outlet_lifecycle_methods() {
              bridges can call it across crate boundaries (SCP-OUT-004 AC5)"
         );
     }
+}
+
+// --- SCP-OUT-025 §5.4.4 registry-callers wiring ---
+//
+// The audit caught `error_code_to_class`, `slug_to_class`, and
+// `validate_slug` as dead-data: every helper existed and was exported
+// from `scp_protocol::context::outlets::error_codes`, but the only
+// references in production crates lived in module rustdoc comments.
+// Construction sites (`OutletError::new`,
+// `OutletError::from_invocation_error_template`) and wire-deserialization
+// sites (`verify_outlet_error`) bypassed the registry entirely; the
+// runtime caveat dispatcher used hand-rolled prefix string matching
+// rather than `slug_to_class`.
+//
+// SCP-OUT-025 remediation wires all three helpers into real production
+// call sites. This assertion pins those call sites structurally so a
+// future refactor cannot silently regress the registry to dead-data.
+#[test]
+fn out025_registry_callers_present() {
+    // Path A: validate_slug must be called in OutletError::new on the
+    // protocol side AND in verify_outlet_error on the runtime side.
+    let outlet_error_new_body = extract_fn_body(PROTOCOL_ERRORS_SRC, "new")
+        .expect("OutletError::new body must exist in scp-protocol errors.rs");
+    assert!(
+        outlet_error_new_body.contains("validate_slug("),
+        "OutletError::new must call validate_slug to enforce the §5.4.4 \
+         slug regex via the registry's typed entry point (SCP-OUT-025)"
+    );
+    let verify_outlet_error_body =
+        extract_fn_body(RUNTIME_OUTLET_ERRORS_SRC, "verify_outlet_error")
+            .expect("verify_outlet_error body must exist in scp-runtime outlets/errors.rs");
+    assert!(
+        verify_outlet_error_body.contains("validate_slug("),
+        "verify_outlet_error must call validate_slug at the wire \
+         deserialization boundary so a malformed envelope is rejected \
+         before any HMAC reverse runs (SCP-OUT-025)"
+    );
+
+    // Path B: error_code_to_class must be called from OutletError::new
+    // and verify_outlet_error to enforce class/code consistency.
+    assert!(
+        outlet_error_new_body.contains("error_code_to_class("),
+        "OutletError::new must call error_code_to_class to enforce the \
+         §5.4.4 class/code consistency invariant (SCP-OUT-025)"
+    );
+    assert!(
+        verify_outlet_error_body.contains("error_code_to_class("),
+        "verify_outlet_error must call error_code_to_class to reject \
+         wire envelopes whose class/code drift on the wire (SCP-OUT-025)"
+    );
+
+    // Path C: slug_to_class must be called in three places — the
+    // protocol-side construction check, the wire-side verification
+    // check, and the runtime caveat-violation envelope dispatcher.
+    assert!(
+        outlet_error_new_body.contains("slug_to_class("),
+        "OutletError::new must call slug_to_class to enforce the \
+         §5.4.4 class/slug consistency invariant (SCP-OUT-025)"
+    );
+    assert!(
+        verify_outlet_error_body.contains("slug_to_class("),
+        "verify_outlet_error must call slug_to_class to reject wire \
+         envelopes whose class/slug drift on the wire (SCP-OUT-025)"
+    );
+    let caveat_envelope_body =
+        extract_fn_body(RUNTIME_OUTLETS_MANAGER_SRC, "caveat_violation_to_envelope")
+            .expect("caveat_violation_to_envelope body must exist in scp-runtime outlets.rs");
+    assert!(
+        caveat_envelope_body.contains("slug_to_class("),
+        "caveat_violation_to_envelope must consult slug_to_class as the \
+         §5.4.4 source of truth for slug → class dispatch rather than \
+         hand-rolled prefix string matching (SCP-OUT-025)"
+    );
 }
 
 // --- Content key rotation (#1548) ---
