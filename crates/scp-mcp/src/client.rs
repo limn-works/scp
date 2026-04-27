@@ -425,7 +425,8 @@ impl<T: McpTransport, C: TimestampProvider> McpClient<T, C> {
     // SCP-vocabulary surface (SCP-OUT-007)
     // -----------------------------------------------------------------------
 
-    /// Invoke an external MCP tool using SCP outlet vocabulary.
+    /// Invoke an external MCP tool using SCP outlet vocabulary, collapsing
+    /// the response to a single one-shot `McpToolResult` (one-shot wire form).
     ///
     /// The `outlet_id` / `kind` pair is projected through the boundary
     /// translator to an MCP `tool.name` (`query.{id}` or `call.{id}`) before
@@ -434,11 +435,18 @@ impl<T: McpTransport, C: TimestampProvider> McpClient<T, C> {
     /// still carries the raw MCP content for callers that want the verbatim
     /// external output.
     ///
+    /// MCP `tools/call` returns a single `CallToolResult` over JSON-RPC and
+    /// has no native streaming. Per SCP-OUT-007, the SCP runtime's chunk
+    /// stream (see [`scp_runtime::context::outlets::invoke::invoke_outlet`])
+    /// is collapsed to this one-shot return at the MCP boundary. The
+    /// `_one_shot` suffix (SCP-OUT-033) makes the collapse explicit so callers
+    /// never assume per-chunk semantics on this surface.
+    ///
     /// # Errors
     ///
     /// Returns [`McpClientError::NotInitialized`] if the handshake has not
     /// completed, or a transport/server error.
-    pub fn invoke_outlet(
+    pub fn invoke_outlet_one_shot(
         &self,
         outlet_id: &str,
         kind: crate::translator::OutletKind,

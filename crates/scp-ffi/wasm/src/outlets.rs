@@ -481,10 +481,14 @@ pub fn outlet_register(context: &WasmContextHandle, definition_json: String) -> 
 
 /// Invokes a registered tool within an SCP context.
 ///
-/// Delegates to `WasmContextManager::invoke_outlet`. When `ucan_token` is
-/// provided, validates the token before dispatch using the WASM-local UCAN
-/// validation pipeline, requiring `outlet_call:{outlet_id}` or `outlet_call:*`
-/// capability. See spec §6.2, §8, ADR-016, and issue #319.
+/// Delegates to `WasmContextManager::invoke_outlet_one_shot` (SCP-OUT-033:
+/// the WASM bridge is single-threaded JS per ADR-034 and exposes the
+/// collapsed one-shot wire form; the runtime free function
+/// `scp_runtime::context::outlets::invoke::invoke_outlet` returns the
+/// chunk receiver for non-WASM callers that want streaming). When
+/// `ucan_token` is provided, validates the token before dispatch using the
+/// WASM-local UCAN validation pipeline, requiring `outlet_call:{outlet_id}`
+/// or `outlet_call:*` capability. See spec §6.2, §8, ADR-016, and issue #319.
 ///
 /// # Returns
 ///
@@ -592,7 +596,7 @@ pub fn outlet_invoke(
         })?;
 
         let result = with_manager(|mgr| {
-            mgr.invoke_outlet(&context_id, &outlet_id, &parsed_input, &identity_did)
+            mgr.invoke_outlet_one_shot(&context_id, &outlet_id, &parsed_input, &identity_did)
         })
         .map_err(ScpWasmError::into_js)?;
 

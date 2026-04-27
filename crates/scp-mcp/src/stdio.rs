@@ -272,7 +272,7 @@ mod tests {
         fn validate_capability(&self, _context_id: &str, _tool_name: &str) -> Result<(), String> {
             Ok(())
         }
-        fn invoke_outlet(
+        fn invoke_outlet_one_shot(
             &self,
             _context_id: &str,
             _outlet_id: &str,

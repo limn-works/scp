@@ -57,6 +57,24 @@ const PYO3_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/src/outl
 const NAPI_OUTLETS_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/outlets.rs");
 const UNIFFI_BRIDGE_SRC: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
 
+// SCP-OUT-033 bridge-naming assertions: every implementer of the MCP
+// `ContextProvider::invoke_outlet_one_shot` trait method (and the parallel
+// non-MCP one-shot collapse on the WASM bridge + the MCP client outlet
+// helper) MUST use the explicit `_one_shot` suffix so the wire-format
+// collapse from a chunk receiver to a single `serde_json::Value` is
+// unambiguous at every site. The runtime free function
+// `scp_runtime::context::outlets::invoke::invoke_outlet` returns a
+// `mpsc::Receiver<OutletStreamChunk>`; bridges that cannot stream
+// natively (MCP `tools/call` JSON-RPC reply, single-threaded WASM JS)
+// collapse via a method whose name carries the suffix. Strategy B from
+// the OUT-033 remediation plan.
+const MCP_SERVER_SRC: &str = include_str!("../../../../crates/scp-mcp/src/server.rs");
+const MCP_CLIENT_SRC: &str = include_str!("../../../../crates/scp-mcp/src/client.rs");
+const PYO3_MCP_SRC: &str = include_str!("../../../../crates/scp-ffi/src/mcp.rs");
+const NAPI_MCP_SRC: &str = include_str!("../../../../crates/scp-ffi/napi/src/mcp.rs");
+const WASM_MANAGER_FOR_OUT033_SRC: &str =
+    include_str!("../../../../crates/scp-ffi/wasm/src/manager.rs");
+
 // Transport layer sources for Batch 3 assertions
 const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/native/adapter.rs");
 
@@ -97,7 +115,17 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // pass `None` for both, so the §7.3.8 post-input gate AND the §7.3.8 /
 // §6.2 / §19.5 / §19.3 layer-composition AND fold never ran for real
 // invocations. Two `#[test]` items, +2 to the active count.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 56;
+//
+// Raised 56 -> 63 by SCP-OUT-033 bridge-naming remediation: adds 7
+// `out033_*_uses_one_shot_suffix` assertions pinning the explicit
+// `invoke_outlet_one_shot` naming at every MCP `ContextProvider` impl
+// site (server trait declaration + dispatcher + 3 FFI bridges + WASM
+// manager + MCP client outlet helper). Without these, the bridge layer
+// could regress to a bare `invoke_outlet` returning `Result<Value, _>`
+// that contradicts the AC1 spirit (every surface either streams natively
+// via the runtime free function OR is an explicitly-named one-shot
+// collapse). Seven `#[test]` items, +7 to the active count.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 63;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -1356,6 +1384,100 @@ fn out008_no_tool_symbols_in_outlet_assertion_table() {
     );
 }
 // END_OF_OUT008_NO_TOOL_SYMBOLS_FN
+
+// ===========================================================================
+// SCP-OUT-033 bridge-naming assertions
+//
+// AC1 spirit: every API surface either streams natively (the runtime free
+// function `scp_runtime::context::outlets::invoke::invoke_outlet` returns
+// `Result<mpsc::Receiver<OutletStreamChunk>, _>`) OR is an explicitly-named
+// one-shot collapse. MCP `tools/call` is one-shot by wire format; the WASM
+// bridge is single-threaded JS per ADR-034 and exposes the collapse only.
+// These assertions pin the explicit `invoke_outlet_one_shot` naming at
+// every implementer site so a future rename or a regression to a bare
+// `invoke_outlet` returning `Result<Value, _>` fails CI.
+// ===========================================================================
+
+/// MCP `ContextProvider` trait declares `invoke_outlet_one_shot` (not bare
+/// `invoke_outlet`).
+#[test]
+fn out033_mcp_provider_trait_uses_one_shot_suffix() {
+    assert!(
+        MCP_SERVER_SRC.contains("fn invoke_outlet_one_shot("),
+        "scp-mcp::ContextProvider must declare `fn invoke_outlet_one_shot(` to make \
+         the wire-format collapse from chunk-stream to single Value explicit per \
+         SCP-OUT-033 / SCP-OUT-007."
+    );
+}
+
+/// MCP server's `tools/call` dispatcher invokes the renamed trait method.
+#[test]
+fn out033_mcp_server_dispatcher_calls_one_shot() {
+    assert!(
+        fn_body_contains(
+            MCP_SERVER_SRC,
+            "handle_tools_call",
+            ".invoke_outlet_one_shot("
+        ),
+        "scp-mcp::McpServer::handle_tools_call must collapse to a single value via \
+         `provider.invoke_outlet_one_shot(...)` — this is the MCP wire boundary \
+         where the runtime chunk receiver folds into a JSON-RPC `CallToolResult`."
+    );
+}
+
+/// MCP client's outlet-vocabulary helper carries the explicit one-shot suffix.
+#[test]
+fn out033_mcp_client_outlet_helper_uses_one_shot_suffix() {
+    assert!(
+        MCP_CLIENT_SRC.contains("pub fn invoke_outlet_one_shot("),
+        "scp-mcp::McpClient must expose `pub fn invoke_outlet_one_shot(` so callers \
+         see that the response is a one-shot `McpToolResult` (no chunk semantics)."
+    );
+}
+
+/// PyO3 bridge's `FfiBridgeProvider` impl uses the explicit suffix.
+#[test]
+fn out033_pyo3_bridge_provider_uses_one_shot_suffix() {
+    assert!(
+        PYO3_MCP_SRC.contains("fn invoke_outlet_one_shot("),
+        "PyO3 FfiBridgeProvider impl in scp-ffi/src/mcp.rs must implement \
+         `fn invoke_outlet_one_shot(...)` per SCP-OUT-033."
+    );
+}
+
+/// NAPI bridge's `McpNapiBridgeProvider` impl uses the explicit suffix.
+#[test]
+fn out033_napi_bridge_provider_uses_one_shot_suffix() {
+    assert!(
+        NAPI_MCP_SRC.contains("fn invoke_outlet_one_shot("),
+        "NAPI McpNapiBridgeProvider impl in scp-ffi/napi/src/mcp.rs must implement \
+         `fn invoke_outlet_one_shot(...)` per SCP-OUT-033."
+    );
+}
+
+/// UniFFI bridge's `McpUniFfiBridgeProvider` impl uses the explicit suffix.
+#[test]
+fn out033_uniffi_bridge_provider_uses_one_shot_suffix() {
+    assert!(
+        UNIFFI_BRIDGE_SRC.contains("fn invoke_outlet_one_shot("),
+        "UniFFI McpUniFfiBridgeProvider impl in scp-ffi/uniffi/src/bridge.rs must \
+         implement `fn invoke_outlet_one_shot(...)` per SCP-OUT-033."
+    );
+}
+
+/// WASM bridge's `WasmContextManager` exposes only a one-shot collapse
+/// (no streaming receiver — single-threaded JS per ADR-034). The method
+/// name MUST carry the explicit `_one_shot` suffix.
+#[test]
+fn out033_wasm_manager_uses_one_shot_suffix() {
+    assert!(
+        WASM_MANAGER_FOR_OUT033_SRC.contains("pub fn invoke_outlet_one_shot("),
+        "WasmContextManager in scp-ffi/wasm/src/manager.rs must expose \
+         `pub fn invoke_outlet_one_shot(...)` per SCP-OUT-033 — WASM has no \
+         tokio mpsc receiver to surface to JavaScript (ADR-034), so the \
+         collapse is the only available form and must be named explicitly."
+    );
+}
 
 // ===========================================================================
 // Batch 3 — Transport/infra wiring (all #[ignore] until implemented)

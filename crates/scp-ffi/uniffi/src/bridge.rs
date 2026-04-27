@@ -6389,7 +6389,7 @@ const UNIFFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::tools::DEFAULT_TIMEOUT_MS
 /// - `context_tools()` reads from the per-context `OutletRegistry`
 /// - `agent_role()` reads from `ContextManager::get_role_state()`
 /// - `validate_capability()` runs UCAN validation + role-state capability check
-/// - `invoke_outlet()` dispatches to registered handlers with schema validation
+/// - `invoke_outlet_one_shot()` dispatches to registered handlers with schema validation (one-shot collapse for MCP wire)
 /// - `context_members()` reads from `ContextManager::member_dids()` + `member_role()`
 /// - `context_events()` reads from the per-context event log (UCAN state)
 struct McpUniFfiBridgeProvider {
@@ -6584,7 +6584,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn invoke_outlet(
+    fn invoke_outlet_one_shot(
         &self,
         context_id: &str,
         outlet_name: &str,
@@ -6592,6 +6592,11 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
     ) -> Result<serde_json::Value, String> {
         // MCP trait uses SCP outlet vocabulary per SCP-OUT-007; boundary
         // translation to MCP `tool` naming happens in the translator module.
+        // SCP-OUT-033: this method is the explicit one-shot collapse for the
+        // MCP `tools/call` wire (no native streaming). The runtime exposes a
+        // chunk receiver via `scp_runtime::context::outlets::invoke::invoke_outlet`;
+        // wire-format-constrained surfaces (this one) collapse to a single
+        // `serde_json::Value` at the boundary.
         let start = std::time::Instant::now();
         let agent_did = self.agent_did.clone();
         let timeout = std::time::Duration::from_millis(self.tool_timeout_ms);

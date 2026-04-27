@@ -158,14 +158,26 @@ pub trait ContextProvider: Send + Sync {
     /// Returns an error message if the agent lacks the required capability.
     fn validate_capability(&self, context_id: &str, tool_name: &str) -> Result<(), String>;
 
-    /// Invokes a tool and returns its output as a JSON value.
+    /// Invokes an outlet and returns its output collapsed to a single
+    /// JSON value (one-shot wire form).
+    ///
+    /// The MCP wire (`tools/call` returning `CallToolResult`) is intrinsically
+    /// one-shot: there is no native streaming on the JSON-RPC `tools/call`
+    /// surface. Per SCP-OUT-007, the runtime's chunk stream
+    /// (`scp_runtime::context::outlets::invoke::invoke_outlet`, returning
+    /// `mpsc::Receiver<OutletStreamChunk>`) is collapsed into a single
+    /// `serde_json::Value` at the MCP boundary by this trait method.
+    /// The explicit `_one_shot` suffix (SCP-OUT-033) makes the collapse
+    /// unambiguous: any caller wanting per-chunk semantics MUST use the
+    /// runtime free function or a non-MCP bridge surface — this method
+    /// will never expose intermediate chunks.
     ///
     /// The implementation is responsible for schema validation and execution.
     ///
     /// # Errors
     ///
-    /// Returns an error message if tool execution fails.
-    fn invoke_outlet(
+    /// Returns an error message if outlet execution fails.
+    fn invoke_outlet_one_shot(
         &self,
         context_id: &str,
         tool_name: &str,
@@ -487,10 +499,16 @@ impl<P: ContextProvider> McpServer<P> {
             );
         }
 
-        // Invoke the tool.
+        // Invoke the outlet. MCP `tools/call` is a one-shot wire (the
+        // `CallToolResult` JSON-RPC reply is a single value, never a stream),
+        // so we call the explicit one-shot collapse surface defined by the
+        // `ContextProvider` trait. Per SCP-OUT-033 / SCP-OUT-007, the runtime
+        // free function `invoke_outlet` returns `mpsc::Receiver<OutletStreamChunk>`;
+        // wire-format-constrained bridges (this MCP server) collapse the stream
+        // into a single value at this boundary.
         match self
             .provider
-            .invoke_outlet(&context_id, tool_name, params.arguments)
+            .invoke_outlet_one_shot(&context_id, tool_name, params.arguments)
         {
             Ok(output) => {
                 // Validate output against schema if available.
@@ -950,7 +968,7 @@ mod tests {
             }
         }
 
-        fn invoke_outlet(
+        fn invoke_outlet_one_shot(
             &self,
             _context_id: &str,
             _tool_name: &str,
@@ -1266,6 +1284,45 @@ mod tests {
         let resp = server.handle_request(&req).unwrap();
         let err = resp.error.unwrap();
         assert_eq!(err.code, protocol::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn invoke_outlet_one_shot_collapses_to_single_value() {
+        // SCP-OUT-033 remediation: the MCP `ContextProvider` trait method is
+        // explicitly named `invoke_outlet_one_shot` so the wire-format
+        // collapse from a chunk stream to a single `serde_json::Value` is
+        // unambiguous at every implementer site. This test calls the
+        // renamed trait method directly with real arguments (NOT a
+        // string-search assertion or `let _ = function_name;`) so a future
+        // rename or signature change breaks compilation here.
+        let provider = MockProvider {
+            invoke_result: Ok(serde_json::json!({"answer": 42})),
+            ..MockProvider::default()
+        };
+        let value = provider
+            .invoke_outlet_one_shot(
+                "ctx_a",
+                "send_message",
+                serde_json::json!({"content": "hi"}),
+            )
+            .expect("one-shot collapse should succeed for the happy-path mock");
+        assert_eq!(value, serde_json::json!({"answer": 42}));
+    }
+
+    #[test]
+    fn invoke_outlet_one_shot_propagates_errors_as_single_value() {
+        // Companion to the happy-path test: the one-shot collapse surfaces
+        // executor failures as a `Result::Err` (the chunk stream's terminal
+        // `ChunkPayload::Error` collapses into the JSON-RPC error reply at
+        // the MCP wire boundary).
+        let provider = MockProvider {
+            invoke_result: Err("execution failed".to_owned()),
+            ..MockProvider::default()
+        };
+        let err = provider
+            .invoke_outlet_one_shot("ctx_a", "send_message", serde_json::json!({"content": "x"}))
+            .expect_err("error path must surface as Result::Err on the one-shot surface");
+        assert!(err.contains("execution failed"));
     }
 
     #[test]

@@ -407,7 +407,7 @@ impl ContextProvider for McpNapiBridgeProvider {
         Err("capability validation not implemented — wire a production ContextProvider".to_owned())
     }
 
-    fn invoke_outlet(
+    fn invoke_outlet_one_shot(
         &self,
         _context_id: &str,
         _outlet_name: &str,
@@ -415,6 +415,11 @@ impl ContextProvider for McpNapiBridgeProvider {
     ) -> Result<serde_json::Value, String> {
         // MCP trait uses SCP outlet vocabulary (SCP-OUT-007); boundary
         // translation to MCP `tool` naming happens in the translator module.
+        // SCP-OUT-033: this method is the explicit one-shot collapse for the
+        // MCP `tools/call` wire (no native streaming). The runtime exposes a
+        // chunk receiver via `scp_runtime::context::outlets::invoke::invoke_outlet`
+        // for non-MCP callers; this MCP-bridge surface aggregates to a single
+        // value at the wire boundary.
         Err(
             "outlet invocation through MCP server requires ContextManager outlet registry integration"
                 .to_owned(),

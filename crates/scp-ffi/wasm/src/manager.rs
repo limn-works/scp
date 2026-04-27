@@ -2047,14 +2047,28 @@ impl WasmContextManager {
         Ok(())
     }
 
-    /// Invokes a tool. Validates the tool exists, validates input against schema,
-    /// and returns a JSON result.
+    /// Invokes an outlet and collapses the result to a single JSON value
+    /// (one-shot wire form).
+    ///
+    /// SCP-OUT-033: the WASM bridge is single-threaded JS per ADR-034 and has
+    /// no `tokio::sync::mpsc::Receiver` surface to expose to JavaScript; the
+    /// `outletInvoke` `#[wasm_bindgen]` export returns a `Promise<string>`
+    /// that resolves to the collapsed result. The explicit `_one_shot`
+    /// suffix names this collapse so callers do not assume per-chunk
+    /// semantics on the WASM bridge. Native (`PyO3` / `NAPI` / `UniFFI`) bridges
+    /// expose the same one-shot collapse for the MCP wire; the runtime free
+    /// function `scp_runtime::context::outlets::invoke::invoke_outlet`
+    /// returns the chunk receiver for non-MCP, non-WASM callers that want
+    /// streaming.
+    ///
+    /// Validates the outlet exists, validates input against schema, and
+    /// returns the collapsed JSON result.
     ///
     /// # Errors
     ///
     /// Returns an error if the context is not active, the tool is not found,
     /// or schema validation fails.
-    pub fn invoke_outlet(
+    pub fn invoke_outlet_one_shot(
         &mut self,
         context_id: &str,
         outlet_id: &str,
