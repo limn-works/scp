@@ -652,6 +652,31 @@ fn hkdf_expand_sha256(
 // z-base-32 encoding (mirrors ucan.rs zbase32_encode)
 // ---------------------------------------------------------------------------
 
+/// Inverse of [`zbase32_encode`]. Returns `None` if the input contains a
+/// character outside the z-base-32 alphabet `ybndrfg8ejkmcpqxot1uwisza345h769`.
+///
+/// Trailing fractional groups (fewer than 8 bits) are silently dropped to
+/// match the encoder's padding behaviour, so a 32-byte payload encoded by
+/// `zbase32_encode` round-trips exactly.
+pub(crate) fn zbase32_decode(input: &str) -> Option<Vec<u8>> {
+    const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+    let mut bits: u64 = 0;
+    let mut bit_count: u32 = 0;
+    let mut output = Vec::with_capacity(input.len() * 5 / 8);
+    for c in input.bytes() {
+        let idx = ALPHABET.iter().position(|&a| a == c)?;
+        bits = (bits << 5) | (idx as u64);
+        bit_count += 5;
+        if bit_count >= 8 {
+            bit_count -= 8;
+            #[allow(clippy::cast_possible_truncation)]
+            output.push(((bits >> bit_count) & 0xff) as u8);
+            bits &= (1u64 << bit_count) - 1;
+        }
+    }
+    Some(output)
+}
+
 /// Minimal z-base-32 encoder for did:dht DID derivation.
 ///
 /// z-base-32 uses the alphabet `ybndrfg8ejkmcpqxot1uwisza345h769`.
@@ -773,9 +798,19 @@ impl WasmIdentity {
     /// 3. Publishing the DID document to the DHT via HTTP gateway.
     /// 4. Calling `WasmIdentity.fromDid(did)` to obtain this handle.
     ///
+    /// The DID is registered in the bridge-local registry as a
+    /// [`IdentityRecord::Resolved`] entry derived from the
+    /// `z`-base-32 portion of the DID. Subsequent signing or rotation
+    /// attempts therefore surface [`codes::IDENT_1028`] (no retained
+    /// key material) — the stable, documented contract — rather than
+    /// the cryptic [`codes::IDENT_1002`] (DID not registered) callers
+    /// would otherwise hit on these handles.
+    ///
     /// # Errors
     ///
     /// Returns `[SCP-IDENT-1000]` if the DID prefix is not `did:dht:`.
+    /// Returns `[SCP-IDENT-1004]` if the DID's `z`-base-32 payload does
+    /// not decode to exactly 32 Ed25519 public-key bytes.
     #[wasm_bindgen(js_name = "fromDid")]
     pub fn from_did(did: String) -> Result<Self, JsError> {
         if !did.starts_with("did:dht:") {
@@ -785,6 +820,37 @@ impl WasmIdentity {
             }
             .into_js());
         }
+        let payload = did.strip_prefix("did:dht:z").ok_or_else(|| {
+            ScpWasmError::Identity {
+                message: format!("did:dht must use the z-base-32 'z' multibase prefix: {did:?}"),
+                code: codes::IDENT_1004.to_owned(),
+            }
+            .into_js()
+        })?;
+        let public_key_bytes: [u8; 32] = zbase32_decode(payload)
+            .ok_or_else(|| {
+                ScpWasmError::Identity {
+                    message: format!("invalid z-base-32 in DID: {did:?}"),
+                    code: codes::IDENT_1004.to_owned(),
+                }
+                .into_js()
+            })?
+            .try_into()
+            .map_err(|_| {
+                ScpWasmError::Identity {
+                    message: format!("did:dht payload must decode to 32 bytes: {did:?}"),
+                    code: codes::IDENT_1004.to_owned(),
+                }
+                .into_js()
+            })?;
+        IDENTITY_REGISTRY.with(|reg| {
+            reg.borrow_mut()
+                .entry(did.clone())
+                .or_insert_with(|| IdentityRecord::Resolved {
+                    public_key_bytes,
+                    custody_type: "js_custody".to_owned(),
+                });
+        });
         Ok(Self {
             did,
             custody_type: "js_custody".to_owned(),
@@ -4678,6 +4744,72 @@ mod tests {
     }
 
     #[test]
+    fn from_did_registers_resolved_record_so_migrate_returns_ident_1028() {
+        cleanup_registries();
+        // Build a syntactically valid `did:dht` from a real Ed25519
+        // public key so `from_did` can decode it back out.
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let pub_bytes = signing_key.verifying_key().to_bytes();
+        let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+
+        let handle = WasmIdentity::from_did(did.clone()).expect("valid did:dht must decode");
+
+        // The DID should now be registered as a Resolved variant — i.e.
+        // migrate must surface IDENT_1028 (no retained key material),
+        // never IDENT_1002 (DID not registered).
+        let err =
+            migrate_inner(&handle, 1_700_000_000).expect_err("from_did handle must refuse migrate");
+        match err {
+            ScpWasmError::Identity { ref code, .. } => {
+                assert_eq!(
+                    code,
+                    codes::IDENT_1028,
+                    "from_did migrate refusal must use IDENT_1028 (no key material); got {code}"
+                );
+            }
+            other => panic!("expected Identity error, got: {other:?}"),
+        }
+
+        // And the registry actually got the canonical 32-byte public key
+        // recovered from the DID's z-base-32 payload.
+        IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            match map.get(&did) {
+                Some(IdentityRecord::Resolved {
+                    public_key_bytes, ..
+                }) => {
+                    assert_eq!(
+                        *public_key_bytes, pub_bytes,
+                        "from_did Resolved record must hold the public key decoded from the DID"
+                    );
+                }
+                other => panic!("expected Resolved variant, got: {other:?}"),
+            }
+        });
+
+        cleanup_registries();
+    }
+
+    #[test]
+    fn zbase32_decode_round_trips_random_32_byte_payloads() {
+        // Property check that recovers the contract `from_did` relies on.
+        // We can't exercise `WasmIdentity::from_did` directly off-wasm
+        // (its error path constructs a `JsError`, a wasm-only type), but
+        // the bug class — `from_did` materialising a Resolved record with
+        // wrong public key bytes — is structurally impossible if the
+        // decoder is the inverse of the encoder, which this test pins.
+        for _ in 0..16 {
+            let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+            let pub_bytes = signing_key.verifying_key().to_bytes();
+            let encoded = zbase32_encode(&pub_bytes);
+            let decoded = zbase32_decode(&encoded).expect("encoded payload must decode");
+            assert_eq!(decoded.as_slice(), &pub_bytes[..]);
+        }
+        // 'l' is outside the z-base-32 alphabet — must reject.
+        assert!(zbase32_decode("zlllllll").is_none());
+    }
+
+    #[test]
     fn migrate_resolved_record_refused_with_ident_1028() {
         cleanup_registries();
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
@@ -4745,5 +4877,68 @@ mod tests {
         );
 
         cleanup_registries();
+    }
+
+    /// Reverse-direction cross-bridge JSON parity: a `DidRotationEvent`
+    /// serialized by the *native* serde impl MUST be byte-identical to
+    /// the WASM `encode_rotation_event_json` output for the same field
+    /// values. Without this assertion, a future drift on either side
+    /// (e.g. native switching to lowercase hex multibase, or WASM
+    /// reordering keys) would only be caught by an integration test.
+    #[test]
+    fn native_emitted_rotation_event_json_matches_wasm_encoding() {
+        let old_did = "did:dht:zoldoldoldoldoldoldoldoldoldold".to_owned();
+        let new_did = "did:dht:znewnewnewnewnewnewnewnewnewnew".to_owned();
+        let rotated_at: u64 = 1_700_000_000;
+        let signature = [0xAAu8; 64];
+        let old_public_key = [0xBBu8; 32];
+        let revealed_key = [0xCCu8; 32];
+        let commitment = compute_pre_rotation_commitment(&revealed_key);
+
+        let native = scp_identity::DidRotationEvent {
+            old_did: old_did.clone(),
+            new_did: new_did.clone(),
+            migration_proof: scp_identity::MigrationProof {
+                signature,
+                old_public_key,
+            },
+            pre_rotation_proof: Some(scp_identity::PreRotationProof {
+                commitment,
+                revealed_key,
+            }),
+            rotated_at,
+        };
+        let native_json = serde_json::to_string(&native).expect("native serde must succeed");
+
+        let wasm_json = encode_rotation_event_json(
+            &old_did,
+            &new_did,
+            rotated_at,
+            &signature,
+            &old_public_key,
+            &commitment,
+            &revealed_key,
+        )
+        .expect("WASM encode must succeed");
+
+        // Compare as parsed JSON values to avoid spurious key-order
+        // mismatches (`serde_json::Value` normalises object key order on
+        // round-trip).
+        let native_value: serde_json::Value =
+            serde_json::from_str(&native_json).expect("native JSON parses");
+        let wasm_value: serde_json::Value =
+            serde_json::from_str(&wasm_json).expect("WASM JSON parses");
+        assert_eq!(
+            native_value, wasm_value,
+            "native- and WASM-emitted DidRotationEvent JSON MUST be \
+             structurally identical (cross-bridge wire-format parity, \
+             reverse direction)"
+        );
+
+        // Belt-and-suspenders: WASM JSON MUST round-trip through the
+        // native struct without loss.
+        let reparsed: scp_identity::DidRotationEvent =
+            serde_json::from_str(&wasm_json).expect("WASM JSON deserialises as native struct");
+        assert_eq!(reparsed, native);
     }
 }
