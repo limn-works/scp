@@ -315,6 +315,51 @@ def _require_bridge() -> Any:
     return _scp_core
 
 
+def outlet_catalog_rotation_validator(
+    *,
+    prior_catalog: list[dict[str, Any]],
+    new_catalog: list[dict[str, Any]],
+    prior_append_time_secs: int,
+    new_append_time_secs: int,
+) -> None:
+    """SCP-OUT-041d catalog-rotation dwell-time validator (Python SDK).
+
+    Calls the PyO3 ``outlet_catalog_rotation_validator`` bridge — pure
+    function, requires no context state. Returns ``None`` on success;
+    raises :class:`OutletProtocolError` (the typed
+    ``CatalogRotationTooFrequent`` rejection) when the new registration
+    is within the §5.4.4 round-5 24-hour dwell floor of the prior.
+
+    Args:
+        prior_catalog: Prior registration's ``message_catalog`` as a
+            list of ``{"key": str, "template": str}`` dicts (matches the
+            Rust ``MessageTemplate`` JSON shape).
+        new_catalog: New registration's ``message_catalog`` (same
+            shape). The validator is silent when it equals
+            ``prior_catalog`` (catalog unchanged).
+        prior_append_time_secs: Prior registration's event-log append
+            time, in Unix seconds.
+        new_append_time_secs: Prospective new registration append time,
+            in Unix seconds.
+
+    Raises:
+        OutletProtocolError: ``CatalogRotationTooFrequent`` rejection.
+    """
+    import json as _json
+
+    bridge = _require_bridge()
+    envelope_json = bridge.outlet_catalog_rotation_validator(
+        _json.dumps(prior_catalog),
+        _json.dumps(new_catalog),
+        int(prior_append_time_secs),
+        int(new_append_time_secs),
+    )
+    if envelope_json == "":
+        return
+    envelope = _json.loads(envelope_json)
+    raise OutletError.from_wire(envelope)
+
+
 # ---------------------------------------------------------------------------
 # InvocationHandle — dual consumption (await aggregate / async for chunks).
 # ---------------------------------------------------------------------------

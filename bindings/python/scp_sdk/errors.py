@@ -466,6 +466,7 @@ class OutletError(ScpError, abc.ABC):
         source_chain: list[ContextHop] | None = None,
         pad_nonce: bytes | None = None,
         registration_event_id: bytes | None = None,
+        context_id: str | None = None,
     ) -> OutletError:
         """Construct a typed :class:`OutletError` subclass.
 
@@ -473,12 +474,19 @@ class OutletError(ScpError, abc.ABC):
         and would be swappable in a positional call — the leading ``*``
         forces keyword-only invocation so a positional call fails at
         type-check / runtime.
+
+        SCP-OUT-041d: when ``context_id`` AND ``registration_event_id``
+        are both provided, this delegates to the PyO3 ``outlet_error_new``
+        FFI export which performs the §5.4.4 wire-message HMAC at the
+        bridge boundary using the pinned ``outlet_message_key`` — the
+        SDK never sees the raw key. When omitted, fall back to the
+        local-only path that does NOT compute a wire HMAC (used by tests
+        and pre-OUT-041 callers).
         """
         if class_ not in OUTLET_ERROR_CLASSES:
             raise ValidationError(f"unknown OutletErrorClass: {class_!r}", "SCP-VALID-7000")
         # CatalogKey runtime check — raises OutletProtocolError on bad
-        # input (round-6 unified error type). Calling make_catalog_key
-        # both validates and re-typechecks at runtime.
+        # input (round-6 unified error type).
         if not isinstance(catalog_key, str) or not _CATALOG_KEY_RE.match(catalog_key):
             raise OutletProtocolError(
                 message=f"catalog_key {catalog_key!r} is not a valid CatalogKey",
@@ -488,6 +496,25 @@ class OutletError(ScpError, abc.ABC):
             )
         if not isinstance(outlet_id, str) or not outlet_id:
             raise ValidationError("outlet_id must be a non-empty string", "SCP-VALID-7000")
+
+        # SCP-OUT-041d FFI path — delegate to outlet_error_new (PyO3) so
+        # the bridge HMACs the catalog_key with the pinned per-outlet
+        # outlet_message_key. SDK callers never see the raw key.
+        if context_id is not None and registration_event_id is not None:
+            return OutletError._new_via_ffi(
+                context_id=context_id,
+                outlet_id=outlet_id,
+                registration_event_id=registration_event_id,
+                catalog_key=catalog_key,
+                class_=class_,
+                code=code,
+                slug=slug,
+                retry=retry,
+                detail=detail,
+                source_chain=source_chain,
+                pad_nonce=pad_nonce,
+            )
+
         cls = _CLASS_TO_SUBCLASS[class_]
         msg = redact_pii(str(catalog_key))
         return cls(
@@ -500,6 +527,80 @@ class OutletError(ScpError, abc.ABC):
             pad_nonce=pad_nonce,
             registration_event_id=registration_event_id,
         )
+
+    @staticmethod
+    def _new_via_ffi(
+        *,
+        context_id: str,
+        outlet_id: OutletId,
+        registration_event_id: bytes,
+        catalog_key: CatalogKey,
+        class_: str,
+        code: str | None,
+        slug: str | None,
+        retry: RetryPolicy | None,
+        detail: dict[str, Any] | None,
+        source_chain: list[ContextHop] | None,
+        pad_nonce: bytes | None,
+    ) -> OutletError:
+        """SCP-OUT-041d FFI path — calls PyO3 ``outlet_error_new``.
+
+        Builds the input arguments in wire form, dispatches to the
+        bridge, parses the returned JSON envelope back into a typed
+        :class:`OutletError` subclass via :meth:`from_wire`. The bridge
+        does the HMAC, catalog-membership check, and code/slug regex
+        validation; this wrapper is purely a marshaling layer.
+        """
+        import os
+        try:
+            import _scp_core  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise ContextError(
+                "failed to import _scp_core -- is the Rust extension built?",
+                "SCP-CTX-2000",
+            ) from e
+
+        cls = _CLASS_TO_SUBCLASS[class_]
+        code_str = code or cls._default_code
+        slug_str = slug or str(catalog_key)
+        retry_policy = retry or RetryPolicy.never()
+        retry_str = retry_policy.to_wire().get("policy", "never")
+        if not isinstance(retry_str, str):
+            retry_str = "never"
+        pad_nonce_bytes = pad_nonce if pad_nonce is not None else os.urandom(16)
+        if len(pad_nonce_bytes) != 16:
+            raise ValidationError("pad_nonce must be 16 bytes", "SCP-VALID-7000")
+        if len(registration_event_id) != 32:
+            raise ValidationError(
+                "registration_event_id must be 32 bytes", "SCP-VALID-7000"
+            )
+        import json as _json
+        detail_json = _json.dumps(detail) if detail is not None else None
+        source_chain_json = (
+            _json.dumps([h.to_wire() for h in source_chain])
+            if source_chain is not None
+            else None
+        )
+
+        envelope_json = _scp_core.outlet_error_new(
+            context_id,
+            str(outlet_id),
+            registration_event_id.hex(),
+            str(catalog_key),
+            class_,
+            code_str,
+            slug_str,
+            retry_str,
+            pad_nonce_bytes.hex(),
+            detail_json,
+            source_chain_json,
+        )
+        # SCP-OUT-041d wire form: the bridge renders byte fields as hex
+        # strings under named keys ("code", "slug", "class", "message",
+        # "retry", "pad_nonce", "registration_event_id"), so from_wire
+        # consumes the JSON directly.
+        envelope = _json.loads(envelope_json)
+        return OutletError.from_wire(envelope)
 
     # ----- Wire round-trip --------------------------------------------
 

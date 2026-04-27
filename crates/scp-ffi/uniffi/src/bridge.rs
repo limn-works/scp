@@ -5645,9 +5645,11 @@ pub async fn outlet_error_new(
                 code: codes::VALID_7000.to_owned(),
             })?;
 
-            serde_json::to_string(&envelope).map_err(|e| ScpError::Tool {
-                msg: format!("failed to serialize OutletError: {e}"),
-                code: codes::TOOL_6006.to_owned(),
+            serde_json::to_string(&serialize_outlet_error_wire(&envelope)).map_err(|e| {
+                ScpError::Tool {
+                    msg: format!("failed to serialize OutletError: {e}"),
+                    code: codes::TOOL_6006.to_owned(),
+                }
             })
         })
         .await
@@ -5655,6 +5657,49 @@ pub async fn outlet_error_new(
             msg: format!("tokio task join error during outlet_error_new: {e}"),
             code: codes::TOOL_6004.to_owned(),
         })?
+}
+
+/// SCP-OUT-041d wire-form helper — see PyO3 bridge for schema docs.
+fn serialize_outlet_error_wire(
+    envelope: &scp_core::context::outlets::errors::OutletError,
+) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "code".to_owned(),
+        serde_json::Value::String(envelope.code.clone()),
+    );
+    out.insert(
+        "slug".to_owned(),
+        serde_json::Value::String(envelope.slug.clone()),
+    );
+    out.insert(
+        "class".to_owned(),
+        serde_json::Value::String(envelope.class.as_wire().to_owned()),
+    );
+    out.insert(
+        "message".to_owned(),
+        serde_json::Value::String(hex::encode(envelope.message)),
+    );
+    if let Ok(retry_v) = serde_json::to_value(&envelope.retry) {
+        out.insert("retry".to_owned(), retry_v);
+    }
+    if let Some(d) = &envelope.detail
+        && let Ok(detail_v) = serde_json::to_value(d)
+    {
+        out.insert("detail".to_owned(), detail_v);
+    }
+    if let Ok(chain_v) = serde_json::to_value(&envelope.source_chain) {
+        out.insert("source_chain".to_owned(), chain_v);
+    }
+    out.insert(
+        "pad_nonce".to_owned(),
+        serde_json::Value::String(hex::encode(envelope.pad_nonce)),
+    );
+    out.insert(
+        "registration_event_id".to_owned(),
+        serde_json::Value::String(hex::encode(envelope.registration_event_id)),
+    );
+    serde_json::Value::Object(out)
 }
 
 /// SCP-OUT-041d catalog-rotation dwell-time validator bridge.
@@ -5694,10 +5739,11 @@ pub async fn outlet_catalog_rotation_validator(
             ) {
                 Ok(()) => Ok(String::new()),
                 Err(rejection) => {
-                    serde_json::to_string(&rejection.envelope).map_err(|e| ScpError::Tool {
-                        msg: format!("failed to serialize CatalogRotationDwellRejection: {e}"),
-                        code: codes::TOOL_6006.to_owned(),
-                    })
+                    serde_json::to_string(&serialize_outlet_error_wire(&rejection.envelope))
+                        .map_err(|e| ScpError::Tool {
+                            msg: format!("failed to serialize CatalogRotationDwellRejection: {e}"),
+                            code: codes::TOOL_6006.to_owned(),
+                        })
                 }
             }
         })
