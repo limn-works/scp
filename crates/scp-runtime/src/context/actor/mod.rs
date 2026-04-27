@@ -440,12 +440,8 @@ impl ContextActor {
     ) -> Outcome<()> {
         match cmd {
             ContextCommand::Messaging(sub) => {
-                handlers::messaging::dispatch_from_shim(
-                    supervisor,
-                    &mut state.send_tracker,
-                    sub,
-                )
-                .await
+                handlers::messaging::dispatch_from_shim(supervisor, &mut state.send_tracker, sub)
+                    .await
             }
             ContextCommand::Lifecycle(sub) => {
                 Box::pin(handlers::lifecycle::dispatch_from_shim(supervisor, sub)).await
@@ -485,14 +481,15 @@ impl ContextActor {
             // event_log together; piping through it preserves the
             // soft-fallback semantics for missing-context cases.
             ContextCommand::Queries(sub) => match supervisor.dispatch_query(sub).await {
-                Ok(o) => Outcome { result: o.result, mutated: false },
+                Ok(o) => Outcome {
+                    result: o.result,
+                    mutated: false,
+                },
                 Err(e) => Outcome::err(e),
             },
             // SagaPhase + LifecycleControl already migrated to the
             // state-owning signature.
-            ContextCommand::SagaPhase(msg) => {
-                handlers::saga::dispatch(state, deps, msg).await
-            }
+            ContextCommand::SagaPhase(msg) => handlers::saga::dispatch(state, deps, msg).await,
             ContextCommand::LifecycleControl(sub) => {
                 handlers::lifecycle_control::dispatch(state, deps, sub).await
             }

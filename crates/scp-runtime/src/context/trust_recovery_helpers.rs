@@ -86,7 +86,10 @@ pub fn create_governance_checkpoint(
 ) -> Result<ContextCheckpoint, ContextError> {
     require_active(&state.handle)?;
 
-    let (_, min_count) = state.governance.engine.checkpoint_cosignature_requirements();
+    let (_, min_count) = state
+        .governance
+        .engine
+        .checkpoint_cosignature_requirements();
     let attestation_status = if min_count == 0 {
         CheckpointAttestationStatus::FullyAttested
     } else {
@@ -222,7 +225,10 @@ pub fn recovery_advance_epoch(
     //     their group epoch and ratchet key material.
     if !epoch_output.commit_bytes.is_empty() {
         let routing_id = scp_protocol::context::context_routing_id(context_id);
-        if let Err(e) = deps.transport.send_message(&routing_id, &epoch_output.commit_bytes) {
+        if let Err(e) = deps
+            .transport
+            .send_message(&routing_id, &epoch_output.commit_bytes)
+        {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -398,7 +404,6 @@ pub async fn recovery_notify_contact(
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
@@ -471,7 +476,12 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
         context_params: state.handle.params().clone(),
         membership: state.membership.clone(),
         role_state: state.role_state.clone(),
-        executed_proposals: state.governance.executed_proposals.keys().copied().collect(),
+        executed_proposals: state
+            .governance
+            .executed_proposals
+            .keys()
+            .copied()
+            .collect(),
         ttl_remaining_secs,
         registered_tools: state.governance.registered_tools.clone(),
         read_exclusion_list: state.access.read_exclusion_list.clone(),

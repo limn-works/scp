@@ -2829,9 +2829,7 @@ impl Supervisor {
             BroadcastCommand::HandleBroadcastKeyRequest { context_id, .. }
             | BroadcastCommand::BroadcastSubscriberCount { context_id, .. }
             | BroadcastCommand::IsBroadcastSubscriber { context_id, .. }
-            | BroadcastCommand::BroadcastAdmission { context_id, .. } => {
-                Some(context_id.as_str())
-            }
+            | BroadcastCommand::BroadcastAdmission { context_id, .. } => Some(context_id.as_str()),
             // SubscribeBroadcast / UnsubscribeBroadcast /
             // BlockBroadcastSubscriber / UnblockBroadcastSubscriber /
             // PublishBroadcast / PublishBroadcastContent /

@@ -113,18 +113,16 @@ impl SupervisorHandle {
     /// then drops the shard locks before locking individual per-context
     /// `Mutex`es. Holding a DashMap `Ref` across `.await` would deadlock
     /// any concurrent shard access.
-    pub async fn find_shared_context(
-        &self,
-        member_a: &str,
-        member_b: &str,
-    ) -> Option<String> {
-        let entries: Vec<(String, Arc<tokio::sync::Mutex<crate::context::state::PerContextState>>)> =
-            self
-                .supervisor
-                .contexts_arc()
-                .iter()
-                .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
-                .collect();
+    pub async fn find_shared_context(&self, member_a: &str, member_b: &str) -> Option<String> {
+        let entries: Vec<(
+            String,
+            Arc<tokio::sync::Mutex<crate::context::state::PerContextState>>,
+        )> = self
+            .supervisor
+            .contexts_arc()
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
         for (context_id, arc) in entries {
             let ctx = arc.lock().await;
             if ctx.membership.contains(member_a) && ctx.membership.contains(member_b) {

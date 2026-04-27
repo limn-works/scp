@@ -307,12 +307,14 @@ pub async fn recovery_notify_contact_legacy(
     // are members. Collect (key, Arc) pairs first to release DashMap
     // shard locks before awaiting per-context Mutexes.
     let shared_context_id = {
-        let entries: Vec<(String, Arc<tokio::sync::Mutex<crate::context::state::PerContextState>>)> =
-            supervisor
-                .contexts_arc()
-                .iter()
-                .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
-                .collect();
+        let entries: Vec<(
+            String,
+            Arc<tokio::sync::Mutex<crate::context::state::PerContextState>>,
+        )> = supervisor
+            .contexts_arc()
+            .iter()
+            .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
+            .collect();
         let mut found = None;
         for (context_id, arc) in entries {
             let ctx = arc.lock().await;

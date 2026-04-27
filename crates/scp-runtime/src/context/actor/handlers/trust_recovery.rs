@@ -249,8 +249,12 @@ async fn shim_handle_add_checkpoint_cosignature(
     >,
 ) -> Outcome<()> {
     use crate::context::trust_recovery_helpers_legacy as helpers;
-    let add_fut =
-        helpers::add_checkpoint_cosignature_legacy(supervisor, context_id, &mut checkpoint, cosignature);
+    let add_fut = helpers::add_checkpoint_cosignature_legacy(
+        supervisor,
+        context_id,
+        &mut checkpoint,
+        cosignature,
+    );
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, add_fut).await {
         Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok((checkpoint, status))),
         Ok(Err(e)) => {
