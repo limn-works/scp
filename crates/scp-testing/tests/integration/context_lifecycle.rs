@@ -186,6 +186,13 @@ async fn context_params_all_fields() {
         sybil_policy: None,
         base_cost_scale: scp_core::economy::Amount::new(100),
         outlet_error_buffer_max_secs: 30,
+        stream_window_default: 32,
+        stream_credit_stall_secs: 30,
+        stream_cancel_ack_secs: 5,
+        stream_ucan_recheck_secs: 10,
+        max_concurrent_inbound_streams_per_invoker: 8,
+        max_concurrent_inbound_streams_per_origin_invoker: 16,
+        max_concurrent_inbound_streams_per_outlet: 128,
     };
 
     assert_eq!(params.mode, ContextMode::Broadcast);

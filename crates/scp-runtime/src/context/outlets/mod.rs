@@ -22,6 +22,7 @@ pub mod invoke;
 pub mod message_key;
 pub mod registration;
 pub mod session;
+pub mod stream;
 
 // SCP-OUT-033 — re-export the streaming entry points so consumers can
 // `use scp_runtime::context::outlets::{invoke_outlet, OutletStreamChunk}`.

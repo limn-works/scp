@@ -645,6 +645,29 @@ pub enum EventLogError {
         /// [`LEGACY_SUFFIXES`].
         legacy_variant: String,
     },
+
+    /// An `OutletInvokedEvent` was offered for log-insert with a
+    /// `chunks_billed` field that does NOT match the reference count
+    /// derivable from its `stream_manifest_hash` and the cancel-ack
+    /// sequence (§5.4.5 wire-layer rejection rule, SCP-OUT-034).
+    ///
+    /// Per §5.4.5: "An `OutletInvokedEvent` whose recorded
+    /// `chunks_billed` does not match the value derivable from the
+    /// manifest root, the sealed chunk sequence, and the cancel-ack
+    /// sequence is a wire-layer rejection — the event is refused at
+    /// log-insert time, not accepted-and-flagged."
+    #[error(
+        "OutletInvokedEvent.chunks_billed mismatch (§5.4.5): recorded={recorded}, \
+         reference={reference}"
+    )]
+    ChunksBilledMismatch {
+        /// Recorded value carried by the rejected event.
+        recorded: u32,
+        /// Reference count derived from the chunk manifest +
+        /// cancel-ack sequence by
+        /// `scp_runtime::context::outlets::stream::compute_chunks_billed_ref`.
+        reference: u32,
+    },
 }
 
 // ---------------------------------------------------------------------------

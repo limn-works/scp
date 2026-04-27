@@ -881,6 +881,70 @@ pub struct ContextParams {
     /// governance-removal timeout. Default 30 s, range `[5, 300]`.
     #[serde(default = "default_outlet_error_buffer_max_secs")]
     pub outlet_error_buffer_max_secs: u32,
+
+    /// Default initial credit window for streaming outlet invocations
+    /// (§5.4.5 credit-based backpressure, registered in §9.18.B). The
+    /// executor may emit up to this many `Data`/`Progress` chunks before
+    /// it must wait for an `OutletStreamCredit` grant. `End` and `Error`
+    /// chunks are terminal and do not consume credit. Default `32`,
+    /// range `[1, 4096]`.
+    #[serde(default = "default_stream_window_default")]
+    pub stream_window_default: u32,
+
+    /// Maximum seconds a stream may sit at zero credit before the
+    /// framework cancels it with
+    /// `OutletErrorClass::Execution::CreditStall`
+    /// (`SCP-TOOL-6133` / `execution.credit-stall`). §5.4.5
+    /// Credit-based backpressure, registered in §9.18.B. Default `30`,
+    /// range `[1, 600]`.
+    #[serde(default = "default_stream_credit_stall_secs")]
+    pub stream_credit_stall_secs: u32,
+
+    /// Maximum seconds the executor framework waits between receiving
+    /// `OutletCancel` and emitting the terminal cancel-ack chunk before
+    /// it forces closure with
+    /// `OutletErrorClass::Execution::CancelAckTimeout` (`SCP-TOOL-6135`
+    /// / `execution.cancel-ack-timeout`). §5.4.5 Cancellation and
+    /// billing boundary, registered in §9.18.B. Default `5`, range
+    /// `[1, 60]`.
+    #[serde(default = "default_stream_cancel_ack_secs")]
+    pub stream_cancel_ack_secs: u32,
+
+    /// Period (seconds) for the receiver-side framework to re-check the
+    /// opening UCAN's revocation status during the lifetime of an
+    /// active stream. §5.4.5 Revocation re-check cadence, registered in
+    /// §9.18.B. On revocation the stream closes with
+    /// `OutletErrorClass::Authorization::RevokedMidStream`
+    /// (`SCP-TOOL-6110` / `authorization.revoked-mid-stream`). Default
+    /// `10`, range `[1, 60]`.
+    #[serde(default = "default_stream_ucan_recheck_secs")]
+    pub stream_ucan_recheck_secs: u32,
+
+    /// Maximum number of streams the immediate-previous-hop invoker DID
+    /// may have open concurrently against any outlet in this context
+    /// (§5.4.5 per-context concurrent-stream bounds, registered in
+    /// §9.18.B). Breach rejects with `Transport::RateLimited` slug
+    /// `transport.concurrent-streams-per-invoker`. Default `8`, range
+    /// `[1, 1024]`.
+    #[serde(default = "default_max_concurrent_inbound_streams_per_invoker")]
+    pub max_concurrent_inbound_streams_per_invoker: u32,
+
+    /// Maximum number of streams the outermost caller DID in the
+    /// delegation chain may have open concurrently against any outlet
+    /// hosted by this operator DID (§5.4.5, tracked at operator scope).
+    /// Breach rejects with `Transport::RateLimited` slug
+    /// `transport.concurrent-streams-per-origin-invoker`. Default `16`,
+    /// range `[1, 1024]`.
+    #[serde(default = "default_max_concurrent_inbound_streams_per_origin_invoker")]
+    pub max_concurrent_inbound_streams_per_origin_invoker: u32,
+
+    /// Maximum number of streams open concurrently against a single
+    /// outlet (across all invokers) — §5.4.5, registered in §9.18.B.
+    /// Breach rejects with `Transport::RateLimited` slug
+    /// `transport.concurrent-streams-per-outlet`. Default `128`, range
+    /// `[1, 1024]`.
+    #[serde(default = "default_max_concurrent_inbound_streams_per_outlet")]
+    pub max_concurrent_inbound_streams_per_outlet: u32,
 }
 
 /// Default for [`ContextParams::base_cost_scale`] — the absolute
@@ -895,6 +959,51 @@ const fn default_base_cost_scale() -> Amount {
 /// discipline.
 const fn default_outlet_error_buffer_max_secs() -> u32 {
     30
+}
+
+/// Default for [`ContextParams::stream_window_default`] — `32`, per
+/// §5.4.5 Credit-based backpressure / §9.18.B.
+const fn default_stream_window_default() -> u32 {
+    32
+}
+
+/// Default for [`ContextParams::stream_credit_stall_secs`] — `30` s,
+/// per §5.4.5 Credit-based backpressure / §9.18.B.
+const fn default_stream_credit_stall_secs() -> u32 {
+    30
+}
+
+/// Default for [`ContextParams::stream_cancel_ack_secs`] — `5` s, per
+/// §5.4.5 Cancellation and billing boundary / §9.18.B.
+const fn default_stream_cancel_ack_secs() -> u32 {
+    5
+}
+
+/// Default for [`ContextParams::stream_ucan_recheck_secs`] — `10` s,
+/// per §5.4.5 Revocation re-check cadence / §9.18.B.
+const fn default_stream_ucan_recheck_secs() -> u32 {
+    10
+}
+
+/// Default for
+/// [`ContextParams::max_concurrent_inbound_streams_per_invoker`] — `8`,
+/// per §5.4.5 per-context concurrent-stream bounds / §9.18.B.
+const fn default_max_concurrent_inbound_streams_per_invoker() -> u32 {
+    8
+}
+
+/// Default for
+/// [`ContextParams::max_concurrent_inbound_streams_per_origin_invoker`]
+/// — `16`, per §5.4.5 per-context concurrent-stream bounds / §9.18.B.
+const fn default_max_concurrent_inbound_streams_per_origin_invoker() -> u32 {
+    16
+}
+
+/// Default for
+/// [`ContextParams::max_concurrent_inbound_streams_per_outlet`] —
+/// `128`, per §5.4.5 per-context concurrent-stream bounds / §9.18.B.
+const fn default_max_concurrent_inbound_streams_per_outlet() -> u32 {
+    128
 }
 
 impl Default for ContextParams {
@@ -927,6 +1036,16 @@ impl Default for ContextParams {
             sybil_policy: None,
             base_cost_scale: default_base_cost_scale(),
             outlet_error_buffer_max_secs: default_outlet_error_buffer_max_secs(),
+            stream_window_default: default_stream_window_default(),
+            stream_credit_stall_secs: default_stream_credit_stall_secs(),
+            stream_cancel_ack_secs: default_stream_cancel_ack_secs(),
+            stream_ucan_recheck_secs: default_stream_ucan_recheck_secs(),
+            max_concurrent_inbound_streams_per_invoker:
+                default_max_concurrent_inbound_streams_per_invoker(),
+            max_concurrent_inbound_streams_per_origin_invoker:
+                default_max_concurrent_inbound_streams_per_origin_invoker(),
+            max_concurrent_inbound_streams_per_outlet:
+                default_max_concurrent_inbound_streams_per_outlet(),
         }
     }
 }
@@ -1152,6 +1271,13 @@ mod tests {
             sybil_policy: None,
             base_cost_scale: Amount::new(100),
             outlet_error_buffer_max_secs: 30,
+            stream_window_default: 32,
+            stream_credit_stall_secs: 30,
+            stream_cancel_ack_secs: 5,
+            stream_ucan_recheck_secs: 10,
+            max_concurrent_inbound_streams_per_invoker: 8,
+            max_concurrent_inbound_streams_per_origin_invoker: 16,
+            max_concurrent_inbound_streams_per_outlet: 128,
         };
 
         assert_eq!(params.mode, ContextMode::Broadcast);
@@ -1300,6 +1426,13 @@ mod tests {
             sybil_policy: None,
             base_cost_scale: Amount::new(1),
             outlet_error_buffer_max_secs: 30,
+            stream_window_default: 32,
+            stream_credit_stall_secs: 30,
+            stream_cancel_ack_secs: 5,
+            stream_ucan_recheck_secs: 10,
+            max_concurrent_inbound_streams_per_invoker: 8,
+            max_concurrent_inbound_streams_per_origin_invoker: 16,
+            max_concurrent_inbound_streams_per_outlet: 128,
         };
 
         let json = serde_json::to_string(&params).ok();
@@ -1365,6 +1498,13 @@ mod tests {
             sybil_policy: None,
             base_cost_scale: Amount::new(1),
             outlet_error_buffer_max_secs: 30,
+            stream_window_default: 32,
+            stream_credit_stall_secs: 30,
+            stream_cancel_ack_secs: 5,
+            stream_ucan_recheck_secs: 10,
+            max_concurrent_inbound_streams_per_invoker: 8,
+            max_concurrent_inbound_streams_per_origin_invoker: 16,
+            max_concurrent_inbound_streams_per_outlet: 128,
         };
 
         let json = serde_json::to_string(&params).unwrap();
