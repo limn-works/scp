@@ -1506,24 +1506,16 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      // The NAPI bridge returns a `NapiIdentity` whose `rotationEventJson`
-      // getter exposes the JSON-serialized `DidRotationEvent`. The
-      // returned object IS the live NAPI handle; we attach
-      // `rotationEventJson` as an own property so downstream callers
-      // (and `BridgeIdentityHandle` consumers) can read it without
-      // crossing the NAPI getter boundary again.
-      const migrated = (await (
-        handle as unknown as {
-          migrate(): Promise<BridgeIdentityHandle & { rotationEventJson?: string | null }>;
-        }
-      ).migrate()) as BridgeIdentityHandle & { rotationEventJson?: string | null };
-      const rotationEventJson = migrated.rotationEventJson ?? undefined;
-      // Preserve the underlying NAPI class instance so subsequent
-      // operations (rotateKey, addAgentKey, etc.) target the correct
-      // DID. Object.assign mutates `migrated` to carry the typed
-      // `rotationEventJson` field even when it was returned via a
-      // getter.
-      return Object.assign(migrated, { rotationEventJson });
+      // The NAPI bridge returns a `NapiIdentity` class instance whose
+      // `rotationEventJson` getter exposes the JSON-serialized
+      // `DidRotationEvent` (spec §3.7, ADR-003 §4b/4c). Returning the
+      // live class instance preserves the handle for downstream
+      // operations (rotateKey, addAgentKey, etc.) AND satisfies the
+      // `BridgeIdentityHandle.rotationEventJson` field via the NAPI
+      // getter — no own-property mutation needed (NAPI class
+      // properties are readonly, so `Object.assign` would throw
+      // `TypeError: Attempted to assign to readonly property.`).
+      return await (handle as unknown as { migrate(): Promise<BridgeIdentityHandle> }).migrate();
     },
 
     async identityAttestDevice(did: string): Promise<string> {

@@ -105,17 +105,25 @@ class Identity:
     ``attest_device``, ``execute_recovery``, attestation lifecycle, etc.)
     live as methods on :class:`scp_sdk.SCP`. Pass ``identity._raw_handle``
     when the SCP-level method needs the opaque bridge handle.
+
+    The ``rotation_event_json`` attribute is populated only on handles
+    produced by :meth:`scp_sdk.SCP.identity_migrate` (spec §3.7,
+    ADR-003 §4b/4c). It carries the JSON-serialized
+    ``DidRotationEvent`` that the SDK MUST distribute to active
+    context members per spec §3.2.1 step 4b. ``None`` for handles
+    produced by other operations.
     """
 
-    __slots__ = ("_raw_handle",)
+    __slots__ = ("_raw_handle", "rotation_event_json")
 
-    def __init__(self, handle: Any) -> None:
+    def __init__(self, handle: Any, rotation_event_json: str | None = None) -> None:
         """Wrap a ``PyIdentity`` bridge handle.
 
         Users should not call this directly — use the ``scp.identity_*``
         factory methods.
         """
         self._raw_handle = handle
+        self.rotation_event_json = rotation_event_json
 
     @classmethod
     def _from_handle(cls, _scp: SCP | None, raw: Any) -> Identity:

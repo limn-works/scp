@@ -236,12 +236,23 @@ class TestIdentity:
             await scp.identity_execute_recovery(identity.did, "invalid_tier", [])
 
     async def test_migrate(self, scp: SCP):
+        import json
+
         identity = await scp.identity_create(CustodyType.IN_MEMORY)
         try:
             new_identity = await scp.identity_migrate(identity._raw_handle)
             # Migration succeeded — new identity should have a different DID
             assert new_identity.did != identity.did
             assert new_identity.did.startswith("did:dht:")
+            # The SDK wrapper must surface the DidRotationEvent JSON so
+            # callers can distribute it to context members per spec
+            # §3.2.1 step 4b.
+            assert new_identity.rotation_event_json is not None
+            event = json.loads(new_identity.rotation_event_json)
+            assert event["new_did"] == new_identity.did
+            assert event["old_did"] == identity.did
+            assert "migration_proof" in event
+            assert "pre_rotation_proof" in event
         except _scp_core.IdentityError:
             # Migration may require pre-rotation commitment setup.
             # The SDK wrapper must propagate the error as IdentityError.
