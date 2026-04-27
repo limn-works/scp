@@ -385,12 +385,14 @@ class TestPackageReExports:
 
     def test_mcp_types_accessible_from_top_level(self) -> None:
         import scp_sdk
+        from scp_sdk.scp import McpAllowlistState
 
         assert scp_sdk.McpClient is McpClient
         assert scp_sdk.McpServer is McpServer
         assert scp_sdk.McpToolDefinition is McpToolDefinition
         assert scp_sdk.McpToolResult is McpToolResult
         assert scp_sdk.McpProvenance is McpProvenance
+        assert scp_sdk.McpAllowlistState is McpAllowlistState
 
 
 # -----------------------------------------------------------------------

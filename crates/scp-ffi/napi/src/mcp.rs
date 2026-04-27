@@ -937,39 +937,28 @@ mod tests {
     use super::*;
     use crate::runtime::NapiBridgeInstance;
 
-    /// WU6: Two-instance regression test — disabling enforcement on one
-    /// `NapiBridgeInstance` MUST NOT leak into another.
+    /// WU6: Two-instance regression test — disabling enforcement via the
+    /// public `mcp_disable_stdio_allowlist_on` entry point on one instance
+    /// MUST NOT leak into another. Drives the public surface so the test
+    /// catches a regression where the helper silently locks the wrong
+    /// mutex or fails to plumb `instance_id`.
     #[test]
     fn allowlist_disable_does_not_leak_across_instances_napi() {
-        use scp_mcp::allowlist::AllowlistError;
-
         let a = NapiBridgeInstance::new_napi();
         let b = NapiBridgeInstance::new_napi();
 
-        a.core
-            .mcp_allowlist()
-            .lock()
-            .unwrap()
-            .disable_enforcement(0);
+        mcp_disable_stdio_allowlist_on(&a).expect("disable on a should succeed");
 
-        // `b` is unaffected and rejects unlisted commands.
-        let res = b
-            .core
-            .mcp_allowlist()
-            .lock()
-            .unwrap()
-            .validate_command("sh");
+        // `b` snapshot remains restricted (default allowlist, enforcement on).
+        let b_state = mcp_get_stdio_allowlist_on(&b).expect("snapshot b");
         assert!(
-            matches!(res, Err(AllowlistError::NotAllowed { .. })),
-            "expected NotAllowed on isolated instance, got {res:?}"
+            !b_state.unrestricted,
+            "instance b must remain restricted after a is disabled"
         );
 
-        // Sanity: `a`'s snapshot reports unrestricted.
-        let a_state = a.core.mcp_allowlist().lock().unwrap().snapshot();
+        // Sanity: `a` reports unrestricted on its own snapshot.
+        let a_state = mcp_get_stdio_allowlist_on(&a).expect("snapshot a");
         assert!(a_state.unrestricted);
-        // `b` snapshot stays restricted.
-        let b_state = b.core.mcp_allowlist().lock().unwrap().snapshot();
-        assert!(!b_state.unrestricted);
     }
 
     /// WU6 supplement: `configure_on` on one instance must not bleed into

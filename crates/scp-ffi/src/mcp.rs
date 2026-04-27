@@ -3407,6 +3407,43 @@ mod tests {
         });
     }
 
+    /// WU6 supplement: `configure` on one instance must not bleed into
+    /// another's allow set, exercised through the public `PyScp` method.
+    #[test]
+    fn allowlist_configure_does_not_leak_across_instances_pyo3() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let a = crate::scp::PyScp::new();
+            let b = crate::scp::PyScp::new();
+
+            a.mcp_configure_stdio_allowlist(vec!["custom-a".to_owned()])
+                .expect("configure on a");
+
+            let a_dict_obj = a.mcp_get_stdio_allowlist(py).expect("snapshot a");
+            let a_dict: &Bound<'_, PyDict> = a_dict_obj.bind(py).downcast().unwrap();
+            let a_allowed: Vec<String> = a_dict
+                .get_item("allowed")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(a_allowed.contains(&"custom-a".to_owned()));
+
+            let b_dict_obj = b.mcp_get_stdio_allowlist(py).expect("snapshot b");
+            let b_dict: &Bound<'_, PyDict> = b_dict_obj.bind(py).downcast().unwrap();
+            let b_allowed: Vec<String> = b_dict
+                .get_item("allowed")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(
+                !b_allowed.contains(&"custom-a".to_owned()),
+                "instance b must not see a's custom binary",
+            );
+        });
+    }
+
     // -----------------------------------------------------------------------
     // Registry statistics and cleanup (issue #108)
     // -----------------------------------------------------------------------
