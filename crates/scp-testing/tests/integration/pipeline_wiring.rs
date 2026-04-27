@@ -86,7 +86,18 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // `ContextManager::accept_outlet_interface`. The single `#[test]`
 // runs 4 inner asserts (dispatch → wrapper → both rejection slugs)
 // but contributes 1 to the total_tests count.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 54;
+//
+// Raised 54 -> 56 by SCP-OUT-021 + SCP-OUT-022 remediation: adds
+// `dispatch_with_economy_passes_layer_composition` and
+// `dispatch_with_economy_passes_caveat_enforcement` pinning the
+// dispatch-layer wiring that constructs and forwards the
+// `LayerCompositionEnforcement` bundle and forwards the
+// `caveat_enforcement` parameter to `invoke_outlet_with_economy`. The
+// audit caught both stories as ghost code — the dispatcher used to
+// pass `None` for both, so the §7.3.8 post-input gate AND the §7.3.8 /
+// §6.2 / §19.5 / §19.3 layer-composition AND fold never ran for real
+// invocations. Two `#[test]` items, +2 to the active count.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 56;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -556,6 +567,108 @@ fn admin_removal_emits_induced_rotations() {
         fn_body_contains(MANAGER_SRC, "execute_remove_member", "InterfaceSaltRotated"),
         "execute_remove_member must append InterfaceSaltRotated events \
          alongside the RemoveMember commit (§6.2.0.1 commit atomicity)"
+    );
+}
+
+// SCP-OUT-021 + SCP-OUT-022 — caveat enforcement + layer-composition
+// wiring through the dispatch layer. The audit caught both stories as
+// ghost code: production callers `invoke_outlet_dispatch_with_economy`
+// and `invoke_outlet_dispatch_with_economy_stream` passed
+// `caveat_enforcement: None` and `layer_composition: None` to
+// `invoke_outlet_with_economy`, so the §7.3.8 post-input gate
+// (`input_schema`, `allowed_adapters`, `allowed_target_dids`,
+// `max_calls`, `amount_max_cumulative`, `rate_window`) and the §7.3.8 /
+// §6.2.0.1 / §19.5 / §19.3 AND fold (Outbound ∧ Inbound ∧
+// SpendingCapability ∧ MemberBudgetTracker) NEVER ran for real
+// invocations. These two assertions pin the remediation: the dispatch
+// layer MUST construct a `LayerCompositionEnforcement` bundle and pass
+// it through, AND it MUST forward the optional `caveat_enforcement`
+// bundle from the caller so the §7.3.8 caveat gate runs end-to-end.
+//
+// A future refactor that reverts either to `None` would silently re-
+// open the ghost-code regression — the structural assertions catch it
+// at CI time before the regression can land.
+#[test]
+fn dispatch_with_economy_passes_layer_composition() {
+    // The dispatcher MUST construct a real `LayerCompositionEnforcement`
+    // — the bundle type appears in the function body. Construction site
+    // is non-test (the tests-only fixture in OUT-022's
+    // `ac2_ac3_integration_wiring_outbound_policy_denial_surfaces_through_manager`
+    // builds its own bundle, but that body is below `extract_fn_body`'s
+    // first-match — the dispatcher's body comes first in the manager
+    // source so this assertion pins the production call site).
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "invoke_outlet_dispatch_with_economy",
+            "LayerCompositionEnforcement {",
+        ),
+        "invoke_outlet_dispatch_with_economy must construct a \
+         LayerCompositionEnforcement bundle (§7.3.8 / §6.2 / §19.5 / \
+         §19.3 AND fold over Outbound ∧ Inbound ∧ SpendingCapability \
+         ∧ MemberBudgetTracker — SCP-OUT-022 remediation; passing \
+         `None` here re-opens the ghost-code regression)"
+    );
+    // The bundle MUST flow into `invoke_outlet_with_economy` as the
+    // `layer_composition` argument — the body must reference the
+    // local binding (`layer_composition`) so the call site cannot
+    // silently regress to a hardcoded `None`.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "invoke_outlet_dispatch_with_economy",
+            "layer_composition,",
+        ),
+        "invoke_outlet_dispatch_with_economy must pass `layer_composition` \
+         (the constructed bundle) to invoke_outlet_with_economy — never \
+         a hardcoded `None`. SCP-OUT-022 remediation."
+    );
+    // Source-context interface lookup MUST happen on the dispatch
+    // path — the §6.2.0.1 `OutboundPolicy` / `InboundPolicy` resolve
+    // from the per-context `tool_interfaces` snapshot. Pin the lookup
+    // identifier so a future refactor that drops the policy snapshot
+    // is caught structurally.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "invoke_outlet_dispatch_with_economy",
+            "tool_interfaces",
+        ),
+        "invoke_outlet_dispatch_with_economy must resolve the \
+         §6.2.0.1 OutboundPolicy / InboundPolicy from \
+         ctx.governance.tool_interfaces (SCP-OUT-022 remediation)"
+    );
+}
+
+#[test]
+fn dispatch_with_economy_passes_caveat_enforcement() {
+    // The dispatcher MUST accept and forward the `caveat_enforcement`
+    // bundle. Pinning the local identifier name (the parameter is
+    // named `caveat_enforcement`) catches a future refactor that
+    // drops the parameter and reverts to a hardcoded `None`.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "invoke_outlet_dispatch_with_economy",
+            "caveat_enforcement,",
+        ),
+        "invoke_outlet_dispatch_with_economy must forward \
+         `caveat_enforcement` to invoke_outlet_with_economy — never a \
+         hardcoded `None` (SCP-OUT-021 remediation)"
+    );
+    // The streaming sibling MUST forward the same bundle so streaming
+    // dispatch enforces caveats on the same terms as the single-shot
+    // dispatcher.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "invoke_outlet_dispatch_with_economy_stream",
+            "caveat_enforcement,",
+        ),
+        "invoke_outlet_dispatch_with_economy_stream must forward \
+         `caveat_enforcement` to the underlying aggregating dispatcher \
+         (SCP-OUT-021 remediation — streaming surface MUST enforce \
+         caveats on parity with the single-shot path)"
     );
 }
 

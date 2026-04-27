@@ -1188,6 +1188,29 @@ impl ContextManager {
     /// as `ContextError::OutletInvocation(OutletError {
     /// code: SCP-TOOL-6130, slug: execution.handler-panic, ... })`
     /// per spec §5.4.4 (SCP-OUT-027).
+    ///
+    /// # SCP-OUT-021 + SCP-OUT-022 — caveat + layer composition wiring
+    ///
+    /// `caveat_enforcement` is the SCP-OUT-021 post-input gate
+    /// ([`CaveatEnforcement`] — `input_schema`, `allowed_adapters`,
+    /// `allowed_target_dids`, `max_calls`, `amount_max_cumulative`,
+    /// `rate_window`). Pass `Some(...)` when the presenting (leaf) action
+    /// UCAN carried `nb` caveats; the caller derives this bundle from the
+    /// validated UCAN's `payload.nb` field plus the bridge-owned
+    /// [`CaveatCounterStore`](crate::trust::CaveatCounterStore).
+    ///
+    /// The §7.3.8 / §6.2.0.1 / §19.5 / §19.3 layer composition
+    /// ([`LayerCompositionEnforcement`]) is constructed INSIDE this method
+    /// from the per-context runtime state — `OutboundPolicy` /
+    /// `InboundPolicy` are looked up from the matching `OutletInterface`
+    /// in `ctx.governance.tool_interfaces` (intra-context invocations
+    /// resolve to `None` for both, which the layer fold treats as "admit"
+    /// per spec); `SpendingCapability` is extracted from `spending_ucan`
+    /// when present; `MemberBudgetTracker` is snapshotted from
+    /// `ctx.governance.budget_tracker`. Passing this bundle through is
+    /// MANDATORY (not opt-in) — the §7.3.8 AND fold over budget +
+    /// spending + Inbound/Outbound policies MUST run for every dispatch
+    /// per SCP-OUT-022.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn invoke_outlet_dispatch_with_economy<E>(
         &self,
@@ -1201,6 +1224,12 @@ impl ContextManager {
         executor: &E,
         misdeclaration_sink: Option<&dyn crate::context::outlets::invoke::QueryMisdeclarationSink>,
         handler_panic_sink: Option<&dyn crate::context::outlets::invoke::HandlerPanicSink>,
+        // SCP-OUT-021: caveat enforcement bundle from the validated leaf
+        // UCAN's `nb` field + the bridge-owned [`CaveatCounterStore`].
+        // `None` only for legacy (no-caveat) callers; production bridges
+        // MUST pass `Some(...)` when the presenting UCAN carries any of
+        // the §7.3.8 fields.
+        caveat_enforcement: Option<CaveatEnforcement<'_>>,
     ) -> Result<DispatchedManagedOutletInvocationOutput, ContextError>
     where
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized,
@@ -1226,12 +1255,25 @@ impl ContextManager {
         // economic policy snapshot). The dispatcher does not stress
         // membership/ceiling checks — those are already enforced by the
         // existing capability gate inside `invoke_outlet_with_economy`.
+        //
+        // SCP-OUT-022: the per-context governance state (Outbound /
+        // Inbound interface policies + the [`MemberBudgetTracker`]
+        // snapshot) is read here under the same lock so the
+        // [`LayerCompositionEnforcement`] bundle constructed below sees a
+        // self-consistent snapshot. `OutboundPolicy` / `InboundPolicy`
+        // resolve from the matching `OutletInterface` in
+        // `ctx.governance.tool_interfaces` keyed on `outlet_id` — intra-
+        // context dispatch resolves to `None` for both, which the
+        // §7.3.8 layer fold treats as "admit" per spec.
         let (
             handle_snapshot,
             role_state_snapshot,
             events_snapshot,
             epoch_snapshot,
             policy_snapshot,
+            outbound_policy,
+            inbound_policy,
+            budget_tracker_snapshot,
         ) = {
             let (guard, _ctx_gen) = self
                 .lock_context(context_id)
@@ -1245,14 +1287,63 @@ impl ContextManager {
                 now_secs,
                 self.event_log.as_ref(),
             );
+            // §6.2.0.1 interface lookup. The `OutletInterface` carries the
+            // source-context-published `OutboundPolicy` and the target-
+            // context-mirrored `InboundPolicy`. Intra-context dispatch
+            // does NOT publish an interface — the lookup misses and both
+            // resolve to `None`, which `evaluate_all_layers` treats as
+            // "admit" (the matching layer is skipped). Cross-context
+            // invocations route through `invoke_cross_context` rather
+            // than this dispatcher, so they own their own policy lookup.
+            let interface = ctx
+                .governance
+                .tool_interfaces
+                .iter()
+                .find(|iface| &iface.outlet_id == outlet_id);
+            let outbound = interface.and_then(|iface| iface.outbound_policy.clone());
+            let inbound = interface.and_then(|iface| iface.inbound_policy.clone());
             (
                 ctx.handle.clone(),
                 ctx.role_state.clone(),
                 events,
                 ctx.epoch.mls_epoch,
                 ctx.governance.economic_policy.clone(),
+                outbound,
+                inbound,
+                ctx.governance.budget_tracker.clone(),
             )
         };
+
+        // SCP-OUT-022: build the layer-composition bundle from the
+        // per-context snapshot taken above + the optional spending UCAN's
+        // `SpendingCapability`. The bundle is `Some` UNCONDITIONALLY so
+        // the §7.3.8 / §6.2 / §19.5 / §19.3 AND fold over the four
+        // economic + policy layers runs on every dispatch — the §6.2.0.1
+        // policies remain `None` for intra-context (handled by the fold)
+        // and the spending capability remains `None` for free actions.
+        // Passing `None` here would re-introduce the SCP-OUT-022 ghost-
+        // code regression (the bundle is constructed but the layer fold
+        // never ran).
+        let spending_capability = spending_ucan.and_then(|tok| {
+            scp_protocol::crypto::ucan::spending::SpendingCapability::from_ucan_token(tok).ok()
+        });
+        // Serialized payload byte length — drives the
+        // `OutboundPolicy.max_payload_bytes` check (§6.2.0.1). `to_string`
+        // is canonical-enough for size accounting at this gate; the §5.4.4
+        // wire-form size check is independent of this surface.
+        let payload_bytes = serde_json::to_vec(&input).map_or(0, |v| v.len());
+        let layer_composition = Some(LayerCompositionEnforcement {
+            outbound_policy,
+            inbound_policy,
+            spending_capability,
+            budget_tracker: budget_tracker_snapshot,
+            // `source_role` is the role the invoker holds in the *source*
+            // context for cross-context invocations (drives
+            // `InboundPolicy.allowed_source_roles`). Intra-context
+            // dispatch has no source/target distinction — leave `None`.
+            source_role: None,
+            payload_bytes,
+        });
 
         // Adapt the trait-based dispatch into the closure-based pipeline.
         // The closure has to hold `&mut Vec<MutationIntent>` so it can
@@ -1368,6 +1459,17 @@ impl ContextManager {
             }
         };
 
+        // SCP-OUT-021 + SCP-OUT-022 wiring. Both bundles are passed
+        // through to `invoke_outlet_with_economy`, which builds the
+        // post-input hook in `build_post_input_hook`. The §7.3.8 AND fold
+        // over (caveat time-box → counter → OutboundPolicy → InboundPolicy
+        // → SpendingCapability → MemberBudgetTracker) runs immediately
+        // after input schema validation and before the executor. The
+        // remediation scope (SCP-OUT-021 + SCP-OUT-022) requires that
+        // `caveat_enforcement` AND `layer_composition` are NOT
+        // hardcoded `None` — the dispatcher MUST build a real
+        // `LayerCompositionEnforcement` bundle (always `Some(...)`) and
+        // forward the optional `caveat_enforcement` from the caller.
         let outcome = self
             .invoke_outlet_with_economy(
                 context_id,
@@ -1379,8 +1481,8 @@ impl ContextManager {
                 timeout_ms,
                 closure,
                 handler_panic_sink,
-                None,
-                None,
+                caveat_enforcement,
+                layer_composition,
             )
             .await?;
 
@@ -1445,6 +1547,11 @@ impl ContextManager {
         executor: &E,
         misdeclaration_sink: Option<&dyn crate::context::outlets::invoke::QueryMisdeclarationSink>,
         handler_panic_sink: Option<&dyn crate::context::outlets::invoke::HandlerPanicSink>,
+        // SCP-OUT-021: caveat enforcement bundle, forwarded verbatim to
+        // [`Self::invoke_outlet_dispatch_with_economy`] so the §7.3.8
+        // post-input gate runs for streaming dispatch on the same terms
+        // as the single-shot path.
+        caveat_enforcement: Option<CaveatEnforcement<'_>>,
     ) -> Result<
         tokio::sync::mpsc::Receiver<scp_protocol::context::outlets::stream::OutletStreamChunk>,
         ContextError,
@@ -1470,6 +1577,7 @@ impl ContextManager {
                 executor,
                 misdeclaration_sink,
                 handler_panic_sink,
+                caveat_enforcement,
             )
             .await;
 

@@ -5180,6 +5180,10 @@ async fn manager_dispatch_routes_action_outlet_through_exec_action() {
             &executor,
             None,
             None,
+            // SCP-OUT-021: this fixture exercises the dispatch surface
+            // without caveats — the §7.3.8 post-input gate is unreachable
+            // from this path so `None` is the correct admission value.
+            None,
         )
         .await
         .expect("dispatch should succeed");
@@ -5269,6 +5273,9 @@ async fn manager_dispatch_query_outlet_misdeclared_emits_signal() {
             &executor,
             Some(&sink),
             None,
+            // SCP-OUT-021: misdeclaration test exercises the executor
+            // dispatch path; no caveat-bearing UCAN is presented.
+            None,
         )
         .await;
 
@@ -5297,3 +5304,429 @@ async fn manager_dispatch_query_outlet_misdeclared_emits_signal() {
     );
     assert_eq!(event.outlet_id, "ro-tool");
 }
+
+// =============================================================================
+// SCP-OUT-021 + SCP-OUT-022 — dispatch wiring integration tests
+//
+// These tests prove that `invoke_outlet_dispatch_with_economy` actually runs
+// the §7.3.8 post-input gate AND the §7.3.8 / §6.2.0.1 / §19.5 / §19.3 layer
+// composition fold for production invocations — closing the audit-detected
+// ghost-code regression in which the dispatcher passed `caveat_enforcement:
+// None` and `layer_composition: None` to `invoke_outlet_with_economy`.
+//
+// Each test exercises the full dispatch path (NOT a unit test on
+// `evaluate_all_layers` in isolation) so that:
+//   1. caveats from the bridge-side bundle reach the post-input hook,
+//   2. the §6.2.0.1 OutboundPolicy / InboundPolicy state in
+//      `ctx.governance.tool_interfaces` is consulted, AND
+//   3. the per-context `MemberBudgetTracker` snapshot is read at dispatch
+//      time and AND-composed with the SpendingCapability ceiling.
+//
+// `caveat_test_setup` reuses the SCP-OUT-021 fixtures (counter store, signed
+// spending UCAN, granted budget, registered echo outlet).
+// =============================================================================
+
+/// SCP-OUT-021 dispatch wiring AC: dispatching with `max_calls: 2` admits
+/// the first two calls and rejects the third with the canonical
+/// `authorization.denied` slug. Proves the dispatcher forwards
+/// `caveat_enforcement` to the post-input gate.
+#[tokio::test]
+async fn dispatch_with_economy_max_calls_rejects_after_cap_reached() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::economy::types::Amount;
+    use scp_protocol::trust::caveats::InvocationCaveats;
+
+    use crate::context::outlets::invoke::{
+        MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
+    };
+
+    let (manager, registry, ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let caveats = InvocationCaveats {
+        max_calls: Some(2),
+        ..InvocationCaveats::empty()
+    };
+
+    struct EchoExec;
+    #[async_trait::async_trait]
+    impl OutletExecutor for EchoExec {
+        async fn exec_action(
+            &self,
+            _ctx: &mut MutableInvocation<'_>,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, OutletExecutorError> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn exec_query(
+            &self,
+            _ctx: &ReadOnlyInvocation<'_>,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, OutletExecutorError> {
+            Ok(serde_json::json!({}))
+        }
+    }
+    let exec = EchoExec;
+
+    let invoke = || {
+        let manager = std::sync::Arc::clone(&manager);
+        let registry = registry.clone();
+        let ucan = ucan.clone();
+        let counter_store = std::sync::Arc::clone(&counter_store);
+        let ucan_cid = ucan_cid.clone();
+        let caveats = caveats.clone();
+        let exec_ref = &exec;
+        async move {
+            manager
+                .invoke_outlet_dispatch_with_economy(
+                    "caveat-ctx",
+                    &registry,
+                    &OutletId::from("echo"),
+                    serde_json::json!({}),
+                    &"did:key:invoker".into(),
+                    Some(&ucan),
+                    None,
+                    exec_ref,
+                    None,
+                    None,
+                    Some(crate::context::manager::outlets::CaveatEnforcement {
+                        caveats: &caveats,
+                        counter_store,
+                        ucan_cid: &ucan_cid,
+                        negotiated_adapter: None,
+                        target_did: None,
+                        estimated_cost: Amount::new(0),
+                    }),
+                )
+                .await
+        }
+    };
+
+    invoke().await.expect("call 1 of 2 admitted via dispatch");
+    invoke().await.expect("call 2 of 2 admitted via dispatch");
+    let err = invoke()
+        .await
+        .expect_err("3rd call must reject at post-input gate");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("authorization.denied") || msg.contains("max_calls"),
+        "expected max_calls rejection through dispatch path, got: {msg}"
+    );
+}
+
+/// SCP-OUT-021 dispatch wiring AC: dispatching with
+/// `amount_max_cumulative` rejects via the counter store once the
+/// cumulative cost would exceed the cap. Proves the counter-store CAS
+/// reaches the dispatch path.
+#[tokio::test]
+async fn dispatch_with_economy_amount_max_cumulative_rejects_when_exhausted() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::economy::types::Amount;
+    use scp_protocol::trust::caveats::InvocationCaveats;
+
+    use crate::context::outlets::invoke::{
+        MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
+    };
+
+    let (manager, registry, ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    let caveats = InvocationCaveats {
+        amount_max_cumulative: Some(Amount::new(100)),
+        ..InvocationCaveats::empty()
+    };
+
+    struct EchoExec;
+    #[async_trait::async_trait]
+    impl OutletExecutor for EchoExec {
+        async fn exec_action(
+            &self,
+            _ctx: &mut MutableInvocation<'_>,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, OutletExecutorError> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn exec_query(
+            &self,
+            _ctx: &ReadOnlyInvocation<'_>,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, OutletExecutorError> {
+            Ok(serde_json::json!({}))
+        }
+    }
+    let exec = EchoExec;
+
+    let invoke_with_cost = |estimated: u64| {
+        let manager = std::sync::Arc::clone(&manager);
+        let registry = registry.clone();
+        let ucan = ucan.clone();
+        let counter_store = std::sync::Arc::clone(&counter_store);
+        let ucan_cid = ucan_cid.clone();
+        let caveats = caveats.clone();
+        let exec_ref = &exec;
+        async move {
+            manager
+                .invoke_outlet_dispatch_with_economy(
+                    "caveat-ctx",
+                    &registry,
+                    &OutletId::from("echo"),
+                    serde_json::json!({}),
+                    &"did:key:invoker".into(),
+                    Some(&ucan),
+                    None,
+                    exec_ref,
+                    None,
+                    None,
+                    Some(crate::context::manager::outlets::CaveatEnforcement {
+                        caveats: &caveats,
+                        counter_store,
+                        ucan_cid: &ucan_cid,
+                        negotiated_adapter: None,
+                        target_did: None,
+                        estimated_cost: Amount::new(estimated),
+                    }),
+                )
+                .await
+        }
+    };
+
+    invoke_with_cost(60)
+        .await
+        .expect("60 admitted via dispatch");
+    invoke_with_cost(40)
+        .await
+        .expect("100 cumulative admitted via dispatch");
+    let err = invoke_with_cost(1)
+        .await
+        .expect_err("over cap must reject via dispatch counter store");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("authorization.cumulative-exceeded") || msg.contains("cumulative"),
+        "expected cumulative-exceeded rejection through dispatch path, got: {msg}"
+    );
+}
+
+/// SCP-OUT-022 dispatch wiring AC: an `OutboundPolicy` whose
+/// `allowed_callers` list excludes the invoker rejects the dispatch via
+/// the §6.2.0.1 layer. The policy is published into the per-context
+/// `tool_interfaces` so the dispatcher's policy snapshot picks it up.
+/// Proves the dispatcher constructs a real
+/// `LayerCompositionEnforcement` bundle from runtime state and that
+/// `evaluate_all_layers` runs.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // §6.2.0.1 fixture must publish a real OutletInterface to exercise the policy snapshot — splitting masks the wiring under test.
+async fn dispatch_with_economy_outbound_policy_denies_when_caller_excluded() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::context::outlets::interface::{OutboundPolicy, OutletInterface};
+    use scp_protocol::economy::types::Amount;
+
+    use crate::context::outlets::invoke::{
+        MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
+    };
+
+    let manager = std::sync::Arc::new(ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    ));
+
+    let mut params = governance_params();
+    params
+        .ceiling
+        .push(scp_protocol::context::params::Capability::OutletCallAll);
+    let _handle = manager
+        .create_context(
+            "out022-dispatch-ctx".into(),
+            params,
+            "did:key:invoker".into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Generous budget so the failure cannot be attributed to the budget
+    // layer; publish an OutletInterface whose OutboundPolicy excludes the
+    // invoker so the §6.2.0.1 layer fires.
+    let other: scp_identity::DID = "did:key:other".into();
+    {
+        let arc = manager
+            .contexts
+            .get("out022-dispatch-ctx")
+            .unwrap()
+            .value()
+            .clone();
+        let mut ctx = arc.lock().await;
+        ctx.governance
+            .budget_tracker
+            .grant(&"did:key:invoker".into(), Amount::new(1_000_000));
+        ctx.governance.tool_interfaces.push(OutletInterface {
+            source_context: "out022-dispatch-ctx".into(),
+            target_context: "peer-ctx".into(),
+            outlet_id: scp_protocol::context::outlets::OutletId::from("echo"),
+            rate_limit: None,
+            per_caller_rate_limit: None,
+            approved_by_source: true,
+            approved_by_target: true,
+            outbound_policy: Some(OutboundPolicy {
+                allowed_callers: vec![other],
+                max_calls_per_minute: 600,
+                max_payload_bytes: 65_536,
+                require_provenance: true,
+            }),
+            inbound_policy: None,
+        });
+    }
+
+    let mut registry = scp_protocol::context::outlets::registry::OutletRegistry::new();
+    registry.insert(test_outlet_registration("echo"));
+
+    let ucan = dummy_spending_ucan_for(&"did:key:invoker".into());
+
+    struct EchoExec;
+    #[async_trait::async_trait]
+    impl OutletExecutor for EchoExec {
+        async fn exec_action(
+            &self,
+            _ctx: &mut MutableInvocation<'_>,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, OutletExecutorError> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn exec_query(
+            &self,
+            _ctx: &ReadOnlyInvocation<'_>,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, OutletExecutorError> {
+            Ok(serde_json::json!({}))
+        }
+    }
+    let exec = EchoExec;
+
+    let err = manager
+        .invoke_outlet_dispatch_with_economy(
+            "out022-dispatch-ctx",
+            &registry,
+            &OutletId::from("echo"),
+            serde_json::json!({}),
+            &"did:key:invoker".into(),
+            Some(&ucan),
+            None,
+            &exec,
+            None,
+            None,
+            None, // no caveats — only layer composition under test
+        )
+        .await
+        .expect_err("OutboundPolicy excludes invoker — dispatch must reject");
+
+    // §5.4.4: the OutboundPolicy denial routes through
+    // `authorization.denied` / `CODE_AUTHORIZATION_DENIED` /
+    // `OutletErrorClass::Authorization`. Per-layer diagnostic is
+    // operator-side only.
+    let envelope = match err {
+        scp_protocol::context::ContextError::OutletInvocation(e) => e,
+        other => panic!("expected OutletInvocation, got {other:?}"),
+    };
+    assert_eq!(
+        envelope.code,
+        scp_protocol::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED,
+    );
+    assert_eq!(
+        envelope.slug,
+        scp_protocol::context::outlets::error_codes::SLUG_AUTHORIZATION_DENIED,
+    );
+}
+
+/// SCP-OUT-022 dispatch wiring AC: `SpendingCapability` `max_per_action`
+/// less than the estimated cost rejects via the §19.5 layer. Uses
+/// `dummy_spending_ucan_with_cap` to bind a tight per-action ceiling to
+/// the spending UCAN; the caveat layer carries `amount_max_per_call` so
+/// the cost reaches `evaluate_all_layers` via the OUT-021 bundle.
+#[tokio::test]
+async fn dispatch_with_economy_spending_capability_denies_over_max_per_action() {
+    use scp_protocol::context::outlets::OutletId;
+    use scp_protocol::economy::types::Amount;
+    use scp_protocol::trust::caveats::InvocationCaveats;
+
+    use crate::context::outlets::invoke::{
+        MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
+    };
+
+    let (manager, registry, _ucan, counter_store, ucan_cid) = caveat_test_setup().await;
+    // Tight per-action ceiling (5 USD); estimated cost = 100 must reject
+    // at the SpendingCapability layer (§19.5) inside `evaluate_all_layers`.
+    let tight_ucan = dummy_spending_ucan_with_cap(&"did:key:invoker".into(), 5, 1_000_000);
+    // Caveats present so the OUT-021 bundle plumbs `estimated_cost`
+    // into the layer composition input. `amount_max_per_call` is left
+    // generous so the OUT-021 local check admits and the §19.5 layer is
+    // the rejecting layer.
+    let caveats = InvocationCaveats {
+        amount_max_per_call: Some(Amount::new(1_000)),
+        ..InvocationCaveats::empty()
+    };
+
+    struct EchoExec;
+    #[async_trait::async_trait]
+    impl OutletExecutor for EchoExec {
+        async fn exec_action(
+            &self,
+            _ctx: &mut MutableInvocation<'_>,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, OutletExecutorError> {
+            Ok(serde_json::json!({}))
+        }
+
+        async fn exec_query(
+            &self,
+            _ctx: &ReadOnlyInvocation<'_>,
+            _input: serde_json::Value,
+        ) -> Result<serde_json::Value, OutletExecutorError> {
+            Ok(serde_json::json!({}))
+        }
+    }
+    let exec = EchoExec;
+
+    let err = manager
+        .invoke_outlet_dispatch_with_economy(
+            "caveat-ctx",
+            &registry,
+            &OutletId::from("echo"),
+            serde_json::json!({}),
+            &"did:key:invoker".into(),
+            Some(&tight_ucan),
+            None,
+            &exec,
+            None,
+            None,
+            Some(crate::context::manager::outlets::CaveatEnforcement {
+                caveats: &caveats,
+                counter_store,
+                ucan_cid: &ucan_cid,
+                negotiated_adapter: None,
+                target_did: None,
+                // 100 > 5 (max_per_action) — §19.5 layer rejects.
+                estimated_cost: Amount::new(100),
+            }),
+        )
+        .await
+        .expect_err("SpendingCapability.max_per_action < estimated_cost — dispatch must reject");
+
+    let envelope = match err {
+        scp_protocol::context::ContextError::OutletInvocation(e) => e,
+        other => panic!("expected OutletInvocation, got {other:?}"),
+    };
+    // Routes through the §5.4.4 authorization-denied envelope. The
+    // `LayerName::SpendingCapability` is operator-side only.
+    assert_eq!(
+        envelope.code,
+        scp_protocol::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED,
+    );
+    assert_eq!(
+        envelope.class,
+        scp_protocol::context::outlets::errors::OutletErrorClass::Authorization,
+    );
+}
+
+// =============================================================================
+// End SCP-OUT-021 + SCP-OUT-022 dispatch wiring integration tests
+// =============================================================================
