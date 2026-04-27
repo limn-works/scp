@@ -441,8 +441,13 @@ pub struct TieredEventLog {
 
 impl TieredEventLog {
     /// Creates a new tiered event log with the given configuration.
+    ///
+    /// Not `const fn` because the embedded [`EventLog`] now constructs a
+    /// per-context [`metrics::EventLogMetrics`] collector that clones the
+    /// `context_id` string (SCP-OUT-003 AC9 wires the outlet counters
+    /// through `EventLog`).
     #[must_use]
-    pub const fn new(context_id: String, config: TierConfig) -> Self {
+    pub fn new(context_id: String, config: TierConfig) -> Self {
         Self {
             hot: EventLog::new(context_id),
             cold_entries: Vec::new(),

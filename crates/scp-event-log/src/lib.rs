@@ -702,19 +702,46 @@ pub struct EventLog {
     /// Full event payloads stored alongside leaf hashes, indexed by sequence.
     /// Enables `get_event` and `query_events` retrieval (#303, #330).
     events: Vec<Event>,
+    /// Per-context metrics collector. Tracks outlet invocation /
+    /// registration totals (SCP-OUT-003 AC9, spec §5.4 / §5.14.10) and
+    /// other append-time tallies. Embedding the collector inside the
+    /// `EventLog` is what wires the outlet counters: `tree::append` and
+    /// `tree::append_unsigned_event` call
+    /// [`metrics::EventLogMetrics::record_outlet_event`] after every
+    /// successful append, so every production call site increments
+    /// automatically without per-caller plumbing.
+    metrics: metrics::EventLogMetrics,
 }
 
 impl EventLog {
     /// Creates a new empty event log for the given context.
+    ///
+    /// Initializes the embedded [`metrics::EventLogMetrics`] collector
+    /// with the same context id; the metrics collector is never `None`,
+    /// so the outlet counters are always wired regardless of how callers
+    /// construct the log.
     #[must_use]
-    pub const fn new(context_id: ContextId) -> Self {
+    pub fn new(context_id: ContextId) -> Self {
+        let metrics = metrics::EventLogMetrics::new(context_id.clone());
         Self {
             leaves: Vec::new(),
             tree: Vec::new(),
             context_id,
             sorted_leaves: BTreeSet::new(),
             events: Vec::new(),
+            metrics,
         }
+    }
+
+    /// Returns a reference to the embedded metrics collector.
+    ///
+    /// Includes the outlet invocation / registration counters wired via
+    /// `tree::append` and `tree::append_unsigned_event`
+    /// (SCP-OUT-003 AC9). The atomic counters are readable through
+    /// shared `&self`, so callers do not need `&mut` to observe them.
+    #[must_use]
+    pub const fn metrics(&self) -> &metrics::EventLogMetrics {
+        &self.metrics
     }
 
     /// Returns the context ID this event log belongs to.

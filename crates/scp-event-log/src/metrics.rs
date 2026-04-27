@@ -16,6 +16,18 @@
 //!
 //! - [`EventLogMetrics::new`] -- Create a new metrics collector for a context.
 //! - [`EventLogMetrics::record_event`] -- Record an appended event.
+//! - [`EventLogMetrics::record_outlet_invocation`] -- Increment the
+//!   `outlet_invocations_total` counter (called on every `OutletInvoked`
+//!   event append per SCP-OUT-003 AC9).
+//! - [`EventLogMetrics::record_outlet_registration`] -- Increment the
+//!   `outlet_registrations_total` counter (called on every `OutletRegistered`
+//!   event append per SCP-OUT-003 AC9).
+//! - [`EventLogMetrics::record_outlet_event`] -- Classify an [`EventType`]
+//!   and increment the matching outlet counter; no-op for non-outlet kinds.
+//! - [`EventLogMetrics::outlet_invocations_total`] -- Read the
+//!   `OutletInvoked` append counter.
+//! - [`EventLogMetrics::outlet_registrations_total`] -- Read the
+//!   `OutletRegistered` append counter.
 //! - [`EventLogMetrics::record_proof_generation`] -- Record proof gen timing.
 //! - [`EventLogMetrics::record_proof_verification`] -- Record proof verify timing.
 //! - [`EventLogMetrics::growth_rate`] -- Compute events/hour and bytes/hour.
@@ -25,11 +37,12 @@
 //!
 //! See ADR-030 in `.docs/adrs/phase-6.md` for the pruning/checkpointing context.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::ContextId;
+use super::{ContextId, EventType};
 
 // ---------------------------------------------------------------------------
 // GrowthSnapshot
@@ -177,6 +190,22 @@ pub struct EventLogMetrics {
     proof_gen_profiles: Vec<ProofProfile>,
     /// Proof verification timing samples.
     proof_verify_profiles: Vec<ProofProfile>,
+    /// Cumulative count of [`EventType::OutletInvoked`] events appended to
+    /// the log (SCP-OUT-003 AC9, spec §5.4 / §5.14.10).
+    ///
+    /// Incremented by [`Self::record_outlet_invocation`] from
+    /// `tree::append` and `tree::append_unsigned_event` whenever an
+    /// `OutletInvoked` event is successfully appended. Atomic so callers
+    /// holding `&self` (e.g., observers reading from another task) can
+    /// read it without taking `&mut`.
+    outlet_invocations_total: AtomicU64,
+    /// Cumulative count of [`EventType::OutletRegistered`] events appended
+    /// to the log (SCP-OUT-003 AC9, spec §5.4 / §5.14.10).
+    ///
+    /// Incremented by [`Self::record_outlet_registration`] from
+    /// `tree::append` and `tree::append_unsigned_event` whenever an
+    /// `OutletRegistered` event is successfully appended.
+    outlet_registrations_total: AtomicU64,
 }
 
 impl EventLogMetrics {
@@ -192,6 +221,8 @@ impl EventLogMetrics {
             max_snapshots: 1000,
             proof_gen_profiles: Vec::new(),
             proof_verify_profiles: Vec::new(),
+            outlet_invocations_total: AtomicU64::new(0),
+            outlet_registrations_total: AtomicU64::new(0),
         }
     }
 
@@ -211,6 +242,67 @@ impl EventLogMetrics {
     #[must_use]
     pub const fn bytes_total(&self) -> u64 {
         self.bytes_total
+    }
+
+    /// Returns the cumulative count of [`EventType::OutletInvoked`] events
+    /// appended to the log (SCP-OUT-003 AC9, spec §5.4 / §5.14.10).
+    ///
+    /// Counter is monotonic for the lifetime of this collector and survives
+    /// across multiple invocations.
+    #[must_use]
+    pub fn outlet_invocations_total(&self) -> u64 {
+        self.outlet_invocations_total.load(Ordering::Relaxed)
+    }
+
+    /// Returns the cumulative count of [`EventType::OutletRegistered`]
+    /// events appended to the log (SCP-OUT-003 AC9, spec §5.4 / §5.14.10).
+    ///
+    /// Counter is monotonic for the lifetime of this collector.
+    #[must_use]
+    pub fn outlet_registrations_total(&self) -> u64 {
+        self.outlet_registrations_total.load(Ordering::Relaxed)
+    }
+
+    /// Increments [`Self::outlet_invocations_total`] by one.
+    ///
+    /// Called by `tree::append` and `tree::append_unsigned_event` whenever
+    /// an [`EventType::OutletInvoked`] event is successfully appended to
+    /// the log (SCP-OUT-003 AC9). `&self` because the counter is atomic;
+    /// production callers may hold the metrics collector behind a shared
+    /// reference (e.g. inside a per-context `EventLog`) while concurrent
+    /// observers read the counter.
+    pub fn record_outlet_invocation(&self) {
+        self.outlet_invocations_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increments [`Self::outlet_registrations_total`] by one.
+    ///
+    /// Called by `tree::append` and `tree::append_unsigned_event` whenever
+    /// an [`EventType::OutletRegistered`] event is successfully appended
+    /// to the log (SCP-OUT-003 AC9). `&self` because the counter is
+    /// atomic.
+    pub fn record_outlet_registration(&self) {
+        self.outlet_registrations_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Classifies `event_type` and increments the matching outlet counter.
+    ///
+    /// - [`EventType::OutletInvoked`] -> [`Self::record_outlet_invocation`]
+    /// - [`EventType::OutletRegistered`] -> [`Self::record_outlet_registration`]
+    /// - Any other variant -> no-op.
+    ///
+    /// This is the single entry point used by [`super::tree::append`] and
+    /// [`super::tree::append_unsigned_event`] so that adding a new outlet
+    /// counter only requires extending the match arm here, not every
+    /// append site (SCP-OUT-003 AC9).
+    pub fn record_outlet_event(&self, event_type: &EventType) {
+        match event_type {
+            EventType::OutletInvoked => self.record_outlet_invocation(),
+            EventType::OutletRegistered => self.record_outlet_registration(),
+            _ => {}
+        }
     }
 
     /// Records an appended event with its serialized byte size.
@@ -521,7 +613,16 @@ fn mean_memory(profiles: &[ProofProfile]) -> Option<u64> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::similar_names,
+    clippy::doc_markdown,
+    clippy::uninlined_format_args,
+    clippy::match_wildcard_for_single_variants,
+    clippy::type_complexity
+)]
 mod tests {
     use std::time::Duration;
 
@@ -945,5 +1046,214 @@ mod tests {
         assert_eq!(min_duration(profiles), None);
         assert_eq!(max_duration(profiles), None);
         assert_eq!(mean_duration(profiles), None);
+    }
+
+    // -------------------------------------------------------------------
+    // Outlet counters (SCP-OUT-003 AC9)
+    // -------------------------------------------------------------------
+
+    /// Builds a single signed event of the requested type appended to the
+    /// supplied log. Returns the new log tail hash so the caller can chain
+    /// further events.
+    fn append_signed(
+        log: &mut EventLog,
+        event_type: EventType,
+        sequence: u64,
+        prev_hash: [u8; 32],
+        signing_key: &ed25519_dalek::SigningKey,
+        did: &str,
+    ) -> [u8; 32] {
+        let event = sign_event(
+            event_type,
+            did,
+            1_000_000 + sequence,
+            sequence,
+            format!("payload {sequence}").into_bytes(),
+            prev_hash,
+            signing_key,
+        );
+        tree::append(log, &event).expect("append should succeed");
+        leaf_hash_from_event(&event)
+    }
+
+    #[test]
+    fn outlet_counters_start_at_zero() {
+        let m = EventLogMetrics::new("ctx-outlet".to_owned());
+        assert_eq!(m.outlet_invocations_total(), 0);
+        assert_eq!(m.outlet_registrations_total(), 0);
+    }
+
+    #[test]
+    fn record_outlet_invocation_increments_only_invocations() {
+        let m = EventLogMetrics::new("ctx-outlet".to_owned());
+
+        m.record_outlet_invocation();
+        assert_eq!(m.outlet_invocations_total(), 1);
+        assert_eq!(
+            m.outlet_registrations_total(),
+            0,
+            "registration counter must not move when invocation is recorded",
+        );
+    }
+
+    #[test]
+    fn record_outlet_registration_increments_only_registrations() {
+        let m = EventLogMetrics::new("ctx-outlet".to_owned());
+
+        m.record_outlet_registration();
+        assert_eq!(m.outlet_registrations_total(), 1);
+        assert_eq!(
+            m.outlet_invocations_total(),
+            0,
+            "invocation counter must not move when registration is recorded",
+        );
+    }
+
+    #[test]
+    fn record_outlet_event_dispatches_by_event_type() {
+        let m = EventLogMetrics::new("ctx-outlet".to_owned());
+
+        m.record_outlet_event(&EventType::OutletInvoked);
+        m.record_outlet_event(&EventType::OutletRegistered);
+        // Non-outlet event types must be silently ignored — the counters
+        // are scoped to OutletInvoked / OutletRegistered per AC9.
+        m.record_outlet_event(&EventType::MessageSent);
+        m.record_outlet_event(&EventType::OutletDeregistered);
+        m.record_outlet_event(&EventType::OutletUpdated);
+        m.record_outlet_event(&EventType::OutletCancel);
+
+        assert_eq!(m.outlet_invocations_total(), 1);
+        assert_eq!(m.outlet_registrations_total(), 1);
+    }
+
+    #[test]
+    fn outlet_invocations_increment_on_outlet_invoked_append() {
+        // Wires the counter through `tree::append`: building the same code
+        // path production callers exercise. Confirms AC9's "wire on every
+        // OutletInvoked event append" requirement.
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let mut log = EventLog::new("ctx-outlet-invoke".to_owned());
+
+        assert_eq!(log.metrics().outlet_invocations_total(), 0);
+
+        let prev = append_signed(
+            &mut log,
+            EventType::OutletInvoked,
+            0,
+            tree::GENESIS_PREV_HASH,
+            &signing_key,
+            &did,
+        );
+
+        assert_eq!(log.metrics().outlet_invocations_total(), 1);
+        assert_eq!(
+            log.metrics().outlet_registrations_total(),
+            0,
+            "appending OutletInvoked must not touch the registrations counter",
+        );
+
+        // Non-outlet append must not increment either counter.
+        let _ = append_signed(
+            &mut log,
+            EventType::MessageSent,
+            1,
+            prev,
+            &signing_key,
+            &did,
+        );
+        assert_eq!(log.metrics().outlet_invocations_total(), 1);
+        assert_eq!(log.metrics().outlet_registrations_total(), 0);
+    }
+
+    #[test]
+    fn outlet_registrations_increment_on_outlet_registered_append() {
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let mut log = EventLog::new("ctx-outlet-register".to_owned());
+
+        assert_eq!(log.metrics().outlet_registrations_total(), 0);
+
+        let _ = append_signed(
+            &mut log,
+            EventType::OutletRegistered,
+            0,
+            tree::GENESIS_PREV_HASH,
+            &signing_key,
+            &did,
+        );
+
+        assert_eq!(log.metrics().outlet_registrations_total(), 1);
+        assert_eq!(
+            log.metrics().outlet_invocations_total(),
+            0,
+            "appending OutletRegistered must not touch the invocations counter",
+        );
+    }
+
+    #[test]
+    fn outlet_counters_persist_across_multiple_appends() {
+        // AC9: counter persists across multiple invocations.
+        let (verifying_key, signing_key) = test_keypair();
+        let did = did_from_pubkey(&verifying_key);
+        let mut log = EventLog::new("ctx-outlet-persist".to_owned());
+
+        let mut prev = tree::GENESIS_PREV_HASH;
+        for seq in 0..5 {
+            prev = append_signed(
+                &mut log,
+                EventType::OutletInvoked,
+                seq,
+                prev,
+                &signing_key,
+                &did,
+            );
+        }
+        for seq in 5..8 {
+            prev = append_signed(
+                &mut log,
+                EventType::OutletRegistered,
+                seq,
+                prev,
+                &signing_key,
+                &did,
+            );
+        }
+        // Interleave with non-outlet events to confirm only outlet kinds
+        // move the counters.
+        for seq in 8..11 {
+            prev = append_signed(
+                &mut log,
+                EventType::MessageSent,
+                seq,
+                prev,
+                &signing_key,
+                &did,
+            );
+        }
+        for seq in 11..13 {
+            prev = append_signed(
+                &mut log,
+                EventType::OutletInvoked,
+                seq,
+                prev,
+                &signing_key,
+                &did,
+            );
+        }
+
+        assert_eq!(
+            log.metrics().outlet_invocations_total(),
+            7,
+            "5 + 2 OutletInvoked appends must be tallied",
+        );
+        assert_eq!(
+            log.metrics().outlet_registrations_total(),
+            3,
+            "3 OutletRegistered appends must be tallied",
+        );
+        // Final guard: prev is exercised so the loop body cannot be
+        // optimized into an empty test.
+        assert_ne!(prev, tree::GENESIS_PREV_HASH);
     }
 }

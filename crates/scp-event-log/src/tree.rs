@@ -98,6 +98,14 @@ pub fn append(log: &mut EventLog, event: &Event) -> Result<u64, EventLogError> {
     // 7. Store the full event payload for retrieval (#303, #330).
     log.push_event(event.clone());
 
+    // 8. Bump outlet metrics counters for OutletInvoked / OutletRegistered
+    //    appends (SCP-OUT-003 AC9, spec §5.4 / §5.14.10). The classifier
+    //    is a no-op for non-outlet event types, so this is safe to call
+    //    on every successful append. Wiring the counters here means every
+    //    production caller of `tree::append` (relay, FFI bridges, runtime
+    //    governance executor) is instrumented automatically.
+    log.metrics().record_outlet_event(&event.event_type);
+
     Ok(leaf_index)
 }
 
@@ -207,6 +215,13 @@ pub fn append_unsigned_event(log: &mut EventLog, event: &Event) -> Result<u64, E
 
     // 6. Store the full event payload for retrieval (#303, #330).
     log.push_event(event.clone());
+
+    // 7. Bump outlet metrics counters for OutletInvoked / OutletRegistered
+    //    appends (SCP-OUT-003 AC9). Mirrors `append`'s instrumentation so
+    //    the FFI bridges that take the unsigned path
+    //    (e.g. `FfiBridgeProvider::invoke_outlet`) still produce the
+    //    same counter increments.
+    log.metrics().record_outlet_event(&event.event_type);
 
     Ok(leaf_index)
 }
