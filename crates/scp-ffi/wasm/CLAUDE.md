@@ -18,7 +18,7 @@ The following modules previously contained standalone WASM reimplementations. Af
 | UCAN | `scp_protocol::crypto::ucan` | `CapabilityUri`, `UcanToken`, `UcanError`, `validate_ucan`, `parse_ucan`, `compute_revocation_cid`, `default_ceiling` |
 | UCAN validation traits | `scp_protocol::crypto::ucan::validate` | `DidResolver`, `InMemoryProofResolver`, `InMemoryRevocationChecker`, `ValidationNonceTracker`, `ValidationContext` |
 | Event log | `scp_event_log` | `EventLog`, `Event`, `EventPayload`, `EventType`, `DID`, `proof::*`, `tree::*` |
-| Tool types | `scp_protocol::context::tools::schema` | `ToolRegistration`, `ToolCost`, `ToolSchema`, `validate_schema`, `validate_value_against_schema` |
+| Outlet types | `scp_protocol::context::outlets::schema` | `OutletRegistration`, `OutletCost`, `OutletSchema`, `validate_schema`, `validate_value_against_schema` |
 | Trust | `scp_protocol::trust::participation` | `ParticipationProfile`, `RequireParticipation` |
 | Provenance | `scp_protocol::provenance` | `SourceType`, `DEFAULT_MAX_CHAIN_DEPTH` |
 | Bridge | `scp_protocol::bridge` | `BridgeMode`, `ShadowProvenanceStatus` |
@@ -54,10 +54,10 @@ The following modules previously contained standalone WASM reimplementations. Af
 
 | Module | Responsibility | Dependency Source |
 |--------|---------------|-------------------|
-| `runtime.rs` | Runtime helpers: re-exports `ToolRegistry` from scp-protocol, `tool_registry_insert_unique` wrapper, hex helpers | `scp_protocol::context::tools` |
+| `runtime.rs` | Runtime helpers: re-exports `OutletRegistry` from scp-protocol, `outlet_registry_insert_unique` wrapper, hex helpers | `scp_protocol::context::outlets` |
 | `manager.rs` | `WasmContextManager`: context lifecycle, governance, broadcast, role checking, event log (via `scp_event_log::EventLog`) | Local + `scp_event_log` + `scp_protocol::context::broadcast_content` |
 | `context.rs` | Context lifecycle: create, join, leave, close, send, subscribe, export, import | Local + `scp_protocol::context::templates` |
-| `tools.rs` | Tool registration, invocation, verification | Local + `scp_protocol::context::tools` |
+| `outlets.rs` | Outlet registration, invocation, verification | Local + `scp_protocol::context::outlets` |
 | `ucan.rs` | UCAN token management: validate (delegates to `scp_protocol::crypto::ucan::validate::validate_ucan`), mint, revoke | `scp_protocol::crypto::ucan` |
 | `event_log.rs` | Event log query, Merkle inclusion/absence proofs | `scp_event_log` |
 | `identity.rs` | Identity create, load, resolve | Local + `scp_protocol::trust::attestation::RevocationStatus` |

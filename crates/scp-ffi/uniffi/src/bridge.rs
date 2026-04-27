@@ -642,8 +642,8 @@ impl From<scp_core::context::promotion::PromotionError> for ScpError {
     }
 }
 
-impl From<scp_core::context::tools::OutletError> for ScpError {
-    fn from(e: scp_core::context::tools::OutletError) -> Self {
+impl From<scp_core::context::outlets::OutletError> for ScpError {
+    fn from(e: scp_core::context::outlets::OutletError) -> Self {
         Self::Tool {
             msg: format!(
                 "outlet operation failed: {e} — check outlet registration, permissions, and input schema"
@@ -653,8 +653,8 @@ impl From<scp_core::context::tools::OutletError> for ScpError {
     }
 }
 
-impl From<scp_core::context::tools::invoke::InvocationError> for ScpError {
-    fn from(e: scp_core::context::tools::invoke::InvocationError) -> Self {
+impl From<scp_core::context::outlets::invoke::InvocationError> for ScpError {
+    fn from(e: scp_core::context::outlets::invoke::InvocationError) -> Self {
         Self::Tool {
             msg: format!(
                 "outlet invocation failed: {e} — verify outlet ID, input, and caller permissions"
@@ -664,8 +664,8 @@ impl From<scp_core::context::tools::invoke::InvocationError> for ScpError {
     }
 }
 
-impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpError {
-    fn from(e: scp_core::context::tools::schema::SchemaValidationError) -> Self {
+impl From<scp_core::context::outlets::schema::SchemaValidationError> for ScpError {
+    fn from(e: scp_core::context::outlets::schema::SchemaValidationError) -> Self {
         Self::Validation {
             msg: format!(
                 "schema validation failed: {e} — check input against the tool's JSON Schema"
@@ -1916,11 +1916,11 @@ pub struct ContextHandle {
     /// Capability ceiling strings for UCAN mint-time enforcement (#339).
     pub(crate) ceiling_strings: Vec<String>,
     /// Tool registry for this context.
-    pub(crate) outlet_registry: tokio::sync::Mutex<scp_core::context::tools::OutletRegistry>,
+    pub(crate) outlet_registry: tokio::sync::Mutex<scp_core::context::outlets::OutletRegistry>,
     /// Registered tool handlers keyed by tool ID.
     pub(crate) outlet_handlers: tokio::sync::Mutex<OutletHandlerMap>,
     /// Session store for stateful tool sessions (spec section 6.2.1).
-    pub(crate) session_store: tokio::sync::Mutex<scp_core::context::tools::SessionStore>,
+    pub(crate) session_store: tokio::sync::Mutex<scp_core::context::outlets::SessionStore>,
     /// Optional economic policy as a JSON string (§19.3, ADR-033).
     pub(crate) economic_policy: std::sync::Mutex<Option<String>>,
     /// Core context parameters, retained for `finalize_close` (`memory_scope`
@@ -3332,11 +3332,11 @@ pub async fn context_create(
                     })
                     .collect(),
                 outlet_registry: tokio::sync::Mutex::new(
-                    scp_core::context::tools::OutletRegistry::new(),
+                    scp_core::context::outlets::OutletRegistry::new(),
                 ),
                 outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
                 session_store: tokio::sync::Mutex::new(
-                    scp_core::context::tools::SessionStore::new(),
+                    scp_core::context::outlets::SessionStore::new(),
                 ),
                 economic_policy: std::sync::Mutex::new(None),
                 core_context_params: retained_core_params,
@@ -3989,7 +3989,7 @@ pub async fn outlet_register(
                 });
             }
 
-            let test_vectors: Vec<scp_core::context::tools::OutletTestVector> =
+            let test_vectors: Vec<scp_core::context::outlets::OutletTestVector> =
                 match definition.test_vectors_json.as_deref() {
                     None => Vec::new(),
                     Some(json) => serde_json::from_str(json).map_err(|e| ScpError::Validation {
@@ -4013,14 +4013,14 @@ pub async fn outlet_register(
 
             let cost = definition
                 .cost
-                .map(|c| scp_core::context::tools::OutletCost {
+                .map(|c| scp_core::context::outlets::OutletCost {
                     amount: c.amount,
                     currency: c.currency,
                     payee: c.payee.into(),
                     cost_formula: c.cost_formula,
                 });
 
-            let core_registration = scp_core::context::tools::OutletRegistration {
+            let core_registration = scp_core::context::outlets::OutletRegistration {
                 outlet_id: outlet_id.clone(),
                 // SCP-OUT-017: kind is REQUIRED on the UniFFI definition
                 // surface — Swift requires the labeled `kind:` argument and
@@ -4030,7 +4030,7 @@ pub async fn outlet_register(
                 kind: definition.kind.into(),
                 name: definition.name,
                 description: definition.description,
-                schema: scp_core::context::tools::OutletSchema {
+                schema: scp_core::context::outlets::OutletSchema {
                     input_schema,
                     output_schema,
                     aggregate_schema: None,
@@ -4061,7 +4061,7 @@ pub async fn outlet_register(
             })?;
 
             let mut registry = handle.outlet_registry.lock().await;
-            let (registered_id, _event) = scp_core::context::tools::register_outlet(
+            let (registered_id, _event) = scp_core::context::outlets::register_outlet(
                 &mut registry,
                 &role_state,
                 core_registration,
@@ -4262,7 +4262,7 @@ pub async fn outlet_invoke(
 
             let manager = crate::runtime::context_manager_expect()?;
             let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
-            let outlet_id_typed = scp_core::context::tools::OutletId::from(outlet_id.as_str());
+            let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id.as_str());
             let outcome = manager
                 .invoke_outlet_with_economy(
                     &context_id,
@@ -4315,7 +4315,7 @@ fn validate_outlet_ucan_uniffi(
     identity_did: &str,
     proof_tokens: Option<&Vec<String>>,
 ) -> Result<(), ScpError> {
-    use scp_core::context::tools::invoke::validate_outlet_invocation_ucan;
+    use scp_core::context::outlets::invoke::validate_outlet_invocation_ucan;
     use scp_core::crypto::ucan::validate::{
         DEFAULT_CLOCK_SKEW_TOLERANCE_SECS, ValidationContext, parse_ucan,
     };
@@ -4380,7 +4380,7 @@ fn validate_outlet_ucan_uniffi(
 
 /// Verifies an outlet against its registered test vectors.
 ///
-/// Delegates to [`scp_core::context::tools::verify_outlet`], which iterates
+/// Delegates to [`scp_core::context::outlets::verify_outlet`], which iterates
 /// the outlet's registered test vectors and compares each expected output
 /// against the executor's actual output. SCP-OUT-008 AC22: this wiring
 /// brings the `UniFFI` bridge onto the outlet runtime pipeline in parity
@@ -4428,7 +4428,7 @@ pub async fn outlet_verify(
             let registry = handle.outlet_registry.lock().await;
             let outlet_id_for_executor = outlet_id.clone();
             let (verification_result, _event) =
-                scp_core::context::tools::verify_outlet(&registry, &outlet_id, |input| {
+                scp_core::context::outlets::verify_outlet(&registry, &outlet_id, |input| {
                     if let Some(registration) = registry.get(&outlet_id_for_executor) {
                         for vector in &registration.test_vectors {
                             if vector.input == *input {
@@ -4591,7 +4591,7 @@ pub async fn outlet_invoke_cross_context(
                 code: codes::TOOL_6002.to_owned(),
             })?;
 
-            scp_core::context::tools::validate_value_against_schema(
+            scp_core::context::outlets::validate_value_against_schema(
                 &input_value,
                 &registration.schema.input_schema,
             )
@@ -4611,7 +4611,7 @@ pub async fn outlet_invoke_cross_context(
                     msg: format!("cross-context tool handler for '{outlet_id}' failed: {e}"),
                     code: codes::TOOL_6002.to_owned(),
                 })?;
-                scp_core::context::tools::validate_value_against_schema(&out, &output_schema)
+                scp_core::context::outlets::validate_value_against_schema(&out, &output_schema)
                     .map_err(|msg| ScpError::Tool {
                         msg: format!("output validation failed for tool '{outlet_id}': {msg}"),
                         code: codes::TOOL_6002.to_owned(),
@@ -4684,7 +4684,7 @@ pub async fn outlet_session_open(
                 mgr.context_params(&handle.context_id)
                     .await
                     .and_then(|p| p.session_cap)
-                    .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER)
+                    .unwrap_or(scp_core::context::outlets::DEFAULT_SESSION_CAP_PER_CALLER)
                     as usize
             };
             let current = store.count_by_source(&source_context_id);
@@ -4700,7 +4700,7 @@ pub async fn outlet_session_open(
             let session_id = Uuid::new_v4().to_string();
             let now_ms = scp_primitives::SystemClock.now_millis();
 
-            let session = scp_core::context::tools::OutletSession {
+            let session = scp_core::context::outlets::OutletSession {
                 session_id: session_id.clone(),
                 outlet_id,
                 source_context: source_context_id,
@@ -4827,7 +4827,7 @@ pub async fn outlet_session_invoke(
             // Validate input against tool's input schema if tool is registered.
             let registry = handle.outlet_registry.lock().await;
             if let Some(registration) = registry.get(&outlet_id) {
-                scp_core::context::tools::validate_value_against_schema(
+                scp_core::context::outlets::validate_value_against_schema(
                     &input_value,
                     &registration.schema.input_schema,
                 )
@@ -4957,7 +4957,7 @@ pub async fn outlet_interface_offer(
 
             let rate_limit = match rate_limit_json {
                 Some(ref json) => {
-                    let parsed: scp_core::context::tools::interface::RateLimit =
+                    let parsed: scp_core::context::outlets::interface::RateLimit =
                         serde_json::from_str(json).map_err(|e| ScpError::Validation {
                             msg: format!("invalid rate_limit_json: {e}"),
                             code: codes::VALID_7040.to_owned(),
@@ -4987,7 +4987,7 @@ pub async fn outlet_interface_offer(
 
             let registry = handle.outlet_registry.lock().await;
 
-            let interface = scp_core::context::tools::interface::expose_tool(
+            let interface = scp_core::context::outlets::interface::expose_tool(
                 context_handle.context_id(),
                 &outlet_id,
                 &target_context_id,
@@ -5052,7 +5052,7 @@ pub async fn outlet_interface_accept(
             }
             drop(state);
 
-            let mut interface: scp_core::context::tools::interface::OutletInterface =
+            let mut interface: scp_core::context::outlets::interface::OutletInterface =
                 serde_json::from_str(&interface_json).map_err(|e| ScpError::Validation {
                     msg: format!("invalid interface_json: {e}"),
                     code: codes::VALID_7041.to_owned(),
@@ -5076,7 +5076,7 @@ pub async fn outlet_interface_accept(
                 scp_core::context::ContextParams::default(),
             );
 
-            scp_core::context::tools::interface::accept_tool_interface(
+            scp_core::context::outlets::interface::accept_tool_interface(
                 context_handle.context_id(),
                 &mut interface,
                 &role_state,
@@ -5142,7 +5142,7 @@ pub async fn outlet_interface_revoke(
 
             let now_ms = scp_primitives::SystemClock.now_millis();
 
-            let event = scp_core::context::tools::interface::revoke_tool_interface(
+            let event = scp_core::context::outlets::interface::revoke_tool_interface(
                 interface_id,
                 &handle.context_id,
                 now_ms,
@@ -5171,7 +5171,7 @@ pub async fn outlet_interface_revoke(
 fn build_outlet_registration_from_uniffi(
     definition: OutletDefinition,
     outlet_id: String,
-) -> Result<scp_core::context::tools::OutletRegistration, ScpError> {
+) -> Result<scp_core::context::outlets::OutletRegistration, ScpError> {
     let input_schema: serde_json::Value = serde_json::from_str(&definition.input_schema_json)
         .map_err(|e| ScpError::Validation {
             msg: format!("invalid input_schema_json: {e}"),
@@ -5202,7 +5202,7 @@ fn build_outlet_registration_from_uniffi(
         });
     }
 
-    let test_vectors: Vec<scp_core::context::tools::OutletTestVector> =
+    let test_vectors: Vec<scp_core::context::outlets::OutletTestVector> =
         match definition.test_vectors_json.as_deref() {
             None => Vec::new(),
             Some(json) => serde_json::from_str(json).map_err(|e| ScpError::Validation {
@@ -5224,21 +5224,21 @@ fn build_outlet_registration_from_uniffi(
 
     let cost = definition
         .cost
-        .map(|c| scp_core::context::tools::OutletCost {
+        .map(|c| scp_core::context::outlets::OutletCost {
             amount: c.amount,
             currency: c.currency,
             payee: c.payee.into(),
             cost_formula: c.cost_formula,
         });
 
-    Ok(scp_core::context::tools::OutletRegistration {
+    Ok(scp_core::context::outlets::OutletRegistration {
         outlet_id,
         // SCP-OUT-017: kind comes from the UniFFI definition; the Swift
         // and Kotlin SDKs require it on `OutletDefinition` (no default).
         kind: definition.kind.into(),
         name: definition.name,
         description: definition.description,
-        schema: scp_core::context::tools::OutletSchema {
+        schema: scp_core::context::outlets::OutletSchema {
             input_schema,
             output_schema,
             aggregate_schema: None,
@@ -5257,7 +5257,7 @@ fn build_outlet_registration_from_uniffi(
 
 /// Updates an existing outlet registration.
 ///
-/// Wraps [`scp_core::context::tools::update_outlet`]. The caller must be
+/// Wraps [`scp_core::context::outlets::update_outlet`]. The caller must be
 /// either the registered operator of the outlet or an admin of the context.
 ///
 /// # Arguments
@@ -5310,7 +5310,7 @@ pub async fn outlet_update(
             })?;
 
             let mut registry = handle.outlet_registry.lock().await;
-            let _event = scp_core::context::tools::update_outlet(
+            let _event = scp_core::context::outlets::update_outlet(
                 &mut registry,
                 &role_state,
                 &outlet_id,
@@ -5386,7 +5386,7 @@ pub async fn outlet_deregister(
                 .clone();
 
             let is_operator = existing.operator_did == actor_did;
-            let is_admin = scp_core::context::tools::has_admin_role(&role_state, &actor_did);
+            let is_admin = scp_core::context::outlets::has_admin_role(&role_state, &actor_did);
             if !is_operator && !is_admin {
                 return Err(ScpError::Permission {
                     msg: format!(
@@ -6379,7 +6379,7 @@ impl scp_mcp::client::McpTransport for McpSseTransport {
 // ---------------------------------------------------------------------------
 
 /// Default tool handler timeout in milliseconds (30 seconds).
-const UNIFFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::tools::DEFAULT_TIMEOUT_MS as u64;
+const UNIFFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::outlets::DEFAULT_TIMEOUT_MS as u64;
 
 /// FFI bridge provider for the MCP server. Implements `ContextProvider` by
 /// reading tool registrations, role state, and event log data from the
@@ -6526,7 +6526,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
                 };
 
-                scp_core::context::tools::validate_outlet_invocation_ucan(
+                scp_core::context::outlets::validate_outlet_invocation_ucan(
                     token,
                     context_id,
                     outlet_name,
@@ -6566,7 +6566,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             format!("context '{context_id}' not found in ContextManager for capability check")
         })?;
 
-        if scp_core::context::tools::invoke::has_outlet_call_capability(
+        if scp_core::context::outlets::invoke::has_outlet_call_capability(
             &role_state,
             &self.agent_did,
             outlet_name,
@@ -6616,13 +6616,13 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             })?;
 
             // Validate input against the tool's input schema.
-            scp_core::context::tools::schema::validate_value_against_schema(
+            scp_core::context::outlets::schema::validate_value_against_schema(
                 &arguments,
                 &registration.schema.input_schema,
             )
             .map_err(|msg| format!("input validation failed for tool '{outlet_name}': {msg}"))?;
 
-            let input_hash = scp_core::context::tools::sha256_json(&arguments);
+            let input_hash = scp_core::context::outlets::sha256_json(&arguments);
 
             let handler_dispatch = {
                 let outlet_handlers = handle.outlet_handlers.blocking_lock();
@@ -6656,7 +6656,7 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
                     .map_err(|e| format!("tool handler for '{outlet_name}' failed: {e}"))?;
 
                 // Validate output against the tool's output schema (defense-in-depth).
-                scp_core::context::tools::schema::validate_value_against_schema(
+                scp_core::context::outlets::schema::validate_value_against_schema(
                     &output,
                     &output_schema,
                 )
@@ -6699,14 +6699,14 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
         // chunk sequence is retained at the FFI boundary), terminal
         // status `Ok` (the bridge only reaches this builder on
         // success).
-        let tool_event = scp_core::context::tools::OutletInvokedEvent {
+        let tool_event = scp_core::context::outlets::OutletInvokedEvent {
             request_id: uuid::Uuid::new_v4().to_string(),
             outlet_id: outlet_name.to_owned(),
             invoker_did: agent_did.clone().into(),
-            status: scp_core::context::tools::OutletStatus::Success,
+            status: scp_core::context::outlets::OutletStatus::Success,
             execution_time_ms: elapsed_ms,
             input_hash,
-            output_hash: Some(scp_core::context::tools::sha256_json(&output)),
+            output_hash: Some(scp_core::context::outlets::sha256_json(&output)),
             cost: None,
             stream_chunk_count: 2,
             chunks_billed: 1,
@@ -14569,10 +14569,10 @@ mod tests {
             signing_key: None,
             ceiling_strings: Vec::new(),
             outlet_registry: tokio::sync::Mutex::new(
-                scp_core::context::tools::OutletRegistry::new(),
+                scp_core::context::outlets::OutletRegistry::new(),
             ),
             outlet_handlers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
-            session_store: tokio::sync::Mutex::new(scp_core::context::tools::SessionStore::new()),
+            session_store: tokio::sync::Mutex::new(scp_core::context::outlets::SessionStore::new()),
             economic_policy: std::sync::Mutex::new(None),
             core_context_params: scp_core::context::ContextParams::default(),
             instance_id,

@@ -347,7 +347,7 @@ pub(crate) struct PerContextState {
 
 /// A stateful tool session for the WASM bridge.
 ///
-/// Mirrors `scp_core::context::tools::OutletSession` locally since WASM
+/// Mirrors `scp_core::context::outlets::OutletSession` locally since WASM
 /// cannot depend on scp-core (ADR-034).
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Fields read via pattern matching and clone.

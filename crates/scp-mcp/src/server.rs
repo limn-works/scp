@@ -25,7 +25,7 @@
 
 use std::collections::HashSet;
 
-use scp_core::context::tools::validate_value_against_schema;
+use scp_core::context::outlets::validate_value_against_schema;
 use serde_json::Value;
 
 use crate::namespace::{

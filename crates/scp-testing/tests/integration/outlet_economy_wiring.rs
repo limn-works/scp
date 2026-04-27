@@ -35,8 +35,8 @@ use scp_core::context::builder::{
 };
 use scp_core::context::governance::KeyResolver;
 use scp_core::context::manager::ContextManager;
-use scp_core::context::tools::OutletId;
-use scp_core::context::tools::registry::{
+use scp_core::context::outlets::OutletId;
+use scp_core::context::outlets::registry::{
     OutletRegistration, OutletRegistry, OutletSchema, OutletTestVector,
 };
 use scp_core::context::{

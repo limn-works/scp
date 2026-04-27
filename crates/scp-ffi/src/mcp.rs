@@ -570,11 +570,11 @@ impl McpTransport for ClientTransport {
 
 /// Default tool handler execution timeout in milliseconds (30 seconds).
 ///
-/// Matches [`scp_core::context::tools::DEFAULT_TIMEOUT_MS`]. If a registered
+/// Matches [`scp_core::context::outlets::DEFAULT_TIMEOUT_MS`]. If a registered
 /// handler does not return within this duration, the invocation is aborted
 /// with a timeout error. Configurable per-provider via
 /// [`FfiBridgeProvider::tool_timeout_ms`].
-const FFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::tools::DEFAULT_TIMEOUT_MS as u64;
+const FFI_TOOL_TIMEOUT_MS: u64 = scp_core::context::outlets::DEFAULT_TIMEOUT_MS as u64;
 
 /// Implements [`ContextProvider`] by reading from the scp-ffi runtime registry.
 ///
@@ -704,7 +704,7 @@ impl ContextProvider for FfiBridgeProvider {
                     caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
                 };
 
-                scp_core::context::tools::validate_outlet_invocation_ucan(
+                scp_core::context::outlets::validate_outlet_invocation_ucan(
                     token,
                     context_id,
                     outlet_name,
@@ -738,7 +738,7 @@ impl ContextProvider for FfiBridgeProvider {
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
         crate::runtime::with_context(context_id, |rt| {
-            if scp_core::context::tools::invoke::has_outlet_call_capability(
+            if scp_core::context::outlets::invoke::has_outlet_call_capability(
                 &rt.role_state,
                 &self.agent_did,
                 outlet_name,
@@ -882,7 +882,7 @@ impl ContextProvider for FfiBridgeProvider {
             })?;
 
             // Validate input against the tool's input schema.
-            scp_core::context::tools::schema::validate_value_against_schema(
+            scp_core::context::outlets::schema::validate_value_against_schema(
                 &arguments,
                 &registration.schema.input_schema,
             )
@@ -894,7 +894,7 @@ impl ContextProvider for FfiBridgeProvider {
 
             // Clone handler Arc and output schema so we can release the lock.
             // Compute input hash before dispatch (arguments may be consumed).
-            let input_hash = scp_core::context::tools::sha256_json(&arguments);
+            let input_hash = scp_core::context::outlets::sha256_json(&arguments);
 
             Ok((
                 rt.outlet_handlers
@@ -933,7 +933,7 @@ impl ContextProvider for FfiBridgeProvider {
                     .map_err(|e| refund(format!("tool handler for '{outlet_name}' failed: {e}")))?;
 
                 // Validate output against the tool's output schema (defense-in-depth).
-                scp_core::context::tools::schema::validate_value_against_schema(
+                scp_core::context::outlets::schema::validate_value_against_schema(
                     &output,
                     &output_schema,
                 )
@@ -985,14 +985,14 @@ impl ContextProvider for FfiBridgeProvider {
         // hash (no chunk sequence is retained at the MCP boundary),
         // terminal status `Ok` because the legacy path only reaches
         // this builder on success.
-        let tool_event = scp_core::context::tools::OutletInvokedEvent {
+        let tool_event = scp_core::context::outlets::OutletInvokedEvent {
             request_id: uuid::Uuid::new_v4().to_string(),
             outlet_id: outlet_name.to_owned(),
             invoker_did: agent_did.clone().into(),
-            status: scp_core::context::tools::OutletStatus::Success,
+            status: scp_core::context::outlets::OutletStatus::Success,
             execution_time_ms: elapsed_ms,
             input_hash,
-            output_hash: Some(scp_core::context::tools::sha256_json(&output)),
+            output_hash: Some(scp_core::context::outlets::sha256_json(&output)),
             cost: None,
             stream_chunk_count: 2,
             chunks_billed: 1,
@@ -2432,12 +2432,12 @@ mod tests {
 
         if with_tool {
             crate::runtime::with_context(&ctx_id, |rt| {
-                let registration = scp_core::context::tools::OutletRegistration {
+                let registration = scp_core::context::outlets::OutletRegistration {
                     outlet_id: "calculator".to_owned(),
                     kind: scp_core::context::outlets::OutletKind::Action,
                     name: "Calculator".to_owned(),
                     description: "A simple calculator".to_owned(),
-                    schema: scp_core::context::tools::OutletSchema {
+                    schema: scp_core::context::outlets::OutletSchema {
                         input_schema: serde_json::json!({
                             "type": "object",
                             "properties": {
@@ -2462,7 +2462,7 @@ mod tests {
                     signature: Vec::new(),
                     message_catalog: Vec::new(),
                 };
-                scp_core::context::tools::register_outlet(
+                scp_core::context::outlets::register_outlet(
                     &mut rt.outlet_registry,
                     &rt.role_state,
                     registration,
@@ -3180,7 +3180,7 @@ mod tests {
         // Verify the default timeout constant matches scp-core.
         assert_eq!(
             FFI_TOOL_TIMEOUT_MS,
-            u64::from(scp_core::context::tools::DEFAULT_TIMEOUT_MS),
+            u64::from(scp_core::context::outlets::DEFAULT_TIMEOUT_MS),
             "FFI default timeout should match scp-core default"
         );
     }

@@ -64,9 +64,9 @@ use scp_core::context::builder::{
     ContextCreationError, ContextCryptoProvider, ContextEventLogProvider, ContextTransportProvider,
 };
 use scp_core::context::manager::{ContextManager, ContextPersistence};
+use scp_core::context::outlets::OutletRegistry;
 use scp_core::context::providers::ProtocolRepositoryContextBridge;
 use scp_core::context::roles::{ContextRoleState, default_ceiling};
-use scp_core::context::tools::OutletRegistry;
 use scp_core::crypto::ucan::nonce::NonceTracker;
 use scp_core::crypto::ucan::revoke::RevocationList;
 use scp_core::store::ProtocolRepository;
@@ -1343,7 +1343,7 @@ pub struct FfiBridgeState {
     ///
     /// Stores active tool sessions keyed by session ID. Sessions are created
     /// via `py_outlet_session_open` and cleaned up on context close.
-    pub session_store: scp_core::context::tools::SessionStore,
+    pub session_store: scp_core::context::outlets::SessionStore,
 }
 
 /// Buffer capacity for the receive channel (SCP-216, sketch.md §receive).
@@ -1420,7 +1420,7 @@ pub fn register_ffi_state(
                 outlet_handlers: HashMap::new(),
                 message_tx: None,
                 message_rx: None,
-                session_store: scp_core::context::tools::SessionStore::new(),
+                session_store: scp_core::context::outlets::SessionStore::new(),
             };
 
             vacant.insert(state);

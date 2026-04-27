@@ -135,7 +135,7 @@ impl PyOutletVerificationResult {
 
 /// Per-invocation cost metadata for a tool (spec §5.4.1, §19.3).
 ///
-/// Mirrors [`scp_core::context::tools::OutletCost`]. Exposed as a typed Python
+/// Mirrors [`scp_core::context::outlets::OutletCost`]. Exposed as a typed Python
 /// class so callers can construct cost metadata without JSON round-trips.
 #[pyclass(name = "OutletCost")]
 #[derive(Debug, Clone)]
@@ -184,7 +184,7 @@ impl PyOutletCost {
 
 /// MCP-compatible JSON Schema for a tool's input and output.
 ///
-/// Mirrors [`scp_core::context::tools::OutletSchema`]. Both fields must be
+/// Mirrors [`scp_core::context::outlets::OutletSchema`]. Both fields must be
 /// valid JSON Schema objects.
 #[pyclass(name = "OutletSchema")]
 #[derive(Debug)]
@@ -221,7 +221,7 @@ impl PyOutletSchema {
 
 /// A known input-output pair for tool verification.
 ///
-/// Mirrors [`scp_core::context::tools::OutletTestVector`].
+/// Mirrors [`scp_core::context::outlets::OutletTestVector`].
 #[pyclass(name = "OutletTestVector")]
 #[derive(Debug)]
 pub struct PyOutletTestVector {
@@ -365,12 +365,12 @@ pub fn py_outlet_register(context_id: &str, registration: &Bound<'_, PyDict>) ->
     let message_catalog = extract_message_catalog(registration)?;
 
     // Build the scp-core OutletRegistration.
-    let core_registration = scp_core::context::tools::OutletRegistration {
+    let core_registration = scp_core::context::outlets::OutletRegistration {
         outlet_id,
         kind,
         name,
         description,
-        schema: scp_core::context::tools::OutletSchema {
+        schema: scp_core::context::outlets::OutletSchema {
             input_schema,
             output_schema,
             aggregate_schema: None,
@@ -395,7 +395,7 @@ pub fn py_outlet_register(context_id: &str, registration: &Bound<'_, PyDict>) ->
     // through `ScpPyError::context` so the Python caller sees a
     // `ContextError` carrying the spec citation.
     let registered_id = crate::runtime::with_context(context_id, |rt| {
-        let (registered_id, _event) = scp_core::context::tools::register_outlet(
+        let (registered_id, _event) = scp_core::context::outlets::register_outlet(
             &mut rt.outlet_registry,
             &rt.role_state,
             core_registration,
@@ -463,7 +463,7 @@ fn validate_outlet_ucan(
             caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
         };
 
-        scp_core::context::tools::validate_outlet_invocation_ucan(
+        scp_core::context::outlets::validate_outlet_invocation_ucan(
             ucan_token,
             context_id,
             outlet_id,
@@ -651,7 +651,7 @@ pub fn py_outlet_invoke(
     // multi-thread global runtime is safe (matches `py_context_send`).
     let manager = crate::runtime::context_manager()?;
     let invoker_did_typed: scp_primitives::DID = identity_did_owned.into();
-    let outlet_id_typed = scp_core::context::tools::OutletId::from(outlet_id_owned.as_str());
+    let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id_owned.as_str());
     let rt = crate::runtime()?;
     let outcome = rt
         .block_on(async {
@@ -717,7 +717,7 @@ pub fn py_outlet_verify(context_id: &str, outlet_id: &str) -> PyResult<PyOutletV
     // bridge layer has no external tool executor. This verifies the test
     // vector structure is intact.
     let result = crate::runtime::with_context(context_id, |rt| {
-        let (verification_result, _event) = scp_core::context::tools::verify_outlet(
+        let (verification_result, _event) = scp_core::context::outlets::verify_outlet(
             &rt.outlet_registry,
             outlet_id,
             // Identity executor: returns the expected output for each vector.
@@ -848,7 +848,7 @@ fn extract_kind(
 /// `payee` (str DID), and optional `cost_formula` (str). Per spec §5.4.1.
 fn extract_cost(
     registration: &Bound<'_, PyDict>,
-) -> PyResult<Option<scp_core::context::tools::OutletCost>> {
+) -> PyResult<Option<scp_core::context::outlets::OutletCost>> {
     let meta_obj = match registration.get_item("cost")? {
         Some(val) if !val.is_none() => val,
         _ => return Ok(None),
@@ -879,7 +879,7 @@ fn extract_cost(
         .map(|v| v.extract())
         .transpose()?;
 
-    Ok(Some(scp_core::context::tools::OutletCost {
+    Ok(Some(scp_core::context::outlets::OutletCost {
         amount,
         currency,
         payee: payee.into(),
@@ -895,7 +895,7 @@ fn extract_cost(
 /// Returns `SCP-VALID-7037` on validation failure (aligned with NAPI bridge).
 fn extract_test_vectors(
     registration: &Bound<'_, PyDict>,
-) -> PyResult<Vec<scp_core::context::tools::OutletTestVector>> {
+) -> PyResult<Vec<scp_core::context::outlets::OutletTestVector>> {
     let vectors_obj = match registration.get_item("test_vectors")? {
         Some(val) if !val.is_none() => val,
         _ => return Ok(Vec::new()),
@@ -933,7 +933,7 @@ fn extract_test_vectors(
             .unwrap_or("")
             .to_owned();
 
-        result.push(scp_core::context::tools::OutletTestVector {
+        result.push(scp_core::context::outlets::OutletTestVector {
             input,
             expected_output,
             description,
@@ -1066,7 +1066,7 @@ pub fn py_outlet_invoke_cross_context(
 
     // Defense-in-depth: check role-state capabilities in the source context.
     let source_has_capability = crate::runtime::with_context(source_context_id, |rt| {
-        Ok(scp_core::context::tools::has_outlet_call_capability(
+        Ok(scp_core::context::outlets::has_outlet_call_capability(
             &rt.role_state,
             invoker_did,
             outlet_id,
@@ -1105,7 +1105,7 @@ pub fn py_outlet_invoke_cross_context(
         })?;
 
         // Validate input against the tool's input schema.
-        scp_core::context::tools::validate_value_against_schema(
+        scp_core::context::outlets::validate_value_against_schema(
             &input_json,
             &registration.schema.input_schema,
         )
@@ -1120,7 +1120,7 @@ pub fn py_outlet_invoke_cross_context(
                 ))
             })?;
 
-            scp_core::context::tools::validate_value_against_schema(
+            scp_core::context::outlets::validate_value_against_schema(
                 &out,
                 &registration.schema.output_schema,
             )
@@ -1208,7 +1208,7 @@ pub fn py_outlet_session_open(
             tokio_rt
                 .block_on(mgr.context_params(context_id))
                 .and_then(|p| p.session_cap)
-                .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER)
+                .unwrap_or(scp_core::context::outlets::DEFAULT_SESSION_CAP_PER_CALLER)
                 as usize
         };
         let current = rt.session_store.count_by_source(source_context_id);
@@ -1221,7 +1221,7 @@ pub fn py_outlet_session_open(
         let session_id = uuid::Uuid::new_v4().to_string();
         let now_ms = scp_primitives::SystemClock.now_millis();
 
-        let session = scp_core::context::tools::OutletSession {
+        let session = scp_core::context::outlets::OutletSession {
             session_id: session_id.clone(),
             outlet_id: outlet_id.to_owned(),
             source_context: source_context_id.to_owned(),
@@ -1329,7 +1329,7 @@ pub fn py_outlet_session_invoke(
 
         // Defense-in-depth: check role-state capabilities in addition to the
         // UCAN layer. See §7.2 and ADR-010 for the dual-check design.
-        if !scp_core::context::tools::has_outlet_call_capability(
+        if !scp_core::context::outlets::has_outlet_call_capability(
             &rt.role_state,
             invoker_did,
             &outlet_id,
@@ -1341,7 +1341,7 @@ pub fn py_outlet_session_invoke(
 
         // Validate input against tool's input schema.
         if let Some(registration) = rt.outlet_registry.get(&outlet_id) {
-            scp_core::context::tools::validate_value_against_schema(
+            scp_core::context::outlets::validate_value_against_schema(
                 &input_json,
                 &registration.schema.input_schema,
             )
@@ -1451,8 +1451,8 @@ pub fn py_outlet_interface_offer(
 
     let rate_limit = match rate_limit_json {
         Some(json) => {
-            let parsed: scp_core::context::tools::interface::RateLimit = serde_json::from_str(json)
-                .map_err(|e| ScpPyError::ValidationError {
+            let parsed: scp_core::context::outlets::interface::RateLimit =
+                serde_json::from_str(json).map_err(|e| ScpPyError::ValidationError {
                     message: format!("invalid rate_limit_json: {e}"),
                     code: codes::VALID_7040.to_owned(),
                 })?;
@@ -1467,7 +1467,7 @@ pub fn py_outlet_interface_offer(
             scp_core::context::ContextParams::default(),
         );
 
-        let interface = scp_core::context::tools::interface::expose_tool(
+        let interface = scp_core::context::outlets::interface::expose_tool(
             context_handle.context_id(),
             &outlet_id.to_owned(),
             &target_context_id.to_owned(),
@@ -1513,7 +1513,7 @@ pub fn py_outlet_interface_offer(
 pub fn py_outlet_interface_accept(context_id: &str, interface_json: &str) -> PyResult<String> {
     validate::validate_context_id(context_id)?;
 
-    let mut interface: scp_core::context::tools::interface::OutletInterface =
+    let mut interface: scp_core::context::outlets::interface::OutletInterface =
         serde_json::from_str(interface_json).map_err(|e| ScpPyError::ValidationError {
             message: format!("invalid interface_json: {e}"),
             code: codes::VALID_7041.to_owned(),
@@ -1525,7 +1525,7 @@ pub fn py_outlet_interface_accept(context_id: &str, interface_json: &str) -> PyR
             scp_core::context::ContextParams::default(),
         );
 
-        scp_core::context::tools::interface::accept_tool_interface(
+        scp_core::context::outlets::interface::accept_tool_interface(
             context_handle.context_id(),
             &mut interface,
             &rt.role_state,
@@ -1584,7 +1584,7 @@ pub fn py_outlet_interface_revoke(context_id: &str, interface_id_hex: &str) -> P
 
     let now_ms = scp_primitives::SystemClock.now_millis();
 
-    let event = scp_core::context::tools::interface::revoke_tool_interface(
+    let event = scp_core::context::outlets::interface::revoke_tool_interface(
         interface_id,
         &context_id.to_owned(),
         now_ms,
@@ -1606,7 +1606,7 @@ pub fn py_outlet_interface_revoke(context_id: &str, interface_id_hex: &str) -> P
 /// consumption. Used by `context_outlet_get` and `context_outlet_list`.
 fn outlet_registration_to_dict<'py>(
     py: Python<'py>,
-    reg: &scp_core::context::tools::OutletRegistration,
+    reg: &scp_core::context::outlets::OutletRegistration,
 ) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("outlet_id", &reg.outlet_id)?;
@@ -1678,7 +1678,7 @@ fn outlet_registration_to_dict<'py>(
 fn build_outlet_registration_from_py(
     registration: &Bound<'_, PyDict>,
     outlet_id: String,
-) -> PyResult<scp_core::context::tools::OutletRegistration> {
+) -> PyResult<scp_core::context::outlets::OutletRegistration> {
     let name: String = registration
         .get_item("name")?
         .ok_or_else(|| ScpPyError::validation("missing 'name' field".to_owned()))?
@@ -1752,12 +1752,12 @@ fn build_outlet_registration_from_py(
     // round-trip the field instead of silently dropping it.
     let message_catalog = extract_message_catalog(registration)?;
 
-    Ok(scp_core::context::tools::OutletRegistration {
+    Ok(scp_core::context::outlets::OutletRegistration {
         outlet_id,
         kind,
         name,
         description,
-        schema: scp_core::context::tools::OutletSchema {
+        schema: scp_core::context::outlets::OutletSchema {
             input_schema,
             output_schema,
             aggregate_schema: None,
@@ -1776,7 +1776,7 @@ fn build_outlet_registration_from_py(
 
 /// Updates an existing outlet registration in an SCP context.
 ///
-/// Wraps [`scp_core::context::tools::update_outlet`]. The `outlet_id` must
+/// Wraps [`scp_core::context::outlets::update_outlet`]. The `outlet_id` must
 /// match an existing registration; the caller must be either the registered
 /// operator or an admin of the context. Validates schemas and test vectors
 /// on the new registration.
@@ -1806,7 +1806,7 @@ pub fn py_outlet_update(
     let new_registration = build_outlet_registration_from_py(registration, outlet_id.to_owned())?;
 
     crate::runtime::with_context(context_id, |rt| {
-        let _event = scp_core::context::tools::update_outlet(
+        let _event = scp_core::context::outlets::update_outlet(
             &mut rt.outlet_registry,
             &rt.role_state,
             outlet_id,
@@ -1855,7 +1855,7 @@ pub fn py_outlet_deregister(context_id: &str, outlet_id: &str, actor_did: &str) 
 
         // Authorization mirrors `update_outlet`: operator or admin.
         let is_operator = existing.operator_did == actor_did;
-        let is_admin = scp_core::context::tools::has_admin_role(&rt.role_state, actor_did);
+        let is_admin = scp_core::context::outlets::has_admin_role(&rt.role_state, actor_did);
         if !is_operator && !is_admin {
             return Err(ScpPyError::ucan(format!(
                 "actor '{actor_did}' is not authorized to deregister outlet '{outlet_id}'"

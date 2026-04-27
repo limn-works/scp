@@ -263,8 +263,8 @@ impl From<scp_core::context::promotion::PromotionError> for ScpNapiError {
     }
 }
 
-impl From<scp_core::context::tools::OutletError> for ScpNapiError {
-    fn from(e: scp_core::context::tools::OutletError) -> Self {
+impl From<scp_core::context::outlets::OutletError> for ScpNapiError {
+    fn from(e: scp_core::context::outlets::OutletError) -> Self {
         Self::Tool {
             message: format!(
                 "outlet operation failed: {e} — check outlet registration, permissions, and input schema"
@@ -274,8 +274,8 @@ impl From<scp_core::context::tools::OutletError> for ScpNapiError {
     }
 }
 
-impl From<scp_core::context::tools::invoke::InvocationError> for ScpNapiError {
-    fn from(e: scp_core::context::tools::invoke::InvocationError) -> Self {
+impl From<scp_core::context::outlets::invoke::InvocationError> for ScpNapiError {
+    fn from(e: scp_core::context::outlets::invoke::InvocationError) -> Self {
         Self::Tool {
             message: format!(
                 "outlet invocation failed: {e} — verify outlet ID, input, and caller permissions"
@@ -285,8 +285,8 @@ impl From<scp_core::context::tools::invoke::InvocationError> for ScpNapiError {
     }
 }
 
-impl From<scp_core::context::tools::schema::SchemaValidationError> for ScpNapiError {
-    fn from(e: scp_core::context::tools::schema::SchemaValidationError) -> Self {
+impl From<scp_core::context::outlets::schema::SchemaValidationError> for ScpNapiError {
+    fn from(e: scp_core::context::outlets::schema::SchemaValidationError) -> Self {
         Self::Validation {
             message: format!(
                 "schema validation failed: {e} — check input against the outlet's JSON Schema"

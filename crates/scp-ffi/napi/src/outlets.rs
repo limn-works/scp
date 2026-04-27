@@ -67,7 +67,7 @@ fn validate_ucan_for_tool(
             caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
         };
 
-        scp_core::context::tools::validate_outlet_invocation_ucan(
+        scp_core::context::outlets::validate_outlet_invocation_ucan(
             ucan_token,
             context_id,
             outlet_id,
@@ -218,7 +218,7 @@ fn validate_schema_json(json: &str, field_name: &str) -> napi::Result<serde_json
 /// JSON returns `SCP-VALID-7037`.
 fn validate_test_vectors_json(
     json: Option<&str>,
-) -> napi::Result<Vec<scp_core::context::tools::OutletTestVector>> {
+) -> napi::Result<Vec<scp_core::context::outlets::OutletTestVector>> {
     json.map_or_else(
         || Ok(Vec::new()),
         |s| {
@@ -316,14 +316,14 @@ pub async fn outlet_register(
 
     let cost = definition
         .cost
-        .map(|c| scp_core::context::tools::OutletCost {
+        .map(|c| scp_core::context::outlets::OutletCost {
             amount: c.amount.max(0).cast_unsigned(),
             currency: c.currency,
             payee: c.payee.into(),
             cost_formula: c.cost_formula,
         });
 
-    let core_registration = scp_core::context::tools::OutletRegistration {
+    let core_registration = scp_core::context::outlets::OutletRegistration {
         outlet_id,
         // SCP-OUT-017: kind is REQUIRED on the NAPI definition surface and
         // forwarded to scp-core. The TypeScript SDK enforces this at compile
@@ -331,7 +331,7 @@ pub async fn outlet_register(
         kind: definition.kind.into(),
         name: definition.name,
         description: definition.description,
-        schema: scp_core::context::tools::OutletSchema {
+        schema: scp_core::context::outlets::OutletSchema {
             input_schema,
             output_schema,
             aggregate_schema: None,
@@ -349,7 +349,7 @@ pub async fn outlet_register(
 
     // Register the tool in the context's tool registry.
     let registered_id = crate::runtime::with_context(&context_id, |rt| {
-        let (registered_id, _event) = scp_core::context::tools::register_outlet(
+        let (registered_id, _event) = scp_core::context::outlets::register_outlet(
             &mut rt.outlet_registry,
             &rt.role_state,
             core_registration,
@@ -534,7 +534,7 @@ pub async fn outlet_invoke(
 
     let manager = crate::runtime::context_manager()?;
     let invoker_did_typed: scp_primitives::DID = identity_did.into();
-    let outlet_id_typed = scp_core::context::tools::OutletId::from(outlet_id.as_str());
+    let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id.as_str());
     let outcome = manager
         .invoke_outlet_with_economy(
             &context_id,
@@ -609,7 +609,7 @@ pub async fn outlet_verify(
 
     // Look up the tool and verify against its test vectors (matching PyO3 pattern).
     let result = crate::runtime::with_context(&context_id, |rt| {
-        let (verification_result, _event) = scp_core::context::tools::verify_outlet(
+        let (verification_result, _event) = scp_core::context::outlets::verify_outlet(
             &rt.outlet_registry,
             &outlet_id,
             // Identity executor: returns the expected output for each vector.
@@ -763,7 +763,7 @@ pub async fn outlet_invoke_cross_context(
                 })?;
 
         // Validate input against the tool's input schema.
-        scp_core::context::tools::validate_value_against_schema(
+        scp_core::context::outlets::validate_value_against_schema(
             &input_value,
             &registration.schema.input_schema,
         )
@@ -780,7 +780,7 @@ pub async fn outlet_invoke_cross_context(
                 code: codes::TOOL_6002.to_owned(),
             })?;
 
-            scp_core::context::tools::validate_value_against_schema(
+            scp_core::context::outlets::validate_value_against_schema(
                 &out,
                 &registration.schema.output_schema,
             )
@@ -853,7 +853,7 @@ pub async fn outlet_session_open(
         mgr.context_params(&context_id)
             .await
             .and_then(|p| p.session_cap)
-            .unwrap_or(scp_core::context::tools::DEFAULT_SESSION_CAP_PER_CALLER) as usize
+            .unwrap_or(scp_core::context::outlets::DEFAULT_SESSION_CAP_PER_CALLER) as usize
     };
 
     crate::runtime::with_context(&context_id, |rt| {
@@ -871,7 +871,7 @@ pub async fn outlet_session_open(
         let session_id = uuid::Uuid::new_v4().to_string();
         let now_ms = scp_primitives::SystemClock.now_millis();
 
-        let session = scp_core::context::tools::OutletSession {
+        let session = scp_core::context::outlets::OutletSession {
             session_id: session_id.clone(),
             outlet_id,
             source_context: source_context_id,
@@ -984,7 +984,7 @@ pub async fn outlet_session_invoke(
 
         // Validate input against tool's input schema if tool is registered.
         if let Some(registration) = rt.outlet_registry.get(&outlet_id) {
-            scp_core::context::tools::validate_value_against_schema(
+            scp_core::context::outlets::validate_value_against_schema(
                 &input_value,
                 &registration.schema.input_schema,
             )
@@ -1104,8 +1104,8 @@ pub async fn outlet_interface_offer(
 
     let rate_limit = match rate_limit_json {
         Some(ref json) => {
-            let parsed: scp_core::context::tools::interface::RateLimit = serde_json::from_str(json)
-                .map_err(|e| {
+            let parsed: scp_core::context::outlets::interface::RateLimit =
+                serde_json::from_str(json).map_err(|e| {
                     napi::Error::from(ScpNapiError::Validation {
                         message: format!("invalid rate_limit_json: {e}"),
                         code: codes::VALID_7040.to_owned(),
@@ -1122,7 +1122,7 @@ pub async fn outlet_interface_offer(
             scp_core::context::ContextParams::default(),
         );
 
-        let interface = scp_core::context::tools::interface::expose_tool(
+        let interface = scp_core::context::outlets::interface::expose_tool(
             context_handle.context_id(),
             &outlet_id,
             &target_context_id,
@@ -1174,7 +1174,7 @@ pub async fn outlet_interface_accept(
     let context_id = handle.context_id();
     crate::runtime::ensure_registered(handle)?;
 
-    let mut interface: scp_core::context::tools::interface::OutletInterface =
+    let mut interface: scp_core::context::outlets::interface::OutletInterface =
         serde_json::from_str(&interface_json).map_err(|e| {
             napi::Error::from(ScpNapiError::Validation {
                 message: format!("invalid interface_json: {e}"),
@@ -1188,7 +1188,7 @@ pub async fn outlet_interface_accept(
             scp_core::context::ContextParams::default(),
         );
 
-        scp_core::context::tools::interface::accept_tool_interface(
+        scp_core::context::outlets::interface::accept_tool_interface(
             context_handle.context_id(),
             &mut interface,
             &rt.role_state,
@@ -1244,7 +1244,7 @@ pub async fn outlet_interface_revoke(
 
     let now_ms = scp_primitives::SystemClock.now_millis();
 
-    let event = scp_core::context::tools::interface::revoke_tool_interface(
+    let event = scp_core::context::outlets::interface::revoke_tool_interface(
         interface_id,
         &context_id,
         now_ms,
@@ -1264,7 +1264,7 @@ pub async fn outlet_interface_revoke(
 
 /// Serializes a core `OutletRegistration` to a JSON string for JS consumers.
 fn serialize_outlet_registration(
-    reg: &scp_core::context::tools::OutletRegistration,
+    reg: &scp_core::context::outlets::OutletRegistration,
 ) -> Result<String, ScpNapiError> {
     serde_json::to_string(reg).map_err(|e| ScpNapiError::Tool {
         message: format!("failed to serialize outlet registration: {e}"),
@@ -1280,7 +1280,7 @@ fn serialize_outlet_registration(
 fn build_outlet_registration_from_napi(
     definition: NapiOutletDefinition,
     outlet_id: String,
-) -> napi::Result<scp_core::context::tools::OutletRegistration> {
+) -> napi::Result<scp_core::context::outlets::OutletRegistration> {
     let input_schema = validate_schema_json(&definition.input_schema_json, "input_schema_json")?;
     let output_schema = validate_schema_json(&definition.output_schema_json, "output_schema_json")?;
     let test_vectors = validate_test_vectors_json(definition.test_vectors_json.as_deref())?;
@@ -1289,21 +1289,21 @@ fn build_outlet_registration_from_napi(
 
     let cost = definition
         .cost
-        .map(|c| scp_core::context::tools::OutletCost {
+        .map(|c| scp_core::context::outlets::OutletCost {
             amount: c.amount.max(0).cast_unsigned(),
             currency: c.currency,
             payee: c.payee.into(),
             cost_formula: c.cost_formula,
         });
 
-    Ok(scp_core::context::tools::OutletRegistration {
+    Ok(scp_core::context::outlets::OutletRegistration {
         outlet_id,
         // SCP-OUT-017: kind comes from the NAPI definition; the TypeScript
         // SDK requires it as a non-optional field on `OutletDefinition`.
         kind: definition.kind.into(),
         name: definition.name,
         description: definition.description,
-        schema: scp_core::context::tools::OutletSchema {
+        schema: scp_core::context::outlets::OutletSchema {
             input_schema,
             output_schema,
             aggregate_schema: None,
@@ -1322,7 +1322,7 @@ fn build_outlet_registration_from_napi(
 
 /// Updates an existing outlet registration.
 ///
-/// Wraps [`scp_core::context::tools::update_outlet`]. The caller's DID is the
+/// Wraps [`scp_core::context::outlets::update_outlet`]. The caller's DID is the
 /// `updater_did`, and must match the outlet's operator DID or hold the admin
 /// role on the context.
 ///
@@ -1363,7 +1363,7 @@ pub async fn outlet_update(
     let core_registration = build_outlet_registration_from_napi(definition, outlet_id.clone())?;
 
     crate::runtime::with_context(&context_id, |rt| {
-        let _event = scp_core::context::tools::update_outlet(
+        let _event = scp_core::context::outlets::update_outlet(
             &mut rt.outlet_registry,
             &rt.role_state,
             &outlet_id,
@@ -1421,7 +1421,7 @@ pub async fn outlet_deregister(
             .clone();
 
         let is_operator = existing.operator_did == actor_did;
-        let is_admin = scp_core::context::tools::has_admin_role(&rt.role_state, &actor_did);
+        let is_admin = scp_core::context::outlets::has_admin_role(&rt.role_state, &actor_did);
         if !is_operator && !is_admin {
             return Err(ScpNapiError::Permission {
                 message: format!(

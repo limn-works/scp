@@ -326,7 +326,7 @@ fn build_tools(tools: &[String]) -> Vec<OutletRegistration> {
             kind: scp_core::context::outlets::OutletKind::default(),
             name: name.clone(),
             description: String::new(),
-            schema: scp_core::context::tools::OutletSchema {
+            schema: scp_core::context::outlets::OutletSchema {
                 input_schema: serde_json::Value::Object(serde_json::Map::default()),
                 output_schema: serde_json::Value::Object(serde_json::Map::default()),
                 aggregate_schema: None,

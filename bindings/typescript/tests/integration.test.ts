@@ -2481,7 +2481,7 @@ describe("Context.create consequenceRules typed discriminated union (H15)", () =
             kind: "SuspendCapability",
             capabilities: [
               "MessagesWrite",
-              { kind: "ToolInvoke", toolId: "calculator" },
+              { kind: "OutletCall", outletId: "calculator" },
               { kind: "Custom", name: "my-custom-cap" },
             ],
           },
@@ -2530,7 +2530,7 @@ describe("Context.create consequenceRules typed discriminated union (H15)", () =
     }>;
     expect(decoded).toHaveLength(3);
 
-    // Rule 0: MessageVelocity / Enforcement(SuspendCapability { ToolInvoke + Custom + unit })
+    // Rule 0: MessageVelocity / Enforcement(SuspendCapability { OutletCall + Custom + unit })
     expect(decoded[0]?.trigger).toBe("MessageVelocity");
     expect(decoded[0]?.threshold).toBe(5);
     expect(decoded[0]?.window).toEqual({ secs: 3600, nanos: 0 });
@@ -2539,7 +2539,7 @@ describe("Context.create consequenceRules typed discriminated union (H15)", () =
     };
     expect(action0.Enforcement?.SuspendCapability?.capabilities).toEqual([
       "MessagesWrite",
-      { ToolInvoke: "calculator" },
+      { OutletCall: "calculator" },
       { Custom: "my-custom-cap" },
     ]);
 

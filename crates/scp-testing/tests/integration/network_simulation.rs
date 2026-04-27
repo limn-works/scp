@@ -1067,9 +1067,9 @@ fn demo_signing_key(did: &scp_identity::DID) -> ed25519_dalek::SigningKey {
 async fn application_layer_demo() {
     use scp_core::context::manager::ContextManager;
     use scp_core::context::membership::{ContextEvent, KeyPackage};
+    use scp_core::context::outlets::registry::{OutletRegistration, OutletRegistry, OutletSchema};
+    use scp_core::context::outlets::{invoke_outlet_aggregating, register_outlet};
     use scp_core::context::roles::{CapabilityCeiling, ContextRoleState};
-    use scp_core::context::tools::registry::{OutletRegistration, OutletRegistry, OutletSchema};
-    use scp_core::context::tools::{invoke_outlet_aggregating, register_outlet};
     use scp_core::context::{Capability, ContextParams, ContextState, GovernanceAction};
     use scp_identity::DID;
 
@@ -1421,7 +1421,7 @@ async fn application_layer_demo() {
                 "total": std::cmp::min(max, 2)
             }))
         },
-        None::<&mut scp_core::context::tools::invoke::OutletEconomyContext<'_>>,
+        None::<&mut scp_core::context::outlets::invoke::OutletEconomyContext<'_>>,
         None,
     )
     .await
@@ -1470,7 +1470,7 @@ async fn application_layer_demo() {
                 "operation": op
             }))
         },
-        None::<&mut scp_core::context::tools::invoke::OutletEconomyContext<'_>>,
+        None::<&mut scp_core::context::outlets::invoke::OutletEconomyContext<'_>>,
         None,
     )
     .await

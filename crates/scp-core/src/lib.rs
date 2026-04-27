@@ -85,10 +85,9 @@ pub mod context {
         pub use scp_protocol::context::governance::*;
         pub use scp_runtime::context::governance::timeout;
     }
-    pub mod tools {
-        // Facade left under the `tools` name for SCP-OUT-004; the full
-        // facade rename happens in SCP-OUT-006 (scp-core). Underlying
-        // paths and identifiers are already on the Outlet vocabulary.
+    pub mod outlets {
+        // SCP-OUT-006: facade renamed from `tools` to `outlets` to match the
+        // Outlet vocabulary used throughout scp-protocol and scp-runtime.
         pub use scp_protocol::context::outlets::*;
         pub use scp_runtime::context::outlets::invoke;
         pub use scp_runtime::context::outlets::invoke::{

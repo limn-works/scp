@@ -1169,7 +1169,7 @@ fn c4_uniffi_outlet_invoke_accepts_spending_ucan() {
 // SCP-OUT-008 AC22 — outlet surface reaches runtime pipeline
 //
 // The FFI bridges MUST delegate register / invoke / deregister / verify /
-// update to the scp_core::context::tools runtime facade (which re-exports
+// update to the scp_core::context::outlets runtime facade (which re-exports
 // the protocol-level outlet registry + runtime invocation pipeline).
 // Each outlet lifecycle verb is asserted on all 3 non-WASM FFI bridges
 // (PyO3, NAPI, UniFFI). invoke is already covered by the C4 assertions
@@ -1177,23 +1177,23 @@ fn c4_uniffi_outlet_invoke_accepts_spending_ucan() {
 // ===========================================================================
 
 /// `register_outlet` reaches the runtime pipeline via the protocol-level
-/// registry function (`scp_core::context::tools::register_outlet`) from all
+/// registry function (`scp_core::context::outlets::register_outlet`) from all
 /// three non-WASM FFI bridges.
 #[test]
 fn out008_register_outlet_reaches_runtime_pipeline() {
     assert!(
         fn_body_contains(PYO3_OUTLETS_SRC, "py_outlet_register", "register_outlet"),
-        "PyO3 py_outlet_register must delegate to scp_core::context::tools::register_outlet \
+        "PyO3 py_outlet_register must delegate to scp_core::context::outlets::register_outlet \
          so outlet registration flows through the runtime pipeline (SCP-OUT-008 AC22)"
     );
     assert!(
         fn_body_contains(NAPI_OUTLETS_SRC, "outlet_register", "register_outlet"),
-        "NAPI outlet_register must delegate to scp_core::context::tools::register_outlet \
+        "NAPI outlet_register must delegate to scp_core::context::outlets::register_outlet \
          so outlet registration flows through the runtime pipeline (SCP-OUT-008 AC22)"
     );
     assert!(
         fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_register", "register_outlet"),
-        "UniFFI outlet_register must delegate to scp_core::context::tools::register_outlet \
+        "UniFFI outlet_register must delegate to scp_core::context::outlets::register_outlet \
          so outlet registration flows through the runtime pipeline (SCP-OUT-008 AC22)"
     );
 }
@@ -1236,45 +1236,45 @@ fn out008_invoke_outlet_reaches_runtime_pipeline() {
 }
 
 /// `update_outlet` reaches the runtime pipeline via the protocol-level
-/// registry function (`scp_core::context::tools::update_outlet`) from all
+/// registry function (`scp_core::context::outlets::update_outlet`) from all
 /// three non-WASM FFI bridges.
 #[test]
 fn out008_update_outlet_reaches_runtime_pipeline() {
     assert!(
         fn_body_contains(PYO3_OUTLETS_SRC, "py_outlet_update", "update_outlet"),
-        "PyO3 py_outlet_update must delegate to scp_core::context::tools::update_outlet \
+        "PyO3 py_outlet_update must delegate to scp_core::context::outlets::update_outlet \
          so outlet updates flow through the runtime pipeline (SCP-OUT-008 AC22)"
     );
     assert!(
         fn_body_contains(NAPI_OUTLETS_SRC, "outlet_update", "update_outlet"),
-        "NAPI outlet_update must delegate to scp_core::context::tools::update_outlet \
+        "NAPI outlet_update must delegate to scp_core::context::outlets::update_outlet \
          so outlet updates flow through the runtime pipeline (SCP-OUT-008 AC22)"
     );
     assert!(
         fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_update", "update_outlet"),
-        "UniFFI outlet_update must delegate to scp_core::context::tools::update_outlet \
+        "UniFFI outlet_update must delegate to scp_core::context::outlets::update_outlet \
          so outlet updates flow through the runtime pipeline (SCP-OUT-008 AC22)"
     );
 }
 
 /// `verify_outlet` reaches the runtime pipeline via the protocol-level
-/// registry function (`scp_core::context::tools::verify_outlet`) from all
+/// registry function (`scp_core::context::outlets::verify_outlet`) from all
 /// three non-WASM FFI bridges.
 #[test]
 fn out008_verify_outlet_reaches_runtime_pipeline() {
     assert!(
         fn_body_contains(PYO3_OUTLETS_SRC, "py_outlet_verify", "verify_outlet"),
-        "PyO3 py_outlet_verify must delegate to scp_core::context::tools::verify_outlet \
+        "PyO3 py_outlet_verify must delegate to scp_core::context::outlets::verify_outlet \
          so outlet verification flows through the runtime pipeline (SCP-OUT-008 AC22)"
     );
     assert!(
         fn_body_contains(NAPI_OUTLETS_SRC, "outlet_verify", "verify_outlet"),
-        "NAPI outlet_verify must delegate to scp_core::context::tools::verify_outlet \
+        "NAPI outlet_verify must delegate to scp_core::context::outlets::verify_outlet \
          so outlet verification flows through the runtime pipeline (SCP-OUT-008 AC22)"
     );
     assert!(
         fn_body_contains(UNIFFI_BRIDGE_SRC, "outlet_verify", "verify_outlet"),
-        "UniFFI outlet_verify must delegate to scp_core::context::tools::verify_outlet \
+        "UniFFI outlet_verify must delegate to scp_core::context::outlets::verify_outlet \
          so outlet verification flows through the runtime pipeline (SCP-OUT-008 AC22)"
     );
 }

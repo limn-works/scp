@@ -70,17 +70,17 @@ export interface ContextParams {
 // ---------------------------------------------------------------------------
 
 /**
- * A registered tool capability (`tool:invoke:<id>`) within a context.
+ * A registered outlet capability (`outlet:call:<id>`) within a context.
  *
- * Mirrors the `Capability::ToolInvoke(ToolId)` newtype. Carries the tool ID
- * (an opaque string) and serializes as `{"ToolInvoke": "id"}` to match the
+ * Mirrors the `Capability::OutletCall(OutletId)` newtype. Carries the outlet
+ * ID (an opaque string) and serializes as `{"OutletCall": "id"}` to match the
  * Rust serde tagging.
  */
-export interface ToolInvokeCapability {
+export interface OutletCallCapability {
   /** Discriminant. */
-  readonly kind: "ToolInvoke";
-  /** Opaque tool identifier matching a registered ToolDefinition. */
-  readonly toolId: string;
+  readonly kind: "OutletCall";
+  /** Opaque outlet identifier matching a registered OutletDefinition. */
+  readonly outletId: string;
 }
 
 /**
@@ -128,14 +128,14 @@ export type UnitCapability =
  * Typed capability matching `scp_protocol::context::roles::Capability`.
  *
  * Either a unit-variant string or an object discriminated by `kind` for
- * payload-bearing variants (`ToolInvoke`, `Custom`). The SDK encoder converts
+ * payload-bearing variants (`OutletCall`, `Custom`). The SDK encoder converts
  * each variant to the matching Rust serde JSON shape:
  *
  * - `"MessagesRead"` → `"MessagesRead"`
- * - `{ kind: "ToolInvoke", toolId: "calculator" }` → `{"ToolInvoke": "calculator"}`
+ * - `{ kind: "OutletCall", outletId: "calculator" }` → `{"OutletCall": "calculator"}`
  * - `{ kind: "Custom", name: "foo" }` → `{"Custom": "foo"}`
  */
-export type ConsequenceCapability = UnitCapability | ToolInvokeCapability | CustomCapability;
+export type ConsequenceCapability = UnitCapability | OutletCallCapability | CustomCapability;
 
 /**
  * The condition that triggers a consequence rule (ADR-017 §6).
@@ -367,8 +367,8 @@ function encodeConsequenceCapability(capability: ConsequenceCapability): unknown
   if (typeof capability === "string") {
     return capability;
   }
-  if (capability.kind === "ToolInvoke") {
-    return { ToolInvoke: capability.toolId };
+  if (capability.kind === "OutletCall") {
+    return { OutletCall: capability.outletId };
   }
   if (capability.kind === "Custom") {
     return { Custom: capability.name };

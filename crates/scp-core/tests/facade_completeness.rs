@@ -9,7 +9,7 @@ use scp_core::context::ContextParams;
 use scp_core::context::ContextState;
 use scp_core::context::builder::ContextCreationError;
 use scp_core::context::governance::GovernanceAction;
-use scp_core::context::tools::OutletSchema;
+use scp_core::context::outlets::OutletSchema;
 
 // Crypto split
 use scp_core::crypto::access_keys::AccessKeyError;
