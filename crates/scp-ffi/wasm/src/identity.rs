@@ -1435,15 +1435,18 @@ fn resolve_did_document_fields(did: &str) -> ResolvedDocumentFields {
             |info| build_did_document_arrays(did, &info),
         );
 
-    // Populate alsoKnownAs from MIGRATION_LINKS — after identity_migrate,
-    // the new DID maps to the old DID (#540). `identity_rotate_key`
-    // preserves the DID and therefore never writes to MIGRATION_LINKS.
+    // Populate alsoKnownAs from MIGRATION_LINKS — `identity_migrate`
+    // writes a forward link `old_did → new_did` so that
+    // `identity_resolve(old_did)` returns the old document with
+    // `alsoKnownAs[new_did]`. Mirrors native's
+    // `old_doc.set_also_known_as(&new_did)` step. `identity_rotate_key`
+    // preserves the DID and never writes to MIGRATION_LINKS.
     let also_known_as_json = MIGRATION_LINKS.with(|links| {
         let map = links.borrow();
         map.get(did).map_or_else(
             || "[]".to_owned(),
-            |old_did| {
-                let arr = serde_json::Value::Array(vec![serde_json::json!(old_did)]);
+            |linked_did| {
+                let arr = serde_json::Value::Array(vec![serde_json::json!(linked_did)]);
                 serde_json::to_string(&arr).unwrap_or_else(|_| "[]".to_owned())
             },
         )
@@ -1948,16 +1951,23 @@ pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
 ///   "old_did": "did:dht:z...",
 ///   "new_did": "did:dht:z...",
 ///   "migration_proof": {
-///     "signature": "<128-hex>",
-///     "old_public_key": "<64-hex>"
+///     "signature": "<128-char lowercase hex>",
+///     "old_public_key": "<64-char lowercase hex>"
 ///   },
 ///   "pre_rotation_proof": {
-///     "commitment": "<64-hex>",
-///     "revealed_key": "<64-hex>"
+///     "commitment": "<64-char lowercase hex>",
+///     "revealed_key": "<64-char lowercase hex>"
 ///   },
 ///   "rotated_at": <unix-seconds>
 /// }
 /// ```
+///
+/// Byte fields are encoded as lowercase hex strings (the project-wide
+/// convention for cryptographic byte material). The shape is byte-for-
+/// byte identical to `serde_json::to_string(&scp_identity::DidRotationEvent)`
+/// — native's `serde_signature_64` and `serde_bytes_32` modules also emit
+/// hex. Any `serde_json::from_str::<DidRotationEvent>` consumer parses
+/// WASM-emitted events identically.
 ///
 /// `pre_rotation_proof` is always present because the WASM bridge always
 /// publishes a `#pre-rotation` commitment for `Local` identities; verifiers
@@ -2076,18 +2086,37 @@ fn lookup_migration_source(did: &str) -> Result<MigrationSourceKeys, ScpWasmErro
     })
 }
 
-/// Removes the source identity, capacity-checks, and installs the
-/// migrated `Local` record. Also ports `LINK_ATTESTATIONS` to the new
-/// DID and records the `MIGRATION_LINKS` mapping for `alsoKnownAs`.
+/// Installs a migrated `Local` record under `new_did`, demotes the old
+/// DID's record to `Resolved` (so `identity_resolve(old_did)` continues
+/// to surface its `#0` public key + `alsoKnownAs → new_did`), ports
+/// `LINK_ATTESTATIONS` to the new DID, and writes the `MIGRATION_LINKS`
+/// forward-link `old_did → new_did`.
+///
+/// Pre-flights ALL capacity checks before any mutation: a partial
+/// failure mid-way would leave the registries in a split-brain state
+/// from which the caller cannot recover (the source DID would be gone
+/// without a forward link, and the new identity would have no
+/// `alsoKnownAs` predecessor record). Native `DidDht::migrate_identity`
+/// publishes both documents in a single atomic step; this WASM version
+/// gives the equivalent guarantee at the registry level.
 fn install_migrated_identity(
     old_did: &str,
     new_did: &str,
+    old_public_key_bytes: [u8; 32],
     record: IdentityRecord,
 ) -> Result<(), ScpWasmError> {
+    // Phase 1: pre-flight all capacity checks against the post-mutation
+    // shape. After mutation: identity registry holds N + (new_did
+    // present pre-migration ? 0 : 1) entries (we keep the old DID as a
+    // `Resolved` stub); migration_links holds M + (old_did already
+    // present? 0 : 1) entries.
     IDENTITY_REGISTRY.with(|reg| -> Result<(), ScpWasmError> {
-        let mut map = reg.borrow_mut();
-        map.remove(old_did);
-        if !map.contains_key(new_did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
+        let map = reg.borrow();
+        let new_present = map.contains_key(new_did);
+        let post_len = map.len() - usize::from(map.contains_key(old_did))
+            + usize::from(map.contains_key(old_did))
+            + usize::from(!new_present);
+        if post_len > WASM_IDENTITY_REGISTRY_CAP {
             return Err(ScpWasmError::Validation {
                 message: format!(
                     "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
@@ -2096,20 +2125,12 @@ fn install_migrated_identity(
                 code: codes::VALID_7400.to_owned(),
             });
         }
-        map.insert(new_did.to_owned(), record);
         Ok(())
     })?;
-
-    LINK_ATTESTATIONS.with(|reg| {
-        let mut map = reg.borrow_mut();
-        if let Some(attestations) = map.remove(old_did) {
-            map.insert(new_did.to_owned(), attestations);
-        }
-    });
-
     MIGRATION_LINKS.with(|links| -> Result<(), ScpWasmError> {
-        let mut map = links.borrow_mut();
-        if !map.contains_key(new_did) && map.len() >= WASM_MIGRATION_LINKS_CAP {
+        let map = links.borrow();
+        let post_len = map.len() + usize::from(!map.contains_key(old_did));
+        if post_len > WASM_MIGRATION_LINKS_CAP {
             return Err(ScpWasmError::Validation {
                 message: format!(
                     "migration links registry has reached capacity ({WASM_MIGRATION_LINKS_CAP}) \
@@ -2118,9 +2139,48 @@ fn install_migrated_identity(
                 code: codes::VALID_7401.to_owned(),
             });
         }
-        map.insert(new_did.to_owned(), old_did.to_owned());
         Ok(())
     })?;
+
+    // Phase 2: mutate. None of these can fail (caps verified above).
+    IDENTITY_REGISTRY.with(|reg| {
+        let mut map = reg.borrow_mut();
+        // Demote the old record to a Resolved stub so verifiers can
+        // still fetch the old DID's `#0` public key and follow
+        // `alsoKnownAs` to the new DID. Mirrors native publishing the
+        // updated old document with `alsoKnownAs[new_did]`. The old
+        // private key material is dropped (Zeroizing wipes it).
+        let old_custody_type = match map.get(old_did) {
+            Some(
+                IdentityRecord::Local { custody_type, .. }
+                | IdentityRecord::Resolved { custody_type, .. },
+            ) => custody_type.clone(),
+            None => "in_memory".to_owned(),
+        };
+        map.insert(
+            old_did.to_owned(),
+            IdentityRecord::Resolved {
+                public_key_bytes: old_public_key_bytes,
+                custody_type: old_custody_type,
+            },
+        );
+        map.insert(new_did.to_owned(), record);
+    });
+
+    LINK_ATTESTATIONS.with(|reg| {
+        let mut map = reg.borrow_mut();
+        if let Some(attestations) = map.remove(old_did) {
+            map.insert(new_did.to_owned(), attestations);
+        }
+    });
+
+    // Forward link: `MIGRATION_LINKS[old_did] = new_did` so
+    // `identity_resolve(old_did)` surfaces `alsoKnownAs → new_did`.
+    // Mirrors native's `old_doc.set_also_known_as(new_did)`.
+    MIGRATION_LINKS.with(|links| {
+        let mut map = links.borrow_mut();
+        map.insert(old_did.to_owned(), new_did.to_owned());
+    });
 
     Ok(())
 }
@@ -2168,8 +2228,12 @@ fn build_migration_signature(
 }
 
 /// Encodes the rotation event JSON for a successful migration. The
-/// shape mirrors `scp_identity::DidRotationEvent` so JS-side verifiers
-/// using the native verification helpers parse identically.
+/// shape is byte-for-byte identical to `serde_json::to_string` of
+/// `scp_identity::DidRotationEvent` — `signature`, `old_public_key`,
+/// `commitment`, and `revealed_key` all serialize as lowercase hex
+/// strings via `serde_signature_64` and `serde_bytes_32` on the native
+/// side. Any `serde_json::from_str::<DidRotationEvent>` consumer
+/// parses WASM-emitted events identically.
 fn encode_rotation_event_json(
     old_did: &str,
     new_did: &str,
@@ -2260,11 +2324,12 @@ fn migrate_inner(
         &new_pub_bytes,
     )?;
 
-    // Phase 6: install the new identity, port LINK_ATTESTATIONS,
-    // record MIGRATION_LINKS for `alsoKnownAs`.
+    // Phase 6: install the new identity, demote OLD to Resolved,
+    // port LINK_ATTESTATIONS, record MIGRATION_LINKS forward link.
     install_migrated_identity(
         &old_did,
         &new_did,
+        source_keys.public_bytes,
         IdentityRecord::Local {
             signing_key_bytes: zeroize::Zeroizing::new(new_signing_key.to_bytes()),
             active_signing_key_bytes: new_active_signing_key_bytes,
@@ -3639,20 +3704,22 @@ mod tests {
     fn test_resolve_with_migration_link() {
         cleanup_registries();
 
+        // `identity_migrate` writes a forward link `old_did → new_did`
+        // so `identity_resolve(old_did)` returns `alsoKnownAs[new_did]`.
+        // Mirrors native's `old_doc.set_also_known_as(&new_did)`.
         let (did, _pub_bytes, _active_pub_bytes) = register_identity();
-        let old_did = "did:dht:zOldDid12345";
+        let new_did = "did:dht:zNewDid12345";
 
-        // Simulate a migration: new DID maps to old DID.
         MIGRATION_LINKS.with(|links| {
-            links.borrow_mut().insert(did.clone(), old_did.to_owned());
+            links.borrow_mut().insert(did.clone(), new_did.to_owned());
         });
 
         let fields = resolve_did_document_fields(&did);
 
-        // alsoKnownAs should contain the old DID.
+        // alsoKnownAs should contain the new DID (forward link).
         let aka: Vec<serde_json::Value> = serde_json::from_str(&fields.also_known_as_json).unwrap();
         assert_eq!(aka.len(), 1, "should have exactly one alsoKnownAs entry");
-        assert_eq!(aka[0], old_did);
+        assert_eq!(aka[0], new_did);
 
         // VMs should still be populated (identity exists in registry).
         let vms: Vec<serde_json::Value> =
@@ -4470,6 +4537,15 @@ mod tests {
         use ed25519_dalek::Verifier;
         use sha2::{Digest, Sha256};
 
+        // Test-only helper: decode a hex-string JSON node into a
+        // fixed-size byte array. Defined at function-top so clippy's
+        // `items_after_statements` lint stays quiet.
+        fn decode_hex<const N: usize>(v: &serde_json::Value) -> [u8; N] {
+            let s = v.as_str().expect("expected JSON string");
+            let bytes = hex::decode(s).expect("expected lowercase hex");
+            bytes.try_into().expect("expected exactly N hex bytes")
+        }
+
         cleanup_registries();
         let (old_did, identity_pub_bytes, _) = register_identity();
         let handle = handle_for(&old_did, identity_pub_bytes);
@@ -4494,41 +4570,65 @@ mod tests {
             "the new #0 MUST be the OLD pre-rotation key (revealed)"
         );
 
-        // Registry is updated: new DID is present, old DID is not.
-        let new_present =
-            IDENTITY_REGISTRY.with(|reg| reg.borrow().contains_key(&expected_new_did));
-        let old_present = IDENTITY_REGISTRY.with(|reg| reg.borrow().contains_key(&old_did));
-        assert!(new_present, "new DID MUST be installed");
-        assert!(!old_present, "old DID MUST be removed");
+        // Registry is updated: new DID is installed as Local, old DID
+        // is demoted to Resolved (so identity_resolve(old_did) still
+        // returns its #0 public key, mirroring native's behavior of
+        // leaving the old document published with alsoKnownAs[new_did]).
+        IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            let new_record = map
+                .get(&expected_new_did)
+                .expect("new DID must be installed");
+            assert!(
+                matches!(new_record, IdentityRecord::Local { .. }),
+                "new DID must be a Local record"
+            );
+            let old_record = map
+                .get(&old_did)
+                .expect("old DID must remain in registry as Resolved");
+            assert!(
+                matches!(old_record, IdentityRecord::Resolved { .. }),
+                "old DID must be demoted to Resolved (no retained signing key material)"
+            );
+            assert_eq!(
+                old_record.public_key_bytes(),
+                identity_pub_bytes,
+                "demoted Resolved record must preserve the old #0 public key for verifiers"
+            );
+        });
 
-        // Verify the rotation-event JSON shape: pre-rotation proof's
-        // revealed_key MUST hash to the commitment.
+        // identity_resolve(old_did) must surface alsoKnownAs[new_did]
+        // (forward link) — mirrors native's
+        // `old_doc.set_also_known_as(&new_did)` step.
+        let old_fields = resolve_did_document_fields(&old_did);
+        let aka: Vec<serde_json::Value> =
+            serde_json::from_str(&old_fields.also_known_as_json).unwrap();
+        assert_eq!(aka.len(), 1, "old DID must surface exactly one alsoKnownAs");
+        assert_eq!(aka[0], expected_new_did);
+
+        // Verify the rotation-event JSON shape matches what
+        // `serde_json::to_string(&scp_identity::DidRotationEvent)`
+        // produces: lowercase hex strings for the four proof fields.
         let event: serde_json::Value = serde_json::from_str(&result.rotation_event_json).unwrap();
         assert_eq!(event["old_did"], old_did);
         assert_eq!(event["new_did"], expected_new_did);
-        let revealed_hex = event["pre_rotation_proof"]["revealed_key"]
-            .as_str()
-            .unwrap();
-        let commitment_hex = event["pre_rotation_proof"]["commitment"].as_str().unwrap();
-        let revealed_bytes: [u8; 32] = hex::decode(revealed_hex).unwrap().try_into().unwrap();
-        let recomputed_commitment_hex =
-            hex::encode(compute_pre_rotation_commitment(&revealed_bytes));
+
+        let revealed_bytes: [u8; 32] = decode_hex(&event["pre_rotation_proof"]["revealed_key"]);
+        let commitment_bytes: [u8; 32] = decode_hex(&event["pre_rotation_proof"]["commitment"]);
+        let recomputed_commitment = compute_pre_rotation_commitment(&revealed_bytes);
         assert_eq!(
-            recomputed_commitment_hex, commitment_hex,
+            recomputed_commitment, commitment_bytes,
             "PreRotationProof MUST satisfy SHA-256(revealed_key) == commitment"
         );
 
         // Migration proof signature MUST verify under the OLD #0 public key.
-        let sig_hex = event["migration_proof"]["signature"].as_str().unwrap();
-        let old_pub_hex = event["migration_proof"]["old_public_key"].as_str().unwrap();
+        let sig_bytes: [u8; 64] = decode_hex(&event["migration_proof"]["signature"]);
+        let old_pub_bytes: [u8; 32] = decode_hex(&event["migration_proof"]["old_public_key"]);
         assert_eq!(
-            old_pub_hex,
-            hex::encode(identity_pub_bytes),
+            old_pub_bytes, identity_pub_bytes,
             "MigrationProof.old_public_key MUST equal the old DID's #0"
         );
-        let sig_bytes: [u8; 64] = hex::decode(sig_hex).unwrap().try_into().unwrap();
         let signature = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-        let old_pub_bytes: [u8; 32] = hex::decode(old_pub_hex).unwrap().try_into().unwrap();
         let old_verifying = ed25519_dalek::VerifyingKey::from_bytes(&old_pub_bytes).unwrap();
         // Recompute the digest the way migrate_inner did.
         let rotated_at = event["rotated_at"].as_u64().unwrap();
@@ -4561,9 +4661,10 @@ mod tests {
             "migrated identity MUST publish the fresh pre-rotation commitment"
         );
 
-        // Migration link records new -> old.
-        let aka = MIGRATION_LINKS.with(|links| links.borrow().get(&expected_new_did).cloned());
-        assert_eq!(aka, Some(old_did));
+        // Migration link records old -> new (forward link). Mirrors
+        // native `old_doc.set_also_known_as(&new_did)`.
+        let aka = MIGRATION_LINKS.with(|links| links.borrow().get(&old_did).cloned());
+        assert_eq!(aka, Some(expected_new_did));
 
         cleanup_registries();
     }

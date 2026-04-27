@@ -38,29 +38,59 @@ use super::IdentityError;
 use super::attestation::{IdentityLinkServiceEntry, ScpKeyCustodyAttestation};
 use serde::{Deserialize, Serialize};
 
-/// Custom serde module for `[u8; 64]` fields.
+/// Custom serde module for hex-encoded `[u8; 64]` fields.
 ///
-/// Serde does not natively support arrays larger than 32 elements. This module
-/// serializes `[u8; 64]` via `Vec<u8>` (leveraging `serde_bytes` for compact
-/// binary representation) and validates the exact length on deserialization,
-/// rejecting anything other than exactly 64 bytes.
+/// Wire format is a lowercase hex string (128 chars). Hex is the
+/// project-wide convention for cryptographic byte material (signatures,
+/// public keys, hashes); it is ~50% smaller on the wire than the
+/// `serde_bytes` JSON-array form, human-readable in logs, trivially
+/// copy-pasteable, and decodes in one call. Deserialization validates
+/// the exact byte count.
 mod serde_signature_64 {
-    use serde::{self, Deserializer, Serializer};
+    use serde::{self, Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serde_bytes::serialize(bytes.as_slice(), serializer)
+        serializer.serialize_str(&hex::encode(bytes))
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
     where
         D: Deserializer<'de>,
     {
-        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+        let s = String::deserialize(deserializer)?;
+        let v =
+            hex::decode(&s).map_err(|e| serde::de::Error::custom(format!("invalid hex: {e}")))?;
         v.try_into().map_err(|v: Vec<u8>| {
             serde::de::Error::custom(format!("expected 64-byte signature, got {} bytes", v.len()))
+        })
+    }
+}
+
+/// Custom serde module for hex-encoded `[u8; 32]` fields (public keys
+/// and SHA-256 commitments). Wire format is a lowercase hex string
+/// (64 chars). Same rationale as [`serde_signature_64`].
+mod serde_bytes_32 {
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&hex::encode(bytes))
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let v =
+            hex::decode(&s).map_err(|e| serde::de::Error::custom(format!("invalid hex: {e}")))?;
+        v.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("expected 32-byte field, got {} bytes", v.len()))
         })
     }
 }
@@ -1088,11 +1118,12 @@ pub struct DidRotationEvent {
 pub struct MigrationProof {
     /// Ed25519 signature of `SHA-256("SCP-MIGRATION-V1:" || old_did
     /// || new_did || rotated_at)` signed by the old Identity Key. Must be
-    /// exactly 64 bytes (Ed25519).
+    /// exactly 64 bytes (Ed25519). Wire format: lowercase hex string.
     #[serde(with = "serde_signature_64")]
     pub signature: [u8; 64],
     /// The old Identity Key's public bytes, for verification without resolving
-    /// the old DID document.
+    /// the old DID document. Wire format: lowercase hex string.
+    #[serde(with = "serde_bytes_32")]
     pub old_public_key: [u8; 32],
 }
 
@@ -1106,10 +1137,13 @@ pub struct MigrationProof {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PreRotationProof {
     /// The commitment published in the old DID document's
-    /// `PreRotationCommitment` service (`sha256:<hex>`).
+    /// `PreRotationCommitment` service (`sha256:<hex>`). Wire format:
+    /// lowercase hex string.
+    #[serde(with = "serde_bytes_32")]
     pub commitment: [u8; 32],
     /// The new Identity Key public bytes. `SHA-256(this)` must equal
-    /// `commitment`.
+    /// `commitment`. Wire format: lowercase hex string.
+    #[serde(with = "serde_bytes_32")]
     pub revealed_key: [u8; 32],
 }
 
@@ -1485,17 +1519,18 @@ mod tests {
         assert_eq!(urls[0], "wss://existing.example.com/scp/v1");
     }
 
-    // --- MigrationProof.signature [u8; 64] tests (SCP-202) ---
+    // --- MigrationProof.signature [u8; 64] hex-string tests ---
 
-    /// Helper: build a JSON object for `MigrationProof` with a signature of
-    /// the given length. The `old_public_key` is always a valid 32-byte array.
-    fn migration_proof_json_with_sig_len(len: usize) -> String {
-        let sig_array: Vec<String> = (0..len).map(|i| ((i % 256) as u8).to_string()).collect();
-        let pk_array: Vec<String> = (0..32).map(|_| "1".to_owned()).collect();
+    /// Helper: build a JSON object for `MigrationProof` with a signature
+    /// of the given byte length, hex-encoded. The `old_public_key` is
+    /// always a valid 32-byte array (hex-encoded).
+    fn migration_proof_json_with_sig_len(byte_len: usize) -> String {
+        let sig_bytes: Vec<u8> = (0..byte_len).map(|i| (i % 256) as u8).collect();
+        let pk_bytes: Vec<u8> = (0..32).map(|_| 1u8).collect();
         format!(
-            r#"{{"signature":[{}],"old_public_key":[{}]}}"#,
-            sig_array.join(","),
-            pk_array.join(",")
+            r#"{{"signature":"{}","old_public_key":"{}"}}"#,
+            hex::encode(&sig_bytes),
+            hex::encode(&pk_bytes)
         )
     }
 
@@ -1504,7 +1539,6 @@ mod tests {
         let json = migration_proof_json_with_sig_len(64);
         let proof: MigrationProof = serde_json::from_str(&json).unwrap();
         assert_eq!(proof.signature.len(), 64);
-        // Verify the bytes are correct.
         for (i, &b) in proof.signature.iter().enumerate() {
             assert_eq!(b, (i % 256) as u8);
         }
@@ -1535,13 +1569,44 @@ mod tests {
     }
 
     #[test]
+    fn migration_proof_invalid_hex_rejected() {
+        // Non-hex character in signature.
+        let json = r#"{"signature":"zzzz","old_public_key":"01010101010101010101010101010101010101010101010101010101010101"}"#;
+        let result = serde_json::from_str::<MigrationProof>(json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid hex"),
+            "error should mention invalid hex, got: {err_msg}"
+        );
+    }
+
+    #[test]
     fn migration_proof_signature_json_roundtrip() {
         let proof = MigrationProof {
             signature: [0xAA; 64],
             old_public_key: [0xBB; 32],
         };
         let json = serde_json::to_string(&proof).unwrap();
+        // Wire format must be hex strings, not byte arrays.
+        assert!(json.contains("\"aaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(json.contains("\"bbbbbbbbbbbbbbbb"));
+        assert!(!json.contains('['));
         let parsed: MigrationProof = serde_json::from_str(&json).unwrap();
+        assert_eq!(proof, parsed);
+    }
+
+    #[test]
+    fn pre_rotation_proof_json_roundtrip() {
+        let proof = PreRotationProof {
+            commitment: [0xCC; 32],
+            revealed_key: [0xDD; 32],
+        };
+        let json = serde_json::to_string(&proof).unwrap();
+        // Wire format must be hex strings.
+        assert!(json.contains("\"cccccccccccccccc"));
+        assert!(json.contains("\"dddddddddddddddd"));
+        let parsed: PreRotationProof = serde_json::from_str(&json).unwrap();
         assert_eq!(proof, parsed);
     }
 
