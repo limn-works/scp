@@ -322,6 +322,7 @@ fn build_tools(tools: &[String]) -> Vec<OutletRegistration> {
             schema: scp_core::context::tools::OutletSchema {
                 input_schema: serde_json::Value::Object(serde_json::Map::default()),
                 output_schema: serde_json::Value::Object(serde_json::Map::default()),
+                aggregate_schema: None,
             },
             implementation_hash: [0u8; 32],
             test_vectors: vec![],

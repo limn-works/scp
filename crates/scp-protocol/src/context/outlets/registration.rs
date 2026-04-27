@@ -387,6 +387,7 @@ mod tests {
         OutletSchema {
             input_schema: json!({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}),
             output_schema: json!({"type": "object", "properties": {"r": {"type": "string"}}}),
+            aggregate_schema: None,
         }
     }
 

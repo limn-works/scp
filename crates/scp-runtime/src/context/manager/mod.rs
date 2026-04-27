@@ -86,11 +86,13 @@ mod queries;
 // `manager::*` path as the chain-depth helpers.
 pub use outlets::{
     CATALOG_ROTATION_DWELL_SECS, CatalogRotationDwellRejection, CrossContextHopAccepted,
-    OuterCallerStems, OutletAmplificationError, OutletErrorWrapView, OutletInterfaceDefaults,
-    action_chain_budget, amplification_error_to_context,
+    CrossContextInvokeInputs, CrossContextStreamBridge, CrossContextStreamCompletion,
+    CrossContextStreamEventHandle, OuterCallerStems, OutletAmplificationError, OutletErrorWrapView,
+    OutletInterfaceDefaults, action_chain_budget, amplification_error_to_context,
     catalog_rotation_dwell_rejection_to_context, cross_context_invoke,
-    cross_context_rate_tier_default, origin_kind_from_ucan_stem, query_chain_budget,
-    record_amplification_rejection, validate_catalog_rotation_dwell_time, wrap_cross_context_error,
+    cross_context_rate_tier_default, invoke_outlet_cross_context, origin_kind_from_ucan_stem,
+    query_chain_budget, record_amplification_rejection, validate_catalog_rotation_dwell_time,
+    wrap_cross_context_error,
 };
 pub(crate) mod standing;
 mod trust_recovery;

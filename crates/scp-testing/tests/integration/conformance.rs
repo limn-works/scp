@@ -2273,6 +2273,7 @@ fn conf_047_outlet_registration_v2_catalog_and_description_hashes() {
         schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}),
             output_schema: serde_json::json!({"type": "object", "properties": {"r": {"type": "string"}}}),
+            aggregate_schema: None,
         },
         implementation_hash: [0xAB; 32],
         test_vectors: Vec::new(),

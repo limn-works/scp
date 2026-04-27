@@ -65,6 +65,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 "required": ["result"]
             }),
+            aggregate_schema: None,
         },
         implementation_hash: [0xAA; 32],
         test_vectors: vec![],

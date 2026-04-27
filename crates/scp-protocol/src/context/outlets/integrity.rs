@@ -359,6 +359,7 @@ mod tests {
             schema: OutletSchema {
                 input_schema: json!({"type": "object"}),
                 output_schema: json!({"type": "object"}),
+                aggregate_schema: None,
             },
             implementation_hash: [0u8; 32],
             test_vectors,

@@ -1312,6 +1312,7 @@ async fn application_layer_demo() {
                     "total": { "type": "integer" }
                 }
             }),
+            aggregate_schema: None,
         },
         implementation_hash: [0xAB; 32],
         test_vectors: vec![],
@@ -1367,6 +1368,7 @@ async fn application_layer_demo() {
                     "operation": { "type": "string" }
                 }
             }),
+            aggregate_schema: None,
         },
         implementation_hash: [0xCD; 32],
         test_vectors: vec![],

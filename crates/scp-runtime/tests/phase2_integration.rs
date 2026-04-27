@@ -346,6 +346,7 @@ async fn phase2_end_to_end_integration() {
             schema: OutletSchema {
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: serde_json::json!({"type": "object"}),
+                aggregate_schema: None,
             },
             implementation_hash: [0u8; 32],
             test_vectors: vec![],
@@ -403,6 +404,7 @@ async fn phase2_end_to_end_integration() {
                     "result": {"type": "number"}
                 }
             }),
+            aggregate_schema: None,
         },
         implementation_hash: [0xAB; 32],
         test_vectors: vec![],

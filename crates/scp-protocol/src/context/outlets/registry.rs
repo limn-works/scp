@@ -37,12 +37,60 @@ use crate::context::roles::ContextRoleState;
 ///
 /// Both `input_schema` and `output_schema` must be valid JSON Schema objects
 /// (at minimum, a JSON object with a `"type"` field). See spec section 8.5.
+///
+/// Streaming outlets (§5.4.5) MAY additionally declare an `aggregate_schema`
+/// describing the shape of the terminal `End.aggregate` value. When present,
+/// it is validated by the cross-context chunk bridge (SCP-OUT-036) at stream
+/// close. When absent, the runtime falls back to validating `End.aggregate`
+/// against `output_schema` per §5.4.5 ("matches `aggregate_schema` or
+/// defaults to last Data").
+///
+/// # Backward compatibility
+///
+/// `aggregate_schema` is `Option` and is omitted from `MessagePack` /
+/// `serde_json` output via `skip_serializing_if = "Option::is_none"`. A
+/// pre-OUT-036 registration deserializes with `aggregate_schema = None`,
+/// and round-trip serialization of a `None`-valued schema is byte-identical
+/// to the pre-OUT-036 form — `schema_hash` (§5.4.1) is preserved across
+/// upgrades, so existing operator signatures remain valid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutletSchema {
     /// JSON Schema describing the tool's expected input.
     pub input_schema: serde_json::Value,
     /// JSON Schema describing the tool's output.
     pub output_schema: serde_json::Value,
+    /// JSON Schema describing the terminal aggregate value emitted by a
+    /// streaming outlet's `End` chunk (§5.4.5). Optional — when absent,
+    /// `End.aggregate` is validated against `output_schema` per the §5.4.5
+    /// "matches `aggregate_schema` or defaults to last Data" rule.
+    ///
+    /// Serialized only when `Some`, preserving byte-for-byte `MessagePack`
+    /// compatibility with pre-OUT-036 registrations whose `schema_hash`
+    /// (§5.4.1) was computed over a 2-field schema body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aggregate_schema: Option<serde_json::Value>,
+}
+
+impl OutletSchema {
+    /// Constructs a non-streaming `OutletSchema` (no `aggregate_schema`).
+    ///
+    /// Convenience constructor for the common pre-OUT-036 case. Use
+    /// [`Self::with_aggregate_schema`] to attach the aggregate schema.
+    #[must_use]
+    pub const fn new(input_schema: serde_json::Value, output_schema: serde_json::Value) -> Self {
+        Self {
+            input_schema,
+            output_schema,
+            aggregate_schema: None,
+        }
+    }
+
+    /// Returns a copy of this schema with `aggregate_schema` set.
+    #[must_use]
+    pub fn with_aggregate_schema(mut self, schema: serde_json::Value) -> Self {
+        self.aggregate_schema = Some(schema);
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -641,6 +689,7 @@ mod tests {
                         "result": {"type": "number"}
                     }
                 }),
+                aggregate_schema: None,
             },
             implementation_hash: [0xAB; 32],
             test_vectors: vec![
@@ -749,6 +798,7 @@ mod tests {
                     "result": {"type": "string"}
                 }
             }),
+            aggregate_schema: None,
         };
 
         let result = register_outlet(
@@ -786,6 +836,7 @@ mod tests {
             output_schema: serde_json::json!({
                 "type": "object"
             }),
+            aggregate_schema: None,
         };
 
         let result = register_outlet(
@@ -1291,10 +1342,107 @@ mod tests {
         let schema = OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "string"}),
+            aggregate_schema: None,
         };
         let json = serde_json::to_string(&schema).unwrap();
         let deserialized: OutletSchema = serde_json::from_str(&json).unwrap();
         assert_eq!(schema, deserialized);
+    }
+
+    /// AC (SCP-OUT-036): `aggregate_schema: None` is omitted from JSON
+    /// and `MessagePack` output, so adding the field does not change the
+    /// `schema_hash` (§5.4.1) for existing pre-OUT-036 registrations.
+    /// Critical for signature compatibility — operators MUST NOT have
+    /// to re-sign every registration on the version bump.
+    #[test]
+    fn outlet_schema_omits_none_aggregate_schema_from_serialization() {
+        // Locally-scoped helper type — declared at the top of the test
+        // body so the items-after-statements lint stays happy.
+        #[derive(Serialize)]
+        struct LegacyOutletSchema {
+            input_schema: serde_json::Value,
+            output_schema: serde_json::Value,
+        }
+
+        let with_none = OutletSchema {
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: serde_json::json!({"type": "string"}),
+            aggregate_schema: None,
+        };
+        let json = serde_json::to_string(&with_none).unwrap();
+        // The JSON output must NOT contain the `aggregate_schema` key.
+        assert!(
+            !json.contains("aggregate_schema"),
+            "None aggregate_schema must be omitted; got {json}"
+        );
+        // MessagePack output should also omit the field. We compare the
+        // bytes against a hand-constructed pre-OUT-036 form.
+        let bytes_new = rmp_serde::to_vec(&with_none).unwrap();
+        let legacy = LegacyOutletSchema {
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: serde_json::json!({"type": "string"}),
+        };
+        let bytes_legacy = rmp_serde::to_vec(&legacy).unwrap();
+        assert_eq!(
+            bytes_new, bytes_legacy,
+            "MessagePack serialization with aggregate_schema=None must match the pre-OUT-036 \
+             2-field encoding byte-for-byte"
+        );
+    }
+
+    /// AC (SCP-OUT-036): `aggregate_schema: Some(...)` round-trips
+    /// through JSON and `MessagePack`. Aggregate schema content survives
+    /// serialization without loss.
+    #[test]
+    fn outlet_schema_with_aggregate_schema_roundtrips() {
+        let schema = OutletSchema {
+            input_schema: serde_json::json!({"type": "object"}),
+            output_schema: serde_json::json!({"type": "object",
+                "properties": {"chunk": {"type": "integer"}}}),
+            aggregate_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "total": {"type": "integer"},
+                    "summary": {"type": "string"}
+                },
+                "required": ["total", "summary"]
+            })),
+        };
+
+        // JSON roundtrip.
+        let json = serde_json::to_string(&schema).unwrap();
+        assert!(
+            json.contains("aggregate_schema"),
+            "Some aggregate_schema must appear in JSON; got {json}"
+        );
+        let parsed: OutletSchema = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, schema);
+
+        // `MessagePack` roundtrip.
+        let bytes = rmp_serde::to_vec(&schema).unwrap();
+        let parsed_mp: OutletSchema = rmp_serde::from_slice(&bytes).unwrap();
+        assert_eq!(parsed_mp, schema);
+    }
+
+    /// AC (SCP-OUT-036): `OutletSchema::new` constructs a 2-field schema
+    /// with `aggregate_schema = None`. `with_aggregate_schema` attaches.
+    #[test]
+    fn outlet_schema_constructors() {
+        let two_field = OutletSchema::new(
+            serde_json::json!({"type": "object"}),
+            serde_json::json!({"type": "string"}),
+        );
+        assert!(two_field.aggregate_schema.is_none());
+
+        let with_agg = two_field
+            .clone()
+            .with_aggregate_schema(serde_json::json!({"type": "object"}));
+        assert_eq!(
+            with_agg.aggregate_schema,
+            Some(serde_json::json!({"type": "object"}))
+        );
+        // The original is unmodified.
+        assert!(two_field.aggregate_schema.is_none());
     }
 
     #[test]
@@ -1386,6 +1534,7 @@ mod tests {
                     "sum": {"type": "number"}
                 }
             }),
+            aggregate_schema: None,
         };
         new_reg.test_vectors = vec![];
 

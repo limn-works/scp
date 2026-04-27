@@ -334,6 +334,7 @@ pub async fn outlet_register(
         schema: scp_core::context::tools::OutletSchema {
             input_schema,
             output_schema,
+            aggregate_schema: None,
         },
         implementation_hash,
         test_vectors,
@@ -1305,6 +1306,7 @@ fn build_outlet_registration_from_napi(
         schema: scp_core::context::tools::OutletSchema {
             input_schema,
             output_schema,
+            aggregate_schema: None,
         },
         implementation_hash,
         test_vectors,

@@ -2444,6 +2444,7 @@ mod tests {
                                 "result": {"type": "number"}
                             }
                         }),
+                        aggregate_schema: None,
                     },
                     implementation_hash: [0xAA; 32],
                     test_vectors: vec![],

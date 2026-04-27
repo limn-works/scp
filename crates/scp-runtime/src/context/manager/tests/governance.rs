@@ -965,6 +965,7 @@ async fn register_outlet_rejected_without_ceiling_capability() {
         schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
+            aggregate_schema: None,
         },
         implementation_hash: [0u8; 32],
         test_vectors: vec![],
@@ -1011,6 +1012,7 @@ async fn register_outlet_succeeds_with_ceiling_capability() {
         schema: OutletSchema {
             input_schema: serde_json::json!({"type": "object"}),
             output_schema: serde_json::json!({"type": "object"}),
+            aggregate_schema: None,
         },
         implementation_hash: [0u8; 32],
         test_vectors: vec![],
@@ -8064,6 +8066,7 @@ async fn test_outlet_call_setup(
                     "status": {"type": "string"}
                 }
             }),
+            aggregate_schema: None,
         },
         implementation_hash: [0xAA; 32],
         test_vectors: vec![],

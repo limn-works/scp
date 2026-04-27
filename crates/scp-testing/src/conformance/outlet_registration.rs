@@ -167,6 +167,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             schema: OutletSchema {
                 input_schema: json!({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}),
                 output_schema: json!({"type": "object", "properties": {"r": {"type": "string"}}}),
+                aggregate_schema: None,
             },
             implementation_hash: sha256_label(b"minimal-query-implementation"),
             test_vectors: Vec::new(),
@@ -190,6 +191,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             schema: OutletSchema {
                 input_schema: json!({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}),
                 output_schema: json!({"type": "object", "properties": {"r": {"type": "string"}}}),
+                aggregate_schema: None,
             },
             implementation_hash: sha256_label(b"minimal-action-implementation"),
             test_vectors: Vec::new(),
@@ -213,6 +215,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             schema: OutletSchema {
                 input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}, "k": {"type": "string"}}}),
                 output_schema: json!({"type": "object", "properties": {"v": {"type": "string"}, "meta": {"type": "object"}}}),
+                aggregate_schema: None,
             },
             implementation_hash: sha256_label(b"query-cost-none-implementation"),
             test_vectors: Vec::new(),
@@ -236,6 +239,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             schema: OutletSchema {
                 input_schema: json!({"type": "object", "properties": {"key": {"type": "string"}, "tier": {"type": "string"}}}),
                 output_schema: json!({"type": "object", "properties": {"value": {"type": "string"}}}),
+                aggregate_schema: None,
             },
             implementation_hash: sha256_label(b"query-cost-zero-implementation"),
             test_vectors: Vec::new(),
@@ -264,6 +268,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             schema: OutletSchema {
                 input_schema: json!({"type": "object", "properties": {"target": {"type": "string"}, "amount": {"type": "integer"}}}),
                 output_schema: json!({"type": "object", "properties": {"receipt": {"type": "string"}, "ts": {"type": "integer"}}}),
+                aggregate_schema: None,
             },
             implementation_hash: sha256_label(b"action-cost-positive-implementation"),
             test_vectors: Vec::new(),
@@ -301,6 +306,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
                         "aggregate": {"type": "object", "properties": {"full_text": {"type": "string"}, "tokens": {"type": "integer"}}}
                     }
                 }),
+                aggregate_schema: None,
             },
             implementation_hash: sha256_label(b"aggregate-schema-implementation"),
             test_vectors: Vec::new(),
@@ -334,6 +340,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
                     }
                 }),
                 output_schema: json!({"type": "object", "properties": {"r": {"type": "string"}}}),
+                aggregate_schema: None,
             },
             implementation_hash: sha256_label(b"max-size-schema-implementation"),
             test_vectors: Vec::new(),
@@ -366,6 +373,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             schema: OutletSchema {
                 input_schema: json!({"type": "object", "properties": {"n": {"type": "integer"}, "tag": {"type": "string"}}}),
                 output_schema: json!({"type": "object", "properties": {"square": {"type": "integer"}}}),
+                aggregate_schema: None,
             },
             implementation_hash: sha256_label(b"hundred-vectors-implementation"),
             test_vectors: hundred_vectors,
@@ -396,6 +404,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             schema: OutletSchema {
                 input_schema: json!({"type": "object", "properties": {"prompt": {"type": "string"}, "max_tokens": {"type": "integer"}}}),
                 output_schema: json!({"type": "object", "properties": {"completion": {"type": "string"}}}),
+                aggregate_schema: None,
             },
             implementation_hash: llm_impl_hash,
             test_vectors: Vec::new(),
@@ -425,6 +434,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             schema: OutletSchema {
                 input_schema: json!({"type": "object", "properties": {"endpoint": {"type": "string"}, "params": {"type": "object"}}}),
                 output_schema: json!({"type": "object", "properties": {"status": {"type": "integer"}, "body": {"type": "object"}}}),
+                aggregate_schema: None,
             },
             implementation_hash: remote_impl_hash,
             test_vectors: Vec::new(),
@@ -462,6 +472,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
                     "required": ["recipient", "amount"]
                 }),
                 output_schema: json!({"type": "object", "properties": {"tx_id": {"type": "string"}, "confirmed": {"type": "boolean"}}}),
+                aggregate_schema: None,
             },
             implementation_hash: sha256_label(b"multi-caveat-implementation"),
             test_vectors: Vec::new(),
@@ -499,6 +510,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
                     "required": ["source_context", "target_resource"]
                 }),
                 output_schema: json!({"type": "object", "properties": {"acknowledged": {"type": "boolean"}, "echo_id": {"type": "string"}}}),
+                aggregate_schema: None,
             },
             implementation_hash: sha256_label(b"cross-context-implementation"),
             test_vectors: Vec::new(),
@@ -537,6 +549,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             schema: OutletSchema {
                 input_schema: json!({"type": "object", "properties": {"a": {"type": "string"}, "b": {"type": "string"}}}),
                 output_schema: json!({"type": "object", "properties": {"r": {"type": "string"}}}),
+                aggregate_schema: None,
             },
             implementation_hash: sha256_label(b"catalog-small-implementation"),
             test_vectors: Vec::new(),
@@ -578,6 +591,7 @@ pub fn reference_registrations() -> Vec<(String, String, OutletRegistration)> {
             schema: OutletSchema {
                 input_schema: json!({"type": "object", "properties": {"q": {"type": "string"}, "k": {"type": "string"}}}),
                 output_schema: json!({"type": "object", "properties": {"v": {"type": "string"}}}),
+                aggregate_schema: None,
             },
             implementation_hash: sha256_label(b"catalog-large-implementation"),
             test_vectors: Vec::new(),
@@ -1057,6 +1071,7 @@ pub fn registration_from_json_input(
         schema: OutletSchema {
             input_schema,
             output_schema,
+            aggregate_schema: None,
         },
         implementation_hash,
         test_vectors,

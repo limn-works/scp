@@ -1931,6 +1931,7 @@ mod tests {
                         "result": {"type": "number"}
                     }
                 }),
+                aggregate_schema: None,
             },
             implementation_hash: [0xAA; 32],
             test_vectors: vec![],
@@ -3032,6 +3033,7 @@ mod tests {
                 schema: OutletSchema {
                     input_schema: serde_json::json!({"type": "object", "properties": {"a": {"type": "number"}, "b": {"type": "number"}}}),
                     output_schema: serde_json::json!({"type": "object", "properties": {"r": {"type": "number"}}}),
+                    aggregate_schema: None,
                 },
                 implementation_hash: [0u8; 32],
                 test_vectors: vec![],
@@ -3704,6 +3706,7 @@ mod tests {
             schema: OutletSchema {
                 input_schema: serde_json::json!({"type": "object"}),
                 output_schema: serde_json::json!({"type": "object"}),
+                aggregate_schema: None,
             },
             implementation_hash: [0xBB; 32],
             test_vectors: vec![],

@@ -2777,6 +2777,7 @@ fn strict_output_tool_registration(id: &str) -> OutletRegistration {
                 },
                 "required": ["result"]
             }),
+            aggregate_schema: None,
         },
         implementation_hash: [0u8; 32],
         test_vectors: vec![OutletTestVector {

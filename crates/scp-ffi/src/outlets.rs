@@ -373,6 +373,7 @@ pub fn py_outlet_register(context_id: &str, registration: &Bound<'_, PyDict>) ->
         schema: scp_core::context::tools::OutletSchema {
             input_schema,
             output_schema,
+            aggregate_schema: None,
         },
         implementation_hash,
         test_vectors,
@@ -1759,6 +1760,7 @@ fn build_outlet_registration_from_py(
         schema: scp_core::context::tools::OutletSchema {
             input_schema,
             output_schema,
+            aggregate_schema: None,
         },
         implementation_hash,
         test_vectors,
