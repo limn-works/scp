@@ -207,14 +207,24 @@ struct StdioTransportInner {
 }
 
 impl StdioMcpTransport {
-    fn spawn(command: &[String]) -> Result<Self, String> {
+    fn spawn(
+        allowlist: &Mutex<allowlist::StdioAllowlist>,
+        command: &[String],
+    ) -> Result<Self, String> {
         let (cmd, args) = command
             .split_first()
             .ok_or_else(|| "command list is empty".to_owned())?;
 
-        // Validate the command against the stdio allowlist (defense-in-depth).
-        // Uses the validated basename for Command::new to prevent path bypass.
-        let basename = allowlist::validate_command(cmd).map_err(|e| e.to_string())?;
+        // Validate the command against the per-instance stdio allowlist
+        // (defense-in-depth). Uses the validated basename for Command::new
+        // to prevent path bypass. Hold the lock only across `validate_command`,
+        // then drop before spawning.
+        let basename = {
+            let guard = allowlist
+                .lock()
+                .map_err(|_| "stdio allowlist lock poisoned".to_owned())?;
+            guard.validate_command(cmd).map_err(|e| e.to_string())?
+        };
 
         let mut child = Command::new(&basename)
             .args(args)
@@ -615,7 +625,7 @@ pub(crate) async fn mcp_client_connect_stdio_on(
         .into());
     }
 
-    let transport = StdioMcpTransport::spawn(&command).map_err(|e| {
+    let transport = StdioMcpTransport::spawn(bi.core.mcp_allowlist(), &command).map_err(|e| {
         napi::Error::from(ScpNapiError::Transport {
             message: format!("failed to connect stdio MCP client: {e}"),
             code: codes::TRANS_5015.to_owned(),
@@ -803,6 +813,11 @@ pub(crate) async fn mcp_client_invoke_on(
 /// Input-validation errors map to `Validation`. Runtime/policy errors
 /// map to `Transport`. Exhaustive match ensures new variants produce
 /// a compile error instead of silently falling through.
+///
+/// Mutex poisoning is NOT modelled by `AllowlistError` — the allowlist
+/// is now per-instance (`CoreFields::mcp_allowlist`). Each call site maps
+/// `PoisonError` to its own typed transport error before invoking allowlist
+/// methods.
 #[allow(clippy::needless_pass_by_value)]
 fn allowlist_err(e: allowlist::AllowlistError) -> ScpNapiError {
     use scp_mcp::allowlist::AllowlistError;
@@ -817,12 +832,19 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpNapiError {
             message: msg,
             code: codes::VALID_7033.to_owned(),
         },
-        AllowlistError::NotAllowed { .. } | AllowlistError::LockPoisoned => {
-            ScpNapiError::Transport {
-                message: msg,
-                code: codes::TRANS_5030.to_owned(),
-            }
-        }
+        AllowlistError::NotAllowed { .. } => ScpNapiError::Transport {
+            message: msg,
+            code: codes::TRANS_5030.to_owned(),
+        },
+    }
+}
+
+/// Maps a `PoisonError` from the per-instance allowlist mutex to a NAPI
+/// transport error.
+fn allowlist_lock_poisoned() -> ScpNapiError {
+    ScpNapiError::Transport {
+        message: "stdio allowlist lock poisoned".to_owned(),
+        code: codes::TRANS_5030.to_owned(),
     }
 }
 
@@ -841,41 +863,125 @@ pub struct NapiAllowlistState {
 
 /// Per-bridge-instance implementation of `mcp_configure_stdio_allowlist`.
 ///
-/// The stdio allowlist is currently a process-global singleton inside
-/// `scp-mcp::allowlist`, so the `bi` argument is carried for API symmetry
-/// today but does not scope state. When the allowlist is moved onto
-/// [`NapiBridgeInstance`] the wiring here will already be in place.
+/// Operates on `bi.core.mcp_allowlist()` — disabling enforcement or
+/// extending the allow set on one `Scp` does NOT leak into another instance
+/// (#1543 PR-D).
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn mcp_configure_stdio_allowlist_on(
-    _bi: &NapiBridgeInstance,
+    bi: &NapiBridgeInstance,
     additional_binaries: Vec<String>,
 ) -> napi::Result<()> {
-    allowlist::configure(&additional_binaries).map_err(|e| napi::Error::from(allowlist_err(e)))?;
+    let mut guard = bi
+        .core
+        .mcp_allowlist()
+        .lock()
+        .map_err(|_| napi::Error::from(allowlist_lock_poisoned()))?;
+    guard
+        .configure(&additional_binaries)
+        .map_err(|e| napi::Error::from(allowlist_err(e)))?;
     Ok(())
 }
 
 /// Per-bridge-instance implementation of `mcp_disable_stdio_allowlist`.
-/// See [`mcp_configure_stdio_allowlist_on`] for `bi` rationale.
-pub(crate) fn mcp_disable_stdio_allowlist_on(_bi: &NapiBridgeInstance) -> napi::Result<()> {
-    allowlist::disable_enforcement().map_err(|e| napi::Error::from(allowlist_err(e)))?;
+///
+/// Disables enforcement on THIS instance only. Other `Scp` instances are
+/// unaffected.
+pub(crate) fn mcp_disable_stdio_allowlist_on(bi: &NapiBridgeInstance) -> napi::Result<()> {
+    let mut guard = bi
+        .core
+        .mcp_allowlist()
+        .lock()
+        .map_err(|_| napi::Error::from(allowlist_lock_poisoned()))?;
+    guard.disable_enforcement();
     Ok(())
 }
 
 /// Per-bridge-instance implementation of `mcp_reset_stdio_allowlist`.
-/// See [`mcp_configure_stdio_allowlist_on`] for `bi` rationale.
-pub(crate) fn mcp_reset_stdio_allowlist_on(_bi: &NapiBridgeInstance) -> napi::Result<()> {
-    allowlist::reset().map_err(|e| napi::Error::from(allowlist_err(e)))?;
+///
+/// Resets THIS instance's allowlist to defaults; does not affect peers.
+pub(crate) fn mcp_reset_stdio_allowlist_on(bi: &NapiBridgeInstance) -> napi::Result<()> {
+    let mut guard = bi
+        .core
+        .mcp_allowlist()
+        .lock()
+        .map_err(|_| napi::Error::from(allowlist_lock_poisoned()))?;
+    guard.reset();
     Ok(())
 }
 
 /// Per-bridge-instance implementation of `mcp_get_stdio_allowlist`.
-/// See [`mcp_configure_stdio_allowlist_on`] for `bi` rationale.
+///
+/// Returns a snapshot of THIS instance's allowlist.
 pub(crate) fn mcp_get_stdio_allowlist_on(
-    _bi: &NapiBridgeInstance,
+    bi: &NapiBridgeInstance,
 ) -> napi::Result<NapiAllowlistState> {
-    let state = allowlist::get_state().map_err(|e| napi::Error::from(allowlist_err(e)))?;
+    let guard = bi
+        .core
+        .mcp_allowlist()
+        .lock()
+        .map_err(|_| napi::Error::from(allowlist_lock_poisoned()))?;
+    let state = guard.snapshot();
+    drop(guard);
     Ok(NapiAllowlistState {
         allowed: state.allowed,
         unrestricted: state.unrestricted,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use crate::runtime::NapiBridgeInstance;
+
+    /// WU6: Two-instance regression test — disabling enforcement on one
+    /// `NapiBridgeInstance` MUST NOT leak into another.
+    #[test]
+    fn allowlist_disable_does_not_leak_across_instances_napi() {
+        use scp_mcp::allowlist::AllowlistError;
+
+        let a = NapiBridgeInstance::new_napi();
+        let b = NapiBridgeInstance::new_napi();
+
+        a.core.mcp_allowlist().lock().unwrap().disable_enforcement();
+
+        // `b` is unaffected and rejects unlisted commands.
+        let res = b
+            .core
+            .mcp_allowlist()
+            .lock()
+            .unwrap()
+            .validate_command("sh");
+        assert!(
+            matches!(res, Err(AllowlistError::NotAllowed { .. })),
+            "expected NotAllowed on isolated instance, got {res:?}"
+        );
+
+        // Sanity: `a`'s snapshot reports unrestricted.
+        let a_state = a.core.mcp_allowlist().lock().unwrap().snapshot();
+        assert!(a_state.unrestricted);
+        // `b` snapshot stays restricted.
+        let b_state = b.core.mcp_allowlist().lock().unwrap().snapshot();
+        assert!(!b_state.unrestricted);
+    }
+
+    /// WU6 supplement: `configure_on` on one instance must not bleed into
+    /// another's allow set.
+    #[test]
+    fn allowlist_configure_does_not_leak_across_instances_napi() {
+        let a = NapiBridgeInstance::new_napi();
+        let b = NapiBridgeInstance::new_napi();
+
+        mcp_configure_stdio_allowlist_on(&a, vec!["custom-a".to_owned()]).expect("configure on a");
+
+        let a_state = mcp_get_stdio_allowlist_on(&a).expect("snapshot a");
+        assert!(a_state.allowed.contains(&"custom-a".to_owned()));
+
+        let b_state = mcp_get_stdio_allowlist_on(&b).expect("snapshot b");
+        assert!(!b_state.allowed.contains(&"custom-a".to_owned()));
+    }
 }

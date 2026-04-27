@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "_generated_from": "crates/scp-testing/tests/integration/ffi_conformance.rs — PARITY_OPERATIONS + per-bridge alias match arms",
+  "_generated_from": "crates/scp-testing/tests/integration/ffi_conformance.rs \u2014 PARITY_OPERATIONS + per-bridge alias match arms",
   "operations": [
     {
       "canonical": "identity_create",
@@ -2687,7 +2687,7 @@
       "category": "mcp",
       "wasm_required": false,
       "pyo3": [
-        "py_mcp_configure_stdio_allowlist"
+        "mcp_configure_stdio_allowlist"
       ],
       "uniffi": [
         "mcp_configure_stdio_allowlist"
@@ -2704,7 +2704,7 @@
       "category": "mcp",
       "wasm_required": false,
       "pyo3": [
-        "py_mcp_disable_stdio_allowlist"
+        "mcp_disable_stdio_allowlist"
       ],
       "uniffi": [
         "mcp_disable_stdio_allowlist"
@@ -2721,7 +2721,7 @@
       "category": "mcp",
       "wasm_required": false,
       "pyo3": [
-        "py_mcp_reset_stdio_allowlist"
+        "mcp_reset_stdio_allowlist"
       ],
       "uniffi": [
         "mcp_reset_stdio_allowlist"
@@ -2738,7 +2738,7 @@
       "category": "mcp",
       "wasm_required": false,
       "pyo3": [
-        "py_mcp_get_stdio_allowlist"
+        "mcp_get_stdio_allowlist"
       ],
       "uniffi": [
         "mcp_get_stdio_allowlist"
@@ -2868,7 +2868,7 @@
       "wasm": [
         "identity_create_link_attestation"
       ],
-      "_note": "WASM diverges from native bridges in attestation signer key. PyO3/NAPI/UniFFI sign with core_id.active_signing_key (#active per spec §3.5.1; crates/scp-ffi/src/identity.rs and equivalents in napi/uniffi). WASM identity_create_link_attestation (crates/scp-ffi/wasm/src/identity.rs:2632) signs with signing_key_bytes (#0 identity key per spec §3.5.2). Cross-bridge verification must know the issuer bridge to choose the correct verification key. Symmetry harness must NOT treat these as byte-equivalent operations. Tracked for spec-vs-impl reconciliation (align WASM to #active or formally document #0 per spec §3.5.2); see ADR-048 §7 + .docs/lessons/per-sdk-idiom-not-cross-language-dogma.md."
+      "_note": "WASM diverges from native bridges in attestation signer key. PyO3/NAPI/UniFFI sign with core_id.active_signing_key (#active per spec \u00a73.5.1; crates/scp-ffi/src/identity.rs and equivalents in napi/uniffi). WASM identity_create_link_attestation (crates/scp-ffi/wasm/src/identity.rs:2632) signs with signing_key_bytes (#0 identity key per spec \u00a73.5.2). Cross-bridge verification must know the issuer bridge to choose the correct verification key. Symmetry harness must NOT treat these as byte-equivalent operations. Tracked for spec-vs-impl reconciliation (align WASM to #active or formally document #0 per spec \u00a73.5.2); see ADR-048 \u00a77 + .docs/lessons/per-sdk-idiom-not-cross-language-dogma.md."
     },
     {
       "canonical": "node_start_in_memory",

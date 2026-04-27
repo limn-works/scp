@@ -40,12 +40,15 @@ Example usage::
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 from types import TracebackType
 from typing import Any, Literal, TypedDict
 
 from scp_sdk.errors import ScpError
 from scp_sdk.types import CustodyType
+
+logger = logging.getLogger("scp_sdk")
 
 __all__ = ["SCP", "InMemoryStorage", "SqliteStorage", "StorageConfig"]
 
@@ -1025,12 +1028,95 @@ class SCP:
         return McpClient(raw)
 
     async def mcp_client_connect_stdio(self, command: list[str]) -> Any:
-        """Connect an MCP client via stdio transport (returns :class:`McpClient`)."""
+        """Connect an MCP client via stdio transport (returns :class:`McpClient`).
+
+        Pre-flight allowlist check uses THIS instance's allowlist
+        (#1543 PR-D, ADR-048 §1).
+        """
         from scp_sdk.mcp import McpClient, validate_client_connect
 
-        validate_client_connect("stdio", command=command)
+        # Snapshot this instance's per-instance allowlist for defense-in-depth
+        # validation before round-tripping into the FFI bridge.
+        allowlist_state = self.mcp_get_stdio_allowlist()
+        validate_client_connect("stdio", command=command, allowlist_state=allowlist_state)
         raw = await asyncio.to_thread(self._native.py_mcp_client_connect_stdio, command)
         return McpClient(raw)
+
+    def mcp_configure_stdio_allowlist(
+        self,
+        additional_binaries: list[str] | None = None,
+    ) -> None:
+        """Add binary names to THIS instance's stdio allowlist.
+
+        Operates on the per-instance allowlist (`CoreFields::mcp_allowlist`)
+        — disabling enforcement or extending the allow set on one
+        :class:`SCP` does NOT leak into another instance.
+
+        Args:
+            additional_binaries: Bare binary names to add (e.g.
+                ``["my-custom-server"]``). Path separators, empty strings,
+                and NUL bytes are rejected.
+
+        Raises:
+            ValidationError: If any entry is invalid.
+        """
+        if not additional_binaries:
+            return
+        self._native.mcp_configure_stdio_allowlist(additional_binaries)
+
+    def mcp_disable_stdio_allowlist(
+        self,
+        *,
+        i_trust_all_commands: bool = False,
+    ) -> None:
+        """Disable THIS instance's stdio allowlist (unrestricted mode).
+
+        After calling this, **any** binary can be spawned as a subprocess
+        by THIS instance. Other :class:`SCP` instances are unaffected.
+
+        Args:
+            i_trust_all_commands: Must be ``True`` to confirm the security
+                bypass. Raises ``ValidationError`` if ``False``.
+
+        Raises:
+            ValidationError: If *i_trust_all_commands* is not ``True``.
+        """
+        from scp_sdk.errors import ValidationError
+
+        if not i_trust_all_commands:
+            raise ValidationError(
+                "You must pass i_trust_all_commands=True to disable the "
+                "stdio allowlist. This allows arbitrary command execution.",
+                code="SCP-MCP-10007",
+            )
+
+        logger.warning(
+            "MCP stdio allowlist DISABLED on SCP instance — arbitrary "
+            "commands will be permitted by THIS instance only. Other "
+            "SCP instances are unaffected."
+        )
+
+        self._native.mcp_disable_stdio_allowlist()
+
+    def mcp_reset_stdio_allowlist(self) -> None:
+        """Reset THIS instance's stdio allowlist to defaults.
+
+        Restores the default binaries, removes any additions, and
+        re-enables enforcement (clears unrestricted mode) for THIS
+        instance only.
+        """
+        self._native.mcp_reset_stdio_allowlist()
+        logger.info("MCP stdio allowlist reset to defaults on SCP instance")
+
+    def mcp_get_stdio_allowlist(self) -> dict[str, Any]:
+        """Return a snapshot of THIS instance's stdio allowlist state.
+
+        Returns:
+            A dict with keys:
+            - ``"allowed"``: sorted list of allowed binary names
+            - ``"unrestricted"``: ``True`` if the allowlist is bypassed
+        """
+        return self._native.mcp_get_stdio_allowlist()
 
     async def mcp_client_disconnect(self, handle: Any) -> Any:
         """Delegate to ``_scp_core.SCP.py_mcp_client_disconnect``.

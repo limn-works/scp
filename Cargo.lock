@@ -5128,6 +5128,7 @@ dependencies = [
  "scp-core",
  "scp-event-log",
  "scp-identity",
+ "scp-mcp",
  "scp-node",
  "scp-platform",
  "scp-primitives",

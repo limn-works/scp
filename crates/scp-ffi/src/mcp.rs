@@ -119,12 +119,22 @@ impl StdioClientTransport {
     /// # Errors
     ///
     /// Returns an error message if the subprocess fails to start.
-    fn spawn(command: &[String]) -> Result<Self, String> {
+    fn spawn(
+        allowlist: &Mutex<allowlist::StdioAllowlist>,
+        command: &[String],
+    ) -> Result<Self, String> {
         let (cmd, args) = command.split_first().ok_or("command list is empty")?;
 
-        // Validate the command against the stdio allowlist (defense-in-depth).
-        // Uses the validated basename for Command::new to prevent path bypass.
-        let basename = allowlist::validate_command(cmd).map_err(|e| e.to_string())?;
+        // Validate the command against the per-instance stdio allowlist
+        // (defense-in-depth). Uses the validated basename for Command::new
+        // to prevent path bypass. Hold the lock only across `validate_command`,
+        // then drop before spawning the subprocess.
+        let basename = {
+            let guard = allowlist
+                .lock()
+                .map_err(|_| "stdio allowlist lock poisoned".to_owned())?;
+            guard.validate_command(cmd).map_err(|e| e.to_string())?
+        };
 
         let mut child = Command::new(&basename)
             .args(args)
@@ -1641,8 +1651,9 @@ impl crate::scp::PyScp {
             );
         }
 
-        // Spawn the subprocess and create the transport.
-        let transport = StdioClientTransport::spawn(&command)
+        // Spawn the subprocess and create the transport. Allowlist is
+        // per-instance (lives on `CoreFields::mcp_allowlist`).
+        let transport = StdioClientTransport::spawn(bi.core.mcp_allowlist(), &command)
             .map_err(|e| ScpPyError::transport(format!("failed to connect stdio client: {e}")))?;
 
         // Create the MCP client and perform the initialize handshake.
@@ -2060,6 +2071,11 @@ fn probe_relay_for_known_contexts(
 /// Input-validation errors map to `ValidationError`. Runtime/policy errors
 /// map to `TransportError`. Exhaustive match ensures new variants produce
 /// a compile error instead of silently falling through.
+///
+/// Mutex poisoning is NOT modelled by `AllowlistError` — the allowlist
+/// type is now per-instance and the mutex lives on `CoreFields`. Each call
+/// site maps `PoisonError` to its own typed transport error before calling
+/// into the allowlist.
 #[allow(clippy::needless_pass_by_value)] // match on e consumes variants carrying String data.
 fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
     use scp_mcp::allowlist::AllowlistError;
@@ -2074,87 +2090,123 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
             message: msg,
             code: codes::VALID_7033.to_owned(),
         },
-        AllowlistError::NotAllowed { .. } | AllowlistError::LockPoisoned => {
-            ScpPyError::transport(msg)
-        }
+        AllowlistError::NotAllowed { .. } => ScpPyError::transport(msg),
     }
 }
 
 // ---------------------------------------------------------------------------
-// Stdio allowlist configuration (PyO3)
+// Stdio allowlist configuration (PyO3, per-instance)
 // ---------------------------------------------------------------------------
 
-/// Configures the MCP stdio subprocess allowlist.
-///
-/// By default, only well-known MCP server launchers are permitted (e.g.
-/// `uvx`, `npx`, `node`, `python3`). Use this function to extend the list.
-///
-/// # Arguments
-///
-/// * `additional_binaries` -- Binary basenames to add to the default allowlist.
-///
-/// # Errors
-///
-/// Raises `ValidationError` if any entry is invalid (path, NUL, empty).
-/// Raises `TransportError` if the allowlist lock is poisoned.
-#[pyfunction]
-#[pyo3(name = "py_mcp_configure_stdio_allowlist", signature = (additional_binaries=vec![]))]
-#[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for #[pyfunction] arguments.
-pub fn py_mcp_configure_stdio_allowlist(additional_binaries: Vec<String>) -> PyResult<()> {
-    allowlist::configure(&additional_binaries).map_err(allowlist_err)?;
-    Ok(())
+/// Maps a `PoisonError` from the per-instance allowlist mutex to a
+/// transport-level [`ScpPyError`].
+fn allowlist_lock_poisoned() -> ScpPyError {
+    ScpPyError::transport("stdio allowlist lock poisoned".to_owned())
 }
 
-/// Disable the stdio allowlist entirely (unrestricted mode).
+/// Per-instance MCP stdio allowlist methods on [`PyScp`].
 ///
-/// # Safety
-///
-/// This allows **any** binary to be spawned as a subprocess. Only use when
-/// the command source is fully trusted.
-///
-/// # Errors
-///
-/// Raises `TransportError` if the allowlist lock is poisoned.
-#[pyfunction]
-#[pyo3(name = "py_mcp_disable_stdio_allowlist")]
-pub fn py_mcp_disable_stdio_allowlist() -> PyResult<()> {
-    allowlist::disable_enforcement().map_err(allowlist_err)?;
-    Ok(())
-}
+/// The allowlist is owned by `CoreFields::mcp_allowlist` (one per bridge
+/// instance) — disabling enforcement on one `SCP` does not leak into another.
+#[pymethods]
+impl crate::scp::PyScp {
+    /// Configures this instance's MCP stdio subprocess allowlist.
+    ///
+    /// By default, only well-known MCP server launchers are permitted (e.g.
+    /// `uvx`, `npx`, `node`, `python3`). Call this method to extend the
+    /// per-instance allow set.
+    ///
+    /// # Arguments
+    ///
+    /// * `additional_binaries` -- Binary basenames to add to the allowlist.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if any entry is invalid (path, NUL, empty).
+    /// Raises `TransportError` if the allowlist lock is poisoned.
+    #[pyo3(name = "mcp_configure_stdio_allowlist", signature = (additional_binaries=vec![]))]
+    #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for method arguments.
+    pub fn mcp_configure_stdio_allowlist(&self, additional_binaries: Vec<String>) -> PyResult<()> {
+        let bi = &*self.inner;
+        let mut guard = bi
+            .core
+            .mcp_allowlist()
+            .lock()
+            .map_err(|_| allowlist_lock_poisoned())?;
+        guard
+            .configure(&additional_binaries)
+            .map_err(allowlist_err)?;
+        Ok(())
+    }
 
-/// Reset the stdio allowlist to its default state.
-///
-/// Restores the default binaries and re-enables allowlist enforcement
-/// (clears unrestricted mode).
-///
-/// # Errors
-///
-/// Raises `TransportError` if the allowlist lock is poisoned.
-#[pyfunction]
-#[pyo3(name = "py_mcp_reset_stdio_allowlist")]
-pub fn py_mcp_reset_stdio_allowlist() -> PyResult<()> {
-    allowlist::reset().map_err(allowlist_err)?;
-    Ok(())
-}
+    /// Disable this instance's stdio allowlist entirely (unrestricted mode).
+    ///
+    /// # Safety
+    ///
+    /// This allows **any** binary to be spawned as a subprocess by THIS
+    /// instance. Other `SCP` instances are unaffected. Only use when the
+    /// command source is fully trusted.
+    ///
+    /// # Errors
+    ///
+    /// Raises `TransportError` if the allowlist lock is poisoned.
+    #[pyo3(name = "mcp_disable_stdio_allowlist")]
+    pub fn mcp_disable_stdio_allowlist(&self) -> PyResult<()> {
+        let bi = &*self.inner;
+        let mut guard = bi
+            .core
+            .mcp_allowlist()
+            .lock()
+            .map_err(|_| allowlist_lock_poisoned())?;
+        guard.disable_enforcement();
+        Ok(())
+    }
 
-/// Return the current stdio allowlist state.
-///
-/// Returns a Python dict with keys:
-/// - `"allowed"`: sorted list of allowed binary names
-/// - `"unrestricted"`: bool indicating whether the allowlist is bypassed
-///
-/// # Errors
-///
-/// Raises `TransportError` if the allowlist lock is poisoned.
-#[pyfunction]
-#[pyo3(name = "py_mcp_get_stdio_allowlist")]
-pub fn py_mcp_get_stdio_allowlist(py: Python<'_>) -> PyResult<PyObject> {
-    let state = allowlist::get_state().map_err(allowlist_err)?;
+    /// Reset this instance's stdio allowlist to its default state.
+    ///
+    /// Restores the default binaries and re-enables allowlist enforcement
+    /// (clears unrestricted mode) for THIS instance only.
+    ///
+    /// # Errors
+    ///
+    /// Raises `TransportError` if the allowlist lock is poisoned.
+    #[pyo3(name = "mcp_reset_stdio_allowlist")]
+    pub fn mcp_reset_stdio_allowlist(&self) -> PyResult<()> {
+        let bi = &*self.inner;
+        let mut guard = bi
+            .core
+            .mcp_allowlist()
+            .lock()
+            .map_err(|_| allowlist_lock_poisoned())?;
+        guard.reset();
+        Ok(())
+    }
 
-    let dict = PyDict::new(py);
-    dict.set_item("allowed", state.allowed)?;
-    dict.set_item("unrestricted", state.unrestricted)?;
-    Ok(dict.into())
+    /// Return the current stdio allowlist state for this instance.
+    ///
+    /// Returns a Python dict with keys:
+    /// - `"allowed"`: sorted list of allowed binary names
+    /// - `"unrestricted"`: bool indicating whether the allowlist is bypassed
+    ///
+    /// # Errors
+    ///
+    /// Raises `TransportError` if the allowlist lock is poisoned.
+    #[pyo3(name = "mcp_get_stdio_allowlist")]
+    pub fn mcp_get_stdio_allowlist(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let bi = &*self.inner;
+        let guard = bi
+            .core
+            .mcp_allowlist()
+            .lock()
+            .map_err(|_| allowlist_lock_poisoned())?;
+        let state = guard.snapshot();
+        drop(guard);
+
+        let dict = PyDict::new(py);
+        dict.set_item("allowed", state.allowed)?;
+        dict.set_item("unrestricted", state.unrestricted)?;
+        Ok(dict.into())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2357,14 +2409,10 @@ impl crate::scp::PyScp {
 /// # Errors
 ///
 /// Returns `PyErr` if registration of functions fails.
-pub fn register_mcp(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // Stateful MCP operations are exposed as methods on `SCP`
-    // (Phase 4 PR 4 sub-slice D, #1549). Only pure allowlist helpers
-    // (module-global config in scp-mcp) remain as free pyfunctions.
-    m.add_function(wrap_pyfunction!(py_mcp_configure_stdio_allowlist, m)?)?;
-    m.add_function(wrap_pyfunction!(py_mcp_disable_stdio_allowlist, m)?)?;
-    m.add_function(wrap_pyfunction!(py_mcp_reset_stdio_allowlist, m)?)?;
-    m.add_function(wrap_pyfunction!(py_mcp_get_stdio_allowlist, m)?)?;
+pub const fn register_mcp(_m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // All MCP operations — including the stdio allowlist (#1543 PR-D) — are
+    // now methods on `SCP`. PyO3 registers `#[pymethods]` automatically with
+    // the class, so this function has nothing to wire up here.
     Ok(())
 }
 
@@ -3292,10 +3340,11 @@ mod tests {
 
     #[test]
     fn stdio_client_transport_spawn_rejects_unlisted_command() {
-        allowlist::reset().unwrap();
-        let result = StdioClientTransport::spawn(&[
-            "nonexistent_command_that_does_not_exist_12345".to_owned(),
-        ]);
+        let allowlist = Mutex::new(allowlist::StdioAllowlist::new_with_defaults());
+        let result = StdioClientTransport::spawn(
+            &allowlist,
+            &["nonexistent_command_that_does_not_exist_12345".to_owned()],
+        );
         match result {
             Err(msg) => assert!(
                 msg.contains("allowlist"),
@@ -3307,8 +3356,40 @@ mod tests {
 
     #[test]
     fn stdio_client_transport_empty_command() {
-        let result = StdioClientTransport::spawn(&[]);
+        let allowlist = Mutex::new(allowlist::StdioAllowlist::new_with_defaults());
+        let result = StdioClientTransport::spawn(&allowlist, &[]);
         assert!(result.is_err());
+    }
+
+    /// WU6: Two-instance regression test — disabling enforcement on one
+    /// `PyBridgeInstance` MUST NOT leak into another.
+    #[test]
+    fn allowlist_disable_does_not_leak_across_instances_pyo3() {
+        use scp_mcp::allowlist::AllowlistError;
+
+        let a = crate::runtime::PyBridgeInstance::new_py();
+        let b = crate::runtime::PyBridgeInstance::new_py();
+
+        a.core.mcp_allowlist().lock().unwrap().disable_enforcement();
+
+        // `b` is unaffected and rejects unlisted commands.
+        let res = b
+            .core
+            .mcp_allowlist()
+            .lock()
+            .unwrap()
+            .validate_command("sh");
+        assert!(
+            matches!(res, Err(AllowlistError::NotAllowed { .. })),
+            "expected NotAllowed on isolated instance, got {res:?}"
+        );
+
+        // Sanity: `a` is unrestricted on its own snapshot.
+        let a_state = a.core.mcp_allowlist().lock().unwrap().snapshot();
+        assert!(a_state.unrestricted);
+        // `b` snapshot remains restricted.
+        let b_state = b.core.mcp_allowlist().lock().unwrap().snapshot();
+        assert!(!b_state.unrestricted);
     }
 
     // -----------------------------------------------------------------------

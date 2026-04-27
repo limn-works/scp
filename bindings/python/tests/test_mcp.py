@@ -8,8 +8,9 @@ Covers:
 - CLI entry point argument parsing
 - Module-level ``__all__`` and package re-exports
 - ``DEFAULT_STDIO_ALLOWLIST`` invariants
-- Allowlist API (``configure_stdio_allowlist``, ``disable_stdio_allowlist``,
-  ``reset_stdio_allowlist``, ``get_stdio_allowlist``)
+- Per-instance allowlist API on :class:`SCP` (#1543 PR-D):
+  ``mcp_configure_stdio_allowlist``, ``mcp_disable_stdio_allowlist``,
+  ``mcp_reset_stdio_allowlist``, ``mcp_get_stdio_allowlist``
 
 Phase 4 PR 5 Agent B+C (#1549) collapsed :class:`McpServer` and
 :class:`McpClient` into pure handle wrappers. :func:`serve_mcp` /
@@ -17,6 +18,10 @@ Phase 4 PR 5 Agent B+C (#1549) collapsed :class:`McpServer` and
 on :class:`scp_sdk.SCP` — see :meth:`SCP.mcp_serve`,
 :meth:`SCP.mcp_client_connect_stdio`, :meth:`SCP.mcp_client_connect_sse`,
 and :meth:`SCP.mcp_server_stop`.
+
+#1543 PR-D moved the stdio allowlist onto each :class:`SCP` instance —
+the previous module-level free functions were deleted; tests drive the
+per-instance methods on :class:`SCP` instead.
 
 Tests mock the ``_native`` bridge where needed; no Rust extension required.
 """
@@ -36,10 +41,6 @@ from scp_sdk.mcp import (
     McpToolDefinition,
     McpToolResult,
     cli_main,
-    configure_stdio_allowlist,
-    disable_stdio_allowlist,
-    get_stdio_allowlist,
-    reset_stdio_allowlist,
     validate_client_connect,
 )
 
@@ -242,22 +243,43 @@ class TestValidateClientConnect:
         assert exc_info.value.code == "SCP-MCP-10006"
 
     def test_rejects_non_allowlist_binary(self) -> None:
-        # Default allowlist excludes arbitrary binary names.
-        reset_stdio_allowlist()
-        try:
-            with pytest.raises(ValidationError, match="allowlist"):
-                validate_client_connect("stdio", command=["my-custom-server"])
-        finally:
-            reset_stdio_allowlist()
+        # Caller supplies a snapshot of an instance's allowlist.
+        default_state = {
+            "allowed": sorted(DEFAULT_STDIO_ALLOWLIST),
+            "unrestricted": False,
+        }
+        with pytest.raises(ValidationError, match="allowlist"):
+            validate_client_connect(
+                "stdio",
+                command=["my-custom-server"],
+                allowlist_state=default_state,
+            )
 
     def test_allows_configured_binary(self) -> None:
-        reset_stdio_allowlist()
-        try:
-            configure_stdio_allowlist(additional_binaries=["any-binary"])
-            # Does not raise.
-            validate_client_connect("stdio", command=["any-binary"])
-        finally:
-            reset_stdio_allowlist()
+        # Simulate an instance-allowlist snapshot that includes the binary.
+        custom_state = {
+            "allowed": [*sorted(DEFAULT_STDIO_ALLOWLIST), "any-binary"],
+            "unrestricted": False,
+        }
+        # Does not raise.
+        validate_client_connect(
+            "stdio",
+            command=["any-binary"],
+            allowlist_state=custom_state,
+        )
+
+    def test_allowlist_check_skipped_when_state_omitted(self) -> None:
+        # Without a state snapshot, the pre-flight only checks shape;
+        # bridge-level enforcement still applies on the FFI round-trip.
+        validate_client_connect("stdio", command=["my-custom-server"])
+
+    def test_unrestricted_state_allows_any_binary(self) -> None:
+        unrestricted_state = {"allowed": [], "unrestricted": True}
+        validate_client_connect(
+            "stdio",
+            command=["totally-unknown"],
+            allowlist_state=unrestricted_state,
+        )
 
 
 # -----------------------------------------------------------------------
@@ -382,6 +404,8 @@ class TestModuleAll:
     def test_all_contains_core_exports(self) -> None:
         from scp_sdk import mcp
 
+        # #1543 PR-D: the four `*_stdio_allowlist` module-level helpers
+        # are gone; their per-instance equivalents live on `SCP`.
         required = {
             "DEFAULT_STDIO_ALLOWLIST",
             "McpClient",
@@ -390,12 +414,26 @@ class TestModuleAll:
             "McpToolDefinition",
             "McpToolResult",
             "cli_main",
-            "configure_stdio_allowlist",
-            "disable_stdio_allowlist",
-            "get_stdio_allowlist",
-            "reset_stdio_allowlist",
+            "validate_client_connect",
         }
         assert required.issubset(set(mcp.__all__))
+
+    def test_legacy_module_level_allowlist_helpers_are_gone(self) -> None:
+        # #1543 PR-D regression: ensure the old module-level free-functions
+        # are not re-introduced.
+        from scp_sdk import mcp
+
+        for legacy_name in (
+            "configure_stdio_allowlist",
+            "disable_stdio_allowlist",
+            "reset_stdio_allowlist",
+            "get_stdio_allowlist",
+        ):
+            assert not hasattr(mcp, legacy_name), (
+                f"{legacy_name} must not exist as a module-level helper "
+                "after #1543 PR-D — use SCP.mcp_*_stdio_allowlist methods."
+            )
+            assert legacy_name not in mcp.__all__
 
     def test_all_names_are_importable(self) -> None:
         from scp_sdk import mcp
@@ -435,35 +473,99 @@ class TestDefaultStdioAllowlist:
 
 
 class TestStdioAllowlistApi:
-    """Tests for the module-level allowlist functions (Python-side validation)."""
+    """Tests for the per-instance allowlist methods on :class:`SCP`.
+
+    #1543 PR-D: these tests use a real ``SCP()`` instance — each test
+    constructs its own and so runs in parallel safely. Cross-instance
+    isolation is exercised by
+    :class:`TestStdioAllowlistInstanceIsolation` below.
+    """
 
     def test_configure_with_no_binaries_is_noop(self) -> None:
-        """Calling with no binaries should not error."""
-        # Early return before calling the bridge — so no bridge needed.
-        configure_stdio_allowlist()
+        """Calling with no binaries should not raise (early return)."""
+        from scp_sdk.scp import SCP
+
+        scp = SCP()
+        # Should not raise.
+        scp.mcp_configure_stdio_allowlist()
+        scp.mcp_configure_stdio_allowlist(additional_binaries=[])
 
     def test_disable_requires_confirmation(self) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = SCP()
         with pytest.raises(ValidationError, match="i_trust_all_commands"):
-            disable_stdio_allowlist()
+            scp.mcp_disable_stdio_allowlist()
 
     def test_disable_rejects_false_confirmation(self) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = SCP()
         with pytest.raises(ValidationError, match="i_trust_all_commands"):
-            disable_stdio_allowlist(i_trust_all_commands=False)
+            scp.mcp_disable_stdio_allowlist(i_trust_all_commands=False)
 
     def test_reset_round_trips(self) -> None:
-        """After ``reset_stdio_allowlist``, the default allowlist is active."""
-        reset_stdio_allowlist()
-        state = get_stdio_allowlist()
+        """A fresh SCP instance has the default allowlist active."""
+        from scp_sdk.scp import SCP
+
+        scp = SCP()
+        scp.mcp_reset_stdio_allowlist()
+        state = scp.mcp_get_stdio_allowlist()
         assert "unrestricted" in state
         assert state["unrestricted"] is False
         for name in ("uvx", "npx", "node", "python3"):
             assert name in state["allowed"]
 
     def test_configure_adds_binaries(self) -> None:
-        reset_stdio_allowlist()
-        try:
-            configure_stdio_allowlist(additional_binaries=["my-mcp-server"])
-            state = get_stdio_allowlist()
-            assert "my-mcp-server" in state["allowed"]
-        finally:
-            reset_stdio_allowlist()
+        from scp_sdk.scp import SCP
+
+        scp = SCP()
+        scp.mcp_configure_stdio_allowlist(additional_binaries=["my-mcp-server"])
+        state = scp.mcp_get_stdio_allowlist()
+        assert "my-mcp-server" in state["allowed"]
+
+    def test_disable_enters_unrestricted(self) -> None:
+        from scp_sdk.scp import SCP
+
+        scp = SCP()
+        scp.mcp_disable_stdio_allowlist(i_trust_all_commands=True)
+        state = scp.mcp_get_stdio_allowlist()
+        assert state["unrestricted"] is True
+
+
+class TestStdioAllowlistInstanceIsolation:
+    """#1543 PR-D regression: the allowlist is per-instance.
+
+    Disabling enforcement (or extending the allow set) on one
+    :class:`SCP` MUST NOT leak into another instance.
+    """
+
+    def test_disable_does_not_leak_across_instances(self) -> None:
+        from scp_sdk.scp import SCP
+
+        a = SCP()
+        b = SCP()
+
+        a.mcp_disable_stdio_allowlist(i_trust_all_commands=True)
+
+        # `b` is unaffected.
+        b_state = b.mcp_get_stdio_allowlist()
+        assert b_state["unrestricted"] is False
+
+        # And `a` reports unrestricted.
+        a_state = a.mcp_get_stdio_allowlist()
+        assert a_state["unrestricted"] is True
+
+    def test_configure_does_not_leak_across_instances(self) -> None:
+        from scp_sdk.scp import SCP
+
+        a = SCP()
+        b = SCP()
+
+        a.mcp_configure_stdio_allowlist(additional_binaries=["custom-a"])
+
+        a_state = a.mcp_get_stdio_allowlist()
+        assert "custom-a" in a_state["allowed"]
+
+        b_state = b.mcp_get_stdio_allowlist()
+        assert "custom-a" not in b_state["allowed"]

@@ -427,6 +427,24 @@ pub struct CoreFields {
     /// ADR-043). Separate from handle registries — scope entries and handle
     /// entries never share storage.
     scope_registries: Mutex<HashMap<String, ScopeRegistry>>,
+
+    // -----------------------------------------------------------------
+    // MCP stdio allowlist — #1543 PR-D (per-instance)
+    // -----------------------------------------------------------------
+    /// Per-instance MCP stdio command allowlist.
+    ///
+    /// Each `CoreFields` owns its own [`scp_mcp::allowlist::StdioAllowlist`]
+    /// guarded by a `Mutex`. Migrated from a `OnceLock<Mutex<…>>` process
+    /// singleton in `scp-mcp::allowlist` so that one bridge disabling
+    /// enforcement (or extending the allow set) does not leak into another
+    /// bridge's policy decisions (#1543 PR-D / ADR-048 multi-instance
+    /// neutrality).
+    ///
+    /// Lock-ordering rule: callers must NOT hold this guard while acquiring
+    /// any other `CoreFields` lock. The allowlist guard is short-lived and
+    /// only wraps the `validate_command` / `configure` / `disable_enforcement`
+    /// / `reset` / `snapshot` calls — there is never a reason to nest.
+    mcp_allowlist: Mutex<scp_mcp::allowlist::StdioAllowlist>,
 }
 
 impl Default for CoreFields {
@@ -476,6 +494,7 @@ impl CoreFields {
             petname_maps: Mutex::new(HashMap::new()),
             handle_registries: Mutex::new(HashMap::new()),
             scope_registries: Mutex::new(HashMap::new()),
+            mcp_allowlist: Mutex::new(scp_mcp::allowlist::StdioAllowlist::new_with_defaults()),
         }
     }
 
@@ -555,6 +574,7 @@ impl CoreFields {
             petname_maps: Mutex::new(HashMap::new()),
             handle_registries: Mutex::new(HashMap::new()),
             scope_registries: Mutex::new(HashMap::new()),
+            mcp_allowlist: Mutex::new(scp_mcp::allowlist::StdioAllowlist::new_with_defaults()),
         }
     }
 
@@ -766,6 +786,25 @@ impl CoreFields {
     #[must_use]
     pub const fn scope_registries(&self) -> &Mutex<HashMap<String, ScopeRegistry>> {
         &self.scope_registries
+    }
+
+    /// Returns a reference to the per-instance MCP stdio allowlist.
+    ///
+    /// Each `CoreFields` owns its own [`scp_mcp::allowlist::StdioAllowlist`]
+    /// guarded by a `Mutex`. Bridge MCP transports must lock this mutex,
+    /// call [`scp_mcp::allowlist::StdioAllowlist::validate_command`], and
+    /// drop the guard before invoking `Command::new`. The bridge layer maps
+    /// `PoisonError` to its own typed transport error.
+    ///
+    /// # Lock ordering
+    ///
+    /// Do NOT call any other `CoreFields` locking method (e.g.
+    /// `petname_maps()`, `handle_registries()`, `with_transport`) while
+    /// holding the allowlist guard — the guard is short-lived (one allowlist
+    /// op only) and there is never a reason to nest.
+    #[must_use]
+    pub const fn mcp_allowlist(&self) -> &Mutex<scp_mcp::allowlist::StdioAllowlist> {
+        &self.mcp_allowlist
     }
 
     /// Whether this instance has been shut down permanently.
@@ -2252,6 +2291,17 @@ pub trait BridgeInstanceCore: Send + Sync {
     /// the bridge-agnostic cleanup finishes, so bridge-specific state is
     /// dropped last (after hooks run and transport is gone).
     fn bridge_specific_shutdown(&self) {}
+
+    /// Returns a reference to the per-instance MCP stdio allowlist.
+    ///
+    /// Default implementation forwards to [`CoreFields::mcp_allowlist`] —
+    /// the field lives on `CoreFields` and bridge-specific impls do not
+    /// need to override.
+    ///
+    /// See [`CoreFields::mcp_allowlist`] for the lock-ordering rule.
+    fn mcp_allowlist(&self) -> &Mutex<scp_mcp::allowlist::StdioAllowlist> {
+        self.core().mcp_allowlist()
+    }
 }
 
 /// Error type for transport lock operations.
