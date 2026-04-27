@@ -41,6 +41,11 @@
 //!   spawned under the instance's `JoinSet` can cooperatively exit
 //! - [`tokio::task::JoinSet`] — owns in-flight async tasks; shutdown awaits
 //!   graceful completion up to a deadline, then aborts the rest
+//! - MCP stdio allowlist — per-instance subprocess-spawn policy for
+//!   `mcp_client_connect_stdio`. Migrated from a process-global
+//!   `OnceLock<Mutex<…>>` in `scp-mcp::allowlist`; one bridge unrestricting
+//!   no longer leaks into another (closes the realm-local RCE-pivot per
+//!   ADR-048 §1).
 //!
 //! # Thread Safety
 //!
@@ -2382,6 +2387,11 @@ impl std::fmt::Display for AllowlistGuardError {
         }
     }
 }
+
+// `std::error::Error` impl mirrors `TransportLockError` so downstream code
+// that builds `From<E: std::error::Error>` adapters (or composes via
+// `Box<dyn std::error::Error>`) can carry this error uniformly.
+impl std::error::Error for AllowlistGuardError {}
 
 /// Error type for transport lock operations.
 ///

@@ -238,6 +238,21 @@ export interface ScpOptions {
   storage?: StorageConfig;
 }
 
+/**
+ * Snapshot of an `SCP` instance's MCP stdio allowlist state.
+ *
+ * Returned by {@link SCP.mcpGetStdioAllowlist}. Mirrors the Rust
+ * `scp_mcp::allowlist::AllowlistState` shape and the Python
+ * `McpAllowlistState` `TypedDict` so consumers get IDE autocomplete on
+ * the snapshot fields.
+ */
+export interface McpAllowlistState {
+  /** Sorted list of allowed binary basenames. */
+  readonly allowed: readonly string[];
+  /** `true` if enforcement is disabled (unrestricted mode). */
+  readonly unrestricted: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // SCP class
 // ---------------------------------------------------------------------------
@@ -1770,13 +1785,8 @@ export class SCP {
     (this.#native.mcpResetStdioAllowlist as () => void)();
   }
 
-  mcpGetStdioAllowlist(): { allowed: readonly string[]; unrestricted: boolean } {
-    return (
-      this.#native.mcpGetStdioAllowlist as () => {
-        allowed: readonly string[];
-        unrestricted: boolean;
-      }
-    )();
+  mcpGetStdioAllowlist(): McpAllowlistState {
+    return (this.#native.mcpGetStdioAllowlist as () => McpAllowlistState)();
   }
 
   // ───────────────────────────────────────────────────────────────────────

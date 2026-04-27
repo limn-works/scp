@@ -44,7 +44,7 @@ _VALID_TRANSPORTS: frozenset[str] = frozenset({"stdio", "sse"})
 #: Default allowlist of MCP server binaries for stdio transport.
 #: Matches the Rust-side ``DEFAULT_ALLOWLIST`` in ``scp-mcp/src/allowlist.rs``.
 #: The Rust layer is the single source of truth; use
-#: :func:`get_stdio_allowlist` to query the live state at runtime.
+#: :meth:`scp_sdk.SCP.mcp_get_stdio_allowlist` to query the live state at runtime.
 DEFAULT_STDIO_ALLOWLIST: frozenset[str] = frozenset(
     {
         "uvx",
