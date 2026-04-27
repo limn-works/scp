@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 use scp_primitives::Clock;
 
+use crate::context::outlets::stream::StreamTerminalStatus;
 use crate::economy::types::Amount;
 use crate::provenance::DataProvenance;
 use scp_primitives::DID;
@@ -170,10 +171,48 @@ pub struct OutletCancel {
 // OutletInvokedEvent (event log integration)
 // ---------------------------------------------------------------------------
 
-/// Event payload for a `ToolInvoked` event in the context event log.
+/// Event payload for a `OutletInvoked` event in the context event log.
 ///
-/// Records tool invocation metadata without full input/output (which may be
-/// large). Only content hashes are stored. See ADR-010 event log recording.
+/// Records outlet invocation metadata without full input/output (which may
+/// be large). Only content hashes are stored. See ADR-010 event log
+/// recording.
+///
+/// # Streaming fields (SCP-OUT-035, spec §5.4.5 event-log shape)
+///
+/// Per ADR-049 §5 every outlet invocation is a stream — non-streaming
+/// invocations are the degenerate two-chunk case (`Data` + `End`). The
+/// event log records ONE `OutletInvokedEvent` per stream, emitted when the
+/// terminal chunk is delivered to the receiver, NOT when the executor
+/// returns. The four streaming fields commit the event to the chunk
+/// sequence:
+///
+/// - [`Self::stream_chunk_count`]: total chunks including terminal
+///   (`Data` + `Progress` + `End` / `Error`).
+/// - [`Self::chunks_billed`]: count of `Data` chunks at or below the
+///   cancel-ack sequence that were validly delivered (§5.4.5 billing
+///   semantics).
+/// - [`Self::stream_manifest_hash`]: 32-byte Merkle root over the chunk
+///   sequence using RFC 6962 leaf/interior tag bytes under the
+///   `SCP-OUTLET-CHUNK-V1:` domain separator. Computed via
+///   [`crate::context::outlets::stream::compute_chunk_manifest_root`].
+/// - [`Self::stream_terminal_status`]: `Ok` (normal `End`), `Cancelled`
+///   (cancel-ack closed the stream), or `Error(code)` (terminal `Error`
+///   chunk).
+///
+/// # Per-chunk inclusion-proof API — deferred (ADR-049 §6)
+///
+/// The protocol commits to the chunk manifest root via
+/// [`Self::stream_manifest_hash`]. Per-chunk inclusion proofs follow
+/// **RFC 6962 §2.1 (audit paths)** using the same leaf/interior tag-byte
+/// construction (`0x00` / `0x01`) under the `SCP-OUTLET-CHUNK-V1:`
+/// separator. The algorithm is pinned at the protocol level, but the
+/// SDK-surface API for retrieving proofs (`outlets.inclusion_proof(
+/// invocation_id, chunk_index) -> path`) is intentionally **deferred**
+/// per ADR-049 §6 and discussion #1698. Auditing tools MAY reconstruct
+/// proofs off-line by replaying the event log and the retained chunk
+/// sequence with a standard RFC 6962 verifier — the manifest root is
+/// sufficient evidence that a particular chunk was part of the stream.
+/// Adding the API later is wire-compatible (no preimage break).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutletInvokedEvent {
     /// The request ID of the invocation.
@@ -195,6 +234,46 @@ pub struct OutletInvokedEvent {
     /// economic policy currency.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<Amount>,
+    /// Total number of chunks emitted on the stream — `Data` +
+    ///   `Progress` + the single terminal `End` or `Error` chunk
+    ///   (§5.4.5 event-log shape, SCP-OUT-035).
+    #[serde(default)]
+    pub stream_chunk_count: u32,
+    /// Count of `Data` chunks at or below the cancel-ack sequence that
+    /// were validly delivered (§5.4.5 billing semantics). Distinct from
+    /// [`Self::stream_chunk_count`] because `Progress`, `End`, and
+    /// `Error` are never billed and a cancelled stream may have a
+    /// `chunks_billed` smaller than the count of delivered `Data`
+    /// chunks.
+    #[serde(default)]
+    pub chunks_billed: u32,
+    /// 32-byte SHA-256 Merkle root over the ordered chunk sequence,
+    /// constructed per §5.4.5 with RFC 6962 tag bytes (`0x00` for
+    /// leaves, `0x01` for interior nodes) under the
+    /// `SCP-OUTLET-CHUNK-V1:` domain separator. Computed via
+    /// [`crate::context::outlets::stream::compute_chunk_manifest_root`].
+    /// All-zero (`[0u8; 32]`) for legacy events written before
+    /// SCP-OUT-035.
+    #[serde(default = "default_zero_manifest_hash")]
+    pub stream_manifest_hash: [u8; 32],
+    /// Terminal status of the stream: normal close, cancelled, or
+    /// error-with-code (§5.4.5 event-log shape).
+    #[serde(default = "default_stream_terminal_status")]
+    pub stream_terminal_status: StreamTerminalStatus,
+}
+
+/// Default for [`OutletInvokedEvent::stream_terminal_status`]; required
+/// because [`StreamTerminalStatus`] does not implement [`Default`] (its
+/// `Error(String)` variant has no inherent zero value).
+const fn default_stream_terminal_status() -> StreamTerminalStatus {
+    StreamTerminalStatus::Ok
+}
+
+/// Default for [`OutletInvokedEvent::stream_manifest_hash`]: an all-zero
+/// 32-byte sentinel signaling "no manifest computed" — used when
+/// deserializing legacy events that pre-date SCP-OUT-035.
+const fn default_zero_manifest_hash() -> [u8; 32] {
+    [0u8; 32]
 }
 
 // ---------------------------------------------------------------------------
@@ -375,12 +454,46 @@ mod tests {
             input_hash: "abcd".to_owned(),
             output_hash: Some("efgh".to_owned()),
             cost: None,
+            stream_chunk_count: 2,
+            chunks_billed: 1,
+            stream_manifest_hash: [0xABu8; 32],
+            stream_terminal_status: StreamTerminalStatus::Ok,
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: OutletInvokedEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.request_id, "req-1");
         assert_eq!(deserialized.status, OutletStatus::Success);
         assert_eq!(deserialized.execution_time_ms, 42);
+        assert_eq!(deserialized.stream_chunk_count, 2);
+        assert_eq!(deserialized.chunks_billed, 1);
+        assert_eq!(deserialized.stream_manifest_hash, [0xABu8; 32]);
+        assert_eq!(
+            deserialized.stream_terminal_status,
+            StreamTerminalStatus::Ok
+        );
+    }
+
+    /// Legacy events serialized BEFORE SCP-OUT-035 omit the four new
+    /// fields. `#[serde(default)]` on each new field must let the
+    /// deserializer fill them with sentinels (zero counts, all-zero
+    /// manifest, `Ok` terminal status) instead of failing.
+    #[test]
+    fn outlet_invoked_event_pre_scp_out_035_legacy_deserializes() {
+        let legacy_json = serde_json::json!({
+            "request_id": "req-legacy",
+            "outlet_id": "tool-legacy",
+            "invoker_did": "did:dht:z6MkInvoker",
+            "status": "Success",
+            "execution_time_ms": 17,
+            "input_hash": "ab",
+            "output_hash": "cd",
+        });
+        let bytes = serde_json::to_vec(&legacy_json).unwrap();
+        let parsed: OutletInvokedEvent = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.stream_chunk_count, 0);
+        assert_eq!(parsed.chunks_billed, 0);
+        assert_eq!(parsed.stream_manifest_hash, [0u8; 32]);
+        assert_eq!(parsed.stream_terminal_status, StreamTerminalStatus::Ok);
     }
 
     #[test]

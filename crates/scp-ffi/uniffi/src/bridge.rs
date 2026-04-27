@@ -6395,6 +6395,14 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             }
         };
 
+        // SCP-OUT-035: legacy UniFFI-bridge invocation path. The
+        // bridge runs the outlet as a degenerate two-chunk stream
+        // (Data + End), matching the §5.4.5 one-shot semantics. The
+        // streaming-event fields carry one-shot sentinels: 2 total
+        // chunks, 1 billable Data chunk, all-zero manifest hash (no
+        // chunk sequence is retained at the FFI boundary), terminal
+        // status `Ok` (the bridge only reaches this builder on
+        // success).
         let tool_event = scp_core::context::tools::OutletInvokedEvent {
             request_id: uuid::Uuid::new_v4().to_string(),
             outlet_id: outlet_name.to_owned(),
@@ -6404,6 +6412,10 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             input_hash,
             output_hash: Some(scp_core::context::tools::sha256_json(&output)),
             cost: None,
+            stream_chunk_count: 2,
+            chunks_billed: 1,
+            stream_manifest_hash: [0u8; 32],
+            stream_terminal_status: scp_core::context::outlets::stream::StreamTerminalStatus::Ok,
         };
 
         let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();

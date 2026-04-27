@@ -970,6 +970,13 @@ impl ContextProvider for FfiBridgeProvider {
             }
         };
 
+        // SCP-OUT-035: legacy MCP-bridge invocation path. MCP outlets
+        // execute as a degenerate two-chunk stream (Data + End), so
+        // the streaming-event fields carry the one-shot sentinels:
+        // 2 total chunks, 1 billable Data chunk, all-zero manifest
+        // hash (no chunk sequence is retained at the MCP boundary),
+        // terminal status `Ok` because the legacy path only reaches
+        // this builder on success.
         let tool_event = scp_core::context::tools::OutletInvokedEvent {
             request_id: uuid::Uuid::new_v4().to_string(),
             outlet_id: outlet_name.to_owned(),
@@ -979,6 +986,10 @@ impl ContextProvider for FfiBridgeProvider {
             input_hash,
             output_hash: Some(scp_core::context::tools::sha256_json(&output)),
             cost: None,
+            stream_chunk_count: 2,
+            chunks_billed: 1,
+            stream_manifest_hash: [0u8; 32],
+            stream_terminal_status: scp_core::context::outlets::stream::StreamTerminalStatus::Ok,
         };
 
         let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();

@@ -728,6 +728,129 @@ pub enum StreamTerminalStatus {
 }
 
 // ---------------------------------------------------------------------------
+// Chunk manifest — §5.4.5 / SCP-OUT-035
+// ---------------------------------------------------------------------------
+
+/// RFC 6962 leaf-tag byte (`0x00`). Inserted between the
+/// [`SCP_OUTLET_CHUNK_V1`] domain separator and the canonical-JCS chunk
+/// bytes when computing a chunk-manifest leaf hash.
+pub const CHUNK_MANIFEST_LEAF_TAG: u8 = 0x00;
+
+/// RFC 6962 interior-tag byte (`0x01`). Inserted between the
+/// [`SCP_OUTLET_CHUNK_V1`] domain separator and the concatenated
+/// `left_hash || right_hash` when computing an interior node hash.
+pub const CHUNK_MANIFEST_INTERIOR_TAG: u8 = 0x01;
+
+/// Computes the SHA-256 leaf hash for one chunk in the manifest tree
+/// (§5.4.5 chunk manifest leaf construction; RFC 6962 §2.1):
+///
+/// ```text
+/// leaf_i = SHA-256("SCP-OUTLET-CHUNK-V1:" || 0x00 || canonical_jcs(chunk_i))
+/// ```
+///
+/// `canonical_jcs(chunk_i)` covers the entire [`OutletStreamChunk`] —
+/// `request_id`, `sequence`, `payload` (already JCS-canonical via the
+/// `@type` discriminator rule), AND `sig`. The leaf therefore commits
+/// to the operator's per-chunk signature, so a later verifier holding
+/// a chunk and the manifest root can prove the operator signed that
+/// exact chunk. The leaf-tag byte (`0x00`) prevents a second-preimage
+/// collision class against interior nodes (which use `0x01`).
+///
+/// # Errors
+///
+/// Returns the JCS canonicalization error string if the chunk cannot
+/// be serialized — should not happen for valid [`OutletStreamChunk`]
+/// values; surfaced for completeness.
+pub fn compute_chunk_leaf_hash(chunk: &OutletStreamChunk) -> Result<[u8; 32], String> {
+    let chunk_jcs = crate::jcs::to_vec(chunk)?;
+    let mut hasher = Sha256::new();
+    hasher.update(SCP_OUTLET_CHUNK_V1);
+    hasher.update([CHUNK_MANIFEST_LEAF_TAG]);
+    hasher.update(&chunk_jcs);
+    Ok(hasher.finalize().into())
+}
+
+/// Computes the SHA-256 interior-node hash from two child hashes
+/// (§5.4.5; RFC 6962 §2.1):
+///
+/// ```text
+/// interior = SHA-256("SCP-OUTLET-CHUNK-V1:" || 0x01 || left_hash || right_hash)
+/// ```
+///
+/// The interior-tag byte (`0x01`) is distinct from the leaf-tag byte
+/// (`0x00`) used by [`compute_chunk_leaf_hash`], preventing a leaf
+/// from colliding with an interior node sharing the same SHA-256 input
+/// length.
+#[must_use]
+pub fn compute_chunk_interior_hash(left_hash: &[u8; 32], right_hash: &[u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SCP_OUTLET_CHUNK_V1);
+    hasher.update([CHUNK_MANIFEST_INTERIOR_TAG]);
+    hasher.update(left_hash);
+    hasher.update(right_hash);
+    hasher.finalize().into()
+}
+
+/// Computes the chunk-manifest Merkle root over an ordered chunk
+/// sequence (§5.4.5 / SCP-OUT-035).
+///
+/// The construction follows RFC 6962 §2.1 exactly:
+///
+/// 1. Each chunk produces a leaf hash via [`compute_chunk_leaf_hash`].
+/// 2. Adjacent leaves are paired and combined via
+///    [`compute_chunk_interior_hash`]; an odd-count level promotes the
+///    final unpaired hash to the next level WITHOUT re-hashing
+///    (matching CT, RFC 6962 §2.1's tree-of-records definition).
+/// 3. The single hash remaining at the top is the manifest root.
+///
+/// Edge cases:
+///
+/// - **Empty stream**: returns the all-zero sentinel `[0u8; 32]`. A
+///   stream that emits no chunks is not a valid §5.4.5 stream (every
+///   stream produces at least one terminal chunk), but the function
+///   defines a total mapping for completeness so callers writing a
+///   legacy / synthetic event do not need to special-case the empty
+///   slice.
+/// - **Single chunk**: the leaf hash IS the root (no interior nodes).
+///
+/// # Errors
+///
+/// Propagates the first JCS canonicalization error encountered while
+/// hashing leaves.
+pub fn compute_chunk_manifest_root(chunks: &[OutletStreamChunk]) -> Result<[u8; 32], String> {
+    if chunks.is_empty() {
+        return Ok([0u8; 32]);
+    }
+
+    // Layer 0: leaf hashes.
+    let mut current: Vec<[u8; 32]> = chunks
+        .iter()
+        .map(compute_chunk_leaf_hash)
+        .collect::<Result<Vec<_>, String>>()?;
+
+    while current.len() > 1 {
+        let mut next: Vec<[u8; 32]> = Vec::with_capacity(current.len().div_ceil(2));
+        let mut iter = current.chunks_exact(2);
+        for pair in &mut iter {
+            // chunks_exact yields slices of length 2 → indexing is
+            // bounded; pattern-match keeps clippy.indexing happy too.
+            let [left, right] = pair else { unreachable!() };
+            next.push(compute_chunk_interior_hash(left, right));
+        }
+        if let Some(unpaired) = iter.remainder().first().copied() {
+            // Odd-count level: promote the unpaired final hash to the
+            // next level verbatim (RFC 6962 §2.1).
+            next.push(unpaired);
+        }
+        current = next;
+    }
+
+    // current.len() == 1 by the loop invariant + the early return on
+    // empty input; index 0 is safe.
+    Ok(current[0])
+}
+
+// ---------------------------------------------------------------------------
 // Session × stream invariants — §6.2.1.1
 // ---------------------------------------------------------------------------
 

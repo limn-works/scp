@@ -2996,6 +2996,12 @@ fn build_amplification_rejection_event(
     invoker_did: &DID,
     request_id: &str,
 ) -> OutletInvokedEvent {
+    // SCP-OUT-035: a rejected hop never opened a stream, so the four
+    // streaming fields carry rejection sentinels — zero chunk counts,
+    // all-zero manifest hash, terminal status `Error` carrying the
+    // §5.4.4 amplification-violation code. The amplification gate
+    // runs before any stream is opened or any chunk is emitted, so
+    // there is no manifest to commit and no chunks to bill.
     OutletInvokedEvent {
         request_id: request_id.to_owned(),
         outlet_id: outlet_id.clone(),
@@ -3005,6 +3011,12 @@ fn build_amplification_rejection_event(
         input_hash: REJECTION_HASH_SENTINEL.to_owned(),
         output_hash: Some(REJECTION_HASH_SENTINEL.to_owned()),
         cost: None,
+        stream_chunk_count: 0,
+        chunks_billed: 0,
+        stream_manifest_hash: [0u8; 32],
+        stream_terminal_status: scp_protocol::context::outlets::stream::StreamTerminalStatus::Error(
+            scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_VIOLATION.to_owned(),
+        ),
     }
 }
 
