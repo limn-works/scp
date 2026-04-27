@@ -897,3 +897,33 @@ export function defineOutletDefinition(params: {
   }
   return result;
 }
+
+/**
+ * SCP-OUT-041d catalog-rotation dwell-time validator (TypeScript SDK).
+ *
+ * Calls the bridge `outletCatalogRotationValidator` — pure function,
+ * no context state required. Resolves with `void` on success; throws
+ * the typed `OutletProtocolError` (`CatalogRotationTooFrequent`) when
+ * the new registration is within the §5.4.4 round-5 24-hour dwell
+ * floor of the prior.
+ */
+export async function outletCatalogRotationValidator(opts: {
+  priorCatalog: ReadonlyArray<{ key: string; template: string }>;
+  newCatalog: ReadonlyArray<{ key: string; template: string }>;
+  priorAppendTimeSecs: number;
+  newAppendTimeSecs: number;
+}): Promise<void> {
+  const { getBridge } = await import("./internal/bridge");
+  const bridge = await getBridge();
+  const json = await bridge.outletCatalogRotationValidator(
+    JSON.stringify(opts.priorCatalog),
+    JSON.stringify(opts.newCatalog),
+    opts.priorAppendTimeSecs,
+    opts.newAppendTimeSecs,
+  );
+  if (json.length === 0) {
+    return;
+  }
+  const wire = JSON.parse(json) as Record<string, unknown>;
+  throw OutletError.fromWire(wire);
+}

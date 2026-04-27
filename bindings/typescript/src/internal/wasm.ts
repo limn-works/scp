@@ -116,6 +116,25 @@ interface WasmModule {
   ) => Promise<string>;
   tool_interface_accept: (handle: BridgeContextHandle, interfaceJson: string) => Promise<string>;
   tool_interface_revoke: (handle: BridgeContextHandle, interfaceIdHex: string) => Promise<string>;
+  outletErrorNew: (
+    handle: BridgeContextHandle,
+    outletId: string,
+    registrationEventIdHex: string,
+    catalogKey: string,
+    classStr: string,
+    code: string,
+    slug: string,
+    retryStr: string,
+    padNonceHex: string,
+    detailJson: string | undefined,
+    sourceChainJson: string | undefined,
+  ) => Promise<string>;
+  outletCatalogRotationValidator: (
+    priorCatalogJson: string,
+    newCatalogJson: string,
+    priorAppendTimeSecs: number,
+    newAppendTimeSecs: number,
+  ) => Promise<string>;
   transport_connect: (relayUrl: string) => Promise<{
     connected: boolean;
     relayUrl: string | null;
@@ -1301,6 +1320,53 @@ export function createWasmBridge(): Bridge {
     ): Promise<string> {
       const wasm = getWasm();
       return await wasm.tool_interface_revoke(handle, interfaceIdHex);
+    },
+
+    // SCP-OUT-041d — outlet_error_new + outlet_catalog_rotation_validator
+    async outletErrorNew(
+      handle: BridgeContextHandle,
+      outletId: string,
+      registrationEventIdHex: string,
+      catalogKey: string,
+      classStr: string,
+      code: string,
+      slug: string,
+      retryStr: string,
+      padNonceHex: string,
+      detailJson?: string,
+      sourceChainJson?: string,
+    ): Promise<string> {
+      const wasm = getWasm();
+      const result = await wasm.outletErrorNew(
+        handle,
+        outletId,
+        registrationEventIdHex,
+        catalogKey,
+        classStr,
+        code,
+        slug,
+        retryStr,
+        padNonceHex,
+        detailJson,
+        sourceChainJson,
+      );
+      return String(result);
+    },
+
+    async outletCatalogRotationValidator(
+      priorCatalogJson: string,
+      newCatalogJson: string,
+      priorAppendTimeSecs: number,
+      newAppendTimeSecs: number,
+    ): Promise<string> {
+      const wasm = getWasm();
+      const result = await wasm.outletCatalogRotationValidator(
+        priorCatalogJson,
+        newCatalogJson,
+        priorAppendTimeSecs,
+        newAppendTimeSecs,
+      );
+      return String(result);
     },
 
     // Cross-context tool invocation (spec section 6.2) — not available in WASM (ADR-034)

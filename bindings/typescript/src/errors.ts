@@ -395,6 +395,14 @@ export interface OutletErrorNewOpts {
   readonly sourceChain?: readonly ContextHop[];
   readonly padNonce?: Uint8Array;
   readonly registrationEventId?: Uint8Array;
+  /**
+   * SCP-OUT-041d: when both `contextId` and `registrationEventId` are
+   * supplied the constructor delegates to the NAPI/WASM FFI export
+   * `outletErrorNew` so the §5.4.4 wire-message HMAC happens at the
+   * bridge boundary using the pinned `outlet_message_key`. The SDK
+   * never sees the raw key.
+   */
+  readonly contextId?: string;
 }
 
 // --- OutletError base + concrete subclasses ------------------------------
@@ -450,6 +458,12 @@ export class OutletError extends ScpError {
    * Construct a typed concrete subclass from a keyword-only options object.
    * `outletId` and `catalogKey` are adjacent string arguments — the
    * options-object shape eliminates the round-6 swap-risk.
+   *
+   * SCP-OUT-041d: when `contextId` AND `registrationEventId` are both
+   * supplied, the construction is delegated to the FFI bridge which
+   * performs the §5.4.4 wire-message HMAC using the pinned
+   * `outlet_message_key` — the SDK never sees the raw key. Use
+   * `OutletError.newViaBridge` directly for the async FFI form.
    */
   static new(opts: OutletErrorNewOpts): OutletError {
     if (!OUTLET_ERROR_CLASSES.has(opts.class)) {
@@ -483,6 +497,71 @@ export class OutletError extends ScpError {
     });
   }
 
+  /**
+   * SCP-OUT-041d FFI form of {@link OutletError.new} — delegates to the
+   * bridge `outletErrorNew` so the §5.4.4 wire-message HMAC happens at
+   * the FFI boundary using the pinned per-outlet `outlet_message_key`.
+   * The SDK never sees the raw key.
+   */
+  static async newViaBridge(opts: {
+    handle: { contextId: string; state: string; creatorDid: string };
+    outletId: string;
+    registrationEventId: Uint8Array;
+    catalogKey: CatalogKey;
+    class: OutletErrorClassWire;
+    code?: string;
+    slug?: string;
+    retry?: RetryPolicy;
+    detail?: OutletErrorDetail;
+    sourceChain?: readonly ContextHop[];
+    padNonce?: Uint8Array;
+  }): Promise<OutletError> {
+    const { getBridge } = await import("./internal/bridge");
+    const bridge = await getBridge();
+    if (!OUTLET_ERROR_CLASSES.has(opts.class)) {
+      throw new ValidationError(
+        `unknown OutletErrorClass: ${JSON.stringify(opts.class)}`,
+        "SCP-VALID-7000",
+      );
+    }
+    if (typeof opts.catalogKey !== "string" || !CATALOG_KEY_RE.test(opts.catalogKey)) {
+      throw new OutletProtocolError(
+        `catalogKey ${JSON.stringify(opts.catalogKey)} is not a valid CatalogKey`,
+        "SCP-TOOL-6100",
+        { slug: "protocol.malformed-catalog-key", retry: { policy: "never" } },
+      );
+    }
+    if (opts.registrationEventId.length !== 32) {
+      throw new ValidationError("registrationEventId must be 32 bytes", "SCP-VALID-7000");
+    }
+    const padNonce = opts.padNonce ?? crypto.getRandomValues(new Uint8Array(16));
+    if (padNonce.length !== 16) {
+      throw new ValidationError("padNonce must be 16 bytes", "SCP-VALID-7000");
+    }
+    const Ctor = CLASS_CTOR[opts.class];
+    const codeStr = opts.code ?? Ctor.defaultCode;
+    const slugStr = opts.slug ?? String(opts.catalogKey);
+    const retryStr = (opts.retry ?? { policy: "never" }).policy;
+    const detailJson = opts.detail !== undefined ? JSON.stringify(opts.detail) : undefined;
+    const sourceChainJson =
+      opts.sourceChain !== undefined ? JSON.stringify(opts.sourceChain) : undefined;
+    const json = await bridge.outletErrorNew(
+      opts.handle,
+      opts.outletId,
+      bytesToHex(opts.registrationEventId),
+      String(opts.catalogKey),
+      opts.class,
+      codeStr,
+      slugStr,
+      retryStr,
+      bytesToHex(padNonce),
+      detailJson,
+      sourceChainJson,
+    );
+    const wire = JSON.parse(json) as Record<string, unknown>;
+    return OutletError.fromWire(wire);
+  }
+
   /** Serialize to a wire-form object. */
   toWire(): Record<string, unknown> {
     const out: Record<string, unknown> = {
@@ -500,7 +579,10 @@ export class OutletError extends ScpError {
     return out;
   }
 
-  /** Deserialize from a wire-form object — re-types into the right subclass. */
+  /** Deserialize from a wire-form object — re-types into the right subclass.
+   *
+   * Accepts both camelCase fields (TypeScript native) and snake_case
+   * fields (the SCP-OUT-041d bridge wire form). */
   static fromWire(value: Record<string, unknown>): OutletError {
     const class_ = String(value.class ?? "").toLowerCase() as OutletErrorClassWire;
     if (!OUTLET_ERROR_CLASSES.has(class_)) {
@@ -513,17 +595,17 @@ export class OutletError extends ScpError {
       validateDetailShape(class_, value.detail);
     }
     const Ctor = CLASS_CTOR[class_];
-    const padNonce = typeof value.padNonce === "string" ? hexToBytes(value.padNonce) : undefined;
-    const regId =
-      typeof value.registrationEventId === "string"
-        ? hexToBytes(value.registrationEventId)
-        : undefined;
+    const padNonceRaw = value.padNonce ?? value.pad_nonce;
+    const padNonce = typeof padNonceRaw === "string" ? hexToBytes(padNonceRaw) : undefined;
+    const regIdRaw = value.registrationEventId ?? value.registration_event_id;
+    const regId = typeof regIdRaw === "string" ? hexToBytes(regIdRaw) : undefined;
+    const sourceChain = (value.sourceChain ?? value.source_chain ?? []) as readonly ContextHop[];
     return new Ctor(String(value.message ?? ""), String(value.code ?? Ctor.defaultCode), {
       classWire: class_,
       slug: value.slug !== undefined ? String(value.slug) : undefined,
       retry: (value.retry ?? { policy: "never" }) as RetryPolicy,
       detail: value.detail as OutletErrorDetail | undefined,
-      sourceChain: (value.sourceChain ?? []) as readonly ContextHop[],
+      sourceChain,
       padNonce,
       registrationEventId: regId,
     });

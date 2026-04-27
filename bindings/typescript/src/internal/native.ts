@@ -777,6 +777,65 @@ export function createNativeBridge(): Bridge {
       )(handle, interfaceIdHex);
     },
 
+    // SCP-OUT-041d — outlet_error_new + outlet_catalog_rotation_validator
+    async outletErrorNew(
+      handle: BridgeContextHandle,
+      outletId: string,
+      registrationEventIdHex: string,
+      catalogKey: string,
+      classStr: string,
+      code: string,
+      slug: string,
+      retryStr: string,
+      padNonceHex: string,
+      detailJson?: string,
+      sourceChainJson?: string,
+    ): Promise<string> {
+      return await (
+        addon.outletErrorNew as (
+          h: BridgeContextHandle,
+          outletId: string,
+          regHex: string,
+          catalogKey: string,
+          classStr: string,
+          code: string,
+          slug: string,
+          retryStr: string,
+          padNonceHex: string,
+          detailJson: string | undefined,
+          sourceChainJson: string | undefined,
+        ) => Promise<string>
+      )(
+        handle,
+        outletId,
+        registrationEventIdHex,
+        catalogKey,
+        classStr,
+        code,
+        slug,
+        retryStr,
+        padNonceHex,
+        detailJson,
+        sourceChainJson,
+      );
+    },
+
+    async outletCatalogRotationValidator(
+      priorCatalogJson: string,
+      newCatalogJson: string,
+      priorAppendTimeSecs: number,
+      newAppendTimeSecs: number,
+    ): Promise<string> {
+      return await (
+        addon.outletCatalogRotationValidator as (
+          prior: string,
+          next: string,
+          pT: number,
+          nT: number,
+        ) => Promise<string>
+      )(priorCatalogJson, newCatalogJson, priorAppendTimeSecs, newAppendTimeSecs);
+    },
+
     // Cross-context tool invocation (spec section 6.2)
     async toolInvokeCrossContext(
       sourceHandle: BridgeContextHandle,

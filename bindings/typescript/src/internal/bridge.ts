@@ -263,6 +263,28 @@ export interface Bridge {
   toolInterfaceAccept(handle: BridgeContextHandle, interfaceJson: string): Promise<string>;
   toolInterfaceRevoke(handle: BridgeContextHandle, interfaceIdHex: string): Promise<string>;
 
+  // SCP-OUT-041d — outlet_error_new + outlet_catalog_rotation_validator
+  outletErrorNew(
+    handle: BridgeContextHandle,
+    outletId: string,
+    registrationEventIdHex: string,
+    catalogKey: string,
+    classStr: string,
+    code: string,
+    slug: string,
+    retryStr: string,
+    padNonceHex: string,
+    detailJson?: string,
+    sourceChainJson?: string,
+  ): Promise<string>;
+
+  outletCatalogRotationValidator(
+    priorCatalogJson: string,
+    newCatalogJson: string,
+    priorAppendTimeSecs: number,
+    newAppendTimeSecs: number,
+  ): Promise<string>;
+
   // Cross-context tool invocation (spec section 6.2)
   toolInvokeCrossContext(
     sourceHandle: BridgeContextHandle,
