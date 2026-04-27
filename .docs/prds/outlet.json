@@ -2202,7 +2202,7 @@
       "gate": "gate-streaming",
       "priority": "P1",
       "severity": "critical",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-event-log/src/lib.rs",
         "crates/scp-runtime/src/context/manager/outlets.rs"
