@@ -5393,6 +5393,7 @@ impl WasmContextManager {
             pruning_policy: ctx.pruning_policy.clone(),
             economic_policy_locked: ctx.economic_policy_locked,
             hard_rate_limit_config: ctx.hard_rate_limit_config.clone(),
+            pinned_outlet_message_keys: HashMap::new(),
         };
 
         // Serialize snapshot to RFC 8785 JCS canonical JSON for HMAC
@@ -6061,6 +6062,11 @@ struct WasmContextExportSnapshot {
     /// `None` means the default Matrix-style config applies.
     #[serde(default)]
     hard_rate_limit_config: Option<String>,
+    /// SCP-OUT-041a/d: per-outlet pinned `outlet_message_key` indexed by
+    /// `(outlet_id, registration_event_id_hex)`. Hex-encoded 32-byte HMAC
+    /// keys; the SDK never receives the raw key.
+    #[serde(default)]
+    pinned_outlet_message_keys: HashMap<(String, String), String>,
 }
 
 /// Serializable member entry for export.

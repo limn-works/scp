@@ -2126,7 +2126,7 @@ pub fn py_outlet_error_new(
 
 /// Serializes an [`OutletError`] envelope into the SDK-friendly wire form
 /// used by SCP-OUT-041d FFI surfaces. The bridge maps numbered §5.4.4
-/// MessagePack tags to named string keys and renders byte arrays as
+/// `MessagePack` tags to named string keys and renders byte arrays as
 /// lowercase hex so language SDKs can `from_wire(json.loads(s))` without
 /// reaching into protobuf-style integer keys.
 ///

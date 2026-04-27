@@ -8,6 +8,8 @@ import { describe, expect, test } from "bun:test";
 
 import {
   AuthorizationError,
+  CatalogKey,
+  makeOutletId,
   OutletError,
   OutletProtocolError,
   ValidationError,
@@ -16,8 +18,8 @@ import {
 describe("OutletError.new — options-object surface (SCP-OUT-041d)", () => {
   test("returns a typed AuthorizationError for class=authorization", () => {
     const err = OutletError.new({
-      outletId: "outlet-test",
-      catalogKey: "authorization.denied",
+      outletId: makeOutletId("outlet-test"),
+      catalogKey: CatalogKey("authorization.denied"),
       class: "authorization",
     });
     expect(err).toBeInstanceOf(AuthorizationError);
@@ -27,8 +29,8 @@ describe("OutletError.new — options-object surface (SCP-OUT-041d)", () => {
   test("rejects an invalid catalog key", () => {
     expect(() =>
       OutletError.new({
-        outletId: "outlet-test",
-        catalogKey: "INVALID UPPER",
+        outletId: makeOutletId("outlet-test"),
+        catalogKey: "INVALID UPPER" as unknown as CatalogKey,
         class: "authorization",
       }),
     ).toThrow(OutletProtocolError);
@@ -37,8 +39,8 @@ describe("OutletError.new — options-object surface (SCP-OUT-041d)", () => {
   test("rejects an unknown OutletErrorClass", () => {
     expect(() =>
       OutletError.new({
-        outletId: "outlet-test",
-        catalogKey: "authorization.denied",
+        outletId: makeOutletId("outlet-test"),
+        catalogKey: CatalogKey("authorization.denied"),
         class: "made-up-class" as never,
       }),
     ).toThrow(ValidationError);
@@ -47,8 +49,8 @@ describe("OutletError.new — options-object surface (SCP-OUT-041d)", () => {
   test("rejects an empty outletId", () => {
     expect(() =>
       OutletError.new({
-        outletId: "",
-        catalogKey: "authorization.denied",
+        outletId: "" as unknown as ReturnType<typeof makeOutletId>,
+        catalogKey: CatalogKey("authorization.denied"),
         class: "authorization",
       }),
     ).toThrow(ValidationError);
@@ -56,8 +58,8 @@ describe("OutletError.new — options-object surface (SCP-OUT-041d)", () => {
 
   test("retry defaults to never", () => {
     const err = OutletError.new({
-      outletId: "outlet-test",
-      catalogKey: "authorization.denied",
+      outletId: makeOutletId("outlet-test"),
+      catalogKey: CatalogKey("authorization.denied"),
       class: "authorization",
     });
     expect(err.retry).toEqual({ policy: "never" });

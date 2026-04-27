@@ -753,6 +753,64 @@ export function createMockBridge(): Bridge & {
       return token;
     },
 
+    // SCP-OUT-041d — mock surface for outlet_error_new and the catalog
+    // rotation validator. The Rust core covers the §5.4.4 envelope HMAC
+    // and the §5.4.4 round-5 dwell-time rule via the bridge conformance
+    // tests; this mock only needs to satisfy the Bridge interface for
+    // test-time consumers that don't exercise the FFI path.
+    async outletErrorNew(
+      _handle: BridgeContextHandle,
+      _outletId: string,
+      _registrationEventIdHex: string,
+      _catalogKey: string,
+      classStr: string,
+      code: string,
+      slug: string,
+      retryStr: string,
+      padNonceHex: string,
+      detailJson?: string,
+      sourceChainJson?: string,
+    ): Promise<string> {
+      const wire = {
+        code,
+        slug,
+        class: classStr,
+        message: "00".repeat(32),
+        retry: { policy: retryStr },
+        pad_nonce: padNonceHex,
+        registration_event_id: _registrationEventIdHex,
+        detail: detailJson ? JSON.parse(detailJson) : undefined,
+        source_chain: sourceChainJson ? JSON.parse(sourceChainJson) : [],
+      };
+      return JSON.stringify(wire);
+    },
+
+    async outletCatalogRotationValidator(
+      _priorCatalogJson: string,
+      _newCatalogJson: string,
+      priorAppendTimeSecs: number,
+      newAppendTimeSecs: number,
+    ): Promise<string> {
+      const elapsed = newAppendTimeSecs - priorAppendTimeSecs;
+      if (elapsed < 86400) {
+        return JSON.stringify({
+          rejected: true,
+          elapsed_secs: elapsed,
+          envelope: {
+            code: "SCP-TOOL-6100",
+            slug: "protocol.catalog-rotation-too-frequent",
+            class: "protocol",
+            message: "00".repeat(32),
+            retry: { policy: "never" },
+            pad_nonce: "00".repeat(16),
+            registration_event_id: "00".repeat(32),
+            source_chain: [],
+          },
+        });
+      }
+      return JSON.stringify({ rejected: false });
+    },
+
     async ucanDelegate(
       handle: BridgeContextHandle,
       delegatorDid: string,

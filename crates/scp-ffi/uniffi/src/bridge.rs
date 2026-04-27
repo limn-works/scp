@@ -5469,7 +5469,7 @@ pub async fn outlet_get(handle: Arc<ContextHandle>, outlet_id: String) -> Result
 // SCP-OUT-041d — outlet_error_new + outlet_catalog_rotation_validator
 // ---------------------------------------------------------------------------
 
-/// SCP-OUT-041d outlet_error_new bridge.
+/// SCP-OUT-041d `outlet_error_new` bridge.
 ///
 /// Constructs an `OutletError` envelope at the FFI boundary using the
 /// pinned per-outlet `outlet_message_key` (§5.4.4 round-5,
@@ -5659,7 +5659,7 @@ pub async fn outlet_error_new(
         })?
 }
 
-/// SCP-OUT-041d wire-form helper — see PyO3 bridge for schema docs.
+/// SCP-OUT-041d wire-form helper — see `PyO3` bridge for schema docs.
 fn serialize_outlet_error_wire(
     envelope: &scp_core::context::outlets::errors::OutletError,
 ) -> serde_json::Value {

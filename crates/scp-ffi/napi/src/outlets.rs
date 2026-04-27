@@ -1673,7 +1673,7 @@ pub async fn outlet_error_new(
     })
 }
 
-/// SCP-OUT-041d wire-form helper — see PyO3 bridge for schema docs.
+/// SCP-OUT-041d wire-form helper — see `PyO3` bridge for schema docs.
 fn serialize_outlet_error_wire(
     envelope: &scp_core::context::outlets::errors::OutletError,
 ) -> serde_json::Value {

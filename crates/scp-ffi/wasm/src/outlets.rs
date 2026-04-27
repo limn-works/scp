@@ -1321,6 +1321,11 @@ pub fn outlet_interface_revoke(context: &WasmContextHandle, interface_id_hex: St
 /// registration acceptance time) MUST pin the key here so the
 /// envelope-construction path can compute the §5.4.4 wire-message
 /// HMAC at the FFI boundary.
+///
+/// # Errors
+///
+/// Returns `JsError` when `outlet_message_key_hex` does not decode to
+/// exactly 32 bytes or when the context handle is no longer valid.
 #[wasm_bindgen(js_name = outletStoreMessageKey)]
 pub fn outlet_store_message_key(
     context: &WasmContextHandle,
@@ -1367,7 +1372,7 @@ pub fn outlet_store_message_key(
     .map_err(ScpWasmError::into_js)
 }
 
-/// SCP-OUT-041d outlet_error_new bridge (WASM).
+/// SCP-OUT-041d `outlet_error_new` bridge (WASM).
 ///
 /// Constructs an `OutletError` envelope at the FFI boundary using the
 /// pinned per-outlet `outlet_message_key`. Returns the envelope as a
@@ -1610,7 +1615,7 @@ pub fn outlet_catalog_rotation_validator(
     })
 }
 
-/// SCP-OUT-041d wire-form helper — see PyO3 bridge for schema docs.
+/// SCP-OUT-041d wire-form helper — see `PyO3` bridge for schema docs.
 fn serialize_outlet_error_wire(
     envelope: &scp_protocol::context::outlets::errors::OutletError,
 ) -> serde_json::Value {

@@ -10,6 +10,8 @@
 //! (Python, TypeScript, Swift, Kotlin) so all four implementations
 //! produce byte-identical wire messages for the same input.
 
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 use scp_protocol::context::outlets::errors::{CatalogKey, OutletError};
 use serde::Deserialize;
 use std::path::PathBuf;
