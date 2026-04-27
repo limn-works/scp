@@ -1,5 +1,5 @@
 // McpAllowlistTest.kt — SDK-level ceremony tests for the per-instance MCP
-// stdio allowlist (#1543 PR-D).
+// stdio allowlist.
 //
 // The Kotlin wrapper requires `iTrustAllCommands = true` before delegating
 // to the inner UniFFI-generated `Scp` and writes a runtime warning when
