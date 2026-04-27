@@ -60,6 +60,7 @@ serde_json = { workspace = true }
 rmp-serde = { workspace = true }
 rmpv = { workspace = true }
 tempfile = "3"
+uuid = { workspace = true }
 x25519-dalek = { workspace = true }
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
 axum = { workspace = true, features = ["ws"] }
@@ -78,6 +79,10 @@ path = "tests/integration/outlet_error_conformance.rs"
 [[test]]
 name = "cross_context_error_wrapping"
 path = "tests/integration/cross_context_error_wrapping.rs"
+
+[[test]]
+name = "cross_context_streaming_manager"
+path = "tests/integration/cross_context_streaming_manager.rs"
 
 [[test]]
 name = "encrypted_relay_roundtrip"

@@ -1737,6 +1737,91 @@ impl ContextManager {
         )
         .await
     }
+
+    /// SCP-OUT-036 — opens a §6.2.0.5 cross-context outlet stream from the
+    /// invoker's source context to the outlet hosted in the target context.
+    ///
+    /// This is the production cross-context streaming entry point on
+    /// [`ContextManager`]. It is the public-API surface that routes a
+    /// cross-context stream open through the bridge implemented by the
+    /// free function [`invoke_outlet_cross_context`]. The bridge consumes
+    /// the executor-side chunk receiver `executor_rx` (chunks signed by
+    /// the target operator under the target's `caveats_binding`) and
+    /// re-issues each chunk under the source context's identity, applying
+    /// per-chunk `output_schema` validation and `End.aggregate` validation
+    /// against `aggregate_schema` (or `output_schema` when no aggregate
+    /// schema is registered) per §5.4.5.
+    ///
+    /// The returned [`CrossContextStreamBridge`] carries the receiver of
+    /// re-issued chunks plus the [`CrossContextStreamEventHandle`] that
+    /// resolves to the source/target [`OutletInvokedEvent`] pair (sharing
+    /// `stream_manifest_hash` per §6.2.0.5) once the bridge has emitted
+    /// its terminal chunk. The fresh `RequestId` is bound into every
+    /// re-issued chunk's signature preimage.
+    ///
+    /// # Boundary contract
+    ///
+    /// - `executor_rx` MUST be the receiver half of the executor's
+    ///   stream — typically returned by the target context's
+    ///   [`Self::open_outlet_stream`] or
+    ///   [`Self::invoke_outlet_dispatch_with_economy_stream`] result on
+    ///   the same outlet. The bridge reads chunks until the executor
+    ///   side closes the channel or emits a terminal payload.
+    /// - `inputs` carries the source/target context ids, the source's
+    ///   re-issuing operator key, the source observer's
+    ///   membership / hop-salt closures (§5.4.4 §6.2.0.1), the schemas,
+    ///   and the §5.4.4 round-5 `max_padded_trail_depth`. The
+    ///   `ContextManager` method does NOT mutate `inputs`; it forwards them
+    ///   verbatim to the spawned bridge task so wrap-view membership and
+    ///   hop-salt resolution capture the same caller perspective the
+    ///   `ContextManager` exposes.
+    /// - The bridge does not buffer the stream end-to-end; chunk-to-chunk
+    ///   latency is bounded by re-signing + the channel's credit window
+    ///   (§5.4.5 default `DEFAULT_CREDIT_WINDOW`).
+    ///
+    /// # Errors
+    ///
+    /// This method does NOT return a synchronous `Result` — every
+    /// streaming failure (mid-stream bridge disconnect, output-schema
+    /// violation, aggregate-schema violation) surfaces as a typed
+    /// terminal `ChunkPayload::Error` chunk on the receiver, with a
+    /// §5.4.4 `OutletError` envelope (carrying the `ContextHop` chain,
+    /// HMAC pseudonymization, oracle collapse, trail padding) wrapped via
+    /// SCP-OUT-029 [`wrap_cross_context_error`]. Bridge failures emit
+    /// `transport.cross-context-bridge-failure` (`SCP-TOOL-6160`);
+    /// schema violations emit `output.schema-violation` (`SCP-TOOL-6140`).
+    ///
+    /// # Pipeline
+    ///
+    /// SCP-OUT-036 audit caught [`invoke_outlet_cross_context`] as ghost
+    /// code (5 `#[tokio::test]` callers, 0 production callers). This
+    /// method is the production wiring: every cross-context streaming
+    /// invocation that arrives at the public `ContextManager` API now
+    /// reaches `invoke_outlet_cross_context` through here, satisfying
+    /// the integration-checklist invariant that protocol logic must be
+    /// reachable from a `ContextManager` method.
+    pub fn invoke_outlet_streaming_cross_context(
+        &self,
+        inputs: CrossContextInvokeInputs,
+        executor_rx: tokio::sync::mpsc::Receiver<
+            scp_protocol::context::outlets::stream::OutletStreamChunk,
+        >,
+    ) -> (
+        scp_protocol::context::outlets::stream::RequestId,
+        CrossContextStreamBridge,
+    ) {
+        // The bridge is a self-contained streaming pipeline: it spawns
+        // its own task, holds its own channels, and drives chunk-by-chunk
+        // forwarding without consulting per-context manager state. The
+        // ContextManager method exists to satisfy the integration
+        // checklist (Rust function called from a ContextManager method,
+        // not just exported) and to provide a stable public API for
+        // future FFI wrapper(s); it does NOT add per-method state. Any
+        // future per-context bookkeeping (e.g., admission tracker
+        // integration with §5.4.5 concurrent-stream caps) MUST be added
+        // here so the ContextManager remains the single source of truth.
+        invoke_outlet_cross_context(inputs, executor_rx)
+    }
 }
 
 /// Result of [`ContextManager::invoke_outlet_dispatch_with_economy`].

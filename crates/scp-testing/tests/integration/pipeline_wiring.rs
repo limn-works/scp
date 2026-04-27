@@ -135,7 +135,15 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // `synth_bridge_failure_chunk` were ghost code — exported but the
 // production return path bypassed them. One `#[test]` item, +1 to the
 // active count.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 64;
+//
+// Raised 64 -> 65 by SCP-OUT-036 cross-context bridge wiring: adds
+// `cross_context_bridge_wired_to_manager` pinning the ContextManager
+// public method `invoke_outlet_streaming_cross_context` as the
+// production entry point that drives the §6.2.0.5 free-function bridge
+// `invoke_outlet_cross_context`. Prior to this remediation, the free
+// function had 0 production callers (5 `#[tokio::test]` callers only)
+// — ghost code. One `#[test]` item, +1 to the active count.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 65;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -937,6 +945,33 @@ fn cross_context_bridge_wraps_errors() {
             "wrap_terminal_error_envelope must call wrap_cross_context_error"
         );
     }
+}
+
+// --- SCP-OUT-036 cross-context bridge wired into ContextManager API ---
+//
+// The audit caught `invoke_outlet_cross_context` as ghost code: the free
+// function existed and was exported through `manager::*`, but every caller
+// lived in `#[tokio::test]` blocks. There was no production path from the
+// public ContextManager API into the bridge. SCP-OUT-036 remediation adds
+// `ContextManager::invoke_outlet_streaming_cross_context` as the production
+// entry. This assertion pins that wiring: a future refactor that drops or
+// renames the method MUST update the assertion in lockstep, preventing a
+// silent regression to ghost-only state.
+//
+// Path A (per §5.4.4): the bridge-failure code is `SCP-TOOL-6160`; AC9 in
+// the PRD was updated from a tentative 6161 to 6160 so spec, registry, and
+// AC agree (6161-6169 is a §5.4.4 reserved gap).
+#[test]
+fn cross_context_bridge_wired_to_manager() {
+    let manager_method = extract_fn_body(MANAGER_SRC, "invoke_outlet_streaming_cross_context")
+        .expect(
+            "ContextManager::invoke_outlet_streaming_cross_context must exist as a public method",
+        );
+    assert!(
+        manager_method.contains("invoke_outlet_cross_context"),
+        "invoke_outlet_streaming_cross_context must call invoke_outlet_cross_context to drive \
+         the §6.2.0.5 cross-context bridge"
+    );
 }
 
 // --- Content key rotation (#1548) ---
