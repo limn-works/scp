@@ -1,0 +1,86 @@
+[
+  {
+    "name": "fixture-1",
+    "outlet_id": "outlet-abc",
+    "outlet_message_key_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "catalog_key": "authorization.denied",
+    "expected_wire_message_hex": "6af72733f4b1bf2234b99bf726343278643b5f460027ff55a4fdeb838be43825"
+  },
+  {
+    "name": "fixture-2",
+    "outlet_id": "outlet-xyz",
+    "outlet_message_key_hex": "1111111111111111111111111111111111111111111111111111111111111111",
+    "catalog_key": "authorization.expired",
+    "expected_wire_message_hex": "6d562cc1285424d7fe7d9d735a310304bab14c9a6a5bfa305d497aa0bfd8edb6"
+  },
+  {
+    "name": "fixture-3",
+    "outlet_id": "outlet-1",
+    "outlet_message_key_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "catalog_key": "protocol.malformed",
+    "expected_wire_message_hex": "63384675236b4e9e42e3da8998a4a796aedf966d49ed145e5c7879925faee54d"
+  },
+  {
+    "name": "fixture-4",
+    "outlet_id": "outlet-2",
+    "outlet_message_key_hex": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "catalog_key": "execution.handler-panic",
+    "expected_wire_message_hex": "dffcf6302edcd730c30e461ad62dd2df3a9135a3844ca99b58300e726f31fa4b"
+  },
+  {
+    "name": "fixture-5",
+    "outlet_id": "outlet-3",
+    "outlet_message_key_hex": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "catalog_key": "input.schema-violation",
+    "expected_wire_message_hex": "c1fe7679815d3c6571b7d01934e0a3d20a33eedd18e46c493520c6162fadd4aa"
+  },
+  {
+    "name": "fixture-6",
+    "outlet_id": "outlet-4",
+    "outlet_message_key_hex": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "catalog_key": "output.too-large",
+    "expected_wire_message_hex": "64867d907193ae63b0fcfc6b653dd47b76c14642725b4b59727b3075a7719654"
+  },
+  {
+    "name": "fixture-7",
+    "outlet_id": "outlet-5",
+    "outlet_message_key_hex": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "catalog_key": "economic.insufficient-funds",
+    "expected_wire_message_hex": "96ce0ba3b2713deb9b130ff95038cf20f098a268bdee6145e4fa172dd4b3cc86"
+  },
+  {
+    "name": "fixture-8",
+    "outlet_id": "outlet-6",
+    "outlet_message_key_hex": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "catalog_key": "transport.relay-unavailable",
+    "expected_wire_message_hex": "f4de370a1aa99155b7ae71683d88cf7da2ce29cbf00c39bdb5830fb8b4c448c4"
+  },
+  {
+    "name": "fixture-9",
+    "outlet_id": "outlet-7",
+    "outlet_message_key_hex": "1212121212121212121212121212121212121212121212121212121212121212",
+    "catalog_key": "governance.outlet-deregistered",
+    "expected_wire_message_hex": "7a04faa6403a52f858e03a499cad369347d60d982f16b4d3b5b5ea862616a2c3"
+  },
+  {
+    "name": "fixture-10",
+    "outlet_id": "outlet-very-long-name-to-cover-multi-segment",
+    "outlet_message_key_hex": "3434343434343434343434343434343434343434343434343434343434343434",
+    "catalog_key": "authorization.attenuation-violation.compound-key.deep-nested",
+    "expected_wire_message_hex": "e99e660a0b1200061056a5baa0d83d712e9dae751ab4f871768794ab78a4eb91"
+  },
+  {
+    "name": "fixture-11",
+    "outlet_id": "outlet-edge-1",
+    "outlet_message_key_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+    "catalog_key": "protocol",
+    "expected_wire_message_hex": "b8976d72bb9591d2be105d8805eb3fcfd24f00dd1666b7ae7af2010a47972b19"
+  },
+  {
+    "name": "fixture-12",
+    "outlet_id": "outlet-edge-2",
+    "outlet_message_key_hex": "abababababababababababababababababababababababababababababababab",
+    "catalog_key": "a",
+    "expected_wire_message_hex": "077db6e7d7bc8a4ba4916c7c85707c339b515ad114add4a5d044a55cd09e2516"
+  }
+]

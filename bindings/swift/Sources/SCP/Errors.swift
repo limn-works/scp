@@ -234,6 +234,86 @@ public struct OutletEnvelope: Sendable, Equatable {
         case .governance: return "SCP-TOOL-6170"
         }
     }
+
+    /// SCP-OUT-041d — parses the bridge wire-form JSON produced by
+    /// `outletErrorNew` / `outletCatalogRotationValidator`. Field names
+    /// are snake_case (`pad_nonce`, `registration_event_id`,
+    /// `source_chain`); byte fields are lowercase hex strings.
+    static func fromBridgeWire(_ json: String) throws -> OutletEnvelope {
+        guard let data = json.data(using: .utf8),
+              let any = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            throw OutletError.validation(
+                message: "outlet error envelope is not valid JSON",
+                code: "SCP-VALID-7000"
+            )
+        }
+        guard let classRaw = any["class"] as? String,
+              let classWire = OutletErrorClass(rawValue: classRaw)
+        else {
+            throw OutletError.validation(
+                message: "outlet error envelope missing or invalid 'class'",
+                code: "SCP-VALID-7000"
+            )
+        }
+        let code = (any["code"] as? String) ?? defaultCode(for: classWire)
+        let slug = (any["slug"] as? String) ?? ""
+        let message = (any["message"] as? String) ?? ""
+        let retryDict = any["retry"] as? [String: Any] ?? ["policy": "never"]
+        let retry: RetryPolicy
+        switch retryDict["policy"] as? String ?? "never" {
+        case "immediate": retry = .immediate
+        case "after":
+            retry = .after(delayMs: (retryDict["delay_ms"] as? UInt64) ?? 0)
+        case "with-backoff":
+            retry = .withBackoff(
+                minMs: (retryDict["min_ms"] as? UInt64) ?? 0,
+                maxMs: (retryDict["max_ms"] as? UInt64) ?? 0
+            )
+        default: retry = .never
+        }
+        let padNonceData = (any["pad_nonce"] as? String).flatMap { Data(hexString: $0) }
+        let regIdData = (any["registration_event_id"] as? String).flatMap { Data(hexString: $0) }
+        return OutletEnvelope(
+            classWire: classWire,
+            code: code,
+            slug: slug,
+            message: message,
+            retry: retry,
+            detail: nil,
+            sourceChain: [],
+            padNonce: padNonceData,
+            registrationEventId: regIdData
+        )
+    }
+}
+
+extension RetryPolicy {
+    /// SCP-OUT-041d wire policy string for the FFI bridge call site.
+    var wireForm: String {
+        switch self {
+        case .never: return "never"
+        case .immediate: return "immediate"
+        case .after: return "after"
+        case .withBackoff: return "with-backoff"
+        }
+    }
+}
+
+private extension Data {
+    init?(hexString: String) {
+        let len = hexString.count / 2
+        var data = Data(capacity: len)
+        var idx = hexString.startIndex
+        for _ in 0..<len {
+            let next = hexString.index(idx, offsetBy: 2)
+            guard next <= hexString.endIndex,
+                  let byte = UInt8(hexString[idx..<next], radix: 16) else { return nil }
+            data.append(byte)
+            idx = next
+        }
+        self = data
+    }
 }
 
 // MARK: - PII redaction

@@ -194,6 +194,148 @@ public enum OutletError: Error, Sendable, Equatable {
         case .governance: return .governance(envelope)
         }
     }
+
+    /// SCP-OUT-041d FFI-delegated form of `OutletError.new`. Calls the
+    /// UniFFI `outletErrorNew` export which performs the §5.4.4 wire-
+    /// message HMAC at the FFI boundary using the pinned per-outlet
+    /// `outlet_message_key`. The SDK never sees the raw key.
+    ///
+    /// - Parameters:
+    ///   - handle: The active context handle.
+    ///   - outletId: Emitting outlet id.
+    ///   - registrationEventId: 32-byte event-log id of the
+    ///     `OutletRegistration` that pinned the message key.
+    ///   - catalogKey: Registered catalog key.
+    ///   - class: §5.4.4 root class.
+    ///   - code: `SCP-TOOL-NNNN`. Defaults to the class default code.
+    ///   - slug: `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$`.
+    ///     Defaults to `catalogKey`.
+    ///   - retry: Retry guidance. Defaults to `.never`.
+    ///   - detail: Typed per-class detail.
+    ///   - sourceChain: Initial cross-context hop trail.
+    ///   - padNonce: 16-byte CSPRNG nonce. Defaults to a fresh value.
+    public static func newViaBridge(
+        handle: ContextHandle,
+        outletId: OutletId,
+        registrationEventId: Data,
+        catalogKey: CatalogKey,
+        class: OutletErrorClass,
+        code: String? = nil,
+        slug: String? = nil,
+        retry: RetryPolicy = .never,
+        detail: OutletErrorDetail? = nil,
+        sourceChain: [OutletContextHop]? = nil,
+        padNonce: Data? = nil
+    ) async throws -> OutletError {
+        guard registrationEventId.count == 32 else {
+            throw OutletError.validation(
+                message: "registrationEventId must be 32 bytes",
+                code: "SCP-VALID-7000"
+            )
+        }
+        let nonce = padNonce ?? Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        guard nonce.count == 16 else {
+            throw OutletError.validation(
+                message: "padNonce must be 16 bytes",
+                code: "SCP-VALID-7000"
+            )
+        }
+        let codeStr = code ?? defaultCodeFor(`class`)
+        let slugStr = slug ?? catalogKey
+        let retryStr = retry.wireForm
+        let detailJson = detail.map { detailValue -> String in
+            (try? JSONEncoder().encode(detailValue)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        }
+        let sourceChainJson = sourceChain.map { hops -> String in
+            (try? JSONEncoder().encode(hops)).flatMap { String(data: $0, encoding: .utf8) } ?? "[]"
+        }
+        let envelopeJson = try await outletErrorNew(
+            handle: handle,
+            outletId: outletId,
+            registrationEventIdHex: registrationEventId.map { String(format: "%02x", $0) }.joined(),
+            catalogKey: catalogKey,
+            classStr: `class`.rawValue,
+            code: codeStr,
+            slug: slugStr,
+            retryStr: retryStr,
+            padNonceHex: nonce.map { String(format: "%02x", $0) }.joined(),
+            detailJson: detailJson,
+            sourceChainJson: sourceChainJson
+        )
+        let envelope = try OutletEnvelope.fromBridgeWire(envelopeJson)
+        switch `class` {
+        case .protocol: return .protocol(envelope)
+        case .authorization: return .authorization(envelope)
+        case .input: return .input(envelope)
+        case .execution: return .execution(envelope)
+        case .output: return .output(envelope)
+        case .economic: return .economic(envelope)
+        case .transport: return .transport(envelope)
+        case .governance: return .governance(envelope)
+        }
+    }
+}
+
+/// Per-class default `SCP-TOOL-NNNN` code for the §5.4.4 envelope.
+private func defaultCodeFor(_ class_: OutletErrorClass) -> String {
+    switch class_ {
+    case .protocol: return "SCP-TOOL-6100"
+    case .authorization: return "SCP-TOOL-6110"
+    case .input: return "SCP-TOOL-6120"
+    case .execution: return "SCP-TOOL-6130"
+    case .output: return "SCP-TOOL-6140"
+    case .economic: return "SCP-TOOL-6150"
+    case .transport: return "SCP-TOOL-6160"
+    case .governance: return "SCP-TOOL-6170"
+    }
+}
+
+/// SCP-OUT-041d catalog-rotation dwell-time validator (Swift SDK).
+///
+/// Calls the UniFFI `outletCatalogRotationValidator` export. Returns
+/// silently on success; throws an `OutletError.protocol` when the new
+/// registration is within the §5.4.4 round-5 24-hour dwell floor.
+public func outletCatalogRotationValidator(
+    priorCatalog: [OutletMessageTemplate],
+    newCatalog: [OutletMessageTemplate],
+    priorAppendTimeSecs: UInt64,
+    newAppendTimeSecs: UInt64
+) async throws {
+    let encoder = JSONEncoder()
+    let priorJson = try String(data: encoder.encode(priorCatalog), encoding: .utf8) ?? "[]"
+    let newJson = try String(data: encoder.encode(newCatalog), encoding: .utf8) ?? "[]"
+    let result = try await outletCatalogRotationValidator(
+        priorCatalogJson: priorJson,
+        newCatalogJson: newJson,
+        priorAppendTimeSecs: priorAppendTimeSecs,
+        newAppendTimeSecs: newAppendTimeSecs
+    )
+    if result.isEmpty { return }
+    let envelope = try OutletEnvelope.fromBridgeWire(result)
+    throw OutletError.protocol(envelope)
+}
+
+/// `MessageTemplate` shape mirrored for the SCP-OUT-041d catalog-rotation
+/// validator surface — `{key, template}` pairs.
+public struct OutletMessageTemplate: Codable, Sendable, Equatable {
+    public let key: String
+    public let template: String
+    public init(key: String, template: String) {
+        self.key = key
+        self.template = template
+    }
+}
+
+/// `ContextHop` shape for the SCP-OUT-041d source_chain field.
+public struct OutletContextHop: Codable, Sendable, Equatable {
+    public let context_id: String
+    public let hop_index: UInt32
+    public let wrapped_code: String
+    public init(contextId: String, hopIndex: UInt32, wrappedCode: String) {
+        self.context_id = contextId
+        self.hop_index = hopIndex
+        self.wrapped_code = wrappedCode
+    }
 }
 
 // MARK: - Streaming & caveats (§5.4.5, §7.3.8)

@@ -444,6 +444,141 @@ fun redactPii(message: String): String {
 }
 
 // ---------------------------------------------------------------------------
-// (Companion is declared in Outlets.kt; the new() extension above attaches
-// to OutletError.Companion.)
+// SCP-OUT-041d — newViaBridge + outlet_catalog_rotation_validator wrappers
 // ---------------------------------------------------------------------------
+
+/**
+ * Options-object input for [OutletError.Companion.newViaBridge] — the
+ * SCP-OUT-041d FFI-delegated form. Adds `contextId` and
+ * `registrationEventId` fields so the bridge can look up the pinned
+ * `outlet_message_key` and compute the §5.4.4 wire-message HMAC at the
+ * FFI boundary. The SDK never sees the raw key.
+ */
+data class OutletErrorNewBridgeOptions(
+    val contextId: String,
+    val outletId: OutletId,
+    val registrationEventId: ByteArray,
+    val catalogKey: CatalogKey,
+    val errorClass: OutletErrorClass,
+    val code: String? = null,
+    val slug: String? = null,
+    val retry: RetryPolicy = RetryPolicy.Never,
+    val detail: OutletErrorDetail? = null,
+    val padNonce: ByteArray? = null,
+) {
+    init {
+        require(registrationEventId.size == 32) {
+            "registrationEventId must be 32 bytes"
+        }
+        require(padNonce == null || padNonce.size == 16) {
+            "padNonce must be 16 bytes when provided"
+        }
+    }
+}
+
+/**
+ * SCP-OUT-041d catalog-rotation dwell-time validator entry-point — pure
+ * function, no context state needed.
+ *
+ * Returns `null` on success; throws [OutletProtocolError] (the
+ * `CatalogRotationTooFrequent` rejection) when the new registration is
+ * within the §5.4.4 round-5 24-hour dwell floor of the prior.
+ */
+suspend fun outletCatalogRotationValidator(
+    priorCatalog: List<MessageTemplateRecord>,
+    newCatalog: List<MessageTemplateRecord>,
+    priorAppendTimeSecs: Long,
+    newAppendTimeSecs: Long,
+): Unit = OutletErrorBridge.outletCatalogRotationValidator(
+    priorCatalog,
+    newCatalog,
+    priorAppendTimeSecs,
+    newAppendTimeSecs,
+)
+
+/**
+ * `MessageTemplate` shape mirrored on the SDK surface for the
+ * SCP-OUT-041d catalog-rotation validator — `{key, template}` pairs.
+ */
+data class MessageTemplateRecord(
+    val key: String,
+    val template: String,
+)
+
+/**
+ * Bridge object holding the UniFFI delegation surface for SCP-OUT-041d.
+ * Defaults call the UniFFI-generated `outletErrorNew` /
+ * `outletCatalogRotationValidator` exports; tests can swap in a
+ * configurable stub.
+ */
+object OutletErrorBridge {
+    /**
+     * Default delegate — forwards to the UniFFI-generated bridge. When the
+     * UniFFI bindings are not yet built (e.g., in a unit test that does
+     * not require the native library), the delegate is replaced via
+     * [setDelegate].
+     */
+    @Volatile
+    private var delegate: Delegate = NotConfigured
+
+    fun setDelegate(d: Delegate) {
+        delegate = d
+    }
+
+    suspend fun outletErrorNew(opts: OutletErrorNewBridgeOptions): OutletError =
+        delegate.outletErrorNew(opts)
+
+    suspend fun outletCatalogRotationValidator(
+        priorCatalog: List<MessageTemplateRecord>,
+        newCatalog: List<MessageTemplateRecord>,
+        priorAppendTimeSecs: Long,
+        newAppendTimeSecs: Long,
+    ) = delegate.outletCatalogRotationValidator(
+        priorCatalog,
+        newCatalog,
+        priorAppendTimeSecs,
+        newAppendTimeSecs,
+    )
+
+    /** Bridge delegate interface — swap for tests. */
+    interface Delegate {
+        suspend fun outletErrorNew(opts: OutletErrorNewBridgeOptions): OutletError
+        suspend fun outletCatalogRotationValidator(
+            priorCatalog: List<MessageTemplateRecord>,
+            newCatalog: List<MessageTemplateRecord>,
+            priorAppendTimeSecs: Long,
+            newAppendTimeSecs: Long,
+        )
+    }
+
+    private object NotConfigured : Delegate {
+        override suspend fun outletErrorNew(opts: OutletErrorNewBridgeOptions): OutletError =
+            throw OutletError.Bridge(
+                message = "OutletError.newViaBridge: UniFFI bridge delegate not configured " +
+                    "(call OutletErrorBridge.setDelegate after binding init)",
+                code = "SCP-CTX-2000",
+            )
+
+        override suspend fun outletCatalogRotationValidator(
+            priorCatalog: List<MessageTemplateRecord>,
+            newCatalog: List<MessageTemplateRecord>,
+            priorAppendTimeSecs: Long,
+            newAppendTimeSecs: Long,
+        ) {
+            throw OutletError.Bridge(
+                message = "outletCatalogRotationValidator: UniFFI bridge delegate not configured " +
+                    "(call OutletErrorBridge.setDelegate after binding init)",
+                code = "SCP-CTX-2000",
+            )
+        }
+    }
+}
+
+/**
+ * SCP-OUT-041d FFI-delegated `OutletError.new`. The §5.4.4 wire-message
+ * HMAC happens at the FFI boundary using the pinned per-outlet
+ * `outlet_message_key`; the SDK never sees the raw key.
+ */
+suspend fun OutletError.Companion.newViaBridge(
+    opts: OutletErrorNewBridgeOptions,
+): OutletError = OutletErrorBridge.outletErrorNew(opts)

@@ -1,0 +1,70 @@
+{
+  "$schema_version": 1,
+  "story": "SCP-OUT-041d",
+  "comment": "Bridge export ratchet for the §5.4.4 outlet redesign per ADR-049 round 5/6. Each new export listed here is enforced as additive — entries can be added but never removed without explicit human approval. Pre-existing exports are tracked elsewhere; this baseline scopes only the SCP-OUT-041d-introduced surface.",
+  "exports": {
+    "pyo3": [
+      {
+        "name": "outlet_error_new",
+        "story": "SCP-OUT-041d",
+        "kind": "function",
+        "signature": "outlet_error_new(context_id, outlet_id, registration_event_id_hex, catalog_key, class_str, code, slug, retry_str, pad_nonce_hex, detail_json=None, source_chain_json=None) -> str"
+      },
+      {
+        "name": "outlet_catalog_rotation_validator",
+        "story": "SCP-OUT-041d",
+        "kind": "function",
+        "signature": "outlet_catalog_rotation_validator(prior_catalog_json, new_catalog_json, prior_append_time_secs, new_append_time_secs) -> str"
+      }
+    ],
+    "napi": [
+      {
+        "name": "outletErrorNew",
+        "story": "SCP-OUT-041d",
+        "kind": "async_function",
+        "signature": "outletErrorNew(handle, outletId, registrationEventIdHex, catalogKey, classStr, code, slug, retryStr, padNonceHex, detailJson?, sourceChainJson?) -> Promise<string>"
+      },
+      {
+        "name": "outletCatalogRotationValidator",
+        "story": "SCP-OUT-041d",
+        "kind": "async_function",
+        "signature": "outletCatalogRotationValidator(priorCatalogJson, newCatalogJson, priorAppendTimeSecs, newAppendTimeSecs) -> Promise<string>"
+      }
+    ],
+    "uniffi": [
+      {
+        "name": "outlet_error_new",
+        "story": "SCP-OUT-041d",
+        "kind": "async_function",
+        "signature": "outlet_error_new(handle: ContextHandle, outlet_id: String, registration_event_id_hex: String, catalog_key: String, class_str: String, code: String, slug: String, retry_str: String, pad_nonce_hex: String, detail_json: Option<String>, source_chain_json: Option<String>) -> Result<String, ScpError>"
+      },
+      {
+        "name": "outlet_catalog_rotation_validator",
+        "story": "SCP-OUT-041d",
+        "kind": "async_function",
+        "signature": "outlet_catalog_rotation_validator(prior_catalog_json: String, new_catalog_json: String, prior_append_time_secs: u64, new_append_time_secs: u64) -> Result<String, ScpError>"
+      }
+    ],
+    "wasm": [
+      {
+        "name": "outletErrorNew",
+        "story": "SCP-OUT-041d",
+        "kind": "function",
+        "signature": "outletErrorNew(context: WasmContextHandle, outletId, registrationEventIdHex, catalogKey, classStr, code, slug, retryStr, padNonceHex, detailJson?, sourceChainJson?) -> Promise<string>"
+      },
+      {
+        "name": "outletCatalogRotationValidator",
+        "story": "SCP-OUT-041d",
+        "kind": "function",
+        "signature": "outletCatalogRotationValidator(priorCatalogJson, newCatalogJson, priorAppendTimeSecs, newAppendTimeSecs) -> Promise<string>"
+      },
+      {
+        "name": "outletStoreMessageKey",
+        "story": "SCP-OUT-041d",
+        "kind": "function",
+        "signature": "outletStoreMessageKey(context: WasmContextHandle, outletId, registrationEventIdHex, outletMessageKeyHex) -> void",
+        "comment": "WASM-only helper — scp-runtime's GovernanceState::pinned_outlet_message_keys map is mirrored locally because WASM cannot depend on scp-runtime (tokio). Callers (typically the SDK receiver layer) pin the key here at outlet-registration acceptance time so outlet_error_new can compute the §5.4.4 HMAC at the FFI boundary."
+      }
+    ]
+  }
+}
