@@ -676,6 +676,7 @@ pub fn validate_governance_action_strings(
         | GovernanceAction::RemoveSigner { .. }
         | GovernanceAction::ModifyThreshold { .. }
         | GovernanceAction::EstablishOutletInterface { .. }
+        | GovernanceAction::AcceptOutletInterface { .. }
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::PromoteContext
         | GovernanceAction::SuspendCapability { .. }

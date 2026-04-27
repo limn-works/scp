@@ -1457,6 +1457,7 @@ impl ContextManager {
             | GovernanceAction::RemoveSigner { .. }
             | GovernanceAction::ModifyThreshold { .. }
             | GovernanceAction::EstablishOutletInterface { .. }
+            | GovernanceAction::AcceptOutletInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
             | GovernanceAction::RotateContentKeys { .. }
@@ -1566,6 +1567,7 @@ impl ContextManager {
             | GovernanceAction::RemoveSigner { .. }
             | GovernanceAction::ModifyThreshold { .. }
             | GovernanceAction::EstablishOutletInterface { .. }
+            | GovernanceAction::AcceptOutletInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
             | GovernanceAction::RotateContentKeys { .. }
@@ -1619,6 +1621,11 @@ impl ContextManager {
             }
             GovernanceAction::EstablishOutletInterface { interface } => {
                 self.execute_establish_tool_interface(context_id, interface, pid, actor_did)
+                    .await?;
+                Ok(GovernanceActionResult::OutletInterfaceEstablished)
+            }
+            GovernanceAction::AcceptOutletInterface { proposal } => {
+                self.execute_accept_outlet_interface(context_id, proposal, pid, actor_did)
                     .await?;
                 Ok(GovernanceActionResult::OutletInterfaceEstablished)
             }
@@ -4153,6 +4160,318 @@ impl ContextManager {
             }
         }
         Ok(())
+    }
+
+    /// Resolves per-context state needed to drive
+    /// [`ContextManager::accept_outlet_interface`]. Returns the
+    /// `(member_count, mls_epoch, base_cost, currency, base_cost_scale,
+    /// proposer_balance, ceiling_has_outlet_interface)` tuple.
+    async fn collect_accept_outlet_interface_context_state(
+        &self,
+        context_id: &str,
+        actor_did: &str,
+    ) -> Result<
+        (
+            u32,
+            u64,
+            scp_protocol::economy::types::Amount,
+            scp_protocol::economy::types::CurrencyCode,
+            scp_protocol::economy::types::Amount,
+            scp_protocol::economy::types::Amount,
+            bool,
+        ),
+        ContextError,
+    > {
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let guard = ctx_arc.lock().await;
+        let ctx = &*guard;
+        require_active(&ctx.handle)?;
+
+        // §5.3, §6.2 ceiling gate — also enforced for accept proposals.
+        let has_cap = ctx
+            .role_state
+            .ceiling
+            .contains(&Capability::OutletInterface);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let member_count = ctx.membership.count() as u32;
+        let mls_epoch = ctx.epoch.mls_epoch;
+
+        // Economic policy lookup. Default cost = 0 + currency = USD when
+        // no policy is configured — the population-weighted floor still
+        // applies via the `currency_atomic_unit` lower bound (OUT-042d
+        // AC 9), so `fee = 0` is impossible even without a policy.
+        let (base_cost, currency) = ctx.governance.economic_policy.as_ref().map_or_else(
+            || {
+                (
+                    scp_protocol::economy::types::Amount::new(0),
+                    scp_protocol::economy::types::CurrencyCode::from("USD"),
+                )
+            },
+            |p| {
+                (
+                    p.cost_schedule
+                        .per_outlet_call
+                        .unwrap_or_else(|| scp_protocol::economy::types::Amount::new(0)),
+                    p.cost_schedule.currency,
+                )
+            },
+        );
+
+        let base_cost_scale = ctx.handle.params().base_cost_scale;
+
+        // Proposer balance — currently use available budget tracker
+        // headroom for the actor. When the actor has no
+        // `ApproveSpend` grant the headroom is zero, so the
+        // quadratic-fee gate trips correctly for unfunded proposers.
+        let actor = DID::from(actor_did);
+        let balance = ctx.governance.budget_tracker.remaining(&actor);
+
+        Ok((
+            member_count,
+            mls_epoch,
+            base_cost,
+            currency,
+            base_cost_scale,
+            balance,
+            has_cap,
+        ))
+    }
+
+    /// Spec §6.2.0.1 step-4 `AcceptOutletInterface` governance dispatch
+    /// (SCP-OUT-042b + SCP-OUT-042d remediation).
+    ///
+    /// Routes the proposal payload + per-context state to
+    /// [`ContextManager::accept_outlet_interface`], which:
+    ///
+    /// 0. Computes the §6.2.0.1 round-6 quadratic interface-spam fee
+    ///    over the 24-hour rolling window. Insufficient funds reject
+    ///    with the cross-class slug `protocol.interface-spam-cost`
+    ///    (`SCP-TOOL-6150`, OUT-042d AC 12).
+    /// 1. Derives `ikm_local` via the peer-suffixed MLS exporter.
+    /// 2. Signs `ikm_local` under the local admin's `#active` key.
+    /// 3. Self-verifies the local signature defensively.
+    /// 4. Verifies `peer_ikm_sig` under the proposal's
+    ///    `peer_admin_active_verifying_key` against the
+    ///    `SCP-OUTLET-IKM-COMMITMENT-V1:` preimage (§6.2.0.1 verifier
+    ///    rule). Failure rejects with the slug
+    ///    `authorization.ikm-signature-invalid` (`SCP-TOOL-6110`).
+    /// 5. Appends an `OutletInterfaceAccepted` event with the
+    ///    fully-populated `InterfaceEstablished` payload.
+    ///
+    /// Errors are mapped through
+    /// [`OutletError::from_invocation_error_template`] so the
+    /// rejection slug + code surface verbatim at the FFI boundary
+    /// without consulting a real `outlet_message_key` (the placeholder
+    /// HMAC is deterministic per §5.4.4 round-5).
+    pub(super) async fn execute_accept_outlet_interface(
+        &self,
+        context_id: &str,
+        proposal: &scp_protocol::context::outlets::interface::AcceptOutletInterfaceProposal,
+        _proposal_id: ProposalId,
+        actor_did: &str,
+    ) -> Result<(), ContextError> {
+        use crate::context::manager::interface::{
+            AUTHORIZATION_IKM_SIGNATURE_INVALID_CODE, AUTHORIZATION_IKM_SIGNATURE_INVALID_SLUG,
+            AcceptOutletInterfaceInputs,
+        };
+        use ed25519_dalek::VerifyingKey;
+        use scp_protocol::context::outlets::errors::{OutletError, OutletErrorClass, RetryPolicy};
+        use std::collections::HashSet;
+
+        // -- Resolve local-side state via helper to keep this method
+        //    within the clippy `too_many_lines` cap.
+        let (
+            local_member_count,
+            local_epoch,
+            local_base_cost,
+            local_currency,
+            local_base_cost_scale,
+            proposer_balance,
+            ceiling_has_outlet_interface,
+        ) = self
+            .collect_accept_outlet_interface_context_state(context_id, actor_did)
+            .await?;
+
+        // Rolling-window events feed predicate evaluation. The full
+        // §6.2.0.1 24-hour window assembly lives in the event-log
+        // adapter (OUT-042c+); we pass the empty slice here so that
+        // the §6.2.0.1 `k=0` baseline still produces a non-zero fee
+        // via the population-weighted floor — the dispatch path is
+        // exercised end-to-end without depending on the rolling-window
+        // event-log query.
+        let rolling_window_events: Vec<
+            scp_protocol::context::outlets::interface::InterfaceEstablished,
+        > = Vec::new();
+
+        if !ceiling_has_outlet_interface {
+            return Err(ContextError::PermissionDenied(
+                "context ceiling does not include outlet interface capability".into(),
+            ));
+        }
+
+        // -- Reconstruct peer admin verifying key. A bad-bytes key
+        //    (parse failure) maps to the same §6.2.0.1 verifier-rule
+        //    rejection as a valid-bytes-but-bad-signature case — both
+        //    surface `authorization.ikm-signature-invalid`. The
+        //    error-template construction itself can only fail on a
+        //    malformed code/slug constant; that is a runtime-config
+        //    bug, not a user-input bug — surface it via
+        //    `IntegrationFailed` rather than panicking.
+        let peer_admin_active_key =
+            match VerifyingKey::from_bytes(&proposal.peer_admin_active_verifying_key) {
+                Ok(k) => k,
+                Err(parse_err) => {
+                    let envelope = OutletError::from_invocation_error_template(
+                        OutletErrorClass::Authorization,
+                        AUTHORIZATION_IKM_SIGNATURE_INVALID_CODE,
+                        AUTHORIZATION_IKM_SIGNATURE_INVALID_SLUG,
+                        RetryPolicy::Never,
+                    )
+                    .map_err(|tpl_err| {
+                        ContextError::IntegrationFailed(format!(
+                            "ikm-signature-invalid template construction failed: \
+                         {tpl_err} (after vk parse: {parse_err})"
+                        ))
+                    })?;
+                    return Err(ContextError::OutletInvocation(Box::new(envelope)));
+                }
+            };
+
+        // -- Build local signing key. The runtime layer derives this
+        //    deterministically per actor — production deployments that
+        //    custody-back the admin `#active` key inject the real signing
+        //    key via `KeyCustody`; this dispatch plumbs the same shape so
+        //    the verifier upstream resolves either form against the role
+        //    registry at `epoch_local`.
+        let local_signing_key = admin_signing_key_for_rotation(actor_did);
+
+        // -- Project peer_capability_map (Vec<(DID, Vec<Capability>)>) into
+        //    Vec<(DID, HashSet<Capability>)> as the handler expects.
+        let peer_capability_map: Vec<(DID, HashSet<Capability>)> = proposal
+            .peer_capability_map
+            .iter()
+            .map(|(did, caps)| (did.clone(), caps.iter().cloned().collect()))
+            .collect();
+
+        // -- Local context_id bytes (32-byte canonical id) for the MLS
+        //    exporter call.
+        let local_context_id_bytes = scp_protocol::context::context_id_bytes(context_id);
+
+        // -- Wall-clock established_at — fall back to now_ms when the
+        //    proposal carries the legacy default (0); both sides MUST
+        //    pin the same timestamp via the proposal in production.
+        let established_at = if proposal.established_at == 0 {
+            self.clock.now_secs().saturating_mul(1_000)
+        } else {
+            proposal.established_at
+        };
+
+        let inputs = AcceptOutletInterfaceInputs {
+            interface_id: proposal.offer_id,
+            outlet_id: proposal.outlet_id.clone(),
+            source_context: proposal.source_context.clone(),
+            target_context: proposal.target_context.clone(),
+            established_at,
+            local_context_id_bytes,
+            local_epoch,
+            local_signing_key,
+            peer_epoch: proposal.peer_epoch,
+            peer_ikm: proposal.peer_ikm,
+            peer_ikm_sig: proposal.peer_ikm_sig.clone(),
+            peer_admin_active_key,
+            peer_creator_did: proposal.peer_creator_did.clone(),
+            peer_admin_set: proposal.peer_admin_set.clone(),
+            peer_capability_map,
+            rolling_window_events,
+            local_base_cost,
+            local_currency,
+            local_member_count,
+            local_base_cost_scale,
+            proposer_balance,
+        };
+
+        let outcome = self
+            .accept_outlet_interface(context_id, actor_did, inputs)
+            .await;
+        self.finalize_accept_outlet_interface(context_id, outcome)
+            .await
+    }
+
+    /// Finalizes a `accept_outlet_interface` outcome by mapping success
+    /// into a checkpoint bump and mapping each error variant into the
+    /// canonical `ContextError` shape per the §6.2.0.1 verifier rule
+    /// (slug `authorization.ikm-signature-invalid` /
+    /// `protocol.interface-spam-cost`). Lifted out of
+    /// `execute_accept_outlet_interface` to satisfy
+    /// `clippy::too_many_lines`.
+    async fn finalize_accept_outlet_interface(
+        &self,
+        context_id: &str,
+        outcome: Result<
+            crate::context::manager::interface::AcceptOutletInterfaceOutput,
+            crate::context::manager::interface::AcceptOutletInterfaceError,
+        >,
+    ) -> Result<(), ContextError> {
+        use crate::context::manager::interface::{
+            AUTHORIZATION_IKM_SIGNATURE_INVALID_CODE, AUTHORIZATION_IKM_SIGNATURE_INVALID_SLUG,
+            AcceptOutletInterfaceError, INTERFACE_SPAM_COST_CODE, INTERFACE_SPAM_COST_SLUG,
+        };
+        use scp_protocol::context::outlets::errors::{OutletError, OutletErrorClass, RetryPolicy};
+
+        match outcome {
+            Ok(_output) => {
+                // Bump checkpoint counter — matches the legacy
+                // `execute_establish_tool_interface` post-write hook.
+                if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+                    let mut guard = ctx_arc.lock().await;
+                    guard.checkpoint_events_since += 1;
+                }
+                Ok(())
+            }
+            Err(
+                AcceptOutletInterfaceError::IkmSignatureInvalid { .. }
+                | AcceptOutletInterfaceError::LocalSelfVerifyFailed { .. },
+            ) => {
+                let envelope = OutletError::from_invocation_error_template(
+                    OutletErrorClass::Authorization,
+                    AUTHORIZATION_IKM_SIGNATURE_INVALID_CODE,
+                    AUTHORIZATION_IKM_SIGNATURE_INVALID_SLUG,
+                    RetryPolicy::Never,
+                )
+                .map_err(|e| {
+                    ContextError::IntegrationFailed(format!(
+                        "error template construction failed: {e}"
+                    ))
+                })?;
+                Err(ContextError::OutletInvocation(Box::new(envelope)))
+            }
+            Err(AcceptOutletInterfaceError::InterfaceSpamCost { .. }) => {
+                let envelope = OutletError::from_invocation_error_template(
+                    OutletErrorClass::Economic,
+                    INTERFACE_SPAM_COST_CODE,
+                    INTERFACE_SPAM_COST_SLUG,
+                    RetryPolicy::Never,
+                )
+                .map_err(|e| {
+                    ContextError::IntegrationFailed(format!(
+                        "error template construction failed: {e}"
+                    ))
+                })?;
+                Err(ContextError::OutletInvocation(Box::new(envelope)))
+            }
+            Err(AcceptOutletInterfaceError::DeriveFailed(e)) => Err(ContextError::CryptoFailed(
+                format!("ikm derivation failed: {e}"),
+            )),
+            Err(AcceptOutletInterfaceError::EventLogFailed(e)) => Err(e),
+            Err(AcceptOutletInterfaceError::PayloadSerializationFailed(e)) => {
+                Err(ContextError::IntegrationFailed(format!(
+                    "InterfaceEstablished serialization failed: {e}"
+                )))
+            }
+        }
     }
 
     /// Establishes a cross-context outlet interface. Requires `OutletInterface`

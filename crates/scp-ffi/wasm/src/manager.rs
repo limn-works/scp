@@ -2847,7 +2847,8 @@ impl WasmContextManager {
 
             GovernanceAction::RegisterOutlet { .. }
             | GovernanceAction::RemoveOutlet { .. }
-            | GovernanceAction::EstablishOutletInterface { .. } => "outlet:register",
+            | GovernanceAction::EstablishOutletInterface { .. }
+            | GovernanceAction::AcceptOutletInterface { .. } => "outlet:register",
 
             GovernanceAction::CloseContext { .. } => "context:close",
 
@@ -3075,6 +3076,7 @@ impl WasmContextManager {
             | GovernanceAction::RemoveSigner { .. }
             | GovernanceAction::ModifyThreshold { .. }
             | GovernanceAction::EstablishOutletInterface { .. }
+            | GovernanceAction::AcceptOutletInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
             | GovernanceAction::RotateContentKeys { .. }
@@ -3258,6 +3260,7 @@ impl WasmContextManager {
             | GovernanceAction::RemoveSigner { .. }
             | GovernanceAction::ModifyThreshold { .. }
             | GovernanceAction::EstablishOutletInterface { .. }
+            | GovernanceAction::AcceptOutletInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
             | GovernanceAction::RotateContentKeys { .. }
@@ -3445,7 +3448,8 @@ impl WasmContextManager {
             | GovernanceAction::SuspendAccess { .. }
             | GovernanceAction::RevokeAccess { .. }
             | GovernanceAction::RestoreAccess { .. } => unreachable!(),
-            GovernanceAction::EstablishOutletInterface { .. } // 11 downstream
+            GovernanceAction::EstablishOutletInterface { .. } // 12 downstream
+            | GovernanceAction::AcceptOutletInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
             | GovernanceAction::RotateContentKeys { .. }
@@ -3477,6 +3481,22 @@ impl WasmContextManager {
                 ctx.outlet_interfaces
                     .push(serde_json::to_string(interface).unwrap_or_default());
                 Ok(serde_json::json!({"action": "EstablishOutletInterface"}))
+            }
+            GovernanceAction::AcceptOutletInterface { proposal } => {
+                // WASM bridge cannot run the §6.2.0.1 IKM-commitment
+                // pipeline (no scp-runtime, no MLS exporter access — see
+                // ADR-034). The browser-target enforcement seam is
+                // forward-looking: when the WASM MLS shim grows
+                // exporter access, this arm will route through the
+                // mirrored handler. For now the dispatch records the
+                // proposal payload so the WASM event stream stays
+                // consistent with the runtime — non-WASM bridges run
+                // the real handler and the cross-bridge byte-equality
+                // tests pin the InterfaceEstablished serialization.
+                let ctx = self.require_active_context_mut(context_id)?;
+                ctx.outlet_interfaces
+                    .push(serde_json::to_string(proposal).unwrap_or_default());
+                Ok(serde_json::json!({"action": "AcceptOutletInterface"}))
             }
             GovernanceAction::ResetMember { did, reason } => {
                 self.dispatch_reset_member(context_id, did, reason)
@@ -3693,6 +3713,7 @@ impl WasmContextManager {
             | GovernanceAction::RemoveSigner { .. }
             | GovernanceAction::ModifyThreshold { .. }
             | GovernanceAction::EstablishOutletInterface { .. }
+            | GovernanceAction::AcceptOutletInterface { .. }
             | GovernanceAction::ResetMember { .. }
             | GovernanceAction::ResolveConflict { .. }
             | GovernanceAction::RotateContentKeys { .. }

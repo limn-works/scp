@@ -109,6 +109,7 @@ pub const fn classify_action(action: &GovernanceAction) -> MlsImpact {
         | GovernanceAction::RemoveSigner { .. }
         | GovernanceAction::ModifyThreshold { .. }
         | GovernanceAction::EstablishOutletInterface { .. }
+        | GovernanceAction::AcceptOutletInterface { .. }
         | GovernanceAction::ResolveConflict { .. }
         | GovernanceAction::PromoteContext
         | GovernanceAction::RotateContentKeys { .. }

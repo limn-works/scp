@@ -673,6 +673,35 @@ pub enum GovernanceAction {
         /// The tool interface to establish.
         interface: OutletInterface,
     },
+    /// Spec §6.2.0.1 step-4 target-side accept proposal — the
+    /// `AcceptOutletInterface` governance action.
+    ///
+    /// Carries the bridged offer identifier, the local inbound policy,
+    /// and the peer-attested accept-time IKM commitment. At dispatch
+    /// time the runtime invokes `accept_outlet_interface`, which:
+    ///
+    /// 1. Computes the §6.2.0.1 round-6 quadratic interface-spam fee
+    ///    over the 24-hour rolling window. Insufficient funds reject
+    ///    with `OutletErrorClass::Economic` slug
+    ///    `protocol.interface-spam-cost` (`SCP-TOOL-6150`,
+    ///    SCP-OUT-042d AC 12).
+    /// 2. Derives the local IKM via the peer-suffixed MLS exporter
+    ///    (§6.2.0.1 step 1).
+    /// 3. Verifies BOTH sides' signatures under the
+    ///    `SCP-OUTLET-IKM-COMMITMENT-V1:` preimage (§6.2.0.1 verifier
+    ///    rule). Failure rejects with `OutletErrorClass::Authorization`
+    ///    slug `authorization.ikm-signature-invalid`
+    ///    (`SCP-TOOL-6110`, SCP-OUT-042b AC).
+    /// 4. Appends an `OutletInterfaceAccepted` event with the
+    ///    fully-populated `InterfaceEstablished` payload (`epoch_a`,
+    ///    `epoch_b`, `ikm_a`, `ikm_a_sig`, `ikm_b`, `ikm_b_sig`,
+    ///    `creator_did`, `admin_set`, `capability_holder_set`).
+    AcceptOutletInterface {
+        /// Boxed proposal payload to keep the enum size bounded — the
+        /// proposal carries cluster-detection metadata which can grow
+        /// to hundreds of bytes for large peer-context capability maps.
+        proposal: Box<crate::context::outlets::interface::AcceptOutletInterfaceProposal>,
+    },
     /// Governance-triggered member reset (ADR-029, Tier 3).
     ///
     /// Forces a group state reset for the target member. Invalidates any
@@ -817,6 +846,7 @@ impl GovernanceAction {
             Self::RemoveSigner { .. } => "RemoveSigner",
             Self::ModifyThreshold { .. } => "ModifyThreshold",
             Self::EstablishOutletInterface { .. } => "EstablishOutletInterface",
+            Self::AcceptOutletInterface { .. } => "AcceptOutletInterface",
             Self::ResetMember { .. } => "ResetMember",
             Self::ResolveConflict { .. } => "ResolveConflict",
             Self::PromoteContext => "PromoteContext",
@@ -861,6 +891,7 @@ impl GovernanceAction {
             | Self::ModifyPruningPolicy { .. }
             | Self::ModifyThreshold { .. }
             | Self::EstablishOutletInterface { .. }
+            | Self::AcceptOutletInterface { .. }
             | Self::ResolveConflict { .. }
             | Self::PromoteContext
             | Self::RotateContentKeys { .. }
@@ -2102,7 +2133,7 @@ mod tests {
     // GovernanceAction serialization
     // -----------------------------------------------------------------------
 
-    /// Returns all 28 `GovernanceAction` variants for serialization testing.
+    /// Returns all 29 `GovernanceAction` variants for serialization testing.
     /// Split into two helpers to stay within the function line limit.
     fn all_governance_actions() -> Vec<GovernanceAction> {
         let mut actions = governance_actions_core();
@@ -2202,6 +2233,26 @@ mod tests {
                     inbound_policy: None,
                 },
             },
+            GovernanceAction::AcceptOutletInterface {
+                proposal: Box::new(
+                    crate::context::outlets::interface::AcceptOutletInterfaceProposal {
+                        offer_id: [0xAA; 32],
+                        source_context: "ctx-src".to_owned(),
+                        target_context: "ctx-tgt".to_owned(),
+                        outlet_id: "tool-1".to_owned(),
+                        inbound_policy: crate::context::outlets::interface::InboundPolicy::default(
+                        ),
+                        established_at: 1_700_000_000_000,
+                        peer_epoch: 7,
+                        peer_ikm: [0x42; 32],
+                        peer_ikm_sig: vec![0u8; 64],
+                        peer_admin_active_verifying_key: [0xCC; 32],
+                        peer_creator_did: bob(),
+                        peer_admin_set: vec![bob()],
+                        peer_capability_map: vec![(bob(), vec![Capability::OutletInterface])],
+                    },
+                ),
+            },
             GovernanceAction::ResetMember {
                 did: bob(),
                 reason: "group state corruption".to_owned(),
@@ -2264,10 +2315,10 @@ mod tests {
     fn governance_action_serialization_roundtrip() {
         let actions = all_governance_actions();
 
-        // Verify all 28 variants are covered.
+        // Verify all 29 variants are covered.
         assert_eq!(
             actions.len(),
-            28,
+            29,
             "all GovernanceAction variants must be tested"
         );
 

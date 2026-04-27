@@ -196,6 +196,25 @@ fn all_governance_actions_for_test() -> Vec<GovernanceAction> {
         GovernanceAction::EstablishOutletInterface {
             interface: simple_tool_interface(),
         },
+        GovernanceAction::AcceptOutletInterface {
+            proposal: Box::new(
+                scp_core::context::tools::interface::AcceptOutletInterfaceProposal {
+                    offer_id: [0xAB; 32],
+                    source_context: "ctx-src".to_owned(),
+                    target_context: "ctx-tgt".to_owned(),
+                    outlet_id: "tool-1".to_owned(),
+                    inbound_policy: scp_core::context::tools::interface::InboundPolicy::default(),
+                    established_at: 1_700_000_000_001,
+                    peer_epoch: 9,
+                    peer_ikm: [0x55; 32],
+                    peer_ikm_sig: vec![0u8; 64],
+                    peer_admin_active_verifying_key: [0xEE; 32],
+                    peer_creator_did: bob(),
+                    peer_admin_set: vec![bob()],
+                    peer_capability_map: vec![(bob(), vec![Capability::OutletInterface])],
+                },
+            ),
+        },
         GovernanceAction::ResetMember {
             did: bob(),
             reason: "group state corruption".to_owned(),
@@ -264,7 +283,7 @@ async fn all_governance_action_variants_roundtrip() {
     // values to exercise both scopes of the AccessScope enum.
     assert_eq!(
         actions.len(),
-        31,
+        32,
         "fixture must cover every GovernanceAction variant; bump when adding a new variant"
     );
 

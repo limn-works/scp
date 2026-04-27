@@ -78,7 +78,15 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // round-6 atomic admin-removal salt-rotation invariant. The single
 // `#[test]` adds 2 inner asserts but contributes 1 to the
 // total_tests count.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 53;
+//
+// Raised 53 -> 54 by SCP-OUT-042b + SCP-OUT-042d remediation: adds
+// `accept_outlet_interface_routed_from_governance` pinning the
+// runtime governance dispatch arm that wires
+// `GovernanceAction::AcceptOutletInterface` to
+// `ContextManager::accept_outlet_interface`. The single `#[test]`
+// runs 4 inner asserts (dispatch → wrapper → both rejection slugs)
+// but contributes 1 to the total_tests count.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 54;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -440,6 +448,84 @@ fn leave_context_calls_rotate_sender_key() {
     assert!(
         fn_body_contains(MANAGER_SRC, "leave_context", "rotate_sender_key"),
         "leave_context must call rotate_sender_key (§9.16.4)"
+    );
+}
+
+// SCP-OUT-042b + SCP-OUT-042d — accept-time IKM verification + the
+// quadratic interface-spam-cost gate. The runtime governance
+// dispatch MUST route `GovernanceAction::AcceptOutletInterface` to
+// `accept_outlet_interface`, which runs §6.2.0.1 step-1 IKM
+// derivation, the `SCP-OUTLET-IKM-COMMITMENT-V1:` signature
+// verification, and the round-6 quadratic-fee
+// `protocol.interface-spam-cost` gate before appending the
+// `OutletInterfaceAccepted` event. Without this assertion, the
+// handler is exported but never called from production code — every
+// defense (IKM signature verification, capability_holder_set
+// capture, InterfaceEstablished event emission, quadratic-fee
+// rejection) becomes structurally dead.
+#[test]
+fn accept_outlet_interface_routed_from_governance() {
+    // Inner dispatcher: the `AcceptOutletInterface` arm in
+    // `dispatch_content_governance_action` MUST call
+    // `execute_accept_outlet_interface`.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "dispatch_content_governance_action",
+            "execute_accept_outlet_interface"
+        ),
+        "dispatch_content_governance_action must dispatch \
+         AcceptOutletInterface to execute_accept_outlet_interface \
+         (§6.2.0.1 step 4, SCP-OUT-042b/d remediation)"
+    );
+    // Wrapper: the runtime's `execute_accept_outlet_interface`
+    // method MUST invoke the cryptographic handler
+    // `accept_outlet_interface`, which is what runs IKM signature
+    // verification + the quadratic-fee gate.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "execute_accept_outlet_interface",
+            "accept_outlet_interface"
+        ),
+        "execute_accept_outlet_interface must call \
+         ContextManager::accept_outlet_interface (the OUT-042b \
+         crypto pipeline + OUT-042d quadratic-fee gate)"
+    );
+    // Pin the rejection slugs to non-test source so future
+    // refactors cannot silently drop the canonical mappings. The
+    // dispatch wrapper delegates the post-handler error mapping to
+    // `finalize_accept_outlet_interface`; the slugs live there.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "finalize_accept_outlet_interface",
+            "AUTHORIZATION_IKM_SIGNATURE_INVALID_SLUG"
+        ),
+        "finalize_accept_outlet_interface must surface the §6.2.0.1 \
+         verifier-rule slug authorization.ikm-signature-invalid"
+    );
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "finalize_accept_outlet_interface",
+            "INTERFACE_SPAM_COST_SLUG"
+        ),
+        "finalize_accept_outlet_interface must surface the OUT-042d \
+         round-6 slug protocol.interface-spam-cost"
+    );
+    // Wrapper MUST delegate to the finalizer — pin that wiring too
+    // so the slug-pinning above cannot be bypassed by a future
+    // refactor that inlines the error mapping somewhere else.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "execute_accept_outlet_interface",
+            "finalize_accept_outlet_interface"
+        ),
+        "execute_accept_outlet_interface must delegate post-handler \
+         error mapping to finalize_accept_outlet_interface so the \
+         canonical slug + code constants stay reachable"
     );
 }
 

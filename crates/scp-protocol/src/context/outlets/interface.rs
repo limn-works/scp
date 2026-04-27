@@ -1245,6 +1245,73 @@ pub struct OutletInterface {
     pub inbound_policy: Option<InboundPolicy>,
 }
 
+/// Spec §6.2.0.1 step-4 `AcceptOutletInterface` governance-action payload.
+///
+/// Carries the target context's accept-side proposal data — the matched
+/// `offer_id`, the local inbound policy, and the peer-attested
+/// accept-time IKM commitment. The runtime's
+/// [`crate::context::outlets::interface::OutletInterface`] is **not**
+/// the right shape for this action: that type is the long-lived
+/// established-interface descriptor, while this struct is the
+/// accept-time proposal payload that drives the runtime's
+/// `accept_outlet_interface` handler at governance approval time
+/// (OUT-042b/d remediation).
+///
+/// All peer-attested fields originate at the source side — bridged to
+/// the target via shared-member bridging on the offer envelope — and
+/// fed verbatim into `AcceptOutletInterfaceInputs`. Local-side fields
+/// (signing key, member count, base cost, balance) are NOT in this
+/// struct: the runtime resolves them from per-context state at
+/// dispatch time, since the proposal payload cannot be trusted to
+/// carry them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcceptOutletInterfaceProposal {
+    /// `offer_id` from the matched [`InterfaceOffer`] (spec §6.2.0.1
+    /// step 3) — pinned into [`InterfaceEstablished::interface_id`].
+    pub offer_id: [u8; 32],
+    /// Source context (Context A — the offerer).
+    pub source_context: ContextId,
+    /// Target context (Context B — the local accepter).
+    pub target_context: ContextId,
+    /// Outlet being shared.
+    pub outlet_id: OutletId,
+    /// Inbound policy set by this (accepting) context (§6.2.0.1 step 4).
+    pub inbound_policy: InboundPolicy,
+    /// Wall-clock unix-millis timestamp at which the accept happens —
+    /// pinned by the proposer at proposal-creation time so peer-bridged
+    /// re-accepts on the source side carry the byte-identical
+    /// `established_at`. Defaults to 0 if absent (legacy serialized form).
+    #[serde(default)]
+    pub established_at: u64,
+    /// Peer-side accept-time MLS epoch (Context A's `epoch_a`).
+    pub peer_epoch: u64,
+    /// Peer-side committed IKM (`ikm_a`) — exporter output peer-suffixed
+    /// with the local `context_id` per §6.2.0.1 step 1.
+    pub peer_ikm: [u8; 32],
+    /// Peer admin's Ed25519 signature over the
+    /// `SCP-OUTLET-IKM-COMMITMENT-V1:` preimage (§6.2.0.1
+    /// "Committed-IKM signing"). Verified at accept-time via
+    /// `IkmCommitment::verify`.
+    pub peer_ikm_sig: Ed25519Signature,
+    /// Peer admin's `#active` verifying key resolved at `peer_epoch` —
+    /// 32 raw bytes (Ed25519 verifying-key form). Caller-supplied so
+    /// the local side does not need to reach into the peer's role
+    /// registry; the peer's role-registry resolution happens at
+    /// proposal-creation time on the source side.
+    pub peer_admin_active_verifying_key: [u8; 32],
+    /// Peer context's `creator_did` at acceptance time (§5.4 lifecycle).
+    /// Captured into [`InterfaceEstablished::creator_did`] for the
+    /// round-6 cluster-detection rolling window.
+    pub peer_creator_did: DID,
+    /// Peer context's admin-set DIDs at acceptance time, sorted
+    /// lexicographically by the proposer.
+    pub peer_admin_set: Vec<DID>,
+    /// Peer-side per-DID capability map at acceptance time, used by the
+    /// runtime to enumerate the `capability_holder_set` (§6.2.0.1
+    /// round-6 predicate 4).
+    pub peer_capability_map: Vec<(DID, Vec<crate::context::roles::Capability>)>,
+}
+
 // ---------------------------------------------------------------------------
 // CrossContextEvent (event log integration)
 // ---------------------------------------------------------------------------
