@@ -398,6 +398,44 @@ impl ContextManager {
         }
     }
 
+    /// Fetches the 32-byte `outlet_message_key` pinned for the given
+    /// `(context_id, outlet_id, registration_event_id)` triple per
+    /// §5.4.4 round-5 (SCP-OUT-041a).
+    ///
+    /// Returns `Ok(Some(key))` when the pinned key is present in the
+    /// in-memory `GovernanceState::pinned_outlet_message_keys` map,
+    /// `Ok(None)` when the context is registered but no key exists
+    /// for the lookup, and `Err` only when the context itself is not
+    /// registered in this manager.
+    ///
+    /// FFI bridges call this to perform the
+    /// `HMAC-SHA-256(outlet_message_key, catalog_key)[..32]` wire-
+    /// message construction at the FFI boundary so the SDK never
+    /// receives the raw key (SCP-OUT-041d).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::NotFound`] when the context is not
+    /// registered.
+    pub async fn pinned_outlet_message_key_for(
+        &self,
+        context_id: &str,
+        outlet_id: &OutletId,
+        registration_event_id: &[u8; 32],
+    ) -> Result<Option<[u8; 32]>, ContextError> {
+        let ctx_arc = self.get_context_arc(context_id).map_err(|_| {
+            ContextError::MembershipFailed(format!("context not registered: {context_id}"))
+        })?;
+        let guard = ctx_arc.lock().await;
+        let key = guard
+            .governance
+            .pinned_outlet_message_keys
+            .get(&(outlet_id.clone(), *registration_event_id))
+            .copied();
+        drop(guard);
+        Ok(key)
+    }
+
     /// Runtime-agnostic hard-rate-limit consume for sync bridge trait
     /// methods that may be called from any of three tokio contexts:
     ///
@@ -3340,8 +3378,9 @@ pub fn amplification_error_to_context(err: &OutletAmplificationError) -> Context
 /// the constant is the rule.
 pub const CATALOG_ROTATION_DWELL_SECS: u64 = 86_400;
 
-/// Outcome of [`validate_catalog_rotation_dwell_time`] when validation
-/// fails — surfaces the typed `OutletError` envelope under
+/// Outcome of [`validate_catalog_rotation_dwell_time`] on validation failure.
+///
+/// Surfaces the typed `OutletError` envelope under
 /// [`OutletErrorClass::Protocol`] (`SCP-TOOL-6100` /
 /// `protocol.catalog-rotation-too-frequent`) plus the elapsed-seconds
 /// delta so callers can render a precise diagnostic without

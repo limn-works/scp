@@ -1927,6 +1927,260 @@ pub fn py_outlet_get(py: Python<'_>, context_id: &str, outlet_id: &str) -> PyRes
 }
 
 // ---------------------------------------------------------------------------
+// SCP-OUT-041d — outlet_error_new + outlet_catalog_rotation_validator
+// ---------------------------------------------------------------------------
+
+/// Constructs an [`OutletError`] envelope at the FFI boundary using the
+/// pinned per-outlet `outlet_message_key` (§5.4.4 round-5, SCP-OUT-041a/d).
+///
+/// Returns the envelope as a JSON-serialized string. The HMAC happens
+/// inside this bridge so the SDK never sees the raw `outlet_message_key`.
+///
+/// # Arguments
+///
+/// * `context_id` — context owning the outlet.
+/// * `outlet_id` — emitting outlet's id.
+/// * `registration_event_id_hex` — 32-byte hex of the
+///   [`OutletRegistration`](scp_protocol::context::outlets::OutletRegistration)
+///   event-log id that pinned the key.
+/// * `catalog_key` — registered catalog key (regex-validated).
+/// * `class_str` — wire-form `OutletErrorClass` ("protocol",
+///   "authorization", …).
+/// * `code` — `SCP-TOOL-NNNN` (§5.4.4 6100-6199).
+/// * `slug` — `^[a-z][a-z0-9-]{0,63}(\.[a-z][a-z0-9-]{0,63})*$`.
+/// * `retry_str` — wire-form retry policy ("never", "after-secs:NN",
+///   "stochastic-backoff").
+/// * `detail_json` — optional per-class typed detail JSON.
+/// * `source_chain_json` — optional initial cross-context hop trail.
+/// * `pad_nonce_hex` — 16-byte hex CSPRNG nonce.
+///
+/// # Errors
+///
+/// Returns a Python exception when validation fails, the registration
+/// is unknown, or the pinned key is missing.
+#[pyfunction]
+#[pyo3(name = "outlet_error_new")]
+#[pyo3(signature = (context_id, outlet_id, registration_event_id_hex, catalog_key, class_str, code, slug, retry_str, pad_nonce_hex, detail_json=None, source_chain_json=None))]
+#[allow(clippy::too_many_arguments)] // Bridge mirrors the §5.4.4 OutletErrorNewOpts fields.
+#[allow(clippy::too_many_lines)] // 11-field options-object + per-field validation.
+#[allow(clippy::needless_pass_by_value)] // PyO3 pyfunction owned String args.
+pub fn py_outlet_error_new(
+    context_id: &str,
+    outlet_id: &str,
+    registration_event_id_hex: &str,
+    catalog_key: &str,
+    class_str: &str,
+    code: &str,
+    slug: &str,
+    retry_str: &str,
+    pad_nonce_hex: &str,
+    detail_json: Option<String>,
+    source_chain_json: Option<String>,
+) -> PyResult<String> {
+    use scp_core::context::outlets::OutletId;
+    use scp_core::context::outlets::errors::{
+        CatalogKey, ContextHop, DetailBody, OutletError, OutletErrorClass, OutletErrorNewOpts,
+        PAD_NONCE_LEN, REGISTRATION_EVENT_ID_LEN, RetryPolicy,
+    };
+
+    validate::validate_context_id(context_id)?;
+    validate::validate_outlet_id(outlet_id)?;
+
+    let reg_event_id_vec =
+        hex::decode(registration_event_id_hex).map_err(|e| ScpPyError::ValidationError {
+            message: format!("invalid registration_event_id_hex: {e}"),
+            code: codes::VALID_7000.to_owned(),
+        })?;
+    let reg_event_id: [u8; REGISTRATION_EVENT_ID_LEN] = reg_event_id_vec
+        .as_slice()
+        .try_into()
+        .map_err(|_| ScpPyError::ValidationError {
+            message: format!("registration_event_id must be {REGISTRATION_EVENT_ID_LEN} bytes"),
+            code: codes::VALID_7000.to_owned(),
+        })?;
+
+    let pad_nonce_vec = hex::decode(pad_nonce_hex).map_err(|e| ScpPyError::ValidationError {
+        message: format!("invalid pad_nonce_hex: {e}"),
+        code: codes::VALID_7000.to_owned(),
+    })?;
+    let pad_nonce: [u8; PAD_NONCE_LEN] =
+        pad_nonce_vec
+            .as_slice()
+            .try_into()
+            .map_err(|_| ScpPyError::ValidationError {
+                message: format!("pad_nonce must be {PAD_NONCE_LEN} bytes"),
+                code: codes::VALID_7000.to_owned(),
+            })?;
+
+    let class: OutletErrorClass =
+        serde_json::from_value(serde_json::Value::String(class_str.to_owned())).map_err(|e| {
+            ScpPyError::ValidationError {
+                message: format!("invalid OutletErrorClass {class_str:?}: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            }
+        })?;
+
+    let retry: RetryPolicy =
+        serde_json::from_value(serde_json::Value::String(retry_str.to_owned()))
+            .or_else(|_| serde_json::from_str::<RetryPolicy>(retry_str))
+            .map_err(|e| ScpPyError::ValidationError {
+                message: format!("invalid retry policy {retry_str:?}: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            })?;
+
+    let catalog_key_typed =
+        CatalogKey::try_new(catalog_key).map_err(|e| ScpPyError::ValidationError {
+            message: format!("invalid catalog_key: {e}"),
+            code: codes::VALID_7000.to_owned(),
+        })?;
+
+    let detail: Option<DetailBody> = match detail_json.as_deref() {
+        None => None,
+        Some(s) => Some(serde_json::from_str::<DetailBody>(s).map_err(|e| {
+            ScpPyError::ValidationError {
+                message: format!("invalid detail_json: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            }
+        })?),
+    };
+
+    let source_chain: Vec<ContextHop> = match source_chain_json.as_deref() {
+        None => Vec::new(),
+        Some(s) => {
+            serde_json::from_str::<Vec<ContextHop>>(s).map_err(|e| ScpPyError::ValidationError {
+                message: format!("invalid source_chain_json: {e}"),
+                code: codes::VALID_7000.to_owned(),
+            })?
+        }
+    };
+
+    let outlet_id_typed = OutletId::from(outlet_id);
+
+    // Pull pinned key from runtime via the SCP-OUT-041d accessor.
+    let manager = crate::runtime::context_manager()?;
+    let rt = crate::runtime()?;
+    let pinned_key: [u8; 32] = rt
+        .block_on(async {
+            manager
+                .pinned_outlet_message_key_for(context_id, &outlet_id_typed, &reg_event_id)
+                .await
+        })
+        .map_err(|e| ScpPyError::ContextError {
+            message: format!("pinned key lookup failed: {e}"),
+            code: codes::CTX_2000.to_owned(),
+        })?
+        .ok_or_else(|| ScpPyError::ValidationError {
+            message: format!(
+                "no pinned outlet_message_key for outlet {outlet_id}, registration {registration_event_id_hex}"
+            ),
+            code: codes::VALID_7000.to_owned(),
+        })?;
+
+    // Snapshot the registered catalog keys for membership check by reading
+    // back the outlet registration. Bridge-owned registry holds the catalog.
+    let registered_keys: Vec<CatalogKey> = crate::runtime::with_context(context_id, |rt_state| {
+        let registration = rt_state.outlet_registry.get(outlet_id).ok_or_else(|| {
+            ScpPyError::context(format!(
+                "outlet '{outlet_id}' not found in context '{context_id}'"
+            ))
+        })?;
+        let mut keys: Vec<CatalogKey> = Vec::with_capacity(registration.message_catalog.len());
+        for tpl in &registration.message_catalog {
+            // The catalog stores raw String keys validated at registration
+            // time; reconstruct the CatalogKey newtype here for the
+            // membership check. A failure indicates the registration
+            // bypassed validation, surfaced as a context error.
+            let k = CatalogKey::try_new(tpl.key.clone()).map_err(|e| {
+                ScpPyError::context(format!(
+                    "outlet '{outlet_id}' has malformed catalog key {:?}: {e}",
+                    tpl.key
+                ))
+            })?;
+            keys.push(k);
+        }
+        Ok(keys)
+    })?;
+
+    let envelope = OutletError::new(OutletErrorNewOpts {
+        outlet_id: &outlet_id_typed,
+        outlet_message_key: &pinned_key,
+        registration_event_id: reg_event_id,
+        catalog_key: &catalog_key_typed,
+        registered_keys: &registered_keys,
+        class,
+        code,
+        slug,
+        retry,
+        detail,
+        source_chain,
+        pad_nonce,
+    })
+    .map_err(|e| ScpPyError::ValidationError {
+        message: format!("OutletError construction failed: {e}"),
+        code: codes::VALID_7000.to_owned(),
+    })?;
+
+    serde_json::to_string(&envelope).map_err(|e| ScpPyError::context(e.to_string()).into())
+}
+
+/// SCP-OUT-041d catalog-rotation dwell-time validator bridge.
+///
+/// Pure-function wrapper around the SCP-OUT-041c
+/// `validate_catalog_rotation_dwell_time` runtime helper. Returns the
+/// empty string on success; a JSON-serialized `OutletError` envelope
+/// otherwise (the `CatalogRotationTooFrequent` rejection's typed envelope).
+///
+/// # Arguments
+///
+/// * `prior_catalog_json` — JSON array of `MessageTemplate`.
+/// * `new_catalog_json` — JSON array of `MessageTemplate`.
+/// * `prior_append_time_secs` — event-log append time of the prior
+///   registration (Unix seconds).
+/// * `new_append_time_secs` — prospective append time of the new
+///   registration (Unix seconds).
+///
+/// # Errors
+///
+/// Returns a Python exception when JSON parsing fails. The dwell-time
+/// rejection itself is signalled in-band via a non-empty return string
+/// (the JSON envelope) rather than a raised exception so SDK callers
+/// can map it to their typed `OutletProtocolError` subclass.
+#[pyfunction]
+#[pyo3(name = "outlet_catalog_rotation_validator")]
+#[pyo3(signature = (prior_catalog_json, new_catalog_json, prior_append_time_secs, new_append_time_secs))]
+#[allow(clippy::needless_pass_by_value)]
+pub fn py_outlet_catalog_rotation_validator(
+    prior_catalog_json: String,
+    new_catalog_json: String,
+    prior_append_time_secs: u64,
+    new_append_time_secs: u64,
+) -> PyResult<String> {
+    use scp_core::context::outlets::MessageTemplate;
+
+    let prior: Vec<MessageTemplate> =
+        serde_json::from_str(&prior_catalog_json).map_err(|e| ScpPyError::ValidationError {
+            message: format!("invalid prior_catalog_json: {e}"),
+            code: codes::VALID_7000.to_owned(),
+        })?;
+    let new_cat: Vec<MessageTemplate> =
+        serde_json::from_str(&new_catalog_json).map_err(|e| ScpPyError::ValidationError {
+            message: format!("invalid new_catalog_json: {e}"),
+            code: codes::VALID_7000.to_owned(),
+        })?;
+
+    match scp_core::context::manager::validate_catalog_rotation_dwell_time(
+        &prior,
+        &new_cat,
+        prior_append_time_secs,
+        new_append_time_secs,
+    ) {
+        Ok(()) => Ok(String::new()),
+        Err(rejection) => serde_json::to_string(&rejection.envelope)
+            .map_err(|e| ScpPyError::context(e.to_string()).into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Module registration
 // ---------------------------------------------------------------------------
 
@@ -1957,6 +2211,8 @@ pub fn register_outlets(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_outlet_deregister, m)?)?;
     m.add_function(wrap_pyfunction!(py_outlet_list, m)?)?;
     m.add_function(wrap_pyfunction!(py_outlet_get, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_error_new, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_catalog_rotation_validator, m)?)?;
     Ok(())
 }
 
