@@ -27,7 +27,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
-from scp_sdk.errors import TransportError, ValidationError
+from scp_sdk.errors import ValidationError
 
 logger = logging.getLogger("scp_sdk")
 
@@ -58,25 +58,6 @@ DEFAULT_STDIO_ALLOWLIST: frozenset[str] = frozenset(
         "scp-mcp",
     }
 )
-
-
-# ---------------------------------------------------------------------------
-# Lazy bridge import
-# ---------------------------------------------------------------------------
-
-
-def _bridge() -> Any:
-    """Return the ``_scp_core`` extension module, imported lazily."""
-    try:
-        import _scp_core  # type: ignore[import-not-found]
-
-        return _scp_core
-    except ImportError as exc:
-        raise TransportError(
-            "The _scp_core extension module is not installed. "
-            "Install scp-python with: pip install scp-python",
-            code="SCP-MCP-10001",
-        ) from exc
 
 
 # ---------------------------------------------------------------------------
