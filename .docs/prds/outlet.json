@@ -1515,7 +1515,7 @@
       "gate": "gate-caveats",
       "priority": "P0",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "crates/scp-ffi/src/ucan.rs",
         "crates/scp-ffi/napi/src/ucan.rs",
