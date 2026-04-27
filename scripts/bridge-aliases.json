@@ -2954,6 +2954,74 @@
       "wasm": [
         "with_storage"
       ]
+    },
+    {
+      "canonical": "sandbox_check_capability",
+      "category": "context",
+      "wasm_required": true,
+      "pyo3": [
+        "py_check_scoped_capability"
+      ],
+      "uniffi": [
+        "sandbox_check_capability"
+      ],
+      "napi": [
+        "check_scoped_capability"
+      ],
+      "wasm": [
+        "sandbox_check_capability"
+      ]
+    },
+    {
+      "canonical": "sandbox_validate_declaration",
+      "category": "context",
+      "wasm_required": true,
+      "pyo3": [
+        "py_validate_capability_declaration"
+      ],
+      "uniffi": [
+        "sandbox_validate_declaration"
+      ],
+      "napi": [
+        "validate_capability_declaration"
+      ],
+      "wasm": [
+        "sandbox_validate_declaration"
+      ]
+    },
+    {
+      "canonical": "configure_relay_transport",
+      "category": "transport",
+      "wasm_required": false,
+      "pyo3": [
+        "configure_relay_transport"
+      ],
+      "uniffi": [
+        "configure_relay_transport"
+      ],
+      "napi": [
+        "configure_relay_transport"
+      ],
+      "wasm": [
+        "configure_relay_transport"
+      ]
+    },
+    {
+      "canonical": "identity_verify_link_attestation",
+      "category": "identity",
+      "wasm_required": true,
+      "pyo3": [
+        "verify_identity_link_attestation"
+      ],
+      "uniffi": [
+        "identity_verify_link_attestation"
+      ],
+      "napi": [
+        "identity_verify_link_attestation"
+      ],
+      "wasm": [
+        "identity_verify_link_attestation_signature"
+      ]
     }
   ],
   "exemptions": {
@@ -3058,6 +3126,10 @@
       {
         "canonical": "with_storage",
         "reason": "WASM bridge has no scp-platform per ADR-034 — no persistent on-disk storage primitives. Storage attachment is a no-op on WASM; consumers either use the in-memory default or wire persistence via the host JS runtime."
+      },
+      {
+        "canonical": "configure_relay_transport",
+        "reason": "WASM has no scp-platform / no transport per ADR-034."
       }
     ]
   }
