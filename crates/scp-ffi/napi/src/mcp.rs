@@ -882,13 +882,9 @@ pub(crate) fn mcp_configure_stdio_allowlist_on(
     bi: &NapiBridgeInstance,
     additional_binaries: Vec<String>,
 ) -> napi::Result<()> {
-    let mut guard = bi
-        .core
-        .mcp_allowlist()
-        .lock()
-        .map_err(|_| napi::Error::from(allowlist_lock_poisoned()))?;
-    guard
-        .configure(&additional_binaries)
+    bi.core
+        .with_mcp_allowlist(|a| a.configure(&additional_binaries))
+        .map_err(|_| napi::Error::from(allowlist_lock_poisoned()))?
         .map_err(|e| napi::Error::from(allowlist_err(e)))?;
     Ok(())
 }
@@ -898,12 +894,10 @@ pub(crate) fn mcp_configure_stdio_allowlist_on(
 /// Disables enforcement on THIS instance only. Other `Scp` instances are
 /// unaffected.
 pub(crate) fn mcp_disable_stdio_allowlist_on(bi: &NapiBridgeInstance) -> napi::Result<()> {
-    let mut guard = bi
-        .core
-        .mcp_allowlist()
-        .lock()
+    let instance_id = bi.core.instance_id();
+    bi.core
+        .with_mcp_allowlist(|a| a.disable_enforcement(instance_id))
         .map_err(|_| napi::Error::from(allowlist_lock_poisoned()))?;
-    guard.disable_enforcement();
     Ok(())
 }
 
@@ -911,12 +905,9 @@ pub(crate) fn mcp_disable_stdio_allowlist_on(bi: &NapiBridgeInstance) -> napi::R
 ///
 /// Resets THIS instance's allowlist to defaults; does not affect peers.
 pub(crate) fn mcp_reset_stdio_allowlist_on(bi: &NapiBridgeInstance) -> napi::Result<()> {
-    let mut guard = bi
-        .core
-        .mcp_allowlist()
-        .lock()
+    bi.core
+        .with_mcp_allowlist(scp_mcp::allowlist::StdioAllowlist::reset)
         .map_err(|_| napi::Error::from(allowlist_lock_poisoned()))?;
-    guard.reset();
     Ok(())
 }
 
@@ -926,13 +917,10 @@ pub(crate) fn mcp_reset_stdio_allowlist_on(bi: &NapiBridgeInstance) -> napi::Res
 pub(crate) fn mcp_get_stdio_allowlist_on(
     bi: &NapiBridgeInstance,
 ) -> napi::Result<NapiAllowlistState> {
-    let guard = bi
+    let state = bi
         .core
-        .mcp_allowlist()
-        .lock()
+        .with_mcp_allowlist(|a| a.snapshot())
         .map_err(|_| napi::Error::from(allowlist_lock_poisoned()))?;
-    let state = guard.snapshot();
-    drop(guard);
     Ok(NapiAllowlistState {
         allowed: state.allowed,
         unrestricted: state.unrestricted,
@@ -958,7 +946,11 @@ mod tests {
         let a = NapiBridgeInstance::new_napi();
         let b = NapiBridgeInstance::new_napi();
 
-        a.core.mcp_allowlist().lock().unwrap().disable_enforcement();
+        a.core
+            .mcp_allowlist()
+            .lock()
+            .unwrap()
+            .disable_enforcement(0);
 
         // `b` is unaffected and rejects unlisted commands.
         let res = b

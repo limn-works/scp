@@ -806,6 +806,45 @@ impl CoreFields {
         &self.mcp_allowlist
     }
 
+    /// Run a closure against the per-instance MCP stdio allowlist with the
+    /// guard held for the duration of the call, then drop it.
+    ///
+    /// Bridges should prefer this helper to manual `mcp_allowlist().lock()`
+    /// at every callsite — it centralizes the `PoisonError` handling and
+    /// removes any chance of forgetting to drop the guard before doing
+    /// non-allowlist work (FFI conversions, error mapping, etc.).
+    ///
+    /// Mirrors the typed-error shape of [`CoreFields::with_transport`]
+    /// rather than the generic `Result<R, E>` form, so the helper composes
+    /// uniformly across `CoreFields` and bridges map the typed error at the
+    /// callsite via `?` and a small wrapper.
+    ///
+    /// Not on the [`BridgeInstanceCore`] trait because adding a generic
+    /// method would break `dyn BridgeInstanceCore` — call as
+    /// `self.core().with_mcp_allowlist(...)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AllowlistGuardError::Poisoned`] if the underlying mutex
+    /// is poisoned. The closure is invoked exactly once when the lock
+    /// acquires successfully.
+    ///
+    /// # Lock ordering
+    ///
+    /// Do NOT call any other `CoreFields` locking method while holding
+    /// the allowlist guard — the guard is intended to be short-lived (one
+    /// allowlist op only). See [`CoreFields::mcp_allowlist`].
+    pub fn with_mcp_allowlist<T>(
+        &self,
+        f: impl FnOnce(&mut scp_mcp::allowlist::StdioAllowlist) -> T,
+    ) -> Result<T, AllowlistGuardError> {
+        let mut guard = self
+            .mcp_allowlist
+            .lock()
+            .map_err(|_| AllowlistGuardError::Poisoned)?;
+        Ok(f(&mut guard))
+    }
+
     /// Whether this instance has been shut down permanently.
     ///
     /// Bridge operations should check this before proceeding and return
@@ -2297,6 +2336,13 @@ pub trait BridgeInstanceCore: Send + Sync {
     /// the field lives on `CoreFields` and bridge-specific impls do not
     /// need to override.
     ///
+    /// Prefer [`CoreFields::with_mcp_allowlist`] when running a single
+    /// allowlist operation — the helper centralizes poison-handling and
+    /// ensures the guard is always dropped before any FFI / Python-GIL
+    /// work runs. The raw accessor is retained for
+    /// `StdioClientTransport::spawn` paths that need to pass `&Mutex`
+    /// across modules without the closure shape.
+    ///
     /// # Lock ordering
     ///
     /// Do NOT call any other `BridgeInstanceCore` / `CoreFields` locking
@@ -2306,6 +2352,34 @@ pub trait BridgeInstanceCore: Send + Sync {
     /// nest. See [`CoreFields::mcp_allowlist`].
     fn mcp_allowlist(&self) -> &Mutex<scp_mcp::allowlist::StdioAllowlist> {
         self.core().mcp_allowlist()
+    }
+
+    // The `with_mcp_allowlist` helper is intentionally NOT on this trait —
+    // adding a generic method would break `dyn BridgeInstanceCore`. Callers
+    // reach the helper through `self.core().with_mcp_allowlist(...)`.
+}
+
+/// Error from [`CoreFields::with_mcp_allowlist`].
+///
+/// Mirrors [`TransportLockError`]'s typed-error pattern so bridges map
+/// poisoning to their own transport-error variant via a small `From`
+/// or `match` at the callsite. The single-variant enum keeps the door
+/// open for additional reasons (e.g. acquisition timeout) without
+/// breaking match arms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AllowlistGuardError {
+    /// The allowlist `Mutex` was poisoned (a holder panicked).
+    Poisoned,
+}
+
+impl std::fmt::Display for AllowlistGuardError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Sanitized: do not leak internal lock-state to callers. Detailed
+            // diagnostics belong in `tracing` events at the poisoning site.
+            Self::Poisoned => write!(f, "stdio allowlist lock poisoned"),
+        }
     }
 }
 
@@ -4124,6 +4198,53 @@ mod tests {
         assert!(!msg.contains('7'));
         assert!(!msg.contains("11"));
         assert!(msg.contains("handle"));
+    }
+
+    // -----------------------------------------------------------------
+    // with_mcp_allowlist helper
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn with_mcp_allowlist_runs_closure_and_returns_ok() {
+        let core = CoreFields::new();
+        let len = core
+            .with_mcp_allowlist(|a| a.snapshot().allowed.len())
+            .unwrap();
+        assert!(len > 0, "default allowlist must be non-empty");
+    }
+
+    #[test]
+    fn with_mcp_allowlist_returns_closure_value_unchanged() {
+        // Helper must surface the closure's return value verbatim; only
+        // poisoning is converted into the typed `AllowlistGuardError`.
+        let core = CoreFields::new();
+        let inner_err: Result<(), &'static str> = core
+            .with_mcp_allowlist(|_a| Err::<(), &'static str>("inner-err"))
+            .unwrap();
+        assert_eq!(inner_err.unwrap_err(), "inner-err");
+    }
+
+    #[test]
+    fn with_mcp_allowlist_drops_guard_before_returning() {
+        // Two back-to-back calls must each acquire the lock cleanly — proving
+        // the first call's guard dropped before the second call started.
+        let core = CoreFields::new();
+        core.with_mcp_allowlist(|a| a.disable_enforcement(0))
+            .unwrap();
+        let unrestricted = core
+            .with_mcp_allowlist(|a| a.snapshot().unrestricted)
+            .unwrap();
+        assert!(unrestricted, "first call's mutation must be visible");
+    }
+
+    #[test]
+    fn with_mcp_allowlist_isolates_per_instance() {
+        // Helper-mediated mutations on instance A must not affect instance B.
+        let a = CoreFields::new();
+        let b = CoreFields::new();
+        a.with_mcp_allowlist(|x| x.disable_enforcement(0)).unwrap();
+        let b_unrestricted = b.with_mcp_allowlist(|x| x.snapshot().unrestricted).unwrap();
+        assert!(!b_unrestricted, "instance b must remain restricted");
     }
 
     // -----------------------------------------------------------------

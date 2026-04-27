@@ -974,7 +974,15 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.mcpClientConnectSse] on [inner]. */
     suspend fun mcpClientConnectSse(url: String): String = inner.mcpClientConnectSse(url = url)
 
-    /** Forwards to [NativeScp.mcpClientConnectStdio] on [inner]. */
+    /**
+     * Forwards to [NativeScp.mcpClientConnectStdio] on [inner].
+     *
+     * `command[0]` is validated against THIS instance's stdio allowlist
+     * (per-instance — disabling enforcement on another [Scp] does not
+     * affect this one). To permit a binary not in the default allowlist,
+     * call [mcpConfigureStdioAllowlist] first; use [mcpGetStdioAllowlist]
+     * to inspect the current state.
+     */
     suspend fun mcpClientConnectStdio(command: List<String>): String = inner.mcpClientConnectStdio(command = command)
 
     /** Forwards to [NativeScp.mcpClientDisconnect] on [inner]. */

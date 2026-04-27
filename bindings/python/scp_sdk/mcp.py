@@ -25,9 +25,12 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from scp_sdk.errors import ValidationError
+
+if TYPE_CHECKING:
+    from scp_sdk.scp import McpAllowlistState
 
 logger = logging.getLogger("scp_sdk")
 
@@ -172,7 +175,7 @@ def validate_client_connect(
     *,
     command: list[str] | None = None,
     url: str | None = None,
-    allowlist_state: dict[str, Any] | None = None,
+    allowlist_state: McpAllowlistState | None = None,
 ) -> None:
     """Validate MCP client connect parameters before FFI dispatch.
 

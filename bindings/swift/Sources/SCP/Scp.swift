@@ -573,6 +573,12 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/mcpClientConnectStdio`` on ``inner``.
+    ///
+    /// `command[0]` is validated against THIS instance's stdio allowlist
+    /// (per-instance — disabling enforcement on another ``SCP`` does not
+    /// affect this one). To permit a binary not in the default allowlist,
+    /// call ``mcpConfigureStdioAllowlist(additionalBinaries:)`` first; use
+    /// ``mcpGetStdioAllowlist()`` to inspect the current state.
     func mcpClientConnectStdio(command: [String]) async throws -> String {
         try await inner.mcpClientConnectStdio(command: command)
     }

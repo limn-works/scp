@@ -11958,14 +11958,10 @@ impl Scp {
         &self,
         additional_binaries: Vec<String>,
     ) -> Result<(), ScpError> {
-        let mut guard = self
-            .inner
+        self.inner
             .core
-            .mcp_allowlist()
-            .lock()
-            .map_err(|_| mcp_allowlist_lock_poisoned())?;
-        guard
-            .configure(&additional_binaries)
+            .with_mcp_allowlist(|a| a.configure(&additional_binaries))
+            .map_err(|_| mcp_allowlist_lock_poisoned())?
             .map_err(mcp_allowlist_err)?;
         Ok(())
     }
@@ -11974,13 +11970,11 @@ impl Scp {
     ///
     /// Other `Scp` instances remain unaffected.
     pub fn mcp_disable_stdio_allowlist(&self) -> Result<(), ScpError> {
-        let mut guard = self
-            .inner
+        let instance_id = self.inner.core.instance_id();
+        self.inner
             .core
-            .mcp_allowlist()
-            .lock()
+            .with_mcp_allowlist(|a| a.disable_enforcement(instance_id))
             .map_err(|_| mcp_allowlist_lock_poisoned())?;
-        guard.disable_enforcement();
         Ok(())
     }
 
@@ -11988,26 +11982,20 @@ impl Scp {
     ///
     /// Other `Scp` instances are unaffected.
     pub fn mcp_reset_stdio_allowlist(&self) -> Result<(), ScpError> {
-        let mut guard = self
-            .inner
+        self.inner
             .core
-            .mcp_allowlist()
-            .lock()
+            .with_mcp_allowlist(scp_mcp::allowlist::StdioAllowlist::reset)
             .map_err(|_| mcp_allowlist_lock_poisoned())?;
-        guard.reset();
         Ok(())
     }
 
     /// Snapshot of THIS instance's stdio allowlist state.
     pub fn mcp_get_stdio_allowlist(&self) -> Result<McpAllowlistState, ScpError> {
-        let guard = self
+        let state = self
             .inner
             .core
-            .mcp_allowlist()
-            .lock()
+            .with_mcp_allowlist(|a| a.snapshot())
             .map_err(|_| mcp_allowlist_lock_poisoned())?;
-        let state = guard.snapshot();
-        drop(guard);
         Ok(McpAllowlistState {
             allowed: state.allowed,
             unrestricted: state.unrestricted,

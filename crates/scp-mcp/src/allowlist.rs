@@ -247,11 +247,15 @@ impl StdioAllowlist {
     /// [`validate_command`](Self::validate_command). Only use when the
     /// command source is fully trusted.
     ///
-    /// Emits a `tracing::warn!` audit event on every call so multi-tenant
-    /// operators can detect a tenant unrestricting before subprocess
-    /// spawning starts.
-    pub fn disable_enforcement(&mut self) {
+    /// Emits a `tracing::warn!` audit event with the supplied
+    /// `instance_id` so multi-tenant operators can identify which bridge
+    /// instance unrestricted before subprocess spawning starts. Pass
+    /// the result of `CoreFields::instance_id()` from the calling bridge;
+    /// in unit tests for the standalone type, any sentinel value (e.g.
+    /// `0`) is fine.
+    pub fn disable_enforcement(&mut self, instance_id: u64) {
         tracing::warn!(
+            instance_id,
             "MCP stdio allowlist enforcement disabled — \
              arbitrary subprocess spawning is now permitted on this bridge instance"
         );
@@ -541,7 +545,7 @@ mod tests {
     #[test]
     fn disable_enforcement_allows_any_binary() {
         let mut allowlist = StdioAllowlist::new_with_defaults();
-        allowlist.disable_enforcement();
+        allowlist.disable_enforcement(0);
         assert!(allowlist.validate_command("curl").is_ok());
         assert!(allowlist.validate_command("totally-unknown").is_ok());
     }
@@ -550,7 +554,7 @@ mod tests {
     fn reset_restores_defaults() {
         let mut allowlist = StdioAllowlist::new_with_defaults();
         allowlist.configure(&["custom-server"]).unwrap();
-        allowlist.disable_enforcement();
+        allowlist.disable_enforcement(0);
         allowlist.reset();
 
         // Custom addition gone.
@@ -589,7 +593,7 @@ mod tests {
     #[test]
     fn snapshot_reflects_unrestricted() {
         let mut allowlist = StdioAllowlist::new_with_defaults();
-        allowlist.disable_enforcement();
+        allowlist.disable_enforcement(0);
         let state = allowlist.snapshot();
         assert!(state.unrestricted);
     }
@@ -608,7 +612,7 @@ mod tests {
         // Path-rejection is a pre-allowlist defense — it must run regardless of
         // whether the allowlist is bypassed.
         let mut allowlist = StdioAllowlist::new_with_defaults();
-        allowlist.disable_enforcement();
+        allowlist.disable_enforcement(0);
         assert!(matches!(
             allowlist.validate_command("/usr/bin/sh"),
             Err(AllowlistError::PathInCommand(_))
@@ -634,7 +638,7 @@ mod tests {
         // characters in commands must be rejected — the validator must not
         // depend on `Command::new` to catch them at the libc boundary.
         let mut allowlist = StdioAllowlist::new_with_defaults();
-        allowlist.disable_enforcement();
+        allowlist.disable_enforcement(0);
         assert!(matches!(
             allowlist.validate_command("node\0evil"),
             Err(AllowlistError::NulInEntry(_))
@@ -676,7 +680,7 @@ mod tests {
         let mut a = StdioAllowlist::new_with_defaults();
         let b = StdioAllowlist::new_with_defaults();
 
-        a.disable_enforcement();
+        a.disable_enforcement(0);
         a.configure(&["custom-a"]).unwrap();
 
         // `b` is unaffected.

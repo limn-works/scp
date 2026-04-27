@@ -2146,14 +2146,10 @@ impl crate::scp::PyScp {
     #[pyo3(name = "mcp_configure_stdio_allowlist", signature = (additional_binaries=vec![]))]
     #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for method arguments.
     pub fn mcp_configure_stdio_allowlist(&self, additional_binaries: Vec<String>) -> PyResult<()> {
-        let bi = &*self.inner;
-        let mut guard = bi
+        self.inner
             .core
-            .mcp_allowlist()
-            .lock()
-            .map_err(|_| allowlist_lock_poisoned())?;
-        guard
-            .configure(&additional_binaries)
+            .with_mcp_allowlist(|a| a.configure(&additional_binaries))
+            .map_err(|_| allowlist_lock_poisoned())?
             .map_err(allowlist_err)?;
         Ok(())
     }
@@ -2171,13 +2167,11 @@ impl crate::scp::PyScp {
     /// Raises `TransportError` if the allowlist lock is poisoned.
     #[pyo3(name = "mcp_disable_stdio_allowlist")]
     pub fn mcp_disable_stdio_allowlist(&self) -> PyResult<()> {
-        let bi = &*self.inner;
-        let mut guard = bi
+        let instance_id = self.inner.core.instance_id();
+        self.inner
             .core
-            .mcp_allowlist()
-            .lock()
+            .with_mcp_allowlist(|a| a.disable_enforcement(instance_id))
             .map_err(|_| allowlist_lock_poisoned())?;
-        guard.disable_enforcement();
         Ok(())
     }
 
@@ -2191,13 +2185,10 @@ impl crate::scp::PyScp {
     /// Raises `TransportError` if the allowlist lock is poisoned.
     #[pyo3(name = "mcp_reset_stdio_allowlist")]
     pub fn mcp_reset_stdio_allowlist(&self) -> PyResult<()> {
-        let bi = &*self.inner;
-        let mut guard = bi
+        self.inner
             .core
-            .mcp_allowlist()
-            .lock()
+            .with_mcp_allowlist(scp_mcp::allowlist::StdioAllowlist::reset)
             .map_err(|_| allowlist_lock_poisoned())?;
-        guard.reset();
         Ok(())
     }
 
@@ -2212,14 +2203,11 @@ impl crate::scp::PyScp {
     /// Raises `TransportError` if the allowlist lock is poisoned.
     #[pyo3(name = "mcp_get_stdio_allowlist")]
     pub fn mcp_get_stdio_allowlist(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let bi = &*self.inner;
-        let guard = bi
+        let state = self
+            .inner
             .core
-            .mcp_allowlist()
-            .lock()
+            .with_mcp_allowlist(|a| a.snapshot())
             .map_err(|_| allowlist_lock_poisoned())?;
-        let state = guard.snapshot();
-        drop(guard);
 
         let dict = PyDict::new(py);
         dict.set_item("allowed", state.allowed)?;
