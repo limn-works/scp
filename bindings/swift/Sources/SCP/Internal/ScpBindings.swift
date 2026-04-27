@@ -929,6 +929,14 @@ public protocol IdentityProtocol: AnyObject, Sendable {
     func rotateKey() async throws  -> Identity
     
     /**
+     * Returns the JSON-serialized `DidRotationEvent` if this handle
+     * was produced by [`Scp::identity_migrate`]; `None` otherwise.
+     * SDK callers MUST distribute the event to active context members
+     * per spec §3.2.1 step 4b.
+     */
+    func rotationEventJson()  -> String?
+    
+    /**
      * Returns the hex-encoded Ed25519 verifying-key bytes for the
      * identity key (VM `#0`, the DID-deriving key), or `null` if this
      * handle was loaded without live key material.
@@ -1221,6 +1229,19 @@ open func rotateKey()async throws  -> Identity  {
             liftFunc: FfiConverterTypeIdentity_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+    
+    /**
+     * Returns the JSON-serialized `DidRotationEvent` if this handle
+     * was produced by [`Scp::identity_migrate`]; `None` otherwise.
+     * SDK callers MUST distribute the event to active context members
+     * per spec §3.2.1 step 4b.
+     */
+open func rotationEventJson() -> String?  {
+    return try!  FfiConverterOptionString.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_identity_rotation_event_json(self.uniffiClonePointer(),$0
+    )
+})
 }
     
     /**
@@ -14399,6 +14420,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotate_key() != 21897) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_identity_rotation_event_json() != 64760) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_verifying_key() != 19807) {
