@@ -8,6 +8,7 @@
 //! # Traits
 //!
 //! - [`KeyCustody`] — Cryptographic key management (generation, signing, ECDH, pseudonym derivation)
+//! - [`PreRotationCustody`] — Cold-storage custody for pre-rotation keys (spec §9.7.4.1)
 //! - [`DeviceAttestation`] — Device-level attestation tokens
 //! - [`Push`] — Push notification registration and handling
 //! - [`Storage`] — Persistent key-value byte storage
@@ -53,6 +54,42 @@ impl KeyHandle {
     }
 
     /// Returns the raw integer identifier for this handle.
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Opaque handle to a pre-rotation key managed by a [`PreRotationCustody`]
+/// implementation.
+///
+/// **Structurally distinct from [`KeyHandle`].** There is no `From<KeyHandle>`,
+/// `Into<KeyHandle>`, or shared accessor — the type system rejects passing an
+/// operational handle to pre-rotation methods at compile time. Per spec
+/// §9.7.4.1 step 3, pre-rotation keys "MUST NOT be accessible through the
+/// same custody provider or authentication flow used for daily operations".
+/// This newtype enforces the rule mechanically.
+///
+/// The inner identifier is opaque — there is no public `id()` accessor;
+/// implementations allocate identifiers privately. SDK callers receive the
+/// handle by value and pass it back to [`PreRotationCustody`] methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PreRotationKeyHandle(u64);
+
+impl PreRotationKeyHandle {
+    /// Creates a new pre-rotation key handle from a raw identifier.
+    ///
+    /// Intended for [`PreRotationCustody`] implementations only — SDK code
+    /// receives handles via [`PreRotationCustody::store_committed_pre_rotation_key`].
+    #[must_use]
+    pub const fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// Returns the raw integer identifier for this handle.
+    ///
+    /// Intended for serialization to FFI callbacks (`UniFFI` string handle,
+    /// NAPI numeric handle). SDK code should treat the handle as opaque.
     #[must_use]
     pub const fn id(&self) -> u64 {
         self.0
@@ -409,6 +446,234 @@ pub trait KeyCustody: Send + Sync {
     ///
     /// This is a synchronous query against local state — no I/O is required.
     fn custody_type(&self, key: &KeyHandle) -> CustodyType;
+
+    /// Generate an Ed25519 keypair seed whose private bytes are returned to the
+    /// caller and NEVER retained in operational custody.
+    ///
+    /// The protocol's pre-rotation flow (spec §9.7.4.1 §1, §5(a), §5(f) and
+    /// ADR-003 §4) requires that the pre-rotation keypair be generated using
+    /// the device CSPRNG — but the private bytes must then be handed off to a
+    /// separate [`PreRotationCustody`] and destroyed from operational custody.
+    /// This method models that one-shot extraction without requiring the
+    /// caller to first persist a real handle (which would put the private
+    /// bytes in operational custody briefly, even if destroyed afterward).
+    ///
+    /// # ADR-046 byte parity
+    ///
+    /// Implementations MUST consume RNG bytes from the same RNG stream as
+    /// [`generate_keypair`](Self::generate_keypair) so that cross-bridge
+    /// deterministic-seed tests remain valid. Specifically:
+    /// `[seed[0..32]] [seed[32..64]] [seed[64..96]]` MUST map to
+    /// identity/active/pre-rotation in that order.
+    ///
+    /// # Hardware-backed implementations
+    ///
+    /// For HSM-bound custody (Secure Enclave non-extractable Ed25519), the
+    /// default implementation returns
+    /// [`PlatformError::Unsupported`]. Such backends require a different
+    /// flow — the SDK MUST call platform CSPRNG (`SecRandomCopyBytes`,
+    /// `KeyStore` random API) directly and route the bytes into a
+    /// `PreRotationCustody` provider. Filed as a follow-up workstream.
+    fn generate_ephemeral_ed25519_seed(
+        &self,
+    ) -> impl Future<Output = Result<zeroize::Zeroizing<[u8; 32]>, PlatformError>> + Send {
+        async {
+            Err(PlatformError::Unsupported(
+                "ephemeral Ed25519 seed export not supported by this custody backend",
+            ))
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PreRotationCustody — cold-storage custody for the pre-rotation key
+// ---------------------------------------------------------------------------
+
+/// Errors specific to [`PreRotationCustody`] operations.
+///
+/// Distinct from [`PlatformError`] so that a `Result<_, PreRotationCustodyError>`
+/// signature in protocol code cannot be confused with operational-custody
+/// errors (and vice versa) — the type system rejects accidental cross-boundary
+/// `?`-propagation without an explicit conversion. None is provided.
+#[derive(Debug, thiserror::Error)]
+pub enum PreRotationCustodyError {
+    /// The handle is not known to this custody (already destroyed, never
+    /// stored, or stored against a different custody instance).
+    #[error("pre-rotation key handle not found")]
+    HandleNotFound,
+    /// The custody backend (FIDO2 device, callback, paper backup, etc.) is
+    /// unavailable. Carries a human-readable description for diagnostics.
+    #[error("pre-rotation custody unavailable: {0}")]
+    Unavailable(String),
+    /// The user declined an interactive prompt (e.g., FIDO2 touch
+    /// confirmation, passphrase entry).
+    #[error("pre-rotation custody operation declined by user")]
+    UserDeclined,
+    /// Persistence backend I/O failure. Carries a human-readable description.
+    #[error("pre-rotation custody storage error: {0}")]
+    Storage(String),
+    /// A callback returned malformed bytes (wrong length, non-canonical
+    /// encoding, etc.).
+    #[error("pre-rotation custody callback returned invalid data: {0}")]
+    InvalidCallbackResponse(String),
+    /// The committed public key does not match what the custody returns —
+    /// the backup is corrupted or has been substituted. Treat as a critical
+    /// integrity failure; do not proceed with migration.
+    #[error("pre-rotation custody public-key mismatch (commitment integrity failure)")]
+    CommitmentMismatch,
+}
+
+/// Discriminator for the six approved §9.7.4.1 §4 custody methods, plus the
+/// bridge-callback and WASM-local variants that route to one of the six.
+///
+/// Used for diagnostics and SDK UX (e.g., "Your pre-rotation key is on a
+/// hardware token — please tap your `YubiKey`"). MUST NOT be used for security
+/// decisions — the [`PreRotationCustody`] instance itself is the security
+/// boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PreRotationCustodyKind {
+    /// Testing-only in-process registry. NOT SUITABLE for production —
+    /// satisfies the §9.7.4.1 §3 type-isolation requirement (separate
+    /// custody object) but does not satisfy the substrate isolation
+    /// requirement (single process memory). Tests only.
+    InMemory,
+    /// FIDO2/U2F hardware security key. Highest security per §9.7.4.1 §4.
+    HardwareSecurityKey,
+    /// Secondary device's secure enclave (not the daily-driver device).
+    SecondaryDeviceEnclave,
+    /// Platform-backed cloud key store (iCloud Keychain ADP, Google Cloud
+    /// Key Vault).
+    PlatformCloudKeyStore,
+    /// Encrypted offline backup (AES-256-GCM + Argon2id).
+    EncryptedOfflineBackup,
+    /// Shamir 3-of-5 secret sharing.
+    ShamirSecretSharing,
+    /// BIP39 paper backup (24-word mnemonic). Lowest acceptable per spec.
+    PaperBackupBip39,
+    /// Bridge-callback-driven. The actual substrate is determined by the
+    /// SDK caller's callback (Apple Keychain entry distinct from
+    /// operational custody, Android Keystore alias with separate
+    /// authentication flow, FIDO2/PRF, encrypted backup, etc.).
+    Callback,
+    /// WASM in-process retention. **DOCUMENTED degraded mode** — the
+    /// pre-rotation key co-resides in WASM linear memory with operational
+    /// keys (acknowledged in `crates/scp-ffi/wasm/src/identity.rs`). Pending
+    /// passkey-PRF cold storage as a follow-up workstream.
+    WasmLocalRetention,
+}
+
+/// Cold-custody interface for pre-rotation keys (spec §9.7.4.1).
+///
+/// The pre-rotation key is the security backstop for the entire identity
+/// system — the last resort for recovery after Identity Key compromise
+/// (§9.12). Spec §9.7.4.1 §3 mandates that it be stored separately from the
+/// Identity Key and Active Signing Key, and that it MUST NOT be accessible
+/// through the same custody provider or authentication flow used for daily
+/// operations.
+///
+/// This trait is the protocol's type-level enforcement of that isolation: it
+/// accepts and yields only [`PreRotationKeyHandle`]s, which cannot be
+/// exchanged with the operational [`KeyHandle`] type.
+///
+/// # Lifecycle (per §9.7.4.1)
+///
+/// 1. **Generation.** The pre-rotation keypair is generated using the device
+///    CSPRNG by the operational [`KeyCustody`] (so that ADR-046 byte-parity
+///    tests stay valid — same RNG stream as identity/active keys). The
+///    private bytes are then handed off via
+///    [`store_committed_pre_rotation_key`](Self::store_committed_pre_rotation_key)
+///    to this trait, and the operational copy is destroyed (§9.7.4.1 §5(f)).
+///
+/// 2. **Commitment publication.** The caller computes
+///    `SHA-256(public_key)` and publishes it as a `PreRotationCommitment`
+///    service entry in the DID document. Only the hash is published; the
+///    public key itself is private until migration.
+///
+/// 3. **Migration.** [`reveal_public_key`](Self::reveal_public_key) returns
+///    the 32-byte public key for the `PreRotationProof::revealed_key`
+///    field. The migration proof is signed by the OLD identity key (via
+///    operational [`KeyCustody::sign`]) — pre-rotation keys never sign
+///    anything, which is why this trait has no `sign` method. The
+///    cryptographic invariant verifiers check is
+///    `SHA-256(revealed_key) == commitment` from the old DID document.
+///
+/// 4. **Post-migration cycling (§9.7.4.1 §6).** After the new identity is
+///    successfully built and registered, the old pre-rotation key is
+///    destroyed via [`destroy_after_migration`](Self::destroy_after_migration),
+///    which returns the private bytes for re-import as the new identity
+///    key. The protocol immediately generates a new pre-rotation keypair
+///    and stores it in this same custody.
+///
+/// # Why no `sign` method
+///
+/// Pre-rotation keys never sign anything in the SCP protocol. Omitting
+/// `sign` keeps the trait viable across all six §9.7.4.1 §4 backends — a
+/// printed BIP39 mnemonic, paper backup, or distributed Shamir shares
+/// cannot sign on demand. Substrates that CAN sign (FIDO2 hardware keys,
+/// platform enclaves) MAY expose signing through a separate method on
+/// their concrete impl, but the trait itself is sign-free.
+///
+/// # Atomicity contract for `destroy_after_migration`
+///
+/// Implementations SHOULD make export-and-destroy atomic where possible
+/// (single `SQLite` transaction, single keychain update). For backends where
+/// atomicity is impossible (printed BIP39 mnemonic), callers MUST treat
+/// any error as "key may or may not still exist" and surface a recovery
+/// prompt.
+///
+/// # Concurrency
+///
+/// Implementations MUST be safe under concurrent calls (`Send + Sync` is
+/// trait-required). Hardware-backed callbacks may serialize internally;
+/// concurrent callers will simply queue.
+pub trait PreRotationCustody: Send + Sync {
+    /// Store a pre-generated pre-rotation keypair in cold custody.
+    ///
+    /// The `private_key` argument is consumed
+    /// ([`zeroize::Zeroizing`](::zeroize::Zeroizing) — wipes on drop, so
+    /// partial failure does not leak). The `public_key` is retained
+    /// alongside for verification on retrieval (`reveal_public_key`'s
+    /// internal commitment-mismatch check, if implemented).
+    ///
+    /// Implementations MAY return immediately (in-memory, callback that
+    /// stashes synchronously) or MAY block on user interaction (FIDO2
+    /// touch, passphrase entry). Callers running on the protocol thread
+    /// should treat this as potentially long-running.
+    fn store_committed_pre_rotation_key(
+        &self,
+        public_key: &[u8; 32],
+        private_key: zeroize::Zeroizing<[u8; 32]>,
+    ) -> impl Future<Output = Result<PreRotationKeyHandle, PreRotationCustodyError>> + Send;
+
+    /// Return the 32-byte Ed25519 public key for the stored pre-rotation
+    /// key. Used to populate `PreRotationProof::revealed_key` during
+    /// `migrate_identity` (ADR-003 §4b).
+    ///
+    /// Implementations MAY verify the public key against an internally
+    /// stored commitment as a defense-in-depth check; if the verification
+    /// fails, return [`PreRotationCustodyError::CommitmentMismatch`].
+    fn reveal_public_key(
+        &self,
+        handle: &PreRotationKeyHandle,
+    ) -> impl Future<Output = Result<[u8; 32], PreRotationCustodyError>> + Send;
+
+    /// Destroy the pre-rotation key after a successful migration, returning
+    /// the raw private key bytes (zeroized wrapper) so the caller can
+    /// re-import them into operational custody as the new identity key
+    /// (the canonical use of the pre-rotation key per ADR-003 §4b).
+    ///
+    /// After this returns, subsequent calls with the same handle MUST
+    /// return [`PreRotationCustodyError::HandleNotFound`].
+    fn destroy_after_migration(
+        &self,
+        handle: PreRotationKeyHandle,
+    ) -> impl Future<Output = Result<zeroize::Zeroizing<[u8; 32]>, PreRotationCustodyError>> + Send;
+
+    /// Returns the custody kind for diagnostic/logging purposes only.
+    ///
+    /// MUST NOT be used for security decisions — the
+    /// [`PreRotationCustody`] instance itself is the security boundary.
+    fn custody_kind(&self) -> PreRotationCustodyKind;
 }
 
 /// Device attestation trait.

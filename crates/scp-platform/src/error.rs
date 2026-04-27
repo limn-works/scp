@@ -45,4 +45,14 @@ pub enum PlatformError {
     /// wrong-key-type.
     #[error("custody error: {0}")]
     CustodyError(String),
+
+    /// The custody backend does not support an optional operation.
+    ///
+    /// Used by [`KeyCustody::generate_ephemeral_ed25519_seed`](crate::traits::KeyCustody::generate_ephemeral_ed25519_seed)
+    /// for HSM-backed implementations whose Ed25519 keys are non-extractable
+    /// (Apple Secure Enclave, Android `StrongBox`). The carried message
+    /// describes which operation was unsupported so SDK callers can route to
+    /// a platform-specific alternative (`SecRandomCopyBytes`, etc.).
+    #[error("unsupported operation: {0}")]
+    Unsupported(&'static str),
 }

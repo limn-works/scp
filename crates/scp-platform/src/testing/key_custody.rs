@@ -486,6 +486,23 @@ impl KeyCustody for InMemoryKeyCustody {
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::InMemory
     }
+
+    fn generate_ephemeral_ed25519_seed(
+        &self,
+    ) -> impl Future<Output = Result<Zeroizing<[u8; 32]>, PlatformError>> + Send {
+        async move {
+            // Draw 32 bytes from the SAME RNG used by `generate_keypair`. This
+            // preserves the ADR-046 byte-parity invariant: the seeded
+            // bridge-parity tests expect `seed[0..32]` → identity_key,
+            // `seed[32..64]` → active_signing_key, `seed[64..96]` →
+            // pre-rotation key. Calling this method between identity and
+            // active generations would break parity; the dht::create flow
+            // is responsible for the correct ordering.
+            let mut seed = Zeroizing::new([0u8; 32]);
+            self.rng.lock().await.fill_bytes(seed.as_mut());
+            Ok(seed)
+        }
+    }
 }
 
 #[cfg(test)]
