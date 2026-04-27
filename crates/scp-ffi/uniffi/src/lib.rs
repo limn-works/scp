@@ -132,7 +132,7 @@ pub use bridge::{
     // Free functions — identity
     // Free functions — MCP (#591)
     // The four mcp_*_stdio_allowlist free functions were deleted in
-    // #1543 PR-D (per-instance allowlist) — see `impl Scp::mcp_*` methods.
+    // Per-instance allowlist — see `impl Scp::mcp_*` methods.
     // Free functions — provenance (#370)
     provenance_check_chain_depth,
     // Free functions — local DID management (#387)

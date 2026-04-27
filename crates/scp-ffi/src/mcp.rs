@@ -2076,7 +2076,11 @@ fn probe_relay_for_known_contexts(
 /// type is now per-instance and the mutex lives on `CoreFields`. Each call
 /// site maps `PoisonError` to its own typed transport error before calling
 /// into the allowlist.
-#[allow(clippy::needless_pass_by_value)] // match on e consumes variants carrying String data.
+// `clippy::match_same_arms` — the explicit wildcard arm at the end is intentional:
+// `AllowlistError` is `#[non_exhaustive]`, so future variants must compile, and
+// classifying them as a validation error fails closed. Folding the wildcard into
+// the named OR-chain would erase that documentation.
+#[allow(clippy::needless_pass_by_value, clippy::match_same_arms)]
 fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
     use scp_mcp::allowlist::AllowlistError;
     let msg = e.to_string();
@@ -2090,7 +2094,18 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
             message: msg,
             code: codes::VALID_7033.to_owned(),
         },
-        AllowlistError::NotAllowed { .. } => ScpPyError::transport(msg),
+        AllowlistError::NotAllowed { .. } => ScpPyError::TransportError {
+            message: msg,
+            code: codes::TRANS_5030.to_owned(),
+        },
+        // `AllowlistError` is `#[non_exhaustive]` — fail closed for any
+        // future variant by classifying as a validation error so an unknown
+        // policy decision can never silently turn into a permissive
+        // transport-success path.
+        _ => ScpPyError::ValidationError {
+            message: msg,
+            code: codes::VALID_7033.to_owned(),
+        },
     }
 }
 
@@ -2099,9 +2114,13 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpPyError {
 // ---------------------------------------------------------------------------
 
 /// Maps a `PoisonError` from the per-instance allowlist mutex to a
-/// transport-level [`ScpPyError`].
+/// transport-level [`ScpPyError`]. Uses `SCP-TRANS-5030` for cross-bridge
+/// parity with NAPI / `UniFFI` — same code, same semantics, regardless of SDK.
 fn allowlist_lock_poisoned() -> ScpPyError {
-    ScpPyError::transport("stdio allowlist lock poisoned".to_owned())
+    ScpPyError::TransportError {
+        message: "stdio allowlist lock poisoned".to_owned(),
+        code: codes::TRANS_5030.to_owned(),
+    }
 }
 
 /// Per-instance MCP stdio allowlist methods on [`PyScp`].
@@ -2410,7 +2429,7 @@ impl crate::scp::PyScp {
 ///
 /// Returns `PyErr` if registration of functions fails.
 pub const fn register_mcp(_m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // All MCP operations — including the stdio allowlist (#1543 PR-D) — are
+    // All MCP operations — including the stdio allowlist — are
     // now methods on `SCP`. PyO3 registers `#[pymethods]` automatically with
     // the class, so this function has nothing to wire up here.
     Ok(())
@@ -3361,35 +3380,43 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// WU6: Two-instance regression test — disabling enforcement on one
-    /// `PyBridgeInstance` MUST NOT leak into another.
+    /// WU6: Two-instance regression test — disabling enforcement via the
+    /// public `PyScp::mcp_disable_stdio_allowlist` method on one instance
+    /// MUST NOT leak into another. Drives the public surface (not the
+    /// internal `core.mcp_allowlist()` accessor) so the test catches a
+    /// regression where the method silently locks the wrong mutex.
     #[test]
     fn allowlist_disable_does_not_leak_across_instances_pyo3() {
-        use scp_mcp::allowlist::AllowlistError;
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let a = crate::scp::PyScp::new();
+            let b = crate::scp::PyScp::new();
 
-        let a = crate::runtime::PyBridgeInstance::new_py();
-        let b = crate::runtime::PyBridgeInstance::new_py();
+            a.mcp_disable_stdio_allowlist()
+                .expect("disable on a should succeed");
 
-        a.core.mcp_allowlist().lock().unwrap().disable_enforcement();
+            // `b` snapshot remains restricted (default allowlist, enforcement on).
+            let b_dict_obj = b.mcp_get_stdio_allowlist(py).expect("snapshot b");
+            let b_dict: &Bound<'_, PyDict> = b_dict_obj.bind(py).downcast().unwrap();
+            let b_unrestricted: bool = b_dict
+                .get_item("unrestricted")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(!b_unrestricted, "instance b must remain restricted");
 
-        // `b` is unaffected and rejects unlisted commands.
-        let res = b
-            .core
-            .mcp_allowlist()
-            .lock()
-            .unwrap()
-            .validate_command("sh");
-        assert!(
-            matches!(res, Err(AllowlistError::NotAllowed { .. })),
-            "expected NotAllowed on isolated instance, got {res:?}"
-        );
-
-        // Sanity: `a` is unrestricted on its own snapshot.
-        let a_state = a.core.mcp_allowlist().lock().unwrap().snapshot();
-        assert!(a_state.unrestricted);
-        // `b` snapshot remains restricted.
-        let b_state = b.core.mcp_allowlist().lock().unwrap().snapshot();
-        assert!(!b_state.unrestricted);
+            // Sanity: `a` is unrestricted via its own snapshot.
+            let a_dict_obj = a.mcp_get_stdio_allowlist(py).expect("snapshot a");
+            let a_dict: &Bound<'_, PyDict> = a_dict_obj.bind(py).downcast().unwrap();
+            let a_unrestricted: bool = a_dict
+                .get_item("unrestricted")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(a_unrestricted, "instance a must be unrestricted");
+        });
     }
 
     // -----------------------------------------------------------------------

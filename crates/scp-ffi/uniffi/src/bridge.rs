@@ -3828,6 +3828,11 @@ async fn run_mcp_stdio_server_uniffi(
 /// Mutex poisoning is NOT modelled by `AllowlistError` — the allowlist is
 /// per-instance (`CoreFields::mcp_allowlist`). Each call site maps
 /// `PoisonError` to a transport error before invoking allowlist methods.
+// `clippy::match_same_arms` — the explicit wildcard arm at the end is intentional:
+// `AllowlistError` is `#[non_exhaustive]`, so future variants must compile, and
+// classifying them as a validation error fails closed. Folding the wildcard into
+// the named OR-chain would erase that documentation.
+#[allow(clippy::match_same_arms)]
 fn mcp_allowlist_err(e: scp_mcp::allowlist::AllowlistError) -> ScpError {
     use scp_mcp::allowlist::AllowlistError;
     let msg = e.to_string();
@@ -3844,6 +3849,13 @@ fn mcp_allowlist_err(e: scp_mcp::allowlist::AllowlistError) -> ScpError {
         AllowlistError::NotAllowed { .. } => ScpError::Transport {
             msg,
             code: codes::TRANS_5030.to_owned(),
+        },
+        // `AllowlistError` is `#[non_exhaustive]` — fail closed for any
+        // future variant by classifying as a validation error rather than
+        // letting an unknown policy decision become a permissive path.
+        _ => ScpError::Validation {
+            msg,
+            code: codes::VALID_7033.to_owned(),
         },
     }
 }
@@ -3866,7 +3878,7 @@ fn mcp_allowlist_lock_poisoned() -> ScpError {
 //
 // All four operations are exposed as **methods on `Scp`** (see
 // `impl Scp { mcp_configure_stdio_allowlist / … }` below). The legacy
-// `#[uniffi::export]` free functions were removed in #1543 PR-D when the
+// `#[uniffi::export]` free functions were removed when the
 // allowlist became per-instance (`CoreFields::mcp_allowlist`); the SDKs
 // already wrap the per-instance methods.
 // ---------------------------------------------------------------------------
@@ -11934,8 +11946,8 @@ impl Scp {
     /// Configures THIS instance's MCP stdio subprocess allowlist.
     ///
     /// Operates on `self.inner.core().mcp_allowlist()` — disabling
-    /// enforcement on one `Scp` does NOT leak into another (#1543 PR-D /
-    /// ADR-048 multi-instance neutrality).
+    /// enforcement on one `Scp` does NOT leak into another (ADR-048
+    /// multi-instance neutrality).
     ///
     /// # Errors
     ///

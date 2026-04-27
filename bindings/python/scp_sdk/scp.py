@@ -50,7 +50,28 @@ from scp_sdk.types import CustodyType
 
 logger = logging.getLogger("scp_sdk")
 
-__all__ = ["SCP", "InMemoryStorage", "SqliteStorage", "StorageConfig"]
+__all__ = [
+    "SCP",
+    "InMemoryStorage",
+    "McpAllowlistState",
+    "SqliteStorage",
+    "StorageConfig",
+]
+
+
+class McpAllowlistState(TypedDict):
+    """Snapshot of an :class:`SCP` instance's stdio allowlist state.
+
+    Returned by :meth:`SCP.mcp_get_stdio_allowlist`. Mirrors the Rust
+    :class:`scp_mcp::allowlist::AllowlistState` shape so consumers get
+    IDE autocomplete on the snapshot fields.
+    """
+
+    #: Sorted list of allowed binary basenames.
+    allowed: list[str]
+    #: ``True`` if enforcement is disabled (unrestricted mode); ``False``
+    #: if only :attr:`allowed` may be spawned.
+    unrestricted: bool
 
 
 class InMemoryStorage(TypedDict):
@@ -1031,7 +1052,10 @@ class SCP:
         """Connect an MCP client via stdio transport (returns :class:`McpClient`).
 
         Pre-flight allowlist check uses THIS instance's allowlist
-        (#1543 PR-D, ADR-048 §1).
+        (ADR-048 §1, multi-instance neutrality). To permit a binary not
+        in the default allowlist, call
+        :meth:`mcp_configure_stdio_allowlist` first; to inspect the
+        current per-instance state, use :meth:`mcp_get_stdio_allowlist`.
         """
         from scp_sdk.mcp import McpClient, validate_client_connect
 
@@ -1108,13 +1132,14 @@ class SCP:
         self._native.mcp_reset_stdio_allowlist()
         logger.info("MCP stdio allowlist reset to defaults on SCP instance")
 
-    def mcp_get_stdio_allowlist(self) -> dict[str, Any]:
+    def mcp_get_stdio_allowlist(self) -> McpAllowlistState:
         """Return a snapshot of THIS instance's stdio allowlist state.
 
         Returns:
-            A dict with keys:
-            - ``"allowed"``: sorted list of allowed binary names
-            - ``"unrestricted"``: ``True`` if the allowlist is bypassed
+            A :class:`McpAllowlistState` ``TypedDict`` with keys:
+
+            - ``"allowed"``: sorted list of allowed binary basenames.
+            - ``"unrestricted"``: ``True`` if the allowlist is bypassed.
         """
         return self._native.mcp_get_stdio_allowlist()
 

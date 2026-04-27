@@ -8,7 +8,7 @@ Covers:
 - CLI entry point argument parsing
 - Module-level ``__all__`` and package re-exports
 - ``DEFAULT_STDIO_ALLOWLIST`` invariants
-- Per-instance allowlist API on :class:`SCP` (#1543 PR-D):
+- Per-instance allowlist API on :class:`SCP`:
   ``mcp_configure_stdio_allowlist``, ``mcp_disable_stdio_allowlist``,
   ``mcp_reset_stdio_allowlist``, ``mcp_get_stdio_allowlist``
 
@@ -19,7 +19,7 @@ on :class:`scp_sdk.SCP` — see :meth:`SCP.mcp_serve`,
 :meth:`SCP.mcp_client_connect_stdio`, :meth:`SCP.mcp_client_connect_sse`,
 and :meth:`SCP.mcp_server_stop`.
 
-#1543 PR-D moved the stdio allowlist onto each :class:`SCP` instance —
+Per-instance migration moved the stdio allowlist onto each :class:`SCP` instance —
 the previous module-level free functions were deleted; tests drive the
 per-instance methods on :class:`SCP` instead.
 
@@ -404,7 +404,7 @@ class TestModuleAll:
     def test_all_contains_core_exports(self) -> None:
         from scp_sdk import mcp
 
-        # #1543 PR-D: the four `*_stdio_allowlist` module-level helpers
+        # The four `*_stdio_allowlist` module-level helpers
         # are gone; their per-instance equivalents live on `SCP`.
         required = {
             "DEFAULT_STDIO_ALLOWLIST",
@@ -419,7 +419,7 @@ class TestModuleAll:
         assert required.issubset(set(mcp.__all__))
 
     def test_legacy_module_level_allowlist_helpers_are_gone(self) -> None:
-        # #1543 PR-D regression: ensure the old module-level free-functions
+        # Regression guard: ensure the old module-level free-functions
         # are not re-introduced.
         from scp_sdk import mcp
 
@@ -431,7 +431,7 @@ class TestModuleAll:
         ):
             assert not hasattr(mcp, legacy_name), (
                 f"{legacy_name} must not exist as a module-level helper "
-                "after #1543 PR-D — use SCP.mcp_*_stdio_allowlist methods."
+                "— use SCP.mcp_*_stdio_allowlist methods instead."
             )
             assert legacy_name not in mcp.__all__
 
@@ -475,7 +475,7 @@ class TestDefaultStdioAllowlist:
 class TestStdioAllowlistApi:
     """Tests for the per-instance allowlist methods on :class:`SCP`.
 
-    #1543 PR-D: these tests use a real ``SCP()`` instance — each test
+    These tests use a real ``SCP()`` instance — each test
     constructs its own and so runs in parallel safely. Cross-instance
     isolation is exercised by
     :class:`TestStdioAllowlistInstanceIsolation` below.
@@ -534,7 +534,7 @@ class TestStdioAllowlistApi:
 
 
 class TestStdioAllowlistInstanceIsolation:
-    """#1543 PR-D regression: the allowlist is per-instance.
+    """Regression guard: the allowlist is per-instance.
 
     Disabling enforcement (or extending the allow set) on one
     :class:`SCP` MUST NOT leak into another instance.

@@ -8,7 +8,7 @@ Phase 4 PR 5 Agent B+C (#1549) collapsed :class:`McpServer` and
 subsequent operation (``list_tools``, ``invoke``, ``stop``,
 ``disconnect``, etc.) lives on :class:`scp_sdk.SCP`.
 
-#1543 PR-D moved the stdio allowlist onto each :class:`SCP` instance.
+Per-instance migration moved the stdio allowlist onto each :class:`SCP` instance.
 Use :meth:`scp_sdk.SCP.mcp_configure_stdio_allowlist`,
 :meth:`scp_sdk.SCP.mcp_disable_stdio_allowlist`,
 :meth:`scp_sdk.SCP.mcp_reset_stdio_allowlist`, and
@@ -160,7 +160,7 @@ class McpClient:
 # Pre-flight client-connect validation
 #
 # The stdio allowlist itself is per-instance state on the Rust bridge and
-# accessed through :class:`scp_sdk.SCP` methods (#1543 PR-D). This pure
+# accessed through :class:`scp_sdk.SCP` methods. This pure
 # helper validates connect parameters and, when an instance allowlist
 # snapshot is provided, performs a defense-in-depth membership check
 # before crossing the FFI boundary.

@@ -1693,6 +1693,15 @@ export class SCP {
     await (this.#native.mcpServerStop as (h: unknown) => Promise<void>)(handle);
   }
 
+  /**
+   * Connect an MCP client via stdio transport.
+   *
+   * `command[0]` is validated against THIS instance's stdio allowlist
+   * (per-instance — disabling enforcement on another `SCP` does not
+   * affect this one). To permit a binary not in the default allowlist,
+   * call {@link mcpConfigureStdioAllowlist} first; use
+   * {@link mcpGetStdioAllowlist} to inspect the current state.
+   */
   async mcpClientConnectStdio(command: readonly string[]): Promise<unknown> {
     return await (this.#native.mcpClientConnectStdio as (c: readonly string[]) => Promise<unknown>)(
       command,
@@ -1735,7 +1744,25 @@ export class SCP {
     (this.#native.mcpConfigureStdioAllowlist as (b: readonly string[]) => void)(additionalBinaries);
   }
 
-  mcpDisableStdioAllowlist(): void {
+  /**
+   * Disable this instance's stdio allowlist (unrestricted mode).
+   *
+   * Allows **any** binary to be spawned by `mcpClientConnectStdio` on this
+   * `SCP` — other instances are unaffected. Requires explicit
+   * `iTrustAllCommands: true` to confirm acknowledgement of the security
+   * implication. A warning is also written to `console.warn`.
+   */
+  mcpDisableStdioAllowlist(opts?: { iTrustAllCommands?: boolean }): void {
+    if (!opts?.iTrustAllCommands) {
+      throw new Error(
+        "Disabling the stdio allowlist allows any binary to be spawned by " +
+          "this SCP instance. Pass { iTrustAllCommands: true } to confirm.",
+      );
+    }
+    console.warn(
+      "[scp] MCP stdio allowlist enforcement disabled — arbitrary subprocess " +
+        "spawning is now permitted on this instance",
+    );
     (this.#native.mcpDisableStdioAllowlist as () => void)();
   }
 
@@ -1743,8 +1770,13 @@ export class SCP {
     (this.#native.mcpResetStdioAllowlist as () => void)();
   }
 
-  mcpGetStdioAllowlist(): unknown {
-    return (this.#native.mcpGetStdioAllowlist as () => unknown)();
+  mcpGetStdioAllowlist(): { allowed: readonly string[]; unrestricted: boolean } {
+    return (
+      this.#native.mcpGetStdioAllowlist as () => {
+        allowed: readonly string[];
+        unrestricted: boolean;
+      }
+    )();
   }
 
   // ───────────────────────────────────────────────────────────────────────

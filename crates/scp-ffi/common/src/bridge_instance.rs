@@ -429,7 +429,7 @@ pub struct CoreFields {
     scope_registries: Mutex<HashMap<String, ScopeRegistry>>,
 
     // -----------------------------------------------------------------
-    // MCP stdio allowlist — #1543 PR-D (per-instance)
+    // MCP stdio allowlist — per-instance
     // -----------------------------------------------------------------
     /// Per-instance MCP stdio command allowlist.
     ///
@@ -437,8 +437,7 @@ pub struct CoreFields {
     /// guarded by a `Mutex`. Migrated from a `OnceLock<Mutex<…>>` process
     /// singleton in `scp-mcp::allowlist` so that one bridge disabling
     /// enforcement (or extending the allow set) does not leak into another
-    /// bridge's policy decisions (#1543 PR-D / ADR-048 multi-instance
-    /// neutrality).
+    /// bridge's policy decisions (ADR-048 multi-instance neutrality).
     ///
     /// Lock-ordering rule: callers must NOT hold this guard while acquiring
     /// any other `CoreFields` lock. The allowlist guard is short-lived and
@@ -2298,7 +2297,13 @@ pub trait BridgeInstanceCore: Send + Sync {
     /// the field lives on `CoreFields` and bridge-specific impls do not
     /// need to override.
     ///
-    /// See [`CoreFields::mcp_allowlist`] for the lock-ordering rule.
+    /// # Lock ordering
+    ///
+    /// Do NOT call any other `BridgeInstanceCore` / `CoreFields` locking
+    /// method (e.g. `petname_maps()`, `handle_registries()`,
+    /// `with_transport`) while holding the allowlist guard — the guard is
+    /// short-lived (one allowlist op only) and there is never a reason to
+    /// nest. See [`CoreFields::mcp_allowlist`].
     fn mcp_allowlist(&self) -> &Mutex<scp_mcp::allowlist::StdioAllowlist> {
         self.core().mcp_allowlist()
     }

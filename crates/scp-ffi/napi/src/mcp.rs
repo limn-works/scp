@@ -818,7 +818,11 @@ pub(crate) async fn mcp_client_invoke_on(
 /// is now per-instance (`CoreFields::mcp_allowlist`). Each call site maps
 /// `PoisonError` to its own typed transport error before invoking allowlist
 /// methods.
-#[allow(clippy::needless_pass_by_value)]
+// `clippy::match_same_arms` — the explicit wildcard arm at the end is intentional:
+// `AllowlistError` is `#[non_exhaustive]`, so future variants must compile, and
+// classifying them as a validation error fails closed. Folding the wildcard into
+// the named OR-chain would erase that documentation.
+#[allow(clippy::needless_pass_by_value, clippy::match_same_arms)]
 fn allowlist_err(e: allowlist::AllowlistError) -> ScpNapiError {
     use scp_mcp::allowlist::AllowlistError;
     let msg = e.to_string();
@@ -835,6 +839,13 @@ fn allowlist_err(e: allowlist::AllowlistError) -> ScpNapiError {
         AllowlistError::NotAllowed { .. } => ScpNapiError::Transport {
             message: msg,
             code: codes::TRANS_5030.to_owned(),
+        },
+        // `AllowlistError` is `#[non_exhaustive]` — fail closed for any
+        // future variant by classifying as a validation error rather than
+        // letting an unknown policy decision become a permissive path.
+        _ => ScpNapiError::Validation {
+            message: msg,
+            code: codes::VALID_7033.to_owned(),
         },
     }
 }
@@ -865,7 +876,7 @@ pub struct NapiAllowlistState {
 ///
 /// Operates on `bi.core.mcp_allowlist()` — disabling enforcement or
 /// extending the allow set on one `Scp` does NOT leak into another instance
-/// (#1543 PR-D).
+/// (per-instance migration).
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn mcp_configure_stdio_allowlist_on(
     bi: &NapiBridgeInstance,

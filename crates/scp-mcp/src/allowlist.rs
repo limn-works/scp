@@ -50,7 +50,12 @@ use std::collections::BTreeSet;
 /// poisoning is **not** modelled here — each FFI bridge that wraps an
 /// allowlist in a `Mutex` maps `PoisonError` to its own transport-error
 /// type.
+///
+/// Marked `#[non_exhaustive]` so future variants (e.g. a richer
+/// rate-limit error class) can be added without breaking match arms in
+/// out-of-tree consumers.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum AllowlistError {
     /// Entry is empty.
     #[error("allowlist entry cannot be empty")]
@@ -184,6 +189,17 @@ impl StdioAllowlist {
             return Err(AllowlistError::PathInCommand(cmd.to_owned()));
         }
 
+        // Defense-in-depth: reject NUL and ASCII control characters even in
+        // unrestricted mode. `Command::new` would also reject NUL at the
+        // libc boundary, but the validator must not depend on the OS as the
+        // last line of content-safety. Symmetric with `validate_entry`.
+        if cmd.contains('\0') {
+            return Err(AllowlistError::NulInEntry(cmd.to_owned()));
+        }
+        if cmd.bytes().any(|b| b < 0x20 || b == 0x7F) {
+            return Err(AllowlistError::ControlCharInEntry(cmd.to_owned()));
+        }
+
         if self.unrestricted {
             return Ok(basename);
         }
@@ -230,7 +246,15 @@ impl StdioAllowlist {
     /// After calling this, **any** binary name passes
     /// [`validate_command`](Self::validate_command). Only use when the
     /// command source is fully trusted.
-    pub const fn disable_enforcement(&mut self) {
+    ///
+    /// Emits a `tracing::warn!` audit event on every call so multi-tenant
+    /// operators can detect a tenant unrestricting before subprocess
+    /// spawning starts.
+    pub fn disable_enforcement(&mut self) {
+        tracing::warn!(
+            "MCP stdio allowlist enforcement disabled — \
+             arbitrary subprocess spawning is now permitted on this bridge instance"
+        );
         self.unrestricted = true;
     }
 
@@ -576,6 +600,74 @@ mod tests {
         let b = StdioAllowlist::new_with_defaults().snapshot();
         assert_eq!(a.unrestricted, b.unrestricted);
         assert_eq!(a.allowed, b.allowed);
+    }
+
+    #[test]
+    fn unrestricted_still_rejects_paths() {
+        // INV-5: even in unrestricted mode, path-shaped commands are rejected.
+        // Path-rejection is a pre-allowlist defense — it must run regardless of
+        // whether the allowlist is bypassed.
+        let mut allowlist = StdioAllowlist::new_with_defaults();
+        allowlist.disable_enforcement();
+        assert!(matches!(
+            allowlist.validate_command("/usr/bin/sh"),
+            Err(AllowlistError::PathInCommand(_))
+        ));
+        assert!(matches!(
+            allowlist.validate_command("./node"),
+            Err(AllowlistError::PathInCommand(_))
+        ));
+        assert!(matches!(
+            allowlist.validate_command("..\\bin\\sh"),
+            Err(AllowlistError::PathInCommand(_))
+        ));
+        // Empty + dot-paths still rejected as InvalidCommand (Path::file_name fails).
+        assert!(matches!(
+            allowlist.validate_command(""),
+            Err(AllowlistError::InvalidCommand(_))
+        ));
+    }
+
+    #[test]
+    fn unrestricted_still_rejects_nul_and_control_chars() {
+        // Defense-in-depth: even in unrestricted mode, NUL and ASCII control
+        // characters in commands must be rejected — the validator must not
+        // depend on `Command::new` to catch them at the libc boundary.
+        let mut allowlist = StdioAllowlist::new_with_defaults();
+        allowlist.disable_enforcement();
+        assert!(matches!(
+            allowlist.validate_command("node\0evil"),
+            Err(AllowlistError::NulInEntry(_))
+        ));
+        assert!(matches!(
+            allowlist.validate_command("node\tevil"),
+            Err(AllowlistError::ControlCharInEntry(_))
+        ));
+        assert!(matches!(
+            allowlist.validate_command("node\nevil"),
+            Err(AllowlistError::ControlCharInEntry(_))
+        ));
+        assert!(matches!(
+            allowlist.validate_command("node\x7fevil"),
+            Err(AllowlistError::ControlCharInEntry(_))
+        ));
+    }
+
+    #[test]
+    fn configure_atomicity_no_partial_inserts() {
+        // INV-6: a multi-entry configure call where one entry fails validation
+        // must NOT insert any of the entries (validate-all-then-insert).
+        let mut allowlist = StdioAllowlist::new_with_defaults();
+        let result = allowlist.configure(&["valid-name", "/invalid/path"]);
+        assert!(result.is_err(), "expected configure to fail");
+        // The valid entry must NOT have been inserted before the invalid one
+        // tripped the validation.
+        assert!(
+            allowlist.validate_command("valid-name").is_err(),
+            "valid-name must NOT be inserted on partial failure"
+        );
+        // Defaults still intact.
+        assert!(allowlist.validate_command("node").is_ok());
     }
 
     #[test]
