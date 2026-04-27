@@ -44,6 +44,9 @@ val hasUniffiBindings = uniffiBindingsDir.exists() && uniffiBindingsDir.listFile
 if (!hasUniffiBindings) {
     sourceSets.test {
         kotlin.exclude("**/RealFFITest.kt")
+        // SCP-OUT-023 AC-7: caveats round-trip test exercises `uniffi.scp.*`
+        // identifiers (real bridge); skip when bindings aren't generated.
+        kotlin.exclude("**/CaveatsRoundtripTest.kt")
     }
 }
 

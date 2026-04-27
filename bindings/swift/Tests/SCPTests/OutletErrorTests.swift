@@ -1,12 +1,10 @@
 // SCP-OUT-041d — Swift SDK unit tests for OutletError.new options-object
 // form, the bridge-wire envelope parser, and labeled-arg ergonomics.
 
+@testable import SCP
 import XCTest
 
-@testable import SCP
-
 final class OutletErrorTests: XCTestCase {
-
     func testNewLabeledArgsConstructsAuthorization() throws {
         let key = try CatalogKey.make("authorization.denied")
         let err = try OutletError.new(
@@ -15,7 +13,7 @@ final class OutletErrorTests: XCTestCase {
             class: .authorization
         )
         switch err {
-        case .authorization(let envelope):
+        case let .authorization(envelope):
             XCTAssertEqual(envelope.classWire, .authorization)
             XCTAssertEqual(envelope.slug, "authorization.denied")
         default:

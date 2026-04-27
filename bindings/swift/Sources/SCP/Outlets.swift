@@ -233,7 +233,7 @@ public enum OutletError: Error, Sendable, Equatable {
                 code: "SCP-VALID-7000"
             )
         }
-        let nonce = padNonce ?? Data((0..<16).map { _ in UInt8.random(in: 0...255) })
+        let nonce = padNonce ?? Data((0 ..< 16).map { _ in UInt8.random(in: 0 ... 255) })
         guard nonce.count == 16 else {
             throw OutletError.validation(
                 message: "padNonce must be 16 bytes",
@@ -277,8 +277,8 @@ public enum OutletError: Error, Sendable, Equatable {
 }
 
 /// Per-class default `SCP-TOOL-NNNN` code for the §5.4.4 envelope.
-private func defaultCodeFor(_ class_: OutletErrorClass) -> String {
-    switch class_ {
+private func defaultCodeFor(_ errorClass: OutletErrorClass) -> String {
+    switch errorClass {
     case .protocol: return "SCP-TOOL-6100"
     case .authorization: return "SCP-TOOL-6110"
     case .input: return "SCP-TOOL-6120"
@@ -328,13 +328,19 @@ public struct OutletMessageTemplate: Codable, Sendable, Equatable {
 
 /// `ContextHop` shape for the SCP-OUT-041d source_chain field.
 public struct OutletContextHop: Codable, Sendable, Equatable {
-    public let context_id: String
-    public let hop_index: UInt32
-    public let wrapped_code: String
+    public let contextId: String
+    public let hopIndex: UInt32
+    public let wrappedCode: String
     public init(contextId: String, hopIndex: UInt32, wrappedCode: String) {
-        self.context_id = contextId
-        self.hop_index = hopIndex
-        self.wrapped_code = wrappedCode
+        self.contextId = contextId
+        self.hopIndex = hopIndex
+        self.wrappedCode = wrappedCode
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case contextId = "context_id"
+        case hopIndex = "hop_index"
+        case wrappedCode = "wrapped_code"
     }
 }
 

@@ -305,10 +305,10 @@ private extension Data {
         let len = hexString.count / 2
         var data = Data(capacity: len)
         var idx = hexString.startIndex
-        for _ in 0..<len {
+        for _ in 0 ..< len {
             let next = hexString.index(idx, offsetBy: 2)
             guard next <= hexString.endIndex,
-                  let byte = UInt8(hexString[idx..<next], radix: 16) else { return nil }
+                  let byte = UInt8(hexString[idx ..< next], radix: 16) else { return nil }
             data.append(byte)
             idx = next
         }

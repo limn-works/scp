@@ -96,7 +96,11 @@ class OutletErrorNewTests {
                 newCatalog: List<MessageTemplateRecord>,
                 priorAppendTimeSecs: Long,
                 newAppendTimeSecs: Long,
-            ) {}
+            ) {
+                // No-op: this stub bridge is exercised only by the outletErrorNew
+                // path in this test file, so the catalog-rotation hook is
+                // intentionally inert.
+            }
         })
 
         val opts = OutletErrorNewBridgeOptions(
