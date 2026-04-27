@@ -1338,13 +1338,18 @@ impl crate::scp::PyScp {
 
         py.allow_threads(|| {
             rt.block_on(async {
-                // Extract what we need from the registry entry.
+                // Extract what we need from the registry entry. The
+                // pre-rotation key is the one whose public hash is in
+                // `pre_rotation_commitment` (spec §3.7) — using a fresh key
+                // here would break the `SHA-256(revealed_key) == commitment`
+                // invariant verified by `verify_migration`.
                 let (
                     custody,
                     old_identity_key,
                     old_active_key,
                     old_agent_key,
                     pre_rotation_commitment,
+                    pre_rotation_key,
                     old_doc,
                 ) = crate::runtime::with_identity(&bi_arc, &old_did, |entry| {
                     Ok((
@@ -1353,23 +1358,10 @@ impl crate::scp::PyScp {
                         entry.identity.active_signing_key,
                         entry.identity.agent_signing_key,
                         entry.identity.pre_rotation_commitment,
+                        entry.identity.pre_rotation_key,
                         entry.document.clone(),
                     ))
                 })?;
-
-                // We need a pre-rotation key handle. Generate one for the
-                // migration — in a full implementation, the pre-rotation key
-                // would have been generated and stored during identity creation.
-                // The custody provider already holds the pre-rotation key from
-                // the original create call (handle = identity_key + 2, following
-                // the sequential handle allocation in DidDht::create).
-                //
-                // For now, generate a fresh pre-rotation key. The migrate_identity
-                // method uses it as the new Identity Key.
-                let pre_rotation_key = custody
-                    .generate_keypair(scp_platform::traits::KeyType::Ed25519)
-                    .await
-                    .map_err(|e| ScpPyError::identity(format!("key generation failed: {e}")))?;
 
                 let rotated_at = scp_primitives::SystemClock.now_secs();
 
@@ -1378,6 +1370,7 @@ impl crate::scp::PyScp {
                     active_signing_key: old_active_key,
                     agent_signing_key: old_agent_key,
                     pre_rotation_commitment,
+                    pre_rotation_key,
                     did: old_did.clone(),
                 };
 
@@ -2152,7 +2145,19 @@ mod tests {
                 serde_json::from_str(&rotation_event_json).unwrap();
             assert_eq!(event.old_did, old_did);
             assert_eq!(event.new_did, new_did);
-            assert!(event.pre_rotation_proof.is_some());
+            // Pre-rotation proof must satisfy the cryptographic invariant
+            // `SHA-256(revealed_key) == commitment` — the same check
+            // recipients run via `verify_migration` (spec §3.7).
+            let pre_rot = event
+                .pre_rotation_proof
+                .as_ref()
+                .expect("pre-rotation proof MUST be present");
+            use sha2::{Digest, Sha256};
+            let recomputed: [u8; 32] = Sha256::digest(pre_rot.revealed_key).into();
+            assert_eq!(
+                recomputed, pre_rot.commitment,
+                "PreRotationProof MUST satisfy SHA-256(revealed_key) == commitment"
+            );
         });
     }
 }

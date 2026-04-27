@@ -772,25 +772,12 @@ impl NapiIdentity {
             })
             .unwrap_or_default();
 
-            // Spec §9.12 (Compromise Recovery Protocol) requires using the
-            // pre-rotation key from cold storage — the pre-rotation commitment
-            // in the old DID document proves the legitimate owner is rotating,
-            // not an attacker. In-memory custody does not persist keys across
-            // sessions, so no cold storage key exists. Generate a fresh
-            // pre-rotation key instead; `migrate_identity` uses it as the new
-            // Identity Key. Production custody providers (platform/HSM) must
-            // retrieve the original pre-rotation key from durable storage.
-            let pre_rotation_key = custody
-                .0
-                .generate_keypair(scp_platform::traits::KeyType::Ed25519)
-                .await
-                .map_err(|e| {
-                    NapiError::from(ScpNapiError::Identity {
-                        message: format!("key generation failed during migration: {e}"),
-                        code: codes::IDENT_1009.to_owned(),
-                    })
-                })?;
-
+            // Spec §3.7 / §9.12 (Compromise Recovery Protocol): the
+            // pre-rotation key whose hash equals the published
+            // `pre_rotation_commitment` is the only key that satisfies the
+            // `SHA-256(revealed_key) == commitment` invariant verified by
+            // `verify_migration`. It is retained on `ScpIdentity` from
+            // `dht.create()` onward.
             let rotated_at = scp_primitives::SystemClock.now_secs();
 
             let dht = make_dht_with_signer(&custody);
@@ -798,7 +785,7 @@ impl NapiIdentity {
                 .migrate_identity(
                     &scp_identity,
                     &document,
-                    &pre_rotation_key,
+                    &scp_identity.pre_rotation_key,
                     &custody.0,
                     rotated_at,
                 )
@@ -1460,7 +1447,19 @@ mod tests {
             .expect("rotation_event_json must deserialize as DidRotationEvent");
         assert_eq!(event.old_did, original_did);
         assert_eq!(event.new_did, migrated.did());
-        assert!(event.pre_rotation_proof.is_some());
+        // Pre-rotation proof must satisfy the cryptographic invariant
+        // `SHA-256(revealed_key) == commitment` — the same check
+        // recipients run via `verify_migration` (spec §3.7).
+        let pre_rot = event
+            .pre_rotation_proof
+            .as_ref()
+            .expect("pre-rotation proof MUST be present");
+        use sha2::{Digest, Sha256};
+        let recomputed: [u8; 32] = Sha256::digest(pre_rot.revealed_key).into();
+        assert_eq!(
+            recomputed, pre_rot.commitment,
+            "PreRotationProof MUST satisfy SHA-256(revealed_key) == commitment"
+        );
     }
 
     #[test]

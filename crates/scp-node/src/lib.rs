@@ -5410,6 +5410,7 @@ mod tests {
             active_signing_key: scp_platform::KeyHandle::new(2),
             agent_signing_key: None,
             pre_rotation_commitment: [0u8; 32],
+            pre_rotation_key: scp_platform::KeyHandle::new(3),
             did: "did:dht:test123".to_owned(),
         };
 
@@ -5498,6 +5499,7 @@ mod tests {
             active_signing_key: scp_platform::KeyHandle::new(2),
             agent_signing_key: None,
             pre_rotation_commitment: [0u8; 32],
+            pre_rotation_key: scp_platform::KeyHandle::new(3),
             did: "did:dht:testnet123".to_owned(),
         };
 
@@ -5586,6 +5588,7 @@ mod tests {
             active_signing_key: scp_platform::KeyHandle::new(2),
             agent_signing_key: None,
             pre_rotation_commitment: [0u8; 32],
+            pre_rotation_key: scp_platform::KeyHandle::new(3),
             did: "did:dht:unchanged123".to_owned(),
         };
 
@@ -5684,6 +5687,7 @@ mod tests {
             active_signing_key: scp_platform::KeyHandle::new(2),
             agent_signing_key: None,
             pre_rotation_commitment: [0u8; 32],
+            pre_rotation_key: scp_platform::KeyHandle::new(3),
             did: "did:dht:resilient123".to_owned(),
         };
 
@@ -5924,6 +5928,7 @@ mod tests {
                 active_signing_key: KeyHandle::new(2),
                 agent_signing_key: None,
                 pre_rotation_commitment: [0u8; 32],
+                pre_rotation_key: KeyHandle::new(3),
                 did: "did:dht:zroundtrip".to_owned(),
             },
             document: DidDocument {
@@ -5959,6 +5964,7 @@ mod tests {
                 active_signing_key: KeyHandle::new(2),
                 agent_signing_key: None,
                 pre_rotation_commitment: [0u8; 32],
+                pre_rotation_key: KeyHandle::new(3),
                 did: "did:dht:zfuture".to_owned(),
             },
             document: DidDocument {

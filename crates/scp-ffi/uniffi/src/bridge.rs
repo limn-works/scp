@@ -12710,14 +12710,11 @@ impl Scp {
                 // Determine which custody to use for key generation.
                 #[cfg(feature = "allow_in_memory_custody")]
                 if let Some(ref kc) = custody_arc {
-                    let pre_rotation_key =
-                        kc.0.generate_keypair(scp_platform::traits::KeyType::Ed25519)
-                            .await
-                            .map_err(|e| ScpError::Identity {
-                                msg: format!("key generation failed during migration: {e}"),
-                                code: codes::IDENT_1009.to_owned(),
-                            })?;
-
+                    // Spec §3.7: pre-rotation key whose hash equals the
+                    // committed value is retained on the identity from
+                    // creation. Generating a fresh key here would break
+                    // `verify_migration`'s SHA-256(revealed) == commitment
+                    // invariant.
                     let rotated_at = scp_primitives::SystemClock.now_secs();
 
                     let dht = DidDht::new();
@@ -12725,7 +12722,7 @@ impl Scp {
                         .migrate_identity(
                             &old_identity,
                             &old_document,
-                            &pre_rotation_key,
+                            &old_identity.pre_rotation_key,
                             &kc.0,
                             rotated_at,
                         )
@@ -12786,14 +12783,10 @@ impl Scp {
                 }
 
                 if let Some(ref cc) = callback_custody {
-                    let pre_rotation_key = cc
-                        .generate_keypair(scp_platform::traits::KeyType::Ed25519)
-                        .await
-                        .map_err(|e| ScpError::Identity {
-                            msg: format!("key generation failed during migration: {e}"),
-                            code: codes::IDENT_1009.to_owned(),
-                        })?;
-
+                    // Spec §3.7: pre-rotation key retained on identity since
+                    // creation; reusing it satisfies the
+                    // SHA-256(revealed) == commitment invariant. Callback
+                    // custody must surface the same handle on resume.
                     let rotated_at = scp_primitives::SystemClock.now_secs();
 
                     let dht = DidDht::new();
@@ -12801,7 +12794,7 @@ impl Scp {
                         .migrate_identity(
                             &old_identity,
                             &old_document,
-                            &pre_rotation_key,
+                            &old_identity.pre_rotation_key,
                             cc.as_ref(),
                             rotated_at,
                         )

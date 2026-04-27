@@ -105,6 +105,13 @@ pub struct ScpIdentity {
     /// Published in DID document as a `PreRotationCommitment` service.
     pub pre_rotation_commitment: [u8; 32],
 
+    /// Pre-rotation key handle (committed to via `pre_rotation_commitment`).
+    /// At migration this becomes the new Identity Key, so the holder retains
+    /// it in custody from creation onward — destroying it would make
+    /// `migrate_identity` unable to satisfy the spec §3.7 invariant
+    /// `SHA-256(revealed_key) == commitment` and would brick recovery.
+    pub pre_rotation_key: KeyHandle,
+
     /// The DID string: `did:dht:z<z-base-32(identity_key.public)>`.
     pub did: String,
 }

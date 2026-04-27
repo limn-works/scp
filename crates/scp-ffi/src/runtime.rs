@@ -2045,6 +2045,7 @@ mod tests {
                 active_signing_key: scp_platform::KeyHandle::new(0),
                 agent_signing_key: None,
                 pre_rotation_commitment: [0u8; 32],
+                pre_rotation_key: scp_platform::KeyHandle::new(0),
             },
             custody: Arc::new(crate::custody::FfiKeyCustody::InMemory(
                 InMemoryKeyCustody::new(),
@@ -2124,6 +2125,7 @@ mod tests {
                 active_signing_key: scp_platform::KeyHandle::new(0),
                 agent_signing_key: None,
                 pre_rotation_commitment: [0u8; 32],
+                pre_rotation_key: scp_platform::KeyHandle::new(0),
             },
             custody: Arc::new(crate::custody::FfiKeyCustody::InMemory(
                 InMemoryKeyCustody::new(),
@@ -2378,6 +2380,7 @@ mod tests {
                     active_signing_key: scp_platform::KeyHandle::new(0),
                     agent_signing_key: None,
                     pre_rotation_commitment: [0u8; 32],
+                    pre_rotation_key: scp_platform::KeyHandle::new(0),
                 },
                 custody: Arc::new(crate::custody::FfiKeyCustody::InMemory(
                     scp_platform::testing::InMemoryKeyCustody::new(),
