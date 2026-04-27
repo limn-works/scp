@@ -16,6 +16,7 @@ mod governance;
 mod lifecycle;
 mod messaging;
 mod outlet_catalog_rotation;
+mod outlets;
 mod queries;
 mod trust_recovery;
 

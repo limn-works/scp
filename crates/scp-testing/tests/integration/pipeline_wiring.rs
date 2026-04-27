@@ -143,7 +143,20 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // `invoke_outlet_cross_context`. Prior to this remediation, the free
 // function had 0 production callers (5 `#[tokio::test]` callers only)
 // — ghost code. One `#[test]` item, +1 to the active count.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 65;
+//
+// Raised 65 -> 66 by SCP-OUT-004 AC5 lifecycle-surface remediation:
+// adds `context_manager_exposes_outlet_lifecycle_methods` pinning the
+// 8 outlet lifecycle verbs (register / update / deregister / verify /
+// list / get / open_session / invoke) as `pub async fn` on
+// `impl ContextManager`. Prior to this fix, every verb except
+// `invoke_outlet_with_economy` lived only as a free function in
+// `scp-protocol` or `scp-runtime/.../outlets/`, forcing FFI bridges to
+// import the underlying free function directly and bypassing the
+// integration-checklist invariant that protocol logic flow through
+// the `ContextManager`. The single `#[test]` item runs N inner
+// assertions over a constant-table of (method, substring) tuples but
+// contributes 1 to the total_tests count.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 66;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -972,6 +985,97 @@ fn cross_context_bridge_wired_to_manager() {
         "invoke_outlet_streaming_cross_context must call invoke_outlet_cross_context to drive \
          the §6.2.0.5 cross-context bridge"
     );
+}
+
+// ---------------------------------------------------------------------------
+// SCP-OUT-004 AC5 — outlet lifecycle ContextManager surface
+//
+// Asserts that the eight outlet lifecycle verbs the rename target enumerated
+// — `register_outlet`, `update_outlet`, `deregister_outlet`, `verify_outlet`,
+// `list_outlets`, `get_outlet`, `open_outlet_session`, `invoke_outlet` — are
+// each `pub async fn`s on `impl ContextManager`. Without this assertion the
+// integration-checklist requirement (Rust function called from a
+// ContextManager method, not just exported) drifts: bridges previously
+// imported `scp_protocol::context::outlets::register_outlet` directly,
+// bypassing the manager. The eight shims close the gap; this test pins them
+// so a future rename or merge cannot silently regress.
+//
+// The body of each shim is also asserted to contain a call into a real
+// implementation (forwarding to a scp-protocol free function or to an
+// existing manager method) so that `let _ = function_name;` style
+// dead-reference cheats — the failure mode CLAUDE.md explicitly calls out —
+// are caught here, not at runtime.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn context_manager_exposes_outlet_lifecycle_methods() {
+    // The `MANAGER_SRC` concatenation above includes
+    // `crates/scp-runtime/src/context/manager/outlets.rs`, which is where
+    // the SCP-OUT-004 AC5 shims live. Asserting against `MANAGER_SRC`
+    // also guards against the methods being moved to a non-included file
+    // by accident — the assertion fails until the source is wired into
+    // the test concat.
+    const SHIMS: &[(&str, &[&str])] = &[
+        // Each entry: (method_name, [substrings the body must contain])
+        // The substrings prove the shim forwards to a real implementation
+        // rather than stubbing with `todo!()` or `let _ = ...;`.
+        (
+            "register_outlet",
+            &["snapshot_role_state", "registry::register_outlet"],
+        ),
+        (
+            "update_outlet",
+            &["snapshot_role_state", "registry::update_outlet"],
+        ),
+        (
+            "deregister_outlet",
+            &["snapshot_role_state", "registry.remove"],
+        ),
+        (
+            "verify_outlet",
+            &["snapshot_role_state", "registry::verify_outlet"],
+        ),
+        ("list_outlets", &["registered_outlets"]),
+        ("get_outlet", &["registered_outlets"]),
+        ("open_outlet_session", &["self.open_outlet_stream"]),
+        (
+            "invoke_outlet",
+            &["self.invoke_outlet_dispatch_with_economy_stream"],
+        ),
+    ];
+
+    for (name, must_contain) in SHIMS {
+        let body = extract_fn_body(MANAGER_SRC, name).unwrap_or_else(|| {
+            panic!(
+                "ContextManager::{name} must be defined on impl ContextManager \
+                 (SCP-OUT-004 AC5)"
+            )
+        });
+        for needle in *must_contain {
+            assert!(
+                body.contains(needle),
+                "ContextManager::{name} body must contain `{needle}` so the shim \
+                 forwards to a real implementation. Stub/dead-reference cheats \
+                 (`let _ = {name};`, `todo!()`) are forbidden by CLAUDE.md \
+                 (SCP-OUT-004 AC5)."
+            );
+        }
+    }
+
+    // Defense-in-depth: the shims must be `pub async fn`. The
+    // `extract_fn_body` helper is signature-agnostic, so a `fn` (sync) or
+    // `pub(crate) async fn` would still match — that would re-introduce
+    // the bridge-direct-call regression because FFI bridges cannot import
+    // crate-private items. Pin the surface explicitly.
+    let outlets_src = include_str!("../../../../crates/scp-runtime/src/context/manager/outlets.rs");
+    for (name, _) in SHIMS {
+        let needle = format!("pub async fn {name}");
+        assert!(
+            outlets_src.contains(&needle),
+            "ContextManager::{name} must be declared `pub async fn` so FFI \
+             bridges can call it across crate boundaries (SCP-OUT-004 AC5)"
+        );
+    }
 }
 
 // --- Content key rotation (#1548) ---

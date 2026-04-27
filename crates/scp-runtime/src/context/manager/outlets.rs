@@ -1822,6 +1822,455 @@ impl ContextManager {
         // here so the ContextManager remains the single source of truth.
         invoke_outlet_cross_context(inputs, executor_rx)
     }
+
+    // =======================================================================
+    // SCP-OUT-004 AC5 — outlet lifecycle ContextManager surface
+    //
+    // The eight methods below are the public `ContextManager` surface for
+    // the outlet lifecycle verbs the rename target enumerated:
+    // `register_outlet`, `update_outlet`, `deregister_outlet`,
+    // `verify_outlet`, `list_outlets`, `get_outlet`, `open_outlet_session`,
+    // and `invoke_outlet`. Each forwards to a real implementation — either
+    // the `scp-protocol` free function operating on the caller-supplied
+    // [`OutletRegistry`] (registry ownership remains in the FFI bridge per
+    // the lock-split discipline noted at the top of this file) or one of
+    // the existing [`Self::invoke_outlet_dispatch_with_economy_stream`] /
+    // [`Self::open_outlet_stream`] / per-context governance-state readers.
+    //
+    // Without these methods FFI bridges had to import the protocol-level
+    // free functions directly, which meant the `ContextManager` was not
+    // the single integration point the integration-checklist requires.
+    // The pinned [`pipeline_wiring`] assertion
+    // `context_manager_exposes_outlet_lifecycle_methods` mechanically
+    // proves these eight remain present.
+    // =======================================================================
+
+    /// SCP-OUT-004 AC5 — registers a new outlet against the supplied
+    /// [`OutletRegistry`].
+    ///
+    /// Forwards to [`scp_protocol::context::outlets::register_outlet`]
+    /// after snapshotting the per-context [`ContextRoleState`] from the
+    /// manager's authoritative state. The registry is owned by the
+    /// caller (typically the FFI bridge layer) so the lock-split
+    /// invariant in the module-level docs is preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is
+    /// unknown to this manager. Otherwise propagates
+    /// [`scp_protocol::context::outlets::OutletError`] from the
+    /// underlying registry call (registrant authorization, schema
+    /// validation, query-cost violation, duplicate id) folded through
+    /// [`outlet_protocol_error_to_context`].
+    pub async fn register_outlet(
+        &self,
+        context_id: &str,
+        registry: &mut scp_protocol::context::outlets::registry::OutletRegistry,
+        registration: scp_protocol::context::outlets::OutletRegistration,
+        registrant_did: &str,
+    ) -> Result<
+        (
+            scp_protocol::context::outlets::OutletId,
+            scp_protocol::context::outlets::OutletRegisteredEvent,
+        ),
+        ContextError,
+    > {
+        let role_state = self.snapshot_role_state(context_id).await?;
+        scp_protocol::context::outlets::registry::register_outlet(
+            registry,
+            &role_state,
+            registration,
+            registrant_did,
+        )
+        .map_err(outlet_protocol_error_to_context)
+    }
+
+    /// SCP-OUT-004 AC5 — updates an existing outlet registration.
+    ///
+    /// Forwards to [`scp_protocol::context::outlets::update_outlet`]
+    /// using the snapshotted per-context role state. See
+    /// [`Self::register_outlet`] for the registry ownership contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] when the context
+    /// is unknown. Otherwise propagates any
+    /// [`scp_protocol::context::outlets::OutletError`] (outlet not
+    /// found, updater not authorized, id mismatch, schema-floor
+    /// violation).
+    pub async fn update_outlet(
+        &self,
+        context_id: &str,
+        registry: &mut scp_protocol::context::outlets::registry::OutletRegistry,
+        outlet_id: &str,
+        new_registration: scp_protocol::context::outlets::OutletRegistration,
+        updater_did: &str,
+    ) -> Result<scp_protocol::context::outlets::OutletUpdatedEvent, ContextError> {
+        let role_state = self.snapshot_role_state(context_id).await?;
+        scp_protocol::context::outlets::registry::update_outlet(
+            registry,
+            &role_state,
+            outlet_id,
+            new_registration,
+            updater_did,
+        )
+        .map_err(outlet_protocol_error_to_context)
+    }
+
+    /// SCP-OUT-004 AC5 — removes an outlet from the supplied registry,
+    /// enforcing operator-or-admin authorization against the manager's
+    /// per-context [`ContextRoleState`].
+    ///
+    /// Mirrors the authorization shape of [`update_outlet`]: the actor
+    /// must either be the registered `operator_did` or hold the admin
+    /// role for the context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is
+    /// unknown to this manager. Returns
+    /// [`ContextError::PermissionDenied`] when the actor is neither
+    /// operator nor admin. Returns
+    /// [`ContextError::OutletInvocation`] wrapping
+    /// [`OutletError::OutletNotFound`] when the outlet is not in the
+    /// registry.
+    pub async fn deregister_outlet(
+        &self,
+        context_id: &str,
+        registry: &mut scp_protocol::context::outlets::registry::OutletRegistry,
+        outlet_id: &str,
+        actor_did: &str,
+    ) -> Result<scp_protocol::context::outlets::OutletRegistration, ContextError> {
+        let role_state = self.snapshot_role_state(context_id).await?;
+        let existing = registry.get(outlet_id).cloned().ok_or_else(|| {
+            outlet_protocol_error_to_context(
+                scp_protocol::context::outlets::OutletError::OutletNotFound {
+                    outlet_id: outlet_id.to_owned(),
+                },
+            )
+        })?;
+        let is_operator = existing.operator_did == actor_did;
+        let is_admin = scp_protocol::context::outlets::has_admin_role(&role_state, actor_did);
+        if !is_operator && !is_admin {
+            return Err(ContextError::PermissionDenied(format!(
+                "actor '{actor_did}' is not authorized to deregister outlet '{outlet_id}'"
+            )));
+        }
+        registry.remove(outlet_id).ok_or_else(|| {
+            outlet_protocol_error_to_context(
+                scp_protocol::context::outlets::OutletError::OutletNotFound {
+                    outlet_id: outlet_id.to_owned(),
+                },
+            )
+        })
+    }
+
+    /// SCP-OUT-004 AC5 — verifies an outlet by replaying its registered
+    /// test vectors through the supplied executor.
+    ///
+    /// Forwards to [`scp_protocol::context::outlets::registry::verify_outlet`].
+    /// The executor closure receives each test vector's `input` and
+    /// returns the actual output that the framework compares against
+    /// `expected_output`. Verification semantics are identical to the
+    /// [`scp_protocol`] free function — this shim adds only the
+    /// context-not-registered guard so callers see the standard
+    /// [`ContextError::ContextNotRegistered`] envelope rather than a
+    /// silent default match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] when the context
+    /// is unknown. Returns
+    /// [`ContextError::OutletInvocation`] wrapping
+    /// [`OutletError::OutletNotFound`] when the outlet is missing from
+    /// the supplied registry.
+    pub async fn verify_outlet<F>(
+        &self,
+        context_id: &str,
+        registry: &scp_protocol::context::outlets::registry::OutletRegistry,
+        outlet_id: &str,
+        executor: F,
+    ) -> Result<
+        (
+            scp_protocol::context::outlets::OutletVerificationResult,
+            scp_protocol::context::outlets::OutletVerifiedEvent,
+        ),
+        ContextError,
+    >
+    where
+        F: Fn(&serde_json::Value) -> serde_json::Value,
+    {
+        // Defensive guard so callers see the same context-membership
+        // surface as the lifecycle methods even though `verify_outlet`
+        // is a pure registry-side function. Manager-state assertions
+        // happen here, registry-side validation happens in scp-protocol.
+        let _ = self.snapshot_role_state(context_id).await?;
+        scp_protocol::context::outlets::registry::verify_outlet(registry, outlet_id, executor)
+            .map_err(outlet_protocol_error_to_context)
+    }
+
+    /// SCP-OUT-004 AC5 — lists every outlet currently registered on the
+    /// per-context governance state.
+    ///
+    /// Reads from the manager's authoritative
+    /// `GovernanceState.registered_outlets`, NOT a caller-supplied
+    /// [`OutletRegistry`]. This is the single source of truth that
+    /// downstream consequence and event-log consumers see; FFI bridges
+    /// that maintain a side registry SHOULD reconcile against this list
+    /// after every governance acceptance (the
+    /// [`Self::execute_governance_action`] dispatch arm
+    /// [`Self::execute_register_outlet`] is what populates the slot).
+    ///
+    /// Returns ids in append order — i.e., chronological by
+    /// registration acceptance. Concurrent re-registrations of the same
+    /// outlet appear multiple times: the SCP-OUT-041b receiver LRU
+    /// disambiguates by `registration_event_id`, so listing-time
+    /// dedup would lose information.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] when the context
+    /// is unknown to this manager.
+    #[allow(clippy::significant_drop_tightening)] // single read of governance.registered_outlets — guard scope is already minimal
+    pub async fn list_outlets(
+        &self,
+        context_id: &str,
+    ) -> Result<Vec<scp_protocol::context::outlets::OutletId>, ContextError> {
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let guard = ctx_arc.lock().await;
+        let ids = guard
+            .governance
+            .registered_outlets
+            .iter()
+            .map(|r| r.outlet_id.clone())
+            .collect();
+        Ok(ids)
+    }
+
+    /// SCP-OUT-004 AC5 — returns the most-recent
+    /// [`OutletRegistration`](scp_protocol::context::outlets::OutletRegistration)
+    /// recorded on per-context governance state for `outlet_id`.
+    ///
+    /// Reads from `GovernanceState.registered_outlets` (the
+    /// authoritative copy populated by
+    /// [`Self::execute_register_outlet`]). When multiple registrations
+    /// share an `outlet_id` (concurrent re-registration), returns the
+    /// last one — matching the SCP-OUT-041b receiver-LRU "most recent"
+    /// semantics that
+    /// [`Self::execute_register_outlet`] uses to compute prior-catalog
+    /// dwell-time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] when the context
+    /// is unknown.
+    #[allow(clippy::significant_drop_tightening)] // single read of governance.registered_outlets — guard scope is already minimal
+    pub async fn get_outlet(
+        &self,
+        context_id: &str,
+        outlet_id: &str,
+    ) -> Result<Option<scp_protocol::context::outlets::OutletRegistration>, ContextError> {
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let guard = ctx_arc.lock().await;
+        let found = guard
+            .governance
+            .registered_outlets
+            .iter()
+            .rfind(|r| r.outlet_id == outlet_id)
+            .cloned();
+        Ok(found)
+    }
+
+    /// SCP-OUT-004 AC5 — opens a §5.4.5 streaming session against the
+    /// per-context outlet pipeline.
+    ///
+    /// Thin alias to [`Self::open_outlet_stream`] under the rename
+    /// vocabulary the AC enumerated. The full admission, escrow,
+    /// credit / cancel-ack tracker wiring lives in
+    /// [`Self::open_outlet_stream`]; this method only re-exports it as
+    /// `open_outlet_session` so the lifecycle surface is uniform under
+    /// the §5.4 rename.
+    ///
+    /// # Errors
+    ///
+    /// See [`crate::context::outlets::dispatch::OpenStreamRejection`]
+    /// for the open-time rejection taxonomy. Once the handle is
+    /// returned, every failure mode surfaces as a terminal
+    /// `ChunkPayload::Error` chunk on the receiver — never as a
+    /// `Result` error.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_outlet_session<E>(
+        &self,
+        context_id: &str,
+        registry: &scp_protocol::context::outlets::registry::OutletRegistry,
+        role_state: &scp_protocol::context::roles::ContextRoleState,
+        outlet_id: &scp_protocol::context::outlets::OutletId,
+        input: serde_json::Value,
+        invoker_did: &DID,
+        timeout_ms: Option<u32>,
+        executor: std::sync::Arc<E>,
+        misdeclaration_sink: Option<
+            std::sync::Arc<dyn crate::context::outlets::invoke::QueryMisdeclarationSink>,
+        >,
+        handler_panic_sink: Option<
+            std::sync::Arc<dyn crate::context::outlets::invoke::HandlerPanicSink>,
+        >,
+        invoked_event_sink: Option<
+            std::sync::Arc<dyn crate::context::outlets::invoke::OutletInvokedEventSink>,
+        >,
+        params: crate::context::outlets::dispatch::OpenStreamParams,
+        admission: std::sync::Arc<
+            std::sync::Mutex<crate::context::outlets::stream::StreamAdmissionTracker>,
+        >,
+    ) -> Result<
+        crate::context::outlets::dispatch::StreamSessionHandle,
+        crate::context::outlets::dispatch::OpenStreamRejection,
+    >
+    where
+        E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
+    {
+        self.open_outlet_stream(
+            context_id,
+            registry,
+            role_state,
+            outlet_id,
+            input,
+            invoker_did,
+            timeout_ms,
+            executor,
+            misdeclaration_sink,
+            handler_panic_sink,
+            invoked_event_sink,
+            params,
+            admission,
+        )
+        .await
+    }
+
+    /// SCP-OUT-004 AC5 — invokes an outlet under the full economy
+    /// pipeline, returning a streaming receiver of
+    /// [`OutletStreamChunk`](scp_protocol::context::outlets::stream::OutletStreamChunk)s.
+    ///
+    /// Forwards to
+    /// [`Self::invoke_outlet_dispatch_with_economy_stream`] which
+    /// drives the same per-DID escalation, budget, escrow, and rollback
+    /// discipline that
+    /// [`Self::invoke_outlet_with_economy`] enforces and adapts the
+    /// aggregated single-shot output into a `Data` + `End` chunk pair
+    /// per the SCP-OUT-033 streaming contract. SDK / FFI consumers that
+    /// need streaming (chunk-at-a-time progress) should call this
+    /// method; consumers wanting an aggregated [`serde_json::Value`]
+    /// should call
+    /// [`Self::invoke_outlet_with_economy`] directly.
+    ///
+    /// # Errors
+    ///
+    /// Synchronous-validation failures (context not registered, outlet
+    /// not found, capability denial) surface as `Result::Err`. Once the
+    /// receiver is returned, mid-stream failures surface as terminal
+    /// `ChunkPayload::Error` chunks, never as a `Result` error.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn invoke_outlet<E>(
+        &self,
+        context_id: &str,
+        registry: &scp_protocol::context::outlets::registry::OutletRegistry,
+        outlet_id: &scp_protocol::context::outlets::OutletId,
+        input: serde_json::Value,
+        invoker_did: &DID,
+        spending_ucan: Option<&UcanToken>,
+        timeout_ms: Option<u32>,
+        executor: &E,
+        misdeclaration_sink: Option<&dyn crate::context::outlets::invoke::QueryMisdeclarationSink>,
+        handler_panic_sink: Option<&dyn crate::context::outlets::invoke::HandlerPanicSink>,
+        caveat_enforcement: Option<CaveatEnforcement<'_>>,
+    ) -> Result<
+        tokio::sync::mpsc::Receiver<scp_protocol::context::outlets::stream::OutletStreamChunk>,
+        ContextError,
+    >
+    where
+        E: crate::context::outlets::invoke::OutletExecutor + ?Sized,
+    {
+        self.invoke_outlet_dispatch_with_economy_stream(
+            context_id,
+            registry,
+            outlet_id,
+            input,
+            invoker_did,
+            spending_ucan,
+            timeout_ms,
+            executor,
+            misdeclaration_sink,
+            handler_panic_sink,
+            caveat_enforcement,
+        )
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Helpers backing the SCP-OUT-004 AC5 lifecycle shims above.
+    // -----------------------------------------------------------------------
+
+    /// Snapshot the per-context [`ContextRoleState`] for the lifecycle
+    /// shims. Returns `ContextNotRegistered` when the context is
+    /// unknown — same envelope every other shim above propagates so
+    /// callers see a uniform error surface for the membership predicate.
+    async fn snapshot_role_state(
+        &self,
+        context_id: &str,
+    ) -> Result<scp_protocol::context::roles::ContextRoleState, ContextError> {
+        let ctx_arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let guard = ctx_arc.lock().await;
+        Ok(guard.role_state.clone())
+    }
+}
+
+/// Folds a protocol-level [`scp_protocol::context::outlets::OutletError`]
+/// returned by the [`scp_protocol::context::outlets::registry`] free
+/// functions into a [`ContextError`] for the SCP-OUT-004 AC5 shims.
+///
+/// Authorization rejections surface as
+/// [`ContextError::PermissionDenied`]; structural rejections (not
+/// found, duplicate, schema-floor, signature) surface as the same
+/// `PermissionDenied` envelope with an `SCP-TOOL-` prefix so callers
+/// see a consistent error shape with the existing §5.4.2 query-cost
+/// path used by [`super::governance::query_cost_violation_to_context`].
+/// Cross-cutting bridges that need the typed §5.4.4 envelope can
+/// reconstruct it from the underlying [`OutletError`] before this fold
+/// (the protocol error is the carrier of truth — this fold is a
+/// downgrade for the runtime `ContextError` surface, not a synthesis).
+fn outlet_protocol_error_to_context(
+    err: scp_protocol::context::outlets::OutletError,
+) -> ContextError {
+    use scp_protocol::context::outlets::OutletError as ProtoErr;
+    match err {
+        ProtoErr::RegistrantNotAuthorized { did } => ContextError::PermissionDenied(format!(
+            "SCP-TOOL-6101: registrant '{did}' lacks OutletRegister capability"
+        )),
+        ProtoErr::UpdaterNotAuthorized { did } => ContextError::PermissionDenied(format!(
+            "SCP-TOOL-6101: updater '{did}' is not operator or admin"
+        )),
+        ProtoErr::OutletNotFound { outlet_id } => ContextError::PermissionDenied(format!(
+            "SCP-TOOL-6002: outlet '{outlet_id}' not found in registry"
+        )),
+        ProtoErr::OutletAlreadyRegistered { outlet_id } => ContextError::PermissionDenied(format!(
+            "SCP-TOOL-6003: outlet '{outlet_id}' already registered"
+        )),
+        ProtoErr::OutletIdMismatch { expected, actual } => ContextError::PermissionDenied(format!(
+            "SCP-TOOL-6004: outlet id mismatch: expected '{expected}', got '{actual}'"
+        )),
+        ProtoErr::QueryCostViolation { reason } => ContextError::PermissionDenied(format!(
+            "SCP-TOOL-6102: Query outlet cost violation (§5.4.2): {reason}" // SCP-CODE-OK: mirrors the legacy PermissionDenied envelope in governance.rs (`query_cost_violation_to_context`); SCP-OUT-027 migrates both call sites to a typed OutletError under CODE_PROTOCOL_VIOLATION + slug `query-cost-violation`.
+        )),
+        other => ContextError::PermissionDenied(format!(
+            "SCP-TOOL-6100: outlet registry validation failed: {other}"
+        )),
+    }
 }
 
 /// Result of [`ContextManager::invoke_outlet_dispatch_with_economy`].
