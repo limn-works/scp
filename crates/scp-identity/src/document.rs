@@ -38,25 +38,29 @@ use super::IdentityError;
 use super::attestation::{IdentityLinkServiceEntry, ScpKeyCustodyAttestation};
 use serde::{Deserialize, Serialize};
 
-/// Custom serde module for hex-encoded `[u8; 64]` fields.
+/// Custom serde helpers for hex-encoded fixed-size byte arrays.
 ///
-/// Wire format is a lowercase hex string (128 chars). Hex is the
-/// project-wide convention for cryptographic byte material (signatures,
-/// public keys, hashes); it is ~50% smaller on the wire than the
-/// `serde_bytes` JSON-array form, human-readable in logs, trivially
-/// copy-pasteable, and decodes in one call. Deserialization validates
-/// the exact byte count.
-mod serde_signature_64 {
-    use serde::{self, Deserialize, Deserializer, Serializer};
+/// Wire format is a lowercase hex string. Hex is the project-wide
+/// convention for cryptographic byte material (signatures, public keys,
+/// hashes): ~50% smaller on the wire than the `serde_bytes` JSON-array
+/// form, human-readable in logs, trivially copy-pasteable, and decodes
+/// in one call. Deserialization validates the exact byte count.
+///
+/// `serde`'s `with = "..."` attribute resolves a *module path* and
+/// cannot pass type parameters, so the const-generic core lives here
+/// and thin per-size submodules (`array64`, `array32`) instantiate it.
+/// Apply via `#[serde(with = "serde_hex_array::array64")]` etc.
+mod serde_hex_array {
+    use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize_impl<const N: usize, S>(bytes: &[u8; N], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
         serializer.serialize_str(&hex::encode(bytes))
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    fn deserialize_impl<'de, const N: usize, D>(deserializer: D) -> Result<[u8; N], D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -64,34 +68,32 @@ mod serde_signature_64 {
         let v =
             hex::decode(&s).map_err(|e| serde::de::Error::custom(format!("invalid hex: {e}")))?;
         v.try_into().map_err(|v: Vec<u8>| {
-            serde::de::Error::custom(format!("expected 64-byte signature, got {} bytes", v.len()))
+            serde::de::Error::custom(format!("expected {N}-byte field, got {} bytes", v.len()))
         })
     }
-}
 
-/// Custom serde module for hex-encoded `[u8; 32]` fields (public keys
-/// and SHA-256 commitments). Wire format is a lowercase hex string
-/// (64 chars). Same rationale as [`serde_signature_64`].
-mod serde_bytes_32 {
-    use serde::{self, Deserialize, Deserializer, Serializer};
+    pub mod array64 {
+        use super::{deserialize_impl, serialize_impl};
+        use serde::{Deserializer, Serializer};
 
-    pub fn serialize<S>(bytes: &[u8; 32], serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(&hex::encode(bytes))
+        pub fn serialize<S: Serializer>(bytes: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+            serialize_impl::<64, S>(bytes, s)
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+            deserialize_impl::<64, D>(d)
+        }
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 32], D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let s = String::deserialize(deserializer)?;
-        let v =
-            hex::decode(&s).map_err(|e| serde::de::Error::custom(format!("invalid hex: {e}")))?;
-        v.try_into().map_err(|v: Vec<u8>| {
-            serde::de::Error::custom(format!("expected 32-byte field, got {} bytes", v.len()))
-        })
+    pub mod array32 {
+        use super::{deserialize_impl, serialize_impl};
+        use serde::{Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+            serialize_impl::<32, S>(bytes, s)
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+            deserialize_impl::<32, D>(d)
+        }
     }
 }
 
@@ -1119,11 +1121,11 @@ pub struct MigrationProof {
     /// Ed25519 signature of `SHA-256("SCP-MIGRATION-V1:" || old_did
     /// || new_did || rotated_at)` signed by the old Identity Key. Must be
     /// exactly 64 bytes (Ed25519). Wire format: lowercase hex string.
-    #[serde(with = "serde_signature_64")]
+    #[serde(with = "serde_hex_array::array64")]
     pub signature: [u8; 64],
     /// The old Identity Key's public bytes, for verification without resolving
     /// the old DID document. Wire format: lowercase hex string.
-    #[serde(with = "serde_bytes_32")]
+    #[serde(with = "serde_hex_array::array32")]
     pub old_public_key: [u8; 32],
 }
 
@@ -1139,11 +1141,11 @@ pub struct PreRotationProof {
     /// The commitment published in the old DID document's
     /// `PreRotationCommitment` service (`sha256:<hex>`). Wire format:
     /// lowercase hex string.
-    #[serde(with = "serde_bytes_32")]
+    #[serde(with = "serde_hex_array::array32")]
     pub commitment: [u8; 32],
     /// The new Identity Key public bytes. `SHA-256(this)` must equal
     /// `commitment`. Wire format: lowercase hex string.
-    #[serde(with = "serde_bytes_32")]
+    #[serde(with = "serde_hex_array::array32")]
     pub revealed_key: [u8; 32],
 }
 

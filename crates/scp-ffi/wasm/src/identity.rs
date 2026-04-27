@@ -2106,16 +2106,13 @@ fn install_migrated_identity(
     record: IdentityRecord,
 ) -> Result<(), ScpWasmError> {
     // Phase 1: pre-flight all capacity checks against the post-mutation
-    // shape. After mutation: identity registry holds N + (new_did
-    // present pre-migration ? 0 : 1) entries (we keep the old DID as a
-    // `Resolved` stub); migration_links holds M + (old_did already
-    // present? 0 : 1) entries.
+    // shape. The OLD DID is preserved (demoted from `Local` to
+    // `Resolved`), so the only registry-size delta is +1 if `new_did`
+    // is not already present. `migration_links` adds +1 iff `old_did`
+    // is not already keyed there.
     IDENTITY_REGISTRY.with(|reg| -> Result<(), ScpWasmError> {
         let map = reg.borrow();
-        let new_present = map.contains_key(new_did);
-        let post_len = map.len() - usize::from(map.contains_key(old_did))
-            + usize::from(map.contains_key(old_did))
-            + usize::from(!new_present);
+        let post_len = map.len() + usize::from(!map.contains_key(new_did));
         if post_len > WASM_IDENTITY_REGISTRY_CAP {
             return Err(ScpWasmError::Validation {
                 message: format!(
