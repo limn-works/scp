@@ -346,20 +346,24 @@ impl ContextActor {
 
                 // --- Arm 2: TTL timer ------------------------------
                 () = async {
-                    if let Some(timer) = self.ttl_timer.as_mut() {
-                        timer.tick().await;
+                    match self.ttl_timer.as_mut() {
+                        Some(timer) => {
+                            let _ = timer.tick().await;
+                        }
+                        None => std::future::pending::<()>().await,
                     }
                 }, if self.ttl_timer.is_some() => {
-                    Self::on_ttl_tick();
+                    self.on_ttl_tick().await;
                 }
 
                 // --- Arm 3: governance timeout ---------------------
                 () = async {
-                    if let Some(pinned) = self.governance_timeout.as_mut() {
-                        pinned.as_mut().await;
+                    match self.governance_timeout.as_mut() {
+                        Some(pinned) => pinned.as_mut().await,
+                        None => std::future::pending::<()>().await,
                     }
                 }, if self.governance_timeout.is_some() => {
-                    Self::on_governance_timeout();
+                    self.on_governance_timeout().await;
                     self.governance_timeout = None;
                 }
 
@@ -369,7 +373,7 @@ impl ContextActor {
                         self.last_persisted_at + COALESCE_INTERVAL
                     )
                 ), if self.dirty => {
-                    Self::persist_snapshot();
+                    self.persist_snapshot().await;
                     self.last_persisted_at = Instant::now();
                     self.dirty = false;
                 }
@@ -378,7 +382,7 @@ impl ContextActor {
         // Final drain: write any pending state before the actor exits
         // so callers observing the shutdown ack can rely on durability.
         if self.dirty {
-            Self::persist_snapshot();
+            self.persist_snapshot().await;
         }
     }
 
@@ -403,23 +407,20 @@ impl ContextActor {
         }
 
         // Take the state/deps/supervisor out so we can pass them as
-        // exclusive borrows without re-borrow conflicts. We restore
-        // them at the end of the function. Each branch restores any
-        // value it has taken before falling back to skeleton dispatch.
-        let Some(mut state) = self.state.take() else {
-            Self::skeleton_dispatch(cmd);
-            return;
-        };
-        let Some(deps) = self.deps.take() else {
-            self.state = Some(state);
-            Self::skeleton_dispatch(cmd);
-            return;
-        };
-        let Some(supervisor) = self.shim_supervisor.clone() else {
-            self.state = Some(state);
-            self.deps = Some(deps);
-            Self::skeleton_dispatch(cmd);
-            return;
+        // exclusive borrows without re-borrow conflicts. The pre-check
+        // above partitions skeleton actors from state-bearing actors;
+        // any missing field after that point is an internal invariant
+        // violation and should fail loudly, not degrade to skeleton
+        // dispatch.
+        let (mut state, deps, supervisor) = {
+            #[allow(clippy::expect_used)]
+            (
+                self.state.take().expect("state-bearing actor lost state"),
+                self.deps.take().expect("state-bearing actor lost deps"),
+                self.shim_supervisor
+                    .clone()
+                    .expect("state-bearing actor lost supervisor shim"),
+            )
         };
 
         let outcome = Self::dispatch_state(&mut state, &deps, &supervisor, cmd).await;
@@ -487,7 +488,7 @@ impl ContextActor {
                 // back to `dispatch_from_shim` when a standing command
                 // has no target context actor during the migration
                 // window.
-                Box::pin(handlers::standing::dispatch(state, deps, sub)).await
+                Box::pin(handlers::standing::dispatch(deps, sub)).await
             }
             ContextCommand::TtlClose(sub) => {
                 handlers::ttl_close::dispatch_from_shim(supervisor, sub).await
@@ -525,7 +526,8 @@ impl ContextActor {
     ///
     /// `_state`/`_deps` allow: future migrations read them; for now the
     /// method is a no-op.
-    const fn on_ttl_tick() {
+    #[allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
+    async fn on_ttl_tick(&mut self) {
         // No-op until the TTL handler migrates to the actor's owned
         // state in a follow-on Phase 2 sub-chunk.
     }
@@ -533,7 +535,8 @@ impl ContextActor {
     /// Drive the governance-timeout arm. Same migration shape as
     /// `on_ttl_tick`: the legacy supervisor still drives governance
     /// timeouts; the arm here is a no-op until the migration lands.
-    const fn on_governance_timeout() {
+    #[allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
+    async fn on_governance_timeout(&mut self) {
         // No-op until the governance timeout handler migrates to the
         // actor's owned state in a follow-on Phase 2 sub-chunk.
     }
@@ -541,7 +544,8 @@ impl ContextActor {
     /// Persistence coalesce: write the current state's snapshot.
     /// Phase 2A delegates to the supervisor's persistence backend if
     /// the actor owns deps; skeleton-mode is a no-op.
-    const fn persist_snapshot() {
+    #[allow(clippy::unused_async, clippy::needless_pass_by_ref_mut)]
+    async fn persist_snapshot(&mut self) {
         // The state-owning persist path is wired in a follow-on Phase 2
         // sub-chunk together with the snapshot-shape contract on
         // `PerContextState`. For Phase 2A the run loop's coalesce arm

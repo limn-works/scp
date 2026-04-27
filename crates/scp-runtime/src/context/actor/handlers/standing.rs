@@ -5,8 +5,8 @@
 //! # Phase 2A.2 — actor-shape dispatch
 //!
 //! The handler's primary entry point [`dispatch`] takes
-//! `(&mut PerContextState, &ActorDeps, StandingCommand)` and routes
-//! variants to migrated actor-shape helpers in
+//! `(&ActorDeps, StandingCommand)` and routes variants to migrated
+//! actor-shape helpers in
 //! [`crate::context::standing_helpers`]. The shim entry point is
 //! retained during Phase 2A and routes through
 //! [`crate::context::standing_helpers_legacy`].
@@ -40,7 +40,6 @@ use tokio::sync::oneshot;
 use crate::context::actor::commands::StandingCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::actor::state::PerContextState;
 use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for standing handlers. Plan §"Transport
@@ -49,12 +48,8 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Dispatch a [`StandingCommand`] against actor-owned state and
 /// capability-reduced dependencies.
-pub async fn dispatch(
-    state: &mut PerContextState,
-    deps: &ActorDeps,
-    cmd: StandingCommand,
-) -> Outcome<()> {
-    Box::pin(dispatch_inner(state, deps, cmd)).await
+pub async fn dispatch(deps: &ActorDeps, cmd: StandingCommand) -> Outcome<()> {
+    Box::pin(dispatch_inner(deps, cmd)).await
 }
 
 /// Shim-callable dispatch. Used by
@@ -69,29 +64,25 @@ pub(crate) async fn dispatch_from_shim(
     Box::pin(dispatch_from_shim_inner(supervisor, cmd)).await
 }
 
-async fn dispatch_inner(
-    state: &mut PerContextState,
-    deps: &ActorDeps,
-    cmd: StandingCommand,
-) -> Outcome<()> {
+async fn dispatch_inner(deps: &ActorDeps, cmd: StandingCommand) -> Outcome<()> {
     match cmd {
         StandingCommand::Placeholder { reply } => reply_not_implemented(reply),
         StandingCommand::StandingContext {
             local_did,
             peer_did,
             reply,
-        } => handle_standing_context(state, deps, local_did, peer_did, reply).await,
+        } => handle_standing_context(deps, local_did, peer_did, reply).await,
         StandingCommand::StandingContextCount { reply } => {
-            handle_standing_context_count(state, deps, reply).await
+            handle_standing_context_count(deps, reply).await
         }
         StandingCommand::HasStandingContext { peer_did, reply } => {
-            handle_has_standing_context(state, deps, peer_did, reply).await
+            handle_has_standing_context(deps, peer_did, reply).await
         }
         StandingCommand::RegisterStandingContext { peer_did, reply } => {
-            handle_register_standing_context(state, deps, peer_did, reply).await
+            handle_register_standing_context(deps, peer_did, reply).await
         }
         StandingCommand::ReconnectAllStanding { reply } => {
-            handle_reconnect_all_standing(state, deps, reply).await
+            handle_reconnect_all_standing(deps, reply).await
         }
         StandingCommand::InitiateStandingPairCreate { reply, .. } => reply_saga_deferred(reply),
     }
@@ -125,14 +116,13 @@ async fn dispatch_from_shim_inner(supervisor: &Supervisor, cmd: StandingCommand)
 /// [`ContextManager::standing_context`](crate::context::standing_helpers::standing_context)
 /// under a 30s timeout.
 async fn handle_standing_context(
-    state: &mut PerContextState,
     deps: &ActorDeps,
     local_did: scp_identity::DID,
     peer_did: scp_identity::DID,
     reply: oneshot::Sender<Result<String, ContextError>>,
 ) -> Outcome<()> {
     let standing_fut = async {
-        crate::context::standing_helpers::standing_context(state, deps, &local_did, &peer_did).await
+        crate::context::standing_helpers::standing_context(deps, &local_did, &peer_did).await
     };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, standing_fut).await {
@@ -156,11 +146,10 @@ async fn handle_standing_context(
 
 /// Handle [`StandingCommand::StandingContextCount`] — read-only.
 async fn handle_standing_context_count(
-    state: &mut PerContextState,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<usize, ContextError>>,
 ) -> Outcome<()> {
-    let count_fut = async { crate::context::standing_helpers::standing_context_count(state, deps) };
+    let count_fut = async { crate::context::standing_helpers::standing_context_count(deps) };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, count_fut).await {
         Ok(count) => (Outcome::ok(()), Ok(count)),
@@ -179,13 +168,11 @@ async fn handle_standing_context_count(
 
 /// Handle [`StandingCommand::HasStandingContext`] — read-only.
 async fn handle_has_standing_context(
-    state: &mut PerContextState,
     deps: &ActorDeps,
     peer_did: scp_identity::DID,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let has_fut =
-        async { crate::context::standing_helpers::has_standing_context(state, deps, &peer_did) };
+    let has_fut = async { crate::context::standing_helpers::has_standing_context(deps, &peer_did) };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, has_fut).await {
         Ok(has) => (Outcome::ok(()), Ok(has)),
@@ -206,14 +193,12 @@ async fn handle_has_standing_context(
 /// [`ContextManager::register_standing_context`](crate::context::standing_helpers::register_standing_context)
 /// under a 30s timeout. Always mutating.
 async fn handle_register_standing_context(
-    state: &mut PerContextState,
     deps: &ActorDeps,
     peer_did: scp_identity::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let register_fut = async {
-        crate::context::standing_helpers::register_standing_context(state, deps, peer_did).await
-    };
+    let register_fut =
+        async { crate::context::standing_helpers::register_standing_context(deps, peer_did).await };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, register_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
@@ -238,11 +223,10 @@ async fn handle_register_standing_context(
 /// [`ContextManager::reconnect_all_standing`](crate::context::standing_helpers::reconnect_all_standing)
 /// under a 30s timeout. Always mutating.
 async fn handle_reconnect_all_standing(
-    state: &mut PerContextState,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<usize, ContextError>>,
 ) -> Outcome<()> {
-    let reconnect_fut = crate::context::standing_helpers::reconnect_all_standing(state, deps);
+    let reconnect_fut = crate::context::standing_helpers::reconnect_all_standing(deps);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reconnect_fut).await {
         Ok(Ok(count)) => (Outcome::ok_mutated(()), Ok(count)),

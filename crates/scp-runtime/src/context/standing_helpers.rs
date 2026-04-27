@@ -12,9 +12,9 @@
 //! The standing domain is supervisor-scoped: the standing index lives on
 //! the supervisor, and standing-pair creation still delegates to the
 //! legacy `create_context` flow until Phase 2C decomposes it into a
-//! saga. These helpers therefore take the actor-shape
-//! `(state: &mut PerContextState, deps: &ActorDeps, ...)` but route
-//! supervisor-scoped work through the capability-reduced
+//! saga. These helpers therefore take [`ActorDeps`] without
+//! `PerContextState`: they do not read or mutate per-context state and
+//! route supervisor-scoped work through the capability-reduced
 //! [`SupervisorHandle`](crate::context::supervisor::SupervisorHandle)
 //! embedded in `deps`.
 //!
@@ -23,14 +23,11 @@
 //! fallback. Phase 2A finalization removes that module after every
 //! domain routes through actor-owned state.
 
-#![allow(clippy::needless_pass_by_ref_mut)]
-
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
 use sha2::{Digest, Sha256};
 
 use crate::context::actor::deps::ActorDeps;
-use crate::context::actor::state::PerContextState;
 
 // ---------------------------------------------------------------------------
 // generate_standing_context_id (pure helper)
@@ -71,7 +68,6 @@ pub fn generate_standing_context_id(local_did: &DID, peer_did: &DID) -> String {
 ///
 /// Returns [`ContextError`] if context creation fails.
 pub async fn standing_context(
-    _state: &mut PerContextState,
     deps: &ActorDeps,
     local_did: &DID,
     peer_did: &DID,
@@ -84,7 +80,7 @@ pub async fn standing_context(
 // ---------------------------------------------------------------------------
 
 /// Returns the number of tracked standing contexts.
-pub fn standing_context_count(_state: &mut PerContextState, deps: &ActorDeps) -> usize {
+pub fn standing_context_count(deps: &ActorDeps) -> usize {
     deps.supervisor.standing_context_count()
 }
 
@@ -93,11 +89,7 @@ pub fn standing_context_count(_state: &mut PerContextState, deps: &ActorDeps) ->
 // ---------------------------------------------------------------------------
 
 /// Returns `true` if a standing context exists for the given peer DID.
-pub fn has_standing_context(
-    _state: &mut PerContextState,
-    deps: &ActorDeps,
-    peer_did: &DID,
-) -> bool {
+pub fn has_standing_context(deps: &ActorDeps, peer_did: &DID) -> bool {
     deps.supervisor.has_standing_context(peer_did)
 }
 
@@ -107,7 +99,6 @@ pub fn has_standing_context(
 
 /// Registers an existing context as a standing context.
 pub async fn register_standing_context(
-    _state: &mut PerContextState,
     deps: &ActorDeps,
     peer_did: DID,
 ) -> Result<(), ContextError> {
@@ -124,9 +115,6 @@ pub async fn register_standing_context(
 /// # Errors
 ///
 /// Returns [`ContextError::TransportFailed`] if any reconnection fails.
-pub async fn reconnect_all_standing(
-    _state: &mut PerContextState,
-    deps: &ActorDeps,
-) -> Result<usize, ContextError> {
+pub async fn reconnect_all_standing(deps: &ActorDeps) -> Result<usize, ContextError> {
     deps.supervisor.reconnect_all_standing().await
 }
