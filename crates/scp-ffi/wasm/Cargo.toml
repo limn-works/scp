@@ -77,6 +77,13 @@ unicode-normalization = { workspace = true }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"
+# Host-only dev-dependency: cross-bridge JSON parity tests deserialize
+# WASM-emitted rotation events via the canonical native types. Behind
+# `cfg(not(target_arch = "wasm32"))` because scp-identity pulls tokio
+# multi-thread, which doesn't compile to wasm32 (ADR-034). Only loaded
+# when running `cargo test` on the host.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+scp-identity = { path = "../../scp-identity", version = "=0.1.0-beta.1" }
 
 [profile.release]
 opt-level = "s"

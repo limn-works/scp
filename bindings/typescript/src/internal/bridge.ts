@@ -629,6 +629,16 @@ export interface Bridge {
 export interface BridgeIdentityHandle {
   readonly did: string;
   readonly custodyType: string;
+  /**
+   * JSON-serialized `scp_identity::DidRotationEvent`, present only on
+   * handles produced by `identityMigrate` (spec §3.7, ADR-003 §4b/4c).
+   * SDK callers MUST distribute this event to active context members
+   * per spec §3.2.1 step 4b. `undefined` for any handle minted by
+   * other operations (`identityCreate`, `identityRotateKey`, agent-key
+   * ops, external load) — those do not change the DID, so no
+   * `DidRotationEvent` is constructed.
+   */
+  readonly rotationEventJson?: string;
 }
 
 /** Opaque handle to a context in the bridge layer. */

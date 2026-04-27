@@ -205,6 +205,19 @@ enum IdentityRecord {
         ///
         /// Wrapped in `Zeroizing` (same rationale as
         /// `signing_key_bytes`).
+        ///
+        /// **Security note (ADR-022/ADR-034):** The pre-rotation private
+        /// key co-resides with `#0` in this `Local` record for the
+        /// identity's lifetime. WASM linear memory is readable by
+        /// same-origin JS, so a same-origin compromise that exfiltrates
+        /// `#0` would also exfiltrate this key, allowing the attacker
+        /// to predict (and forge a `PreRotationProof` for) the next
+        /// `#0`. Native bridges store the pre-rotation key in
+        /// `KeyCustody` (Keychain / Keystore / file), which decouples
+        /// the two keys' compromise windows. Closing this gap on WASM
+        /// requires WebAuthn-PRF or passkey-wrapped key material — a
+        /// separate workstream beyond ADR-022's current `JsKeyCustody`
+        /// scope.
         pre_rotation_signing_key_bytes: zeroize::Zeroizing<[u8; 32]>,
         /// Ed25519 public key bytes (32 bytes) — the `#0` VM's public
         /// key, i.e. the DID-deriving identity key's public half.
@@ -356,7 +369,21 @@ fn check_registry_capacity<K: std::hash::Hash + Eq, V>(
 }
 
 /// Maximum number of migration links stored in the WASM-local registry.
-const WASM_MIGRATION_LINKS_CAP: usize = 10_000;
+///
+/// The bound is per-bridge (per-tab) — a same-realm attacker who could
+/// fill the registry already has full bridge access under the
+/// ADR-022/ADR-034 same-origin trust model and could `DoS` the SDK in
+/// other ways (e.g. monkey-patching `Date.now`, calling
+/// `identity_remove_agent_key`, etc.). The cap is therefore sized
+/// generously to avoid blocking legitimate usage rather than as a
+/// security primitive: 100,000 sequential migrations on a single tab
+/// is far above any realistic flow (every migration requires the
+/// source's retained pre-rotation key, so an attacker can only fill
+/// slots they themselves created). LRU eviction was rejected because
+/// silently dropping forward `alsoKnownAs` links is worse than a hard
+/// refusal — verifiers following a stale link must see "not found"
+/// rather than "different new DID."
+const WASM_MIGRATION_LINKS_CAP: usize = 100_000;
 
 /// Maximum number of identity link attestation entries (DID keys) in the
 /// WASM-local attestation registry.
@@ -1612,43 +1639,20 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
     let agent_multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
 
     // Store the agent signing key in the identity registry. Only a
-    // `Local` record can carry an agent key; `Resolved` handles do not
-    // have retained key material and cannot host an agent key.
+    // `Local` record can carry an agent key; `Resolved` handles refuse
+    // with IDENT_1028 via the shared helper.
     let did = identity.did.clone();
-    let status = IDENTITY_REGISTRY.with(|reg| {
-        let mut map = reg.borrow_mut();
-        match map.get_mut(&did) {
-            Some(IdentityRecord::Local {
-                agent_signing_key_bytes,
-                ..
-            }) => {
-                *agent_signing_key_bytes = Some(zeroize::Zeroizing::new(agent_key.to_bytes()));
-                AgentKeyMutationStatus::Updated
-            }
-            Some(IdentityRecord::Resolved { .. }) => AgentKeyMutationStatus::NotLocal,
-            None => AgentKeyMutationStatus::NotFound,
+    let agent_bytes = zeroize::Zeroizing::new(agent_key.to_bytes());
+    with_local_record_mut(&did, "add an agent key", |record| {
+        if let IdentityRecord::Local {
+            agent_signing_key_bytes,
+            ..
+        } = record
+        {
+            *agent_signing_key_bytes = Some(agent_bytes);
         }
-    });
-    match status {
-        AgentKeyMutationStatus::Updated => {}
-        AgentKeyMutationStatus::NotFound => {
-            return Err(ScpWasmError::Identity {
-                message: format!("identity not found in registry: {did}"),
-                code: codes::IDENT_1002.to_owned(),
-            }
-            .into_js());
-        }
-        AgentKeyMutationStatus::NotLocal => {
-            return Err(ScpWasmError::Identity {
-                message: format!(
-                    "identity '{did}' was resolved from a DID string without local \
-                     key material — cannot add an agent key"
-                ),
-                code: codes::IDENT_1028.to_owned(),
-            }
-            .into_js());
-        }
-    }
+    })
+    .map_err(ScpWasmError::into_js)?;
 
     Ok(WasmIdentity {
         did,
@@ -1661,7 +1665,7 @@ pub fn identity_add_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity, J
     })
 }
 
-/// Outcome of a registry mutation that writes to the agent-key slot.
+/// Outcome of a registry mutation that writes to a `Local`-only field.
 /// Exists so callers can distinguish "DID not in registry" from
 /// "DID in registry but the record is a `Resolved` handle that cannot
 /// host key material."
@@ -1669,6 +1673,46 @@ enum AgentKeyMutationStatus {
     Updated,
     NotFound,
     NotLocal,
+}
+
+/// Looks up `did` and applies `mutate` to the matched
+/// `IdentityRecord::Local`. Returns `Ok(())` on success; refuses with
+/// `IDENT_1002` if the DID is absent and with `IDENT_1028`
+/// (interpolating `op_description` into the message) if the entry is
+/// a `Resolved` handle without retained signing-key material.
+///
+/// Callers wrap into `JsError` at the FFI boundary via
+/// `ScpWasmError::into_js`.
+fn with_local_record_mut(
+    did: &str,
+    op_description: &str,
+    mutate: impl FnOnce(&mut IdentityRecord),
+) -> Result<(), ScpWasmError> {
+    let status = IDENTITY_REGISTRY.with(|reg| {
+        let mut map = reg.borrow_mut();
+        match map.get_mut(did) {
+            Some(record @ IdentityRecord::Local { .. }) => {
+                mutate(record);
+                AgentKeyMutationStatus::Updated
+            }
+            Some(IdentityRecord::Resolved { .. }) => AgentKeyMutationStatus::NotLocal,
+            None => AgentKeyMutationStatus::NotFound,
+        }
+    });
+    match status {
+        AgentKeyMutationStatus::Updated => Ok(()),
+        AgentKeyMutationStatus::NotFound => Err(ScpWasmError::Identity {
+            message: format!("identity not found in registry: {did}"),
+            code: codes::IDENT_1002.to_owned(),
+        }),
+        AgentKeyMutationStatus::NotLocal => Err(ScpWasmError::Identity {
+            message: format!(
+                "identity '{did}' was resolved from a DID string without local \
+                 key material — cannot {op_description}"
+            ),
+            code: codes::IDENT_1028.to_owned(),
+        }),
+    }
 }
 
 /// Rotates the agent signing key for an identity (ADR-039).
@@ -1697,43 +1741,20 @@ pub fn identity_rotate_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
     let agent_pub = agent_key.verifying_key();
     let agent_multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
 
-    // Store the new agent signing key in the identity registry. Only a
-    // `Local` record can host an agent key.
+    // Store the new agent signing key in the identity registry via the
+    // shared helper. `Resolved` records refuse with IDENT_1028.
     let did = identity.did.clone();
-    let status = IDENTITY_REGISTRY.with(|reg| {
-        let mut map = reg.borrow_mut();
-        match map.get_mut(&did) {
-            Some(IdentityRecord::Local {
-                agent_signing_key_bytes,
-                ..
-            }) => {
-                *agent_signing_key_bytes = Some(zeroize::Zeroizing::new(agent_key.to_bytes()));
-                AgentKeyMutationStatus::Updated
-            }
-            Some(IdentityRecord::Resolved { .. }) => AgentKeyMutationStatus::NotLocal,
-            None => AgentKeyMutationStatus::NotFound,
+    let agent_bytes = zeroize::Zeroizing::new(agent_key.to_bytes());
+    with_local_record_mut(&did, "rotate an agent key", |record| {
+        if let IdentityRecord::Local {
+            agent_signing_key_bytes,
+            ..
+        } = record
+        {
+            *agent_signing_key_bytes = Some(agent_bytes);
         }
-    });
-    match status {
-        AgentKeyMutationStatus::Updated => {}
-        AgentKeyMutationStatus::NotFound => {
-            return Err(ScpWasmError::Identity {
-                message: format!("identity not found in registry: {did}"),
-                code: codes::IDENT_1002.to_owned(),
-            }
-            .into_js());
-        }
-        AgentKeyMutationStatus::NotLocal => {
-            return Err(ScpWasmError::Identity {
-                message: format!(
-                    "identity '{did}' was resolved from a DID string without local \
-                     key material — cannot rotate an agent key"
-                ),
-                code: codes::IDENT_1028.to_owned(),
-            }
-            .into_js());
-        }
-    }
+    })
+    .map_err(ScpWasmError::into_js)?;
 
     Ok(WasmIdentity {
         did,
@@ -1820,41 +1841,18 @@ fn rotate_active_key_inner(identity: &WasmIdentity) -> Result<WasmIdentity, ScpW
     let new_active_bytes = zeroize::Zeroizing::new(new_active.to_bytes());
 
     let did = identity.did.clone();
-    let status = IDENTITY_REGISTRY.with(|reg| {
-        let mut map = reg.borrow_mut();
-        match map.get_mut(&did) {
-            Some(IdentityRecord::Local {
-                active_signing_key_bytes,
-                ..
-            }) => {
-                // In-place replacement: the old `Zeroizing<[u8; 32]>` is
-                // dropped and zeroed when the new value is assigned, so no
-                // unprotected copy of the previous active key persists.
-                *active_signing_key_bytes = new_active_bytes;
-                AgentKeyMutationStatus::Updated
-            }
-            Some(IdentityRecord::Resolved { .. }) => AgentKeyMutationStatus::NotLocal,
-            None => AgentKeyMutationStatus::NotFound,
+    with_local_record_mut(&did, "rotate the active signing key", |record| {
+        if let IdentityRecord::Local {
+            active_signing_key_bytes,
+            ..
+        } = record
+        {
+            // In-place replacement: the old `Zeroizing<[u8; 32]>` is
+            // dropped and zeroed when the new value is assigned, so no
+            // unprotected copy of the previous active key persists.
+            *active_signing_key_bytes = new_active_bytes;
         }
-    });
-    match status {
-        AgentKeyMutationStatus::Updated => {}
-        AgentKeyMutationStatus::NotFound => {
-            return Err(ScpWasmError::Identity {
-                message: format!("identity not found in registry: {did}"),
-                code: codes::IDENT_1002.to_owned(),
-            });
-        }
-        AgentKeyMutationStatus::NotLocal => {
-            return Err(ScpWasmError::Identity {
-                message: format!(
-                    "identity '{did}' was resolved from a DID string without local \
-                     key material — cannot rotate the active signing key"
-                ),
-                code: codes::IDENT_1028.to_owned(),
-            });
-        }
-    }
+    })?;
 
     Ok(WasmIdentity {
         did,
@@ -1890,45 +1888,20 @@ pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
         .into_js());
     }
 
-    // Clear the agent signing key from the identity registry to prevent
-    // the key material from lingering in WASM linear memory. Only
-    // `Local` records host an agent key; for `Resolved` there is no key
-    // to clear, so fail-closed with a distinct error.
+    // Clear the agent signing key via the shared helper. The helper
+    // refuses with IDENT_1028 for `Resolved` records and IDENT_1002 for
+    // unknown DIDs.
     let did = identity.did.clone();
-    let status = IDENTITY_REGISTRY.with(|reg| {
-        let mut map = reg.borrow_mut();
-        match map.get_mut(&did) {
-            Some(IdentityRecord::Local {
-                agent_signing_key_bytes,
-                ..
-            }) => {
-                *agent_signing_key_bytes = None;
-                AgentKeyMutationStatus::Updated
-            }
-            Some(IdentityRecord::Resolved { .. }) => AgentKeyMutationStatus::NotLocal,
-            None => AgentKeyMutationStatus::NotFound,
+    with_local_record_mut(&did, "remove an agent key", |record| {
+        if let IdentityRecord::Local {
+            agent_signing_key_bytes,
+            ..
+        } = record
+        {
+            *agent_signing_key_bytes = None;
         }
-    });
-    match status {
-        AgentKeyMutationStatus::Updated => {}
-        AgentKeyMutationStatus::NotFound => {
-            return Err(ScpWasmError::Identity {
-                message: format!("identity not found in registry: {did}"),
-                code: codes::IDENT_1002.to_owned(),
-            }
-            .into_js());
-        }
-        AgentKeyMutationStatus::NotLocal => {
-            return Err(ScpWasmError::Identity {
-                message: format!(
-                    "identity '{did}' was resolved from a DID string without local \
-                     key material — cannot remove an agent key"
-                ),
-                code: codes::IDENT_1028.to_owned(),
-            }
-            .into_js());
-        }
-    }
+    })
+    .map_err(ScpWasmError::into_js)?;
 
     Ok(WasmIdentity {
         did,
@@ -4720,6 +4693,44 @@ mod tests {
             }
             other => panic!("expected Identity error, got: {other:?}"),
         }
+
+        cleanup_registries();
+    }
+
+    /// Cross-bridge wire-format parity: WASM-emitted `DidRotationEvent`
+    /// JSON MUST deserialize byte-identically into native
+    /// `scp_identity::DidRotationEvent`. This is the missing
+    /// behavioral assertion that issue #1717 AC4 demands beyond the
+    /// matrix-name parity in `ffi_conformance.rs`.
+    #[test]
+    fn migrate_emits_native_compatible_rotation_event() {
+        cleanup_registries();
+        let (old_did, _, _) = register_identity();
+        let handle = handle_for(&old_did, [0u8; 32]);
+
+        let result = migrate_inner(&handle, 1_700_000_000).expect("migrate must succeed");
+
+        let parsed: scp_identity::DidRotationEvent =
+            serde_json::from_str(&result.rotation_event_json).expect(
+                "WASM-emitted rotation_event_json MUST deserialize as the canonical \
+                 scp_identity::DidRotationEvent (cross-bridge wire-format parity)",
+            );
+        assert_eq!(parsed.old_did, old_did);
+        assert_eq!(parsed.new_did, result.identity.did);
+        assert_eq!(parsed.rotated_at, 1_700_000_000);
+        assert!(
+            parsed.pre_rotation_proof.is_some(),
+            "WASM always publishes #pre-rotation; the proof MUST round-trip"
+        );
+
+        // Verify the deserialized proof structure matches what a native
+        // verifier would consume via verify_migration.
+        let pre_rot = parsed.pre_rotation_proof.as_ref().unwrap();
+        let recomputed = compute_pre_rotation_commitment(&pre_rot.revealed_key);
+        assert_eq!(
+            recomputed, pre_rot.commitment,
+            "PreRotationProof MUST satisfy SHA-256(revealed_key) == commitment"
+        );
 
         cleanup_registries();
     }

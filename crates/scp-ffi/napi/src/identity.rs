@@ -292,6 +292,13 @@ pub(crate) struct NapiIdentityInner {
     /// handle-affinity checks at every FFI entry point that accepts a
     /// `NapiIdentity`. Mismatches are rejected with `SCP-PERM-3030`.
     pub(crate) instance_id: u64,
+    /// JSON-serialized `scp_identity::DidRotationEvent` produced when
+    /// this handle was minted by [`NapiIdentity::migrate`]. SDK callers
+    /// MUST distribute the event to active context members per spec
+    /// §3.2.1 step 4b. `None` for handles produced by `identity_create`,
+    /// `rotate_key`, agent-key ops, or external load — those operations
+    /// do not change the DID, so no `DidRotationEvent` is constructed.
+    pub(crate) rotation_event_json: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -465,6 +472,7 @@ impl NapiIdentity {
                     bi: Arc::clone(&self.inner.bi),
                     verifying_key_hex,
                     instance_id: self.inner.bi.instance_id(),
+                    rotation_event_json: None,
                 }),
             };
             increment_handle_count();
@@ -543,6 +551,7 @@ impl NapiIdentity {
                     bi: Arc::clone(&self.inner.bi),
                     verifying_key_hex,
                     instance_id: self.inner.bi.instance_id(),
+                    rotation_event_json: None,
                 }),
             };
             increment_handle_count();
@@ -621,6 +630,7 @@ impl NapiIdentity {
                     bi: Arc::clone(&self.inner.bi),
                     verifying_key_hex,
                     instance_id: self.inner.bi.instance_id(),
+                    rotation_event_json: None,
                 }),
             };
             increment_handle_count();
@@ -699,6 +709,7 @@ impl NapiIdentity {
                     bi: Arc::clone(&self.inner.bi),
                     verifying_key_hex,
                     instance_id: self.inner.bi.instance_id(),
+                    rotation_event_json: None,
                 }),
             };
             increment_handle_count();
@@ -730,6 +741,11 @@ impl NapiIdentity {
     ///   migration.
     ///
     /// See ADR-003 acceptance criterion 4b, spec §9.12, and SCP-214 criterion 10.
+    /// Returns the migrated identity. The handle exposes the
+    /// `DidRotationEvent` JSON via the `rotationEventJson` getter
+    /// (spec §3.7, ADR-003 §4b/4c). The SDK distributes the event to
+    /// active context members per spec §3.2.1 step 4b. Wire shape is
+    /// `serde_json::to_string(&scp_identity::DidRotationEvent)`.
     #[napi]
     #[allow(clippy::unused_async)] // napi requires async for Promise return type
     pub async fn migrate(&self) -> napi::Result<Self> {
@@ -778,7 +794,7 @@ impl NapiIdentity {
             let rotated_at = scp_primitives::SystemClock.now_secs();
 
             let dht = make_dht_with_signer(&custody);
-            let (new_identity, new_document, _rotation_event) = dht
+            let (new_identity, new_document, rotation_event) = dht
                 .migrate_identity(
                     &scp_identity,
                     &document,
@@ -788,6 +804,13 @@ impl NapiIdentity {
                 )
                 .await
                 .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+            let rotation_event_json = serde_json::to_string(&rotation_event).map_err(|e| {
+                NapiError::from(ScpNapiError::Identity {
+                    message: format!("failed to serialize rotation event: {e}"),
+                    code: codes::IDENT_1004.to_owned(),
+                })
+            })?;
 
             let new_did = new_identity.did.clone();
 
@@ -817,11 +840,22 @@ impl NapiIdentity {
                     bi: Arc::clone(&self.inner.bi),
                     verifying_key_hex,
                     instance_id: self.inner.bi.instance_id(),
+                    rotation_event_json: Some(rotation_event_json),
                 }),
             };
             increment_handle_count();
             Ok(handle)
         }
+    }
+
+    /// Returns the JSON-serialized `DidRotationEvent` if this handle was
+    /// produced by [`NapiIdentity::migrate`]; `None` otherwise. The SDK
+    /// distributes the event to active context members per spec §3.2.1
+    /// step 4b.
+    #[napi(getter, js_name = "rotationEventJson")]
+    #[must_use]
+    pub fn rotation_event_json(&self) -> Option<String> {
+        self.inner.rotation_event_json.clone()
     }
 }
 
@@ -1069,6 +1103,7 @@ mod tests {
                 bi,
                 verifying_key_hex,
                 instance_id,
+                rotation_event_json: None,
             }),
         };
         increment_handle_count();
@@ -1216,6 +1251,7 @@ mod tests {
                 bi,
                 verifying_key_hex: None,
                 instance_id,
+                rotation_event_json: None,
             }),
         };
         increment_handle_count();
@@ -1414,6 +1450,17 @@ mod tests {
             migrated.did().starts_with("did:dht:"),
             "migrated DID must be a did:dht DID"
         );
+
+        // Rotation event JSON deserializes into the canonical
+        // DidRotationEvent shape (spec §3.7, ADR-003 §4b/4c).
+        let event_json = migrated
+            .rotation_event_json()
+            .expect("migrated handle must surface rotationEventJson");
+        let event: scp_identity::DidRotationEvent = serde_json::from_str(&event_json)
+            .expect("rotation_event_json must deserialize as DidRotationEvent");
+        assert_eq!(event.old_did, original_did);
+        assert_eq!(event.new_did, migrated.did());
+        assert!(event.pre_rotation_proof.is_some());
     }
 
     #[test]
@@ -1517,6 +1564,7 @@ mod tests {
                 bi,
                 verifying_key_hex: None,
                 instance_id,
+                rotation_event_json: None,
             }),
         };
         increment_handle_count();

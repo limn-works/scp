@@ -415,6 +415,7 @@ impl Scp {
                         bi: Arc::clone(&self.inner),
                         verifying_key_hex,
                         instance_id: bi.instance_id(),
+                        rotation_event_json: None,
                     }),
                 };
                 crate::increment_handle_count();
@@ -535,6 +536,7 @@ impl Scp {
                         bi: Arc::clone(&self.inner),
                         verifying_key_hex,
                         instance_id: bi.instance_id(),
+                        rotation_event_json: None,
                     }),
                 };
                 crate::increment_handle_count();
@@ -612,6 +614,7 @@ impl Scp {
                         bi: Arc::clone(&self.inner),
                         verifying_key_hex,
                         instance_id: bi.instance_id(),
+                        rotation_event_json: None,
                     }),
                 };
                 crate::increment_handle_count();
@@ -636,6 +639,7 @@ impl Scp {
                 bi: Arc::clone(&self.inner),
                 verifying_key_hex: None,
                 instance_id: bi.instance_id(),
+                rotation_event_json: None,
             }),
         };
         crate::increment_handle_count();

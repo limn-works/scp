@@ -1506,7 +1506,24 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
-      return await (handle as unknown as { migrate(): Promise<BridgeIdentityHandle> }).migrate();
+      // The NAPI bridge returns a `NapiIdentity` whose `rotationEventJson`
+      // getter exposes the JSON-serialized `DidRotationEvent`. The
+      // returned object IS the live NAPI handle; we attach
+      // `rotationEventJson` as an own property so downstream callers
+      // (and `BridgeIdentityHandle` consumers) can read it without
+      // crossing the NAPI getter boundary again.
+      const migrated = (await (
+        handle as unknown as {
+          migrate(): Promise<BridgeIdentityHandle & { rotationEventJson?: string | null }>;
+        }
+      ).migrate()) as BridgeIdentityHandle & { rotationEventJson?: string | null };
+      const rotationEventJson = migrated.rotationEventJson ?? undefined;
+      // Preserve the underlying NAPI class instance so subsequent
+      // operations (rotateKey, addAgentKey, etc.) target the correct
+      // DID. Object.assign mutates `migrated` to carry the typed
+      // `rotationEventJson` field even when it was returned via a
+      // getter.
+      return Object.assign(migrated, { rotationEventJson });
     },
 
     async identityAttestDevice(did: string): Promise<string> {

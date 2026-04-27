@@ -1319,7 +1319,16 @@ impl crate::scp::PyScp {
     /// generation fails, or if DHT publishing fails.
     ///
     /// See ADR-003 acceptance criterion 4b and SCP-214 criterion 10.
-    pub fn identity_migrate(&self, py: Python<'_>, identity: &PyIdentity) -> PyResult<PyIdentity> {
+    /// Returns `(new_identity, rotation_event_json)`. The JSON shape is
+    /// `serde_json::to_string(&scp_identity::DidRotationEvent)` so JS-,
+    /// Python-, Swift-, or Kotlin-side consumers parse it directly. The
+    /// SDK distributes the event to context members (spec §3.2.1
+    /// step 4b).
+    pub fn identity_migrate(
+        &self,
+        py: Python<'_>,
+        identity: &PyIdentity,
+    ) -> PyResult<(PyIdentity, String)> {
         let bi = &*self.inner;
         crate::pyscp_check_handle!(&bi.core, identity);
         let bi_arc = Arc::clone(&self.inner);
@@ -1381,7 +1390,7 @@ impl crate::scp::PyScp {
                     Arc::new(DidCache::new()),
                     sign_fn,
                 );
-                let (new_identity, new_document, _rotation_event) = did_method
+                let (new_identity, new_document, rotation_event) = did_method
                     .migrate_identity(
                         &old_identity,
                         &old_doc,
@@ -1391,6 +1400,12 @@ impl crate::scp::PyScp {
                     )
                     .await
                     .map_err(ScpPyError::from)?;
+                let rotation_event_json = serde_json::to_string(&rotation_event).map_err(|e| {
+                    ScpPyError::IdentityError {
+                        message: format!("failed to serialize rotation event: {e}"),
+                        code: scp_ffi_common::error_codes::IDENT_1004.to_owned(),
+                    }
+                })?;
 
                 let new_did = new_identity.did.clone();
                 let document_for_handle = new_document.clone();
@@ -1421,12 +1436,15 @@ impl crate::scp::PyScp {
                         identity_link_attestations: existing_attestations,
                     },
                 );
-                Ok(PyIdentity::from_document(
-                    &bi_arc,
-                    new_did,
-                    custody_str,
-                    &document_for_handle,
-                    verifying_key_hex,
+                Ok((
+                    PyIdentity::from_document(
+                        &bi_arc,
+                        new_did,
+                        custody_str,
+                        &document_for_handle,
+                        verifying_key_hex,
+                    ),
+                    rotation_event_json,
                 ))
             })
         })
@@ -2107,7 +2125,7 @@ mod tests {
             assert!(crate::runtime::identity_registry_contains(&bi, &old_did));
 
             // Migrate to a new DID via the actual bridge method.
-            let migrated = scp.identity_migrate(py, &original).unwrap();
+            let (migrated, rotation_event_json) = scp.identity_migrate(py, &original).unwrap();
             let new_did = migrated.did.clone();
 
             // New DID is a valid, distinct did:dht.
@@ -2126,6 +2144,15 @@ mod tests {
                 crate::runtime::with_identity(&bi, &new_did, |entry| Ok(entry.document.id.clone()))
                     .unwrap();
             assert_eq!(doc_did, new_did);
+
+            // Rotation event JSON deserializes into the canonical
+            // `DidRotationEvent` shape (spec §3.7, ADR-003 §4b/4c) so the
+            // SDK can distribute it to context members per §3.2.1 step 4b.
+            let event: scp_identity::DidRotationEvent =
+                serde_json::from_str(&rotation_event_json).unwrap();
+            assert_eq!(event.old_did, old_did);
+            assert_eq!(event.new_did, new_did);
+            assert!(event.pre_rotation_proof.is_some());
         });
     }
 }

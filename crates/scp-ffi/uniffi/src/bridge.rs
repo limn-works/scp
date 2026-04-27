@@ -1441,6 +1441,13 @@ pub struct Identity {
     /// every `#[uniffi::export]` entry that accepts an `Identity`. Mismatches
     /// map to `ScpError::Permission` with code `SCP-PERM-3030`.
     pub(crate) instance_id: u64,
+    /// JSON-serialized `scp_identity::DidRotationEvent` produced when this
+    /// handle was minted by [`Scp::identity_migrate`]. SDK callers MUST
+    /// distribute the event to active context members per spec §3.2.1
+    /// step 4b. `None` for handles produced by `identity_create`,
+    /// `rotate_key`, agent-key ops, or external load — those do not
+    /// change the DID, so no `DidRotationEvent` is constructed.
+    pub(crate) rotation_event_json: Option<String>,
 }
 
 #[uniffi::export]
@@ -1457,6 +1464,15 @@ impl Identity {
     #[must_use]
     pub fn did(&self) -> String {
         self.did.clone()
+    }
+
+    /// Returns the JSON-serialized `DidRotationEvent` if this handle
+    /// was produced by [`Scp::identity_migrate`]; `None` otherwise.
+    /// SDK callers MUST distribute the event to active context members
+    /// per spec §3.2.1 step 4b.
+    #[must_use]
+    pub fn rotation_event_json(&self) -> Option<String> {
+        self.rotation_event_json.clone()
     }
 
     /// Returns the custody method string for this identity.
@@ -1534,6 +1550,7 @@ impl Identity {
                 callback_custody: self.callback_custody.clone(),
                 verifying_key_hex,
                 instance_id: self.instance_id,
+                rotation_event_json: None,
             });
             increment_handle_count();
             return Ok(handle);
@@ -1559,6 +1576,7 @@ impl Identity {
                 callback_custody: None,
                 verifying_key_hex,
                 instance_id: self.instance_id,
+                rotation_event_json: None,
             });
             increment_handle_count();
             return Ok(handle);
@@ -1700,6 +1718,7 @@ impl Identity {
                         callback_custody: None,
                         verifying_key_hex,
                         instance_id,
+                        rotation_event_json: None,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -1800,6 +1819,7 @@ impl Identity {
                         callback_custody: None,
                         verifying_key_hex,
                         instance_id,
+                        rotation_event_json: None,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -1895,6 +1915,7 @@ impl Identity {
                         callback_custody: None,
                         verifying_key_hex,
                         instance_id,
+                        rotation_event_json: None,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -6935,6 +6956,7 @@ impl Scp {
                                 callback_custody: None,
                                 verifying_key_hex,
                                 instance_id: bi.core.instance_id(),
+                                rotation_event_json: None,
                             });
                             increment_handle_count();
                             Ok(handle)
@@ -7028,6 +7050,7 @@ impl Scp {
                     callback_custody: Some(callback_custody),
                     verifying_key_hex,
                     instance_id: bi.core.instance_id(),
+                    rotation_event_json: None,
                 });
                 increment_handle_count();
                 Ok(handle)
@@ -7070,6 +7093,7 @@ impl Scp {
                     callback_custody: None,
                     verifying_key_hex: None,
                     instance_id: bi.core.instance_id(),
+                    rotation_event_json: None,
                 });
                 increment_handle_count();
                 Ok(handle)
@@ -12697,7 +12721,7 @@ impl Scp {
                     let rotated_at = scp_primitives::SystemClock.now_secs();
 
                     let dht = DidDht::new();
-                    let (new_identity, new_document, _rotation_event) = dht
+                    let (new_identity, new_document, rotation_event) = dht
                         .migrate_identity(
                             &old_identity,
                             &old_document,
@@ -12707,6 +12731,11 @@ impl Scp {
                         )
                         .await
                         .map_err(ScpError::from)?;
+                    let rotation_event_json =
+                        serde_json::to_string(&rotation_event).map_err(|e| ScpError::Identity {
+                            msg: format!("failed to serialize rotation event: {e}"),
+                            code: codes::IDENT_1004.to_owned(),
+                        })?;
 
                     let new_did = new_identity.did.clone();
                     let has_agent = new_document.has_agent_key();
@@ -12725,6 +12754,7 @@ impl Scp {
                         callback_custody,
                         verifying_key_hex,
                         instance_id,
+                        rotation_event_json: Some(rotation_event_json),
                     });
                     increment_handle_count();
                     let _ = has_agent; // suppress unused warning
@@ -12767,7 +12797,7 @@ impl Scp {
                     let rotated_at = scp_primitives::SystemClock.now_secs();
 
                     let dht = DidDht::new();
-                    let (new_identity, new_document, _rotation_event) = dht
+                    let (new_identity, new_document, rotation_event) = dht
                         .migrate_identity(
                             &old_identity,
                             &old_document,
@@ -12777,6 +12807,11 @@ impl Scp {
                         )
                         .await
                         .map_err(ScpError::from)?;
+                    let rotation_event_json =
+                        serde_json::to_string(&rotation_event).map_err(|e| ScpError::Identity {
+                            msg: format!("failed to serialize rotation event: {e}"),
+                            code: codes::IDENT_1004.to_owned(),
+                        })?;
 
                     let new_did = new_identity.did.clone();
                     let verifying_key_hex =
@@ -12791,6 +12826,7 @@ impl Scp {
                         callback_custody: Some(Arc::clone(cc)),
                         verifying_key_hex,
                         instance_id,
+                        rotation_event_json: Some(rotation_event_json),
                     });
                     increment_handle_count();
 
@@ -12894,6 +12930,7 @@ impl Scp {
                                 callback_custody: None,
                                 verifying_key_hex,
                                 instance_id: bi.core.instance_id(),
+                                rotation_event_json: None,
                             });
                             increment_handle_count();
                             Ok(handle)
@@ -14229,6 +14266,7 @@ mod tests {
             callback_custody: None,
             verifying_key_hex: None,
             instance_id,
+            rotation_event_json: None,
         })
     }
 
