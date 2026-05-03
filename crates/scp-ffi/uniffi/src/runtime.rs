@@ -236,6 +236,20 @@ pub struct UniffiBridgeInstance {
     /// `OnceLock<DashMap<String, McpClientEntry>>` singleton in commit 4.
     /// Cleared by [`BridgeInstanceCore::bridge_specific_shutdown`].
     pub(crate) mcp_client_registry: Arc<DashMap<String, crate::bridge::McpClientEntry>>,
+
+    /// Active streaming outlet sessions keyed by 32-char lowercase hex
+    /// `request_id` (§5.4.5).
+    ///
+    /// Mirrors `PyBridgeInstance::outlet_stream_registry` and
+    /// `NapiBridgeInstance::outlet_stream_registry`. Per ADR-048 §1 the
+    /// registry lives on the bridge instance — never as a process global —
+    /// so multi-instance fallback / shutdown clearing works uniformly.
+    /// Populated by `outlet_invoke_stream`, drained by the streaming pump
+    /// task on terminal-chunk emission, and cleared by
+    /// [`BridgeInstanceCore::bridge_specific_shutdown`] so cancel and
+    /// grant-credit paths cannot reach a stale handle past shutdown.
+    pub(crate) outlet_stream_registry:
+        Arc<DashMap<String, Arc<crate::outlet_stream::StreamRegistryEntry>>>,
 }
 
 impl UniffiBridgeInstance {
@@ -259,6 +273,7 @@ impl UniffiBridgeInstance {
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -285,6 +300,7 @@ impl UniffiBridgeInstance {
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -389,6 +405,7 @@ impl UniffiBridgeInstance {
             context_handle_registry: Arc::new(DashMap::new()),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -471,6 +488,17 @@ impl UniffiBridgeInstance {
     ) -> &Arc<DashMap<String, crate::bridge::McpClientEntry>> {
         &self.mcp_client_registry
     }
+
+    /// Returns a reference to the per-bridge outlet stream registry.
+    ///
+    /// `pub(crate)` because [`crate::outlet_stream::StreamRegistryEntry`] is
+    /// itself `pub(crate)` and would leak through the public signature.
+    #[must_use]
+    pub(crate) const fn outlet_stream_registry(
+        &self,
+    ) -> &Arc<DashMap<String, Arc<crate::outlet_stream::StreamRegistryEntry>>> {
+        &self.outlet_stream_registry
+    }
 }
 
 #[async_trait]
@@ -524,6 +552,12 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         // shutdown (the caller normally holds its own `Arc`).
         self.identity_link_attestation_registry.clear();
         self.context_handle_registry.clear();
+        // Clear outlet stream registry — drops every
+        // `StreamRegistryEntry` and the inner
+        // `StreamSessionHandle`/`SigningKey` they hold so cancel and
+        // grant-credit paths cannot reach a stale handle past
+        // shutdown. Mirrors the PyO3 / NAPI bridges (SCP-OUT-037).
+        self.outlet_stream_registry.clear();
     }
 }
 
