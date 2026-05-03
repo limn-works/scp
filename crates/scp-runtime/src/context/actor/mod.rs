@@ -452,8 +452,14 @@ impl ContextActor {
     ) -> Outcome<()> {
         match cmd {
             ContextCommand::Messaging(sub) => {
-                handlers::messaging::dispatch_from_shim(supervisor, &mut state.send_tracker, sub)
-                    .await
+                // Phase 2A.7 — messaging domain migrated to the
+                // actor-shape handler. Supervisor dispatch still falls
+                // back to `dispatch_from_shim` when no per-context
+                // actor exists for the target context during the
+                // migration window. The send-sequence tracker
+                // (`state.send_tracker`) is reserved internally inside
+                // the handler.
+                handlers::messaging::dispatch(state, deps, sub).await
             }
             ContextCommand::Lifecycle(sub) => {
                 Box::pin(handlers::lifecycle::dispatch_from_shim(supervisor, sub)).await

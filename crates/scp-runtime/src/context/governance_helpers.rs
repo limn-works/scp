@@ -5582,7 +5582,24 @@ pub const fn governance_event_label(event: &GovernanceEvent) -> &'static str {
 /// Returns [`ContextError::CommitBroadcastFault`] if the context has an
 /// active fault marker.
 pub fn check_commit_fault(ctx: &PerContextState) -> Result<(), ContextError> {
-    if let Some(ref marker) = ctx.commit_fault {
+    check_commit_fault_marker(ctx.commit_fault.as_ref())
+}
+
+/// Field-disjoint variant of [`check_commit_fault`] used by both the
+/// legacy [`PerContextState`] and the actor-shape
+/// [`crate::context::actor::state::PerContextState`].
+///
+/// ADR-049 Phase 2A.7 — added so the actor-shape `messaging_helpers`
+/// can drive the same fail-closed gate without going through the
+/// legacy state struct.
+///
+/// # Errors
+///
+/// Returns [`ContextError::CommitBroadcastFault`] if the marker is `Some`.
+pub fn check_commit_fault_marker(
+    marker: Option<&crate::context::state::CommitFaultMarker>,
+) -> Result<(), ContextError> {
+    if let Some(marker) = marker {
         return Err(ContextError::CommitBroadcastFault {
             operation: marker.operation.label(),
             reason: marker.reason.clone(),

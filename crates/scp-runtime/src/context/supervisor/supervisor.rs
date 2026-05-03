@@ -2507,11 +2507,17 @@ impl Supervisor {
     }
 
     /// Passthrough to
-    /// [`crate::context::messaging_helpers::send_message`] — encrypts
-    /// and broadcasts a payload through the context's MLS group.
+    /// [`crate::context::messaging_helpers_legacy::send_message_legacy`]
+    /// — encrypts and broadcasts a payload through the context's MLS
+    /// group via the lock-and-call legacy path.
     ///
-    /// Resolves the supervisor's clock and key resolver from its
-    /// provider slots; both are populated by [`Self::with_providers`].
+    /// Phase 2A.7 — the actor-shape `messaging_helpers::send_message`
+    /// takes `(&mut PerContextState, &ActorDeps, ...)` directly; this
+    /// passthrough still uses the legacy `&Supervisor` shape because
+    /// callers without an attached actor (test fixtures, integration
+    /// suites that bypass the mailbox) need the lock-and-call dance to
+    /// land per-context state mutations. Removed in Phase 2A
+    /// finalization with the rest of the supervisor shim.
     ///
     /// # Errors
     ///
@@ -2528,9 +2534,7 @@ impl Supervisor {
         source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     ) -> Result<(), ContextError> {
-        // Phase 1 fix-up of ADR-049 (post-review-round-1): the helper
-        // reads `clock` / `key_resolver` from the supervisor directly.
-        crate::context::messaging_helpers::send_message(
+        crate::context::messaging_helpers_legacy::send_message_legacy(
             self,
             handle,
             sender_did,
