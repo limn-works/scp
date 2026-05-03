@@ -91,10 +91,6 @@ from scp_sdk.mcp import (
     McpServer,
     McpToolDefinition,
     McpToolResult,
-    configure_stdio_allowlist,
-    disable_stdio_allowlist,
-    get_stdio_allowlist,
-    reset_stdio_allowlist,
 )
 from scp_sdk.media import (
     activate_session as media_activate_session,
@@ -129,7 +125,7 @@ from scp_sdk.media import (
 from scp_sdk.media import (
     verify_sender_attribution as media_verify_sender_attribution,
 )
-from scp_sdk.scp import SCP, InMemoryStorage, SqliteStorage, StorageConfig
+from scp_sdk.scp import SCP, InMemoryStorage, McpAllowlistState, SqliteStorage, StorageConfig
 from scp_sdk.server import Node, Relay
 from scp_sdk.sync import classify_offline, get_policy, run_sync
 from scp_sdk.tools import (
@@ -202,6 +198,7 @@ __all__ = [
     "IdentityAttestation",
     "IdentityError",
     "InMemoryStorage",
+    "McpAllowlistState",
     "McpClient",
     "McpProvenance",
     "McpServer",
@@ -251,13 +248,10 @@ __all__ = [
     "check_media_capability",
     "check_policy_lock",
     "classify_offline",
-    "configure_stdio_allowlist",
     "create_query",
-    "disable_stdio_allowlist",
     "estimate_cost",
     "evaluate_formula",
     "get_policy",
-    "get_stdio_allowlist",
     "media_activate_session",
     "media_create_answer",
     "media_create_ice_candidate",
@@ -271,7 +265,6 @@ __all__ = [
     "normalize_address",
     "parse_address",
     "policy_requires_payment",
-    "reset_stdio_allowlist",
     "run_sync",
     "validate_admission",
     "validate_broadcast_key_hex",

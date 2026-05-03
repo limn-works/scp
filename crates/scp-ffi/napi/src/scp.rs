@@ -3331,7 +3331,8 @@ impl Scp {
         .await
     }
 
-    /// Per-instance equivalent of the free-function `mcp_configure_stdio_allowlist`.
+    /// Adds binary names to THIS instance's MCP stdio allowlist.
+    /// Forwards to [`crate::mcp::mcp_configure_stdio_allowlist_on`].
     #[napi(js_name = "mcpConfigureStdioAllowlist")]
     pub fn mcp_configure_stdio_allowlist(
         &self,
@@ -3340,19 +3341,22 @@ impl Scp {
         crate::mcp::mcp_configure_stdio_allowlist_on(&self.inner, additional_binaries)
     }
 
-    /// Per-instance equivalent of the free-function `mcp_disable_stdio_allowlist`.
+    /// Disables THIS instance's MCP stdio allowlist (unrestricted mode).
+    /// Forwards to [`crate::mcp::mcp_disable_stdio_allowlist_on`].
     #[napi(js_name = "mcpDisableStdioAllowlist")]
     pub fn mcp_disable_stdio_allowlist(&self) -> napi::Result<()> {
         crate::mcp::mcp_disable_stdio_allowlist_on(&self.inner)
     }
 
-    /// Per-instance equivalent of the free-function `mcp_reset_stdio_allowlist`.
+    /// Resets THIS instance's MCP stdio allowlist to its defaults.
+    /// Forwards to [`crate::mcp::mcp_reset_stdio_allowlist_on`].
     #[napi(js_name = "mcpResetStdioAllowlist")]
     pub fn mcp_reset_stdio_allowlist(&self) -> napi::Result<()> {
         crate::mcp::mcp_reset_stdio_allowlist_on(&self.inner)
     }
 
-    /// Per-instance equivalent of the free-function `mcp_get_stdio_allowlist`.
+    /// Returns a snapshot of THIS instance's MCP stdio allowlist state.
+    /// Forwards to [`crate::mcp::mcp_get_stdio_allowlist_on`].
     #[napi(js_name = "mcpGetStdioAllowlist")]
     pub fn mcp_get_stdio_allowlist(&self) -> napi::Result<NapiAllowlistState> {
         crate::mcp::mcp_get_stdio_allowlist_on(&self.inner)

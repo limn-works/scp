@@ -573,6 +573,12 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/mcpClientConnectStdio`` on ``inner``.
+    ///
+    /// `command[0]` is validated against THIS instance's stdio allowlist
+    /// (per-instance — disabling enforcement on another ``SCP`` does not
+    /// affect this one). To permit a binary not in the default allowlist,
+    /// call ``mcpConfigureStdioAllowlist(additionalBinaries:)`` first; use
+    /// ``mcpGetStdioAllowlist()`` to inspect the current state.
     func mcpClientConnectStdio(command: [String]) async throws -> String {
         try await inner.mcpClientConnectStdio(command: command)
     }
@@ -597,8 +603,21 @@ public extension SCP {
         try inner.mcpConfigureStdioAllowlist(additionalBinaries: additionalBinaries)
     }
 
-    /// Forwards to ``Scp/mcpDisableStdioAllowlist`` on ``inner``.
-    func mcpDisableStdioAllowlist() throws {
+    /// Disable this instance's stdio allowlist (unrestricted mode).
+    ///
+    /// After calling this, **any** binary may be spawned by
+    /// ``mcpClientConnectStdio`` on this ``SCP``. Other instances are
+    /// unaffected. Pass ``iTrustAllCommands: true`` to confirm
+    /// acknowledgement of the security implication; the call also emits
+    /// an `os_log` / `print` warning for operator audit.
+    func mcpDisableStdioAllowlist(iTrustAllCommands: Bool = false) throws {
+        guard iTrustAllCommands else {
+            throw ScpError.Validation(
+                msg: "Disabling the stdio allowlist allows any binary to be spawned by this SCP instance. Pass iTrustAllCommands: true to confirm.",
+                code: "SCP-MCP-10010"
+            )
+        }
+        print("[scp] MCP stdio allowlist enforcement disabled — arbitrary subprocess spawning is now permitted on this instance")
         try inner.mcpDisableStdioAllowlist()
     }
 

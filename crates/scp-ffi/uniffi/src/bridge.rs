@@ -3124,15 +3124,25 @@ struct McpStdioTransportInner {
 }
 
 impl McpStdioTransport {
-    fn spawn(command: &[String]) -> Result<Self, String> {
+    fn spawn(
+        allowlist: &std::sync::Mutex<scp_mcp::allowlist::StdioAllowlist>,
+        command: &[String],
+    ) -> Result<Self, String> {
         use std::process::{Command, Stdio};
 
         let (cmd, args) = command
             .split_first()
             .ok_or_else(|| "command list is empty".to_owned())?;
 
-        // Validate the command against the stdio allowlist (defense-in-depth).
-        let basename = scp_mcp::allowlist::validate_command(cmd).map_err(|e| e.to_string())?;
+        // Validate the command against the per-instance stdio allowlist
+        // (defense-in-depth). Hold the lock only across `validate_command`,
+        // then drop before spawning.
+        let basename = {
+            let guard = allowlist
+                .lock()
+                .map_err(|_| "stdio allowlist lock poisoned".to_owned())?;
+            guard.validate_command(cmd).map_err(|e| e.to_string())?
+        };
 
         let mut child = Command::new(&basename)
             .args(args)
@@ -3814,6 +3824,15 @@ async fn run_mcp_stdio_server_uniffi(
 /// Input-validation errors map to `Validation`. Runtime/policy errors
 /// map to `Transport`. Exhaustive match ensures new variants produce
 /// a compile error instead of silently falling through.
+///
+/// Mutex poisoning is NOT modelled by `AllowlistError` — the allowlist is
+/// per-instance (`CoreFields::mcp_allowlist`). Each call site maps
+/// `PoisonError` to a transport error before invoking allowlist methods.
+// `clippy::match_same_arms` — the explicit wildcard arm at the end is intentional:
+// `AllowlistError` is `#[non_exhaustive]`, so future variants must compile, and
+// classifying them as a validation error fails closed. Folding the wildcard into
+// the named OR-chain would erase that documentation.
+#[allow(clippy::match_same_arms)]
 fn mcp_allowlist_err(e: scp_mcp::allowlist::AllowlistError) -> ScpError {
     use scp_mcp::allowlist::AllowlistError;
     let msg = e.to_string();
@@ -3827,10 +3846,26 @@ fn mcp_allowlist_err(e: scp_mcp::allowlist::AllowlistError) -> ScpError {
             msg,
             code: codes::VALID_7033.to_owned(),
         },
-        AllowlistError::NotAllowed { .. } | AllowlistError::LockPoisoned => ScpError::Transport {
+        AllowlistError::NotAllowed { .. } => ScpError::Transport {
             msg,
             code: codes::TRANS_5030.to_owned(),
         },
+        // `AllowlistError` is `#[non_exhaustive]` — fail closed for any
+        // future variant by classifying as a validation error rather than
+        // letting an unknown policy decision become a permissive path.
+        _ => ScpError::Validation {
+            msg,
+            code: codes::VALID_7033.to_owned(),
+        },
+    }
+}
+
+/// Maps a `PoisonError` from the per-instance allowlist mutex to a `UniFFI`
+/// transport error.
+fn mcp_allowlist_lock_poisoned() -> ScpError {
+    ScpError::Transport {
+        msg: "stdio allowlist lock poisoned".to_owned(),
+        code: codes::TRANS_5030.to_owned(),
     }
 }
 
@@ -3839,73 +3874,14 @@ fn mcp_allowlist_err(e: scp_mcp::allowlist::AllowlistError) -> ScpError {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Stdio allowlist configuration (UniFFI)
+// Stdio allowlist configuration
+//
+// All four operations are exposed as **methods on `Scp`** (see
+// `impl Scp { mcp_configure_stdio_allowlist / … }` below). The legacy
+// `#[uniffi::export]` free functions were removed when the
+// allowlist became per-instance (`CoreFields::mcp_allowlist`); the SDKs
+// already wrap the per-instance methods.
 // ---------------------------------------------------------------------------
-
-/// Configures the MCP stdio subprocess allowlist.
-///
-/// By default, only well-known MCP server launchers are permitted (e.g.
-/// `uvx`, `npx`, `node`, `python3`). Use this function to extend the list.
-///
-/// # Arguments
-///
-/// * `additional_binaries` — Binary basenames to add to the default allowlist.
-///
-/// # Errors
-///
-/// Returns `ScpError::Validation` if any entry is invalid (path, NUL, empty).
-/// Returns `ScpError::Transport` if the allowlist lock is poisoned.
-#[uniffi::export]
-pub fn mcp_configure_stdio_allowlist(additional_binaries: Vec<String>) -> Result<(), ScpError> {
-    scp_mcp::allowlist::configure(&additional_binaries).map_err(mcp_allowlist_err)?;
-    Ok(())
-}
-
-/// Disable the stdio allowlist entirely (unrestricted mode).
-///
-/// After calling this, **any** binary name may be spawned as a subprocess.
-/// Only use when the command source is fully trusted.
-///
-/// # Errors
-///
-/// Returns `ScpError::Transport` if the allowlist lock is poisoned.
-#[uniffi::export]
-pub fn mcp_disable_stdio_allowlist() -> Result<(), ScpError> {
-    scp_mcp::allowlist::disable_enforcement().map_err(mcp_allowlist_err)?;
-    Ok(())
-}
-
-/// Reset the stdio allowlist to its default state.
-///
-/// Restores the default binaries, removes any additions, and re-enables
-/// enforcement (clears unrestricted mode).
-///
-/// # Errors
-///
-/// Returns `ScpError::Transport` if the allowlist lock is poisoned.
-#[uniffi::export]
-pub fn mcp_reset_stdio_allowlist() -> Result<(), ScpError> {
-    scp_mcp::allowlist::reset().map_err(mcp_allowlist_err)?;
-    Ok(())
-}
-
-/// Return the current stdio allowlist state.
-///
-/// Returns a record with:
-/// - `allowed`: sorted list of allowed binary names
-/// - `unrestricted`: whether the allowlist is bypassed
-///
-/// # Errors
-///
-/// Returns `ScpError::Transport` if the allowlist lock is poisoned.
-#[uniffi::export]
-pub fn mcp_get_stdio_allowlist() -> Result<McpAllowlistState, ScpError> {
-    let state = scp_mcp::allowlist::get_state().map_err(mcp_allowlist_err)?;
-    Ok(McpAllowlistState {
-        allowed: state.allowed,
-        unrestricted: state.unrestricted,
-    })
-}
 
 // ---------------------------------------------------------------------------
 // Free functions — UCAN operations
@@ -11804,10 +11780,11 @@ impl Scp {
             });
         }
 
-        let transport = McpStdioTransport::spawn(&command).map_err(|e| ScpError::Transport {
-            msg: format!("failed to connect stdio MCP client: {e}"),
-            code: codes::TRANS_5015.to_owned(),
-        })?;
+        let transport = McpStdioTransport::spawn(self.inner.core.mcp_allowlist(), &command)
+            .map_err(|e| ScpError::Transport {
+                msg: format!("failed to connect stdio MCP client: {e}"),
+                code: codes::TRANS_5015.to_owned(),
+            })?;
 
         let mut client =
             scp_mcp::client::McpClient::new(McpUniFFITransportWrapper::Stdio(transport));
@@ -11966,40 +11943,67 @@ impl Scp {
         })
     }
 
-    /// Per-instance equivalent of the free-function [`mcp_configure_stdio_allowlist`].
+    /// Configures THIS instance's MCP stdio subprocess allowlist.
     ///
-    /// The stdio allowlist is process-wide (module-level state) — this
-    /// method exists purely to give the SDK a uniform `scp.method(...)`
-    /// surface.
+    /// Operates on `self.inner.core().mcp_allowlist()` — disabling
+    /// enforcement on one `Scp` does NOT leak into another (ADR-048
+    /// multi-instance neutrality).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Validation` if any entry is invalid (path, NUL,
+    /// empty). Returns `ScpError::Transport` if the per-instance allowlist
+    /// lock is poisoned.
     pub fn mcp_configure_stdio_allowlist(
         &self,
         additional_binaries: Vec<String>,
     ) -> Result<(), ScpError> {
-        scp_mcp::allowlist::configure(&additional_binaries).map_err(mcp_allowlist_err)?;
+        let instance_id = self.inner.core.instance_id();
+        self.inner
+            .core
+            .with_mcp_allowlist(|a| a.configure(&additional_binaries))
+            .map_err(|_| mcp_allowlist_lock_poisoned())?
+            .map_err(mcp_allowlist_err)?;
+        tracing::info!(
+            instance_id,
+            added = ?additional_binaries,
+            "MCP stdio allowlist extended"
+        );
         Ok(())
     }
 
-    /// Per-instance equivalent of the free-function [`mcp_disable_stdio_allowlist`].
+    /// Disable THIS instance's stdio allowlist (unrestricted mode).
     ///
-    /// The stdio allowlist is process-wide (module-level state).
+    /// Other `Scp` instances remain unaffected.
     pub fn mcp_disable_stdio_allowlist(&self) -> Result<(), ScpError> {
-        scp_mcp::allowlist::disable_enforcement().map_err(mcp_allowlist_err)?;
+        let instance_id = self.inner.core.instance_id();
+        self.inner
+            .core
+            .with_mcp_allowlist(|a| a.disable_enforcement(instance_id))
+            .map_err(|_| mcp_allowlist_lock_poisoned())?;
         Ok(())
     }
 
-    /// Per-instance equivalent of the free-function [`mcp_reset_stdio_allowlist`].
+    /// Reset THIS instance's stdio allowlist to defaults.
     ///
-    /// The stdio allowlist is process-wide (module-level state).
+    /// Other `Scp` instances are unaffected.
     pub fn mcp_reset_stdio_allowlist(&self) -> Result<(), ScpError> {
-        scp_mcp::allowlist::reset().map_err(mcp_allowlist_err)?;
+        let instance_id = self.inner.core.instance_id();
+        self.inner
+            .core
+            .with_mcp_allowlist(scp_mcp::allowlist::StdioAllowlist::reset)
+            .map_err(|_| mcp_allowlist_lock_poisoned())?;
+        tracing::info!(instance_id, "MCP stdio allowlist reset to defaults");
         Ok(())
     }
 
-    /// Per-instance equivalent of the free-function [`mcp_get_stdio_allowlist`].
-    ///
-    /// The stdio allowlist is process-wide (module-level state).
+    /// Snapshot of THIS instance's stdio allowlist state.
     pub fn mcp_get_stdio_allowlist(&self) -> Result<McpAllowlistState, ScpError> {
-        let state = scp_mcp::allowlist::get_state().map_err(mcp_allowlist_err)?;
+        let state = self
+            .inner
+            .core
+            .with_mcp_allowlist(|a| a.snapshot())
+            .map_err(|_| mcp_allowlist_lock_poisoned())?;
         Ok(McpAllowlistState {
             allowed: state.allowed,
             unrestricted: state.unrestricted,
@@ -14180,9 +14184,6 @@ impl Scp {
 mod tests {
     use super::*;
 
-    /// Mutex to serialize MCP allowlist tests (shared global state in `scp_mcp::allowlist`).
-    static ALLOWLIST_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     /// Returns a fresh `Scp` instance for tests. Phase 4 PR 4 demolition
     /// (#1549) deleted the free-function façade; tests now drive bridge
     /// logic through an owned `Scp` instance.
@@ -15260,16 +15261,14 @@ mod tests {
         }
     }
 
-    /// Stdio allowlist: `get_state` returns default entries.
+    /// Stdio allowlist: `get_state` on a fresh instance returns defaults.
     #[test]
     fn mcp_allowlist_get_state_returns_defaults() {
-        let _guard = ALLOWLIST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Reset to clean state first.
-        mcp_reset_stdio_allowlist().expect("reset should succeed");
+        let scp = scp_test();
 
-        let state = mcp_get_stdio_allowlist().expect("get_state should succeed");
+        let state = scp
+            .mcp_get_stdio_allowlist()
+            .expect("get_state should succeed");
         assert!(!state.unrestricted, "should not be unrestricted by default");
         assert!(
             !state.allowed.is_empty(),
@@ -15286,74 +15285,113 @@ mod tests {
         );
     }
 
-    /// Stdio allowlist: configure adds entries.
+    /// Stdio allowlist: configure adds entries on this instance.
     #[test]
     fn mcp_allowlist_configure_adds_entries() {
-        let _guard = ALLOWLIST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        mcp_reset_stdio_allowlist().expect("reset should succeed");
+        let scp = scp_test();
 
-        mcp_configure_stdio_allowlist(vec!["my-custom-server".to_owned()])
+        scp.mcp_configure_stdio_allowlist(vec!["my-custom-server".to_owned()])
             .expect("configure should succeed");
 
-        let state = mcp_get_stdio_allowlist().expect("get_state should succeed");
+        let state = scp
+            .mcp_get_stdio_allowlist()
+            .expect("get_state should succeed");
         assert!(
             state.allowed.contains(&"my-custom-server".to_owned()),
             "allowlist should contain newly added entry"
         );
-
-        // Clean up.
-        mcp_reset_stdio_allowlist().expect("reset should succeed");
     }
 
     /// Stdio allowlist: configure rejects entries containing paths.
     #[test]
     fn mcp_allowlist_configure_rejects_path_entries() {
-        let _guard = ALLOWLIST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = mcp_configure_stdio_allowlist(vec!["/usr/bin/evil".to_owned()]);
+        let scp = scp_test();
+        let result = scp.mcp_configure_stdio_allowlist(vec!["/usr/bin/evil".to_owned()]);
         assert!(result.is_err(), "path entries must be rejected");
     }
 
-    /// Stdio allowlist: disable enters unrestricted mode.
+    /// Stdio allowlist: disable enters unrestricted mode for this instance.
     #[test]
     fn mcp_allowlist_disable_enters_unrestricted() {
-        let _guard = ALLOWLIST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        mcp_reset_stdio_allowlist().expect("reset should succeed");
+        let scp = scp_test();
 
-        mcp_disable_stdio_allowlist().expect("disable should succeed");
-        let state = mcp_get_stdio_allowlist().expect("get_state should succeed");
+        scp.mcp_disable_stdio_allowlist()
+            .expect("disable should succeed");
+        let state = scp
+            .mcp_get_stdio_allowlist()
+            .expect("get_state should succeed");
         assert!(state.unrestricted, "should be unrestricted after disable");
-
-        // Clean up.
-        mcp_reset_stdio_allowlist().expect("reset should succeed");
     }
 
     /// Stdio allowlist: reset restores defaults and re-enables enforcement.
     #[test]
     fn mcp_allowlist_reset_restores_defaults() {
-        let _guard = ALLOWLIST_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let scp = scp_test();
+
         // Start by disabling and adding a custom entry.
-        mcp_disable_stdio_allowlist().expect("disable should succeed");
-        mcp_configure_stdio_allowlist(vec!["custom-thing".to_owned()])
+        scp.mcp_disable_stdio_allowlist()
+            .expect("disable should succeed");
+        scp.mcp_configure_stdio_allowlist(vec!["custom-thing".to_owned()])
             .expect("configure should succeed");
 
         // Reset.
-        mcp_reset_stdio_allowlist().expect("reset should succeed");
-        let state = mcp_get_stdio_allowlist().expect("get_state should succeed");
+        scp.mcp_reset_stdio_allowlist()
+            .expect("reset should succeed");
+        let state = scp
+            .mcp_get_stdio_allowlist()
+            .expect("get_state should succeed");
 
         assert!(
             !state.unrestricted,
             "should not be unrestricted after reset"
         );
-        // custom-thing should be gone after reset.
-        // (Note: configure adds to defaults, reset removes everything non-default)
+        assert!(
+            !state.allowed.contains(&"custom-thing".to_owned()),
+            "custom entry should be gone after reset"
+        );
+    }
+
+    /// WU6: Two-instance regression test — disabling enforcement on one
+    /// `Scp` MUST NOT leak into another. Drives the public per-instance
+    /// methods that SDKs call.
+    #[test]
+    fn allowlist_disable_does_not_leak_across_instances_uniffi() {
+        let a = scp_test();
+        let b = scp_test();
+
+        a.mcp_disable_stdio_allowlist()
+            .expect("disable on a should succeed");
+
+        // `b` is unaffected.
+        let b_state = b
+            .mcp_get_stdio_allowlist()
+            .expect("get_state on b should succeed");
+        assert!(
+            !b_state.unrestricted,
+            "instance b must remain restricted after a is disabled"
+        );
+
+        // And `a` reports unrestricted.
+        let a_state = a
+            .mcp_get_stdio_allowlist()
+            .expect("get_state on a should succeed");
+        assert!(a_state.unrestricted);
+    }
+
+    /// WU6 supplement: configure on one instance does not leak.
+    #[test]
+    fn allowlist_configure_does_not_leak_across_instances_uniffi() {
+        let a = scp_test();
+        let b = scp_test();
+
+        a.mcp_configure_stdio_allowlist(vec!["custom-a".to_owned()])
+            .expect("configure on a");
+
+        let a_state = a.mcp_get_stdio_allowlist().expect("snapshot a");
+        assert!(a_state.allowed.contains(&"custom-a".to_owned()));
+
+        let b_state = b.mcp_get_stdio_allowlist().expect("snapshot b");
+        assert!(!b_state.allowed.contains(&"custom-a".to_owned()));
     }
 
     // -- Media bridge tests --------------------------------------------------

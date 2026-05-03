@@ -8,24 +8,29 @@ Phase 4 PR 5 Agent B+C (#1549) collapsed :class:`McpServer` and
 subsequent operation (``list_tools``, ``invoke``, ``stop``,
 ``disconnect``, etc.) lives on :class:`scp_sdk.SCP`.
 
-Data classes (:class:`McpProvenance`, :class:`McpToolDefinition`,
-:class:`McpToolResult`) and stdio-allowlist controls
-(:func:`configure_stdio_allowlist`, :func:`disable_stdio_allowlist`,
-:func:`reset_stdio_allowlist`, :func:`get_stdio_allowlist`) remain at
-module scope. The allowlist is process-wide static state in the Rust
-bridge, not an :class:`SCP`-scoped resource.
+Per-instance migration moved the stdio allowlist onto each :class:`SCP` instance.
+Use :meth:`scp_sdk.SCP.mcp_configure_stdio_allowlist`,
+:meth:`scp_sdk.SCP.mcp_disable_stdio_allowlist`,
+:meth:`scp_sdk.SCP.mcp_reset_stdio_allowlist`, and
+:meth:`scp_sdk.SCP.mcp_get_stdio_allowlist` — the previous module-level
+free functions were deleted because they implied a process-global state
+that no longer exists.
 
-See ``.docs/adrs/phase-3.md`` ADR-015 for the full design and ADR-048
-for the façade consolidation rationale.
+See ``.docs/adrs/phase-3.md`` ADR-015 for the full design, ADR-048 for
+the façade consolidation rationale, and ADR-048 §1 for the per-instance
+multi-instance neutrality requirement.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from scp_sdk.errors import TransportError, ValidationError
+from scp_sdk.errors import ValidationError
+
+if TYPE_CHECKING:
+    from scp_sdk.scp import McpAllowlistState
 
 logger = logging.getLogger("scp_sdk")
 
@@ -39,7 +44,7 @@ _VALID_TRANSPORTS: frozenset[str] = frozenset({"stdio", "sse"})
 #: Default allowlist of MCP server binaries for stdio transport.
 #: Matches the Rust-side ``DEFAULT_ALLOWLIST`` in ``scp-mcp/src/allowlist.rs``.
 #: The Rust layer is the single source of truth; use
-#: :func:`get_stdio_allowlist` to query the live state at runtime.
+#: :meth:`scp_sdk.SCP.mcp_get_stdio_allowlist` to query the live state at runtime.
 DEFAULT_STDIO_ALLOWLIST: frozenset[str] = frozenset(
     {
         "uvx",
@@ -56,25 +61,6 @@ DEFAULT_STDIO_ALLOWLIST: frozenset[str] = frozenset(
         "scp-mcp",
     }
 )
-
-
-# ---------------------------------------------------------------------------
-# Lazy bridge import
-# ---------------------------------------------------------------------------
-
-
-def _bridge() -> Any:
-    """Return the ``_scp_core`` extension module, imported lazily."""
-    try:
-        import _scp_core  # type: ignore[import-not-found]
-
-        return _scp_core
-    except ImportError as exc:
-        raise TransportError(
-            "The _scp_core extension module is not installed. "
-            "Install scp-python with: pip install scp-python",
-            code="SCP-MCP-10001",
-        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -174,94 +160,14 @@ class McpClient:
 
 
 # ---------------------------------------------------------------------------
-# Stdio allowlist controls — process-wide static state, not SCP-scoped.
+# Pre-flight client-connect validation
+#
+# The stdio allowlist itself is per-instance state on the Rust bridge and
+# accessed through :class:`scp_sdk.SCP` methods. This pure
+# helper validates connect parameters and, when an instance allowlist
+# snapshot is provided, performs a defense-in-depth membership check
+# before crossing the FFI boundary.
 # ---------------------------------------------------------------------------
-
-
-def configure_stdio_allowlist(
-    *,
-    additional_binaries: list[str] | None = None,
-) -> None:
-    """Add binary names to the stdio subprocess allowlist.
-
-    By default, only well-known MCP server launchers are permitted
-    (see :data:`DEFAULT_STDIO_ALLOWLIST`). Call this to extend the list
-    with custom binary names.
-
-    This is additive — previously added binaries are retained. To reset
-    to defaults, use :func:`reset_stdio_allowlist`.
-
-    Args:
-        additional_binaries: Bare binary names to add (e.g.
-            ``["my-custom-server"]``). Path separators, empty strings,
-            and NUL bytes are rejected.
-
-    Raises:
-        ValidationError: If any entry contains path separators, NUL
-            bytes, or is empty.
-    """
-    if not additional_binaries:
-        return
-
-    bridge = _bridge()
-    bridge.py_mcp_configure_stdio_allowlist(additional_binaries)
-
-
-def disable_stdio_allowlist(
-    *,
-    i_trust_all_commands: bool = False,
-) -> None:
-    """Disable the stdio allowlist entirely (unrestricted mode).
-
-    After calling this, **any** binary can be spawned as a subprocess.
-    Only use when the command source is fully trusted.
-
-    Args:
-        i_trust_all_commands: Must be ``True`` to confirm the security
-            bypass. Raises ``ValidationError`` if ``False``.
-
-    Raises:
-        ValidationError: If *i_trust_all_commands* is not ``True``.
-    """
-    if not i_trust_all_commands:
-        raise ValidationError(
-            "You must pass i_trust_all_commands=True to disable the "
-            "stdio allowlist. This allows arbitrary command execution.",
-            code="SCP-MCP-10007",
-        )
-
-    logger.warning(
-        "MCP stdio allowlist DISABLED — arbitrary commands will be "
-        "permitted. Only use this when the command source is fully "
-        "trusted."
-    )
-
-    bridge = _bridge()
-    bridge.py_mcp_disable_stdio_allowlist()
-
-
-def reset_stdio_allowlist() -> None:
-    """Reset the stdio allowlist to its default state.
-
-    Restores the default binaries, removes any additions, and
-    re-enables allowlist enforcement (clears unrestricted mode).
-    """
-    bridge = _bridge()
-    bridge.py_mcp_reset_stdio_allowlist()
-    logger.info("MCP stdio allowlist reset to defaults")
-
-
-def get_stdio_allowlist() -> dict[str, Any]:
-    """Return the current stdio allowlist state.
-
-    Returns:
-        A dict with keys:
-
-        - ``"allowed"``: sorted list of allowed binary names
-        - ``"unrestricted"``: ``True`` if the allowlist is bypassed
-    """
-    bridge = _bridge()
-    return bridge.py_mcp_get_stdio_allowlist()
 
 
 def validate_client_connect(
@@ -269,15 +175,20 @@ def validate_client_connect(
     *,
     command: list[str] | None = None,
     url: str | None = None,
+    allowlist_state: McpAllowlistState | None = None,
 ) -> None:
     """Validate MCP client connect parameters before FFI dispatch.
 
     Raises :class:`~scp_sdk.errors.ValidationError` with a canonical
-    error code when a parameter is missing or the stdio command is not
-    in the allowlist. This is the same validation the old
-    :meth:`McpClient.connect` factory performed — it's still exposed so
-    callers can pre-check arguments without round-tripping through the
-    bridge.
+    error code when a parameter is missing or the stdio command shape is
+    invalid (path, missing).
+
+    When *allowlist_state* is supplied (typically the dict returned by
+    :meth:`scp_sdk.SCP.mcp_get_stdio_allowlist`), the basename is also
+    checked against ``allowlist_state["allowed"]`` unless
+    ``allowlist_state["unrestricted"]`` is ``True``. Callers without an
+    instance can omit *allowlist_state* — the bridge will still reject
+    unlisted commands, but only after the FFI round-trip.
     """
     if transport not in _VALID_TRANSPORTS:
         raise ValidationError(
@@ -303,23 +214,33 @@ def validate_client_connect(
         binary = command[0]
         basename = os.path.basename(binary)
 
-        if binary != basename:
+        # Mirror the Rust-side `validate_command` rejection rules so the
+        # SDK pre-flight catches the same shapes the bridge would. On Unix,
+        # `os.path.basename` does not strip backslashes — explicit check
+        # covers ``..\\bin\\sh`` (the same gap `validate_command` documents
+        # in `crates/scp-mcp/src/allowlist.rs`).
+        if binary != basename or "\\" in binary:
             raise ValidationError(
                 f"command must be a bare binary name, not a path: "
                 f"'{binary}'. The OS will resolve it via PATH.",
                 code="SCP-MCP-10006",
             )
 
-        state = get_stdio_allowlist()
-        if not state["unrestricted"] and basename not in state["allowed"]:
-            allowed = sorted(state["allowed"])
-            raise ValidationError(
-                f"command '{basename}' is not in the MCP stdio allowlist. "
-                f"Allowed: {allowed}. "
-                f"Call configure_stdio_allowlist("
-                f"additional_binaries=['{basename}']) first.",
-                code="SCP-MCP-10006",
-            )
+        if allowlist_state is not None:
+            # `McpAllowlistState` is a `TypedDict` with concrete keys —
+            # access them directly so type-checkers can verify the
+            # contract instead of widening to `Any`.
+            unrestricted = allowlist_state["unrestricted"]
+            allowed_set = allowlist_state["allowed"]
+            if not unrestricted and basename not in allowed_set:
+                allowed = sorted(allowed_set)
+                raise ValidationError(
+                    f"command '{basename}' is not in the MCP stdio allowlist. "
+                    f"Allowed: {allowed}. "
+                    f"Call scp.mcp_configure_stdio_allowlist("
+                    f"['{basename}']) first.",
+                    code="SCP-MCP-10006",
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -426,9 +347,5 @@ __all__ = [
     "McpToolDefinition",
     "McpToolResult",
     "cli_main",
-    "configure_stdio_allowlist",
-    "disable_stdio_allowlist",
-    "get_stdio_allowlist",
-    "reset_stdio_allowlist",
     "validate_client_connect",
 ]

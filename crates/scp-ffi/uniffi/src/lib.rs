@@ -131,10 +131,8 @@ pub use bridge::{
     // Free functions — governance proposal lifecycle (#621)
     // Free functions — identity
     // Free functions — MCP (#591)
-    mcp_configure_stdio_allowlist,
-    mcp_disable_stdio_allowlist,
-    mcp_get_stdio_allowlist,
-    mcp_reset_stdio_allowlist,
+    // The four mcp_*_stdio_allowlist free functions were deleted in
+    // Per-instance allowlist — see `impl Scp::mcp_*` methods.
     // Free functions — provenance (#370)
     provenance_check_chain_depth,
     // Free functions — local DID management (#387)

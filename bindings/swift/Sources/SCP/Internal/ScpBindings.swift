@@ -2634,32 +2634,36 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func mcpClientListTools(handle: String) async throws  -> [McpToolInfo]
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_configure_stdio_allowlist`].
+     * Configures THIS instance's MCP stdio subprocess allowlist.
      *
-     * The stdio allowlist is process-wide (module-level state) — this
-     * method exists purely to give the SDK a uniform `scp.method(...)`
-     * surface.
+     * Operates on `self.inner.core().mcp_allowlist()` — disabling
+     * enforcement on one `Scp` does NOT leak into another (ADR-048
+     * multi-instance neutrality).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` if any entry is invalid (path, NUL,
+     * empty). Returns `ScpError::Transport` if the per-instance allowlist
+     * lock is poisoned.
      */
     func mcpConfigureStdioAllowlist(additionalBinaries: [String]) throws 
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_disable_stdio_allowlist`].
+     * Disable THIS instance's stdio allowlist (unrestricted mode).
      *
-     * The stdio allowlist is process-wide (module-level state).
+     * Other `Scp` instances remain unaffected.
      */
     func mcpDisableStdioAllowlist() throws 
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_get_stdio_allowlist`].
-     *
-     * The stdio allowlist is process-wide (module-level state).
+     * Snapshot of THIS instance's stdio allowlist state.
      */
     func mcpGetStdioAllowlist() throws  -> McpAllowlistState
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_reset_stdio_allowlist`].
+     * Reset THIS instance's stdio allowlist to defaults.
      *
-     * The stdio allowlist is process-wide (module-level state).
+     * Other `Scp` instances are unaffected.
      */
     func mcpResetStdioAllowlist() throws 
     
@@ -5011,11 +5015,17 @@ open func mcpClientListTools(handle: String)async throws  -> [McpToolInfo]  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_configure_stdio_allowlist`].
+     * Configures THIS instance's MCP stdio subprocess allowlist.
      *
-     * The stdio allowlist is process-wide (module-level state) — this
-     * method exists purely to give the SDK a uniform `scp.method(...)`
-     * surface.
+     * Operates on `self.inner.core().mcp_allowlist()` — disabling
+     * enforcement on one `Scp` does NOT leak into another (ADR-048
+     * multi-instance neutrality).
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Validation` if any entry is invalid (path, NUL,
+     * empty). Returns `ScpError::Transport` if the per-instance allowlist
+     * lock is poisoned.
      */
 open func mcpConfigureStdioAllowlist(additionalBinaries: [String])throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_method_scp_mcp_configure_stdio_allowlist(self.uniffiClonePointer(),
@@ -5025,9 +5035,9 @@ open func mcpConfigureStdioAllowlist(additionalBinaries: [String])throws   {try 
 }
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_disable_stdio_allowlist`].
+     * Disable THIS instance's stdio allowlist (unrestricted mode).
      *
-     * The stdio allowlist is process-wide (module-level state).
+     * Other `Scp` instances remain unaffected.
      */
 open func mcpDisableStdioAllowlist()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_method_scp_mcp_disable_stdio_allowlist(self.uniffiClonePointer(),$0
@@ -5036,9 +5046,7 @@ open func mcpDisableStdioAllowlist()throws   {try rustCallWithError(FfiConverter
 }
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_get_stdio_allowlist`].
-     *
-     * The stdio allowlist is process-wide (module-level state).
+     * Snapshot of THIS instance's stdio allowlist state.
      */
 open func mcpGetStdioAllowlist()throws  -> McpAllowlistState  {
     return try  FfiConverterTypeMcpAllowlistState_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
@@ -5048,9 +5056,9 @@ open func mcpGetStdioAllowlist()throws  -> McpAllowlistState  {
 }
     
     /**
-     * Per-instance equivalent of the free-function [`mcp_reset_stdio_allowlist`].
+     * Reset THIS instance's stdio allowlist to defaults.
      *
-     * The stdio allowlist is process-wide (module-level state).
+     * Other `Scp` instances are unaffected.
      */
 open func mcpResetStdioAllowlist()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_method_scp_mcp_reset_stdio_allowlist(self.uniffiClonePointer(),$0
@@ -13767,74 +13775,6 @@ public func evaluateProvenanceQuality(sourceContext: String?, sourceType: String
 })
 }
 /**
- * Configures the MCP stdio subprocess allowlist.
- *
- * By default, only well-known MCP server launchers are permitted (e.g.
- * `uvx`, `npx`, `node`, `python3`). Use this function to extend the list.
- *
- * # Arguments
- *
- * * `additional_binaries` — Binary basenames to add to the default allowlist.
- *
- * # Errors
- *
- * Returns `ScpError::Validation` if any entry is invalid (path, NUL, empty).
- * Returns `ScpError::Transport` if the allowlist lock is poisoned.
- */
-public func mcpConfigureStdioAllowlist(additionalBinaries: [String])throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_mcp_configure_stdio_allowlist(
-        FfiConverterSequenceString.lower(additionalBinaries),$0
-    )
-}
-}
-/**
- * Disable the stdio allowlist entirely (unrestricted mode).
- *
- * After calling this, **any** binary name may be spawned as a subprocess.
- * Only use when the command source is fully trusted.
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if the allowlist lock is poisoned.
- */
-public func mcpDisableStdioAllowlist()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_mcp_disable_stdio_allowlist($0
-    )
-}
-}
-/**
- * Return the current stdio allowlist state.
- *
- * Returns a record with:
- * - `allowed`: sorted list of allowed binary names
- * - `unrestricted`: whether the allowlist is bypassed
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if the allowlist lock is poisoned.
- */
-public func mcpGetStdioAllowlist()throws  -> McpAllowlistState  {
-    return try  FfiConverterTypeMcpAllowlistState_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_mcp_get_stdio_allowlist($0
-    )
-})
-}
-/**
- * Reset the stdio allowlist to its default state.
- *
- * Restores the default binaries, removes any additions, and re-enables
- * enforcement (clears unrestricted mode).
- *
- * # Errors
- *
- * Returns `ScpError::Transport` if the allowlist lock is poisoned.
- */
-public func mcpResetStdioAllowlist()throws   {try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_func_mcp_reset_stdio_allowlist($0
-    )
-}
-}
-/**
  * Activates a media session (transitions from Initiating to Active).
  *
  * Takes a JSON string representing the session and returns the updated session.
@@ -14332,18 +14272,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_evaluate_provenance_quality() != 60373) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_mcp_configure_stdio_allowlist() != 2409) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_mcp_disable_stdio_allowlist() != 46389) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_mcp_get_stdio_allowlist() != 20344) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_func_mcp_reset_stdio_allowlist() != 47824) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_func_media_activate_session() != 44695) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14770,16 +14698,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_client_list_tools() != 53196) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_configure_stdio_allowlist() != 12983) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_configure_stdio_allowlist() != 7937) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_disable_stdio_allowlist() != 51720) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_disable_stdio_allowlist() != 42656) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_get_stdio_allowlist() != 35396) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_get_stdio_allowlist() != 6897) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_reset_stdio_allowlist() != 41096) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_reset_stdio_allowlist() != 39655) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_mcp_server_create() != 11371) {

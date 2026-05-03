@@ -974,7 +974,15 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.mcpClientConnectSse] on [inner]. */
     suspend fun mcpClientConnectSse(url: String): String = inner.mcpClientConnectSse(url = url)
 
-    /** Forwards to [NativeScp.mcpClientConnectStdio] on [inner]. */
+    /**
+     * Forwards to [NativeScp.mcpClientConnectStdio] on [inner].
+     *
+     * `command[0]` is validated against THIS instance's stdio allowlist
+     * (per-instance — disabling enforcement on another [Scp] does not
+     * affect this one). To permit a binary not in the default allowlist,
+     * call [mcpConfigureStdioAllowlist] first; use [mcpGetStdioAllowlist]
+     * to inspect the current state.
+     */
     suspend fun mcpClientConnectStdio(command: List<String>): String = inner.mcpClientConnectStdio(command = command)
 
     /** Forwards to [NativeScp.mcpClientDisconnect] on [inner]. */
@@ -1005,8 +1013,26 @@ class SCP internal constructor(
             additionalBinaries = additionalBinaries,
         )
 
-    /** Forwards to [NativeScp.mcpDisableStdioAllowlist] on [inner]. */
-    fun mcpDisableStdioAllowlist() = inner.mcpDisableStdioAllowlist()
+    /**
+     * Disable this instance's stdio allowlist (unrestricted mode).
+     *
+     * After calling this, **any** binary may be spawned by
+     * [mcpClientConnectStdio] on this [Scp]. Other instances are
+     * unaffected. Pass [iTrustAllCommands] = true to confirm
+     * acknowledgement of the security implication; the call also writes
+     * a warning via `println` for operator audit.
+     */
+    fun mcpDisableStdioAllowlist(iTrustAllCommands: Boolean = false) {
+        require(iTrustAllCommands) {
+            "Disabling the stdio allowlist allows any binary to be spawned by this Scp instance. " +
+                "Pass iTrustAllCommands = true to confirm."
+        }
+        println(
+            "[scp] MCP stdio allowlist enforcement disabled — arbitrary subprocess " +
+                "spawning is now permitted on this instance",
+        )
+        inner.mcpDisableStdioAllowlist()
+    }
 
     /** Forwards to [NativeScp.mcpGetStdioAllowlist] on [inner]. */
     fun mcpGetStdioAllowlist(): McpAllowlistState = inner.mcpGetStdioAllowlist()
