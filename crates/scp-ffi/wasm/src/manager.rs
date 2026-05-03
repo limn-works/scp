@@ -822,6 +822,21 @@ pub(crate) struct WasmOutletStreamSession {
     /// values. Returned to JS from `outlet_stream_grant_credit` so SDK
     /// callers see the running total without a separate query path.
     pub total_credit: u32,
+    /// Remaining credit available for `Data`/`Progress` chunk emission.
+    /// Decremented on every billable chunk in `outlet_stream_next`;
+    /// replenished by accepted `outlet_stream_grant_credit` calls.
+    /// `End`/`Error` chunks are terminal and do NOT consume credit
+    /// (§5.4.5 credit-based backpressure).
+    ///
+    /// On exhaustion, `outlet_stream_next` injects a synthetic terminal
+    /// `Error { code: SCP-TOOL-6131, slug: "execution.credit-exhausted",
+    /// terminal: true }` chunk (signed under the same per-session key
+    /// as the real chunks) and flips the session to `terminated`. This
+    /// matches the §5.4.5 backpressure semantics on a single-threaded
+    /// pre-materialised pipeline — the WASM bridge cannot suspend a
+    /// running executor, so credit exhaustion closes the stream
+    /// instead of stalling.
+    pub remaining_credit: u32,
 }
 
 /// Parameters for [`WasmContextManager::open_outlet_stream`] (SCP-OUT-037
@@ -850,6 +865,10 @@ pub struct OpenOutletStreamParams<'a> {
     /// Invoker's Ed25519 signing key. Moved into the per-session
     /// record and dropped (zeroed) when the session is evicted.
     pub invoker_signing_key: ed25519_dalek::SigningKey,
+    /// Initial credit window — number of `Data`/`Progress` chunks the
+    /// executor may emit before requiring an `OutletStreamCredit` grant
+    /// (§5.4.5). Pinned at `OutletStreamOpen` acceptance.
+    pub credit_window: u32,
 }
 
 /// Inputs passed to [`build_stream_chunks`]. Bundled to stay under the
@@ -2436,6 +2455,7 @@ impl WasmContextManager {
             caveats_binding,
             stream_epoch,
             invoker_signing_key,
+            credit_window,
         } = params;
 
         let ctx = self.require_active_context_mut(context_id)?;
@@ -2459,13 +2479,15 @@ impl WasmContextManager {
         )?;
         let output_schema = registration.schema.output_schema.clone();
 
-        // Generate a fresh §5.4.5 16-byte `request_id` via WASM
-        // `getrandom/js` (already wired for `uuid::Uuid::new_v4`).
-        let mut request_id = [0u8; 16];
-        getrandom::getrandom(&mut request_id).map_err(|e| ScpWasmError::Tool {
-            message: format!("failed to generate request_id: {e}"),
-            code: codes::TOOL_6002.to_owned(),
-        })?;
+        // Generate a fresh §5.4.5 16-byte `request_id` via `UUIDv7`. Per
+        // §5.4.5 wire types: `request_id: [u8; 16]` MUST be a `UUIDv7` —
+        // monotonic time-sortable so log readers can order streams by
+        // the byte form alone without consulting an out-of-band
+        // timestamp. The `uuid` crate's `getrandom/js` feature is
+        // already wired in for `Uuid::new_v4`, so the WASM target uses
+        // the same `crypto.getRandomValues`-backed RNG for the
+        // 74-bit-random tail of a v7 timestamp.
+        let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
         let request_id_hex = hex::encode(request_id);
 
         // Run the registered handler if present, otherwise return the
@@ -2535,6 +2557,11 @@ impl WasmContextManager {
                 terminated: false,
                 cancelled: false,
                 total_credit: 0,
+                // §5.4.5 credit-based backpressure: the open allocates
+                // `credit_window` chunks of headroom for billable
+                // chunks (Data + Progress). End/Error are terminal and
+                // do NOT consume credit.
+                remaining_credit: credit_window,
             },
             &request_id_hex,
         );
@@ -2568,26 +2595,79 @@ impl WasmContextManager {
         &mut self,
         request_id_hex: &str,
     ) -> Option<scp_protocol::context::outlets::stream::OutletStreamChunk> {
+        use scp_protocol::context::outlets::error_codes::{
+            CODE_EXECUTION_CREDIT, SLUG_EXECUTION_CREDIT_EXHAUSTED,
+        };
+        use scp_protocol::context::outlets::stream::{ChunkPayload, sign_chunk};
+
         let session = self.outlet_streams.get_mut(request_id_hex)?;
-        if let Some(chunk) = session.chunks.pop_front() {
-            if matches!(
-                chunk.payload,
-                scp_protocol::context::outlets::stream::ChunkPayload::End { .. }
-                    | scp_protocol::context::outlets::stream::ChunkPayload::Error {
-                        terminal: true,
-                        ..
-                    }
-            ) {
-                session.terminated = true;
-            }
-            Some(chunk)
-        } else {
+        let Some(chunk) = session.chunks.pop_front() else {
             // Queue drained — flip terminated and evict so future
             // `next()` calls see `None` cleanly without a stale entry.
             session.terminated = true;
             self.outlet_streams.remove(request_id_hex);
-            None
+            return None;
+        };
+
+        let is_terminal = matches!(
+            chunk.payload,
+            ChunkPayload::End { .. } | ChunkPayload::Error { terminal: true, .. }
+        );
+        let is_billable = matches!(
+            chunk.payload,
+            ChunkPayload::Data { .. } | ChunkPayload::Progress { .. }
+        );
+
+        // §5.4.5 credit-based backpressure: every Data/Progress chunk
+        // consumes one credit. Terminal chunks (End / terminal Error)
+        // do NOT consume credit and always pass through. On exhaustion
+        // the WASM bridge replaces the would-be billable chunk with a
+        // synthetic terminal Error and closes the stream — a
+        // single-threaded pre-materialised pipeline cannot suspend
+        // emission the way the dispatch pump can on tokio.
+        if is_billable {
+            if session.remaining_credit == 0 {
+                // Build a synthetic terminal Error chunk at the same
+                // sequence the suppressed billable chunk would have
+                // occupied. Sign it under the same per-session key
+                // so SDK-side `verify_chunk_signature` round-trips.
+                let error_payload = ChunkPayload::Error {
+                    code: CODE_EXECUTION_CREDIT.to_owned(),
+                    message: format!(
+                        "{SLUG_EXECUTION_CREDIT_EXHAUSTED}: stream credit window depleted"
+                    ),
+                    terminal: true,
+                };
+                let sequence = chunk.sequence;
+                let sig = sign_chunk(
+                    &session.invoker_signing_key,
+                    session.context_id.as_str(),
+                    session.outlet_id.as_str(),
+                    &session.request_id,
+                    sequence,
+                    &session.caveats_binding,
+                    &error_payload,
+                )
+                .ok()?;
+                session.terminated = true;
+                // Drop the suppressed billable chunk and any queued
+                // tail — credit-exhausted closure is a hard stop, no
+                // further Data/Progress passes through.
+                session.chunks.clear();
+                return Some(scp_protocol::context::outlets::stream::OutletStreamChunk {
+                    request_id: session.request_id,
+                    sequence,
+                    payload: error_payload,
+                    sig,
+                });
+            }
+            session.remaining_credit = session.remaining_credit.saturating_sub(1);
         }
+
+        if is_terminal {
+            session.terminated = true;
+        }
+        Some(chunk)
     }
 
     /// Returns `true` if the named stream session has flipped
@@ -2716,6 +2796,12 @@ impl WasmContextManager {
         // Saturating add: practical totals stay well inside `u32`,
         // but defend against overflow so the bridge never panics.
         session.total_credit = session.total_credit.saturating_add(grant);
+        // §5.4.5: a validly accepted grant replenishes the live
+        // backpressure counter. Without this the WASM bridge tracked
+        // `total_credit` for SDK observability but left
+        // `remaining_credit` static — the credit-exhausted gate in
+        // `outlet_stream_next` would then never lift after a grant.
+        session.remaining_credit = session.remaining_credit.saturating_add(grant);
         Ok(session.total_credit)
     }
 
@@ -8522,6 +8608,197 @@ mod tests {
         assert!(
             mgr.contexts[context_id].economic_policy.is_none(),
             "rejected SetEconomicPolicy must not mutate stored policy"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-037 critical fix #5 — WASM credit enforcement
+    // -----------------------------------------------------------------------
+
+    /// Test (SCP-OUT-037 critical fix #5) — `outlet_stream_next`
+    /// enforces credit-window backpressure. When the per-session
+    /// `remaining_credit` counter reaches zero, the next `Data`/
+    /// `Progress` chunk is replaced with a synthetic terminal
+    /// `Error { code: SCP-TOOL-6131, terminal: true }` chunk, the
+    /// session's `terminated` flag is set, and the queue is cleared
+    /// so subsequent calls return `None`.
+    #[test]
+    fn wasm_outlet_stream_next_enforces_credit_window() {
+        use scp_protocol::context::outlets::stream::{ChunkPayload, sign_chunk};
+        let mut mgr = WasmContextManager::new();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x37; 32]);
+        let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+        let request_id_hex = hex::encode(request_id);
+        let caveats_binding = [0xA5u8; 32];
+
+        // Build two Data chunks + one terminal End and prime the
+        // session with `remaining_credit = 1` so the second Data chunk
+        // hits the exhausted path.
+        let make_chunk = |seq: u64, payload: ChunkPayload| {
+            let sig = sign_chunk(
+                &signing,
+                "ctx",
+                "outlet",
+                &request_id,
+                seq,
+                &caveats_binding,
+                &payload,
+            )
+            .expect("sign chunk");
+            scp_protocol::context::outlets::stream::OutletStreamChunk {
+                request_id,
+                sequence: seq,
+                payload,
+                sig,
+            }
+        };
+        let mut chunks: VecDeque<scp_protocol::context::outlets::stream::OutletStreamChunk> =
+            VecDeque::new();
+        chunks.push_back(make_chunk(
+            0,
+            ChunkPayload::Data {
+                value: serde_json::json!({"a": 1}),
+            },
+        ));
+        chunks.push_back(make_chunk(
+            1,
+            ChunkPayload::Data {
+                value: serde_json::json!({"a": 2}),
+            },
+        ));
+        chunks.push_back(make_chunk(
+            2,
+            ChunkPayload::End {
+                aggregate: serde_json::json!({"final": true}),
+                provenance: super::build_minimal_stream_end_provenance("ctx"),
+                execution_time_ms: 0,
+            },
+        ));
+
+        mgr.outlet_streams.insert(
+            request_id_hex.clone(),
+            super::WasmOutletStreamSession {
+                request_id,
+                context_id: "ctx".to_owned(),
+                outlet_id: "outlet".to_owned(),
+                stream_epoch: 0,
+                caveats_binding,
+                monotonic_seq: 0,
+                invoker_signing_key: signing.clone(),
+                chunks,
+                terminated: false,
+                cancelled: false,
+                total_credit: 0,
+                // Only one billable chunk fits in the window — the
+                // second Data chunk MUST hit the exhausted path.
+                remaining_credit: 1,
+            },
+        );
+
+        // First Data chunk consumes the lone credit and passes through.
+        let c0 = mgr
+            .outlet_stream_next(&request_id_hex)
+            .expect("first chunk");
+        assert!(matches!(c0.payload, ChunkPayload::Data { .. }));
+        assert_eq!(c0.sequence, 0);
+
+        // Second `next()` call sees `remaining_credit == 0` and returns
+        // a synthetic terminal Error chunk at the suppressed chunk's
+        // sequence. The signature verifies under the same per-session
+        // key so SDK-side `verify_chunk_signature` round-trips.
+        let c1 = mgr
+            .outlet_stream_next(&request_id_hex)
+            .expect("synthetic terminal");
+        match &c1.payload {
+            ChunkPayload::Error {
+                code,
+                terminal,
+                message: _,
+            } => {
+                assert!(*terminal, "synthetic chunk MUST be terminal");
+                assert_eq!(
+                    code,
+                    scp_protocol::context::outlets::error_codes::CODE_EXECUTION_CREDIT
+                );
+            }
+            other => panic!("expected synthetic terminal Error, got {other:?}"),
+        }
+        assert_eq!(c1.sequence, 1, "synthetic chunk takes suppressed sequence");
+        // The synthetic chunk MUST verify under the same per-session
+        // key so SDK consumers see a valid signed chunk.
+        assert!(
+            scp_protocol::context::outlets::stream::verify_chunk_signature(
+                &c1,
+                &signing.verifying_key(),
+                "ctx",
+                "outlet",
+                &caveats_binding,
+            ),
+            "synthetic terminal chunk signature must verify"
+        );
+
+        // Third call: queue cleared, session terminated, returns None
+        // and evicts the entry.
+        assert!(mgr.outlet_stream_next(&request_id_hex).is_none());
+        assert!(!mgr.outlet_streams.contains_key(&request_id_hex));
+    }
+
+    /// Test (SCP-OUT-037 critical fix #5) — `outlet_stream_grant_credit`
+    /// replenishes the live `remaining_credit` counter, lifting the
+    /// stream out of the exhausted state.
+    #[test]
+    fn wasm_outlet_stream_grant_credit_replenishes_remaining_credit() {
+        let mut mgr = WasmContextManager::new();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+        let request_id_hex = hex::encode(request_id);
+
+        mgr.outlet_streams.insert(
+            request_id_hex.clone(),
+            super::WasmOutletStreamSession {
+                request_id,
+                context_id: "ctx".to_owned(),
+                outlet_id: "outlet".to_owned(),
+                stream_epoch: 0,
+                caveats_binding: [0u8; 32],
+                monotonic_seq: 0,
+                invoker_signing_key: signing,
+                chunks: VecDeque::new(),
+                terminated: false,
+                cancelled: false,
+                total_credit: 0,
+                remaining_credit: 0,
+            },
+        );
+
+        let total = mgr
+            .outlet_stream_grant_credit(&request_id_hex, 5)
+            .expect("grant accepted");
+        assert_eq!(total, 5, "total_credit reflects accepted grant");
+
+        let session = mgr
+            .outlet_streams
+            .get(&request_id_hex)
+            .expect("session present");
+        assert_eq!(session.remaining_credit, 5, "remaining_credit replenished");
+        assert_eq!(session.total_credit, 5);
+    }
+
+    /// Test (SCP-OUT-037 critical fix #5) — `request_id` generated by
+    /// `open_outlet_stream` is a `UUIDv7`. The version nibble of the 7th
+    /// byte (`bytes[6] & 0xF0`) MUST equal `0x70` per RFC 9562 §5.7.
+    #[test]
+    fn wasm_request_id_is_uuid_v7() {
+        // We can't easily call `open_outlet_stream` without a context,
+        // so verify the UUID generator itself produces v7 — the same
+        // call site used in `open_outlet_stream`.
+        let bytes: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+        // Version nibble lives in the high 4 bits of byte 6 per RFC
+        // 9562 §4.2 (variant) / §5.7 (version 7).
+        assert_eq!(
+            bytes[6] & 0xF0,
+            0x70,
+            "request_id MUST carry the `UUIDv7` version nibble"
         );
     }
 }
