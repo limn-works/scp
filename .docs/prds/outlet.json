@@ -2372,7 +2372,7 @@
       "gate": "gate-streaming",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "bindings/python/scp_sdk/outlets.py",
         "bindings/typescript/src/outlets.ts",
