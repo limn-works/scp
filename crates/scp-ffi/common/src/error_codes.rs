@@ -57,6 +57,15 @@ pub const IDENT_1011: &str = "SCP-IDENT-1011";
 pub const IDENT_1012: &str = "SCP-IDENT-1012";
 /// `UniFFI` identity passphrase error.
 pub const IDENT_1013: &str = "SCP-IDENT-1013";
+/// DID method or format invalid.
+///
+/// Distinct from `IDENT_1004` (key generation failure) which is a
+/// runtime / cryptographic error category. `IDENT_1014` is for
+/// input-validation failures: unsupported DID method prefix, invalid
+/// `z`-base-32 payload, non-canonical multibase encoding, payload
+/// length wrong for the declared key type, or decoded bytes that fail
+/// curve-point validation.
+pub const IDENT_1014: &str = "SCP-IDENT-1014";
 /// Identity agent key creation.
 pub const IDENT_1020: &str = "SCP-IDENT-1020";
 /// Identity DID document error.

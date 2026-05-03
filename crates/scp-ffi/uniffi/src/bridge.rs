@@ -12802,8 +12802,9 @@ impl Scp {
                 // Determine which custody to use for key generation.
                 #[cfg(feature = "allow_in_memory_custody")]
                 if let Some(ref kc) = custody_arc {
-                    // Spec §3.7: pre-rotation key whose hash equals the
-                    // committed value is retained on the identity from
+                    // Spec §9.7.4.1 / §9.12 / ADR-003 §4b: the pre-rotation
+                    // key whose hash equals the committed value lives in
+                    // a separate `PreRotationCustody` instance from
                     // creation. Generating a fresh key here would break
                     // `verify_migration`'s SHA-256(revealed) == commitment
                     // invariant.
@@ -12883,10 +12884,11 @@ impl Scp {
                 }
 
                 if let Some(ref cc) = callback_custody {
-                    // Spec §3.7: pre-rotation key retained on identity since
-                    // creation; reusing it satisfies the
-                    // SHA-256(revealed) == commitment invariant. Callback
-                    // custody must surface the same handle on resume.
+                    // Spec §9.7.4.1 / §9.12: pre-rotation key lives in the
+                    // separate `PreRotationCustody` since creation; reusing
+                    // its handle satisfies the SHA-256(revealed) ==
+                    // commitment invariant. Callback custody MUST surface
+                    // the same handle on resume.
                     let rotated_at = scp_primitives::SystemClock.now_secs();
 
                     let dht = DidDht::new();

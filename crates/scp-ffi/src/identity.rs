@@ -2162,7 +2162,7 @@ mod tests {
             assert_eq!(doc_did, new_did);
 
             // Rotation event JSON deserializes into the canonical
-            // `DidRotationEvent` shape (spec §3.7, ADR-003 §4b/4c) so the
+            // `DidRotationEvent` shape (spec §9.12, ADR-003 §4b/4c) so the
             // SDK can distribute it to context members per §3.2.1 step 4b.
             let event: scp_identity::DidRotationEvent =
                 serde_json::from_str(&rotation_event_json).unwrap();
@@ -2170,7 +2170,7 @@ mod tests {
             assert_eq!(event.new_did, new_did);
             // Pre-rotation proof must satisfy the cryptographic invariant
             // `SHA-256(revealed_key) == commitment` — the same check
-            // recipients run via `verify_migration` (spec §3.7).
+            // recipients run via `verify_migration` (spec §9.12 / ADR-003 §4c).
             let pre_rot = event
                 .pre_rotation_proof
                 .as_ref()

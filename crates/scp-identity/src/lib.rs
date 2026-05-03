@@ -83,7 +83,13 @@ pub use scp_primitives::{DID, SigningKeyId};
 /// document as a `PreRotationCommitment` service.
 ///
 /// See ADR-003 acceptance criterion 1 and ADR-039 for the full construction.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `Debug` is implemented manually to redact opaque [`KeyHandle`] slot
+/// indices: leaking them via logs/traces enables cross-identity
+/// correlation (ordering of key creation across identities sharing a
+/// custody) without revealing key material. The DID and commitment
+/// hash are public values, so they print verbatim.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ScpIdentity {
     /// `did:dht` Identity Key (`#0`). Derives the DID string. Stored in
     /// highest-security custody (Secure Enclave, HSM). Used ONLY for DID
@@ -115,6 +121,26 @@ pub struct ScpIdentity {
 
     /// The DID string: `did:dht:z<z-base-32(identity_key.public)>`.
     pub did: String,
+}
+
+impl std::fmt::Debug for ScpIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScpIdentity")
+            .field("did", &self.did)
+            .field("identity_key", &"KeyHandle(<redacted>)")
+            .field("active_signing_key", &"KeyHandle(<redacted>)")
+            .field(
+                "agent_signing_key",
+                &self
+                    .agent_signing_key
+                    .map_or("None", |_| "KeyHandle(<redacted>)"),
+            )
+            .field(
+                "pre_rotation_commitment",
+                &format_args!("{}", hex::encode(self.pre_rotation_commitment)),
+            )
+            .finish()
+    }
 }
 
 /// Errors produced by identity operations.

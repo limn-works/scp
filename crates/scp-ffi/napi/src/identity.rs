@@ -800,7 +800,7 @@ impl NapiIdentity {
     /// See ADR-003 acceptance criterion 4b, spec §9.12, and SCP-214 criterion 10.
     /// Returns the migrated identity. The handle exposes the
     /// `DidRotationEvent` JSON via the `rotationEventJson` getter
-    /// (spec §3.7, ADR-003 §4b/4c). The SDK distributes the event to
+    /// (spec §9.12, ADR-003 §4b/4c). The SDK distributes the event to
     /// active context members per spec §3.2.1 step 4b. Wire shape is
     /// `serde_json::to_string(&scp_identity::DidRotationEvent)`.
     #[napi]
@@ -1513,7 +1513,7 @@ mod tests {
         );
 
         // Rotation event JSON deserializes into the canonical
-        // DidRotationEvent shape (spec §3.7, ADR-003 §4b/4c).
+        // DidRotationEvent shape (spec §9.12, ADR-003 §4b/4c).
         let event_json = migrated
             .rotation_event_json()
             .expect("migrated handle must surface rotationEventJson");
@@ -1523,7 +1523,7 @@ mod tests {
         assert_eq!(event.new_did, migrated.did());
         // Pre-rotation proof must satisfy the cryptographic invariant
         // `SHA-256(revealed_key) == commitment` — the same check
-        // recipients run via `verify_migration` (spec §3.7).
+        // recipients run via `verify_migration` (spec §9.12 / ADR-003 §4c).
         let pre_rot = event
             .pre_rotation_proof
             .as_ref()
