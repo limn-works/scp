@@ -35,6 +35,16 @@ package works.limn.scp
 
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
+import uniffi.scp.ContextHandle
+import uniffi.scp.Identity
+import uniffi.scp.OutletStreamHandle
+import uniffi.scp.OutletStreamSubscriber
+import uniffi.scp.computeCaveatsBinding as ffiComputeCaveatsBinding
+import uniffi.scp.outletInvokeStream as ffiOutletInvokeStream
+import uniffi.scp.outletInvokeStreamWithSubscriber as ffiOutletInvokeStreamWithSubscriber
+import uniffi.scp.outletStreamCancel as ffiOutletStreamCancel
+import uniffi.scp.outletStreamGrantCredit as ffiOutletStreamGrantCredit
+import uniffi.scp.verifyChunkSignature as ffiVerifyChunkSignature
 
 // ---------------------------------------------------------------------------
 // FFI-shaped chunk record — separate from the SDK-shaped sealed class
@@ -232,7 +242,7 @@ class OutletStreamFlow internal constructor(
      *   the grant or the stream has already terminated.
      */
     suspend fun grantCredit(grant: UInt): UInt =
-        outletStreamGrantCredit(requestIdHex = requestIdHex, grant = grant)
+        ffiOutletStreamGrantCredit(requestIdHex = requestIdHex, grant = grant)
 
     /**
      * Applies an `OutletCancel` to this stream.
@@ -291,7 +301,7 @@ suspend fun openOutletStreamSession(
     creditWindow: UInt? = null,
     estimatedChunkCount: UInt? = null,
 ): OutletStreamFlow {
-    val raw = outletInvokeStream(
+    val raw = ffiOutletInvokeStream(
         handle = contextHandle,
         outletId = outletId,
         inputJson = inputJson,
@@ -326,7 +336,7 @@ suspend fun openOutletStreamSessionWithSubscriber(
     creditWindow: UInt? = null,
     estimatedChunkCount: UInt? = null,
     subscriber: OutletStreamSubscriber,
-): String = outletInvokeStreamWithSubscriber(
+): String = ffiOutletInvokeStreamWithSubscriber(
     handle = contextHandle,
     outletId = outletId,
     inputJson = inputJson,
@@ -369,7 +379,7 @@ object OutletStreaming {
         contextId: String,
         outletId: String,
         caveatsBinding: ByteArray,
-    ): Boolean = works.limn.scp.verifyChunkSignature(
+    ): Boolean = ffiVerifyChunkSignature(
         chunkJson = chunkJson,
         operatorPk = operatorPk,
         contextId = contextId,
@@ -397,7 +407,7 @@ object OutletStreaming {
         invokerDid: String,
         estimatedChunkCount: UInt,
         effectiveCaveatsJson: String,
-    ): ByteArray = works.limn.scp.computeCaveatsBinding(
+    ): ByteArray = ffiComputeCaveatsBinding(
         ucanCid = ucanCid,
         requestId = requestId,
         invokerDid = invokerDid,
@@ -414,7 +424,7 @@ object OutletStreaming {
      */
     @JvmStatic
     suspend fun grantCredit(requestIdHex: String, grant: UInt): UInt =
-        outletStreamGrantCredit(requestIdHex = requestIdHex, grant = grant)
+        ffiOutletStreamGrantCredit(requestIdHex = requestIdHex, grant = grant)
 
     /**
      * Applies an `OutletCancel` to an active stream by [requestIdHex].
@@ -424,5 +434,20 @@ object OutletStreaming {
      */
     @JvmStatic
     suspend fun cancel(requestIdHex: String, nextSeq: ULong? = null): ULong? =
-        outletStreamCancel(requestIdHex = requestIdHex, nextSeq = nextSeq)
+        ffiOutletStreamCancel(requestIdHex = requestIdHex, nextSeq = nextSeq)
 }
+
+/**
+ * Module-internal alias for the UniFFI-generated `outletStreamGrantCredit`
+ * — exposed at the `works.limn.scp` package scope so SDK code in
+ * `Outlets.kt` (the `InvocationHandle.grantCredit` method) can call it
+ * without importing from the generated `uniffi.scp` package.
+ */
+internal suspend fun outletStreamGrantCredit(requestIdHex: String, grant: UInt): UInt =
+    ffiOutletStreamGrantCredit(requestIdHex = requestIdHex, grant = grant)
+
+/**
+ * Module-internal alias for the UniFFI-generated `outletStreamCancel`.
+ */
+internal suspend fun outletStreamCancel(requestIdHex: String, nextSeq: ULong? = null): ULong? =
+    ffiOutletStreamCancel(requestIdHex = requestIdHex, nextSeq = nextSeq)

@@ -113,23 +113,30 @@ sealed class OutletErrorDetail {
  * Branded newtype for an Outlet credit grant. Constructor rejects zero
  * with [InvalidGrant] under the [OutletError] hierarchy (round-6 unified
  * error type — replaces the round-5 `IllegalArgumentException`).
+ *
+ * Per OUT-038 AC9 / AC10 the constructor itself raises [InvalidGrant]
+ * for `raw == 0u` so all four SDKs surface a uniform exception class
+ * for the zero-rejection rule. Per OUT-038 AC10 the Kotlin compiler
+ * rejects passing a raw [UInt] where [Credit] is expected.
  */
 @JvmInline
 value class Credit(val raw: UInt) {
     init {
-        require(raw > 0u) { "Credit must be > 0; use OutletError.InvalidGrant for the typed reject" }
+        if (raw == 0u) {
+            throw InvalidGrant(raw)
+        }
     }
 }
 
 /**
- * Construct a [Credit] from a raw [UInt]. Throws [InvalidGrant] (under the
- * [OutletError] hierarchy) on `raw == 0u` so all four SDKs surface the same
- * exception class for the same condition.
+ * Backward-compat factory — equivalent to [Credit] constructor.
+ *
+ * Pre-OUT-038 callers used `creditOf(...)`; the round-6 spec promoted
+ * the constructor itself to be the validating factory so all four SDKs
+ * share the same construction idiom. Retained so existing call sites
+ * keep compiling.
  */
-fun creditOf(raw: UInt): Credit {
-    if (raw == 0u) throw InvalidGrant(raw)
-    return Credit(raw)
-}
+fun creditOf(raw: UInt): Credit = Credit(raw)
 
 /**
  * Branded newtype for §5.4.4 catalog keys.
@@ -343,6 +350,25 @@ class InvalidGrant(val grant: UInt) : OutletProtocolError(
     message = "invalid grant ${'$'}grant: must be in (0, 2^32 - 1]",
     code = "SCP-TOOL-6101",
     slug = "protocol.invalid-grant",
+)
+
+/**
+ * SCP-OUT-038 lifecycle-violation error. Raised when control-plane
+ * methods (`grantCredit`, `cancel`) are invoked on an
+ * [InvocationHandle] whose stream has already emitted a terminal
+ * chunk (`End` or `Error{terminal: true}`).
+ *
+ * Per AC13 the lifecycle error sits at the SAME inheritance depth as
+ * the other protocol-class siblings (`InvalidGrant`, catalog-rotation,
+ * stream-already-open, unknown-session): the parent class is
+ * [OutletProtocolError], NOT [OutletError] directly. This makes
+ * `catch (e: OutletProtocolError)` catch every protocol-class
+ * violation uniformly across SDKs.
+ */
+class StreamAlreadyClosed(message: String? = null) : OutletProtocolError(
+    message = message ?: "stream has already terminated; control-plane methods rejected",
+    code = "SCP-TOOL-6102",
+    slug = "protocol.stream-already-closed",
 )
 
 // ---------------------------------------------------------------------------

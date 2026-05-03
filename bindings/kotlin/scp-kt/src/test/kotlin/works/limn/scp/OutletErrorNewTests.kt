@@ -11,6 +11,12 @@ import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Test
 
+/** Shorthand factory for [CatalogKey] used by the tests below. */
+private fun catalogKey(raw: String): CatalogKey = CatalogKey.of(raw)
+
+/** Shorthand factory for [OutletId] used by the tests below. */
+private fun outletId(raw: String): OutletId = OutletId.of(raw)
+
 class OutletErrorNewTests {
 
     @AfterEach
@@ -40,14 +46,19 @@ class OutletErrorNewTests {
     fun `new options-object returns AuthorizationError for class authorization`() {
         val key = catalogKey("authorization.denied")
         val opts = OutletErrorNewOptions(
-            outletId = "outlet-test",
+            outletId = outletId("outlet-test"),
             catalogKey = key,
             errorClass = OutletErrorClass.AUTHORIZATION,
         )
         val err = OutletError.new(opts)
-        assertEquals("authorization", err::class.simpleName?.let { _ ->
-            (err as OutletError).javaClass.simpleName.lowercase().contains("authorization")
-        }.toString())
+        // The original assertion compared `"authorization"` against the
+        // stringified result of a `.contains(...)` call (always
+        // `"true"`/`"false"`) — a pre-existing test bug. Restore the
+        // intended invariant: the constructed instance must be an
+        // `AuthorizationError` and its class-wire discriminator must
+        // be `AUTHORIZATION`.
+        assertEquals(true, err is AuthorizationError)
+        assertEquals(OutletErrorClass.AUTHORIZATION, (err as AuthorizationError).classWire)
     }
 
     @Test
@@ -55,7 +66,7 @@ class OutletErrorNewTests {
         assertThrows(IllegalArgumentException::class.java) {
             OutletErrorNewBridgeOptions(
                 contextId = "ctx-1",
-                outletId = "outlet-1",
+                outletId = outletId("outlet-1"),
                 registrationEventId = ByteArray(8),
                 catalogKey = catalogKey("authorization.denied"),
                 errorClass = OutletErrorClass.AUTHORIZATION,
@@ -68,7 +79,7 @@ class OutletErrorNewTests {
         assertThrows(IllegalArgumentException::class.java) {
             OutletErrorNewBridgeOptions(
                 contextId = "ctx-1",
-                outletId = "outlet-1",
+                outletId = outletId("outlet-1"),
                 registrationEventId = ByteArray(32),
                 catalogKey = catalogKey("authorization.denied"),
                 errorClass = OutletErrorClass.AUTHORIZATION,
@@ -81,7 +92,7 @@ class OutletErrorNewTests {
     fun `newViaBridge delegates to OutletErrorBridge`() = runTest {
         val expected = OutletError.new(
             OutletErrorNewOptions(
-                outletId = "outlet-test",
+                outletId = outletId("outlet-test"),
                 catalogKey = catalogKey("authorization.denied"),
                 errorClass = OutletErrorClass.AUTHORIZATION,
             ),
@@ -105,7 +116,7 @@ class OutletErrorNewTests {
 
         val opts = OutletErrorNewBridgeOptions(
             contextId = "ctx-1",
-            outletId = "outlet-test",
+            outletId = outletId("outlet-test"),
             registrationEventId = ByteArray(32),
             catalogKey = catalogKey("authorization.denied"),
             errorClass = OutletErrorClass.AUTHORIZATION,

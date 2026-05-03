@@ -15,6 +15,17 @@ package works.limn.scp
 import java.security.SecureRandom
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
+import kotlinx.coroutines.flow.flow
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.booleanOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.doubleOrNull
+import kotlinx.serialization.json.longOrNull
 
 // ---------------------------------------------------------------------------
 // SessionId — @JvmInline value-class newtype (API MAJOR 28).
@@ -101,9 +112,10 @@ fun newSessionId(now: Long = System.currentTimeMillis()): SessionId {
 @JvmInline
 value class DID(val raw: String)
 
-/** Distinct `OutletId` value class. */
-@JvmInline
-value class OutletId(val raw: String)
+// `OutletId` (a branded newtype) is defined in `Errors.kt` so the
+// §5.4.4 sealed error hierarchy and the OUT-031 round-6 swap-risk fix
+// can share a single canonical declaration. Re-importing it here is
+// not necessary because both definitions live in the same package.
 
 /**
  * Outlet semantic class (§5.4.2).
@@ -358,9 +370,23 @@ sealed class OutletError(message: String, val code: String) : RuntimeException(m
  * Supports BOTH consumption patterns (API MAJOR 21, review item 32):
  *
  * * `val agg = handle.aggregate()` — suspends until the terminal `End`
- *   chunk is emitted; returns the aggregate value.
+ *   chunk is emitted; returns the aggregate value (validated against
+ *   the registered `aggregateSchemaJson` per OUT-038 AC12).
  * * `handle.asFlow().collect { chunk -> ... }` — iterate chunks via
- *   [Flow]<[OutletStreamChunk]>.
+ *   [Flow]<[OutletStreamChunk]>. Per OUT-038 AC14 the flow yields the
+ *   terminal `End` chunk too — 10 Data + End ⇒ 11 chunks observed.
+ *
+ * SCP-OUT-038 control plane (AC9-10): every handle exposes
+ * `grantCredit(grant: Credit)` and `cancel()` suspend functions. When
+ * the handle wraps a real §5.4.5 streaming session the methods route
+ * to the UniFFI `outletStreamGrantCredit` / `outletStreamCancel`
+ * exports. When the handle wraps a degenerate single-shot invocation
+ * the End chunk arrives synchronously and the control-plane methods
+ * raise [StreamAlreadyClosed] per AC13.
+ *
+ * Lifecycle guard (AC13): once a terminal chunk is observed via the
+ * flow OR the aggregate await path, subsequent control-plane calls
+ * raise [StreamAlreadyClosed].
  *
  * Implementations MUST buffer chunks so both APIs see the same stream;
  * a handle is expected to be consumed by only one API per invocation.
@@ -368,12 +394,155 @@ sealed class OutletError(message: String, val code: String) : RuntimeException(m
 class InvocationHandle internal constructor(
     private val aggregateFn: suspend () -> Aggregate,
     private val flowFn: () -> Flow<OutletStreamChunk>,
+    private val requestIdHex: String? = null,
+    private val aggregateSchemaJson: String? = null,
 ) {
-    /** Suspends until the terminal `End` chunk and returns the aggregate. */
-    suspend fun aggregate(): Aggregate = aggregateFn()
+    private val terminatedFlag = java.util.concurrent.atomic.AtomicBoolean(false)
 
-    /** Returns a cold [Flow] over the outlet's chunks (§5.4.5). */
-    fun asFlow(): Flow<OutletStreamChunk> = flowFn()
+    /** `true` once a terminal chunk has been observed (AC13). */
+    val isTerminated: Boolean
+        get() = terminatedFlag.get()
+
+    /** Suspends until the terminal `End` chunk and returns the aggregate. */
+    suspend fun aggregate(): Aggregate {
+        val agg = aggregateFn()
+        terminatedFlag.set(true)
+        validateAggregate(agg)
+        return agg
+    }
+
+    /** Returns a cold [Flow] over the outlet's chunks (§5.4.5). Per
+     *  OUT-038 AC14 the flow yields the terminal End chunk; the flow
+     *  is augmented with a side effect that flips the lifecycle flag
+     *  on terminal observation so subsequent control-plane calls
+     *  fail-fast with [StreamAlreadyClosed]. */
+    fun asFlow(): Flow<OutletStreamChunk> = flow {
+        flowFn().collect { chunk ->
+            if (chunk is OutletStreamChunk.End ||
+                (chunk is OutletStreamChunk.Error && chunk.terminal)
+            ) {
+                terminatedFlag.set(true)
+            }
+            emit(chunk)
+        }
+    }
+
+    /**
+     * SCP-OUT-038 AC9/AC11 — issues an additional credit grant for
+     * the underlying §5.4.5 stream session.
+     *
+     * `grant` MUST be a typed [Credit] value; the Kotlin compiler
+     * rejects passing a raw [UInt] where [Credit] is expected (AC10).
+     * The [Credit] constructor itself raises [InvalidGrant] for
+     * `raw == 0u` so the zero-rejection rule is uniform across SDKs.
+     *
+     * @throws StreamAlreadyClosed (AC13) when the stream has already
+     *   emitted a terminal chunk.
+     */
+    suspend fun grantCredit(grant: Credit): UInt {
+        if (terminatedFlag.get()) {
+            throw StreamAlreadyClosed(
+                "grantCredit rejected: stream has already emitted a terminal chunk",
+            )
+        }
+        val rid = requestIdHex
+            ?: throw StreamAlreadyClosed(
+                "grantCredit rejected: handle was opened without a streaming session " +
+                    "(degenerate single-shot invoke; the End chunk arrived synchronously)",
+            )
+        return outletStreamGrantCredit(requestIdHex = rid, grant = grant.raw)
+    }
+
+    /**
+     * SCP-OUT-038 AC9 — cancels the active stream (§5.4.5 cancel-ack).
+     *
+     * @return Recorded cancel-ack sequence, or `null` when the stream
+     *   had already reached a terminal chunk at the moment the cancel
+     *   reached the runtime (idempotent per §5.4.5).
+     * @throws StreamAlreadyClosed (AC13) when the stream has already
+     *   emitted a terminal chunk.
+     */
+    suspend fun cancel(nextSeq: ULong? = null): ULong? {
+        if (terminatedFlag.get()) {
+            throw StreamAlreadyClosed(
+                "cancel rejected: stream has already emitted a terminal chunk",
+            )
+        }
+        val rid = requestIdHex
+            ?: throw StreamAlreadyClosed(
+                "cancel rejected: handle was opened without a streaming session " +
+                    "(degenerate single-shot invoke; the End chunk arrived synchronously)",
+            )
+        return outletStreamCancel(requestIdHex = rid, nextSeq = nextSeq)
+    }
+
+    /**
+     * SCP-OUT-038 AC12 — validate the End.aggregate payload against
+     * the registered `aggregateSchemaJson`. No-op when no schema is
+     * bound. The validator performs a structural pass-through (type
+     * match + required fields) using `kotlinx.serialization.json`
+     * (already a project dep) — the bridge has already validated at
+     * registration time per §5.4.5; this SDK-side hook is defense in
+     * depth.
+     */
+    @Suppress("CyclomaticComplexMethod", "ReturnCount", "ThrowsCount")
+    private fun validateAggregate(agg: Aggregate) {
+        val schemaJson = aggregateSchemaJson ?: return
+        val schema = runCatching {
+            Json.parseToJsonElement(schemaJson)
+        }.getOrNull() as? JsonObject ?: return
+        val aggValue = runCatching {
+            Json.parseToJsonElement(agg.valueJson)
+        }.getOrNull() ?: throw OutletProtocolError(
+            message = "End.aggregate is not valid JSON",
+            code = "SCP-TOOL-6140",
+            slug = "output.invalid-json",
+        )
+        val declaredType = (schema["type"] as? JsonPrimitive)?.contentOrNull
+        if (!declaredType.isNullOrEmpty()) {
+            val actual = jsonValueTypeName(aggValue)
+            val matches = declaredType == actual ||
+                (declaredType == "number" && actual == "integer") ||
+                (declaredType == "object" && actual == "object")
+            if (!matches) {
+                throw OutletProtocolError(
+                    message = "End.aggregate type '$actual' does not match aggregate_schema type '$declaredType'",
+                    code = "SCP-TOOL-6140",
+                    slug = "output.type-mismatch",
+                )
+            }
+        }
+        val required = schema["required"] as? JsonArray
+        val aggObj = aggValue as? JsonObject
+        if (required != null && aggObj != null) {
+            for (entry in required) {
+                val field = (entry as? JsonPrimitive)?.contentOrNull
+                    ?: continue
+                if (!aggObj.containsKey(field)) {
+                    throw OutletProtocolError(
+                        message = "End.aggregate missing required field '$field' per aggregate_schema",
+                        code = "SCP-TOOL-6140",
+                        slug = "output.missing-required-field",
+                    )
+                }
+            }
+        }
+    }
+
+    private fun jsonValueTypeName(value: JsonElement): String {
+        return when (value) {
+            is JsonArray -> "array"
+            is JsonObject -> "object"
+            is JsonNull -> "null"
+            is JsonPrimitive -> when {
+                value.isString -> "string"
+                value.booleanOrNull != null -> "boolean"
+                value.longOrNull != null -> "integer"
+                value.doubleOrNull != null -> "number"
+                else -> "unknown"
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
