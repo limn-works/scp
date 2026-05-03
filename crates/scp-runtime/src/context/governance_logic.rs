@@ -197,7 +197,7 @@ pub struct ConsequenceStateSplit<'a> {
 
 impl<'a> ConsequenceStateSplit<'a> {
     /// Build a split-borrow from the legacy [`PerContextState`].
-    pub fn from_legacy(ctx: &'a mut PerContextState) -> Self {
+    pub const fn from_legacy(ctx: &'a mut PerContextState) -> Self {
         Self {
             governance: &mut ctx.governance,
             role_state: &mut ctx.role_state,

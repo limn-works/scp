@@ -1454,9 +1454,9 @@ impl PerContextState {
 /// channel is provided, sends a sanitized copy on it too.
 ///
 /// Free-function form of `PerContextState::emit_event` (legacy) and the
-/// per-helper `emit_event` shims (broadcast, ttl_close). Used by both the
+/// per-helper `emit_event` shims (broadcast, `ttl_close`). Used by both the
 /// legacy state and the actor [`crate::context::actor::state::PerContextState`]
-/// so the WelcomeGenerated suppression and payload-stripping invariants
+/// so the `WelcomeGenerated` suppression and payload-stripping invariants
 /// stay in one place. ADR-049 Phase 2A.7 — extracted so messaging-domain
 /// helpers can emit events without going through a wrapper method.
 ///

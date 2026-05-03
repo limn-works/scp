@@ -264,6 +264,11 @@ async fn handle_send_message(
 }
 
 /// Handle [`MessagingCommand::DeliverIncoming`] (actor-shape).
+///
+/// `deliver_incoming` is sync (no awaits in the actor body), so we
+/// wrap it in `async {...}` to keep the per-call transport-timeout
+/// budget. Precedent: `handlers::broadcast::handle_broadcast_*` wraps
+/// sync helpers the same way.
 async fn handle_deliver_incoming(
     state: &mut PerContextState,
     deps: &ActorDeps,
@@ -271,12 +276,9 @@ async fn handle_deliver_incoming(
     envelope_bytes: &[u8],
     reply: crate::context::actor::commands::DeliverIncomingReply,
 ) -> Outcome<()> {
-    let deliver_fut = crate::context::messaging_helpers::deliver_incoming(
-        state,
-        deps,
-        context_id,
-        envelope_bytes,
-    );
+    let deliver_fut = async {
+        crate::context::messaging_helpers::deliver_incoming(state, deps, context_id, envelope_bytes)
+    };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, deliver_fut).await {
         Ok(Ok(opt)) => (Outcome::ok_mutated(()), Ok(opt)),

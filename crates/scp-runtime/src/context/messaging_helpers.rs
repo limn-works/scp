@@ -658,7 +658,6 @@ pub async fn send_message(
         payload,
         signing_key,
     )
-    .await
 }
 
 // ---------------------------------------------------------------------------
@@ -669,8 +668,12 @@ pub async fn send_message(
 /// (actor-shape). Returns the decrypted plaintext + sender DID for
 /// application messages, `None` for management messages or buffered
 /// out-of-order arrivals.
+///
+/// Sync — no await points in the actor body. The handler wraps the
+/// call in `async {...}` so the per-call transport-timeout budget
+/// still applies.
 #[allow(clippy::too_many_lines)]
-pub async fn deliver_incoming(
+pub fn deliver_incoming(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -687,7 +690,9 @@ pub async fn deliver_incoming(
         .member_dids()
         .find(|d| local_dids.contains(*d))
         .map(std::string::ToString::to_string)
-        .ok_or_else(|| ContextError::CryptoFailed("no local member found in this context".into()))?;
+        .ok_or_else(|| {
+            ContextError::CryptoFailed("no local member found in this context".into())
+        })?;
     let access_key = state
         .access
         .access_key_store
@@ -770,7 +775,15 @@ pub async fn deliver_incoming(
             }
         }
         SequenceCheck::Ahead { expected: _ } => {
-            buffer_ahead_message(state, deps, context_id, &inner, &sender_did, &plaintext, now_ms)?;
+            buffer_ahead_message(
+                state,
+                deps,
+                context_id,
+                &inner,
+                &sender_did,
+                &plaintext,
+                now_ms,
+            );
             Ok(None)
         }
     }
@@ -877,9 +890,10 @@ pub async fn capture_send_payment(
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
 ) {
     if let Some(a) = auth
-        && let Err(e) =
-            crate::context::economy_helpers::complete_paid_action(state, deps, a, sender_did, context_id)
-                .await
+        && let Err(e) = crate::context::economy_helpers::complete_paid_action(
+            state, deps, a, sender_did, context_id,
+        )
+        .await
     {
         // H8: do NOT rollback budget — service was delivered.
         tracing::warn!(
@@ -951,8 +965,12 @@ fn record_payment_capture_failure(
 /// Pushes a `MessageSent` event, appends to the event log, runs
 /// consequence enforcement, and persists. Actor-shape: no relock
 /// dance — `state` is borrowed throughout.
+///
+/// Sync — no await points in the actor body. The caller (`send_message`)
+/// stays `async` because it threads through escrow / transport awaits
+/// before `finalize_send`.
 #[allow(clippy::too_many_arguments)]
-pub async fn finalize_send(
+pub fn finalize_send(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -998,12 +1016,8 @@ pub async fn finalize_send(
         &*deps.event_log,
     );
     let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
-    let send_triggered = evaluate_consequence_rules(
-        &consequence_rules,
-        &send_events,
-        sender_did.as_ref(),
-        now,
-    );
+    let send_triggered =
+        evaluate_consequence_rules(&consequence_rules, &send_events, sender_did.as_ref(), now);
     {
         let mut split = crate::context::governance_logic::ConsequenceStateSplit {
             governance: &mut state.governance,
@@ -1298,7 +1312,7 @@ pub fn buffer_ahead_message(
     sender_did: &str,
     plaintext: &[u8],
     now_ms: u64,
-) -> Result<(), ContextError> {
+) {
     let buffered_msg = scp_protocol::envelope::validation::BufferedMessage {
         inner: inner.clone(),
         sender_did: sender_did.to_owned(),
@@ -1361,8 +1375,6 @@ pub fn buffer_ahead_message(
             }
         }
     }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1490,11 +1502,10 @@ pub fn deliver_message_and_drain_buffered(
                 .velocity_tracker
                 .record_message(&DID(sender_did.to_owned()), now);
         }
-        if let Err(e) = deps.event_log.append_context_event(
-            context_id_bytes,
-            "PseudonymAnnounced",
-            sender_did,
-        ) {
+        if let Err(e) =
+            deps.event_log
+                .append_context_event(context_id_bytes, "PseudonymAnnounced", sender_did)
+        {
             tracing::warn!(
                 context_id,
                 sender_did,
@@ -1594,9 +1605,9 @@ pub fn deliver_message_and_drain_buffered(
     }
 
     // H5: append durable event log entry BEFORE consequence eval.
-    if let Err(e) = deps
-        .event_log
-        .append_context_event(context_id_bytes, "MessageReceived", sender_did)
+    if let Err(e) =
+        deps.event_log
+            .append_context_event(context_id_bytes, "MessageReceived", sender_did)
     {
         tracing::warn!(
             context_id,
