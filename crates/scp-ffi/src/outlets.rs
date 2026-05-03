@@ -413,7 +413,7 @@ pub fn py_outlet_register(context_id: &str, registration: &Bound<'_, PyDict>) ->
 /// Runs the full 11-step ADR-016 pipeline, requiring `outlet_call:{outlet_id}`
 /// or `outlet_call:*` capability. Extracted to keep `py_outlet_invoke` within
 /// the 100-line clippy limit.
-fn validate_outlet_ucan(
+pub(crate) fn validate_outlet_ucan(
     context_id: &str,
     outlet_id: &str,
     ucan_token: &str,

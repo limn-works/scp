@@ -62,6 +62,7 @@ pub mod event_log;
 pub mod identity;
 pub mod mcp;
 pub mod media;
+pub mod outlet_stream;
 pub mod outlets;
 pub mod provenance;
 pub mod runtime;
@@ -353,6 +354,7 @@ pub fn _scp_core(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     discovery::register_discovery(m)?;
     economy::register_economy(m)?;
     outlets::register_outlets(m)?;
+    outlet_stream::register_outlet_stream(m)?;
     transport::register_transport(m)?;
     ucan::register_ucan(m)?;
     event_log::register_event_log(m)?;

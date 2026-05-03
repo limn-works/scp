@@ -400,6 +400,17 @@ pub struct PyBridgeInstance {
     /// which is only compiled with that feature.
     #[cfg(feature = "allow_in_memory_custody")]
     pub(crate) network: std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>>,
+
+    /// SCP-OUT-037 — per-bridge stream registry keyed by §5.4.5 16-byte
+    /// `request_id` rendered as 32-char lowercase hex. Each entry holds
+    /// the `StreamSessionHandle` returned by
+    /// [`scp_runtime::context::manager::ContextManager::open_outlet_stream`]
+    /// plus the per-stream monotonic-grant counter and the
+    /// `SCP-OUTLET-CREDIT-V1:` preimage signing material. Cleared by
+    /// `BridgeInstanceCore::bridge_specific_shutdown` so any in-flight
+    /// streams' handles drop during instance shutdown.
+    pub(crate) outlet_stream_registry:
+        Arc<DashMap<String, Arc<crate::outlet_stream::StreamRegistryEntry>>>,
 }
 
 impl PyBridgeInstance {
@@ -421,6 +432,7 @@ impl PyBridgeInstance {
             connected_relay_url: RwLock::new(None),
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -443,6 +455,7 @@ impl PyBridgeInstance {
             connected_relay_url: RwLock::new(None),
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -511,6 +524,7 @@ impl PyBridgeInstance {
                             connected_relay_url: RwLock::new(None),
                             #[cfg(feature = "allow_in_memory_custody")]
                             network: std::sync::Mutex::new(None),
+                            outlet_stream_registry: Arc::new(DashMap::new()),
                         };
                         let _ = instance
                             .storage_provider
@@ -568,6 +582,19 @@ impl PyBridgeInstance {
         &self,
     ) -> &Arc<DashMap<String, crate::mcp::McpServerState>> {
         &self.mcp_server_registry
+    }
+
+    /// Returns a reference to the SCP-OUT-037 outlet-stream registry.
+    ///
+    /// `pub(crate)` because `StreamRegistryEntry` is itself `pub(crate)`.
+    /// Used by `crate::outlet_stream` to look up active stream
+    /// `StreamSessionHandle`s by §5.4.5 `request_id` (rendered as
+    /// 32-char lowercase hex).
+    #[must_use]
+    pub(crate) const fn outlet_stream_registry(
+        &self,
+    ) -> &Arc<DashMap<String, Arc<crate::outlet_stream::StreamRegistryEntry>>> {
+        &self.outlet_stream_registry
     }
 
     /// Returns a reference to the MCP client registry.
@@ -703,6 +730,9 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // connections drop, allowing background tasks to terminate cleanly.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
+        // Clear the SCP-OUT-037 outlet-stream registry so any in-flight
+        // `StreamSessionHandle` entries drop — ending background pump tasks.
+        self.outlet_stream_registry.clear();
     }
 }
 
