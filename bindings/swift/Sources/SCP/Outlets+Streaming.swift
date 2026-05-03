@@ -135,34 +135,18 @@ public struct OutletStreamIterator: AsyncIteratorProtocol, Sendable {
 
 // MARK: - Context streaming entry points
 
-public extension Context {
-    /// Opens a §5.4.5 streaming outlet invocation and returns an
-    /// `AsyncSequence` of chunks.
+extension Context {
+    /// Internal §5.4.5 streaming entry point. Per SCP-OUT-038 AC1 the
+    /// public surface exposes ONLY `ctx.outlets.invoke(...)`; this
+    /// helper is `internal` so the SDK's invoke implementation can
+    /// open a streaming session without surfacing the verb at the
+    /// public API.
     ///
-    /// Mirrors the PyO3 / NAPI / SDK contracts: re-validates the UCAN
-    /// under the full 11-step ADR-016 pipeline, reserves a per-stream
-    /// `request_id`, and registers the session for later
+    /// Mirrors the PyO3 / NAPI / Kotlin contracts: re-validates the
+    /// UCAN under the full 11-step ADR-016 pipeline, reserves a
+    /// per-stream `request_id`, and registers the session for later
     /// `grantCredit` / `cancel` lookups.
-    ///
-    /// - Parameters:
-    ///   - outletId: Outlet to invoke.
-    ///   - inputJson: JSON-encoded input matching the outlet's input
-    ///     schema.
-    ///   - ucanToken: UCAN authorising the invocation.
-    ///   - caveatsBindingHex: 32-byte `caveats_binding` rendered as
-    ///     64-char lowercase hex. Compute via
-    ///     ``OutletsStreaming/computeCaveatsBinding(ucanCid:requestId:invokerDid:estimatedChunkCount:effectiveCaveatsJson:)``.
-    ///   - streamEpoch: Hosting context's MLS epoch counter at open
-    ///     acceptance.
-    ///   - proofTokens: Optional encoded parent UCANs for delegation-
-    ///     chain traversal.
-    ///   - creditWindow: Initial credit-window size; defaults to §5.4.5
-    ///     `DEFAULT_CREDIT_WINDOW` when `nil`.
-    ///   - estimatedChunkCount: Optional upper bound on billable chunks.
-    /// - Returns: An ``OutletStreamSequence`` ready for `for await`
-    ///   iteration. Use ``OutletStreamSequence/grantCredit(_:)`` /
-    ///   ``OutletStreamSequence/cancel(nextSeq:)`` to manage flow.
-    func openOutletStream(
+    func openOutletStreamSession(
         outletId: String,
         inputJson: String,
         ucanToken: String,
@@ -187,15 +171,11 @@ public extension Context {
         return OutletStreamSequence(handle: raw)
     }
 
-    /// Push-style variant of ``openOutletStream`` that drives every
-    /// chunk into a caller-supplied `OutletStreamSubscriber`. Returns
-    /// the 32-char hex `request_id` so the caller can address the
-    /// active stream from
-    /// ``OutletsStreaming/grantCredit(requestIdHex:grant:)`` /
-    /// ``OutletsStreaming/cancel(requestIdHex:nextSeq:)`` before the
-    /// pump exits.
+    /// Push-style variant of `openOutletStreamSession` — internal per
+    /// AC1; routes through the streaming UniFFI export with a caller-
+    /// supplied `OutletStreamSubscriber`.
     @discardableResult
-    func openOutletStreamWithSubscriber(
+    func openOutletStreamSessionWithSubscriber(
         outletId: String,
         inputJson: String,
         ucanToken: String,
@@ -220,6 +200,97 @@ public extension Context {
             subscriber: subscriber
         )
     }
+}
+
+/// Drains an open `OutletStreamHandle` into the InvocationHandle's
+/// pump sink. Called by `OutletNamespace.invoke` in streaming mode —
+/// kept at module scope so the per-mode helper functions in
+/// `Outlets.swift` stay short enough to satisfy SwiftLint's
+/// `function_body_length` rule.
+///
+/// Per OUT-038 AC14 the iterator yields the terminal chunk too: every
+/// chunk read from the bridge is forwarded to `yieldChunk` before any
+/// terminal-state transition. End resolves the aggregate with the
+/// chunk's `aggregate` field; terminal Error{terminal:true} rejects
+/// with an `OutletError.execution(...)` envelope.
+func pumpStreamingChunks(
+    from raw: OutletStreamHandle,
+    yieldChunk: @Sendable (OutletStreamChunk) -> Void,
+    resolveAggregate: @Sendable (Aggregate) -> Void,
+    rejectAggregate: @Sendable (Error) -> Void
+) async throws {
+    while true {
+        guard let bridgeChunk = try await raw.next() else {
+            resolveAggregate(Aggregate(valueJson: "null"))
+            return
+        }
+        let sdkChunk = bridgeChunkToSdk(bridgeChunk)
+        yieldChunk(sdkChunk)
+        switch sdkChunk.payload {
+        case let .end(aggregate, executionTimeMs):
+            resolveAggregate(Aggregate(
+                valueJson: aggregate,
+                executionTimeMs: executionTimeMs
+            ))
+            return
+        case let .error(code, message, terminal):
+            if terminal {
+                let env = OutletEnvelope(
+                    classWire: .execution,
+                    code: code,
+                    slug: code,
+                    message: message,
+                    retry: .never,
+                    detail: nil,
+                    sourceChain: [],
+                    padNonce: nil,
+                    registrationEventId: nil
+                )
+                rejectAggregate(OutletError.execution(env))
+                return
+            }
+        default:
+            break
+        }
+    }
+}
+
+/// Convert a UniFFI-generated `OutletStreamChunkRecord` to the SDK-
+/// shaped `OutletStreamChunk` variant (used by
+/// `OutletNamespace.invoke` when streaming-mode is engaged).
+func bridgeChunkToSdk(_ raw: OutletStreamChunkRecord) -> OutletStreamChunk {
+    let requestId = Data(raw.requestId)
+    let payload: OutletStreamChunk.Payload
+    switch raw.payloadType {
+    case "data":
+        payload = .data(value: raw.valueJson ?? "null")
+    case "progress":
+        payload = .progress(pct: raw.pct ?? 0, note: raw.note)
+    case "end":
+        payload = .end(
+            aggregate: raw.aggregateJson ?? "null",
+            executionTimeMs: raw.executionTimeMs ?? 0
+        )
+    case "error":
+        payload = .error(
+            code: raw.code ?? "SCP-TOOL-6200",
+            message: raw.message ?? "",
+            terminal: raw.terminal ?? false
+        )
+    default:
+        // Unknown payload type — synthesize an Error chunk so the
+        // pump terminates cleanly instead of stalling.
+        payload = .error(
+            code: "SCP-TOOL-6200",
+            message: "unknown chunk payload type: \(raw.payloadType)",
+            terminal: true
+        )
+    }
+    return OutletStreamChunk(
+        requestId: requestId,
+        sequence: raw.sequence,
+        payload: payload
+    )
 }
 
 // MARK: - Top-level streaming helpers

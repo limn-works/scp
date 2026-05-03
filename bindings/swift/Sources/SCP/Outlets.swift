@@ -165,6 +165,37 @@ public enum OutletError: Error, Sendable, Equatable {
     // exception class for the `Credit` zero-rejection rule.
     case invalidGrant(Credit)
 
+    /// SCP-OUT-038 lifecycle-violation case — raised when control-plane
+    /// methods are called on an `InvocationHandle` whose stream has
+    /// already emitted a terminal chunk (End / Error{terminal:true}).
+    ///
+    /// Per AC13 the lifecycle error sits at the SAME depth as the
+    /// protocol-class siblings (`.invalidGrant`, catalog-rotation
+    /// entries). Carrying an `OutletEnvelope` keeps the wire-form fields
+    /// (code, slug, retry, message) on the case so callers can inspect
+    /// them uniformly. Default: code `SCP-TOOL-6102`, slug
+    /// `protocol.stream-already-closed`.
+    case streamAlreadyClosed(OutletEnvelope)
+
+    /// Builds a default `streamAlreadyClosed` envelope so SDK callers
+    /// don't have to assemble the wire-form fields themselves. Use this
+    /// to construct the `OutletError.streamAlreadyClosed(_:)` case from
+    /// the SDK's lifecycle-guard call sites.
+    public static func makeStreamAlreadyClosed(message: String? = nil) -> OutletError {
+        let envelope = OutletEnvelope(
+            classWire: .protocol,
+            code: "SCP-TOOL-6102",
+            slug: "protocol.stream-already-closed",
+            message: message ?? "stream has already terminated; control-plane methods rejected",
+            retry: .never,
+            detail: nil,
+            sourceChain: [],
+            padNonce: nil,
+            registrationEventId: nil
+        )
+        return .streamAlreadyClosed(envelope)
+    }
+
     /// Constructs a typed `OutletError` from a keyword-only options struct
     /// (§5.4.4 round-6 swap-risk fix). Swift's labeled-argument idiom is
     /// already unambiguous, but the labelled variant is the only path
@@ -509,18 +540,52 @@ public final class CaveatBuilder {
 ///
 /// * `let aggregate = try await handle.aggregate` — await the aggregate value.
 /// * `for try await chunk in handle { ... }` — iterate chunks via
-///   `AsyncSequence` / `AsyncThrowingStream`.
+///   `AsyncSequence` / `AsyncThrowingStream`. Per SCP-OUT-038 AC14 the
+///   iterator yields the terminal `End` chunk (10 Data + End ⇒ 11
+///   chunks observed).
+///
+/// SCP-OUT-038 control plane (AC2-3): every handle exposes
+/// `grantCredit(_: Credit)` and `cancel(nextSeq:)`. When the handle was
+/// opened against a real §5.4.5 streaming session, these route to the
+/// UniFFI `outletStreamGrantCredit` / `outletStreamCancel` exports.
+/// When the handle wraps a degenerate single-shot invocation (no
+/// streaming session), the synthesized End arrives synchronously and
+/// the control-plane methods raise `OutletError.streamAlreadyClosed`
+/// per AC13.
+///
+/// Lifecycle guard (AC13): once a terminal chunk is observed via the
+/// iterator OR the await path, subsequent control-plane calls raise
+/// `OutletError.streamAlreadyClosed`.
 public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     public typealias Element = OutletStreamChunk
 
     private let stream: AsyncThrowingStream<OutletStreamChunk, Error>
     private let aggregateTask: Task<Aggregate, Error>
 
-    public init(pump: @Sendable @escaping (
-        @Sendable @escaping (OutletStreamChunk) -> Void,
-        @Sendable @escaping (Aggregate) -> Void,
-        @Sendable @escaping (Error) -> Void
-    ) -> Void) {
+    /// 32-char lowercase hex `request_id` of the underlying §5.4.5
+    /// stream — `nil` for handles backed by the non-streaming bridge.
+    private let requestIdHex: String?
+
+    /// Optional aggregate-schema (JSON Schema-shaped) for End-chunk
+    /// validation per OUT-038 AC12.
+    private let aggregateSchemaJson: String?
+
+    /// Lifecycle terminal-flag — flips once an End / Error{terminal:true}
+    /// chunk is observed. `@unchecked Sendable` is preserved because all
+    /// mutations happen on the pump's serial queue.
+    private let terminatedFlag = TerminatedFlag()
+
+    public init(
+        requestIdHex: String? = nil,
+        aggregateSchemaJson: String? = nil,
+        pump: @Sendable @escaping (
+            @Sendable @escaping (OutletStreamChunk) -> Void,
+            @Sendable @escaping (Aggregate) -> Void,
+            @Sendable @escaping (Error) -> Void
+        ) -> Void
+    ) {
+        self.requestIdHex = requestIdHex
+        self.aggregateSchemaJson = aggregateSchemaJson
         var chunkCont: AsyncThrowingStream<OutletStreamChunk, Error>.Continuation?
         let stream = AsyncThrowingStream<OutletStreamChunk, Error> { cont in
             chunkCont = cont
@@ -534,28 +599,207 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
                 rejectAggregate = { cont.resume(throwing: $0) }
             }
         }
+        let terminatedFlag = self.terminatedFlag
         pump(
-            { chunk in chunkCont?.yield(chunk) },
+            { chunk in
+                // AC13: track terminal observation on the iterator
+                // path so control-plane callers see the lifecycle
+                // guard fire after observing End / terminal Error.
+                let isTerminal: Bool
+                switch chunk.payload {
+                case .end:
+                    isTerminal = true
+                case let .error(_, _, terminal):
+                    isTerminal = terminal
+                default:
+                    isTerminal = false
+                }
+                if isTerminal {
+                    terminatedFlag.markTerminated()
+                }
+                chunkCont?.yield(chunk)
+            },
             { agg in
+                terminatedFlag.markTerminated()
                 resolveAggregate?(agg)
                 chunkCont?.finish()
             },
             { err in
+                terminatedFlag.markTerminated()
                 rejectAggregate?(err)
                 chunkCont?.finish(throwing: err)
             }
         )
     }
 
-    /// Await the terminal aggregate value.
+    /// Backward-compat overload — retained so call sites that don't
+    /// pass `requestIdHex` / `aggregateSchemaJson` keep compiling.
+    public convenience init(pump: @Sendable @escaping (
+        @Sendable @escaping (OutletStreamChunk) -> Void,
+        @Sendable @escaping (Aggregate) -> Void,
+        @Sendable @escaping (Error) -> Void
+    ) -> Void) {
+        self.init(requestIdHex: nil, aggregateSchemaJson: nil, pump: pump)
+    }
+
+    /// Await the terminal aggregate value. SCP-OUT-038 AC12: when an
+    /// `aggregateSchemaJson` is bound to the handle, the aggregate is
+    /// validated against the schema before resolving. Throws
+    /// `OutletError.output(...)` on schema mismatch.
     public var aggregate: Aggregate {
         get async throws {
-            try await aggregateTask.value
+            let agg = try await aggregateTask.value
+            try validateAggregate(agg)
+            return agg
         }
     }
 
     public func makeAsyncIterator() -> AsyncThrowingStream<OutletStreamChunk, Error>.AsyncIterator {
         stream.makeAsyncIterator()
+    }
+
+    /// SCP-OUT-038 AC2/AC3 — issues an additional credit grant.
+    ///
+    /// `grant` MUST be a typed `Credit` value (constructed via
+    /// `try Credit(rawUInt32)` which throws `OutletError.invalidGrant`
+    /// for `raw == 0`). The Swift compiler rejects passing a raw
+    /// `UInt32` where `Credit` is expected.
+    ///
+    /// - Throws: `OutletError.streamAlreadyClosed` (AC13) when the
+    ///   stream has already emitted a terminal chunk.
+    @discardableResult
+    public func grantCredit(_ grant: Credit) async throws -> UInt32 {
+        if terminatedFlag.isTerminated {
+            throw OutletError.makeStreamAlreadyClosed()
+        }
+        guard let ridHex = requestIdHex else {
+            throw OutletError.makeStreamAlreadyClosed(
+                message: "grantCredit rejected: handle was opened without a streaming session"
+            )
+        }
+        return try await outletStreamGrantCredit(requestIdHex: ridHex, grant: grant.raw)
+    }
+
+    /// SCP-OUT-038 AC2/AC3 — cancels the active stream (§5.4.5).
+    ///
+    /// - Throws: `OutletError.streamAlreadyClosed` (AC13) when the
+    ///   stream has already emitted a terminal chunk.
+    @discardableResult
+    public func cancel(nextSeq: UInt64? = nil) async throws -> UInt64? {
+        if terminatedFlag.isTerminated {
+            throw OutletError.makeStreamAlreadyClosed()
+        }
+        guard let ridHex = requestIdHex else {
+            throw OutletError.makeStreamAlreadyClosed(
+                message: "cancel rejected: handle was opened without a streaming session"
+            )
+        }
+        return try await outletStreamCancel(requestIdHex: ridHex, nextSeq: nextSeq)
+    }
+
+    /// `true` once a terminal chunk has been observed (AC13). Exposed
+    /// read-only so callers can branch on it before invoking the
+    /// control-plane methods.
+    public var isTerminated: Bool {
+        terminatedFlag.isTerminated
+    }
+
+    /// SCP-OUT-038 AC12 — validate the End.aggregate payload against
+    /// the registered `aggregateSchemaJson`. No-op when no schema is
+    /// bound. The validator performs a structural pass-through (type
+    /// match + required fields) — the bridge has already validated at
+    /// registration time per §5.4.5; this SDK-side hook is defense in
+    /// depth.
+    private func validateAggregate(_ agg: Aggregate) throws {
+        guard let schemaJson = aggregateSchemaJson else { return }
+        guard let schemaData = schemaJson.data(using: .utf8),
+              let schema = try? JSONSerialization.jsonObject(with: schemaData) as? [String: Any]
+        else {
+            return // can't parse schema — fail open
+        }
+        guard let aggData = agg.valueJson.data(using: .utf8),
+              let aggValue = try? JSONSerialization.jsonObject(with: aggData)
+        else {
+            throw makeOutputError(slug: "output.invalid-json", message: "End.aggregate is not valid JSON")
+        }
+        try checkSchemaType(aggValue: aggValue, schema: schema)
+        try checkSchemaRequired(aggValue: aggValue, schema: schema)
+    }
+
+    private func checkSchemaType(aggValue: Any, schema: [String: Any]) throws {
+        guard let declaredType = schema["type"] as? String else { return }
+        let actual = jsonValueTypeName(aggValue)
+        let matches = declaredType == actual
+            || (declaredType == "number" && actual == "integer")
+            || (declaredType == "object" && actual == "object")
+        if !matches {
+            throw makeOutputError(
+                slug: "output.type-mismatch",
+                message: "End.aggregate type '\(actual)' does not match aggregate_schema type '\(declaredType)'"
+            )
+        }
+    }
+
+    private func checkSchemaRequired(aggValue: Any, schema: [String: Any]) throws {
+        guard let required = schema["required"] as? [String],
+              let obj = aggValue as? [String: Any] else { return }
+        for field in required where obj[field] == nil {
+            throw makeOutputError(
+                slug: "output.missing-required-field",
+                message: "End.aggregate missing required field '\(field)' per aggregate_schema"
+            )
+        }
+    }
+
+    private func jsonValueTypeName(_ value: Any) -> String {
+        if value is [Any] { return "array" }
+        if value is [String: Any] { return "object" }
+        if value is String { return "string" }
+        if value is NSNull { return "null" }
+        if let num = value as? NSNumber {
+            if CFGetTypeID(num) == CFBooleanGetTypeID() { return "boolean" }
+            if num.intValue == num.doubleValue, num.doubleValue.truncatingRemainder(dividingBy: 1) == 0 {
+                return "integer"
+            }
+            return "number"
+        }
+        return "unknown"
+    }
+
+    private func makeOutputError(slug: String, message: String) -> OutletError {
+        OutletError.output(
+            OutletEnvelope(
+                classWire: .output,
+                code: "SCP-TOOL-6140",
+                slug: slug,
+                message: message,
+                retry: .never,
+                detail: nil,
+                sourceChain: [],
+                padNonce: nil,
+                registrationEventId: nil
+            )
+        )
+    }
+}
+
+/// Internal — atomic terminal-state flag for `InvocationHandle`. Held
+/// behind an `NSLock` so the iterator pump can flip it from any thread
+/// while the control-plane methods read it on the caller's actor.
+private final class TerminatedFlag: @unchecked Sendable {
+    private var flag = false
+    private let lock = NSLock()
+
+    func markTerminated() {
+        lock.lock()
+        defer { lock.unlock() }
+        flag = true
+    }
+
+    var isTerminated: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return flag
     }
 }
 
@@ -685,30 +929,80 @@ public actor OutletNamespace {
         )
     }
 
-    /// Invoke an outlet — returns an `InvocationHandle` that exposes both
-    /// `await handle.aggregate` and `for try await chunk in handle`.
+    /// Invoke an outlet — the SOLE public verb (SCP-OUT-038 AC1).
+    ///
+    /// Returns an `InvocationHandle` that exposes both
+    /// `await handle.aggregate` and `for try await chunk in handle`,
+    /// plus the SCP-OUT-038 control-plane methods
+    /// `handle.grantCredit(_:)` and `handle.cancel(nextSeq:)`.
+    ///
+    /// When `caveatsBindingHex` AND `streamEpoch` are supplied, opens
+    /// a real §5.4.5 streaming session via `outletInvokeStream` — the
+    /// returned handle carries a real `request_id` and grant_credit /
+    /// cancel route to the runtime. When omitted, falls back to the
+    /// non-streaming bridge (degenerate single-chunk per §5.4.5) and
+    /// the handle's lifecycle ends synchronously — control-plane
+    /// methods then raise `OutletError.streamAlreadyClosed` per AC13.
     public func invoke(
         id: String,
         input: String,
         ucanToken: String? = nil,
         proofTokens: [String]? = nil,
-        spendingUcanJwt: String? = nil
+        spendingUcanJwt: String? = nil,
+        caveatsBindingHex: String? = nil,
+        streamEpoch: UInt64? = nil,
+        creditWindow: UInt32? = nil,
+        estimatedChunkCount: UInt32? = nil,
+        aggregateSchemaJson: String? = nil
+    ) -> InvocationHandle {
+        if let cbh = caveatsBindingHex, let epoch = streamEpoch, let ucan = ucanToken {
+            return makeStreamingHandle(
+                outletId: id,
+                inputJson: input,
+                ucanToken: ucan,
+                caveatsBindingHex: cbh,
+                streamEpoch: epoch,
+                proofTokens: proofTokens,
+                creditWindow: creditWindow,
+                estimatedChunkCount: estimatedChunkCount,
+                aggregateSchemaJson: aggregateSchemaJson
+            )
+        }
+        return makeOneShotHandle(
+            outletId: id,
+            inputJson: input,
+            ucanToken: ucanToken,
+            proofTokens: proofTokens,
+            spendingUcanJwt: spendingUcanJwt,
+            aggregateSchemaJson: aggregateSchemaJson
+        )
+    }
+
+    private func makeOneShotHandle(
+        outletId: String,
+        inputJson: String,
+        ucanToken: String?,
+        proofTokens: [String]?,
+        spendingUcanJwt: String?,
+        aggregateSchemaJson: String?
     ) -> InvocationHandle {
         let handle = self.handle
         let identity = self.identity
-        return InvocationHandle { yieldChunk, resolveAggregate, rejectAggregate in
+        return InvocationHandle(
+            requestIdHex: nil,
+            aggregateSchemaJson: aggregateSchemaJson
+        ) { yieldChunk, resolveAggregate, rejectAggregate in
             Task {
                 do {
                     let output = try await outletInvoke(
                         handle: handle,
-                        outletId: id,
-                        inputJson: input,
+                        outletId: outletId,
+                        inputJson: inputJson,
                         identity: identity,
                         ucanToken: ucanToken,
                         proofTokens: proofTokens,
                         spendingUcanJwt: spendingUcanJwt
                     )
-                    // Non-streaming bridge — synthesize a single `end` chunk.
                     let chunk = OutletStreamChunk(
                         requestId: Data(count: 16),
                         sequence: 0,
@@ -716,6 +1010,55 @@ public actor OutletNamespace {
                     )
                     yieldChunk(chunk)
                     resolveAggregate(Aggregate(valueJson: output))
+                } catch {
+                    rejectAggregate(error)
+                }
+            }
+        }
+    }
+
+    // §5.4.5 streaming open + 4 wire-mandated knobs
+    // (caveatsBinding, streamEpoch, creditWindow, estimatedChunkCount)
+    // require 9 parameters; the count is bound to the spec's preimage,
+    // not to the SDK's choice.
+    // swiftlint:disable:next function_parameter_count
+    private func makeStreamingHandle(
+        outletId: String,
+        inputJson: String,
+        ucanToken: String,
+        caveatsBindingHex: String,
+        streamEpoch: UInt64,
+        proofTokens: [String]?,
+        creditWindow: UInt32?,
+        estimatedChunkCount: UInt32?,
+        aggregateSchemaJson: String?
+    ) -> InvocationHandle {
+        let handle = self.handle
+        let identity = self.identity
+        return InvocationHandle(
+            requestIdHex: nil,
+            aggregateSchemaJson: aggregateSchemaJson
+        ) { yieldChunk, resolveAggregate, rejectAggregate in
+            Task {
+                do {
+                    let raw = try await outletInvokeStream(
+                        handle: handle,
+                        outletId: outletId,
+                        inputJson: inputJson,
+                        identity: identity,
+                        ucanToken: ucanToken,
+                        caveatsBindingHex: caveatsBindingHex,
+                        streamEpoch: streamEpoch,
+                        proofTokens: proofTokens,
+                        creditWindow: creditWindow,
+                        estimatedChunkCount: estimatedChunkCount
+                    )
+                    try await pumpStreamingChunks(
+                        from: raw,
+                        yieldChunk: yieldChunk,
+                        resolveAggregate: resolveAggregate,
+                        rejectAggregate: rejectAggregate
+                    )
                 } catch {
                     rejectAggregate(error)
                 }
