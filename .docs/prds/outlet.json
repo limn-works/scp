@@ -2431,7 +2431,7 @@
       "gate": "gate-streaming",
       "priority": "P1",
       "severity": "major",
-      "status": "pending",
+      "status": "done",
       "files": [
         "tests/conformance/vectors/outlet_stream_vectors.json",
         "crates/scp-testing/tests/integration/outlet_stream_conformance.rs",
