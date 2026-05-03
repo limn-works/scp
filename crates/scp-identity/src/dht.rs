@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use ed25519_dalek::VerifyingKey;
 use sha2::{Digest, Sha256};
 
-use scp_platform::traits::{KeyCustody, KeyHandle, KeyType};
+use scp_platform::traits::{KeyCustody, KeyType, PreRotationCustody, PreRotationKeyHandle};
 
 use super::cache::{Clock, DidCache, DidResolutionResult, Staleness, SystemClock};
 use super::dht_client::{DhtClient, InMemoryDhtClient};
@@ -269,12 +269,15 @@ impl DidDht<InMemoryDhtClient, SystemClock> {
     /// use std::sync::Arc;
     /// use scp_identity::dht::DidDht;
     /// use scp_identity::DidMethod;
-    /// use scp_platform::testing::InMemoryKeyCustody;
+    /// use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
     /// let custody = Arc::new(InMemoryKeyCustody::new());
+    /// let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
     /// let did_dht = DidDht::with_in_memory_custody(Arc::clone(&custody));
-    /// let (identity, document) = did_dht.create(&*custody).await?;
+    /// let (identity, document, _pre_rotation_handle) = did_dht
+    ///     .create(&*custody, &*pre_rotation_custody)
+    ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -335,11 +338,13 @@ impl DidDht<InMemoryDhtClient, SystemClock> {
         ),
         IdentityError,
     > {
-        use scp_platform::testing::InMemoryKeyCustody;
+        use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 
         let custody = Arc::new(InMemoryKeyCustody::new());
+        let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let did_dht = Self::with_in_memory_custody(Arc::clone(&custody));
-        let (identity, document) = did_dht.create(&*custody).await?;
+        let (identity, document, _pre_rotation_handle) =
+            did_dht.create(&*custody, &*pre_rotation_custody).await?;
         Ok((identity, document, custody, did_dht))
     }
 }
@@ -801,7 +806,6 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             active_signing_key: new_active_key,
             agent_signing_key: identity.agent_signing_key,
             pre_rotation_commitment: identity.pre_rotation_commitment,
-            pre_rotation_key: identity.pre_rotation_key,
             did: identity.did.clone(),
         };
 
@@ -816,18 +820,25 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// # Arguments
     ///
-    /// * `key_custody` - The key custody for generating all keypairs.
+    /// * `key_custody` - The key custody for generating Identity, Active,
+    ///   and Agent keypairs (operational keys).
+    /// * `pre_rotation_custody` - Cold-storage custody for the pre-rotation
+    ///   key (spec §9.7.4.1 §3 — separate substrate from operational
+    ///   custody). See [`DidMethod::create`] for the lifecycle.
     ///
     /// # Errors
     ///
-    /// Returns [`IdentityError::Platform`] if key generation fails.
+    /// Returns [`IdentityError::Platform`] if operational key generation
+    /// fails. Returns [`IdentityError::PreRotation`] if the pre-rotation
+    /// key cannot be stored in cold custody.
     ///
     /// See ADR-039 acceptance criterion 4.
     pub async fn create_with_agent_key(
         &self,
         key_custody: &impl KeyCustody,
-    ) -> Result<(ScpIdentity, DidDocument), IdentityError> {
-        // Step 1: Generate four Ed25519 keypairs.
+        pre_rotation_custody: &impl PreRotationCustody,
+    ) -> Result<(ScpIdentity, DidDocument, PreRotationKeyHandle), IdentityError> {
+        // Step 1: Operational keypairs (#0, #active, #agent).
         let identity_key = key_custody
             .generate_keypair(KeyType::Ed25519)
             .await
@@ -838,17 +849,27 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .await
             .map_err(IdentityError::Platform)?;
 
-        let pre_rotation_key = key_custody
-            .generate_keypair(KeyType::Ed25519)
+        // Step 2: Ephemeral pre-rotation seed from the same RNG stream
+        // (ADR-046 byte parity). Order matters: identity → active →
+        // pre-rotation, MATCHING the seed-byte windows
+        // [0..32]/[32..64]/[64..96] that cross-bridge tests pin. The
+        // agent key follows after, since pre-the-add-agent-key seed
+        // sequence already has agent at byte window [96..128].
+        let pre_rotation_seed = key_custody
+            .generate_ephemeral_ed25519_seed()
             .await
             .map_err(IdentityError::Platform)?;
+        let pre_rotation_signing = ed25519_dalek::SigningKey::from_bytes(&pre_rotation_seed);
+        let pre_rotation_public_bytes = pre_rotation_signing.verifying_key().to_bytes();
+        drop(pre_rotation_signing);
 
+        // Step 3: Agent keypair (the fourth in the seed window).
         let agent_key = key_custody
             .generate_keypair(KeyType::Ed25519)
             .await
             .map_err(IdentityError::Platform)?;
 
-        // Step 2: Get public keys.
+        // Step 4: Get operational public keys.
         let identity_public = key_custody
             .public_key(&identity_key)
             .await
@@ -859,31 +880,32 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .await
             .map_err(IdentityError::Platform)?;
 
-        let pre_rotation_public = key_custody
-            .public_key(&pre_rotation_key)
-            .await
-            .map_err(IdentityError::Platform)?;
-
         let agent_public = key_custody
             .public_key(&agent_key)
             .await
             .map_err(IdentityError::Platform)?;
 
-        // Step 3: Derive the DID string.
+        // Step 5: Derive the DID string.
         let did = format!(
             "{DID_DHT_PREFIX}z{}",
             zbase32::encode(identity_public.as_bytes())
         );
 
-        // Step 4: Compute pre-rotation commitment.
+        // Step 6: Compute pre-rotation commitment.
         let mut hasher = Sha256::new();
-        hasher.update(pre_rotation_public.as_bytes());
+        hasher.update(pre_rotation_public_bytes);
         let commitment_bytes = hasher.finalize();
         let mut pre_rotation_commitment = [0u8; 32];
         pre_rotation_commitment.copy_from_slice(&commitment_bytes);
 
-        // Step 5: Build the DID document with agent key. The pre-rotation key
-        // is retained — see `create` step 5 for rationale.
+        // Step 7: Hand the pre-rotation seed to cold custody. Operational
+        // copy drops here (Zeroizing).
+        let pre_rotation_handle = pre_rotation_custody
+            .store_committed_pre_rotation_key(&pre_rotation_public_bytes, pre_rotation_seed)
+            .await
+            .map_err(IdentityError::PreRotation)?;
+
+        // Step 8: Build the DID document with agent key.
         let document = DidDocument::new_with_agent_key(
             &did,
             identity_public.as_bytes(),
@@ -892,17 +914,16 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             Some(agent_public.as_bytes()),
         );
 
-        // Step 6: Return the identity and document.
+        // Step 9: Return the identity, document, and pre-rotation handle.
         let identity = ScpIdentity {
             identity_key,
             active_signing_key,
             agent_signing_key: Some(agent_key),
             pre_rotation_commitment,
-            pre_rotation_key,
             did,
         };
 
-        Ok((identity, document))
+        Ok((identity, document, pre_rotation_handle))
     }
 
     /// Adds an agent signing key to an existing identity (ADR-039).
@@ -962,7 +983,6 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             active_signing_key: identity.active_signing_key,
             agent_signing_key: Some(agent_key),
             pre_rotation_commitment: identity.pre_rotation_commitment,
-            pre_rotation_key: identity.pre_rotation_key,
             did: identity.did.clone(),
         };
 
@@ -1028,7 +1048,6 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             active_signing_key: identity.active_signing_key,
             agent_signing_key: Some(new_agent_key),
             pre_rotation_commitment: identity.pre_rotation_commitment,
-            pre_rotation_key: identity.pre_rotation_key,
             did: identity.did.clone(),
         };
 
@@ -1075,7 +1094,6 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             active_signing_key: identity.active_signing_key,
             agent_signing_key: None,
             pre_rotation_commitment: identity.pre_rotation_commitment,
-            pre_rotation_key: identity.pre_rotation_key,
             did: identity.did.clone(),
         };
 
@@ -1138,99 +1156,90 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// * `identity` - The current identity being migrated.
     /// * `old_document` - The current DID document for the old identity.
-    /// * `pre_rotation_key` - The pre-rotation key handle (must match the
-    ///   commitment in the old DID document).
-    /// * `key_custody` - The key custody for generating new keypairs.
+    /// * `pre_rotation_handle` - Handle returned by [`PreRotationCustody::store_committed_pre_rotation_key`]
+    ///   when the identity was created. Resolved against `pre_rotation_custody`
+    ///   to recover the public bytes (for `revealed_key`) and consume the
+    ///   private bytes (which become the new identity key, ADR-003 §4b).
+    /// * `pre_rotation_custody` - The cold-storage custody holding the
+    ///   pre-rotation key. Per spec §9.7.4.1 §6, the protocol immediately
+    ///   stores a fresh pre-rotation key in this custody before returning.
+    /// * `key_custody` - The operational custody for the new identity. The
+    ///   migrated `#0` (the old pre-rotation key's private bytes) is
+    ///   imported here; the new `#active` is generated here.
     /// * `rotated_at` - Unix timestamp for the migration event.
     ///
     /// # Returns
     ///
-    /// A tuple of `(new_identity, new_document, rotation_event)`:
-    /// - `new_identity` — The new [`ScpIdentity`] with new DID, keys, and
-    ///   pre-rotation commitment.
+    /// `(new_identity, new_document, rotation_event, new_pre_rotation_handle)`:
+    /// - `new_identity` — The new [`ScpIdentity`] with new DID and keys.
     /// - `new_document` — The DID document for the new identity.
     /// - `rotation_event` — The [`DidRotationEvent`] to distribute to all
-    ///   active contexts.
+    ///   active contexts (spec §3.2.1 step 4b).
+    /// - `new_pre_rotation_handle` — Handle for the freshly-minted
+    ///   pre-rotation key in `pre_rotation_custody` (per §9.7.4.1 §6
+    ///   "post-rotation key cycling"). Caller persists this for the next
+    ///   migration.
     ///
     /// # Errors
     ///
     /// Returns errors if key generation, signing, or DHT publishing fails.
     ///
-    /// See ADR-003 acceptance criterion 4b.
+    /// See ADR-003 acceptance criterion 4b and spec §9.7.4.1 §6.
     pub async fn migrate_identity(
         &self,
         identity: &ScpIdentity,
         old_document: &DidDocument,
-        pre_rotation_key: &KeyHandle,
+        pre_rotation_handle: &PreRotationKeyHandle,
+        pre_rotation_custody: &impl PreRotationCustody,
         key_custody: &impl KeyCustody,
         rotated_at: u64,
-    ) -> Result<(ScpIdentity, DidDocument, DidRotationEvent), IdentityError> {
-        // Step 1: The pre-rotation key becomes the new Identity Key.
-        let new_identity_public = key_custody
-            .public_key(pre_rotation_key)
+    ) -> Result<
+        (
+            ScpIdentity,
+            DidDocument,
+            DidRotationEvent,
+            PreRotationKeyHandle,
+        ),
+        IdentityError,
+    > {
+        // Step 1: Reveal the pre-rotation public key. This will become the
+        // new identity public key (ADR-003 §4b). The custody verifies its
+        // own commitment integrity if it stored one.
+        let new_identity_public_bytes = pre_rotation_custody
+            .reveal_public_key(pre_rotation_handle)
             .await
-            .map_err(IdentityError::Platform)?;
+            .map_err(IdentityError::PreRotation)?;
 
         let new_did = format!(
             "{DID_DHT_PREFIX}z{}",
-            zbase32::encode(new_identity_public.as_bytes())
+            zbase32::encode(&new_identity_public_bytes)
         );
 
-        // Step 2: Generate new keys and build new DID document.
-        let (new_active_key, new_pre_rotation_key, new_pre_rotation_commitment, new_document) =
-            Self::create_new_identity_keys(key_custody, &new_did, &new_identity_public).await?;
-
-        // Step 3: Update old DID document with alsoKnownAs forwarding.
-        let mut updated_old_doc = old_document.clone();
-        updated_old_doc.set_also_known_as(&new_did);
-
-        // Step 4: Create the migration and pre-rotation proofs.
+        // Step 2: Build the migration_proof signed by the OLD identity key
+        // and the pre_rotation_proof carrying the revealed public key.
         let migration_proof =
             Self::build_migration_proof(identity, &new_did, rotated_at, key_custody).await?;
         let pre_rotation_proof =
-            Self::build_pre_rotation_proof(old_document, &new_identity_public)?;
+            Self::build_pre_rotation_proof_from_bytes(old_document, &new_identity_public_bytes)?;
 
-        // Step 5: Publish both documents.
+        // Step 3: Update the OLD DID document with `alsoKnownAs` and
+        // publish — this happens BEFORE we touch operational custody so
+        // that any failure leaves the old identity intact.
+        let mut updated_old_doc = old_document.clone();
+        updated_old_doc.set_also_known_as(&new_did);
         self.publish_document(identity, &updated_old_doc).await?;
-        let temp_new_identity = ScpIdentity {
-            identity_key: *pre_rotation_key,
-            active_signing_key: new_active_key,
-            agent_signing_key: None,
-            pre_rotation_commitment: new_pre_rotation_commitment,
-            pre_rotation_key: new_pre_rotation_key,
-            did: new_did.clone(),
-        };
-        self.publish_document(&temp_new_identity, &new_document)
-            .await?;
 
-        // Step 6: Build and return the rotation event and new identity.
-        let rotation_event = DidRotationEvent {
-            old_did: identity.did.clone(),
-            new_did: new_did.clone(),
-            migration_proof,
-            pre_rotation_proof,
-            rotated_at,
-        };
+        // Step 4: Generate the NEW pre-rotation seed using the operational
+        // custody's RNG (ADR-046 byte parity). The new active key follows.
+        let new_pre_rotation_seed = key_custody
+            .generate_ephemeral_ed25519_seed()
+            .await
+            .map_err(IdentityError::Platform)?;
+        let new_pre_rotation_signing =
+            ed25519_dalek::SigningKey::from_bytes(&new_pre_rotation_seed);
+        let new_pre_rotation_public_bytes = new_pre_rotation_signing.verifying_key().to_bytes();
+        drop(new_pre_rotation_signing);
 
-        let new_identity = ScpIdentity {
-            identity_key: *pre_rotation_key,
-            active_signing_key: new_active_key,
-            agent_signing_key: None,
-            pre_rotation_commitment: new_pre_rotation_commitment,
-            pre_rotation_key: new_pre_rotation_key,
-            did: new_did,
-        };
-
-        Ok((new_identity, new_document, rotation_event))
-    }
-
-    /// Generates new active signing key, pre-rotation key, and DID document
-    /// for a migrated identity.
-    async fn create_new_identity_keys(
-        key_custody: &impl KeyCustody,
-        new_did: &str,
-        new_identity_public: &scp_platform::traits::PublicKey,
-    ) -> Result<(KeyHandle, KeyHandle, [u8; 32], DidDocument), IdentityError> {
         let new_active_key = key_custody
             .generate_keypair(KeyType::Ed25519)
             .await
@@ -1240,29 +1249,70 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .await
             .map_err(IdentityError::Platform)?;
 
-        let new_pre_rotation_key = key_custody
-            .generate_keypair(KeyType::Ed25519)
-            .await
-            .map_err(IdentityError::Platform)?;
-        let new_pre_rotation_public = key_custody
-            .public_key(&new_pre_rotation_key)
-            .await
-            .map_err(IdentityError::Platform)?;
-
         let mut hasher = Sha256::new();
-        hasher.update(new_pre_rotation_public.as_bytes());
-        let commitment_bytes = hasher.finalize();
-        let mut commitment = [0u8; 32];
-        commitment.copy_from_slice(&commitment_bytes);
+        hasher.update(new_pre_rotation_public_bytes);
+        let new_pre_rotation_commitment_bytes = hasher.finalize();
+        let mut new_pre_rotation_commitment = [0u8; 32];
+        new_pre_rotation_commitment.copy_from_slice(&new_pre_rotation_commitment_bytes);
 
-        let document = DidDocument::new(
-            new_did,
-            new_identity_public.as_bytes(),
+        // Step 5: Hand the new pre-rotation seed to cold custody. If this
+        // fails, the operational copy zeroizes on drop and we surface the
+        // error WITHOUT having consumed the old pre-rotation key.
+        let new_pre_rotation_handle = pre_rotation_custody
+            .store_committed_pre_rotation_key(&new_pre_rotation_public_bytes, new_pre_rotation_seed)
+            .await
+            .map_err(IdentityError::PreRotation)?;
+
+        // Step 6: Consume the OLD pre-rotation key from cold custody —
+        // returning its private bytes — and import them into operational
+        // custody as the new `#0`. Per spec §9.7.4.1 §6, the old
+        // pre-rotation key is destroyed after migration completes; here
+        // we destroy-and-export atomically (the trait method's
+        // documented contract).
+        let revealed_private = pre_rotation_custody
+            .destroy_after_migration(*pre_rotation_handle)
+            .await
+            .map_err(IdentityError::PreRotation)?;
+
+        let new_identity_key = key_custody
+            .import_ed25519_signing_key(&revealed_private)
+            .await
+            .map_err(IdentityError::Platform)?;
+        // `revealed_private` is `Zeroizing` — drops here.
+
+        // Step 7: Build and publish the new DID document.
+        let new_document = DidDocument::new(
+            &new_did,
+            &new_identity_public_bytes,
             new_active_public.as_bytes(),
-            &commitment,
+            &new_pre_rotation_commitment,
         );
 
-        Ok((new_active_key, new_pre_rotation_key, commitment, document))
+        let new_identity = ScpIdentity {
+            identity_key: new_identity_key,
+            active_signing_key: new_active_key,
+            agent_signing_key: None,
+            pre_rotation_commitment: new_pre_rotation_commitment,
+            did: new_did.clone(),
+        };
+
+        self.publish_document(&new_identity, &new_document).await?;
+
+        // Step 8: Build and return the rotation event.
+        let rotation_event = DidRotationEvent {
+            old_did: identity.did.clone(),
+            new_did,
+            migration_proof,
+            pre_rotation_proof,
+            rotated_at,
+        };
+
+        Ok((
+            new_identity,
+            new_document,
+            rotation_event,
+            new_pre_rotation_handle,
+        ))
     }
 
     /// Builds a migration proof by signing
@@ -1323,11 +1373,12 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         })
     }
 
-    /// Builds a pre-rotation proof from the old document's `PreRotationCommitment`
-    /// service, if present.
-    fn build_pre_rotation_proof(
+    /// Builds a pre-rotation proof from the old document's
+    /// `PreRotationCommitment` service, if present, against the revealed
+    /// new identity public key (32 bytes).
+    fn build_pre_rotation_proof_from_bytes(
         old_document: &DidDocument,
-        new_identity_public: &scp_platform::traits::PublicKey,
+        new_identity_public_bytes: &[u8; 32],
     ) -> Result<Option<PreRotationProof>, IdentityError> {
         let Some(svc) = old_document.pre_rotation_service() else {
             return Ok(None);
@@ -1347,16 +1398,10 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
                 v.len()
             ))
         })?;
-        let new_identity_bytes: [u8; 32] =
-            new_identity_public.as_bytes().try_into().map_err(|_| {
-                IdentityError::KeyRotationFailed(
-                    "new identity public key is not 32 bytes".to_owned(),
-                )
-            })?;
 
         Ok(Some(PreRotationProof {
             commitment,
-            revealed_key: new_identity_bytes,
+            revealed_key: *new_identity_public_bytes,
         }))
     }
 }
@@ -1436,9 +1481,13 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
     fn create(
         &self,
         key_custody: &impl KeyCustody,
-    ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send {
+        pre_rotation_custody: &impl PreRotationCustody,
+    ) -> impl Future<
+        Output = Result<(ScpIdentity, DidDocument, PreRotationKeyHandle), IdentityError>,
+    > + Send {
         async move {
-            // Step 1: Generate three Ed25519 keypairs.
+            // Step 1: Generate the operational keypairs in `key_custody`
+            // (Identity Key #0, Active Signing Key #active).
             let identity_key = key_custody
                 .generate_keypair(KeyType::Ed25519)
                 .await
@@ -1449,12 +1498,23 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
                 .await
                 .map_err(IdentityError::Platform)?;
 
-            let pre_rotation_key = key_custody
-                .generate_keypair(KeyType::Ed25519)
+            // Step 2: Mint an ephemeral pre-rotation seed using the SAME
+            // RNG stream as the operational keypairs. This preserves the
+            // ADR-046 cross-bridge byte-parity invariant (seed[0..32] →
+            // identity, seed[32..64] → active, seed[64..96] → pre-rotation)
+            // while ensuring the private bytes never sit in operational
+            // custody (spec §9.7.4.1 §1, §5(a)). For HSM-backed custody
+            // that cannot export ephemeral seed bytes, callers must
+            // surface the pre-rotation key through a platform-CSPRNG
+            // path and route it directly into `pre_rotation_custody`.
+            let pre_rotation_seed = key_custody
+                .generate_ephemeral_ed25519_seed()
                 .await
                 .map_err(IdentityError::Platform)?;
+            let pre_rotation_signing = ed25519_dalek::SigningKey::from_bytes(&pre_rotation_seed);
+            let pre_rotation_public_bytes = pre_rotation_signing.verifying_key().to_bytes();
 
-            // Step 2: Get public keys.
+            // Step 3: Get operational public keys.
             let identity_public = key_custody
                 .public_key(&identity_key)
                 .await
@@ -1465,29 +1525,36 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
                 .await
                 .map_err(IdentityError::Platform)?;
 
-            let pre_rotation_public = key_custody
-                .public_key(&pre_rotation_key)
-                .await
-                .map_err(IdentityError::Platform)?;
-
-            // Step 3: Derive the DID string: did:dht:z<z-base-32(identity_public_key)>
+            // Step 4: Derive the DID string: did:dht:z<z-base-32(identity_public_key)>
             let did = format!(
                 "{DID_DHT_PREFIX}z{}",
                 zbase32::encode(identity_public.as_bytes())
             );
 
-            // Step 4: Compute pre-rotation commitment: SHA-256(pre_rotation_key.public)
+            // Step 5: Compute pre-rotation commitment: SHA-256(pre_rotation_public)
             let mut hasher = Sha256::new();
-            hasher.update(pre_rotation_public.as_bytes());
+            hasher.update(pre_rotation_public_bytes);
             let commitment_bytes = hasher.finalize();
             let mut pre_rotation_commitment = [0u8; 32];
             pre_rotation_commitment.copy_from_slice(&commitment_bytes);
 
-            // Step 5: Build the DID document. The pre-rotation key is retained
-            // in custody — it becomes the new Identity Key when `migrate_identity`
-            // is called, and `build_pre_rotation_proof` requires the actual
-            // public key (not just the commitment) to satisfy spec §3.7's
-            // SHA-256(revealed_key) == commitment invariant.
+            // Step 6: Hand the pre-rotation private bytes to cold custody
+            // (spec §9.7.4.1 §3 — separate substrate). The operational
+            // copy is ephemeral: `pre_rotation_seed` is a `Zeroizing<[u8;
+            // 32]>` and drops here.
+            let pre_rotation_handle = pre_rotation_custody
+                .store_committed_pre_rotation_key(&pre_rotation_public_bytes, pre_rotation_seed)
+                .await
+                .map_err(IdentityError::PreRotation)?;
+            // The intermediate SigningKey carries its own copy of the
+            // private bytes; drop it explicitly so it zeroizes before the
+            // function returns.
+            drop(pre_rotation_signing);
+
+            // Step 7: Build the DID document. Verifiers see only the
+            // commitment hash; the public key is never published until
+            // migration, when `revealed_key` is filled by
+            // `pre_rotation_custody.reveal_public_key`.
             let document = DidDocument::new(
                 &did,
                 identity_public.as_bytes(),
@@ -1495,17 +1562,18 @@ impl<D: DhtClient + 'static, C: Clock + 'static> DidMethod for DidDht<D, C> {
                 &pre_rotation_commitment,
             );
 
-            // Step 6: Return the identity and document.
+            // Step 8: Return the identity, document, and pre-rotation
+            // handle. Callers persist all three so that `migrate_identity`
+            // can present the handle back to the same `pre_rotation_custody`.
             let identity = ScpIdentity {
                 identity_key,
                 active_signing_key,
                 agent_signing_key: None,
                 pre_rotation_commitment,
-                pre_rotation_key,
                 did,
             };
 
-            Ok((identity, document))
+            Ok((identity, document, pre_rotation_handle))
         }
     }
 
@@ -1803,7 +1871,10 @@ mod tests {
         let custody = InMemoryKeyCustody::new();
         let dht = DidDht::new();
 
-        let (identity, document) = dht.create(&custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&custody, &*pre_rotation_custody).await.unwrap();
 
         // DID starts with "did:dht:z"
         assert!(identity.did.starts_with("did:dht:z"));
@@ -1820,7 +1891,10 @@ mod tests {
         let custody = InMemoryKeyCustody::new();
         let dht = DidDht::new();
 
-        let (identity, _document) = dht.create(&custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, _document, _pre_rotation_handle) =
+            dht.create(&custody, &*pre_rotation_custody).await.unwrap();
 
         // Get the identity public key
         let identity_public = custody.public_key(&identity.identity_key).await.unwrap();
@@ -1834,7 +1908,10 @@ mod tests {
         let custody = InMemoryKeyCustody::new();
         let dht = DidDht::new();
 
-        let (identity, _document) = dht.create(&custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, _document, _pre_rotation_handle) =
+            dht.create(&custody, &*pre_rotation_custody).await.unwrap();
 
         // Use a different key (the active signing key, not the identity key)
         let active_public = custody
@@ -1873,7 +1950,10 @@ mod tests {
         let custody = InMemoryKeyCustody::new();
         let dht = DidDht::new();
 
-        let (identity, document) = dht.create(&custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&custody, &*pre_rotation_custody).await.unwrap();
 
         // Should have two verification methods
         assert_eq!(document.verification_method.len(), 2);
@@ -1902,7 +1982,10 @@ mod tests {
         let custody = InMemoryKeyCustody::new();
         let dht = DidDht::new();
 
-        let (_identity, document) = dht.create(&custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (_identity, document, _pre_rotation_handle) =
+            dht.create(&custody, &*pre_rotation_custody).await.unwrap();
 
         let svc = document.pre_rotation_service().unwrap();
         assert_eq!(svc.service_type, "PreRotationCommitment");
@@ -1919,8 +2002,18 @@ mod tests {
         let custody2 = InMemoryKeyCustody::from_seed_bytes([42u8; 32]);
         let dht = DidDht::new();
 
-        let (identity1, doc1) = dht.create(&custody1).await.unwrap();
-        let (identity2, doc2) = dht.create(&custody2).await.unwrap();
+        let pre_rotation_custody1 =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let pre_rotation_custody2 =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity1, doc1, _pre_rotation_handle1) = dht
+            .create(&custody1, &*pre_rotation_custody1)
+            .await
+            .unwrap();
+        let (identity2, doc2, _pre_rotation_handle2) = dht
+            .create(&custody2, &*pre_rotation_custody2)
+            .await
+            .unwrap();
 
         // Same seed produces the same DID
         assert_eq!(identity1.did, identity2.did);
@@ -1942,7 +2035,10 @@ mod tests {
     async fn print_parity_seed_expected_values() {
         let custody = InMemoryKeyCustody::from_seed_bytes([0x7bu8; 32]);
         let dht = DidDht::new();
-        let (identity, _doc) = dht.create(&custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, _doc, _pre_rotation_handle) =
+            dht.create(&custody, &*pre_rotation_custody).await.unwrap();
         let pk = custody.public_key(&identity.identity_key).await.unwrap();
         println!("EXPECTED_SEEDED_DID = \"{}\"", identity.did);
         println!(
@@ -1963,8 +2059,18 @@ mod tests {
         let custody2 = InMemoryKeyCustody::from_seed_bytes(seed);
         let dht = DidDht::new();
 
-        let (id1, doc1) = dht.create(&custody1).await.unwrap();
-        let (id2, doc2) = dht.create(&custody2).await.unwrap();
+        let pre_rotation_custody1 =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let pre_rotation_custody2 =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (id1, doc1, _pre_rotation_handle1) = dht
+            .create(&custody1, &*pre_rotation_custody1)
+            .await
+            .unwrap();
+        let (id2, doc2, _pre_rotation_handle2) = dht
+            .create(&custody2, &*pre_rotation_custody2)
+            .await
+            .unwrap();
 
         assert_eq!(id1.did, id2.did);
         assert_eq!(id1.pre_rotation_commitment, id2.pre_rotation_commitment);
@@ -1982,7 +2088,10 @@ mod tests {
         let custody = InMemoryKeyCustody::new();
         let dht = DidDht::new();
 
-        let (_identity, document) = dht.create(&custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (_identity, document, _pre_rotation_handle) =
+            dht.create(&custody, &*pre_rotation_custody).await.unwrap();
 
         let json = document.to_json().unwrap();
         let parsed = DidDocument::from_json(&json).unwrap();
@@ -1999,7 +2108,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Publish the document.
         dht.publish_document(&identity, &document).await.unwrap();
@@ -2015,7 +2127,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         assert_eq!(dht.current_sequence(), 0);
         dht.publish_document(&identity, &document).await.unwrap();
@@ -2029,7 +2144,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         // First resolve populates cache.
@@ -2052,7 +2170,10 @@ mod tests {
             DidDht::<InMemoryDhtClient, Arc<TestClock>>::make_sign_fn(Arc::clone(&custody));
         let dht = DidDht::with_client_and_signer(Arc::clone(&dht_client), cache, sign_fn);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         // Clear the cache so resolve hits DHT again.
@@ -2073,7 +2194,10 @@ mod tests {
             DidDht::<InMemoryDhtClient, Arc<TestClock>>::make_sign_fn(Arc::clone(&custody));
         let dht = DidDht::with_client_and_signer(Arc::clone(&dht_client), cache, sign_fn);
 
-        let (identity, _document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, _document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Publish a tampered document by directly writing to the DHT client
         // with a different document but same DID. The BEP44 signature won't match.
@@ -2101,7 +2225,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, _document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, _document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Don't publish. Resolve should return DhtNotFound.
         let result = dht.resolve_did(&identity.did).await;
@@ -2113,7 +2240,10 @@ mod tests {
         let custody = InMemoryKeyCustody::new();
         let dht = DidDht::new();
 
-        let (identity, document) = dht.create(&custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&custody, &*pre_rotation_custody).await.unwrap();
 
         let result = dht.publish_document(&identity, &document).await;
         assert!(matches!(result, Err(IdentityError::DhtPublishFailed(_))));
@@ -2140,7 +2270,10 @@ mod tests {
             DidDht::<InMemoryDhtClient, Arc<TestClock>>::make_sign_fn(Arc::clone(&custody));
         let dht = DidDht::with_client_and_signer(dht_client, cache, sign_fn);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         // First resolve: fresh.
@@ -2165,7 +2298,10 @@ mod tests {
             DidDht::<InMemoryDhtClient, Arc<TestClock>>::make_sign_fn(Arc::clone(&custody));
         let dht = DidDht::with_client_and_signer(dht_client, cache, sign_fn);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         // First resolve populates cache.
@@ -2190,7 +2326,10 @@ mod tests {
             DidDht::<InMemoryDhtClient, Arc<TestClock>>::make_sign_fn(Arc::clone(&custody));
         let dht = DidDht::with_client_and_signer(dht_client, cache, sign_fn);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         // First resolve + mark active.
@@ -2267,17 +2406,32 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Helper that creates an identity. Equivalent to `dht.create()` for tests
-    /// — the pre-rotation key is retained on the identity (production behavior
-    /// per spec §3.7).
+    /// Helper that creates an identity with a fresh
+    /// [`InMemoryPreRotationCustody`]. Returns the identity, document, the
+    /// pre-rotation handle (so migration tests can present it back), and
+    /// the pre-rotation custody (so migration tests can pass the same
+    /// instance to `migrate_identity`).
     async fn create_identity_with_pre_rotation_key(
         custody: &InMemoryKeyCustody,
         dht: &DidDht<InMemoryDhtClient, Arc<TestClock>>,
-    ) -> (ScpIdentity, DidDocument) {
-        let (identity, document) = dht.create(custody).await.unwrap();
+    ) -> (
+        ScpIdentity,
+        DidDocument,
+        PreRotationKeyHandle,
+        Arc<scp_platform::testing::InMemoryPreRotationCustody>,
+    ) {
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, pre_rotation_handle) =
+            dht.create(custody, &*pre_rotation_custody).await.unwrap();
         let identity_public = custody.public_key(&identity.identity_key).await.unwrap();
         assert!(dht.verify(&identity.did, identity_public.as_bytes()));
-        (identity, document)
+        (
+            identity,
+            document,
+            pre_rotation_handle,
+            pre_rotation_custody,
+        )
     }
 
     // -----------------------------------------------------------------------
@@ -2289,7 +2443,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         let (rotated_identity, _rotated_doc) = dht
@@ -2306,7 +2463,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         let old_active_public = custody
@@ -2333,7 +2493,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         let (rotated_identity, _rotated_doc) = dht
@@ -2350,7 +2513,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         let (_, rotated_doc) = dht
@@ -2382,7 +2548,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         let (_, rotated_doc) = dht
@@ -2406,7 +2575,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         let (rotated_identity, _) = dht
@@ -2426,7 +2598,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         let seq_before = dht.current_sequence();
@@ -2445,7 +2620,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         // Use the trait method which resolves the document internally.
@@ -2471,16 +2649,18 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = create_identity_with_pre_rotation_key(&custody, &dht).await;
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
         dht.publish_document(&identity, &document).await.unwrap();
 
         let rotated_at = 1_700_000_000u64;
 
-        let (new_identity, _new_doc, _event) = dht
+        let (new_identity, _new_doc, _event, _new_pre_rotation_handle) = dht
             .migrate_identity(
                 &identity,
                 &document,
-                &identity.pre_rotation_key,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
                 &*custody,
                 rotated_at,
             )
@@ -2498,20 +2678,22 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = create_identity_with_pre_rotation_key(&custody, &dht).await;
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
         dht.publish_document(&identity, &document).await.unwrap();
 
-        let pre_rot_public = custody
-            .public_key(&identity.pre_rotation_key)
+        let pre_rot_public_bytes = pre_rotation_custody
+            .reveal_public_key(&pre_rotation_handle)
             .await
             .unwrap();
         let rotated_at = 1_700_000_000u64;
 
-        let (new_identity, _new_doc, _event) = dht
+        let (new_identity, _new_doc, _event, _new_pre_rotation_handle) = dht
             .migrate_identity(
                 &identity,
                 &document,
-                &identity.pre_rotation_key,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
                 &*custody,
                 rotated_at,
             )
@@ -2519,7 +2701,7 @@ mod tests {
             .unwrap();
 
         // The new DID must be self-certifying for the pre-rotation key.
-        assert!(dht.verify(&new_identity.did, pre_rot_public.as_bytes()));
+        assert!(dht.verify(&new_identity.did, &pre_rot_public_bytes));
     }
 
     #[tokio::test]
@@ -2527,16 +2709,18 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = create_identity_with_pre_rotation_key(&custody, &dht).await;
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
         dht.publish_document(&identity, &document).await.unwrap();
 
         let rotated_at = 1_700_000_000u64;
 
-        let (new_identity, _new_doc, _event) = dht
+        let (new_identity, _new_doc, _event, _new_pre_rotation_handle) = dht
             .migrate_identity(
                 &identity,
                 &document,
-                &identity.pre_rotation_key,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
                 &*custody,
                 rotated_at,
             )
@@ -2555,16 +2739,18 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = create_identity_with_pre_rotation_key(&custody, &dht).await;
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
         dht.publish_document(&identity, &document).await.unwrap();
 
         let rotated_at = 1_700_000_000u64;
 
-        let (new_identity, _new_doc, event) = dht
+        let (new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
             .migrate_identity(
                 &identity,
                 &document,
-                &identity.pre_rotation_key,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
                 &*custody,
                 rotated_at,
             )
@@ -2592,16 +2778,27 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = create_identity_with_pre_rotation_key(&custody, &dht).await;
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
         dht.publish_document(&identity, &document).await.unwrap();
+
+        // Snapshot the pre-rotation public BEFORE migrate, since
+        // `migrate_identity` consumes the handle (§9.7.4.1 §6 destroys
+        // the old pre-rotation key) — calling `reveal_public_key` after
+        // would fail with `HandleNotFound`.
+        let pre_rot_public_bytes = pre_rotation_custody
+            .reveal_public_key(&pre_rotation_handle)
+            .await
+            .unwrap();
 
         let rotated_at = 1_700_000_000u64;
 
-        let (_new_identity, _new_doc, event) = dht
+        let (_new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
             .migrate_identity(
                 &identity,
                 &document,
-                &identity.pre_rotation_key,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
                 &*custody,
                 rotated_at,
             )
@@ -2613,15 +2810,7 @@ mod tests {
         assert!(event.pre_rotation_proof.is_some());
         let pre_rot_proof = event.pre_rotation_proof.unwrap();
 
-        // The revealed key should match the pre-rotation key's public key.
-        let pre_rot_public = custody
-            .public_key(&identity.pre_rotation_key)
-            .await
-            .unwrap();
-        assert_eq!(
-            pre_rot_proof.revealed_key,
-            <[u8; 32]>::try_from(pre_rot_public.as_bytes()).unwrap()
-        );
+        assert_eq!(pre_rot_proof.revealed_key, pre_rot_public_bytes);
     }
 
     #[tokio::test]
@@ -2629,16 +2818,18 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = create_identity_with_pre_rotation_key(&custody, &dht).await;
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
         dht.publish_document(&identity, &document).await.unwrap();
 
         let rotated_at = 1_700_000_000u64;
 
-        let (new_identity, new_doc, _event) = dht
+        let (new_identity, new_doc, _event, _new_pre_rotation_handle) = dht
             .migrate_identity(
                 &identity,
                 &document,
-                &identity.pre_rotation_key,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
                 &*custody,
                 rotated_at,
             )
@@ -2655,16 +2846,18 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = create_identity_with_pre_rotation_key(&custody, &dht).await;
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
         dht.publish_document(&identity, &document).await.unwrap();
 
         let rotated_at = 1_700_000_000u64;
 
-        let (new_identity, _new_doc, _event) = dht
+        let (new_identity, _new_doc, _event, _new_pre_rotation_handle) = dht
             .migrate_identity(
                 &identity,
                 &document,
-                &identity.pre_rotation_key,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
                 &*custody,
                 rotated_at,
             )
@@ -2689,16 +2882,18 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = create_identity_with_pre_rotation_key(&custody, &dht).await;
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
         dht.publish_document(&identity, &document).await.unwrap();
 
         let rotated_at = 1_700_000_000u64;
 
-        let (new_identity, _new_doc, event) = dht
+        let (new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
             .migrate_identity(
                 &identity,
                 &document,
-                &identity.pre_rotation_key,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
                 &*custody,
                 rotated_at,
             )
@@ -2729,16 +2924,18 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = create_identity_with_pre_rotation_key(&custody, &dht).await;
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
         dht.publish_document(&identity, &document).await.unwrap();
 
         let rotated_at = 1_700_000_000u64;
 
-        let (_new_identity, _new_doc, event) = dht
+        let (_new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
             .migrate_identity(
                 &identity,
                 &document,
-                &identity.pre_rotation_key,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
                 &*custody,
                 rotated_at,
             )
@@ -2768,16 +2965,18 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = create_identity_with_pre_rotation_key(&custody, &dht).await;
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
         dht.publish_document(&identity, &document).await.unwrap();
 
         let rotated_at = 1_700_000_000u64;
 
-        let (_new_identity, _new_doc, event) = dht
+        let (_new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
             .migrate_identity(
                 &identity,
                 &document,
-                &identity.pre_rotation_key,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
                 &*custody,
                 rotated_at,
             )
@@ -2800,16 +2999,18 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = create_identity_with_pre_rotation_key(&custody, &dht).await;
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
         dht.publish_document(&identity, &document).await.unwrap();
 
         let rotated_at = 1_700_000_000u64;
 
-        let (_new_identity, _new_doc, event) = dht
+        let (_new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
             .migrate_identity(
                 &identity,
                 &document,
-                &identity.pre_rotation_key,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
                 &*custody,
                 rotated_at,
             )
@@ -2833,16 +3034,18 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = create_identity_with_pre_rotation_key(&custody, &dht).await;
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
         dht.publish_document(&identity, &document).await.unwrap();
 
         let rotated_at = 1_700_000_000u64;
 
-        let (_new_identity, _new_doc, event) = dht
+        let (_new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
             .migrate_identity(
                 &identity,
                 &document,
-                &identity.pre_rotation_key,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
                 &*custody,
                 rotated_at,
             )
@@ -2965,7 +3168,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         let relay_urls = &[
             "wss://relay1.example.com/scp/v1",
@@ -2997,7 +3203,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Publish without relay URLs (empty slice).
         let published_doc = dht
@@ -3019,7 +3228,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Initial publish with one relay URL.
         let initial_doc = dht
@@ -3070,7 +3282,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Invalid scheme.
         let result = dht
@@ -3090,7 +3305,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Verify the document starts with a PreRotationCommitment service.
         assert!(document.pre_rotation_service().is_some());
@@ -3129,7 +3347,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Publish with relay URLs.
         let published_doc = dht
@@ -3157,7 +3378,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         let relay_urls = &["wss://relay.example.com/scp/v1"];
         dht.publish_with_relay_urls(&identity, &document, relay_urls)
@@ -3189,7 +3413,12 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) = dht
+            .create_with_agent_key(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
 
         // DID format is valid.
         assert!(identity.did.starts_with("did:dht:z"));
@@ -3238,7 +3467,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Should have two verification methods: #0 and #active.
         assert_eq!(document.verification_method.len(), 2);
@@ -3257,7 +3489,12 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) = dht
+            .create_with_agent_key(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
 
         // Self-certification: identity key in document matches DID string.
         let identity_public = custody.public_key(&identity.identity_key).await.unwrap();
@@ -3272,7 +3509,12 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) = dht
+            .create_with_agent_key(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         // Resolve and verify the agent key survives the roundtrip.
@@ -3289,7 +3531,10 @@ mod tests {
         let dht = make_dht_with_custody(&custody);
 
         // Create identity without agent key.
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
         assert!(!document.has_agent_key());
         assert!(identity.agent_signing_key.is_none());
@@ -3324,7 +3569,12 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) = dht
+            .create_with_agent_key(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         // Trying to add again should fail.
@@ -3337,7 +3587,12 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) = dht
+            .create_with_agent_key(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         let old_agent_key = identity.agent_signing_key.unwrap();
@@ -3383,7 +3638,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         let result = dht.rotate_agent_key(&identity, &document, &*custody).await;
@@ -3395,7 +3653,12 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) = dht
+            .create_with_agent_key(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
         assert!(document.has_agent_key());
 
@@ -3433,7 +3696,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         let result = dht.remove_agent_key(&identity, &document).await;
@@ -3446,7 +3712,12 @@ mod tests {
         let dht = make_dht_with_custody(&custody);
 
         // Create identity with agent key.
-        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) = dht
+            .create_with_agent_key(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         let agent_key = identity.agent_signing_key.unwrap();
@@ -3511,7 +3782,12 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create_with_agent_key(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) = dht
+            .create_with_agent_key(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
 
         // Self-certification only checks #0 (identity key), so it should work
@@ -3526,51 +3802,24 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        // Create identity with agent key and pre-rotation key (manual).
-        let identity_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let active_signing_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let pre_rotation_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-        let agent_key = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
-
-        let identity_public = custody.public_key(&identity_key).await.unwrap();
-        let active_public = custody.public_key(&active_signing_key).await.unwrap();
-        let pre_rotation_public = custody.public_key(&pre_rotation_key).await.unwrap();
-        let agent_public = custody.public_key(&agent_key).await.unwrap();
-
-        let did = format!("did:dht:z{}", zbase32::encode(identity_public.as_bytes()));
-
-        let mut hasher = Sha256::new();
-        hasher.update(pre_rotation_public.as_bytes());
-        let commitment_bytes = hasher.finalize();
-        let mut pre_rotation_commitment = [0u8; 32];
-        pre_rotation_commitment.copy_from_slice(&commitment_bytes);
-
-        let document = DidDocument::new_with_agent_key(
-            &did,
-            identity_public.as_bytes(),
-            active_public.as_bytes(),
-            &pre_rotation_commitment,
-            Some(agent_public.as_bytes()),
-        );
-
-        let identity = ScpIdentity {
-            identity_key,
-            active_signing_key,
-            agent_signing_key: Some(agent_key),
-            pre_rotation_commitment,
-            pre_rotation_key,
-            did,
-        };
+        // Create identity with agent key via the production constructor.
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, pre_rotation_handle) = dht
+            .create_with_agent_key(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
 
         dht.publish_document(&identity, &document).await.unwrap();
 
         // Migrate the identity.
         let rotated_at = 1_700_000_000u64;
-        let (new_identity, new_doc, _event) = dht
+        let (new_identity, new_doc, _event, _new_pre_rotation_handle) = dht
             .migrate_identity(
                 &identity,
                 &document,
-                &pre_rotation_key,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
                 &*custody,
                 rotated_at,
             )
@@ -3667,7 +3916,10 @@ mod tests {
         let store = Arc::new(InMemorySequenceStore::new());
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Publish increments and persists.
         dht.publish_document(&identity, &document).await.unwrap();
@@ -3691,7 +3943,10 @@ mod tests {
         let store = Arc::new(InMemorySequenceStore::new());
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Publish 3 times to get sequence to 3.
         for _ in 0..3 {
@@ -3721,7 +3976,10 @@ mod tests {
 
         // First instance: publish with a store.
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         for _ in 0..5 {
             dht.publish_document(&identity, &document).await.unwrap();
         }
@@ -3748,7 +4006,10 @@ mod tests {
 
         // First instance: publish to get DHT seq to 3.
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         for _ in 0..3 {
             dht.publish_document(&identity, &document).await.unwrap();
         }
@@ -3776,7 +4037,12 @@ mod tests {
 
         // First session: create and publish.
         let dht1 = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
-        let (identity, document) = dht1.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) = dht1
+            .create(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
         dht1.publish_document(&identity, &document).await.unwrap();
         let seq_before_restart = dht1.current_sequence();
         assert_eq!(seq_before_restart, 1);
@@ -3803,7 +4069,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.publish_document(&identity, &document).await.unwrap();
         assert_eq!(dht.current_sequence(), 1);
         dht.publish_document(&identity, &document).await.unwrap();
@@ -3818,7 +4087,10 @@ mod tests {
         let store = Arc::new(InMemorySequenceStore::new());
         let dht = make_dht_with_store(&custody, Arc::clone(&dht_client), Arc::clone(&store));
 
-        let (identity, _document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, _document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
         dht.initialize_sequence(&identity.did).await.unwrap();
         assert_eq!(dht.current_sequence(), 0);
     }
@@ -3835,7 +4107,10 @@ mod tests {
         let dht = make_dht_with_custody(&custody);
         let attestation = InMemoryDeviceAttestation::new();
 
-        let (_identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (_identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Before attaching: no device attestation service entry.
         assert!(!document.has_device_attestation());
@@ -3865,7 +4140,10 @@ mod tests {
         let dht = make_dht_with_custody(&custody);
         let attestation = InMemoryDeviceAttestation::new();
 
-        let (_identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (_identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Attach device attestation.
         let updated_doc = dht
@@ -3889,7 +4167,10 @@ mod tests {
         let dht = make_dht_with_custody(&custody);
         let attestation = InMemoryDeviceAttestation::new();
 
-        let (_identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (_identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // Attach device attestation.
         let updated_doc = dht
@@ -3918,7 +4199,10 @@ mod tests {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
-        let (_identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (_identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // No device attestation service entry when not explicitly attached.
         assert!(!document.has_device_attestation());
@@ -3934,7 +4218,10 @@ mod tests {
         let dht = make_dht_with_custody(&custody);
         let attestation = InMemoryDeviceAttestation::new();
 
-        let (identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         let updated_doc = dht
             .attach_device_attestation(&document, &attestation)
@@ -3971,7 +4258,10 @@ mod tests {
         let dht = make_dht_with_custody(&custody);
         let attestation = InMemoryDeviceAttestation::new();
 
-        let (_identity, document) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (_identity, document, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         let updated_doc = dht
             .attach_device_attestation(&document, &attestation)
@@ -3996,7 +4286,10 @@ mod tests {
     async fn with_in_memory_custody_creates_signing_capable_instance() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = DidDht::with_in_memory_custody(Arc::clone(&custody));
-        let (identity, doc) = dht.create(&*custody).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, doc, _pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
 
         // DID is valid.
         assert!(identity.did.starts_with("did:dht:z"));

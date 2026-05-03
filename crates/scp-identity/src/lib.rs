@@ -69,7 +69,7 @@ pub use resolver::{
 
 use serde::{Deserialize, Serialize};
 
-use scp_platform::traits::{KeyCustody, KeyHandle};
+use scp_platform::traits::{KeyCustody, KeyHandle, PreRotationCustody, PreRotationKeyHandle};
 
 // Re-export DID and SigningKeyId from scp-primitives for backward compatibility.
 pub use scp_primitives::{DID, SigningKeyId};
@@ -103,14 +103,15 @@ pub struct ScpIdentity {
 
     /// SHA-256 hash of the next Identity Key's public key.
     /// Published in DID document as a `PreRotationCommitment` service.
+    ///
+    /// The corresponding pre-rotation private key is held in a separate
+    /// [`PreRotationCustody`](scp_platform::PreRotationCustody) instance
+    /// — never in operational [`KeyCustody`] alongside `identity_key` or
+    /// `active_signing_key`. Per spec §9.7.4.1 step 3 ("storage isolation")
+    /// the pre-rotation key MUST be on a separate custody provider /
+    /// authentication flow from daily operations, so that compromise of
+    /// the operational custody path does not compromise the recovery path.
     pub pre_rotation_commitment: [u8; 32],
-
-    /// Pre-rotation key handle (committed to via `pre_rotation_commitment`).
-    /// At migration this becomes the new Identity Key, so the holder retains
-    /// it in custody from creation onward — destroying it would make
-    /// `migrate_identity` unable to satisfy the spec §3.7 invariant
-    /// `SHA-256(revealed_key) == commitment` and would brick recovery.
-    pub pre_rotation_key: KeyHandle,
 
     /// The DID string: `did:dht:z<z-base-32(identity_key.public)>`.
     pub did: String,
@@ -126,6 +127,15 @@ pub enum IdentityError {
     /// A platform key custody operation failed.
     #[error("platform error: {0}")]
     Platform(#[from] scp_platform::PlatformError),
+
+    /// A pre-rotation custody operation failed.
+    ///
+    /// Distinct from [`Platform`](Self::Platform) so that callers can
+    /// distinguish a daily-operations custody failure from a recovery-path
+    /// failure — the two surfaces have different SDK UX implications
+    /// (re-authenticate vs. re-prompt for the cold-storage substrate).
+    #[error("pre-rotation custody error: {0}")]
+    PreRotation(#[from] scp_platform::PreRotationCustodyError),
 
     /// The DID string has an invalid format.
     #[error("invalid DID format: {0}")]
@@ -234,15 +244,27 @@ pub enum IdentityError {
 pub trait DidMethod: Send + Sync {
     /// Creates a new identity with three Ed25519 keypairs.
     ///
-    /// Generates the Identity Key, Active Signing Key, and Pre-Rotation Key
-    /// via the provided [`KeyCustody`] implementation. Returns the
-    /// [`ScpIdentity`] handle and the constructed [`DidDocument`].
+    /// Generates the Identity Key and Active Signing Key in the operational
+    /// `key_custody`. Generates an ephemeral pre-rotation keypair, hashes
+    /// the public key as the `PreRotationCommitment`, hands the private
+    /// bytes off to the cold-storage `pre_rotation_custody`, and discards
+    /// the operational copy (spec §9.7.4.1 §1, §5(a), §5(f)). The two
+    /// custodies MUST be distinct instances on distinct substrates per
+    /// §9.7.4.1 §3 (storage isolation).
+    ///
+    /// Returns the [`ScpIdentity`] handle, the constructed [`DidDocument`],
+    /// and the [`PreRotationKeyHandle`] referencing the cold-stored
+    /// pre-rotation key. The caller persists the handle alongside the
+    /// identity so it can be presented to `migrate_identity` later.
     ///
     /// See ADR-003 acceptance criterion 1.
     fn create(
         &self,
         key_custody: &impl KeyCustody,
-    ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send;
+        pre_rotation_custody: &impl PreRotationCustody,
+    ) -> impl Future<
+        Output = Result<(ScpIdentity, DidDocument, PreRotationKeyHandle), IdentityError>,
+    > + Send;
 
     /// Verifies that a DID string is self-certifying for the given public key.
     ///

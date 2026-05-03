@@ -343,7 +343,8 @@ mod tests {
     use scp_identity::document::{DidDocument, Service};
     use scp_identity::{DidMethod, IdentityError, ScpIdentity};
 
-    use scp_platform::traits::KeyCustody;
+    use scp_platform::PreRotationKeyHandle;
+    use scp_platform::traits::{KeyCustody, PreRotationCustody};
 
     // -----------------------------------------------------------------------
     // Mock DidMethod
@@ -386,8 +387,10 @@ mod tests {
         fn create(
             &self,
             _key_custody: &impl KeyCustody,
-        ) -> impl Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send
-        {
+            _pre_rotation_custody: &impl PreRotationCustody,
+        ) -> impl Future<
+            Output = Result<(ScpIdentity, DidDocument, PreRotationKeyHandle), IdentityError>,
+        > + Send {
             async { unreachable!("not needed for well_known tests") }
         }
 

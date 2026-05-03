@@ -1630,6 +1630,15 @@ pub struct IdentityEntry {
     pub document: DidDocument,
     /// Identity link attestations (§3.5.1). Stored locally per identity.
     pub identity_link_attestations: Vec<scp_core::identity::attestation::IdentityLinkAttestation>,
+    /// Handle to the per-identity pre-rotation key in cold-storage custody.
+    /// Returned by `DidDht::create` / `migrate_identity` and consumed by
+    /// the next `migrate_identity` call. See ADR-003 §4b.
+    pub pre_rotation_handle: scp_platform::PreRotationKeyHandle,
+    /// Cold-storage custody for the pre-rotation key. A separate substrate
+    /// from operational `key_custody` (spec §9.7.4.1 §3). The same `Arc` is
+    /// preserved across migrations (we don't mint a new custody per
+    /// migration — only a new handle).
+    pub pre_rotation_custody: Arc<scp_platform::testing::InMemoryPreRotationCustody>,
 }
 
 /// Registers an identity in the global identity registry.
@@ -2045,13 +2054,14 @@ mod tests {
                 active_signing_key: scp_platform::KeyHandle::new(0),
                 agent_signing_key: None,
                 pre_rotation_commitment: [0u8; 32],
-                pre_rotation_key: scp_platform::KeyHandle::new(0),
             },
             custody: Arc::new(crate::custody::FfiKeyCustody::InMemory(
                 InMemoryKeyCustody::new(),
             )),
             document: test_did_document(did),
             identity_link_attestations: Vec::new(),
+            pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+            pre_rotation_custody: Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new()),
         };
         register_identity(bi, did, entry);
         let stats = registry_stats(bi);
@@ -2125,13 +2135,14 @@ mod tests {
                 active_signing_key: scp_platform::KeyHandle::new(0),
                 agent_signing_key: None,
                 pre_rotation_commitment: [0u8; 32],
-                pre_rotation_key: scp_platform::KeyHandle::new(0),
             },
             custody: Arc::new(crate::custody::FfiKeyCustody::InMemory(
                 InMemoryKeyCustody::new(),
             )),
             document: test_did_document(did),
             identity_link_attestations: Vec::new(),
+            pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+            pre_rotation_custody: Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new()),
         };
         register_identity(bi, did, entry);
         assert!(remove_identity_if_present(bi, did));
@@ -2380,7 +2391,6 @@ mod tests {
                     active_signing_key: scp_platform::KeyHandle::new(0),
                     agent_signing_key: None,
                     pre_rotation_commitment: [0u8; 32],
-                    pre_rotation_key: scp_platform::KeyHandle::new(0),
                 },
                 custody: Arc::new(crate::custody::FfiKeyCustody::InMemory(
                     scp_platform::testing::InMemoryKeyCustody::new(),
@@ -2395,6 +2405,10 @@ mod tests {
                     service: vec![],
                 },
                 identity_link_attestations: Vec::new(),
+                pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+                pre_rotation_custody: Arc::new(
+                    scp_platform::testing::InMemoryPreRotationCustody::new(),
+                ),
             },
         );
         assert_eq!(bi.identity_registry().len(), 1);

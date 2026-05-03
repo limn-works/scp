@@ -81,11 +81,16 @@ fn create_test_identity(bi: &PyBridgeInstance) -> String {
         scp_platform::testing::InMemoryKeyCustody::new(),
     ));
 
-    let (identity, document) = rt.block_on(async {
+    let pre_rotation_custody = Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+    let (identity, document, pre_rotation_handle) = rt.block_on(async {
         let did_method = scp_identity::DidDht::new();
-        scp_identity::DidMethod::create(&did_method, custody.as_ref())
-            .await
-            .unwrap()
+        scp_identity::DidMethod::create(
+            &did_method,
+            custody.as_ref(),
+            pre_rotation_custody.as_ref(),
+        )
+        .await
+        .unwrap()
     });
 
     let did = identity.did.clone();
@@ -98,6 +103,8 @@ fn create_test_identity(bi: &PyBridgeInstance) -> String {
             custody,
             document,
             identity_link_attestations: Vec::new(),
+            pre_rotation_handle,
+            pre_rotation_custody,
         },
     );
 

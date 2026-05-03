@@ -698,8 +698,14 @@ impl crate::scp::PyScp {
         py.allow_threads(|| {
             rt.block_on(async {
                 let did_method = DidDht::new();
-                let (identity, document) = did_method
-                    .create(key_custody.as_ref())
+                // Mint a fresh per-identity pre-rotation custody. ADR-003
+                // §4b: the pre-rotation key lives in a separate substrate
+                // from operational `key_custody`. The same `Arc` is
+                // preserved across migrations.
+                let pre_rotation_custody =
+                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                let (identity, document, pre_rotation_handle) = did_method
+                    .create(key_custody.as_ref(), pre_rotation_custody.as_ref())
                     .await
                     .map_err(ScpPyError::from)?;
 
@@ -732,6 +738,8 @@ impl crate::scp::PyScp {
                         custody: key_custody,
                         document,
                         identity_link_attestations: Vec::new(),
+                        pre_rotation_handle,
+                        pre_rotation_custody,
                     },
                 );
 
@@ -790,8 +798,12 @@ impl crate::scp::PyScp {
         py.allow_threads(|| {
             rt.block_on(async {
                 let did_method = DidDht::new();
-                let (identity, document) = did_method
-                    .create_with_agent_key(key_custody.as_ref())
+                // Fresh per-identity pre-rotation custody (see
+                // `identity_create` for rationale).
+                let pre_rotation_custody =
+                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                let (identity, document, pre_rotation_handle) = did_method
+                    .create_with_agent_key(key_custody.as_ref(), pre_rotation_custody.as_ref())
                     .await
                     .map_err(ScpPyError::from)?;
 
@@ -819,6 +831,8 @@ impl crate::scp::PyScp {
                         custody: key_custody,
                         document,
                         identity_link_attestations: Vec::new(),
+                        pre_rotation_handle,
+                        pre_rotation_custody,
                     },
                 );
 
@@ -1339,17 +1353,19 @@ impl crate::scp::PyScp {
         py.allow_threads(|| {
             rt.block_on(async {
                 // Extract what we need from the registry entry. The
-                // pre-rotation key is the one whose public hash is in
-                // `pre_rotation_commitment` (spec §3.7) — using a fresh key
-                // here would break the `SHA-256(revealed_key) == commitment`
-                // invariant verified by `verify_migration`.
+                // pre-rotation handle points into the cold-storage
+                // `pre_rotation_custody`; revealing it must yield a public
+                // key whose SHA-256 matches `pre_rotation_commitment`
+                // (spec §9.7.4.1 §6) — using a fresh handle here would
+                // break that invariant.
                 let (
                     custody,
                     old_identity_key,
                     old_active_key,
                     old_agent_key,
                     pre_rotation_commitment,
-                    pre_rotation_key,
+                    pre_rotation_handle,
+                    pre_rotation_custody,
                     old_doc,
                 ) = crate::runtime::with_identity(&bi_arc, &old_did, |entry| {
                     Ok((
@@ -1358,7 +1374,8 @@ impl crate::scp::PyScp {
                         entry.identity.active_signing_key,
                         entry.identity.agent_signing_key,
                         entry.identity.pre_rotation_commitment,
-                        entry.identity.pre_rotation_key,
+                        entry.pre_rotation_handle,
+                        Arc::clone(&entry.pre_rotation_custody),
                         entry.document.clone(),
                     ))
                 })?;
@@ -1370,7 +1387,6 @@ impl crate::scp::PyScp {
                     active_signing_key: old_active_key,
                     agent_signing_key: old_agent_key,
                     pre_rotation_commitment,
-                    pre_rotation_key,
                     did: old_did.clone(),
                 };
 
@@ -1383,16 +1399,18 @@ impl crate::scp::PyScp {
                     Arc::new(DidCache::new()),
                     sign_fn,
                 );
-                let (new_identity, new_document, rotation_event) = did_method
-                    .migrate_identity(
-                        &old_identity,
-                        &old_doc,
-                        &pre_rotation_key,
-                        custody.as_ref(),
-                        rotated_at,
-                    )
-                    .await
-                    .map_err(ScpPyError::from)?;
+                let (new_identity, new_document, rotation_event, new_pre_rotation_handle) =
+                    did_method
+                        .migrate_identity(
+                            &old_identity,
+                            &old_doc,
+                            &pre_rotation_handle,
+                            pre_rotation_custody.as_ref(),
+                            custody.as_ref(),
+                            rotated_at,
+                        )
+                        .await
+                        .map_err(ScpPyError::from)?;
                 let rotation_event_json = serde_json::to_string(&rotation_event).map_err(|e| {
                     ScpPyError::IdentityError {
                         message: format!("failed to serialize rotation event: {e}"),
@@ -1417,7 +1435,10 @@ impl crate::scp::PyScp {
                 })
                 .unwrap_or_default();
 
-                // Remove old identity and register the new one.
+                // Remove old identity and register the new one. We carry
+                // the SAME pre-rotation custody Arc forward — only the
+                // handle changes per migration (ADR-003 §4b: each
+                // migration mints a fresh pre-rotation key).
                 crate::runtime::remove_identity(&bi_arc, &old_did);
                 crate::runtime::register_identity(
                     &bi_arc,
@@ -1427,6 +1448,8 @@ impl crate::scp::PyScp {
                         custody,
                         document: new_document,
                         identity_link_attestations: existing_attestations,
+                        pre_rotation_handle: new_pre_rotation_handle,
+                        pre_rotation_custody,
                     },
                 );
                 Ok((

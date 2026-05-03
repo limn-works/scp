@@ -487,6 +487,28 @@ impl KeyCustody for InMemoryKeyCustody {
         CustodyType::InMemory
     }
 
+    fn import_ed25519_signing_key(
+        &self,
+        seed: &Zeroizing<[u8; 32]>,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        // Copy the seed into a new Zeroizing — the borrow is non-consuming
+        // so the caller's wrapper continues to control its lifetime.
+        let seed_copy: [u8; 32] = **seed;
+        async move {
+            let handle = self.next_handle();
+            let signing_key = SigningKey::from_bytes(&seed_copy);
+
+            let mut store = self.store.lock().await;
+            store.ed25519_keys.insert(handle.id(), signing_key);
+            store.key_types.insert(handle.id(), StoredKeyType::Ed25519);
+            drop(store);
+
+            // Wipe the local stack copy of the seed bytes.
+            let _ = Zeroizing::new(seed_copy);
+            Ok(handle)
+        }
+    }
+
     fn generate_ephemeral_ed25519_seed(
         &self,
     ) -> impl Future<Output = Result<Zeroizing<[u8; 32]>, PlatformError>> + Send {

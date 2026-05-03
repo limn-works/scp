@@ -2856,7 +2856,10 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             key_custody,
             did_method,
         } => {
-            let (identity, document) = did_method.create(&*key_custody).await?;
+            let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
+            let (identity, document, _pre_rotation_handle) = did_method
+                .create(&*key_custody, &pre_rotation_custody)
+                .await?;
             Ok((identity, document, did_method))
         }
         IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
@@ -3006,7 +3009,10 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
                 Ok((persisted.identity, persisted.document, did_method))
             } else {
                 // 3. Generate a new identity and persist it.
-                let (identity, document) = did_method.create(&*key_custody).await?;
+                let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
+                let (identity, document, _pre_rotation_handle) = did_method
+                    .create(&*key_custody, &pre_rotation_custody)
+                    .await?;
                 let persisted = PersistedIdentity {
                     identity: identity.clone(),
                     document: document.clone(),
@@ -3724,8 +3730,13 @@ impl DidMethod for NoOpDidMethod {
     fn create(
         &self,
         _key_custody: &impl KeyCustody,
-    ) -> impl std::future::Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send
-    {
+        _pre_rotation_custody: &impl scp_platform::PreRotationCustody,
+    ) -> impl std::future::Future<
+        Output = Result<
+            (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+            IdentityError,
+        >,
+    > + Send {
         std::future::ready(Err(IdentityError::DhtPublishFailed(
             "NoOpDidMethod: not configured".to_owned(),
         )))
@@ -3912,8 +3923,12 @@ mod tests {
     /// Helper: creates an identity and document for explicit identity tests.
     async fn create_test_identity() -> (ScpIdentity, DidDocument, Arc<InMemoryKeyCustody>) {
         let custody = Arc::new(InMemoryKeyCustody::new());
+        let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
         let did_dht = make_test_dht(&custody);
-        let (identity, document) = did_dht.create(&*custody).await.unwrap();
+        let (identity, document, _pre_rotation_handle) = did_dht
+            .create(&*custody, &pre_rotation_custody)
+            .await
+            .unwrap();
         (identity, document, custody)
     }
 
@@ -4038,10 +4053,14 @@ mod tests {
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
+                pre_rotation_custody: &impl scp_platform::PreRotationCustody,
             ) -> impl std::future::Future<
-                Output = Result<(ScpIdentity, DidDocument), IdentityError>,
+                Output = Result<
+                    (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+                    IdentityError,
+                >,
             > + Send {
-                self.inner.create(key_custody)
+                self.inner.create(key_custody, pre_rotation_custody)
             }
 
             fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
@@ -4168,10 +4187,14 @@ mod tests {
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
+                pre_rotation_custody: &impl scp_platform::PreRotationCustody,
             ) -> impl std::future::Future<
-                Output = Result<(ScpIdentity, DidDocument), IdentityError>,
+                Output = Result<
+                    (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+                    IdentityError,
+                >,
             > + Send {
-                self.inner.create(key_custody)
+                self.inner.create(key_custody, pre_rotation_custody)
             }
 
             fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
@@ -4648,10 +4671,14 @@ mod tests {
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
+                pre_rotation_custody: &impl scp_platform::PreRotationCustody,
             ) -> impl std::future::Future<
-                Output = Result<(ScpIdentity, DidDocument), IdentityError>,
+                Output = Result<
+                    (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+                    IdentityError,
+                >,
             > + Send {
-                self.inner.create(key_custody)
+                self.inner.create(key_custody, pre_rotation_custody)
             }
 
             fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
@@ -5410,7 +5437,6 @@ mod tests {
             active_signing_key: scp_platform::KeyHandle::new(2),
             agent_signing_key: None,
             pre_rotation_commitment: [0u8; 32],
-            pre_rotation_key: scp_platform::KeyHandle::new(3),
             did: "did:dht:test123".to_owned(),
         };
 
@@ -5499,7 +5525,6 @@ mod tests {
             active_signing_key: scp_platform::KeyHandle::new(2),
             agent_signing_key: None,
             pre_rotation_commitment: [0u8; 32],
-            pre_rotation_key: scp_platform::KeyHandle::new(3),
             did: "did:dht:testnet123".to_owned(),
         };
 
@@ -5588,7 +5613,6 @@ mod tests {
             active_signing_key: scp_platform::KeyHandle::new(2),
             agent_signing_key: None,
             pre_rotation_commitment: [0u8; 32],
-            pre_rotation_key: scp_platform::KeyHandle::new(3),
             did: "did:dht:unchanged123".to_owned(),
         };
 
@@ -5687,7 +5711,6 @@ mod tests {
             active_signing_key: scp_platform::KeyHandle::new(2),
             agent_signing_key: None,
             pre_rotation_commitment: [0u8; 32],
-            pre_rotation_key: scp_platform::KeyHandle::new(3),
             did: "did:dht:resilient123".to_owned(),
         };
 
@@ -5928,7 +5951,6 @@ mod tests {
                 active_signing_key: KeyHandle::new(2),
                 agent_signing_key: None,
                 pre_rotation_commitment: [0u8; 32],
-                pre_rotation_key: KeyHandle::new(3),
                 did: "did:dht:zroundtrip".to_owned(),
             },
             document: DidDocument {
@@ -5964,7 +5986,6 @@ mod tests {
                 active_signing_key: KeyHandle::new(2),
                 agent_signing_key: None,
                 pre_rotation_commitment: [0u8; 32],
-                pre_rotation_key: KeyHandle::new(3),
                 did: "did:dht:zfuture".to_owned(),
             },
             document: DidDocument {

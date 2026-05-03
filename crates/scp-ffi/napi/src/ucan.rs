@@ -1088,6 +1088,10 @@ mod tests {
         // Create two distinct identities (creator and delegator).
         let custody_a = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
         let custody_b = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let pre_rotation_custody_a =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let pre_rotation_custody_b =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
 
         let dht_a = scp_identity::DidDht::new();
         let dht_b = scp_identity::DidDht::new();
@@ -1097,8 +1101,12 @@ mod tests {
             .build()
             .unwrap();
 
-        let (identity_a, doc_a) = rt.block_on(dht_a.create(&custody_a.0)).unwrap();
-        let (identity_b, doc_b) = rt.block_on(dht_b.create(&custody_b.0)).unwrap();
+        let (identity_a, doc_a, pre_rotation_handle_a) = rt
+            .block_on(dht_a.create(&custody_a.0, pre_rotation_custody_a.as_ref()))
+            .unwrap();
+        let (identity_b, doc_b, pre_rotation_handle_b) = rt
+            .block_on(dht_b.create(&custody_b.0, pre_rotation_custody_b.as_ref()))
+            .unwrap();
 
         // Verify different DIDs were generated.
         assert_ne!(
@@ -1120,6 +1128,8 @@ mod tests {
                 custody: Arc::clone(&custody_a),
                 document: doc_a,
                 identity_link_attestations: Vec::new(),
+                pre_rotation_handle: pre_rotation_handle_a,
+                pre_rotation_custody: pre_rotation_custody_a,
             },
         );
         runtime::register_identity(
@@ -1130,6 +1140,8 @@ mod tests {
                 custody: Arc::clone(&custody_b),
                 document: doc_b,
                 identity_link_attestations: Vec::new(),
+                pre_rotation_handle: pre_rotation_handle_b,
+                pre_rotation_custody: pre_rotation_custody_b,
             },
         );
 
@@ -1187,6 +1199,8 @@ mod tests {
         use scp_platform::testing::InMemoryKeyCustody;
 
         let custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::new();
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1194,7 +1208,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let (identity, doc) = rt.block_on(dht.create(&custody.0)).unwrap();
+        let (identity, doc, pre_rotation_handle) = rt
+            .block_on(dht.create(&custody.0, pre_rotation_custody.as_ref()))
+            .unwrap();
         let did = identity.did.clone();
 
         let bi = runtime::NapiBridgeInstance::new_napi();
@@ -1208,6 +1224,8 @@ mod tests {
                 custody: Arc::clone(&custody),
                 document: doc,
                 identity_link_attestations: Vec::new(),
+                pre_rotation_handle,
+                pre_rotation_custody,
             },
         );
 
@@ -1238,6 +1256,8 @@ mod tests {
         use scp_platform::testing::InMemoryKeyCustody;
 
         let custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::new();
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1245,7 +1265,9 @@ mod tests {
             .build()
             .unwrap();
 
-        let (identity, doc) = rt.block_on(dht.create(&custody.0)).unwrap();
+        let (identity, doc, pre_rotation_handle) = rt
+            .block_on(dht.create(&custody.0, pre_rotation_custody.as_ref()))
+            .unwrap();
         let did = identity.did.clone();
 
         let bi = runtime::NapiBridgeInstance::new_napi();
@@ -1259,6 +1281,8 @@ mod tests {
                 custody: Arc::clone(&custody),
                 document: doc,
                 identity_link_attestations: Vec::new(),
+                pre_rotation_handle,
+                pre_rotation_custody,
             },
         );
 

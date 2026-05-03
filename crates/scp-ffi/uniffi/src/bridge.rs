@@ -1448,6 +1448,32 @@ pub struct Identity {
     /// `rotate_key`, agent-key ops, or external load — those do not
     /// change the DID, so no `DidRotationEvent` is constructed.
     pub(crate) rotation_event_json: Option<String>,
+    /// Opaque handle into [`pre_rotation_custody`](Self::pre_rotation_custody)
+    /// for the pre-rotation key whose SHA-256 hash equals the
+    /// `pre_rotation_commitment` retained on `core_id`.
+    ///
+    /// Spec §9.7.4.1 §6 / ADR-003 §4b: the pre-rotation key lives in a
+    /// substrate distinct from operational `KeyCustody` so a compromise of
+    /// operational keys cannot reveal the pre-rotation key. The handle is
+    /// minted at identity creation and consumed by
+    /// [`Scp::identity_migrate`], which mints a fresh one for the next
+    /// migration. Active-key rotation, agent-key operations, and load
+    /// preserve the handle verbatim.
+    ///
+    /// Rust-internal field — NOT exposed through `#[uniffi::export]`.
+    #[allow(dead_code)]
+    pub(crate) pre_rotation_handle: scp_platform::PreRotationKeyHandle,
+    /// Cold-storage custody for the pre-rotation key referenced by
+    /// [`pre_rotation_handle`](Self::pre_rotation_handle).
+    ///
+    /// The same `Arc` is preserved across all migrations of this identity
+    /// (per ADR-003 §4b). Production custody migration is a follow-up
+    /// workstream; the in-memory testing backend is sufficient for the
+    /// dev/desktop and parity-test paths exercised today.
+    ///
+    /// Rust-internal field — NOT exposed through `#[uniffi::export]`.
+    #[allow(dead_code)]
+    pub(crate) pre_rotation_custody: Arc<scp_platform::testing::InMemoryPreRotationCustody>,
 }
 
 #[uniffi::export]
@@ -1551,6 +1577,13 @@ impl Identity {
                 verifying_key_hex,
                 instance_id: self.instance_id,
                 rotation_event_json: None,
+                // `rotate` (active-signing-key rotation) does NOT mint a new
+                // pre-rotation commitment, so the per-identity pre-rotation
+                // custody and handle are preserved verbatim. Only
+                // `migrate_identity` (DID rotation) consumes the existing
+                // pre-rotation handle and produces a fresh one.
+                pre_rotation_handle: self.pre_rotation_handle,
+                pre_rotation_custody: Arc::clone(&self.pre_rotation_custody),
             });
             increment_handle_count();
             return Ok(handle);
@@ -1577,6 +1610,10 @@ impl Identity {
                 verifying_key_hex,
                 instance_id: self.instance_id,
                 rotation_event_json: None,
+                // See note above: active-key rotation preserves the
+                // pre-rotation custody and handle.
+                pre_rotation_handle: self.pre_rotation_handle,
+                pre_rotation_custody: Arc::clone(&self.pre_rotation_custody),
             });
             increment_handle_count();
             return Ok(handle);
@@ -1696,6 +1733,10 @@ impl Identity {
             let custody_type = self.custody_type.clone();
             let in_memory_custody = Some(custody.clone());
             let instance_id = self.instance_id;
+            // Agent-key operations don't change the pre-rotation commitment
+            // — preserve the existing handle and custody.
+            let pre_rotation_handle = self.pre_rotation_handle;
+            let pre_rotation_custody = Arc::clone(&self.pre_rotation_custody);
             let dht = make_dht_with_signer(&custody)?;
 
             runtime()
@@ -1719,6 +1760,8 @@ impl Identity {
                         verifying_key_hex,
                         instance_id,
                         rotation_event_json: None,
+                        pre_rotation_handle,
+                        pre_rotation_custody,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -1794,6 +1837,10 @@ impl Identity {
             let custody_type = self.custody_type.clone();
             let in_memory_custody = self.in_memory_custody.clone();
             let instance_id = self.instance_id;
+            // Agent-key operations don't change the pre-rotation commitment
+            // — preserve the existing handle and custody.
+            let pre_rotation_handle = self.pre_rotation_handle;
+            let pre_rotation_custody = Arc::clone(&self.pre_rotation_custody);
             let dht = make_dht_with_signer(custody)?;
 
             let custody_for_key = custody.clone();
@@ -1820,6 +1867,8 @@ impl Identity {
                         verifying_key_hex,
                         instance_id,
                         rotation_event_json: None,
+                        pre_rotation_handle,
+                        pre_rotation_custody,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -1893,6 +1942,10 @@ impl Identity {
             let custody_type = self.custody_type.clone();
             let in_memory_custody = Some(custody.clone());
             let instance_id = self.instance_id;
+            // Agent-key rotation doesn't change the pre-rotation commitment
+            // — preserve the existing handle and custody.
+            let pre_rotation_handle = self.pre_rotation_handle;
+            let pre_rotation_custody = Arc::clone(&self.pre_rotation_custody);
             let dht = make_dht_with_signer(&custody)?;
 
             runtime()
@@ -1916,6 +1969,8 @@ impl Identity {
                         verifying_key_hex,
                         instance_id,
                         rotation_event_json: None,
+                        pre_rotation_handle,
+                        pre_rotation_custody,
                     });
                     increment_handle_count();
                     Ok(handle)
@@ -6932,8 +6987,17 @@ impl Scp {
                             );
                             let key_custody = Arc::new(OpaqueInMemoryKeyCustody(in_memory));
                             let dht = DidDht::new();
-                            let (identity, document) =
-                                dht.create(&key_custody.0).await.map_err(ScpError::from)?;
+                            // Mint a fresh per-identity pre-rotation custody.
+                            // ADR-003 §4b: the pre-rotation key lives in a
+                            // separate substrate from operational
+                            // `key_custody`. The same `Arc` is preserved
+                            // across migrations.
+                            let pre_rotation_custody =
+                                Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                            let (identity, document, pre_rotation_handle) = dht
+                                .create(&key_custody.0, pre_rotation_custody.as_ref())
+                                .await
+                                .map_err(ScpError::from)?;
 
                             // Snapshot the #0 (identity) verifying key for ADR-046 parity.
                             let verifying_key_hex =
@@ -6957,6 +7021,8 @@ impl Scp {
                                 verifying_key_hex,
                                 instance_id: bi.core.instance_id(),
                                 rotation_event_json: None,
+                                pre_rotation_handle,
+                                pre_rotation_custody,
                             });
                             increment_handle_count();
                             Ok(handle)
@@ -7026,8 +7092,14 @@ impl Scp {
                 let callback_custody = Arc::new(CallbackKeyCustody::new(provider));
 
                 let dht = DidDht::new();
-                let (identity, document) = dht
-                    .create(callback_custody.as_ref())
+                // Mint a fresh per-identity pre-rotation custody (ADR-003 §4b).
+                // Production callback custody integration is a follow-up
+                // workstream; in-memory custody is used here so the
+                // commitment invariant holds for tests and dev/desktop builds.
+                let pre_rotation_custody =
+                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                let (identity, document, pre_rotation_handle) = dht
+                    .create(callback_custody.as_ref(), pre_rotation_custody.as_ref())
                     .await
                     .map_err(ScpError::from)?;
 
@@ -7051,6 +7123,8 @@ impl Scp {
                     verifying_key_hex,
                     instance_id: bi.core.instance_id(),
                     rotation_event_json: None,
+                    pre_rotation_handle,
+                    pre_rotation_custody,
                 });
                 increment_handle_count();
                 Ok(handle)
@@ -7083,6 +7157,14 @@ impl Scp {
                 // identity_load returns a DID-string-only handle. Key operations
                 // require the KeyCustodyProvider callback interface to be wired.
                 // No live key material, so `verifying_key_hex` is `None`.
+                //
+                // Pre-rotation state is unused on externally loaded handles —
+                // `identity_migrate` rejects this path before the handle is
+                // consulted (`core_id` is `None`, surface as IDENT_1009). The
+                // empty in-memory custody is a placeholder so the field is
+                // populated; it never receives a key.
+                let pre_rotation_custody =
+                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                 let handle = Arc::new(Identity {
                     did,
                     custody_type: CustodyMethod::External,
@@ -7094,6 +7176,8 @@ impl Scp {
                     verifying_key_hex: None,
                     instance_id: bi.core.instance_id(),
                     rotation_event_json: None,
+                    pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+                    pre_rotation_custody,
                 });
                 increment_handle_count();
                 Ok(handle)
@@ -12700,6 +12784,14 @@ impl Scp {
         let custody_type = identity.custody_type.clone();
         let instance_id = identity.instance_id;
 
+        // Pre-rotation key state. The pre-rotation handle points into the
+        // cold-storage custody; revealing it must yield a public key whose
+        // SHA-256 matches the committed value (spec §9.7.4.1 §6 / ADR-003
+        // §4b). The custody `Arc` is preserved across migrations; only the
+        // handle changes per rotation.
+        let pre_rotation_handle = identity.pre_rotation_handle;
+        let pre_rotation_custody = Arc::clone(&identity.pre_rotation_custody);
+
         #[cfg(feature = "allow_in_memory_custody")]
         let custody_arc = in_memory.map(Arc::clone);
         let callback_custody = identity.callback_custody.as_ref().map(Arc::clone);
@@ -12717,12 +12809,18 @@ impl Scp {
                     // invariant.
                     let rotated_at = scp_primitives::SystemClock.now_secs();
 
-                    let dht = DidDht::new();
-                    let (new_identity, new_document, rotation_event) = dht
+                    // `migrate_identity` calls `publish_document` for the old
+                    // and new DID documents — both BEP44 puts require a
+                    // signing function bound to the identity custody.
+                    // `DidDht::new()` would surface
+                    // "no signing function configured".
+                    let dht = make_dht_with_signer(kc)?;
+                    let (new_identity, new_document, rotation_event, new_pre_rotation_handle) = dht
                         .migrate_identity(
                             &old_identity,
                             &old_document,
-                            &old_identity.pre_rotation_key,
+                            &pre_rotation_handle,
+                            pre_rotation_custody.as_ref(),
                             &kc.0,
                             rotated_at,
                         )
@@ -12752,6 +12850,8 @@ impl Scp {
                         verifying_key_hex,
                         instance_id,
                         rotation_event_json: Some(rotation_event_json),
+                        pre_rotation_handle: new_pre_rotation_handle,
+                        pre_rotation_custody,
                     });
                     increment_handle_count();
                     let _ = has_agent; // suppress unused warning
@@ -12790,11 +12890,12 @@ impl Scp {
                     let rotated_at = scp_primitives::SystemClock.now_secs();
 
                     let dht = DidDht::new();
-                    let (new_identity, new_document, rotation_event) = dht
+                    let (new_identity, new_document, rotation_event, new_pre_rotation_handle) = dht
                         .migrate_identity(
                             &old_identity,
                             &old_document,
-                            &old_identity.pre_rotation_key,
+                            &pre_rotation_handle,
+                            pre_rotation_custody.as_ref(),
                             cc.as_ref(),
                             rotated_at,
                         )
@@ -12820,6 +12921,8 @@ impl Scp {
                         verifying_key_hex,
                         instance_id,
                         rotation_event_json: Some(rotation_event_json),
+                        pre_rotation_handle: new_pre_rotation_handle,
+                        pre_rotation_custody,
                     });
                     increment_handle_count();
 
@@ -12897,8 +13000,14 @@ impl Scp {
                             let key_custody =
                                 Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
                             let dht = DidDht::new();
-                            let (identity, document) = dht
-                                .create_with_agent_key(&key_custody.0)
+                            // Fresh per-identity pre-rotation custody (ADR-003 §4b).
+                            let pre_rotation_custody =
+                                Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                            let (identity, document, pre_rotation_handle) = dht
+                                .create_with_agent_key(
+                                    &key_custody.0,
+                                    pre_rotation_custody.as_ref(),
+                                )
                                 .await
                                 .map_err(ScpError::from)?;
 
@@ -12924,6 +13033,8 @@ impl Scp {
                                 verifying_key_hex,
                                 instance_id: bi.core.instance_id(),
                                 rotation_event_json: None,
+                                pre_rotation_handle,
+                                pre_rotation_custody,
                             });
                             increment_handle_count();
                             Ok(handle)
@@ -14249,6 +14360,11 @@ mod tests {
     /// `instance_id`. Phase D (#1695): see `test_handle_for`.
     fn test_identity_for(scp: &Arc<crate::scp::Scp>) -> Arc<Identity> {
         let instance_id = scp.instance_id();
+        // Synthetic pre-rotation custody — never inspected by callers that
+        // only exercise non-migration paths, but the field is non-optional
+        // so the test handle has to provide something.
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         Arc::new(Identity {
             did: "did:dht:z6MkTestUser".to_owned(),
             custody_type: CustodyMethod::InMemory,
@@ -14260,6 +14376,8 @@ mod tests {
             verifying_key_hex: None,
             instance_id,
             rotation_event_json: None,
+            pre_rotation_handle: scp_platform::PreRotationKeyHandle::new(0),
+            pre_rotation_custody,
         })
     }
 
@@ -15136,7 +15254,12 @@ mod tests {
             Arc::new(DidCache::new()),
             sign_fn,
         );
-        let (identity, doc) = dht.create(custody.as_ref()).await.unwrap();
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, doc, _pre_rotation_handle) = dht
+            .create(custody.as_ref(), pre_rotation_custody.as_ref())
+            .await
+            .unwrap();
 
         // Publish the document to the shared DHT so the resolver can find it.
         dht.publish(&identity, &doc).await.unwrap();
@@ -15172,6 +15295,53 @@ mod tests {
 
         assert_eq!(auth.did, identity.did);
         assert_eq!(auth.signing_key_id, scp_identity::SigningKeyId::Active);
+    }
+
+    // -----------------------------------------------------------------------
+    // Pre-rotation invariant — cross-bridge parity
+    //
+    // Mirrors the SHA-256(revealed_key) == commitment assertions in the
+    // PyO3, NAPI, and WASM bridges. Spec §9.7.4.1 §6 / ADR-003 §4b
+    // require that every `DidRotationEvent` carry a `PreRotationProof`
+    // whose `revealed_key` hashes to the previous identity's
+    // `pre_rotation_commitment`. Failing this invariant breaks
+    // `verify_migration` for every downstream consumer.
+    // -----------------------------------------------------------------------
+
+    /// Verifies that `identity_migrate` on the in-memory custody path
+    /// produces a `DidRotationEvent` whose `PreRotationProof` satisfies
+    /// `SHA-256(revealed_key) == commitment`. Cross-bridge parity with
+    /// the corresponding `PyO3`, NAPI, and WASM tests.
+    #[tokio::test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    async fn identity_migrate_pre_rotation_proof_satisfies_sha256_invariant() {
+        use sha2::{Digest, Sha256};
+
+        let scp = scp_test();
+        let identity = scp
+            .identity_create("in_memory".to_owned(), None)
+            .await
+            .expect("identity_create");
+        let migrated = scp
+            .identity_migrate(Arc::clone(&identity))
+            .await
+            .expect("identity_migrate");
+
+        let event_json = migrated
+            .rotation_event_json()
+            .expect("rotationEventJson must be Some on migrated handles");
+        let event: scp_identity::DidRotationEvent =
+            serde_json::from_str(&event_json).expect("rotation_event_json deserialises");
+        let pre_rot = event
+            .pre_rotation_proof
+            .as_ref()
+            .expect("PreRotationProof MUST be present on a migrate event");
+
+        let recomputed: [u8; 32] = Sha256::digest(pre_rot.revealed_key).into();
+        assert_eq!(
+            recomputed, pre_rot.commitment,
+            "PreRotationProof MUST satisfy SHA-256(revealed_key) == commitment"
+        );
     }
 
     // MCP bridge tests (issue #591)

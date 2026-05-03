@@ -1124,13 +1124,18 @@ mod tests {
         type DevDidDht = DidDht<InMemoryDhtClient, SystemClock>;
 
         let custody = Arc::new(InMemoryKeyCustody::new());
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht_client = Arc::new(InMemoryDhtClient::new());
         let cache = Arc::new(DidCache::new());
         let sign_fn = DevDidDht::make_sign_fn(Arc::clone(&custody));
         let did_method = Arc::new(DevDidDht::with_client_and_signer(
             dht_client, cache, sign_fn,
         ));
-        let (identity, document) = did_method.create(custody.as_ref()).await.unwrap();
+        let (identity, document, _pre_rotation_handle) = did_method
+            .create(custody.as_ref(), pre_rotation_custody.as_ref())
+            .await
+            .unwrap();
 
         NodeIdentity {
             identity,

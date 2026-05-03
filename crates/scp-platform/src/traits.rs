@@ -447,6 +447,39 @@ pub trait KeyCustody: Send + Sync {
     /// This is a synchronous query against local state — no I/O is required.
     fn custody_type(&self, key: &KeyHandle) -> CustodyType;
 
+    /// Import an existing Ed25519 private key (raw 32-byte seed) into
+    /// operational custody, returning a fresh [`KeyHandle`].
+    ///
+    /// This is used by `migrate_identity` (ADR-003 §4b) to install the
+    /// pre-rotation key revealed from cold custody as the NEW identity
+    /// key (`#0`) of the migrated identity. The pre-rotation seed bytes
+    /// are consumed in a [`zeroize::Zeroizing`] wrapper, so partial
+    /// failure does not leak.
+    ///
+    /// # Hardware-backed implementations
+    ///
+    /// HSM-bound custody (Apple Secure Enclave, Android `StrongBox`)
+    /// generally cannot import raw Ed25519 seed bytes — the key material
+    /// must be generated inside the secure element. Such backends MUST
+    /// return [`PlatformError::Unsupported`]. The SDK is responsible for
+    /// surfacing this as a degraded-mode warning at migration time;
+    /// production HSM-backed migration requires a separate flow (HSM-attested
+    /// generation chained to the previous commitment) — out of scope for
+    /// the trait baseline.
+    fn import_ed25519_signing_key(
+        &self,
+        seed: &zeroize::Zeroizing<[u8; 32]>,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        // Default: not supported. The seed parameter is borrowed (not
+        // consumed) so the default impl does not even need to drop it.
+        let _ = seed;
+        async {
+            Err(PlatformError::Unsupported(
+                "Ed25519 signing-key import not supported by this custody backend",
+            ))
+        }
+    }
+
     /// Generate an Ed25519 keypair seed whose private bytes are returned to the
     /// caller and NEVER retained in operational custody.
     ///

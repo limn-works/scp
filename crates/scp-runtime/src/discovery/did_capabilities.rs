@@ -199,7 +199,7 @@ mod tests {
     use scp_identity::document::DidDocument;
     use scp_identity::{DidDht, DidMethod};
 
-    use scp_platform::testing::InMemoryKeyCustody;
+    use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 
     /// Helper: creates a `DidDht` instance with signing capability for tests.
     fn create_test_dht(custody: &Arc<InMemoryKeyCustody>) -> DidDht<InMemoryDhtClient> {
@@ -214,9 +214,13 @@ mod tests {
     async fn create_identity_with_capabilities(
         did_dht: &DidDht<InMemoryDhtClient>,
         key_custody: &InMemoryKeyCustody,
+        pre_rotation_custody: &InMemoryPreRotationCustody,
         capabilities: &[&str],
     ) -> (String, DidDocument) {
-        let (identity, mut document) = did_dht.create(key_custody).await.unwrap();
+        let (identity, mut document, _pre_rotation_handle) = did_dht
+            .create(key_custody, pre_rotation_custody)
+            .await
+            .unwrap();
 
         // Add SCPCapabilities service.
         let cap_str = capabilities.join(",");
@@ -405,11 +409,13 @@ mod tests {
     #[tokio::test]
     async fn resolve_capabilities_end_to_end() {
         let custody = Arc::new(InMemoryKeyCustody::new());
+        let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let did_dht = create_test_dht(&custody);
 
         let (did, _doc) = create_identity_with_capabilities(
             &did_dht,
             &custody,
+            &pre_rotation_custody,
             &[
                 "scp:capability:schema-validation/v1",
                 "scp:capability:rate-limit-compliance/v1",
@@ -438,10 +444,14 @@ mod tests {
     #[tokio::test]
     async fn resolve_capabilities_no_service_returns_error() {
         let custody = Arc::new(InMemoryKeyCustody::new());
+        let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
         let did_dht = create_test_dht(&custody);
 
         // Create identity without SCPCapabilities service.
-        let (identity, document) = did_dht.create(&*custody).await.unwrap();
+        let (identity, document, _pre_rotation_handle) = did_dht
+            .create(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
         did_dht.publish(&identity, &document).await.unwrap();
 
         let err = resolve_capabilities(&identity.did, &did_dht, &scp_primitives::SystemClock)

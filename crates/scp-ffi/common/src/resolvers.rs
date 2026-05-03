@@ -837,8 +837,9 @@ mod tests {
             .build()
             .unwrap();
         let custody = scp_platform::testing::InMemoryKeyCustody::new();
-        let (identity, document) = rt
-            .block_on(scp_identity::DidDht::new().create(&custody))
+        let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
+        let (identity, document, _pre_rotation_handle) = rt
+            .block_on(scp_identity::DidDht::new().create(&custody, &pre_rotation_custody))
             .unwrap();
 
         let resolved = ResolvedDidDocument {

@@ -839,6 +839,41 @@ impl KeyCustody for FileKeyCustody {
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::Software
     }
+
+    fn generate_ephemeral_ed25519_seed(
+        &self,
+    ) -> impl Future<Output = Result<Zeroizing<[u8; 32]>, PlatformError>> + Send {
+        async move {
+            // Software custody: draw 32 bytes from OsRng. The bytes are
+            // returned to the caller in a Zeroizing wrapper and never
+            // persisted in the file-encrypted custody — the caller hands
+            // them to a `PreRotationCustody` per spec §9.7.4.1 §1, §5(f).
+            let mut seed = Zeroizing::new([0u8; 32]);
+            rand::rngs::OsRng.fill_bytes(seed.as_mut());
+            Ok(seed)
+        }
+    }
+
+    fn import_ed25519_signing_key(
+        &self,
+        seed: &Zeroizing<[u8; 32]>,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        async move {
+            // Persist the seed bytes via the same encrypted append-only
+            // log used by `generate_keypair`. After this call the bytes
+            // are encrypted-at-rest under the same passphrase-derived key.
+            let key_bytes = Zeroizing::new(**seed);
+            let entry_index = self.append_entry(StoredKeyType::Ed25519, &key_bytes)?;
+
+            let handle = self.next_handle();
+            let mut map = self.handle_map.lock().await;
+            map.entries
+                .insert(handle.id(), (StoredKeyType::Ed25519, entry_index));
+            drop(map);
+
+            Ok(handle)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

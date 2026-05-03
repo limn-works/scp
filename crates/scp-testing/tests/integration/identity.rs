@@ -28,7 +28,12 @@ use scp_platform::traits::{KeyCustody, KeyType};
 /// Creates an identity via `DidDht::create` and returns the identity + document.
 async fn create_test_identity(custody: &InMemoryKeyCustody) -> (ScpIdentity, DidDocument) {
     let did_dht = DidDht::new();
-    did_dht.create(custody).await.expect("create identity")
+    let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
+    let (identity, doc, _pre_rotation_handle) = did_dht
+        .create(custody, &pre_rotation_custody)
+        .await
+        .expect("create identity");
+    (identity, doc)
 }
 
 // ---------------------------------------------------------------------------

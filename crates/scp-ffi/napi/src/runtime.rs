@@ -1071,6 +1071,16 @@ pub(crate) struct NapiIdentityEntry {
     /// Identity link attestations (§3.5.1). Stored locally per identity.
     pub(crate) identity_link_attestations:
         Vec<scp_core::identity::attestation::IdentityLinkAttestation>,
+    /// Cold-storage handle for the pre-rotation key associated with this
+    /// identity. Returned by `dht.create()` / `dht.migrate_identity()` and
+    /// must be presented to the next `migrate_identity` call to reveal the
+    /// committed key (spec §9.7.4.1, ADR-003 §4b).
+    pub(crate) pre_rotation_handle: scp_platform::PreRotationKeyHandle,
+    /// Cold-storage custody provider for the pre-rotation key. Held alongside
+    /// the operational `custody` so that migration can hand the old handle
+    /// back to the same custody instance that issued it (spec §9.7.4.1 §3:
+    /// storage isolation — distinct from operational `KeyCustody`).
+    pub(crate) pre_rotation_custody: Arc<scp_platform::testing::InMemoryPreRotationCustody>,
 }
 
 /// Returns a reference to the given bridge instance's identity registry.
