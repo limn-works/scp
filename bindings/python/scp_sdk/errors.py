@@ -552,6 +552,7 @@ class OutletError(ScpError, abc.ABC):
         validation; this wrapper is purely a marshaling layer.
         """
         import os
+
         try:
             import _scp_core  # type: ignore[import-not-found]
         except ImportError as e:
@@ -571,15 +572,12 @@ class OutletError(ScpError, abc.ABC):
         if len(pad_nonce_bytes) != 16:
             raise ValidationError("pad_nonce must be 16 bytes", "SCP-VALID-7000")
         if len(registration_event_id) != 32:
-            raise ValidationError(
-                "registration_event_id must be 32 bytes", "SCP-VALID-7000"
-            )
+            raise ValidationError("registration_event_id must be 32 bytes", "SCP-VALID-7000")
         import json as _json
+
         detail_json = _json.dumps(detail) if detail is not None else None
         source_chain_json = (
-            _json.dumps([h.to_wire() for h in source_chain])
-            if source_chain is not None
-            else None
+            _json.dumps([h.to_wire() for h in source_chain]) if source_chain is not None else None
         )
 
         envelope_json = _scp_core.outlet_error_new(
