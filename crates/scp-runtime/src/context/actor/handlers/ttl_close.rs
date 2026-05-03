@@ -1,42 +1,32 @@
 //! TTL-close handlers — see
 //! [`TtlCloseCommand`](crate::context::actor::commands::TtlCloseCommand)
-//! and spec §5.8 / plan row 9 of the commit ladder.
+//! and spec §5.8.
 //!
-//! # Commit 9 scope
+//! # Phase 2A.6 — actor-shape dispatch
 //!
-//! Migrates the dispatch shape: the handler takes
-//! `&Arc<ContextManager>` + [`ActorDeps`] + [`TtlCloseCommand`], returns
-//! `Outcome<()>`.
+//! The handler's primary entry point [`dispatch`] takes
+//! `(&mut PerContextState, &ActorDeps, TtlCloseCommand)` and routes
+//! every variant through [`crate::context::ttl_close_helpers`] (the
+//! actor-shape TTL-domain helpers). The shim entry point
+//! [`dispatch_from_shim`] remains during Phase 2A and routes through
+//! [`crate::context::ttl_close_helpers_legacy`] for callers that arrive
+//! via the supervisor mailbox-fallback path before a per-context actor
+//! exists.
 //!
-//! The underlying byte-identical implementation still lives on
-//! [`Supervisor`](crate::context::supervisor::Supervisor): each
-//! handler delegates to
-//! [`spawn_ttl_timer`](crate::context::lifecycle_helpers::spawn_ttl_timer)
-//! (via an internal helper),
-//! [`ContextManager::propose_ttl_extension`](crate::context::lifecycle_helpers::propose_ttl_extension),
-//! [`ContextManager::reset_ttl_timer`](crate::context::lifecycle_helpers::reset_ttl_timer),
-//! [`ContextManager::handle_ttl_expiry`](crate::context::lifecycle_helpers::handle_ttl_expiry),
-//! or
-//! [`ContextManager::finalize_close`](crate::context::lifecycle_helpers::finalize_close).
+//! # Timer ownership
 //!
-//! **TTL timer specifics (commit 9 scope).** The post-refactor
-//! architecture turns the TTL timer into a `select!` arm in
-//! [`ContextActor::run`](crate::context::actor::ContextActor). Commit 9
-//! keeps the timer spawned from the legacy
-//! [`Supervisor`](crate::context::supervisor::Supervisor) internals;
-//! the handler variants here respond to caller-initiated TTL commands
-//! (extend, finalize, explicit expiry, timer start / reset)
-//! synchronously. Full timer-owning actor logic migrates with plan row
-//! 11.
-//!
-//! # ADR-049 commit 12c.7 — direct dispatch
-//!
-//! Prior to 12c.7 the handler took a `MutationStateView<'_>` borrow
-//! adapter that bundled an `Arc<ContextManager>` reference plus a
-//! mutable scratch send-sequence tracker (the TTL path never read
-//! the tracker, but the adapter was uniform across handlers). 12c.7
-//! deletes the adapter: the supervisor passes the
-//! `&Arc<ContextManager>` directly and no scratch tracker is allocated.
+//! Spawning the TTL timer still requires the supervisor's `task_set`
+//! and contexts map (cross-actor mutation on timer fire); neither
+//! resource is on `ActorDeps`. The actor-shape `start_ttl_timer` /
+//! `reset_ttl_timer` reach
+//! [`crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy`]
+//! through
+//! [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
+//! during Phase 2A.6 — see the
+//! [`crate::context::ttl_close_helpers`] module-level doc for the full
+//! rationale (Option B of the Phase 2A.6 plan). Phase 2A.9 (lifecycle
+//! migration) revisits timer ownership so the TTL timer becomes a
+//! `select!` arm in [`ContextActor::run`](crate::context::actor::ContextActor).
 //!
 //! # Transport-timeout budget
 //!
@@ -55,80 +45,323 @@ use crate::context::ContextHandle;
 use crate::context::actor::commands::TtlCloseCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
+use crate::context::actor::state::PerContextState;
 use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for TTL-close handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch a [`TtlCloseCommand`] against an attached manager + deps
-/// bundle.
+/// Dispatch a [`TtlCloseCommand`] against actor-owned state and deps.
 ///
 /// Plan-conforming dispatch signature: matches the post-refactor actor
 /// `run()` loop's call shape
-/// (`handlers::ttl_close::dispatch(&mgr, &self.deps, cmd).await`).
-/// `deps` is accepted for symmetry — the ttl-close handler does not yet
-/// touch deps during the shim period. Commit 12 rewires these paths.
+/// (`handlers::ttl_close::dispatch(&mut state, &deps, cmd).await`).
+/// Each variant routes through [`crate::context::ttl_close_helpers`]
+/// (the actor-shape TTL-domain helpers).
 pub async fn dispatch(
-    supervisor: &Supervisor,
-    _deps: &ActorDeps,
+    state: &mut PerContextState,
+    deps: &ActorDeps,
     cmd: TtlCloseCommand,
 ) -> Outcome<()> {
-    dispatch_inner(supervisor, cmd).await
-}
-
-/// Shim-callable dispatch. Used by
-/// [`Supervisor::dispatch_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_command)
-/// during the commits-9-to-11 migration window — deleted in commit 12
-/// when the shim dissolves and the actor's `run()` loop is the only
-/// caller of [`dispatch`].
-///
-/// # Supervisor receiver (ADR-049 commit 12)
-pub(crate) async fn dispatch_from_shim(
-    supervisor: &Supervisor,
-    cmd: TtlCloseCommand,
-) -> Outcome<()> {
-    dispatch_inner(supervisor, cmd).await
-}
-
-async fn dispatch_inner(supervisor: &Supervisor, cmd: TtlCloseCommand) -> Outcome<()> {
     match cmd {
         TtlCloseCommand::Placeholder { reply } => reply_not_implemented(reply),
         TtlCloseCommand::StartTtlTimer { payload, reply } => {
             let p = *payload;
-            handle_start_ttl_timer(supervisor, p.context_id, p.params, p.duration, reply).await
+            handle_start_ttl_timer(state, deps, p.context_id, p.params, p.duration, reply).await
         }
         TtlCloseCommand::ExtendTtl {
             context_id,
             member_did,
             proposed_duration,
             reply,
-        } => handle_extend_ttl(supervisor, context_id, member_did, proposed_duration, reply).await,
+        } => {
+            handle_extend_ttl(
+                state,
+                deps,
+                context_id,
+                member_did,
+                proposed_duration,
+                reply,
+            )
+            .await
+        }
         TtlCloseCommand::ResetTtlTimer { payload, reply } => {
             let p = *payload;
-            handle_reset_ttl_timer(supervisor, p.context_id, p.params, p.duration, reply).await
+            handle_reset_ttl_timer(state, deps, p.context_id, p.params, p.duration, reply).await
         }
         TtlCloseCommand::ExecuteTtlClose { payload, reply } => {
             let p = *payload;
-            handle_execute_ttl_close(supervisor, p.context_id, p.params, reply).await
+            handle_execute_ttl_close(state, deps, p.context_id, p.params, reply).await
         }
         TtlCloseCommand::FinalizeClose { payload, reply } => {
             let p = *payload;
-            handle_finalize_close(supervisor, p.context_id, p.params, reply).await
+            handle_finalize_close(state, deps, p.context_id, p.params, reply).await
         }
     }
 }
 
-/// Handle [`TtlCloseCommand::StartTtlTimer`]: delegate to
-/// [`spawn_ttl_timer`](crate::context::lifecycle_helpers::spawn_ttl_timer)
-/// via the public
-/// [`Supervisor::start_ttl_timer`](crate::context::supervisor::Supervisor::start_ttl_timer)
-/// shim accessor added by this commit.
+/// Shim-callable dispatch. Used by
+/// [`Supervisor::dispatch_ttl_close_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_ttl_close_command)
+/// during the Phase 2A migration window when no per-context actor
+/// exists for the target context — every variant routes through
+/// [`crate::context::ttl_close_helpers_legacy`]. Removed in Phase 2A
+/// finalization with the rest of the supervisor shim.
+pub(crate) async fn dispatch_from_shim(
+    supervisor: &Supervisor,
+    cmd: TtlCloseCommand,
+) -> Outcome<()> {
+    match cmd {
+        TtlCloseCommand::Placeholder { reply } => reply_not_implemented(reply),
+        TtlCloseCommand::StartTtlTimer { payload, reply } => {
+            let p = *payload;
+            shim_handle_start_ttl_timer(supervisor, p.context_id, p.params, p.duration, reply).await
+        }
+        TtlCloseCommand::ExtendTtl {
+            context_id,
+            member_did,
+            proposed_duration,
+            reply,
+        } => {
+            shim_handle_extend_ttl(supervisor, context_id, member_did, proposed_duration, reply)
+                .await
+        }
+        TtlCloseCommand::ResetTtlTimer { payload, reply } => {
+            let p = *payload;
+            shim_handle_reset_ttl_timer(supervisor, p.context_id, p.params, p.duration, reply).await
+        }
+        TtlCloseCommand::ExecuteTtlClose { payload, reply } => {
+            let p = *payload;
+            shim_handle_execute_ttl_close(supervisor, p.context_id, p.params, reply).await
+        }
+        TtlCloseCommand::FinalizeClose { payload, reply } => {
+            let p = *payload;
+            shim_handle_finalize_close(supervisor, p.context_id, p.params, reply).await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Actor-shape handlers — route through `ttl_close_helpers` (PerContextState).
+// ---------------------------------------------------------------------------
+
+/// Handle [`TtlCloseCommand::StartTtlTimer`] against actor-owned state.
 ///
-/// `spawn_ttl_timer` itself has no inherent timeout (it returns once
-/// the task is spawned), but we still wrap it so a pathological mutex
-/// contention storm cannot block the dispatcher indefinitely.
+/// Routes to
+/// [`crate::context::ttl_close_helpers::start_ttl_timer`] which reaches
+/// [`crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy`]
+/// via the supervisor shim (Option B of the Phase 2A.6 plan). The
+/// timer itself has no inherent timeout, but we still wrap it so a
+/// pathological mutex contention storm cannot block the dispatcher
+/// indefinitely.
 async fn handle_start_ttl_timer(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: String,
+    params: scp_protocol::context::params::ContextParams,
+    duration: std::time::Duration,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let handle = ContextHandle::new(context_id.clone(), params);
+    if let Err(e) = handle
+        .transition_to(&scp_protocol::context::ContextState::Active)
+        .await
+    {
+        let sketch = outcome_error_sketch(&e);
+        let _ = reply.send(Err(e));
+        return Outcome::err(sketch);
+    }
+
+    let spawn_fut = crate::context::ttl_close_helpers::start_ttl_timer(
+        state,
+        deps,
+        &context_id,
+        duration,
+        handle,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, spawn_fut).await {
+        Ok(()) => (Outcome::ok_mutated(()), Ok(())),
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "start_ttl_timer exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`TtlCloseCommand::ExtendTtl`] against actor-owned state.
+async fn handle_extend_ttl(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: String,
+    member_did: scp_identity::DID,
+    proposed_duration: std::time::Duration,
+    reply: oneshot::Sender<Result<bool, ContextError>>,
+) -> Outcome<()> {
+    // `propose_ttl_extension` is synchronous (the actor owns `state`
+    // and persistence is fire-and-forget); wrap in `async { ... }` so
+    // the timeout budget still fires on pathological mutex contention.
+    let extend_fut = async {
+        crate::context::ttl_close_helpers::propose_ttl_extension(
+            state,
+            deps,
+            &context_id,
+            &member_did,
+            proposed_duration,
+        )
+    };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, extend_fut).await {
+        Ok(Ok(unanimous)) => (Outcome::ok_mutated(()), Ok(unanimous)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "propose_ttl_extension exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`TtlCloseCommand::ResetTtlTimer`] against actor-owned state.
+async fn handle_reset_ttl_timer(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: String,
+    params: scp_protocol::context::params::ContextParams,
+    new_duration: std::time::Duration,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let handle = ContextHandle::new(context_id.clone(), params);
+    if let Err(e) = handle
+        .transition_to(&scp_protocol::context::ContextState::Active)
+        .await
+    {
+        let sketch = outcome_error_sketch(&e);
+        let _ = reply.send(Err(e));
+        return Outcome::err(sketch);
+    }
+
+    let reset_fut = crate::context::ttl_close_helpers::reset_ttl_timer(
+        state,
+        deps,
+        &context_id,
+        new_duration,
+        handle,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reset_fut).await {
+        Ok(()) => (Outcome::ok_mutated(()), Ok(())),
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "reset_ttl_timer exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`TtlCloseCommand::ExecuteTtlClose`] against actor-owned state.
+async fn handle_execute_ttl_close(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: String,
+    params: scp_protocol::context::params::ContextParams,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let handle = ContextHandle::new(context_id.clone(), params);
+    if let Err(e) = handle
+        .transition_to(&scp_protocol::context::ContextState::Active)
+        .await
+    {
+        let sketch = outcome_error_sketch(&e);
+        let _ = reply.send(Err(e));
+        return Outcome::err(sketch);
+    }
+
+    let expiry_fut = crate::context::ttl_close_helpers::handle_ttl_expiry(state, deps, &handle);
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, expiry_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "handle_ttl_expiry exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`TtlCloseCommand::FinalizeClose`] against actor-owned state.
+async fn handle_finalize_close(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: String,
+    params: scp_protocol::context::params::ContextParams,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let handle = ContextHandle::new(context_id.clone(), params);
+    if let Err(e) = handle
+        .transition_to(&scp_protocol::context::ContextState::Closing)
+        .await
+    {
+        let sketch = outcome_error_sketch(&e);
+        let _ = reply.send(Err(e));
+        return Outcome::err(sketch);
+    }
+
+    let finalize_fut = crate::context::ttl_close_helpers::finalize_close(state, deps, &handle);
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, finalize_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "finalize_close exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// Shim-fallback handlers — route through `ttl_close_helpers_legacy`
+// (Supervisor lock-and-call). Used when no per-context actor exists.
+// ---------------------------------------------------------------------------
+
+async fn shim_handle_start_ttl_timer(
     supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -145,7 +378,7 @@ async fn handle_start_ttl_timer(
         return Outcome::err(sketch);
     }
 
-    let spawn_fut = crate::context::lifecycle_helpers::start_ttl_timer(
+    let spawn_fut = crate::context::ttl_close_helpers_legacy::start_ttl_timer(
         supervisor,
         &context_id,
         duration,
@@ -167,17 +400,14 @@ async fn handle_start_ttl_timer(
     outcome
 }
 
-/// Handle [`TtlCloseCommand::ExtendTtl`]: delegate to
-/// [`ContextManager::propose_ttl_extension`](crate::context::lifecycle_helpers::propose_ttl_extension)
-/// under a 30s timeout.
-async fn handle_extend_ttl(
+async fn shim_handle_extend_ttl(
     supervisor: &Supervisor,
     context_id: String,
     member_did: scp_identity::DID,
     proposed_duration: std::time::Duration,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let extend_fut = crate::context::lifecycle_helpers::propose_ttl_extension(
+    let extend_fut = crate::context::ttl_close_helpers_legacy::propose_ttl_extension(
         supervisor,
         &context_id,
         &member_did,
@@ -203,10 +433,7 @@ async fn handle_extend_ttl(
     outcome
 }
 
-/// Handle [`TtlCloseCommand::ResetTtlTimer`]: delegate to
-/// [`ContextManager::reset_ttl_timer`](crate::context::lifecycle_helpers::reset_ttl_timer)
-/// under a 30s timeout.
-async fn handle_reset_ttl_timer(
+async fn shim_handle_reset_ttl_timer(
     supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -223,7 +450,7 @@ async fn handle_reset_ttl_timer(
         return Outcome::err(sketch);
     }
 
-    let reset_fut = crate::context::lifecycle_helpers::reset_ttl_timer(
+    let reset_fut = crate::context::ttl_close_helpers_legacy::reset_ttl_timer(
         supervisor,
         &context_id,
         new_duration,
@@ -245,10 +472,7 @@ async fn handle_reset_ttl_timer(
     outcome
 }
 
-/// Handle [`TtlCloseCommand::ExecuteTtlClose`]: delegate to
-/// [`ContextManager::handle_ttl_expiry`](crate::context::lifecycle_helpers::handle_ttl_expiry)
-/// under a 30s timeout.
-async fn handle_execute_ttl_close(
+async fn shim_handle_execute_ttl_close(
     supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -264,7 +488,8 @@ async fn handle_execute_ttl_close(
         return Outcome::err(sketch);
     }
 
-    let expiry_fut = crate::context::lifecycle_helpers::handle_ttl_expiry(supervisor, &handle);
+    let expiry_fut =
+        crate::context::ttl_close_helpers_legacy::handle_ttl_expiry(supervisor, &handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, expiry_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
@@ -285,10 +510,7 @@ async fn handle_execute_ttl_close(
     outcome
 }
 
-/// Handle [`TtlCloseCommand::FinalizeClose`]: delegate to
-/// [`ContextManager::finalize_close`](crate::context::lifecycle_helpers::finalize_close)
-/// under a 30s timeout.
-async fn handle_finalize_close(
+async fn shim_handle_finalize_close(
     supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -304,7 +526,8 @@ async fn handle_finalize_close(
         return Outcome::err(sketch);
     }
 
-    let finalize_fut = crate::context::lifecycle_helpers::finalize_close(supervisor, &handle);
+    let finalize_fut =
+        crate::context::ttl_close_helpers_legacy::finalize_close(supervisor, &handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, finalize_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
@@ -348,9 +571,9 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
     const MSG: &str = "TtlCloseCommand::Placeholder — real variants \
                        StartTtlTimer/ExtendTtl/ResetTtlTimer/ExecuteTtlClose/\
-                       FinalizeClose land in commit 9 of ADR-049; \
-                       Placeholder retained for commit-6 compile stability and \
-                       deleted in commit 12 with the shim";
+                       FinalizeClose are wired; Placeholder retained for actor \
+                       run-loop skeleton-handshake stability and deleted in \
+                       Phase 2A finalization with the shim";
     let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
     Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }

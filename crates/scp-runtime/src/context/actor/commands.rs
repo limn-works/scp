@@ -1561,7 +1561,7 @@ pub enum TtlCloseCommand {
 
     /// Spawns (or respawns) the TTL timer for the given context with a
     /// caller-supplied duration. Mirrors the legacy `ContextManager`'s
-    /// [`spawn_ttl_timer`](crate::context::lifecycle_helpers::spawn_ttl_timer)
+    /// [`spawn_ttl_timer_legacy`](crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy)
     /// call path used at `create_context` / `restore_context` time.
     ///
     /// `Ok(())` once the timer has been successfully installed.
@@ -1573,7 +1573,7 @@ pub enum TtlCloseCommand {
     },
 
     /// Proposes a TTL extension on behalf of a specific member. Mirrors
-    /// [`ContextManager::propose_ttl_extension`](crate::context::lifecycle_helpers::propose_ttl_extension).
+    /// [`propose_ttl_extension`](crate::context::ttl_close_helpers::propose_ttl_extension).
     ///
     /// Reply is `Ok(true)` iff the extension reaches unanimous consent
     /// on this call; the caller then invokes
@@ -1596,7 +1596,7 @@ pub enum TtlCloseCommand {
 
     /// Resets the TTL timer to a new duration after a successful
     /// unanimous extension. Mirrors
-    /// [`ContextManager::reset_ttl_timer`](crate::context::lifecycle_helpers::reset_ttl_timer).
+    /// [`reset_ttl_timer`](crate::context::ttl_close_helpers::reset_ttl_timer).
     ResetTtlTimer {
         /// Boxed owned payload — see [`TtlTimerPayload`].
         payload: Box<TtlTimerPayload>,
@@ -1605,7 +1605,7 @@ pub enum TtlCloseCommand {
     },
 
     /// Executes a caller-initiated TTL expiry. Mirrors
-    /// [`ContextManager::handle_ttl_expiry`](crate::context::lifecycle_helpers::handle_ttl_expiry).
+    /// [`handle_ttl_expiry`](crate::context::ttl_close_helpers::handle_ttl_expiry).
     ///
     /// In commit 9 this is the explicit-expiry entry point; the timer
     /// task spawned by `StartTtlTimer` still runs the automatic path
@@ -1620,7 +1620,7 @@ pub enum TtlCloseCommand {
 
     /// Completes context closure after all members have processed the
     /// `ContextClosing` notification. Mirrors
-    /// [`ContextManager::finalize_close`](crate::context::lifecycle_helpers::finalize_close).
+    /// [`finalize_close`](crate::context::ttl_close_helpers::finalize_close).
     FinalizeClose {
         /// Boxed owned payload — see [`TtlContextPayload`].
         payload: Box<TtlContextPayload>,

@@ -49,8 +49,8 @@
 use std::sync::Arc;
 
 use scp_identity::DID;
-use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::ContextError;
+use scp_protocol::context::membership::ContextEvent;
 
 use crate::context::ContextHandle;
 use crate::context::manager_methods;
@@ -72,7 +72,7 @@ use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT
 /// Destroys MLS group state and sender keys, issues relay deletion
 /// requests for ephemeral/summary scopes, transitions from `Closing`
 /// to `Closed`, and appends the final `ContextClosed` event.
-pub(crate) async fn finalize_close(
+pub async fn finalize_close(
     supervisor: &Supervisor,
     handle: &ContextHandle,
 ) -> Result<(), ContextError> {
@@ -113,7 +113,7 @@ pub(crate) async fn finalize_close(
 /// Transitions from `Active` to `Expired`, destroys keys per memory
 /// scope, issues relay deletion requests for ephemeral/summary scopes,
 /// and appends `ContextExpired` to the event log.
-pub(crate) async fn handle_ttl_expiry(
+pub async fn handle_ttl_expiry(
     supervisor: &Supervisor,
     handle: &ContextHandle,
 ) -> Result<(), ContextError> {
@@ -212,7 +212,7 @@ pub(crate) async fn handle_ttl_expiry(
 /// Records consent from the given member. Returns `true` iff every
 /// member has now consented (unanimous); the caller should then call
 /// [`reset_ttl_timer`] with the new duration.
-pub(crate) async fn propose_ttl_extension(
+pub async fn propose_ttl_extension(
     supervisor: &Supervisor,
     context_id: &str,
     member_did: &DID,
@@ -257,7 +257,7 @@ pub(crate) async fn propose_ttl_extension(
 ///
 /// Cancels the old timer and spawns a new one with the given duration.
 /// Clears the extension proposal state.
-pub(crate) async fn reset_ttl_timer(
+pub async fn reset_ttl_timer(
     supervisor: &Supervisor,
     context_id: &str,
     new_duration: std::time::Duration,
@@ -298,7 +298,7 @@ pub(crate) async fn reset_ttl_timer(
 /// [`TtlCloseCommand::StartTtlTimer`](crate::context::actor::commands::TtlCloseCommand::StartTtlTimer)
 /// fallback uses this wrapper so it doesn't need to depend on the
 /// supervisor-internal spawn helper directly.
-pub(crate) async fn start_ttl_timer(
+pub async fn start_ttl_timer(
     supervisor: &Supervisor,
     context_id: &str,
     duration: std::time::Duration,
@@ -329,7 +329,7 @@ pub(crate) async fn start_ttl_timer(
 /// actor-shape `spawn_ttl_timer` that might land in
 /// [`crate::context::ttl_close_helpers`] during Phase 2A.9.
 #[allow(clippy::too_many_lines)] // 12c.9g.2 widens the prelude (5 supervisor accessor probes vs 1 provider readiness check) by 14 lines so the spawn_blocking closure body fits within the previous 90-line budget — see commit message.
-pub(crate) async fn spawn_ttl_timer_legacy(
+pub async fn spawn_ttl_timer_legacy(
     supervisor: &Supervisor,
     context_id: &str,
     duration: std::time::Duration,

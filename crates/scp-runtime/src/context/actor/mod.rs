@@ -495,7 +495,12 @@ impl ContextActor {
                 Box::pin(handlers::standing::dispatch(deps, sub)).await
             }
             ContextCommand::TtlClose(sub) => {
-                handlers::ttl_close::dispatch_from_shim(supervisor, sub).await
+                // Phase 2A.6 — TTL-close domain migrated to the
+                // actor-shape handler. Supervisor dispatch still falls
+                // back to `dispatch_from_shim` when no per-context
+                // actor exists for the target context during the
+                // migration window.
+                handlers::ttl_close::dispatch(state, deps, sub).await
             }
             ContextCommand::Tools(sub) => {
                 // Phase 2A.4 -- tools domain migrated to the

@@ -24,7 +24,7 @@
 //! This module hoists the query-domain methods that the actor-handler
 //! shim path ([`crate::context::supervisor::supervisor::Supervisor::dispatch_query`])
 //! and existing hoisted helpers (`messaging_helpers::finalize_send`,
-//! `lifecycle_helpers::finalize_close`) reach via legacy
+//! `ttl_close_helpers_legacy::finalize_close`) reach via legacy
 //! `ContextManager::X(...)` method calls. After ADR-049 commit 12
 //! (`ContextManager` deletion) every helper takes `&Supervisor`; Phase 2
 //! of the post-review-round-1 plan will retarget the handler-side

@@ -142,7 +142,12 @@ pub async fn handle_ttl_expiry(
 /// member-count lookups and mutates `state.ttl.extension` to record
 /// consents. Best-effort persistence on success runs through
 /// `deps.persistence`.
-pub async fn propose_ttl_extension(
+///
+/// Synchronous because the actor owns `state` for the entire dispatch
+/// turn — no lock acquisition is needed and the persistence call is
+/// best-effort fire-and-forget. The handler wraps this in
+/// `async { ... }` for the dispatcher's `tokio::time::timeout` budget.
+pub fn propose_ttl_extension(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,

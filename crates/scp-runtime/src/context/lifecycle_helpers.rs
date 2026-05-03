@@ -1653,7 +1653,6 @@ pub async fn close_context_with_key(
     Ok(result)
 }
 
-
 // ---------------------------------------------------------------------------
 // load_persisted_context_state — hoisted out of the deleted `ContextManager` (ADR-049 commit 12)
 // ---------------------------------------------------------------------------
