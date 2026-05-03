@@ -288,12 +288,36 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
 
 ### Acceptance Criteria
 
-1. **`create_identity(key_custody) -> Identity`**
-   - Generates three or four keypairs via key_custody:
-     - **Identity Key** (Ed25519): derives the DID string. Stored in highest-security custody.
-     - **Active Signing Key** (Ed25519): used for MLS, envelopes, UCANs. Rotatable.
-     - **Pre-Rotation Key** (Ed25519): stored in cold/offline custody. Generates the pre-rotation commitment `SHA-256(pre_rotation_key.public)`.
-     - **Agent Signing Key** (Ed25519, optional): software-held key for autonomous agent operations. Rotatable independently of the Active Signing Key. Generated only when agent delegation is needed. See ADR-039.
+1. **`create_identity(key_custody, pre_rotation_custody) -> (Identity, PreRotationKeyHandle)`**
+   - Generates the operational keypairs via `key_custody` (`#0`, `#active`,
+     and optional `#agent`).
+   - Generates the pre-rotation seed bytes via the operational custody's
+     RNG (preserves cross-bridge byte parity per ADR-046), hands them to
+     `pre_rotation_custody.store_committed_pre_rotation_key`, and lets
+     the operational copy zeroize. The pre-rotation key is NOT
+     persisted in operational custody — spec §9.7.4.1 §3 (storage
+     isolation) and §5(f) (destroy after backup) MANDATE separation.
+   - Returns the `Identity` (containing operational handles + the
+     `pre_rotation_commitment` hash) AND a `PreRotationKeyHandle`
+     referencing the cold-custody entry. The caller persists both.
+   - **Key roles:**
+     - **Identity Key** (Ed25519, in `key_custody`): derives the DID
+       string. Stored in highest-security operational custody.
+     - **Active Signing Key** (Ed25519, in `key_custody`): used for
+       MLS, envelopes, UCANs. Rotatable.
+     - **Pre-Rotation Key** (Ed25519, in `pre_rotation_custody`): a
+       SEPARATE custody substrate — FIDO2 hardware key, secondary-device
+       enclave, platform cloud key store, encrypted offline backup,
+       Shamir 3-of-5, or BIP39 paper backup (spec §9.7.4.1 §4 enumerates
+       the six approved methods). Generates the pre-rotation commitment
+       `SHA-256(pre_rotation_key.public)` published in the DID document.
+       The `PreRotationCustody` trait in `scp-platform` enforces this
+       separation at the type level: a `PreRotationKeyHandle` cannot be
+       converted to a `KeyHandle` and vice versa.
+     - **Agent Signing Key** (Ed25519, optional, in `key_custody`):
+       software-held key for autonomous agent operations. Rotatable
+       independently of the Active Signing Key. Generated only when
+       agent delegation is needed. See ADR-039.
    - Derives the did:dht identifier: `did:dht:` + z-base-32 encoding of the Identity Key's public key.
    - Constructs a DID document with:
      - Identity Key as verification method `#0`
@@ -345,14 +369,32 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
    - Also used for initial agent key provisioning: if no `#agent` VM exists, adds one.
    - After rotation, the caller MUST revoke/reissue self-delegated UCANs that grant `#agent` scope.
 
-   **4b. `migrate_identity(identity, pre_rotation_key, key_custody) -> (Identity, DidRotationEvent)`** (Layer 2 — rare, planned migration)
-   - Creates a new DID using the pre-rotation key as the new Identity Key.
-   - Generates a new Active Signing Key, new pre-rotation commitment, and (if the old identity had one) a new Agent Signing Key for the new DID.
-   - Updates the OLD DID document: adds `alsoKnownAs` pointing to the new DID, includes cryptographic linkage (old Identity Key signs new Identity Key public bytes, per did:dht spec).
-   - Publishes both old (updated) and new DID documents to the DHT.
-   - Returns the new Identity and a `DidRotationEvent` for distribution to all active contexts.
-   - Starts a background republish task for the old DID document (forwarding record maintenance, recommended 90 days).
-   - **The DID string changes. All per-context references must be migrated via DidRotationEvent.**
+   **4b. `migrate_identity(identity, old_doc, pre_rotation_handle, pre_rotation_custody, key_custody, rotated_at) -> (Identity, DidDocument, DidRotationEvent, PreRotationKeyHandle)`** (Layer 2 — rare, planned migration)
+   - Reveals the pre-rotation public key via
+     `pre_rotation_custody.reveal_public_key(pre_rotation_handle)` and
+     uses it to derive the new DID string.
+   - Generates a new Active Signing Key in `key_custody`. Generates the
+     NEW pre-rotation seed via `key_custody`'s RNG, hands it to the
+     SAME `pre_rotation_custody` (so callers don't need to swap
+     substrates between migrations), and lets the operational copy
+     zeroize.
+   - Builds the migration proof (signed by the OLD identity key) and
+     pre-rotation proof (`SHA-256(revealed) == commitment`).
+   - Updates the OLD DID document with `alsoKnownAs` pointing to the
+     new DID; publishes both documents.
+   - **§9.7.4.1 §6 (post-rotation key cycling):** consumes the OLD
+     pre-rotation handle via `destroy_after_migration`, returning the
+     private bytes; imports those bytes into operational custody as the
+     NEW Identity Key (`#0`) of the migrated identity. The old
+     pre-rotation key is destroyed after migration completes per spec.
+   - Returns `(new_identity, new_document, rotation_event,
+     new_pre_rotation_handle)`. The caller persists the new
+     pre-rotation handle alongside the new identity for the next
+     migration cycle.
+   - Starts a background republish task for the old DID document
+     (forwarding record maintenance, recommended 90 days).
+   - **The DID string changes. All per-context references must be
+     migrated via DidRotationEvent.**
 
    **4c. `verify_migration(old_did, new_did, migration_proof, pre_rotation_proof) -> bool`**
    - Verifies the cryptographic linkage: old Identity Key signed the new Identity Key public bytes.
@@ -361,11 +403,22 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
 
    **Identity structure at creation:**
 
+   `ScpIdentity` carries the operational keys + the public commitment
+   only. The pre-rotation private key is held in a separate
+   `PreRotationCustody` instance, returned alongside as a
+   `PreRotationKeyHandle` so the caller can persist it and present it
+   back at migration time. Per spec §9.7.4.1 §3 the pre-rotation key
+   MUST NOT live on the same custody substrate as `identity_key` /
+   `active_signing_key`; the type system enforces this by making
+   `PreRotationKeyHandle` a distinct type from `KeyHandle` (no
+   conversion either direction).
+
    ```rust
    pub struct ScpIdentity {
        /// did:dht Identity Key. Derives the DID string. Stored in highest-security
-       /// custody (Secure Enclave, HSM). Used ONLY for DID document updates and
-       /// signing pre-rotation commitments. NEVER for MLS, envelopes, or UCANs.
+       /// operational custody (Secure Enclave, HSM). Used ONLY for DID document
+       /// updates and signing pre-rotation commitments. NEVER for MLS, envelopes,
+       /// or UCANs.
        pub identity_key: KeyHandle,
 
        /// Current Active Signing Key. A verification method in the DID document.
@@ -379,8 +432,11 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
        /// with `fct.scp_key_scope: "#agent"`. See ADR-039.
        pub agent_signing_key: Option<KeyHandle>,
 
-       /// SHA-256 hash of the next Identity Key's public key.
-       /// Published in DID document as a PreRotationCommitment service.
+       /// SHA-256 hash of the next Identity Key's public key. Published in DID
+       /// document as a PreRotationCommitment service. The corresponding private
+       /// key is held in a separate `PreRotationCustody` instance and referenced
+       /// by a `PreRotationKeyHandle` returned alongside this struct from
+       /// `create_identity` — NEVER on `ScpIdentity` directly. Spec §9.7.4.1 §3.
        pub pre_rotation_commitment: [u8; 32],
 
        /// The DID string: did:dht:z<z-base-32(identity_key.public)>

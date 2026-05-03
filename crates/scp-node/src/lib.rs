@@ -5940,6 +5940,74 @@ mod tests {
         );
     }
 
+    /// Regression: persisted `ScpIdentity` blobs from interim builds
+    /// (where `pre_rotation_key: KeyHandle` was briefly a field on the
+    /// struct) MUST deserialize cleanly into the post-revert struct,
+    /// since msgpack-named ignores unknown fields and the
+    /// `PreRotationCustody` workstream replaced that field with a
+    /// separate cold-storage substrate. Without this regression test,
+    /// a future change adding `#[serde(deny_unknown_fields)]` would
+    /// silently break upgrades from interim builds.
+    #[tokio::test]
+    async fn identity_with_storage_deserialises_blob_with_extra_pre_rotation_key_field() {
+        use scp_platform::traits::KeyHandle;
+
+        // Synthesize a `PersistedIdentity` shape that mirrors the
+        // interim-build serialization: same fields plus an extra
+        // `pre_rotation_key` slot.
+        #[derive(serde::Serialize)]
+        struct InterimIdentity {
+            identity_key: KeyHandle,
+            active_signing_key: KeyHandle,
+            agent_signing_key: Option<KeyHandle>,
+            pre_rotation_commitment: [u8; 32],
+            // The extra field that should be silently ignored on read.
+            pre_rotation_key: KeyHandle,
+            did: String,
+        }
+
+        #[derive(serde::Serialize)]
+        struct InterimPersistedIdentity {
+            identity: InterimIdentity,
+            document: DidDocument,
+        }
+
+        let interim = InterimPersistedIdentity {
+            identity: InterimIdentity {
+                identity_key: KeyHandle::new(1),
+                active_signing_key: KeyHandle::new(2),
+                agent_signing_key: None,
+                pre_rotation_commitment: [7u8; 32],
+                pre_rotation_key: KeyHandle::new(3),
+                did: "did:dht:zinterim".to_owned(),
+            },
+            document: DidDocument {
+                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                id: "did:dht:zinterim".to_owned(),
+                verification_method: vec![],
+                authentication: vec![],
+                assertion_method: vec![],
+                also_known_as: vec![],
+                service: vec![],
+            },
+        };
+
+        let envelope = StoredValue {
+            version: CURRENT_STORE_VERSION,
+            data: &interim,
+        };
+        let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+
+        // The post-revert struct (no `pre_rotation_key` field) MUST
+        // deserialize successfully — the extra field is silently
+        // dropped.
+        let decoded: StoredValue<PersistedIdentity> = rmp_serde::from_slice(&bytes)
+            .expect("interim-build blob with extra pre_rotation_key field MUST deserialize");
+        assert_eq!(decoded.version, CURRENT_STORE_VERSION);
+        assert_eq!(decoded.data.identity.did, "did:dht:zinterim");
+        assert_eq!(decoded.data.identity.pre_rotation_commitment, [7u8; 32]);
+    }
+
     #[tokio::test]
     async fn identity_with_storage_stored_value_envelope_roundtrip() {
         // Verify that a StoredValue<PersistedIdentity> envelope round-trips
