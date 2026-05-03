@@ -46,6 +46,7 @@ scp-core = { path = "../scp-core", features = ["testing"] }
 scp-event-log = { path = "../scp-event-log" }
 scp-identity = { path = "../scp-identity" }
 scp-platform = { path = "../scp-platform", features = ["testing"] }
+scp-runtime = { path = "../scp-runtime", features = ["testing"] }
 scp-transport = { path = "../scp-transport" }
 scp-ffi-common = { path = "../scp-ffi/common" }
 base64 = { workspace = true }
@@ -75,6 +76,10 @@ path = "tests/integration/harness_meta.rs"
 [[test]]
 name = "outlet_error_conformance"
 path = "tests/integration/outlet_error_conformance.rs"
+
+[[test]]
+name = "outlet_stream_conformance"
+path = "tests/integration/outlet_stream_conformance.rs"
 
 [[test]]
 name = "cross_context_error_wrapping"

@@ -719,3 +719,67 @@ cargo test -p scp-testing --test conformance \
 ```
 
 The regenerator is `#[ignore]` by default so the default `cargo test` run does not write to disk. Fixture drift (live code changes that should but do not invalidate the JSON) is caught by `CONF-046`, which compares the on-disk file byte-for-byte to the generator's current output.
+
+## 25.20 Outlet Streaming Conformance Vectors (§5.4.5)
+
+Domain: streaming control-plane state-machine vectors per §5.4.5 (`OutletStreamOpen`, `OutletStreamChunk`, `OutletStreamCredit`, cancellation and credit-stall semantics).
+
+The canonical conformance fixture lives at:
+
+```
+tests/conformance/vectors/outlet_stream_vectors.json
+```
+
+The fixture documents **7 control-plane vectors** that exercise every streaming edge case in §5.4.5. Each vector specifies:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | string | Stable case identifier — exactly one of `non_streaming`, `multi_chunk`, `cancellation`, `error_terminal`, `error_recoverable`, `sequence_gap`, `credit_exhaustion`. |
+| `description` | string | Human-readable narrative cross-referenced to §5.4.5 ordering rules and the §5.4.4 error taxonomy. |
+| `open` | object | Subset of `OutletStreamOpen` fields required to drive the runtime: `outlet_id`, `outlet_kind`, `input`, `invoker_did`, `operator_did`, `context_id`, `credit_window`, `estimated_chunk_count`, `cost_per_chunk`, `available_balance`, `stream_credit_stall_secs`, `stream_cancel_ack_secs`, `timeout_ms`, `chain_depth`. |
+| `chunks` | array | Ordered list of `OutletStreamChunk` payload entries (`type` ∈ `{data, end, error, progress}`) with `sequence` numbers. The `cancellation` and `credit_exhaustion` vectors include the framework-emitted terminal envelope (cancel-ack-style chunk per §5.4.5). |
+| `credits` | array | List of `OutletStreamCredit` grants with timing — empty for vectors whose initial `credit_window` covers the stream. |
+| `cancel` | object (optional) | Receiver-side cancel timing for the `cancellation` vector: `after_sequence` (chunk index after which `OutletCancel` arrives) and `expected_cancel_ack_seq` (next-to-emit sequence at cancel arrival, pinned per §5.4.5). |
+| `trigger` | string (optional) | Free-form trigger identifier for vectors whose terminal arises from a runtime timer (e.g., `credit_stall_fires_after_initial_window`). |
+| `expected_end_status` | string | One of `Ok`, `Error`, `Cancelled` — the `StreamTerminalStatus` recorded on the `OutletInvokedEvent` per §5.4.5 event-log shape. |
+| `expected_error_code` | string (optional) | The `SCP-TOOL-NNNN` code carried by the terminal Error chunk (or by the receiver-side StreamGap envelope) for `Error`-status vectors. |
+| `expected_error_slug` | string (optional) | The §5.4.4 slug paired with the code (used for SDK disambiguation when slugs share a code). |
+| `expected_chunks_billed` | u32 | The §5.4.5 `chunks_billed` reference count (count of Data chunks at or below `cancel_ack_seq` for non-zero-cost streams; 0 for Query and zero-cost outlets). |
+| `expected_total_chunks` | u32 | Total chunks emitted by the executor (Progress + Data + terminal). The `sequence_gap` vector counts only what the executor emits — the receiver-side StreamGap envelope is synthesized at SDK smoke time. |
+| `expected_cancel_ack_seq` | u64 (optional) | Pinned cancel-ack sequence — `null` for vectors that do not cancel. |
+| `expected_first_gap_sequence` | u64 (optional) | First missing sequence the receiver observes — present only on the `sequence_gap` vector. |
+
+### 25.20.1 Vector index
+
+| # | Name | Shape |
+|---|------|-------|
+| 1 | `non_streaming` | One-shot Action — single Data chunk + End. The §5.4.5 "non-streaming invocation is a stream that emits exactly two chunks" degenerate case. |
+| 2 | `multi_chunk` | 10-chunk streaming Query — sequential Data chunks 0..9 followed by End. Initial credit_window = 32 covers the full stream so no mid-stream grants required. |
+| 3 | `cancellation` | Mid-stream `OutletCancel` after sequence 3 lands; executor honors with terminal cancel-ack at sequence 4 within `stream_cancel_ack_secs`. Status `Cancelled`. |
+| 4 | `error_terminal` | Two Data chunks then a terminal `Error{terminal: true, code: SCP-TOOL-6130}` (handler-panic). Stream closes immediately. Status `Error("SCP-TOOL-6130")`. |
+| 5 | `error_recoverable` | One Data, then a non-terminal `Error{terminal: false, code: SCP-TOOL-6160}` (transient transport fault), then more Data, then End. Status `Ok` — non-terminal Error does NOT close the stream per §5.4.5. |
+| 6 | `sequence_gap` | Receiver observes 0, 1, 3 (gap at 2). Receiver MUST cancel with `OutletErrorClass::Execution::StreamGap` (slug `execution.stream-gap`, code `SCP-TOOL-6131` per the §5.4.4 round-5 slug consolidation that shares the code with `execution.credit-exhausted`). Status `Error("SCP-TOOL-6131")`. |
+| 7 | `credit_exhaustion` | Initial `credit_window: 2`, no grants. Executor emits 2 Data chunks (consuming all credit), credit reaches 0, framework emits terminal `Error{terminal: true, code: SCP-TOOL-6133}` (`execution.credit-stall`) per `CancelAckTracker::credit_stall_payload`. Status `Error("SCP-TOOL-6133")`. |
+
+The §5.4.5 wire-level signature and preimage layer (`SCP-OUTLET-CHUNK-SIG-V1`, `SCP-OUTLET-CREDIT-V1`, `caveats_binding`) is covered separately by the protocol-level tests in `crates/scp-protocol/src/context/outlets/stream.rs`. These vectors deliberately omit signatures so they can be replayed against synthetic identities — they describe **ordering** between executor-emitted chunks and receiver-issued grants/cancels, not byte-for-byte signature reproduction.
+
+### 25.20.2 Conformance procedure
+
+The four FFI bridges (PyO3, NAPI, UniFFI Swift / Kotlin) and the WASM bridge all funnel through the runtime's streaming primitives — `scp_runtime::context::outlets::stream::CreditTracker`, `CancelAckTracker`, `StreamEscrow`, and `compute_chunks_billed_ref`. Validating the vectors against the Rust core therefore transitively validates every bridge for the streaming control-plane invariants (§5.4.5 round-5 admission, credit-stall arming, cancel-ack pinning, billing-ceiling enforcement).
+
+```bash
+# Rust replay — 9 invariants per vector:
+cargo test -p scp-testing --test outlet_stream_conformance
+
+# Per-SDK smoke (asserts iterator-surface terminal status for each vector):
+python3.12 -m pytest bindings/python/tests/test_outlet_stream_vectors.py
+bun test bindings/typescript/tests/outlet-stream-vectors.test.ts
+swift test --filter OutletStreamVectorsTests             # bindings/swift/
+./gradlew :scp-kt:test --tests works.limn.scp.OutletStreamVectorsTest  # bindings/kotlin/
+```
+
+Independent implementations SHOULD parse `outlet_stream_vectors.json`, drive each vector's `chunks` sequence through their streaming runtime, and verify that the recorded `StreamTerminalStatus` matches `expected_end_status`. The `cancellation` vector additionally exercises the cancel-ack pinning rule: implementations MUST record the cancel-ack-seq at the moment of `OutletCancel` arrival and reject Data/Progress chunks above the ceiling. The `credit_exhaustion` vector exercises the credit-stall timer: implementations MUST emit a framework-generated terminal `Error{code: SCP-TOOL-6133}` chunk when the credit window remains at zero past `stream_credit_stall_secs`. The `sequence_gap` vector exercises receiver-side gap detection: implementations MUST cancel the stream with `OutletErrorClass::Execution::StreamGap` (code `SCP-TOOL-6131`) when a missing sequence is observed.
+
+### 25.20.3 Layer separation
+
+The vectors are control-plane fixtures, not wire-format fixtures. The §5.4.5 layer they validate is the receiver/executor state machine and chunk ordering, not the per-chunk `Ed25519Signature` over the `SCP-OUTLET-CHUNK-SIG-V1:` preimage (which is exercised by `verify_chunk_signature` unit tests against synthetic keypairs). The two layers compose: a wire-conforming `OutletStreamChunk` whose `payload` violates the §5.4.5 ordering rule is rejected at the runtime layer regardless of signature validity, and vice versa.

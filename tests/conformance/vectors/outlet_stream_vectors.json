@@ -1,0 +1,242 @@
+{
+  "comment": "SCP-OUT-039 streaming conformance vectors per §5.4.5. Seven vectors exercise every streaming edge case: non-streaming one-shot, multi-chunk, cancellation, terminal error, recoverable error, sequence gap, and credit exhaustion. Each vector models the control-plane ordering between executor-emitted chunks and receiver-issued credit grants / cancels. The wire-level signature/preimage layer is covered separately by the §5.4.5 chunk_sig and credit_sig fixtures (caveats_binding, SCP-OUTLET-CHUNK-SIG-V1, SCP-OUTLET-CREDIT-V1) — these vectors deliberately omit signatures so they can be replayed against synthetic identities. Per-bridge funnel: all four FFI bridges (PyO3, NAPI, UniFFI Swift/Kotlin, WASM) funnel through scp_runtime::context::outlets::stream (CreditTracker, CancelAckTracker, StreamEscrow, compute_chunks_billed_ref) — the Rust replay validates the runtime path; per-SDK smoke tests assert that each vector produces the expected terminal status through the SDK's InvocationHandle pump. The 'name' field is a stable case identifier; the 'description' is human-readable narrative cross-referenced to the spec.",
+  "spec_section": ".docs/specs/05-contexts.md §5.4.5 Progressive Output (Streaming)",
+  "vectors": [
+    {
+      "name": "non_streaming",
+      "description": "§5.4.5 'Non-streaming invocation' — a one-shot Action that emits exactly Data(value) followed by End(aggregate). The degenerate two-chunk case the spec collapses to. Models invoke()→sync surface that completes after the End chunk lands.",
+      "open": {
+        "outlet_id": "calc.add",
+        "outlet_kind": "action",
+        "input": { "a": 2, "b": 3 },
+        "invoker_did": "did:dht:zVECTOR-INVOKER-01",
+        "operator_did": "did:dht:zVECTOR-OPERATOR-01",
+        "context_id": "vec-ctx-non-streaming",
+        "credit_window": 32,
+        "estimated_chunk_count": 1,
+        "cost_per_chunk": 0,
+        "available_balance": 0,
+        "stream_credit_stall_secs": 30,
+        "stream_cancel_ack_secs": 5,
+        "timeout_ms": 5000,
+        "chain_depth": 0
+      },
+      "chunks": [
+        { "sequence": 0, "type": "data", "value": { "result": 5 } },
+        { "sequence": 1, "type": "end", "aggregate": { "result": 5 }, "execution_time_ms": 12 }
+      ],
+      "credits": [],
+      "expected_end_status": "Ok",
+      "expected_error_code": null,
+      "expected_chunks_billed": 0,
+      "expected_total_chunks": 2,
+      "expected_cancel_ack_seq": null
+    },
+    {
+      "name": "multi_chunk",
+      "description": "§5.4.5 'Per-chunk operator signature' / streaming Query — 10 sequential Data chunks followed by End. Credit window opens at 32 (DEFAULT_CREDIT_WINDOW) so no mid-stream grants are required. Models a paginated Query result set.",
+      "open": {
+        "outlet_id": "search.paged",
+        "outlet_kind": "query",
+        "input": { "q": "stream conformance" },
+        "invoker_did": "did:dht:zVECTOR-INVOKER-02",
+        "operator_did": "did:dht:zVECTOR-OPERATOR-02",
+        "context_id": "vec-ctx-multi-chunk",
+        "credit_window": 32,
+        "estimated_chunk_count": 10,
+        "cost_per_chunk": 0,
+        "available_balance": 0,
+        "stream_credit_stall_secs": 30,
+        "stream_cancel_ack_secs": 5,
+        "timeout_ms": 30000,
+        "chain_depth": 0
+      },
+      "chunks": [
+        { "sequence": 0, "type": "data", "value": { "page": 0, "n": 10 } },
+        { "sequence": 1, "type": "data", "value": { "page": 1, "n": 10 } },
+        { "sequence": 2, "type": "data", "value": { "page": 2, "n": 10 } },
+        { "sequence": 3, "type": "data", "value": { "page": 3, "n": 10 } },
+        { "sequence": 4, "type": "data", "value": { "page": 4, "n": 10 } },
+        { "sequence": 5, "type": "data", "value": { "page": 5, "n": 10 } },
+        { "sequence": 6, "type": "data", "value": { "page": 6, "n": 10 } },
+        { "sequence": 7, "type": "data", "value": { "page": 7, "n": 10 } },
+        { "sequence": 8, "type": "data", "value": { "page": 8, "n": 10 } },
+        { "sequence": 9, "type": "data", "value": { "page": 9, "n": 10 } },
+        { "sequence": 10, "type": "end", "aggregate": { "total_pages": 10, "total_results": 100 }, "execution_time_ms": 240 }
+      ],
+      "credits": [],
+      "expected_end_status": "Ok",
+      "expected_error_code": null,
+      "expected_chunks_billed": 0,
+      "expected_total_chunks": 11,
+      "expected_cancel_ack_seq": null
+    },
+    {
+      "name": "cancellation",
+      "description": "§5.4.5 'Cancellation and billing boundary' — receiver issues OutletCancel after sequence 3 lands; executor honors with terminal Error{terminal:true} cancel-ack at sequence 4 within stream_cancel_ack_secs window. cancel_ack_seq is pinned at the next-to-emit sequence (4) at cancel arrival; chunks above the ceiling are NOT billed. Terminal status Cancelled per §5.4.5 event-log shape.",
+      "open": {
+        "outlet_id": "calc.long-running",
+        "outlet_kind": "action",
+        "input": { "iterations": 1000 },
+        "invoker_did": "did:dht:zVECTOR-INVOKER-03",
+        "operator_did": "did:dht:zVECTOR-OPERATOR-03",
+        "context_id": "vec-ctx-cancellation",
+        "credit_window": 32,
+        "estimated_chunk_count": 8,
+        "cost_per_chunk": 1,
+        "available_balance": 1000,
+        "stream_credit_stall_secs": 30,
+        "stream_cancel_ack_secs": 5,
+        "timeout_ms": 30000,
+        "chain_depth": 0
+      },
+      "chunks": [
+        { "sequence": 0, "type": "data", "value": { "step": 0 } },
+        { "sequence": 1, "type": "data", "value": { "step": 100 } },
+        { "sequence": 2, "type": "data", "value": { "step": 200 } },
+        { "sequence": 3, "type": "data", "value": { "step": 300 } },
+        { "sequence": 4, "type": "error", "code": "SCP-TOOL-6131", "slug": "execution.cancel-ack", "message": "stream cancelled by invoker", "terminal": true }
+      ],
+      "credits": [],
+      "cancel": {
+        "after_sequence": 3,
+        "expected_cancel_ack_seq": 4
+      },
+      "expected_end_status": "Cancelled",
+      "expected_error_code": null,
+      "expected_chunks_billed": 4,
+      "expected_total_chunks": 5,
+      "expected_cancel_ack_seq": 4
+    },
+    {
+      "name": "error_terminal",
+      "description": "§5.4.5 ChunkPayload::Error with terminal=true — executor emits two Data chunks then a terminal Error which immediately closes the stream. Status Error(code) per StreamTerminalStatus. Code SCP-TOOL-6130 (execution.handler-panic) — operator-emitted handler fault.",
+      "open": {
+        "outlet_id": "calc.flaky",
+        "outlet_kind": "action",
+        "input": { "trigger": "panic" },
+        "invoker_did": "did:dht:zVECTOR-INVOKER-04",
+        "operator_did": "did:dht:zVECTOR-OPERATOR-04",
+        "context_id": "vec-ctx-error-terminal",
+        "credit_window": 32,
+        "estimated_chunk_count": 5,
+        "cost_per_chunk": 1,
+        "available_balance": 1000,
+        "stream_credit_stall_secs": 30,
+        "stream_cancel_ack_secs": 5,
+        "timeout_ms": 30000,
+        "chain_depth": 0
+      },
+      "chunks": [
+        { "sequence": 0, "type": "data", "value": { "ok": true, "i": 0 } },
+        { "sequence": 1, "type": "data", "value": { "ok": true, "i": 1 } },
+        { "sequence": 2, "type": "error", "code": "SCP-TOOL-6130", "slug": "execution.handler-panic", "message": "handler panicked computing iteration 2", "terminal": true }
+      ],
+      "credits": [],
+      "expected_end_status": "Error",
+      "expected_error_code": "SCP-TOOL-6130",
+      "expected_chunks_billed": 2,
+      "expected_total_chunks": 3,
+      "expected_cancel_ack_seq": null
+    },
+    {
+      "name": "error_recoverable",
+      "description": "§5.4.5 ChunkPayload::Error with terminal=false — executor emits a Data chunk, then a non-terminal Error (informational; stream remains open per §5.4.5), then more Data chunks, then End. Stream completes with terminal status Ok. Models a transient fault the operator surfaces but recovers from (e.g., a downstream timeout that retries internally).",
+      "open": {
+        "outlet_id": "calc.resilient",
+        "outlet_kind": "action",
+        "input": { "retry": true },
+        "invoker_did": "did:dht:zVECTOR-INVOKER-05",
+        "operator_did": "did:dht:zVECTOR-OPERATOR-05",
+        "context_id": "vec-ctx-error-recoverable",
+        "credit_window": 32,
+        "estimated_chunk_count": 4,
+        "cost_per_chunk": 1,
+        "available_balance": 1000,
+        "stream_credit_stall_secs": 30,
+        "stream_cancel_ack_secs": 5,
+        "timeout_ms": 30000,
+        "chain_depth": 0
+      },
+      "chunks": [
+        { "sequence": 0, "type": "data", "value": { "i": 0, "ok": true } },
+        { "sequence": 1, "type": "error", "code": "SCP-TOOL-6160", "slug": "transport.relay-unavailable", "message": "transient downstream timeout; retrying internally", "terminal": false },
+        { "sequence": 2, "type": "data", "value": { "i": 1, "ok": true } },
+        { "sequence": 3, "type": "data", "value": { "i": 2, "ok": true } },
+        { "sequence": 4, "type": "end", "aggregate": { "completed": 3, "transient_errors": 1 }, "execution_time_ms": 180 }
+      ],
+      "credits": [],
+      "expected_end_status": "Ok",
+      "expected_error_code": null,
+      "expected_chunks_billed": 3,
+      "expected_total_chunks": 5,
+      "expected_cancel_ack_seq": null
+    },
+    {
+      "name": "sequence_gap",
+      "description": "§5.4.5 'Ordering and gaps' — receiver observes sequences 0, 1, 3 (gap at 2) and MUST cancel the stream with OutletErrorClass::Execution::StreamGap. The expected_error_code follows the §5.4.4 taxonomy slug→code allocation (execution.stream-gap shares SCP-TOOL-6131 with execution.credit-exhausted per the round-5 slug consolidation; the story description's '6134' is reserved/unallocated and predated the consolidation). Receiver-side cancel-and-rerun mitigation per the spec — MLS provides no per-message retransmit primitive.",
+      "open": {
+        "outlet_id": "search.streaming",
+        "outlet_kind": "query",
+        "input": { "q": "ordered results" },
+        "invoker_did": "did:dht:zVECTOR-INVOKER-06",
+        "operator_did": "did:dht:zVECTOR-OPERATOR-06",
+        "context_id": "vec-ctx-sequence-gap",
+        "credit_window": 32,
+        "estimated_chunk_count": 5,
+        "cost_per_chunk": 0,
+        "available_balance": 0,
+        "stream_credit_stall_secs": 30,
+        "stream_cancel_ack_secs": 5,
+        "timeout_ms": 30000,
+        "chain_depth": 0
+      },
+      "chunks": [
+        { "sequence": 0, "type": "data", "value": { "page": 0 } },
+        { "sequence": 1, "type": "data", "value": { "page": 1 } },
+        { "sequence": 3, "type": "data", "value": { "page": 3 } }
+      ],
+      "credits": [],
+      "expected_end_status": "Error",
+      "expected_error_code": "SCP-TOOL-6131",
+      "expected_error_slug": "execution.stream-gap",
+      "expected_first_gap_sequence": 2,
+      "expected_chunks_billed": 0,
+      "expected_total_chunks": 3,
+      "expected_cancel_ack_seq": null
+    },
+    {
+      "name": "credit_exhaustion",
+      "description": "§5.4.5 'Credit-based backpressure' — receiver sends NO credit grants beyond the initial credit_window of 2. Executor emits 2 Data chunks (consuming all initial credit), credit reaches zero, stream_credit_stall_secs (here 30s, modeled abstractly via the trigger 'credit_stall_fires') elapses without a grant, framework emits the terminal Error{code=SCP-TOOL-6133, terminal=true} cancel-ack-style chunk per CancelAckTracker::credit_stall_payload. Status Error(SCP-TOOL-6133).",
+      "open": {
+        "outlet_id": "calc.streaming",
+        "outlet_kind": "action",
+        "input": { "iterations": 100 },
+        "invoker_did": "did:dht:zVECTOR-INVOKER-07",
+        "operator_did": "did:dht:zVECTOR-OPERATOR-07",
+        "context_id": "vec-ctx-credit-exhaustion",
+        "credit_window": 2,
+        "estimated_chunk_count": 2,
+        "cost_per_chunk": 1,
+        "available_balance": 1000,
+        "stream_credit_stall_secs": 30,
+        "stream_cancel_ack_secs": 5,
+        "timeout_ms": 60000,
+        "chain_depth": 0
+      },
+      "chunks": [
+        { "sequence": 0, "type": "data", "value": { "i": 0 } },
+        { "sequence": 1, "type": "data", "value": { "i": 1 } },
+        { "sequence": 2, "type": "error", "code": "SCP-TOOL-6133", "slug": "execution.credit-stall", "message": "credit window remained at zero past stream_credit_stall_secs", "terminal": true }
+      ],
+      "credits": [],
+      "trigger": "credit_stall_fires_after_initial_window",
+      "expected_end_status": "Error",
+      "expected_error_code": "SCP-TOOL-6133",
+      "expected_error_slug": "execution.credit-stall",
+      "expected_chunks_billed": 2,
+      "expected_total_chunks": 3,
+      "expected_cancel_ack_seq": null
+    }
+  ]
+}
