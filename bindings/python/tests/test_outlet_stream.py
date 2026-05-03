@@ -31,7 +31,12 @@ from typing import Any
 import pytest
 
 from scp_sdk import outlets as outlets_mod
-from scp_sdk.errors import ContextError, ValidationError
+from scp_sdk.errors import (
+    Credit,
+    InvalidGrant,
+    StreamAlreadyClosed,
+    ValidationError,
+)
 from scp_sdk.outlets import (
     InvocationHandle,
     compute_caveats_binding,
@@ -232,36 +237,51 @@ class TestInvocationHandleControlPlane:
     """`grant_credit` and `cancel` route to the bridge with error paths."""
 
     @pytest.mark.asyncio
-    async def test_grant_credit_no_request_id_raises_context_error(self) -> None:
-        # Legacy one-shot handle has request_id=None.
+    async def test_grant_credit_no_request_id_raises_stream_already_closed(self) -> None:
+        # Non-streaming handle (request_id=None) — the End chunk arrives
+        # synchronously so by the time grant_credit is called, the
+        # stream is closed (OUT-038 AC13).
         q: asyncio.Queue[Any] = asyncio.Queue()
         handle = InvocationHandle(q, request_id=None)
-        with pytest.raises(ContextError) as exc_info:
-            await handle.grant_credit(10)
-        assert exc_info.value.code == "SCP-CTX-2030"
+        with pytest.raises(StreamAlreadyClosed):
+            await handle.grant_credit(Credit(10))
 
     @pytest.mark.asyncio
-    async def test_cancel_no_request_id_raises_context_error(self) -> None:
+    async def test_cancel_no_request_id_raises_stream_already_closed(self) -> None:
         q: asyncio.Queue[Any] = asyncio.Queue()
         handle = InvocationHandle(q, request_id=None)
-        with pytest.raises(ContextError) as exc_info:
+        with pytest.raises(StreamAlreadyClosed):
             await handle.cancel()
-        assert exc_info.value.code == "SCP-CTX-2030"
+
+    def test_credit_zero_raises_invalid_grant(self) -> None:
+        # OUT-031 round-6 / OUT-038 AC4 — Credit(0) raises InvalidGrant
+        # at construction time, NOT inside grant_credit.
+        with pytest.raises(InvalidGrant):
+            Credit(0)
+
+    def test_credit_negative_raises_invalid_grant(self) -> None:
+        # OUT-038 AC4 — Credit(-1) raises InvalidGrant (not TypeError).
+        with pytest.raises(InvalidGrant):
+            Credit(-1)
+
+    def test_credit_overflow_raises_invalid_grant(self) -> None:
+        # OUT-038 AC4 — Credit(2**32) raises InvalidGrant.
+        with pytest.raises(InvalidGrant):
+            Credit(2**32)
+
+    def test_credit_in_range_succeeds(self) -> None:
+        # OUT-038 AC4 — Credit(10) succeeds.
+        c = Credit(10)
+        assert c.raw == 10
 
     @pytest.mark.asyncio
-    async def test_grant_credit_zero_raises(self, bridge: Any) -> None:
+    async def test_grant_credit_raw_int_raises_validation_error(self) -> None:
+        # OUT-038 AC4 — passing a raw int 10 fails at the runtime guard.
+        # mypy --strict additionally rejects this at type-check time.
         q: asyncio.Queue[Any] = asyncio.Queue()
-        # Use a request_id that doesn't exist in the registry — but
-        # `grant=0` is checked BEFORE the registry lookup in the bridge
-        # so we get the InvalidGrant rejection regardless.
-        handle = InvocationHandle(q, request_id="00" * 16)
-        with pytest.raises(Exception) as exc_info:
-            await handle.grant_credit(0)
-        # The bridge raises ValidationError; it gets translated through
-        # _translate_bridge_error to a typed SDK exception. We accept
-        # any subclass that mentions `invalid grant` / `invalid-grant`.
-        msg = str(exc_info.value).lower()
-        assert "invalid grant" in msg or "invalid-grant" in msg
+        handle = InvocationHandle(q, request_id="aa" * 16)
+        with pytest.raises(ValidationError):
+            await handle.grant_credit(10)  # type: ignore[arg-type]
 
     @pytest.mark.asyncio
     async def test_cancel_unknown_request_raises(self, bridge: Any) -> None:
@@ -279,7 +299,7 @@ class TestInvocationHandleControlPlane:
         q: asyncio.Queue[Any] = asyncio.Queue()
         handle = InvocationHandle(q, request_id="ee" * 16)
         with pytest.raises(Exception) as exc_info:
-            await handle.grant_credit(5)
+            await handle.grant_credit(Credit(5))
         msg = str(exc_info.value).lower()
         assert "not found" in msg or "unknown-session" in msg
 

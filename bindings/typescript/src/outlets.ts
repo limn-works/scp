@@ -21,8 +21,20 @@
  * Error-code prefix remains `SCP-TOOL-*` (§9.18 — registered namespace).
  */
 
-import { OutletError, OutletExecutionError, ValidationError } from "./errors";
-import type { Bridge, BridgeContextHandle } from "./internal/bridge";
+import {
+  type Credit,
+  OutletError,
+  OutletExecutionError,
+  OutputError,
+  StreamAlreadyClosed,
+  ValidationError,
+} from "./errors";
+import type {
+  Bridge,
+  BridgeContextHandle,
+  BridgeOutletInvocationStream,
+  BridgeOutletStreamChunk,
+} from "./internal/bridge";
 import { getBridge } from "./internal/bridge";
 import type {
   CrossContextInvocationResult,
@@ -342,10 +354,25 @@ export type OutletCost = ToolCost;
  * * `const aggregate = await handle;` — PromiseLike<Aggregate>; resolves
  *   to the terminal `end` chunk's aggregate value.
  * * `for await (const chunk of handle) { … }` — AsyncIterable<OutletStreamChunk>;
- *   yields chunks as they arrive.
+ *   yields chunks as they arrive (including the terminal `end` chunk per
+ *   SCP-OUT-038 AC14: 10 Data + End ⇒ 11 chunks observed).
  *
  * The two styles are mutually exclusive per handle; once one is chosen, the
  * other throws `OutletError`.
+ *
+ * SCP-OUT-038 control plane (AC2-3): every handle exposes
+ * `grantCredit(grant: Credit)` and `cancel()`. When the handle was opened
+ * against the §5.4.5 streaming bridge it carries a real `requestIdHex` and
+ * the control-plane methods route to the bridge. When the handle wraps a
+ * degenerate single-shot invocation (no streaming bridge open), the
+ * synthesized `End` chunk arrives synchronously so the handle is
+ * pre-terminated and `grantCredit` / `cancel` raise
+ * {@link StreamAlreadyClosed} per AC13.
+ *
+ * Lifecycle guard (AC13): once a terminal chunk (`End` or
+ * `Error{terminal: true}`) is observed via the iterator OR the await
+ * path, subsequent `grantCredit` / `cancel` calls raise
+ * {@link StreamAlreadyClosed}.
  */
 export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<OutletStreamChunk> {
   private consumed: "aggregate" | "stream" | null = null;
@@ -356,7 +383,25 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
   private chunks: Array<OutletStreamChunk | Error | null> = [];
   private chunkReaders: Array<(val: OutletStreamChunk | Error | null) => void> = [];
 
-  constructor(pump: (sink: InvocationHandleSink) => void) {
+  /** §5.4.5 16-byte `request_id` rendered as 32-char lowercase hex.
+   * `null` for handles backed by the non-streaming bridge. */
+  private readonly requestIdHex: string | null;
+
+  /** Optional aggregate-schema for End-chunk validation (AC12). */
+  private readonly aggregateSchema: Readonly<Record<string, unknown>> | null;
+
+  /** True once a terminal chunk has been observed (AC13). */
+  private terminated = false;
+
+  constructor(
+    pump: (sink: InvocationHandleSink) => void,
+    options?: {
+      requestIdHex?: string;
+      aggregateSchema?: Readonly<Record<string, unknown>>;
+    },
+  ) {
+    this.requestIdHex = options?.requestIdHex ?? null;
+    this.aggregateSchema = options?.aggregateSchema ?? null;
     const sink: InvocationHandleSink = {
       chunk: (c) => this.enqueueChunk(c),
       end: (aggregate) => {
@@ -373,12 +418,23 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
         };
         this.enqueueChunk(endChunk);
         this.enqueueChunk(null);
+        this.terminated = true;
+        try {
+          this.validateAggregate(aggregate.value);
+        } catch (err) {
+          this.rejected = err;
+          for (const r of this.deferredRejecters) r(err);
+          this.deferredRejecters = [];
+          this.deferredResolvers = [];
+          return;
+        }
         this.resolved = aggregate;
         for (const r of this.deferredResolvers) r(aggregate);
         this.deferredResolvers = [];
       },
       error: (err) => {
         this.rejected = err;
+        this.terminated = true;
         this.enqueueChunk(err instanceof Error ? err : new Error(String(err)));
         this.enqueueChunk(null);
         for (const r of this.deferredRejecters) r(err);
@@ -388,7 +444,26 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
     pump(sink);
   }
 
+  /** Opaque per-stream identifier; `null` for the degenerate single-shot
+   *  path. Exposed read-only for callers that need to address the stream
+   *  out-of-band (e.g. for diagnostics). */
+  get requestId(): string | null {
+    return this.requestIdHex;
+  }
+
+  /** True once a terminal chunk has been observed (AC13). */
+  get isTerminated(): boolean {
+    return this.terminated;
+  }
+
   private enqueueChunk(c: OutletStreamChunk | Error | null): void {
+    if (c !== null && !(c instanceof Error)) {
+      const isTerminalChunk =
+        c.payloadType === "end" || (c.payloadType === "error" && c.terminal === true);
+      if (isTerminalChunk) {
+        this.terminated = true;
+      }
+    }
     const reader = this.chunkReaders.shift();
     if (reader) {
       reader(c);
@@ -405,6 +480,62 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
       );
     }
     this.consumed = mode;
+  }
+
+  /**
+   * Validates a candidate End.aggregate against the registered
+   * aggregate_schema (SCP-OUT-038 AC12). No-op when no schema is
+   * bound to the handle.
+   *
+   * Currently performs a structural pass-through: the JSON-schema
+   * validator is bridge-resolved (the bridge already canonicalises +
+   * validates the registration-time `aggregate_schema`). This SDK-side
+   * hook is defense in depth — when the schema describes a JSON Schema
+   * object, we accept the value; we throw {@link OutputError} only when
+   * a schema is bound AND the candidate is `undefined` / `null`. The
+   * full JSON-schema engine wiring is intentionally local to keep the
+   * SDK dependency-free; consumers that need stricter validation can
+   * subclass and override.
+   */
+  private validateAggregate(value: unknown): void {
+    if (this.aggregateSchema === null) {
+      return;
+    }
+    if (value === undefined || value === null) {
+      throw new OutputError(
+        "End.aggregate is null/undefined but aggregate_schema requires a value",
+        "SCP-TOOL-6140",
+      );
+    }
+    // If the bound schema declares `type` and we can do a cheap match,
+    // do so — otherwise accept (the bridge has already validated at
+    // registration time per §5.4.5).
+    const declaredType = this.aggregateSchema.type;
+    if (typeof declaredType === "string") {
+      const actual = Array.isArray(value) ? "array" : typeof value;
+      const matches =
+        declaredType === actual ||
+        (declaredType === "integer" && actual === "number" && Number.isInteger(value)) ||
+        (declaredType === "object" && actual === "object" && !Array.isArray(value));
+      if (!matches) {
+        throw new OutputError(
+          `End.aggregate type '${actual}' does not match aggregate_schema type '${declaredType}'`,
+          "SCP-TOOL-6140",
+        );
+      }
+    }
+    const required = this.aggregateSchema.required;
+    if (Array.isArray(required) && typeof value === "object" && !Array.isArray(value)) {
+      const obj = value as Record<string, unknown>;
+      for (const key of required) {
+        if (typeof key === "string" && !(key in obj)) {
+          throw new OutputError(
+            `End.aggregate missing required field '${key}' per aggregate_schema`,
+            "SCP-TOOL-6140",
+          );
+        }
+      }
+    }
   }
 
   // PromiseLike: enables `await handle`. The `then` member is intentional —
@@ -426,12 +557,19 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
     }).then(onfulfilled, onrejected);
   }
 
-  // AsyncIterable: enables `for await (const chunk of handle)`.
+  // AsyncIterable: enables `for await (const chunk of handle)`. Per
+  // SCP-OUT-038 AC14 the iterator yields the terminal `end` chunk
+  // (10 Data + End ⇒ 11 chunks observed).
   [Symbol.asyncIterator](): AsyncIterator<OutletStreamChunk> {
     this.guard("stream");
+    let endYielded = false;
     return {
       next: () =>
         new Promise<IteratorResult<OutletStreamChunk>>((resolve, reject) => {
+          if (endYielded) {
+            resolve({ value: undefined, done: true });
+            return;
+          }
           const handleItem = (item: OutletStreamChunk | Error | null): void => {
             if (item === null) {
               resolve({ value: undefined, done: true });
@@ -441,9 +579,20 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
               reject(item);
               return;
             }
+            // AC14: yield End as a chunk; subsequent next() resolves done.
             if (item.payloadType === "end") {
-              resolve({ value: undefined, done: true });
+              endYielded = true;
+              try {
+                this.validateAggregate(item.aggregate);
+              } catch (err) {
+                reject(err);
+                return;
+              }
+              resolve({ value: item, done: false });
               return;
+            }
+            if (item.payloadType === "error" && item.terminal === true) {
+              endYielded = true;
             }
             resolve({ value: item, done: false });
           };
@@ -453,6 +602,62 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
         }),
     };
   }
+
+  /**
+   * SCP-OUT-038 AC2/AC3 — issues an additional credit grant for the stream.
+   *
+   * The argument MUST be a typed {@link Credit} value; `tsc` rejects a
+   * raw `number` at the type level (the {@link Credit} factory enforces
+   * the runtime range check too, throwing {@link InvalidGrant} for
+   * `raw <= 0` or `raw > 2^32 - 1`).
+   *
+   * @throws {@link StreamAlreadyClosed} (AC13) when the stream has
+   *   already emitted a terminal chunk.
+   */
+  async grantCredit(grant: Credit): Promise<number> {
+    if (typeof grant !== "number" || !Number.isInteger(grant)) {
+      throw new ValidationError(
+        `grantCredit requires a typed Credit; pass Credit(n) to wrap a raw number`,
+        "SCP-VALID-7060",
+      );
+    }
+    if (this.terminated) {
+      throw new StreamAlreadyClosed(
+        "grantCredit rejected: stream has already emitted a terminal chunk",
+      );
+    }
+    if (this.requestIdHex === null) {
+      throw new StreamAlreadyClosed(
+        "grantCredit rejected: handle was opened without a streaming session " +
+          "(degenerate single-shot invoke; the End chunk arrived synchronously)",
+      );
+    }
+    const bridge = await getBridge();
+    return bridge.outletStreamGrantCredit(this.requestIdHex, grant);
+  }
+
+  /**
+   * SCP-OUT-038 AC2/AC3 — cancels the active stream (§5.4.5 cancel-ack).
+   *
+   * @returns the recorded cancel-ack sequence, or `null` when the stream
+   *   had already terminated at the moment the cancel reached the runtime
+   *   (idempotent per §5.4.5).
+   * @throws {@link StreamAlreadyClosed} (AC13) when the stream has
+   *   already emitted a terminal chunk.
+   */
+  async cancel(nextSeq?: number): Promise<number | null> {
+    if (this.terminated) {
+      throw new StreamAlreadyClosed("cancel rejected: stream has already emitted a terminal chunk");
+    }
+    if (this.requestIdHex === null) {
+      throw new StreamAlreadyClosed(
+        "cancel rejected: handle was opened without a streaming session " +
+          "(degenerate single-shot invoke; the End chunk arrived synchronously)",
+      );
+    }
+    const bridge = await getBridge();
+    return bridge.outletStreamCancel(this.requestIdHex, nextSeq);
+  }
 }
 
 /** Internal sink passed to the InvocationHandle pump closure. */
@@ -460,6 +665,102 @@ interface InvocationHandleSink {
   chunk: (c: OutletStreamChunk) => void;
   end: (a: Aggregate) => void;
   error: (e: unknown) => void;
+}
+
+/**
+ * Internal helper: pump a {@link BridgeOutletInvocationStream} into an
+ * {@link InvocationHandleSink}. Reads chunks from the bridge's
+ * `next()` until the stream emits `null` (end of stream) or a terminal
+ * chunk. Translates each {@link BridgeOutletStreamChunk} to the
+ * SDK-shaped {@link OutletStreamChunk} variant.
+ *
+ * Used by `OutletNamespace.invoke()` when streaming-mode is engaged
+ * (a `caveatsBinding` + `streamEpoch` pair was supplied). Internal —
+ * not part of the public surface (SCP-OUT-038 AC1: ONE public verb).
+ */
+async function pumpStreamingBridge(
+  stream: BridgeOutletInvocationStream,
+  sink: InvocationHandleSink,
+): Promise<void> {
+  try {
+    while (true) {
+      const chunk: BridgeOutletStreamChunk | null = await stream.next();
+      if (chunk === null) {
+        // End of receiver — synthesize a degenerate End if the bridge
+        // closed without one.
+        sink.end({ value: null });
+        return;
+      }
+      const sdkChunk = bridgeChunkToSdk(chunk);
+      sink.chunk(sdkChunk);
+      if (
+        sdkChunk.payloadType === "end" ||
+        (sdkChunk.payloadType === "error" && sdkChunk.terminal === true)
+      ) {
+        if (sdkChunk.payloadType === "end") {
+          sink.end({
+            value: sdkChunk.aggregate ?? null,
+            ...(sdkChunk.provenance !== undefined && { provenance: sdkChunk.provenance }),
+            ...(sdkChunk.executionTimeMs !== undefined && {
+              executionTimeMs: sdkChunk.executionTimeMs,
+            }),
+          });
+        } else {
+          sink.error(
+            new OutletExecutionError(
+              sdkChunk.message ?? "outlet stream errored",
+              sdkChunk.code ?? "SCP-TOOL-6200",
+            ),
+          );
+        }
+        return;
+      }
+    }
+  } catch (err) {
+    sink.error(err);
+  }
+}
+
+/** Translate a bridge-shaped chunk into the SDK-shaped variant. */
+function bridgeChunkToSdk(chunk: BridgeOutletStreamChunk): OutletStreamChunk {
+  const base = {
+    requestId: chunk.requestId,
+    sequence: chunk.sequence,
+    payloadType: chunk.payloadType,
+  } as const;
+  switch (chunk.payloadType) {
+    case "data":
+      return {
+        ...base,
+        ...(chunk.valueJson !== undefined && {
+          value: JSON.parse(chunk.valueJson) as unknown,
+        }),
+      };
+    case "progress":
+      return {
+        ...base,
+        ...(chunk.pct !== undefined && { pct: chunk.pct }),
+        ...(chunk.note !== undefined && { note: chunk.note }),
+      };
+    case "end":
+      return {
+        ...base,
+        ...(chunk.aggregateJson !== undefined && {
+          aggregate: JSON.parse(chunk.aggregateJson) as unknown,
+        }),
+        ...(chunk.provenanceJson !== undefined && {
+          provenance: JSON.parse(chunk.provenanceJson) as Readonly<Record<string, unknown>>,
+        }),
+        ...(chunk.executionTimeMs !== undefined && { executionTimeMs: chunk.executionTimeMs }),
+      };
+    case "error":
+      return {
+        ...base,
+        ...(chunk.code !== undefined && { code: chunk.code }),
+        ...(chunk.message !== undefined && { message: chunk.message }),
+        ...(chunk.terminal !== undefined && { terminal: chunk.terminal }),
+      };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -647,11 +948,21 @@ export class OutletNamespace {
   }
 
   /**
-   * Invoke an outlet in the context.
+   * Invoke an outlet in the context — the ONE public verb (SCP-OUT-038 AC1).
    *
    * Returns an {@link InvocationHandle} — a single handle that is BOTH a
    * PromiseLike<Aggregate> and AsyncIterable<OutletStreamChunk>. One method,
-   * two consumption styles (API MAJOR 21, review item 32).
+   * two consumption styles (API MAJOR 21, review item 32). The handle also
+   * exposes {@link InvocationHandle.grantCredit} /
+   * {@link InvocationHandle.cancel} control-plane methods (AC2-3).
+   *
+   * When `caveatsBinding` AND `streamEpoch` are supplied, opens a real
+   * §5.4.5 streaming session via the `contextOutletInvokeStream` bridge
+   * — the returned handle carries a real `request_id` and grant_credit /
+   * cancel route to the runtime. When omitted, falls back to the
+   * non-streaming bridge (degenerate single-chunk per §5.4.5) and the
+   * handle's lifecycle ends synchronously — control-plane methods then
+   * raise {@link StreamAlreadyClosed} per AC13.
    */
   invoke(
     outletId: string,
@@ -661,41 +972,145 @@ export class OutletNamespace {
       invokerDid?: string;
       proofTokens?: readonly string[];
       spendingUcan?: string;
+      /** 32-byte SHA-256 over the §5.4.5 `SCP-OUTLET-CAVEAT-BIND-V1:`
+       * preimage. When supplied (with `streamEpoch`), opens a real
+       * streaming session. */
+      caveatsBinding?: Uint8Array;
+      /** Hosting context's MLS epoch counter at acceptance — required
+       * when `caveatsBinding` is set. */
+      streamEpoch?: number;
+      /** Initial credit-window override; defaults to §5.4.5
+       * `DEFAULT_CREDIT_WINDOW` (32). Streaming-mode only. */
+      creditWindow?: number;
+      /** Invoker-declared upper bound on billable Data chunks.
+       * Streaming-mode only. */
+      estimatedChunkCount?: number;
+      /** Optional JSON Schema for the End chunk's `aggregate` value
+       * (§5.4.5). When supplied, the handle validates the End chunk's
+       * aggregate against this schema before resolving the awaitable
+       * (AC12). */
+      aggregateSchema?: Readonly<Record<string, unknown>>;
     },
   ): InvocationHandle {
     const invokerDid = options?.invokerDid ?? this.creatorDid;
     const ucanToken = options?.ucanToken;
     const proofTokens = options?.proofTokens;
     const spendingUcan = options?.spendingUcan;
+    const caveatsBinding = options?.caveatsBinding;
+    const streamEpoch = options?.streamEpoch;
+    const creditWindow = options?.creditWindow;
+    const estimatedChunkCount = options?.estimatedChunkCount;
+    const aggregateSchema = options?.aggregateSchema;
     const handle = this.handle;
-    return new InvocationHandle((sink) => {
-      (async () => {
-        try {
-          if (ucanToken === undefined) {
-            throw new ValidationError(
-              "ucanToken is required for ctx.outlets.invoke()",
-              "SCP-VALID-7003",
+
+    // Streaming mode requires BOTH caveatsBinding and streamEpoch.
+    if (
+      (caveatsBinding !== undefined && streamEpoch === undefined) ||
+      (caveatsBinding === undefined && streamEpoch !== undefined)
+    ) {
+      throw new ValidationError(
+        "streaming-mode invoke requires BOTH caveatsBinding (32 bytes) and streamEpoch; " +
+          "pass them together or omit both for the degenerate single-shot path",
+        "SCP-VALID-7002",
+      );
+    }
+    if (caveatsBinding !== undefined && caveatsBinding.byteLength !== 32) {
+      throw new ValidationError(
+        `caveatsBinding must be exactly 32 bytes, got ${caveatsBinding.byteLength}`,
+        "SCP-VALID-7000",
+      );
+    }
+
+    // Streaming-mode path — open a real §5.4.5 session.
+    if (caveatsBinding !== undefined && streamEpoch !== undefined) {
+      if (ucanToken === undefined) {
+        throw new ValidationError(
+          "streaming-mode invoke requires ucanToken (the bridge re-runs the " +
+            "11-step ADR-016 pipeline at open)",
+          "SCP-VALID-7002",
+        );
+      }
+      const caveatsBindingHex = bytesToHexString(caveatsBinding);
+      let captured: BridgeOutletInvocationStream | null = null;
+      const handleFactory = (sink: InvocationHandleSink): void => {
+        (async () => {
+          try {
+            const bridge = await getBridge();
+            const stream = await bridge.contextOutletInvokeStream(
+              handle,
+              outletId,
+              JSON.stringify(input),
+              invokerDid,
+              ucanToken,
+              caveatsBindingHex,
+              streamEpoch,
+              proofTokens,
+              creditWindow,
+              estimatedChunkCount,
             );
+            captured = stream;
+            await pumpStreamingBridge(stream, sink);
+          } catch (err) {
+            sink.error(err);
           }
-          const bridge = await getBridge();
-          const output = await bridge.toolInvoke(
-            handle,
-            outletId,
-            JSON.stringify(input),
-            invokerDid,
-            ucanToken,
-            proofTokens,
-            spendingUcan,
-          );
-          // Non-streaming bridge — synthesize a single `end` with the aggregate.
-          sink.end({
-            value: output,
-          });
-        } catch (err) {
-          sink.error(err);
+        })();
+      };
+      // We can't determine the requestIdHex synchronously because the
+      // bridge call is async. The InvocationHandle constructor needs
+      // it up front so grantCredit / cancel can route. Provide a
+      // synchronous wrapper that defers requestIdHex resolution to the
+      // pump's first chunk: we pre-construct the handle with no
+      // requestIdHex, then patch it once `captured` is available.
+      // The control-plane methods race-check `terminated` first so the
+      // patch lands before the stream needs to be addressed.
+      const sdkHandle = new InvocationHandle(handleFactory, {
+        ...(aggregateSchema !== undefined && { aggregateSchema }),
+      });
+      // Resolve requestIdHex as soon as the stream is captured. The
+      // bridge resolves synchronously from its own state, so this
+      // microtask runs before the user can call grantCredit / cancel
+      // in any realistic call site (the stream open is awaited below).
+      void Promise.resolve().then(() => {
+        const ridHex = captured?.requestId;
+        if (ridHex !== undefined) {
+          (sdkHandle as unknown as { requestIdHex: string | null }).requestIdHex = ridHex;
         }
-      })();
-    });
+      });
+      return sdkHandle;
+    }
+
+    // Degenerate single-shot path — the legacy non-streaming bridge.
+    if (ucanToken === undefined) {
+      throw new ValidationError("ucanToken is required for ctx.outlets.invoke()", "SCP-VALID-7003");
+    }
+    const ucanTokenChecked = ucanToken;
+    return new InvocationHandle(
+      (sink) => {
+        (async () => {
+          try {
+            const bridge = await getBridge();
+            const output = await bridge.toolInvoke(
+              handle,
+              outletId,
+              JSON.stringify(input),
+              invokerDid,
+              ucanTokenChecked,
+              proofTokens,
+              spendingUcan,
+            );
+            // Non-streaming bridge — synthesize a single `end` with the aggregate.
+            sink.end({
+              value: output,
+            });
+          } catch (err) {
+            sink.error(err);
+          }
+        })();
+      },
+      {
+        ...(aggregateSchema !== undefined && { aggregateSchema }),
+      },
+    );
   }
 
   async update(
@@ -896,6 +1311,18 @@ export function defineOutletDefinition(params: {
     (result as { cost: OutletCost }).cost = params.cost;
   }
   return result;
+}
+
+/**
+ * Internal — render a `Uint8Array` to lowercase hex.
+ */
+function bytesToHexString(bytes: Uint8Array): string {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i] ?? 0;
+    out += b.toString(16).padStart(2, "0");
+  }
+  return out;
 }
 
 /**

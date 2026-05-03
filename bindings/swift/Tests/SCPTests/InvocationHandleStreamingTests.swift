@@ -1,0 +1,354 @@
+import Foundation
+@testable import SCP
+import Testing
+
+// SCP-OUT-038 — Swift SDK InvocationHandle integration tests.
+//
+// Covers AC2-AC18 of the SDK control-plane story:
+//
+// - AC2: handle conforms to AsyncSequence + has awaited `aggregate`
+// - AC7: Credit struct rejects 0 with throwing init
+// - AC8: try Credit(0) throws OutletError.invalidGrant
+// - AC13: OutletError.streamAlreadyClosed sits at protocol-class depth
+// - AC14: 10 Data + End -> 11 chunks observed
+// - AC17: post-End grantCredit / cancel raise streamAlreadyClosed
+// - AC18: post-Error{terminal:true} grantCredit raises streamAlreadyClosed
+//
+// The tests drive an `InvocationHandle` directly via the pump closure so
+// the SDK-level lifecycle is exercised without depending on the
+// XCFramework binary (which is regenerated in CI).
+
+// MARK: - Helpers
+
+private func dataChunk(seq: UInt64, value: String = #"{"x":1}"#) -> OutletStreamChunk {
+    OutletStreamChunk(
+        requestId: Data(count: 16),
+        sequence: seq,
+        payload: .data(value: value)
+    )
+}
+
+private func endChunk(
+    seq: UInt64,
+    aggregate: String = #"{"sum":45}"#,
+    executionTimeMs: UInt64 = 42
+) -> OutletStreamChunk {
+    OutletStreamChunk(
+        requestId: Data(count: 16),
+        sequence: seq,
+        payload: .end(aggregate: aggregate, executionTimeMs: executionTimeMs)
+    )
+}
+
+private func errorChunk(
+    seq: UInt64,
+    terminal: Bool,
+    code: String = "SCP-TOOL-6131",
+    message: String = "synthetic error"
+) -> OutletStreamChunk {
+    OutletStreamChunk(
+        requestId: Data(count: 16),
+        sequence: seq,
+        payload: .error(code: code, message: message, terminal: terminal)
+    )
+}
+
+// MARK: - AC7/AC8: Credit struct construction
+
+struct CreditConstructionTests {
+    @Test("try Credit(0) throws OutletError.invalidGrant")
+    func zeroRejected() throws {
+        do {
+            _ = try Credit(0)
+            #expect(Bool(false), "expected throw")
+        } catch let OutletError.invalidGrant(credit) {
+            #expect(credit.raw == 0)
+        } catch {
+            #expect(Bool(false), "wrong error type: \(error)")
+        }
+    }
+
+    @Test("try Credit(1) succeeds")
+    func minSucceeds() throws {
+        let credit = try Credit(1)
+        #expect(credit.raw == 1)
+    }
+
+    @Test("try Credit(UInt32.max) succeeds")
+    func maxSucceeds() throws {
+        let credit = try Credit(UInt32.max)
+        #expect(credit.raw == UInt32.max)
+    }
+}
+
+// MARK: - AC13: OutletError.streamAlreadyClosed depth
+
+struct StreamAlreadyClosedDepthTests {
+    @Test("streamAlreadyClosed wraps a Protocol-class envelope")
+    func wrapsProtocolEnvelope() {
+        let err = OutletError.makeStreamAlreadyClosed()
+        guard case let .streamAlreadyClosed(env) = err else {
+            #expect(Bool(false), "expected .streamAlreadyClosed case")
+            return
+        }
+        #expect(env.classWire == .protocol)
+        #expect(env.code == "SCP-TOOL-6102")
+        #expect(env.slug == "protocol.stream-already-closed")
+    }
+
+    @Test("custom message overrides default")
+    func customMessage() {
+        let err = OutletError.makeStreamAlreadyClosed(message: "custom-reason")
+        guard case let .streamAlreadyClosed(env) = err else {
+            #expect(Bool(false), "expected .streamAlreadyClosed case")
+            return
+        }
+        #expect(env.message == "custom-reason")
+    }
+}
+
+// MARK: - AC14: 10 Data + End -> 11 chunks observed
+
+struct InvocationHandleIteratorTests {
+    @Test("10 Data + End yields 11 chunks via AsyncSequence")
+    func tenDataPlusEnd() async throws {
+        let handle = InvocationHandle { yieldChunk, resolveAggregate, _ in
+            Task {
+                for idx in 0 ..< 10 {
+                    yieldChunk(dataChunk(seq: UInt64(idx)))
+                }
+                let end = endChunk(seq: 10)
+                yieldChunk(end)
+                resolveAggregate(Aggregate(valueJson: #"{"sum":45}"#, executionTimeMs: 42))
+            }
+        }
+        var observed: [OutletStreamChunk] = []
+        for try await chunk in handle {
+            observed.append(chunk)
+        }
+        #expect(observed.count == 11)
+        // First 10 are Data; last is End.
+        for (idx, chunk) in observed.prefix(10).enumerated() {
+            switch chunk.payload {
+            case .data:
+                #expect(chunk.sequence == UInt64(idx))
+            default:
+                #expect(Bool(false), "expected Data at index \(idx)")
+            }
+        }
+        switch observed[10].payload {
+        case .end:
+            #expect(observed[10].sequence == 10)
+        default:
+            #expect(Bool(false), "expected End at index 10")
+        }
+    }
+
+    @Test("await aggregate returns End.aggregate")
+    func aggregateAwait() async throws {
+        let handle = InvocationHandle { _, resolveAggregate, _ in
+            Task {
+                resolveAggregate(Aggregate(valueJson: #"{"v":99}"#, executionTimeMs: 10))
+            }
+        }
+        let agg = try await handle.aggregate
+        #expect(agg.valueJson == #"{"v":99}"#)
+        #expect(agg.executionTimeMs == 10)
+    }
+}
+
+// MARK: - AC17: post-End grantCredit / cancel raise
+
+struct PostTerminalLifecycleTests {
+    @Test("grantCredit after End raises streamAlreadyClosed")
+    func grantAfterEnd() async throws {
+        let handle = InvocationHandle(requestIdHex: String(repeating: "dd", count: 16)) { yieldChunk, resolveAggregate, _ in
+            Task {
+                yieldChunk(endChunk(seq: 0))
+                resolveAggregate(Aggregate(valueJson: #"{"ok":true}"#))
+            }
+        }
+        // Drain iterator so End is observed.
+        for try await _ in handle {
+            // discard
+        }
+        #expect(handle.isTerminated)
+
+        do {
+            _ = try await handle.grantCredit(Credit(10))
+            #expect(Bool(false), "expected throw")
+        } catch OutletError.streamAlreadyClosed {
+            // expected
+        } catch {
+            #expect(Bool(false), "wrong error: \(error)")
+        }
+    }
+
+    @Test("cancel after End raises streamAlreadyClosed")
+    func cancelAfterEnd() async throws {
+        let handle = InvocationHandle(requestIdHex: String(repeating: "dd", count: 16)) { yieldChunk, resolveAggregate, _ in
+            Task {
+                yieldChunk(endChunk(seq: 0))
+                resolveAggregate(Aggregate(valueJson: #"{"ok":true}"#))
+            }
+        }
+        for try await _ in handle {
+            // discard
+        }
+        do {
+            _ = try await handle.cancel(nextSeq: 0)
+            #expect(Bool(false), "expected throw")
+        } catch OutletError.streamAlreadyClosed {
+            // expected
+        } catch {
+            #expect(Bool(false), "wrong error: \(error)")
+        }
+    }
+
+    @Test("grantCredit after Error{terminal:true} raises streamAlreadyClosed")
+    func grantAfterTerminalError() async throws {
+        let handle = InvocationHandle(requestIdHex: String(repeating: "ee", count: 16)) { yieldChunk, _, rejectAggregate in
+            Task {
+                yieldChunk(errorChunk(seq: 0, terminal: true))
+                rejectAggregate(NSError(domain: "test", code: 0))
+            }
+        }
+        // Drain iterator — terminal error throws when consumed.
+        do {
+            for try await _ in handle {
+                // discard
+            }
+        } catch {
+            // expected — pump rejected with the terminal error
+        }
+        #expect(handle.isTerminated)
+
+        do {
+            _ = try await handle.grantCredit(Credit(10))
+            #expect(Bool(false), "expected throw")
+        } catch OutletError.streamAlreadyClosed {
+            // expected
+        } catch {
+            #expect(Bool(false), "wrong error: \(error)")
+        }
+    }
+}
+
+// MARK: - Single-shot lifecycle
+
+struct NonStreamingControlPlaneTests {
+    @Test("grantCredit on handle without requestIdHex raises streamAlreadyClosed")
+    func grantWithoutRequestId() async throws {
+        let handle = InvocationHandle { _, resolveAggregate, _ in
+            Task {
+                resolveAggregate(Aggregate(valueJson: #"{"v":1}"#))
+            }
+        }
+        do {
+            _ = try await handle.grantCredit(Credit(10))
+            #expect(Bool(false), "expected throw")
+        } catch OutletError.streamAlreadyClosed {
+            // expected
+        } catch {
+            #expect(Bool(false), "wrong error: \(error)")
+        }
+    }
+
+    @Test("cancel on handle without requestIdHex raises streamAlreadyClosed")
+    func cancelWithoutRequestId() async throws {
+        let handle = InvocationHandle { _, resolveAggregate, _ in
+            Task {
+                resolveAggregate(Aggregate(valueJson: #"{"v":1}"#))
+            }
+        }
+        do {
+            _ = try await handle.cancel()
+            #expect(Bool(false), "expected throw")
+        } catch OutletError.streamAlreadyClosed {
+            // expected
+        } catch {
+            #expect(Bool(false), "wrong error: \(error)")
+        }
+    }
+}
+
+// MARK: - AC12: aggregate_schema validation
+
+struct AggregateSchemaValidationTests {
+    @Test("matching schema passes")
+    func matchingSchema() async throws {
+        let schema = #"{"type":"object","required":["sum"]}"#
+        let handle = InvocationHandle(
+            requestIdHex: nil,
+            aggregateSchemaJson: schema
+        ) { _, resolveAggregate, _ in
+            Task {
+                resolveAggregate(Aggregate(valueJson: #"{"sum":42}"#))
+            }
+        }
+        let agg = try await handle.aggregate
+        #expect(agg.valueJson == #"{"sum":42}"#)
+    }
+
+    @Test("missing required field rejects with output error")
+    func missingRequired() async throws {
+        let schema = #"{"type":"object","required":["sum"]}"#
+        let handle = InvocationHandle(
+            requestIdHex: nil,
+            aggregateSchemaJson: schema
+        ) { _, resolveAggregate, _ in
+            Task {
+                resolveAggregate(Aggregate(valueJson: #"{"wrong":1}"#))
+            }
+        }
+        do {
+            _ = try await handle.aggregate
+            #expect(Bool(false), "expected throw")
+        } catch let OutletError.output(env) {
+            #expect(env.classWire == .output)
+            #expect(env.code == "SCP-TOOL-6140")
+        } catch {
+            #expect(Bool(false), "wrong error: \(error)")
+        }
+    }
+
+    @Test("type mismatch rejects with output error")
+    func typeMismatch() async throws {
+        let schema = #"{"type":"object"}"#
+        let handle = InvocationHandle(
+            requestIdHex: nil,
+            aggregateSchemaJson: schema
+        ) { _, resolveAggregate, _ in
+            Task {
+                resolveAggregate(Aggregate(valueJson: #"42"#))
+            }
+        }
+        do {
+            _ = try await handle.aggregate
+            #expect(Bool(false), "expected throw")
+        } catch let OutletError.output(env) {
+            #expect(env.classWire == .output)
+        } catch {
+            #expect(Bool(false), "wrong error: \(error)")
+        }
+    }
+}
+
+// MARK: - Compile-time: Credit is REQUIRED for grantCredit
+
+/// The block below is never executed; it exists purely so that any drift
+/// in the `grantCredit` signature breaks at compile time. AC8: passing a
+/// raw `UInt32` where `Credit` is expected fails at compile time.
+private func _swiftCompilerRejectsRawUInt32(_ handle: InvocationHandle) async {
+    // Compile-only sanity:
+    if false {
+        // Valid call: typed Credit is accepted.
+        _ = try? await handle.grantCredit(Credit(10))
+        // Invalid call: raw UInt32 is NOT a Credit. The line below
+        // would fail to compile — kept as a comment so the assertion
+        // is documented but the test target still builds.
+        // _ = try? await handle.grantCredit(10)
+        // ^^ would fail with "Cannot convert value of type 'UInt32' to expected argument type 'Credit'"
+    }
+    _ = handle
+}

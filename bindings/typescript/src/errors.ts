@@ -631,7 +631,8 @@ export class OutletError extends ScpError {
         tag === "EconomicError" ||
         tag === "OutletTransportError" ||
         tag === "OutletGovernanceError" ||
-        tag === "InvalidGrant")
+        tag === "InvalidGrant" ||
+        tag === "StreamAlreadyClosed")
     );
   }
   static isOutletProtocolError(err: unknown): err is OutletProtocolError {
@@ -660,6 +661,9 @@ export class OutletError extends ScpError {
   }
   static isInvalidGrant(err: unknown): err is InvalidGrant {
     return err instanceof InvalidGrant || hasScpClassTag(err, "InvalidGrant");
+  }
+  static isStreamAlreadyClosed(err: unknown): err is StreamAlreadyClosed {
+    return err instanceof StreamAlreadyClosed || hasScpClassTag(err, "StreamAlreadyClosed");
   }
 }
 
@@ -816,6 +820,36 @@ export class InvalidGrant extends OutletProtocolError {
     this.name = "InvalidGrant";
     (this as unknown as { scpClassTag: string }).scpClassTag = "InvalidGrant";
     this.grant = grant;
+  }
+}
+
+/**
+ * SCP-OUT-038 lifecycle-violation error. Raised when control-plane
+ * methods (`grantCredit`, `cancel`) are invoked on an
+ * {@link InvocationHandle} whose stream has already emitted a terminal
+ * chunk (`End` or `Error{terminal: true}`).
+ *
+ * Per AC13 the lifecycle error sits at the SAME inheritance depth as
+ * the other protocol-class siblings (`StreamAlreadyOpen`,
+ * `UnknownSession`, catalog-rotation): the parent class is
+ * {@link OutletProtocolError}, NOT {@link OutletError} directly. This
+ * makes `instanceof OutletProtocolError` catch every protocol-class
+ * violation uniformly across SDKs.
+ */
+export class StreamAlreadyClosed extends OutletProtocolError {
+  static override readonly scpClassTag: string = "StreamAlreadyClosed";
+  static override readonly defaultCode = "SCP-TOOL-6102";
+  constructor(message?: string) {
+    super(
+      message ?? "stream has already terminated; control-plane methods rejected",
+      StreamAlreadyClosed.defaultCode,
+      {
+        slug: "protocol.stream-already-closed",
+        retry: { policy: "never" },
+      },
+    );
+    this.name = "StreamAlreadyClosed";
+    (this as unknown as { scpClassTag: string }).scpClassTag = "StreamAlreadyClosed";
   }
 }
 

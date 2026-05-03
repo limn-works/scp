@@ -69,7 +69,7 @@ from __future__ import annotations
 import abc
 import re
 from dataclasses import dataclass
-from typing import Any, NewType
+from typing import Any, NewType, final
 
 # ---------------------------------------------------------------------------
 # Root SCP exception
@@ -204,24 +204,59 @@ OutletId = NewType("OutletId", str)
 
 # --- Credit newtype --------------------------------------------------------
 
-Credit = NewType("Credit", int)
-
 _CREDIT_MAX = 2**32 - 1
 
 
-def make_credit(raw: int) -> Credit:
-    """Validates ``raw`` falls in ``(0, 2**32 - 1]`` and returns a typed
-    :data:`Credit` newtype.
+@final
+class Credit:
+    """Branded newtype for an Outlet credit grant (§5.4.5 round-6).
 
-    Raises :class:`InvalidGrant` (under the :class:`OutletError`
-    hierarchy) on out-of-range input. Round-5 used :class:`ValueError`
-    here; round-6 unified the error type so all four SDKs surface the
-    same exception class for the same condition.
+    Constructor rejects ``raw <= 0`` and ``raw > 2**32 - 1`` with
+    :class:`InvalidGrant` (under the :class:`OutletError` hierarchy)
+    so all four SDKs surface a uniform exception class for the same
+    condition. Round-5 used :class:`ValueError`; round-6 unified the
+    error type.
+
+    Used as the type-checked argument of
+    :meth:`InvocationHandle.grant_credit` — passing a raw ``int`` where
+    :class:`Credit` is expected fails at ``mypy --strict``.
     """
-    if not isinstance(raw, int) or isinstance(raw, bool):
-        raise InvalidGrant(grant=raw if isinstance(raw, int) else 0)
-    if raw <= 0 or raw > _CREDIT_MAX:
-        raise InvalidGrant(grant=raw)
+
+    __slots__ = ("_raw",)
+
+    def __init__(self, raw: int) -> None:
+        if not isinstance(raw, int) or isinstance(raw, bool):
+            # Coerce non-int / bool to an int for the error payload so
+            # the error message reflects what the caller passed.
+            raise InvalidGrant(grant=raw if isinstance(raw, int) else 0)
+        if raw <= 0 or raw > _CREDIT_MAX:
+            raise InvalidGrant(grant=raw)
+        self._raw = raw
+
+    @property
+    def raw(self) -> int:
+        """The underlying ``int`` value (always in ``(0, 2**32 - 1]``)."""
+        return self._raw
+
+    def __repr__(self) -> str:
+        return f"Credit({self._raw})"
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, Credit):
+            return self._raw == other._raw
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash(("Credit", self._raw))
+
+
+def make_credit(raw: int) -> Credit:
+    """Backward-compat factory — equivalent to :class:`Credit(raw)`.
+
+    Pre-OUT-038 callers used ``make_credit(...)``; the round-6 spec
+    promoted the constructor itself to be the validating factory so all
+    four SDKs share the same construction idiom.
+    """
     return Credit(raw)
 
 
@@ -445,9 +480,8 @@ class OutletError(ScpError, abc.ABC):
         # `source_chain or []` is intentional — `None` and an empty list
         # are equivalent for the §5.4.4 envelope (an empty trail and an
         # absent trail both render as "no cross-context hops").
-        self.source_chain: list[ContextHop] = list(
-            source_chain or []
-        )  # falsy-ok: empty and absent are equivalent for §5.4.4 source_chain
+        # falsy-ok: empty and absent are equivalent for §5.4.4 source_chain
+        self.source_chain: list[ContextHop] = list(source_chain or [])
         self.pad_nonce: bytes | None = pad_nonce
         self.registration_event_id: bytes | None = registration_event_id
 
@@ -765,6 +799,35 @@ class InvalidGrant(OutletProtocolError):
         self.grant = grant
 
 
+class StreamAlreadyClosed(OutletProtocolError):
+    """Raised when control-plane methods are called on a terminated stream.
+
+    SCP-OUT-038 lifecycle guard — calling
+    :meth:`InvocationHandle.grant_credit` or
+    :meth:`InvocationHandle.cancel` after the stream has emitted a
+    terminal chunk (``End`` or ``Error{terminal: true}``) raises this
+    error.
+
+    Per OUT-031 round-5 / OUT-038 AC13, this lifecycle-violation error
+    sits at the same inheritance depth as other protocol-class errors
+    (catalog-rotation, stream-already-open, unknown-session) — the
+    common parent is :class:`OutletProtocolError` (the Python subclass
+    for ``OutletErrorClass::Protocol``), NOT :class:`OutletError`
+    directly. This makes ``except OutletProtocolError`` catch every
+    protocol-class violation uniformly across SDKs.
+    """
+
+    _default_code = "SCP-TOOL-6102"
+
+    def __init__(self, message: str | None = None) -> None:
+        super().__init__(
+            message=message or "stream has already terminated; control-plane methods rejected",
+            code="SCP-TOOL-6102",
+            slug="protocol.stream-already-closed",
+            retry=RetryPolicy.never(),
+        )
+
+
 # Class-discriminator → subclass dispatch table.
 _CLASS_TO_SUBCLASS: dict[str, type[OutletError]] = {
     "protocol": OutletProtocolError,
@@ -846,12 +909,15 @@ __all__ = [
     "InvalidGrant",
     "OutletError",
     "OutletExecutionError",
+    "OutletGovernanceError",
     "OutletId",
     "OutletNotFoundError",
     "OutletProtocolError",
+    "OutletTransportError",
     "OutputError",
     "RetryPolicy",
     "ScpError",
+    "StreamAlreadyClosed",
     "TransportError",
     "UcanPermissionError",
     "ValidationError",

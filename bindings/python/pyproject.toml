@@ -56,6 +56,15 @@ strict = true
 warn_return_any = true
 warn_unused_configs = true
 
+# `jsonschema` is a soft / optional dep used by InvocationHandle's
+# aggregate-schema validation path (SCP-OUT-038 AC12). When the
+# package is not installed, mypy cannot find type stubs — silence the
+# import-untyped diagnostic so the SDK still type-checks cleanly in
+# environments that don't pull in the validation extra.
+[[tool.mypy.overrides]]
+module = "jsonschema"
+ignore_missing_imports = true
+
 [tool.maturin]
 features = ["extension-module"]
 manifest-path = "../../crates/scp-ffi/Cargo.toml"

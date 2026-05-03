@@ -43,9 +43,12 @@ from typing import TYPE_CHECKING, Any, NewType
 from scp_sdk.errors import (
     BRIDGE_ERROR_MAP,
     ContextError,
+    Credit,
     OutletError,
     OutletExecutionError,
     OutletNotFoundError,
+    OutputError,
+    StreamAlreadyClosed,
     ValidationError,
 )
 
@@ -510,14 +513,19 @@ class InvocationHandle:
     The two styles are mutually exclusive per handle: once one is chosen,
     the other raises :class:`ContextError` (API MAJOR 26).
 
-    SCP-OUT-037 control plane (PyO3 portion): when the handle is bound
-    to a ``request_id`` (set by :meth:`OutletNamespace.invoke_stream`)
-    the methods :meth:`grant_credit` and :meth:`cancel` route to the
-    bridge's ``outlet_stream_grant_credit`` / ``outlet_stream_cancel``
-    entry points. Handles produced by the legacy single-shot
-    :meth:`OutletNamespace.invoke` carry ``request_id is None`` and
-    raise :class:`ContextError` from the control-plane methods (the
-    one-shot bridge has no per-stream control surface).
+    SCP-OUT-038 control plane: every handle exposes
+    :meth:`grant_credit` and :meth:`cancel`. When a handle was opened
+    against the §5.4.5 streaming bridge it carries a real ``request_id``
+    and the control-plane methods route to the bridge. When the handle
+    represents a degenerate single-shot invocation (no streaming bridge
+    open), the stream "ends" immediately on construction so the
+    control-plane methods raise :class:`StreamAlreadyClosed` per AC13.
+
+    Lifecycle guard (AC13): once the stream has emitted a terminal
+    chunk (``End`` or ``Error{terminal: true}``) — observable either
+    via the iterator or via ``await`` — subsequent calls to
+    :meth:`grant_credit` / :meth:`cancel` raise
+    :class:`StreamAlreadyClosed`.
     """
 
     def __init__(
@@ -525,18 +533,34 @@ class InvocationHandle:
         chunks: asyncio.Queue[OutletStreamChunk | BaseException | None],
         *,
         request_id: str | None = None,
+        aggregate_schema: dict[str, Any] | None = None,
     ) -> None:
         self._chunks = chunks
         self._consumed: str | None = None
         self._request_id = request_id
+        self._aggregate_schema = aggregate_schema
+        # Terminal-chunk observed: set once an End / Error{terminal:true}
+        # chunk passes through the iterator or the aggregate await path.
+        # AC13 lifecycle guard rejects grant_credit / cancel after this.
+        self._terminated = False
 
     @property
     def request_id(self) -> str | None:
         """Hex-encoded §5.4.5 16-byte ``request_id`` for this stream.
 
-        ``None`` for legacy one-shot handles.
+        ``None`` for handles backed by the non-streaming bridge.
         """
         return self._request_id
+
+    @property
+    def is_terminated(self) -> bool:
+        """``True`` once a terminal chunk has been observed.
+
+        Tracked so :meth:`grant_credit` / :meth:`cancel` can fail-fast
+        with :class:`StreamAlreadyClosed` per OUT-038 AC13 rather than
+        round-tripping the bridge for a known-dead session.
+        """
+        return self._terminated
 
     def _guard(self, mode: str) -> None:
         if self._consumed is not None and self._consumed != mode:
@@ -554,20 +578,62 @@ class InvocationHandle:
         while True:
             item = await self._chunks.get()
             if isinstance(item, BaseException):
+                # Rethrowing terminates the stream from the awaiter's
+                # perspective — record terminal so the control-plane
+                # lifecycle guard fires on subsequent grant_credit /
+                # cancel calls.
+                self._terminated = True
                 raise item
             if item is None:
+                self._terminated = True
                 return Aggregate(value=None)
             if item.payload_type == "end":
+                self._terminated = True
+                self._validate_aggregate_against_schema(item.aggregate)
                 return Aggregate(
                     value=item.aggregate,
                     provenance=item.provenance,
                     execution_time_ms=item.execution_time_ms,
                 )
             if item.payload_type == "error":
+                if item.terminal:
+                    self._terminated = True
                 raise OutletExecutionError(
                     item.message or "outlet execution failed",
                     code=item.code or "SCP-TOOL-6200",
                 )
+
+    def _validate_aggregate_against_schema(self, aggregate_value: Any) -> None:
+        """Validate End.aggregate against the registered aggregate_schema.
+
+        Per §5.4.5 the End chunk's aggregate must conform to the
+        outlet's ``aggregate_schema``. The bridge already pinned the
+        schema at registration; the SDK enforces it on the receive side
+        as defense in depth so a malformed aggregate is surfaced as
+        :class:`OutputError` rather than silently propagating to caller.
+
+        No-op when no schema is bound to the handle (``aggregate_schema
+        is None``) — the End chunk is forwarded unchanged.
+        """
+        if self._aggregate_schema is None:
+            return
+        try:
+            import jsonschema
+        except ImportError:
+            # `jsonschema` is a soft dep; if missing we surface a clear
+            # OutputError so the SDK developer knows to install it.
+            raise OutputError(
+                "aggregate_schema validation requires the 'jsonschema' package; "
+                "install scp_sdk[validation] to enable",
+                code="SCP-TOOL-6140",
+            ) from None
+        try:
+            jsonschema.validate(instance=aggregate_value, schema=self._aggregate_schema)
+        except jsonschema.ValidationError as exc:
+            raise OutputError(
+                f"End.aggregate does not match aggregate_schema: {exc.message}",
+                code="SCP-TOOL-6140",
+            ) from exc
 
     def __aiter__(self) -> InvocationHandle:
         self._guard("stream")
@@ -576,36 +642,71 @@ class InvocationHandle:
     async def __anext__(self) -> OutletStreamChunk:
         item = await self._chunks.get()
         if isinstance(item, BaseException):
+            self._terminated = True
             raise item
         if item is None:
+            self._terminated = True
             raise StopAsyncIteration
         if item.payload_type == "end":
-            raise StopAsyncIteration
+            # AC2 / AC14: End is observable as a chunk in the iterator
+            # (yielded as part of the 11-chunk count for 10 Data + End).
+            # Mark terminated so subsequent control-plane calls fail.
+            self._terminated = True
+            self._validate_aggregate_against_schema(item.aggregate)
+            return item
+        if item.payload_type == "error" and item.terminal:
+            self._terminated = True
+            return item
         return item
 
-    async def grant_credit(self, grant: int) -> int:
-        """Issue an additional ``grant`` chunks of credit (§5.4.5).
+    async def grant_credit(self, grant: Credit) -> int:
+        """Issue an additional credit grant against the stream (§5.4.5).
 
         Internally constructs a signed ``OutletStreamCredit`` per
-        ``SCP-OUTLET-CREDIT-V1:`` and forwards it to the runtime via
-        the PyO3 bridge. ``grant == 0`` raises
-        :class:`OutletProtocolError` (the round-6 uniform InvalidGrant
-        rule).
+        ``SCP-OUTLET-CREDIT-V1:`` (the bridge handles signing under the
+        invoker's pinned key) and forwards it to the runtime via
+        ``outlet_stream_grant_credit``. ``grant`` MUST be a typed
+        :class:`Credit` instance — passing a raw ``int`` fails at
+        ``mypy --strict`` per OUT-031 round-6.
+
+        Raises :class:`StreamAlreadyClosed` (OUT-038 AC13) when the
+        stream has already terminated. Raises :class:`InvalidGrant`
+        when the supplied :class:`Credit` was constructed with
+        ``raw <= 0`` or ``raw > 2**32 - 1`` (defense-in-depth — the
+        :class:`Credit` constructor already enforces this).
 
         Returns the new running credit total reported by the runtime.
         """
+        if not isinstance(grant, Credit):
+            # Defense-in-depth runtime guard. Also satisfies the case
+            # where the caller circumvents mypy --strict (e.g. dynamic
+            # callers from non-typed Python).
+            raise ValidationError(
+                f"grant_credit requires a Credit instance; got {type(grant).__name__}. "
+                f"Wrap a raw int as `Credit(n)` first.",
+                code="SCP-VALID-7060",
+            )
+        if self._terminated:
+            raise StreamAlreadyClosed(
+                "grant_credit rejected: stream has already emitted a terminal chunk",
+            )
         if self._request_id is None:
-            raise ContextError(
-                "InvocationHandle has no request_id (one-shot invoke does not "
-                "support grant_credit); use invoke_stream instead",
-                code="SCP-CTX-2030",
+            # Non-streaming handle reaches terminal state immediately on
+            # construction. We treat the initial state of a non-streaming
+            # handle as "already closed" for control-plane purposes per
+            # OUT-038 AC13 — the End chunk arrived synchronously so by
+            # the time the caller invokes grant_credit, the stream is
+            # closed.
+            raise StreamAlreadyClosed(
+                "grant_credit rejected: handle was opened without a streaming session "
+                "(degenerate single-shot invoke; the End chunk arrived synchronously)",
             )
         bridge = _require_bridge()
         try:
             return await asyncio.to_thread(
                 bridge.outlet_stream_grant_credit,
                 self._request_id,
-                int(grant),
+                grant.raw,
             )
         except Exception as exc:
             raise _translate_bridge_error(exc) from exc
@@ -616,20 +717,25 @@ class InvocationHandle:
         ``next_seq`` is the receiver's view of the next-to-emit
         sequence — passed verbatim to the runtime's
         ``apply_outlet_cancel`` so the framework can record
-        ``cancel_ack_seq`` per §5.4.5. Defaults to ``0`` (the runtime
-        records its own current emission cursor; the SDK does not
-        track a per-stream sequence cursor — the framework's cursor is
-        authoritative).
+        ``cancel_ack_seq`` per §5.4.5. Defaults to ``None`` (the
+        runtime records its own current emission cursor).
+
+        Raises :class:`StreamAlreadyClosed` (OUT-038 AC13) when the
+        stream has already terminated.
 
         Returns the recorded cancel-ack sequence, or ``None`` if the
-        stream had already terminated when the cancel arrived (the
-        runtime ignores the cancel per §5.4.5 idempotency rule).
+        stream had already terminated at the moment the cancel reached
+        the runtime (the runtime ignores the cancel per §5.4.5
+        idempotency rule).
         """
+        if self._terminated:
+            raise StreamAlreadyClosed(
+                "cancel rejected: stream has already emitted a terminal chunk",
+            )
         if self._request_id is None:
-            raise ContextError(
-                "InvocationHandle has no request_id (one-shot invoke does not "
-                "support cancel); use invoke_stream instead",
-                code="SCP-CTX-2030",
+            raise StreamAlreadyClosed(
+                "cancel rejected: handle was opened without a streaming session "
+                "(degenerate single-shot invoke; the End chunk arrived synchronously)",
             )
         bridge = _require_bridge()
         try:
@@ -1050,17 +1156,119 @@ class OutletNamespace:
         identity: Identity | None = None,
         proof_tokens: list[str] | None = None,
         spending_ucan: str | None = None,
+        *,
+        caveats_binding: bytes | None = None,
+        stream_epoch: int | None = None,
+        credit_window: int | None = None,
+        estimated_chunk_count: int | None = None,
+        aggregate_schema: dict[str, Any] | None = None,
     ) -> InvocationHandle:
-        """Invoke an outlet in the context.
+        """Invoke an outlet in the context — the ONE public verb (OUT-038 AC1).
 
         Returns an :class:`InvocationHandle`. ``await handle`` returns
         the aggregate; ``async for chunk in handle`` yields chunks.
-        One method, two consumption styles (API MAJOR 21).
+        One method, two consumption styles (API MAJOR 21). The handle
+        also exposes :meth:`InvocationHandle.grant_credit` /
+        :meth:`InvocationHandle.cancel` control-plane methods (OUT-038
+        AC2-3).
+
+        When ``caveats_binding`` and ``stream_epoch`` are supplied,
+        the SDK opens a real §5.4.5 streaming session via the
+        ``context_outlet_invoke_stream`` bridge — the returned handle
+        carries a real ``request_id`` and grant_credit / cancel route
+        to the runtime. When omitted, the SDK falls back to the
+        non-streaming bridge (degenerate single-chunk case per §5.4.5)
+        and the handle's lifecycle ends as soon as the synthesized
+        ``End`` chunk arrives — control-plane methods then raise
+        :class:`StreamAlreadyClosed` per OUT-038 AC13.
+
+        Args:
+            outlet_id: Outlet to invoke.
+            input: JSON-serialisable dict matching the outlet's input
+                schema.
+            ucan_token: UCAN authorising the invocation. Required for
+                streaming-mode invocations (when ``caveats_binding`` is
+                supplied) — the bridge re-runs the 11-step ADR-016
+                pipeline at open.
+            identity: Optional invoker identity; falls back to the
+                context creator DID.
+            proof_tokens: Optional encoded parent UCAN tokens for
+                delegation chain traversal (ADR-016 step 3).
+            spending_ucan: Optional spending-cap UCAN for paid outlets.
+            caveats_binding: 32-byte SHA-256 over the §5.4.5
+                ``SCP-OUTLET-CAVEAT-BIND-V1:`` preimage; pass the
+                output of :func:`compute_caveats_binding`. When
+                supplied, opens a real streaming session.
+            stream_epoch: Hosting context's MLS epoch counter at open
+                acceptance. Required when ``caveats_binding`` is set.
+            credit_window: Optional initial credit window override;
+                defaults to §5.4.5 ``DEFAULT_CREDIT_WINDOW`` (32) on
+                the bridge side. Streaming-mode only.
+            estimated_chunk_count: Optional invoker-declared upper
+                bound on billable Data chunks. Streaming-mode only.
+            aggregate_schema: Optional JSON Schema for the End chunk's
+                ``aggregate`` value (§5.4.5). When supplied, the
+                handle validates the End chunk's aggregate against
+                this schema before resolving the awaitable. When
+                omitted, no aggregate validation runs (defense in
+                depth; the registration-time ``aggregate_schema`` is
+                authoritative on the runtime side).
         """
-        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
         invoker_did = identity.did if identity is not None else self._creator_did
         context_id = self._context_id
-        effective_ucan = ucan_token
+        if caveats_binding is not None and stream_epoch is not None:
+            return self._invoke_streaming(
+                context_id=context_id,
+                outlet_id=outlet_id,
+                input=input,
+                invoker_did=invoker_did,
+                ucan_token=ucan_token,
+                caveats_binding=caveats_binding,
+                stream_epoch=stream_epoch,
+                proof_tokens=proof_tokens,
+                credit_window=credit_window,
+                estimated_chunk_count=estimated_chunk_count,
+                aggregate_schema=aggregate_schema,
+            )
+        if caveats_binding is not None or stream_epoch is not None:
+            raise ValidationError(
+                "streaming-mode invoke requires BOTH caveats_binding (32 bytes) "
+                "and stream_epoch; pass them together or omit both for the "
+                "degenerate single-shot path",
+                code="SCP-VALID-7002",
+            )
+        return self._invoke_one_shot(
+            context_id=context_id,
+            outlet_id=outlet_id,
+            input=input,
+            invoker_did=invoker_did,
+            ucan_token=ucan_token,
+            proof_tokens=proof_tokens,
+            spending_ucan=spending_ucan,
+            aggregate_schema=aggregate_schema,
+        )
+
+    def _invoke_one_shot(
+        self,
+        *,
+        context_id: str,
+        outlet_id: str,
+        input: dict[str, Any],
+        invoker_did: str,
+        ucan_token: str | None,
+        proof_tokens: list[str] | None,
+        spending_ucan: str | None,
+        aggregate_schema: dict[str, Any] | None,
+    ) -> InvocationHandle:
+        """Degenerate single-shot path — calls ``context_outlet_invoke``.
+
+        The bridge returns the End.aggregate value directly; the SDK
+        synthesizes a single ``end`` chunk for the iterator and resolves
+        the aggregate await with it. Control-plane methods on the
+        returned handle raise :class:`StreamAlreadyClosed` (OUT-038
+        AC13) because the stream "ends" synchronously.
+        """
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
 
         async def _pump() -> None:
             bridge = _scp_core
@@ -1080,7 +1288,7 @@ class OutletNamespace:
                     outlet_id,
                     input,
                     invoker_did,
-                    effective_ucan,
+                    ucan_token,
                     proof_tokens,
                     spending_ucan,
                 )
@@ -1103,69 +1311,53 @@ class OutletNamespace:
         except RuntimeError:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-        handle = InvocationHandle(q)
+        handle = InvocationHandle(q, aggregate_schema=aggregate_schema)
         # Pump task ownership lives on the handle for the lifetime of the stream.
         handle._pump_task = loop.create_task(_pump())  # type: ignore[attr-defined]
         return handle
 
-    def invoke_stream(
+    def _invoke_streaming(
         self,
+        *,
+        context_id: str,
         outlet_id: str,
         input: dict[str, Any],
-        ucan_token: str,
+        invoker_did: str,
+        ucan_token: str | None,
         caveats_binding: bytes,
         stream_epoch: int,
-        identity: Identity | None = None,
-        proof_tokens: list[str] | None = None,
-        credit_window: int | None = None,
-        estimated_chunk_count: int | None = None,
+        proof_tokens: list[str] | None,
+        credit_window: int | None,
+        estimated_chunk_count: int | None,
+        aggregate_schema: dict[str, Any] | None,
     ) -> InvocationHandle:
-        """Open a §5.4.5 streaming outlet invocation (SCP-OUT-037).
+        """Open a §5.4.5 streaming outlet invocation (OUT-038 internal).
 
-        Calls the PyO3 ``context_outlet_invoke_stream`` bridge directly,
-        wraps the resulting native async iterator in an
-        :class:`InvocationHandle`, and returns it. The handle's
+        Internal helper called by :meth:`invoke` when a caveats_binding
+        + stream_epoch pair is supplied. Calls the PyO3
+        ``context_outlet_invoke_stream`` bridge, wraps the resulting
+        native async iterator in an :class:`InvocationHandle`, and
+        returns it. The handle's
         :attr:`InvocationHandle.request_id` is the §5.4.5 16-byte
         ``request_id`` rendered as 32-char lowercase hex — the lookup
         key for :meth:`InvocationHandle.grant_credit` and
         :meth:`InvocationHandle.cancel`.
 
-        Args:
-            outlet_id: Outlet to invoke.
-            input: JSON-serialisable dict matching the outlet's input
-                schema.
-            ucan_token: UCAN authorising the invocation; the bridge
-                re-runs the 11-step ADR-016 pipeline at open.
-            caveats_binding: 32-byte SHA-256 over the §5.4.5
-                ``SCP-OUTLET-CAVEAT-BIND-V1:`` preimage; pass the
-                output of :meth:`compute_caveats_binding`.
-            stream_epoch: Hosting context's MLS epoch counter at open
-                acceptance, pinned in the runtime's stream record so
-                every credit grant can commit it.
-            identity: Optional invoker identity; falls back to the
-                context creator DID.
-            proof_tokens: Optional encoded parent UCAN tokens for
-                delegation chain traversal (ADR-016 step 3).
-            credit_window: Optional initial credit window override;
-                defaults to §5.4.5 ``DEFAULT_CREDIT_WINDOW`` (32) on
-                the bridge side.
-            estimated_chunk_count: Optional invoker-declared upper
-                bound on billable Data chunks; routes into the
-                §5.4.5 escrow-at-open computation.
-
-        Returns:
-            An :class:`InvocationHandle` that yields chunks via
-            ``async for chunk in handle:`` and supports control-plane
-            methods :meth:`InvocationHandle.grant_credit` and
-            :meth:`InvocationHandle.cancel`.
+        This method is intentionally name-prefixed with ``_`` to keep
+        the public SDK surface to the single :meth:`invoke` verb per
+        OUT-038 AC1 (no ``invoke_stream`` at the public layer).
         """
         if len(caveats_binding) != 32:
             raise ValidationError(
                 f"caveats_binding must be exactly 32 bytes, got {len(caveats_binding)}",
                 code="SCP-VALID-7000",
             )
-        invoker_did = identity.did if identity is not None else self._creator_did
-        context_id = self._context_id
+        if ucan_token is None:
+            raise ValidationError(
+                "streaming-mode invoke requires ucan_token (the bridge re-runs the "
+                "11-step ADR-016 pipeline at open)",
+                code="SCP-VALID-7002",
+            )
         bridge = _require_bridge()
         try:
             stream_obj = bridge.context_outlet_invoke_stream(
@@ -1213,7 +1405,11 @@ class OutletNamespace:
         except RuntimeError:
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-        handle = InvocationHandle(q, request_id=request_id_hex)
+        handle = InvocationHandle(
+            q,
+            request_id=request_id_hex,
+            aggregate_schema=aggregate_schema,
+        )
         handle._pump_task = loop.create_task(_pump())  # type: ignore[attr-defined]
         return handle
 
@@ -1369,6 +1565,7 @@ class OutletNamespace:
 
 __all__ = [
     "Aggregate",
+    "Credit",
     "InvocationCaveats",
     "InvocationHandle",
     "InvokeCrossContextOptions",
@@ -1380,6 +1577,7 @@ __all__ = [
     "OutletSessionsNamespace",
     "OutletStreamChunk",
     "SessionId",
+    "StreamAlreadyClosed",
     "TestVector",
     "compute_caveats_binding",
     "new_session_id",

@@ -292,6 +292,7 @@ export {
   redactPii,
   ScpError,
   StorageError,
+  StreamAlreadyClosed,
   TransportError,
   UcanPermissionError,
   ValidationError,
