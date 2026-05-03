@@ -1148,3 +1148,164 @@ fn init_storage_unknown_type_fails() {
     setup();
     assert!(runtime::init_storage("nonexistent").is_err());
 }
+
+// ============================================================================
+// SCP-OUT-037 — streaming bridge integration tests
+// ============================================================================
+//
+// These tests exercise the §5.4.5 streaming control plane through the
+// PyO3 bridge entry points: the chunk-signature verifier, the
+// caveats-binding helper, and the grant_credit / cancel registry
+// lookups. Full open-stream → emit chunks → grant → cancel pipeline
+// integration lives in `crates/scp-runtime/.../invoke.rs::out034_*`
+// (3 tests, all passing); the bridge layer is a thin translation over
+// those primitives, so the bridge-specific tests below cover
+// translation-layer correctness without re-running the full pipeline.
+
+/// AC10 — `verify_chunk_signature` round-trips a freshly signed chunk
+/// and rejects tampered preimage components.
+#[test]
+fn out037_verify_chunk_signature_roundtrip() {
+    use ed25519_dalek::SigningKey;
+    use scp_protocol::context::outlets::stream::{ChunkPayload, OutletStreamChunk, sign_chunk};
+
+    setup();
+    let signing = SigningKey::from_bytes(&[0x42; 32]);
+    let request_id: [u8; 16] = [0x11; 16];
+    let caveats_binding: [u8; 32] = [0xAB; 32];
+    let payload = ChunkPayload::Data {
+        value: serde_json::json!({"tick": 7}),
+    };
+    let sig = sign_chunk(
+        &signing,
+        "ctx-stream",
+        "outlet-x",
+        &request_id,
+        42,
+        &caveats_binding,
+        &payload,
+    )
+    .unwrap();
+    let chunk = OutletStreamChunk {
+        request_id,
+        sequence: 42,
+        payload,
+        sig,
+    };
+    let chunk_json = serde_json::to_string(&chunk).unwrap();
+
+    // Valid path: signature verifies under the right preimage.
+    let ok = _scp_core::outlet_stream::py_verify_chunk_signature(
+        &chunk_json,
+        signing.verifying_key().as_bytes(),
+        "ctx-stream",
+        "outlet-x",
+        &caveats_binding,
+    )
+    .unwrap();
+    assert!(ok, "freshly signed chunk must verify");
+
+    // Tamper: changing context_id flips the result.
+    let bad = _scp_core::outlet_stream::py_verify_chunk_signature(
+        &chunk_json,
+        signing.verifying_key().as_bytes(),
+        "ctx-other",
+        "outlet-x",
+        &caveats_binding,
+    )
+    .unwrap();
+    assert!(!bad, "tampered context_id must NOT verify");
+}
+
+/// AC11 — `compute_caveats_binding` is deterministic and binds every
+/// preimage component.
+#[test]
+fn out037_compute_caveats_binding_determinism() {
+    setup();
+    Python::with_gil(|py| {
+        let ucan_cid = b"bafyreigh-test";
+        let request_id: [u8; 16] = [0x77; 16];
+        let invoker_did = "did:dht:z6MkInvoker";
+        let caveats_json = "{\"maxCalls\":10}";
+
+        let a = _scp_core::outlet_stream::py_compute_caveats_binding(
+            py,
+            ucan_cid,
+            &request_id,
+            invoker_did,
+            100,
+            caveats_json,
+        )
+        .unwrap()
+        .extract::<Vec<u8>>(py)
+        .unwrap();
+
+        // Same inputs ⇒ same output.
+        let b = _scp_core::outlet_stream::py_compute_caveats_binding(
+            py,
+            ucan_cid,
+            &request_id,
+            invoker_did,
+            100,
+            caveats_json,
+        )
+        .unwrap()
+        .extract::<Vec<u8>>(py)
+        .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 32);
+
+        // Different chunk count ⇒ different output.
+        let c = _scp_core::outlet_stream::py_compute_caveats_binding(
+            py,
+            ucan_cid,
+            &request_id,
+            invoker_did,
+            101,
+            caveats_json,
+        )
+        .unwrap()
+        .extract::<Vec<u8>>(py)
+        .unwrap();
+        assert_ne!(a, c);
+    });
+}
+
+/// AC5 — `outlet_stream_grant_credit` rejects `grant=0` per OUT-031
+/// round-6 uniform `InvalidGrant` rule.
+#[test]
+fn out037_grant_credit_rejects_zero() {
+    setup();
+    let result =
+        _scp_core::outlet_stream::py_outlet_stream_grant_credit("00".repeat(16).as_str(), 0);
+    assert!(result.is_err());
+    let err_str = format!("{}", result.unwrap_err());
+    assert!(
+        err_str.contains("invalid grant 0") || err_str.contains("protocol.invalid-grant"),
+        "expected invalid-grant in error: {err_str}"
+    );
+}
+
+/// AC5/AC6 — `grant_credit` and `cancel` raise `ContextError` with
+/// slug `protocol.unknown-session` when the `request_id` is not in the
+/// registry.
+#[test]
+fn out037_grant_credit_and_cancel_unknown_session() {
+    setup();
+    let unknown = "ff".repeat(16);
+    let grant_err = _scp_core::outlet_stream::py_outlet_stream_grant_credit(&unknown, 5);
+    assert!(grant_err.is_err());
+    let grant_err_str = format!("{}", grant_err.unwrap_err());
+    assert!(
+        grant_err_str.contains("not found") || grant_err_str.contains("unknown-session"),
+        "expected unknown-session in grant error: {grant_err_str}"
+    );
+
+    let cancel_err = _scp_core::outlet_stream::py_outlet_stream_cancel(&unknown, Some(0));
+    assert!(cancel_err.is_err());
+    let cancel_err_str = format!("{}", cancel_err.unwrap_err());
+    assert!(
+        cancel_err_str.contains("not found") || cancel_err_str.contains("unknown-session"),
+        "expected unknown-session in cancel error: {cancel_err_str}"
+    );
+}

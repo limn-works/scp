@@ -33,6 +33,8 @@ async-trait = { workspace = true }
 pyo3 = { version = "0.24.1", features = ["experimental-async"] }
 tokio = { workspace = true }
 scp-core = { path = "../scp-core" }
+scp-protocol = { path = "../scp-protocol" }
+scp-runtime = { path = "../scp-runtime" }
 scp-identity = { path = "../scp-identity" }
 scp-primitives = { path = "../scp-primitives" }
 scp-event-log = { path = "../scp-event-log" }
