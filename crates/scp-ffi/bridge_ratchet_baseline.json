@@ -64,6 +64,43 @@
         "kind": "function",
         "signature": "outletStoreMessageKey(context: WasmContextHandle, outletId, registrationEventIdHex, outletMessageKeyHex) -> void",
         "comment": "WASM-only helper — scp-runtime's GovernanceState::pinned_outlet_message_keys map is mirrored locally because WASM cannot depend on scp-runtime (tokio). Callers (typically the SDK receiver layer) pin the key here at outlet-registration acceptance time so outlet_error_new can compute the §5.4.4 HMAC at the FFI boundary."
+      },
+      {
+        "name": "outletInvokeStream",
+        "story": "SCP-OUT-037",
+        "kind": "function",
+        "signature": "outletInvokeStream(context: WasmContextHandle, outletId, inputJson, identityDid, ucanToken, caveatsBindingHex, streamEpoch, proofTokens?, creditWindow?, estimatedChunkCount?) -> Promise<OutletInvocationStream>"
+      },
+      {
+        "name": "outletStreamGrantCredit",
+        "story": "SCP-OUT-037",
+        "kind": "function",
+        "signature": "outletStreamGrantCredit(requestIdHex, grant) -> Promise<number>"
+      },
+      {
+        "name": "outletStreamCancel",
+        "story": "SCP-OUT-037",
+        "kind": "function",
+        "signature": "outletStreamCancel(requestIdHex, nextSeq?) -> Promise<number | null>"
+      },
+      {
+        "name": "verifyChunkSignature",
+        "story": "SCP-OUT-037",
+        "kind": "function",
+        "signature": "verifyChunkSignature(chunkJson, operatorPk: Uint8Array, contextId, outletId, caveatsBinding: Uint8Array) -> Promise<boolean>"
+      },
+      {
+        "name": "computeCaveatsBinding",
+        "story": "SCP-OUT-037",
+        "kind": "function",
+        "signature": "computeCaveatsBinding(ucanCid: Uint8Array, requestId: Uint8Array, invokerDid, estimatedChunkCount, effectiveCaveatsJson) -> Promise<Uint8Array>"
+      },
+      {
+        "name": "OutletInvocationStream",
+        "story": "SCP-OUT-037",
+        "kind": "class",
+        "signature": "class OutletInvocationStream { readonly requestId: string; readonly done: boolean; next(): Promise<OutletStreamChunk | null> }",
+        "comment": "JS class returned by outletInvokeStream — the WASM bridge surfaces an async-iterator-shaped pull API; the TypeScript SDK wraps it with Symbol.asyncIterator (wasm-bindgen does not expose Symbol-keyed methods directly)."
       }
     ]
   }

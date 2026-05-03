@@ -39,6 +39,7 @@ import type {
   BridgeContextHandle,
   BridgeIdentityHandle,
   BridgeOutletInvocationStream,
+  BridgeOutletStreamChunk,
   BridgeTransportHandle,
   MessageCallback,
 } from "./bridge";
@@ -47,6 +48,26 @@ import { safeJsonParse } from "./json-utils";
 // ---------------------------------------------------------------------------
 // WASM module types
 // ---------------------------------------------------------------------------
+
+/**
+ * Shape of the JS class returned by `outletInvokeStream` (SCP-OUT-037
+ * WASM portion). Mirrors the `#[wasm_bindgen(js_name = "OutletInvocationStream")]`
+ * class declared in `crates/scp-ffi/wasm/src/outlet_stream.rs`.
+ *
+ * The class exposes:
+ * - `requestId` — 32-char lowercase hex of the §5.4.5 16-byte
+ *   `request_id`.
+ * - `done` — synchronous getter that flips `true` once a terminal
+ *   chunk has been observed or the queue is drained.
+ * - `next()` — async method returning a `Promise` that resolves to
+ *   the next chunk JS object (matching `BridgeOutletStreamChunk`'s
+ *   shape) or `null` at end-of-stream.
+ */
+interface WasmOutletInvocationStream {
+  readonly requestId: string;
+  readonly done: boolean;
+  next(): Promise<unknown | null>;
+}
 
 /** The shape of the wasm-bindgen generated module. */
 interface WasmModule {
@@ -136,6 +157,37 @@ interface WasmModule {
     priorAppendTimeSecs: number,
     newAppendTimeSecs: number,
   ) => Promise<string>;
+  // SCP-OUT-037 (WASM portion) — §5.4.5 progressive-output streaming
+  // surface. The wasm-bindgen exports use the JS-friendly camelCase
+  // names declared in `crates/scp-ffi/wasm/src/outlet_stream.rs`.
+  outletInvokeStream: (
+    context: BridgeContextHandle,
+    outletId: string,
+    inputJson: string,
+    identityDid: string,
+    ucanToken: string,
+    caveatsBindingHex: string,
+    streamEpoch: number,
+    proofTokens: readonly string[] | undefined,
+    creditWindow: number | undefined,
+    estimatedChunkCount: number | undefined,
+  ) => Promise<WasmOutletInvocationStream>;
+  outletStreamGrantCredit: (requestIdHex: string, grant: number) => Promise<number>;
+  outletStreamCancel: (requestIdHex: string, nextSeq: number | undefined) => Promise<number | null>;
+  verifyChunkSignature: (
+    chunkJson: string,
+    operatorPk: Uint8Array,
+    contextId: string,
+    outletId: string,
+    caveatsBinding: Uint8Array,
+  ) => Promise<boolean>;
+  computeCaveatsBinding: (
+    ucanCid: Uint8Array,
+    requestId: Uint8Array,
+    invokerDid: string,
+    estimatedChunkCount: number,
+    effectiveCaveatsJson: string,
+  ) => Promise<Uint8Array>;
   transport_connect: (relayUrl: string) => Promise<{
     connected: boolean;
     relayUrl: string | null;
@@ -639,10 +691,9 @@ function getWasm(): WasmModule {
 
 /** Converts a Uint8Array to a base64 string for WASM boundary crossing. */
 function uint8ToBase64(bytes: Uint8Array): string {
-  // Use Buffer in Node.js/Bun, or manual conversion in browser.
-  if (typeof Buffer !== "undefined") {
-    return Buffer.from(bytes).toString("base64");
-  }
+  // `globalThis.btoa` is available in both browser and Node 18+/Bun, so the
+  // WASM bridge uses it uniformly — `Buffer` is Node-only and would break
+  // browser builds where this module ships.
   let binary = "";
   for (const byte of bytes) {
     binary += String.fromCharCode(byte);
@@ -652,9 +703,6 @@ function uint8ToBase64(bytes: Uint8Array): string {
 
 /** Converts a base64 string back to a Uint8Array. */
 function base64ToUint8(base64: string): Uint8Array {
-  if (typeof Buffer !== "undefined") {
-    return new Uint8Array(Buffer.from(base64, "base64"));
-  }
   const binary = globalThis.atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
@@ -1425,62 +1473,94 @@ export function createWasmBridge(): Bridge {
       );
     },
 
-    // SCP-OUT-037 — §5.4.5 streaming surface (NAPI-only until WASM portion lands)
+    // SCP-OUT-037 — §5.4.5 progressive-output streaming surface.
+    // Forwards directly to the wasm-bindgen exports declared in
+    // `crates/scp-ffi/wasm/src/outlet_stream.rs`. The WASM bridge
+    // pre-materialises chunks at open time per ADR-034 (no async
+    // executor on the wasm32 target), so `next()` is a synchronous
+    // dequeue under a Promise wrapper.
     async contextOutletInvokeStream(
-      _handle: BridgeContextHandle,
-      _outletId: string,
-      _inputJson: string,
-      _identityDid: string,
-      _ucanToken: string,
-      _caveatsBindingHex: string,
-      _streamEpoch: number,
-      _proofTokens?: readonly string[],
-      _creditWindow?: number,
-      _estimatedChunkCount?: number,
+      handle: BridgeContextHandle,
+      outletId: string,
+      inputJson: string,
+      identityDid: string,
+      ucanToken: string,
+      caveatsBindingHex: string,
+      streamEpoch: number,
+      proofTokens?: readonly string[],
+      creditWindow?: number,
+      estimatedChunkCount?: number,
     ): Promise<BridgeOutletInvocationStream> {
-      throw new OutletError(
-        "streaming outlet invocation is not yet implemented in the WASM bridge",
-        "SCP-TOOL-6020",
+      const wasm = getWasm();
+      const native = await wasm.outletInvokeStream(
+        handle,
+        outletId,
+        inputJson,
+        identityDid,
+        ucanToken,
+        caveatsBindingHex,
+        streamEpoch,
+        proofTokens,
+        creditWindow,
+        estimatedChunkCount,
       );
+      // Wrap the wasm-bindgen class in the Bridge-shaped iterator. The
+      // wasm-bindgen class already returns chunks in the
+      // `BridgeOutletStreamChunk` shape (built in `chunk_to_js` on the
+      // Rust side), so the wrapper is a thin pass-through.
+      return {
+        requestId: native.requestId,
+        async next(): Promise<BridgeOutletStreamChunk | null> {
+          const raw = await native.next();
+          if (raw === null || raw === undefined) {
+            return null;
+          }
+          return raw as BridgeOutletStreamChunk;
+        },
+      };
     },
 
-    async outletStreamGrantCredit(_requestIdHex: string, _grant: number): Promise<number> {
-      throw new OutletError(
-        "streaming outlet invocation is not yet implemented in the WASM bridge",
-        "SCP-TOOL-6020",
-      );
+    async outletStreamGrantCredit(requestIdHex: string, grant: number): Promise<number> {
+      const wasm = getWasm();
+      return await wasm.outletStreamGrantCredit(requestIdHex, grant);
     },
 
-    async outletStreamCancel(_requestIdHex: string, _nextSeq?: number): Promise<number | null> {
-      throw new OutletError(
-        "streaming outlet invocation is not yet implemented in the WASM bridge",
-        "SCP-TOOL-6020",
-      );
+    async outletStreamCancel(requestIdHex: string, nextSeq?: number): Promise<number | null> {
+      const wasm = getWasm();
+      return await wasm.outletStreamCancel(requestIdHex, nextSeq);
     },
 
     async verifyChunkSignature(
-      _chunkJson: string,
-      _operatorPk: Uint8Array,
-      _contextId: string,
-      _outletId: string,
-      _caveatsBinding: Uint8Array,
+      chunkJson: string,
+      operatorPk: Uint8Array,
+      contextId: string,
+      outletId: string,
+      caveatsBinding: Uint8Array,
     ): Promise<boolean> {
-      throw new OutletError(
-        "streaming outlet invocation is not yet implemented in the WASM bridge",
-        "SCP-TOOL-6020",
+      const wasm = getWasm();
+      return await wasm.verifyChunkSignature(
+        chunkJson,
+        operatorPk,
+        contextId,
+        outletId,
+        caveatsBinding,
       );
     },
 
     async computeCaveatsBinding(
-      _ucanCid: Uint8Array,
-      _requestId: Uint8Array,
-      _invokerDid: string,
-      _estimatedChunkCount: number,
-      _effectiveCaveatsJson: string,
+      ucanCid: Uint8Array,
+      requestId: Uint8Array,
+      invokerDid: string,
+      estimatedChunkCount: number,
+      effectiveCaveatsJson: string,
     ): Promise<Uint8Array> {
-      throw new OutletError(
-        "streaming outlet invocation is not yet implemented in the WASM bridge",
-        "SCP-TOOL-6020",
+      const wasm = getWasm();
+      return await wasm.computeCaveatsBinding(
+        ucanCid,
+        requestId,
+        invokerDid,
+        estimatedChunkCount,
+        effectiveCaveatsJson,
       );
     },
 

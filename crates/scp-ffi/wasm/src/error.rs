@@ -149,6 +149,42 @@ impl ScpWasmError {
         };
         JsValue::from_str(&err.to_string())
     }
+
+    /// Returns the stable error code (e.g. `SCP-CTX-2000`) for this
+    /// error variant. Used by the streaming bridge to embed the
+    /// originating code in a terminal `Error` chunk so SDK consumers
+    /// see the same error code string they would have seen from a
+    /// thrown `Promise` rejection.
+    #[must_use]
+    pub fn error_code(&self) -> &str {
+        match self {
+            Self::Identity { code, .. }
+            | Self::Context { code, .. }
+            | Self::Permission { code, .. }
+            | Self::Crypto { code, .. }
+            | Self::Transport { code, .. }
+            | Self::Tool { code, .. }
+            | Self::Validation { code, .. }
+            | Self::Trust { code, .. } => code,
+        }
+    }
+
+    /// Returns the human-readable message body for this error
+    /// variant. Used alongside [`Self::error_code`] when synthesising
+    /// terminal `Error` chunks on the streaming bridge.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Identity { message, .. }
+            | Self::Context { message, .. }
+            | Self::Permission { message, .. }
+            | Self::Crypto { message, .. }
+            | Self::Transport { message, .. }
+            | Self::Tool { message, .. }
+            | Self::Validation { message, .. }
+            | Self::Trust { message, .. } => message,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

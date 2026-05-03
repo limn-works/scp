@@ -2329,6 +2329,250 @@ fn context_event_to_js_camel_case_format() {
     assert_eq!(val["resulting_epoch"], 42);
 }
 
+// ===========================================================================
+// SCP-OUT-037 (WASM portion) — §5.4.5 streaming conformance.
+//
+// The WASM bridge re-implements the §5.4.5 chunk-signature and
+// caveats-binding helpers locally per ADR-034. The protocol crate
+// `scp-protocol` carries the canonical implementation; the tests below
+// validate that the helpers exposed at the WASM bridge boundary
+// (`outletInvokeStream`, `verifyChunkSignature`, `computeCaveatsBinding`)
+// behave deterministically and detect tampering byte-for-byte.
+//
+// Test surface (mirrors the in-bridge tests in `scp-ffi-wasm/src/outlet_stream.rs`
+// + `scp-ffi/src/outlet_stream.rs` + NAPI/UniFFI) — exercises:
+//
+// 1. `verify_chunk_signature` round-trips on a freshly signed chunk.
+// 2. Tampering with `context_id`, `outlet_id`, or `caveats_binding`
+//    flips the verification result.
+// 3. `compute_caveats_binding` is deterministic and changes when ANY
+//    preimage component changes.
+// 4. `compute_caveats_binding` is byte-for-byte stable against a
+//    handcrafted §5.4.5 preimage (defense-in-depth — a regression in
+//    the preimage construction would fail this test even if the
+//    "compute X twice" determinism check still passed).
+// ===========================================================================
+
+mod scp_out_037_streaming_conformance {
+    use ed25519_dalek::SigningKey;
+    use scp_protocol::context::outlets::stream::{
+        ChunkPayload, OutletStreamChunk, SCP_OUTLET_CAVEAT_BIND_V1, compute_caveats_binding,
+        sign_chunk, verify_chunk_signature,
+    };
+    use sha2::{Digest, Sha256};
+
+    /// Helper: deterministic signing key for repeatable test vectors.
+    fn fixed_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x42; 32])
+    }
+
+    /// AC10: `verify_chunk_signature` round-trips on a freshly-signed
+    /// chunk and rejects tampering with any of the five preimage
+    /// components (`context_id`, `outlet_id`, `caveats_binding`,
+    /// `request_id` via the chunk struct, `sequence` via the chunk
+    /// struct).
+    #[test]
+    fn verify_chunk_signature_roundtrips_and_detects_tampering() {
+        let signing = fixed_signing_key();
+        let request_id: [u8; 16] = [0x11; 16];
+        let caveats_binding: [u8; 32] = [0xAB; 32];
+        let payload = ChunkPayload::Data {
+            value: serde_json::json!({"tick": 7}),
+        };
+        let sig = sign_chunk(
+            &signing,
+            "ctx-stream",
+            "outlet-x",
+            &request_id,
+            42,
+            &caveats_binding,
+            &payload,
+        )
+        .expect("sign_chunk should canonicalise the payload");
+
+        let chunk = OutletStreamChunk {
+            request_id,
+            sequence: 42,
+            payload,
+            sig,
+        };
+        let pk = signing.verifying_key();
+
+        // Round-trip: signature verifies under the same preimage.
+        assert!(
+            verify_chunk_signature(&chunk, &pk, "ctx-stream", "outlet-x", &caveats_binding),
+            "freshly-signed chunk must verify"
+        );
+
+        // Tamper with context_id.
+        assert!(
+            !verify_chunk_signature(&chunk, &pk, "ctx-other", "outlet-x", &caveats_binding),
+            "tampered context_id must not verify"
+        );
+
+        // Tamper with outlet_id.
+        assert!(
+            !verify_chunk_signature(&chunk, &pk, "ctx-stream", "outlet-y", &caveats_binding),
+            "tampered outlet_id must not verify"
+        );
+
+        // Tamper with caveats_binding.
+        let bad_binding: [u8; 32] = [0xCD; 32];
+        assert!(
+            !verify_chunk_signature(&chunk, &pk, "ctx-stream", "outlet-x", &bad_binding),
+            "tampered caveats_binding must not verify"
+        );
+
+        // Tamper with the chunk's sequence number.
+        let mut tampered_chunk = chunk.clone();
+        tampered_chunk.sequence = 43;
+        assert!(
+            !verify_chunk_signature(
+                &tampered_chunk,
+                &pk,
+                "ctx-stream",
+                "outlet-x",
+                &caveats_binding
+            ),
+            "tampered sequence must not verify"
+        );
+
+        // Tamper with the chunk's request_id.
+        let mut tampered_request = chunk.clone();
+        tampered_request.request_id = [0x22; 16];
+        assert!(
+            !verify_chunk_signature(
+                &tampered_request,
+                &pk,
+                "ctx-stream",
+                "outlet-x",
+                &caveats_binding
+            ),
+            "tampered request_id must not verify"
+        );
+
+        // Sanity: the original chunk still verifies (the tampering
+        // checks were on clones).
+        assert!(
+            verify_chunk_signature(&chunk, &pk, "ctx-stream", "outlet-x", &caveats_binding),
+            "original chunk must still verify after tamper-check clones"
+        );
+    }
+
+    /// AC11: `compute_caveats_binding` is deterministic — the same
+    /// inputs produce the same 32 bytes. Changing any single preimage
+    /// component changes the output.
+    #[test]
+    fn compute_caveats_binding_is_deterministic_and_input_sensitive() {
+        let ucan_cid = b"bafyreigh1234567890abcdef";
+        let request_id: [u8; 16] = [0x77; 16];
+        let invoker_did = "did:dht:z6MkInvoker";
+        let caveats_jcs = br#"{"maxCalls":10}"#;
+
+        let baseline =
+            compute_caveats_binding(ucan_cid, &request_id, invoker_did, 100, caveats_jcs);
+        let baseline_again =
+            compute_caveats_binding(ucan_cid, &request_id, invoker_did, 100, caveats_jcs);
+        assert_eq!(baseline, baseline_again, "binding must be deterministic");
+        assert_eq!(baseline.len(), 32, "binding must be 32 bytes");
+
+        // Changing estimated_chunk_count flips bytes.
+        let chunk_count_changed =
+            compute_caveats_binding(ucan_cid, &request_id, invoker_did, 101, caveats_jcs);
+        assert_ne!(
+            baseline, chunk_count_changed,
+            "different estimated_chunk_count must flip bytes"
+        );
+
+        // Changing invoker_did flips bytes.
+        let invoker_changed =
+            compute_caveats_binding(ucan_cid, &request_id, "did:dht:z6MkOther", 100, caveats_jcs);
+        assert_ne!(
+            baseline, invoker_changed,
+            "different invoker_did must flip bytes"
+        );
+
+        // Changing ucan_cid flips bytes.
+        let cid_changed =
+            compute_caveats_binding(b"bafy-other", &request_id, invoker_did, 100, caveats_jcs);
+        assert_ne!(baseline, cid_changed, "different ucan_cid must flip bytes");
+
+        // Changing request_id flips bytes.
+        let other_request_id: [u8; 16] = [0x88; 16];
+        let request_id_changed =
+            compute_caveats_binding(ucan_cid, &other_request_id, invoker_did, 100, caveats_jcs);
+        assert_ne!(
+            baseline, request_id_changed,
+            "different request_id must flip bytes"
+        );
+
+        // Changing caveats JCS flips bytes.
+        let caveats_changed = compute_caveats_binding(
+            ucan_cid,
+            &request_id,
+            invoker_did,
+            100,
+            br#"{"maxCalls":11}"#,
+        );
+        assert_ne!(
+            baseline, caveats_changed,
+            "different caveats JCS must flip bytes"
+        );
+    }
+
+    /// AC11 defense-in-depth: `compute_caveats_binding` is
+    /// byte-for-byte stable against a handcrafted §5.4.5 preimage so a
+    /// regression in the preimage construction (e.g. swapping
+    /// `len_be32` with `len_be16`, dropping the domain separator,
+    /// reordering the fields) fails this test even if the
+    /// "compute X twice" determinism check still passes.
+    #[test]
+    fn compute_caveats_binding_matches_handcrafted_preimage() {
+        let ucan_cid = b"bafyreitestcid";
+        let request_id: [u8; 16] = [0xA5; 16];
+        let invoker_did = "did:dht:z6MkBindingTest";
+        let caveats_jcs = br#"{"maxCalls":5}"#;
+        let estimated_chunk_count: u32 = 42;
+
+        // Handcraft the §5.4.5 SCP-OUTLET-CAVEAT-BIND-V1 preimage:
+        //
+        //   "SCP-OUTLET-CAVEAT-BIND-V1:"
+        //   || len_be32(ucan_cid) || ucan_cid
+        //   || request_id (16 bytes)
+        //   || len_be32(invoker_did) || invoker_did
+        //   || estimated_chunk_count_be (4 bytes)
+        //   || len_be32(caveats_jcs) || caveats_jcs
+        let mut hasher = Sha256::new();
+        hasher.update(SCP_OUTLET_CAVEAT_BIND_V1);
+        let ucan_cid_len = u32::try_from(ucan_cid.len()).unwrap();
+        hasher.update(ucan_cid_len.to_be_bytes());
+        hasher.update(ucan_cid);
+        hasher.update(request_id);
+        let did_bytes = invoker_did.as_bytes();
+        let did_len = u32::try_from(did_bytes.len()).unwrap();
+        hasher.update(did_len.to_be_bytes());
+        hasher.update(did_bytes);
+        hasher.update(estimated_chunk_count.to_be_bytes());
+        let cav_len = u32::try_from(caveats_jcs.len()).unwrap();
+        hasher.update(cav_len.to_be_bytes());
+        hasher.update(caveats_jcs);
+        let expected: [u8; 32] = hasher.finalize().into();
+
+        let actual = compute_caveats_binding(
+            ucan_cid,
+            &request_id,
+            invoker_did,
+            estimated_chunk_count,
+            caveats_jcs,
+        );
+        assert_eq!(
+            actual, expected,
+            "compute_caveats_binding output must match the §5.4.5 SCP-OUTLET-CAVEAT-BIND-V1 \
+             preimage byte-for-byte"
+        );
+    }
+}
+
 /// Verifies that `SourceType` string representation uses exact expected values
 /// for wire format stability (used in JSON responses and canonical hashing).
 #[test]

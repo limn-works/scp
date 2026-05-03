@@ -99,6 +99,12 @@ pub mod event_log;
 pub mod identity;
 /// Centralized context state manager (`WasmContextManager`).
 pub mod manager;
+/// §5.4.5 progressive-output streaming bridge for outlets.
+///
+/// SCP-OUT-037 (WASM portion). Exposes `outletInvokeStream`,
+/// `outletStreamGrantCredit`, `outletStreamCancel`,
+/// `verifyChunkSignature`, and `computeCaveatsBinding` to JS.
+pub mod outlet_stream;
 /// Tool registration, invocation, and verification.
 pub mod outlets;
 /// Provenance metadata operations.
