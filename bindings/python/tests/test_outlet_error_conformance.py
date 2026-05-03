@@ -103,10 +103,13 @@ def test_outlet_error_is_subclass_of_abc() -> None:
 
 
 def test_credit_factory_accepts_positive_in_range() -> None:
+    # OUT-038 promoted `Credit` from a NewType alias to a real class
+    # so `Credit(0)` raises InvalidGrant at construction time. Accessing
+    # the underlying int now goes through the `.raw` property.
     c = make_credit(1)
-    assert c == 1
+    assert c.raw == 1
     c2 = make_credit(2**32 - 1)
-    assert c2 == 2**32 - 1
+    assert c2.raw == 2**32 - 1
 
 
 def test_credit_factory_rejects_zero_with_invalid_grant() -> None:

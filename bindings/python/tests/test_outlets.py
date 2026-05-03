@@ -443,6 +443,10 @@ class TestInvocationHandle:
         assert agg.value == {"result": 42}
 
     async def test_async_iter_yields_chunks(self) -> None:
+        # OUT-038 AC14: iterator yields the End chunk (so 1 Data + End =
+        # 2 chunks; 10 Data + End = 11). The non-streaming bridge
+        # synthesizes a single End chunk via the SDK pump, so the
+        # iterator yields exactly one chunk here.
         mock_bridge = MagicMock()
         mock_bridge.context_outlet_invoke.return_value = {"result": 42}
         with patch("scp_sdk.outlets._scp_core", mock_bridge):
@@ -450,7 +454,9 @@ class TestInvocationHandle:
             chunks: list[OutletStreamChunk] = []
             async for chunk in handle:
                 chunks.append(chunk)
-        assert all(c.payload_type != "end" for c in chunks)
+        assert len(chunks) == 1
+        assert chunks[0].payload_type == "end"
+        assert chunks[0].aggregate == {"result": 42}
 
     async def test_double_consumption_rejected(self) -> None:
         mock_bridge = MagicMock()
