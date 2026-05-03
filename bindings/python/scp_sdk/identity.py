@@ -107,7 +107,7 @@ class Identity:
     when the SCP-level method needs the opaque bridge handle.
 
     The ``rotation_event_json`` attribute is populated only on handles
-    produced by :meth:`scp_sdk.SCP.identity_migrate` (spec §3.7,
+    produced by :meth:`scp_sdk.SCP.identity_migrate` (spec §9.12,
     ADR-003 §4b/4c). It carries the JSON-serialized
     ``DidRotationEvent`` that the SDK MUST distribute to active
     context members per spec §3.2.1 step 4b. ``None`` for handles

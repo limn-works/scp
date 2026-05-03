@@ -446,13 +446,15 @@ impl NapiIdentity {
                         Arc::clone(&e.pre_rotation_custody),
                     ))
                 })
-                .unwrap_or_else(|_| {
-                    (
-                        Vec::new(),
-                        scp_platform::PreRotationKeyHandle::new(0),
-                        Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new()),
-                    )
-                });
+                .map_err(|e| {
+                    // Fail-fast rather than fabricate a synthetic
+                    // `(handle = 0, fresh empty custody)` pair: a fresh
+                    // empty custody would silently overwrite the
+                    // registered pre-rotation state, leaving the
+                    // identity un-migratable. Surface the real error
+                    // so the caller can recover.
+                    NapiError::from(e)
+                })?;
 
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
@@ -538,13 +540,15 @@ impl NapiIdentity {
                         Arc::clone(&e.pre_rotation_custody),
                     ))
                 })
-                .unwrap_or_else(|_| {
-                    (
-                        Vec::new(),
-                        scp_platform::PreRotationKeyHandle::new(0),
-                        Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new()),
-                    )
-                });
+                .map_err(|e| {
+                    // Fail-fast rather than fabricate a synthetic
+                    // `(handle = 0, fresh empty custody)` pair: a fresh
+                    // empty custody would silently overwrite the
+                    // registered pre-rotation state, leaving the
+                    // identity un-migratable. Surface the real error
+                    // so the caller can recover.
+                    NapiError::from(e)
+                })?;
 
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
@@ -632,13 +636,15 @@ impl NapiIdentity {
                         Arc::clone(&e.pre_rotation_custody),
                     ))
                 })
-                .unwrap_or_else(|_| {
-                    (
-                        Vec::new(),
-                        scp_platform::PreRotationKeyHandle::new(0),
-                        Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new()),
-                    )
-                });
+                .map_err(|e| {
+                    // Fail-fast rather than fabricate a synthetic
+                    // `(handle = 0, fresh empty custody)` pair: a fresh
+                    // empty custody would silently overwrite the
+                    // registered pre-rotation state, leaving the
+                    // identity un-migratable. Surface the real error
+                    // so the caller can recover.
+                    NapiError::from(e)
+                })?;
 
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht
@@ -725,13 +731,15 @@ impl NapiIdentity {
                         Arc::clone(&e.pre_rotation_custody),
                     ))
                 })
-                .unwrap_or_else(|_| {
-                    (
-                        Vec::new(),
-                        scp_platform::PreRotationKeyHandle::new(0),
-                        Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new()),
-                    )
-                });
+                .map_err(|e| {
+                    // Fail-fast rather than fabricate a synthetic
+                    // `(handle = 0, fresh empty custody)` pair: a fresh
+                    // empty custody would silently overwrite the
+                    // registered pre-rotation state, leaving the
+                    // identity un-migratable. Surface the real error
+                    // so the caller can recover.
+                    NapiError::from(e)
+                })?;
 
             let dht = make_dht_with_signer(&custody);
             let (new_identity, new_document) = dht

@@ -436,22 +436,35 @@ impl KeyCustody for CallbackKeyCustody {
     async fn generate_ephemeral_ed25519_seed(
         &self,
     ) -> Result<zeroize::Zeroizing<[u8; 32]>, PlatformError> {
-        // The pre-rotation seed is generated locally via OsRng and
-        // returned to the caller — it MUST NOT enter the operational
-        // callback custody (spec §9.7.4.1 §3 storage isolation: the
-        // pre-rotation key cannot be accessible through the same
-        // custody provider as `#0`/`#active`). The bridge then hands
-        // the seed to a `PreRotationCustody` instance that lives on a
-        // separate substrate. The SDK consumer's `KeyCustodyProvider`
-        // is never called.
+        // Generates the pre-rotation seed locally via OsRng. The bytes
+        // never traverse the SDK consumer's `KeyCustodyProvider`
+        // callback — the bridge hands them directly to a
+        // `PreRotationCustody` instance.
         //
-        // For HSM-bound callback custody where `OsRng` is not the
-        // appropriate CSPRNG source, the SDK MUST instead generate
-        // pre-rotation key bytes via the platform CSPRNG
-        // (`SecRandomCopyBytes` on Apple, `KeyStore.getRandom` on
-        // Android) and route them directly into `PreRotationCustody`
-        // without going through `KeyCustody` at all. That path is the
-        // production custody workstream tracked by issue #1729.
+        // # Storage isolation status (spec §9.7.4.1 §3)
+        //
+        // **Type-level isolation is satisfied** (the bytes never enter
+        // the operational `KeyCustody` provider). **Substrate isolation
+        // is NOT yet satisfied**: the bridge process and the
+        // currently-shipped `InMemoryPreRotationCustody` co-reside in
+        // the same Rust process memory as the operational
+        // `KeyHandle` ID space. A process-memory dump compromises
+        // both.
+        //
+        // Full §9.7.4.1 §3 substrate isolation requires a non-in-memory
+        // `PreRotationCustody` backend (FIDO2, passkey-PRF, Apple
+        // Keychain entry under a separate access-control class,
+        // Android Keystore alias with separate authentication flow,
+        // encrypted offline backup, Shamir, BIP39). Production
+        // backends are a separate workstream — see the
+        // `PreRotationCustodyKind::InMemory` doc-comment.
+        //
+        // For HSM-bound platforms where `OsRng` is not the appropriate
+        // CSPRNG source, the SDK MUST instead generate pre-rotation
+        // key bytes via the platform CSPRNG (`SecRandomCopyBytes` on
+        // Apple, `KeyStore.getRandom` on Android) and route them
+        // directly into a `PreRotationCustody` impl, bypassing
+        // `KeyCustody` entirely.
         use rand::RngCore;
         let mut seed = zeroize::Zeroizing::new([0u8; 32]);
         rand::rngs::OsRng.fill_bytes(seed.as_mut());
@@ -465,23 +478,24 @@ impl KeyCustody for CallbackKeyCustody {
         // Migrating an identity via callback custody requires the SDK
         // consumer to install the pre-rotation private bytes (revealed
         // at migration time) as the NEW operational `#0` key. The
-        // current `KeyCustodyProvider` callback interface does not
-        // include an `import_ed25519_seed_bytes(seed) -> handle`
-        // method, so callback custody cannot complete migrate today.
+        // `KeyCustodyProvider` callback interface today has no method
+        // for "import a known seed and return a handle" — only
+        // `generate_keypair`, which mints a fresh random key.
         //
-        // Identity CREATION via callback custody still works
-        // (`generate_ephemeral_ed25519_seed` above generates the
-        // pre-rotation seed locally and routes it through
-        // `PreRotationCustody`, never touching the operational
-        // callback). Migration is the constrained path.
+        // Identity CREATION via callback custody works
+        // (`generate_ephemeral_ed25519_seed` above generates locally
+        // and routes through `PreRotationCustody`, never touching the
+        // SDK callback). MIGRATION is the constrained path.
         //
-        // Tracked by #1729 alongside the production custody backends:
-        // adding `import_ed25519_seed_bytes` to `KeyCustodyProvider`
-        // is the simplest unblock for callback-custody migration.
+        // The unblock is to extend `KeyCustodyProvider` with an
+        // `import_ed25519_seed_bytes(seed) -> handle` method that
+        // SDK consumers (Swift / Kotlin) implement. Until then, this
+        // method MUST surface a clear error rather than silently
+        // failing later in the migration flow.
         Err(PlatformError::Unsupported(
-            "callback custody migration requires KeyCustodyProvider::import_ed25519_seed_bytes \
-             — see issue #1729 (production custody workstream). Identity creation via callback \
-             custody is unaffected.",
+            "callback custody cannot import pre-rotation seed bytes; \
+             KeyCustodyProvider has no import_ed25519_seed_bytes method. \
+             Identity creation via callback custody is unaffected.",
         ))
     }
 }

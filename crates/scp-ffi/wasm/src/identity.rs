@@ -1057,32 +1057,54 @@ impl WasmIdentity {
         // migration) all gate the registry on `WASM_IDENTITY_REGISTRY_CAP`;
         // doing the same here ensures `from_did` cannot be used as an
         // unbounded-DoS amplifier against legitimate identity creation.
-        let at_cap = IDENTITY_REGISTRY.with(|reg| -> Result<(), ScpWasmError> {
-            let mut map = reg.borrow_mut();
-            if !map.contains_key(&did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
-                return Err(ScpWasmError::Validation {
-                    message: format!(
-                        "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
-                         — cannot register additional resolved DIDs"
-                    ),
-                    code: codes::VALID_7400.to_owned(),
-                });
-            }
-            map.entry(did.clone())
-                .or_insert_with(|| IdentityRecord::Resolved {
-                    public_key_bytes,
-                    custody_type: "js_custody".to_owned(),
-                });
-            Ok(())
-        });
-        if let Err(err) = at_cap {
-            return Err(err.into_js());
-        }
+        //
+        // If the DID is already registered as `Local`, preserve its
+        // agent-key state in the returned handle so JS callers see
+        // the actual record's shape, not a fresh-Resolved placeholder.
+        let registry_view: Result<(bool, Option<String>), ScpWasmError> =
+            IDENTITY_REGISTRY.with(|reg| {
+                let mut map = reg.borrow_mut();
+                if !map.contains_key(&did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
+                    return Err(ScpWasmError::Validation {
+                        message: format!(
+                            "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
+                             — cannot register additional resolved DIDs"
+                        ),
+                        code: codes::VALID_7400.to_owned(),
+                    });
+                }
+                let entry = map
+                    .entry(did.clone())
+                    .or_insert_with(|| IdentityRecord::Resolved {
+                        public_key_bytes,
+                        custody_type: "js_custody".to_owned(),
+                    });
+                // Mirror the existing record's agent-key state so the
+                // returned `WasmIdentity` doesn't lie about it.
+                Ok(match entry {
+                    IdentityRecord::Local {
+                        agent_signing_key_bytes,
+                        ..
+                    } => agent_signing_key_bytes
+                        .as_ref()
+                        .map_or((false, None), |sk_bytes| {
+                            let signing_key = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                            let multibase = format!(
+                                "z{}",
+                                zbase32_encode(&signing_key.verifying_key().to_bytes())
+                            );
+                            (true, Some(multibase))
+                        }),
+                    IdentityRecord::Resolved { .. } => (false, None),
+                })
+            });
+        let (has_agent_key, agent_public_key_multibase) =
+            registry_view.map_err(ScpWasmError::into_js)?;
         Ok(Self {
             did,
             custody_type: "js_custody".to_owned(),
-            has_agent_key: false,
-            agent_public_key_multibase: None,
+            has_agent_key,
+            agent_public_key_multibase,
             // The decoded bytes ARE the public key — surface them as
             // the hex parity field. Callers reading
             // `identity.verifyingKey` get the same shape as
@@ -2602,6 +2624,43 @@ fn migrate_inner(
     let new_pub_bytes = revealed_pre_rotation_public;
     let new_did = format!("did:dht:z{}", zbase32_encode(&new_pub_bytes));
 
+    // Phase 2b: pre-flight ALL capacity checks before any mutation.
+    // `install_migrated_identity` does its own cap pre-flight at
+    // phase 1, but by the time it runs we've already mutated
+    // `PRE_ROTATION_REGISTRY` (added new entry at step "store" below,
+    // removed old entry at step "destroy" below). A cap failure
+    // there would leave the source identity un-migratable and the
+    // new pre-rotation entry orphaned. Running the same checks here
+    // first converts a corruption failure into a clean fail-fast.
+    IDENTITY_REGISTRY.with(|reg| -> Result<(), ScpWasmError> {
+        let map = reg.borrow();
+        let post_len = map.len() + usize::from(!map.contains_key(&new_did));
+        if post_len > WASM_IDENTITY_REGISTRY_CAP {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
+                     — cannot store migrated entry"
+                ),
+                code: codes::VALID_7400.to_owned(),
+            });
+        }
+        Ok(())
+    })?;
+    MIGRATION_LINKS.with(|links| -> Result<(), ScpWasmError> {
+        let map = links.borrow();
+        let post_len = map.len() + usize::from(!map.contains_key(&old_did));
+        if post_len > WASM_MIGRATION_LINKS_CAP {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "migration links registry has reached capacity \
+                     ({WASM_MIGRATION_LINKS_CAP}) — cannot store additional entries"
+                ),
+                code: codes::VALID_7401.to_owned(),
+            });
+        }
+        Ok(())
+    })?;
+
     // Fresh `#active` for the new identity (matches
     // `DidDht::create_new_identity_keys` ordering: identity →
     // active → pre-rotation).
@@ -2621,19 +2680,19 @@ fn migrate_inner(
         new_pre_rotation_signing_key_bytes,
     )?;
 
-    // If the source identity had an agent key, mint a fresh one for
-    // the migrated identity.
-    let (new_agent_signing_key_bytes, new_agent_public_key_multibase) = if had_agent_key {
-        let agent_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-        let agent_pub = agent_key.verifying_key();
-        let multibase = format!("z{}", zbase32_encode(&agent_pub.to_bytes()));
-        (
-            Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
-            Some(multibase),
-        )
-    } else {
-        (None, None)
-    };
+    // Migration drops the agent key — matches native behavior in
+    // `crates/scp-identity/src/dht.rs::migrate_identity` (returned
+    // identity has `agent_signing_key: None`). The agent relationship
+    // is a per-DID delegation; after migration the new DID has no
+    // outstanding agent attestations, and the SDK consumer must call
+    // `add_agent_key` to re-establish the relationship explicitly.
+    // This default is safer than auto-minting (which would silently
+    // grant the new DID's agent key the same scope as the old).
+    let (new_agent_signing_key_bytes, new_agent_public_key_multibase): (
+        Option<zeroize::Zeroizing<[u8; 32]>>,
+        Option<String>,
+    ) = (None, None);
+    let _ = had_agent_key; // signal-only; behaviour does not branch.
 
     // Phases 3-5: build proofs and rotation event JSON.
     let migration_signature_bytes =
@@ -2679,7 +2738,10 @@ fn migrate_inner(
         identity: WasmIdentity {
             did: new_did,
             custody_type: custody,
-            has_agent_key: had_agent_key,
+            // Agent key is intentionally dropped on migration —
+            // matches native parity. SDK consumers re-establish via
+            // `add_agent_key` if needed.
+            has_agent_key: false,
             agent_public_key_multibase: new_agent_public_key_multibase,
             verifying_key_hex: Some(hex::encode(new_pub_bytes)),
         },

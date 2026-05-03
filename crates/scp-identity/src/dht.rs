@@ -1202,6 +1202,27 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         ),
         IdentityError,
     > {
+        // Step 0: Pre-flight `import_ed25519_signing_key` capability on
+        // the operational custody. Step 6 below consumes the old
+        // pre-rotation private bytes and imports them as the new `#0`.
+        // If `import_ed25519_signing_key` is unsupported on this
+        // backend (e.g., HSM-bound `CallbackKeyCustody` today), we
+        // would fail AFTER publishing the old DID document with
+        // `alsoKnownAs[new_did]` — leaving the OLD doc on the DHT
+        // pointing at a successor DID that has no holder, and the
+        // OLD pre-rotation key destroyed (consumed by step 6). The
+        // probe here converts that corruption failure into a clean
+        // fail-fast before any externally-visible mutation.
+        let probe_seed = zeroize::Zeroizing::new([0u8; 32]);
+        let probe_handle = key_custody
+            .import_ed25519_signing_key(&probe_seed)
+            .await
+            .map_err(IdentityError::Platform)?;
+        key_custody
+            .destroy_key(&probe_handle)
+            .await
+            .map_err(IdentityError::Platform)?;
+
         // Step 1: Reveal the pre-rotation public key. This will become the
         // new identity public key (ADR-003 §4b). The custody verifies its
         // own commitment integrity if it stored one.
@@ -1222,15 +1243,13 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let pre_rotation_proof =
             Self::build_pre_rotation_proof_from_bytes(old_document, &new_identity_public_bytes)?;
 
-        // Step 3: Update the OLD DID document with `alsoKnownAs` and
-        // publish — this happens BEFORE we touch operational custody so
-        // that any failure leaves the old identity intact.
-        let mut updated_old_doc = old_document.clone();
-        updated_old_doc.set_also_known_as(&new_did);
-        self.publish_document(identity, &updated_old_doc).await?;
-
-        // Step 4: Generate the NEW pre-rotation seed using the operational
+        // Step 3: Generate the NEW pre-rotation seed using the operational
         // custody's RNG (ADR-046 byte parity). The new active key follows.
+        // All mutations through step 6 are LOCAL — no externally-visible
+        // state changes until the new DID document is published in
+        // step 7. Publishing the OLD doc with `alsoKnownAs` is deferred
+        // to step 8 (chain-forward order) so a failure in steps 4-7
+        // leaves the OLD identity wholly intact and recoverable.
         let new_pre_rotation_seed = key_custody
             .generate_ephemeral_ed25519_seed()
             .await
@@ -1255,7 +1274,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         let mut new_pre_rotation_commitment = [0u8; 32];
         new_pre_rotation_commitment.copy_from_slice(&new_pre_rotation_commitment_bytes);
 
-        // Step 5: Hand the new pre-rotation seed to cold custody. If this
+        // Step 4: Hand the new pre-rotation seed to cold custody. If this
         // fails, the operational copy zeroizes on drop and we surface the
         // error WITHOUT having consumed the old pre-rotation key.
         let new_pre_rotation_handle = pre_rotation_custody
@@ -1263,7 +1282,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .await
             .map_err(IdentityError::PreRotation)?;
 
-        // Step 6: Consume the OLD pre-rotation key from cold custody —
+        // Step 5: Consume the OLD pre-rotation key from cold custody —
         // returning its private bytes — and import them into operational
         // custody as the new `#0`. Per spec §9.7.4.1 §6, the old
         // pre-rotation key is destroyed after migration completes; here
@@ -1280,7 +1299,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             .map_err(IdentityError::Platform)?;
         // `revealed_private` is `Zeroizing` — drops here.
 
-        // Step 7: Build and publish the new DID document.
+        // Step 6: Build the new DID document and identity.
         let new_document = DidDocument::new(
             &new_did,
             &new_identity_public_bytes,
@@ -1296,9 +1315,24 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             did: new_did.clone(),
         };
 
+        // Step 7: Publish the NEW DID document FIRST. Doing this before
+        // the OLD doc's `alsoKnownAs` update ensures verifiers who
+        // follow `alsoKnownAs[new_did]` will always find a published
+        // new document — there is no window where the old doc claims
+        // a successor that doesn't exist on the DHT yet.
         self.publish_document(&new_identity, &new_document).await?;
 
-        // Step 8: Build and return the rotation event.
+        // Step 8: Update the OLD DID document with `alsoKnownAs` pointing
+        // at the now-published new DID, and publish. A failure here
+        // leaves the new identity fully published and the old identity
+        // unchanged — a worse-but-recoverable degraded state (the user
+        // can republish the old `alsoKnownAs` update on retry without
+        // any cryptographic concern).
+        let mut updated_old_doc = old_document.clone();
+        updated_old_doc.set_also_known_as(&new_did);
+        self.publish_document(identity, &updated_old_doc).await?;
+
+        // Step 9: Build and return the rotation event.
         let rotation_event = DidRotationEvent {
             old_did: identity.did.clone(),
             new_did,
@@ -1743,6 +1777,29 @@ pub fn verify_migration(
             ))
         })?;
 
+    // Step 1b: bind `migration_proof.old_public_key` to `old_did`.
+    // Without this check, step 1 only proves "SOMEONE signed the
+    // migration digest using the public key in the proof" — not that
+    // the signer is actually the holder of `old_did`'s identity key.
+    // An attacker could substitute their own pubkey + valid signature
+    // and the function would return Ok(true), defeating the
+    // "MODERATE assurance" the migration proof is supposed to deliver
+    // when no pre-rotation proof is present (ADR-003 §4c). did:dht is
+    // self-certifying — the DID string is z-base-32 of the identity
+    // key public — so deriving the expected DID from
+    // `old_public_key` and comparing against the `old_did` argument
+    // closes the gap.
+    let expected_old_did = format!(
+        "{DID_DHT_PREFIX}z{}",
+        zbase32::encode(&migration_proof.old_public_key)
+    );
+    if expected_old_did != old_did {
+        return Err(IdentityError::MigrationVerificationFailed(format!(
+            "migration_proof.old_public_key derives DID {expected_old_did:?} \
+             but the migration is from {old_did:?}"
+        )));
+    }
+
     // Step 2: Verify the pre-rotation proof if present.
     if let Some(pre_rot) = pre_rotation_proof {
         // Step 2a: SHA-256(revealed_key) == commitment.
@@ -1899,7 +1956,7 @@ pub fn did_from_ed25519_public_key(public_key: &[u8; 32]) -> String {
 /// decoded bytes and require the input to match the canonical form,
 /// so two distinct DID strings cannot resolve to the same `#0` key
 /// (would otherwise enable petname squatting, log/UI spoofing, and
-/// equality-by-string mismatches downstream). See issue #1728.
+/// equality-by-string mismatches downstream).
 pub fn extract_public_key(did_string: &str) -> Result<[u8; 32], IdentityError> {
     let encoded = did_string
         .strip_prefix(DID_DHT_PREFIX)
@@ -2500,12 +2557,12 @@ mod tests {
         assert!(result.is_err());
     }
 
-    /// Regression for #1728: z-base-32 encoding of 32-byte payloads is
-    /// not strictly injective on its trailing bit-padding (4 zero
-    /// padding bits in the 52nd char yield 16 alternate encodings that
-    /// decode to the same bytes). The native parser MUST reject
-    /// non-canonical inputs to prevent two distinct DID strings from
-    /// resolving to the same `#0` key.
+    /// z-base-32 encoding of 32-byte payloads is not strictly
+    /// injective on its trailing bit-padding (4 zero padding bits in
+    /// the 52nd char yield 16 alternate encodings that decode to the
+    /// same bytes). The native parser MUST reject non-canonical
+    /// inputs to prevent two distinct DID strings from resolving to
+    /// the same `#0` key.
     #[test]
     fn extract_public_key_rejects_non_canonical_zbase32_padding() {
         // The z-base-32 alphabet. The last char of a canonical 32-byte
@@ -3229,12 +3286,105 @@ mod tests {
         ));
     }
 
-    /// Regression for #1727: a `PreRotationProof` whose
-    /// `SHA-256(revealed_key) == commitment` invariant holds but whose
-    /// `commitment` does NOT match the old DID document's
-    /// `PreRotationCommitment` service entry MUST be rejected. Without
-    /// this binding, an attacker could pair a `(commitment,
-    /// revealed_key)` they control with someone else's `migration_proof`.
+    /// `migration_proof.old_public_key` MUST derive `old_did`. Without
+    /// this binding, step 1's signature verification only proves
+    /// "SOMEONE signed the digest using the public key in the proof"
+    /// — not that the signer holds `old_did`'s identity key. An
+    /// attacker could substitute their own pubkey + valid signature
+    /// and the function would return Ok with no pre-rotation proof.
+    #[tokio::test]
+    async fn verify_migration_rejects_old_public_key_not_deriving_old_did() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (_new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .unwrap();
+
+        // Build a SECOND independent identity (different `#0` key,
+        // different `old_did`). Sign a migration_proof for the
+        // FIRST identity's old_did using the SECOND identity's #0.
+        // The signature verifies (it's a valid Ed25519 over the
+        // digest), but `migration_proof.old_public_key` derives
+        // identity_2's DID, not identity_1's old_did.
+        let pre_rotation_custody_2 =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity_2, _doc_2, _h_2) = dht
+            .create(&*custody, &*pre_rotation_custody_2)
+            .await
+            .unwrap();
+
+        let mut hasher = Sha256::new();
+        hasher.update(DOMAIN_MIGRATION_V1);
+        let old_len = u32::try_from(event.old_did.len()).unwrap();
+        let new_len = u32::try_from(event.new_did.len()).unwrap();
+        hasher.update(old_len.to_be_bytes());
+        hasher.update(event.old_did.as_bytes());
+        hasher.update(new_len.to_be_bytes());
+        hasher.update(event.new_did.as_bytes());
+        hasher.update(rotated_at.to_be_bytes());
+        let digest = hasher.finalize();
+
+        let attacker_sig = custody
+            .sign(&identity_2.identity_key, &digest)
+            .await
+            .unwrap();
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(attacker_sig.as_bytes());
+
+        let attacker_pub = custody.public_key(&identity_2.identity_key).await.unwrap();
+        let mut pub_arr = [0u8; 32];
+        pub_arr.copy_from_slice(attacker_pub.as_bytes());
+
+        let crafted_proof = MigrationProof {
+            signature: sig_arr,
+            old_public_key: pub_arr,
+        };
+
+        // Verify with NO pre-rotation proof so step 1b is the only
+        // binding to old_did.
+        let result = verify_migration(
+            &event.old_did,
+            &document,
+            &event.new_did,
+            &crafted_proof,
+            None,
+            rotated_at,
+        );
+        let err = result.expect_err(
+            "step 1b MUST reject migration_proof whose old_public_key does not derive old_did",
+        );
+        match err {
+            IdentityError::MigrationVerificationFailed(msg) => {
+                assert!(
+                    msg.contains("old_public_key derives DID"),
+                    "expected step 1b error, got: {msg}"
+                );
+            }
+            other => panic!("expected MigrationVerificationFailed, got: {other:?}"),
+        }
+    }
+
+    /// A `PreRotationProof` whose `SHA-256(revealed_key) == commitment`
+    /// invariant holds but whose `commitment` does NOT match the old
+    /// DID document's `PreRotationCommitment` service entry MUST be
+    /// rejected. Without this binding, an attacker could pair a
+    /// `(commitment, revealed_key)` they control with someone else's
+    /// `migration_proof`.
     #[tokio::test]
     async fn verify_migration_rejects_commitment_mismatch_with_old_document() {
         let custody = Arc::new(InMemoryKeyCustody::new());
@@ -3291,12 +3441,11 @@ mod tests {
         }
     }
 
-    /// Regression for #1727: a `PreRotationProof` whose
-    /// `SHA-256(revealed_key) == commitment` AND whose `commitment`
-    /// matches the old DID doc, but whose `revealed_key` does NOT derive
-    /// the `new_did` argument MUST be rejected. Without this binding, a
-    /// valid proof for one `new_did` could be replayed under a
-    /// different `new_did` string.
+    /// A `PreRotationProof` whose `SHA-256(revealed_key) == commitment`
+    /// AND whose `commitment` matches the old DID doc, but whose
+    /// `revealed_key` does NOT derive the `new_did` argument MUST be
+    /// rejected. Without this binding, a valid proof for one
+    /// `new_did` could be replayed under a different `new_did` string.
     #[tokio::test]
     async fn verify_migration_rejects_revealed_key_not_deriving_new_did() {
         let custody = Arc::new(InMemoryKeyCustody::new());

@@ -491,9 +491,13 @@ impl KeyCustody for InMemoryKeyCustody {
         &self,
         seed: &Zeroizing<[u8; 32]>,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
-        // Copy the seed into a new Zeroizing — the borrow is non-consuming
-        // so the caller's wrapper continues to control its lifetime.
-        let seed_copy: [u8; 32] = **seed;
+        // Wrap the local copy in `Zeroizing` immediately so the bytes
+        // are wiped when this function returns. `[u8; 32]` is `Copy`,
+        // so dereferencing the borrow performs a stack copy; capturing
+        // it directly into a `Zeroizing` ensures the wrapper owns the
+        // only stack residue (the original `seed` is owned by the
+        // caller and stays in their `Zeroizing`).
+        let seed_copy: Zeroizing<[u8; 32]> = Zeroizing::new(**seed);
         async move {
             let handle = self.next_handle();
             let signing_key = SigningKey::from_bytes(&seed_copy);
@@ -503,8 +507,7 @@ impl KeyCustody for InMemoryKeyCustody {
             store.key_types.insert(handle.id(), StoredKeyType::Ed25519);
             drop(store);
 
-            // Wipe the local stack copy of the seed bytes.
-            let _ = Zeroizing::new(seed_copy);
+            // `seed_copy: Zeroizing<[u8; 32]>` drops here → bytes wiped.
             Ok(handle)
         }
     }

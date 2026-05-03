@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::sync::Mutex;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::traits::{
     PreRotationCustody, PreRotationCustodyError, PreRotationCustodyKind, PreRotationKeyHandle,
@@ -32,7 +32,12 @@ pub struct InMemoryPreRotationCustody {
     next_id: AtomicU64,
 }
 
-#[derive(Debug)]
+/// Defense in depth: derive `Zeroize` + `ZeroizeOnDrop` so the
+/// `private_key` field is wiped if the entry is moved/dropped via any
+/// path the `Zeroizing` wrapper alone wouldn't catch (e.g., enum
+/// repacking, struct-level drop). The `public_key` is non-secret but
+/// included for the derive's structural correctness.
+#[derive(Debug, Zeroize, ZeroizeOnDrop)]
 struct PreRotationKeyEntry {
     public_key: [u8; 32],
     private_key: Zeroizing<[u8; 32]>,
@@ -102,11 +107,20 @@ impl PreRotationCustody for InMemoryPreRotationCustody {
     {
         let id = handle.id();
         async move {
+            // `PreRotationKeyEntry` derives `ZeroizeOnDrop`, so partial
+            // moves out of fields are forbidden. Copy the private key
+            // bytes into a fresh `Zeroizing` and let the entry's
+            // `Drop` zeroize the source on the next line.
             self.store
                 .lock()
                 .await
                 .remove(&id)
-                .map(|entry| entry.private_key)
+                .map(|entry| {
+                    let bytes: [u8; 32] = *entry.private_key;
+                    Zeroizing::new(bytes)
+                    // `entry` drops here → ZeroizeOnDrop wipes both
+                    // public_key and private_key fields.
+                })
                 .ok_or(PreRotationCustodyError::HandleNotFound)
         }
     }

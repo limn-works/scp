@@ -70,9 +70,12 @@ impl KeyHandle {
 /// same custody provider or authentication flow used for daily operations".
 /// This newtype enforces the rule mechanically.
 ///
-/// The inner identifier is opaque — there is no public `id()` accessor;
-/// implementations allocate identifiers privately. SDK callers receive the
-/// handle by value and pass it back to [`PreRotationCustody`] methods.
+/// The inner identifier is reachable via [`PreRotationKeyHandle::id`] for
+/// FFI serialization (`UniFFI` string handle, NAPI numeric handle), but
+/// SDK code SHOULD treat the handle as opaque — pass it back to
+/// [`PreRotationCustody`] methods by value rather than reconstructing
+/// from the raw `u64`. [`PreRotationCustody`] implementations allocate
+/// identifiers privately; cross-instance handles are not interchangeable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PreRotationKeyHandle(u64);
 
@@ -653,6 +656,26 @@ pub enum PreRotationCustodyKind {
 /// atomicity is impossible (printed BIP39 mnemonic), callers MUST treat
 /// any error as "key may or may not still exist" and surface a recovery
 /// prompt.
+///
+/// # SDK presentation (spec §9.7.4.1 §5) is OUTSIDE this trait
+///
+/// The protocol layer covered by this trait implements §9.7.4.1 §5(a)
+/// (generation), §5(e) (commitment publication after the trait round-trip
+/// returns), and §5(f) (operational copy destruction). Steps §5(b)
+/// (present custody options to the user), §5(c) (guide the user through
+/// the selected method), and §5(d) (verify the backup before publishing
+/// the commitment) are SDK-layer concerns that the trait does NOT model.
+/// SDK consumers are responsible for layering those steps over a
+/// concrete [`PreRotationCustody`] backend before calling
+/// [`store_committed_pre_rotation_key`](Self::store_committed_pre_rotation_key).
+///
+/// Today's shipped backend ([`InMemoryPreRotationCustody`](super::testing::InMemoryPreRotationCustody))
+/// has no user-facing flow and is testing-only. Production backends
+/// (FIDO2, passkey-PRF, Apple Keychain entry under a separate access
+/// control class, Android Keystore alias with separate authentication
+/// flow, encrypted offline backup, Shamir 3-of-5, BIP39 paper backup —
+/// the six methods §9.7.4.1 §4 enumerates) need the SDK layer to
+/// implement §5(b)-(d) before this trait sees the seed bytes.
 ///
 /// # Concurrency
 ///

@@ -2856,10 +2856,29 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             key_custody,
             did_method,
         } => {
+            // KNOWN LIMITATION: this path drops the `PreRotationKeyHandle`
+            // because `ApplicationNode<K, D, S, Dom, Id>`'s generic
+            // parameter list does not yet carry a `P: PreRotationCustody`
+            // slot. As a consequence, identities produced by this code
+            // path CANNOT be migrated later — the migrate flow needs both
+            // the handle and the custody instance to call
+            // `dht::migrate_identity`. The current shipped backend is
+            // `InMemoryPreRotationCustody` which is process-local
+            // anyway, so the migration capability would be lost on
+            // process restart even if we persisted the handle. Widening
+            // the builder to accept a real `PreRotationCustody` is
+            // tracked alongside the production custody backends.
             let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
             let (identity, document, _pre_rotation_handle) = did_method
                 .create(&*key_custody, &pre_rotation_custody)
                 .await?;
+            tracing::warn!(
+                did = %identity.did,
+                "identity created without a persistent PreRotationCustody — migration \
+                 (Layer-2 DID rotation) will be impossible until the builder API is \
+                 widened to accept a real backend. Recovery from `#0` compromise via \
+                 spec §9.7.4.1 is unreachable for this identity."
+            );
             Ok((identity, document, did_method))
         }
         IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
@@ -3009,10 +3028,26 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
                 Ok((persisted.identity, persisted.document, did_method))
             } else {
                 // 3. Generate a new identity and persist it.
+                //
+                // Same KNOWN LIMITATION as `resolve_identity` above: the
+                // `PreRotationKeyHandle` is dropped because the builder
+                // does not yet carry a `P: PreRotationCustody` generic
+                // slot. Identities produced via this persistent path
+                // cannot migrate. With `InMemoryPreRotationCustody` as
+                // the only shipped backend, the handle would be
+                // process-local anyway and lost on restart.
                 let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
                 let (identity, document, _pre_rotation_handle) = did_method
                     .create(&*key_custody, &pre_rotation_custody)
                     .await?;
+                tracing::warn!(
+                    did = %identity.did,
+                    "persisted identity created without a persistent PreRotationCustody — \
+                     migration (Layer-2 DID rotation) will be impossible after process \
+                     restart. Recovery from `#0` compromise via spec §9.7.4.1 is unreachable \
+                     for this identity until the builder API is widened to accept a real \
+                     backend."
+                );
                 let persisted = PersistedIdentity {
                     identity: identity.clone(),
                     document: document.clone(),
