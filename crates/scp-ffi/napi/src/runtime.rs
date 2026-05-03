@@ -208,6 +208,27 @@ pub struct NapiBridgeInstance {
     /// Feature-gated behind `allow_in_memory_custody` to mirror `testing.rs`.
     #[cfg(feature = "allow_in_memory_custody")]
     pub(crate) network: std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>>,
+
+    /// SCP-OUT-037 — per-bridge stream registry keyed by §5.4.5 16-byte
+    /// `request_id` rendered as 32-char lowercase hex. Each entry holds
+    /// the `StreamSessionHandle` returned by
+    /// [`scp_runtime::context::manager::ContextManager::open_outlet_stream`]
+    /// plus the per-stream monotonic-grant counter and the
+    /// `SCP-OUTLET-CREDIT-V1:` preimage signing material. Cleared by
+    /// `BridgeInstanceCore::bridge_specific_shutdown` so any in-flight
+    /// streams' handles drop during instance shutdown.
+    ///
+    /// Mirrors the `PyBridgeInstance::outlet_stream_registry` field on
+    /// the `PyO3` bridge so multi-instance fallback / shutdown clearing
+    /// works uniformly across bridges (ADR-048 §1).
+    ///
+    /// Feature-gated behind `allow_in_memory_custody` because the
+    /// streaming bridge's credit-grant signing path uses
+    /// `with_identity`, which is only compiled with that feature; non-
+    /// custody builds simply omit the registry slot entirely.
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub(crate) outlet_stream_registry:
+        Arc<DashMap<String, Arc<crate::outlet_stream::StreamRegistryEntry>>>,
 }
 
 impl NapiBridgeInstance {
@@ -231,6 +252,8 @@ impl NapiBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
+            #[cfg(feature = "allow_in_memory_custody")]
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -254,6 +277,8 @@ impl NapiBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
+            #[cfg(feature = "allow_in_memory_custody")]
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -349,6 +374,8 @@ impl NapiBridgeInstance {
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
+            #[cfg(feature = "allow_in_memory_custody")]
+            outlet_stream_registry: Arc::new(DashMap::new()),
         }
     }
 
@@ -385,6 +412,21 @@ impl NapiBridgeInstance {
         &self,
     ) -> &std::sync::Mutex<Option<scp_testing::fullstack::FullStackNetwork>> {
         &self.network
+    }
+
+    /// Returns a reference to the SCP-OUT-037 outlet-stream registry.
+    ///
+    /// `pub(crate)` because `StreamRegistryEntry` is itself `pub(crate)`.
+    /// Used by `crate::outlet_stream` to look up active stream
+    /// `StreamSessionHandle`s by §5.4.5 `request_id` (rendered as
+    /// 32-char lowercase hex). Feature-gated alongside the registry
+    /// field itself.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[must_use]
+    pub(crate) const fn outlet_stream_registry(
+        &self,
+    ) -> &Arc<DashMap<String, Arc<crate::outlet_stream::StreamRegistryEntry>>> {
+        &self.outlet_stream_registry
     }
 }
 
@@ -433,6 +475,11 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         // shutdown-hook closure) in #1549 Phase 4 PR 2 commit 4.
         self.mcp_server_registry.clear();
         self.mcp_client_registry.clear();
+        // Clear the SCP-OUT-037 outlet-stream registry so any in-flight
+        // `StreamSessionHandle` entries drop — ending background pump
+        // tasks and dropping receivers cleanly.
+        #[cfg(feature = "allow_in_memory_custody")]
+        self.outlet_stream_registry.clear();
     }
 }
 

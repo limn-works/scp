@@ -5148,6 +5148,8 @@ dependencies = [
  "scp-node",
  "scp-platform",
  "scp-primitives",
+ "scp-protocol",
+ "scp-runtime",
  "scp-testing",
  "scp-transport",
  "serde_json",

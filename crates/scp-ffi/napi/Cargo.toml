@@ -35,6 +35,8 @@ rmp-serde = { workspace = true }
 ed25519-dalek = { workspace = true }
 tls_codec = "0.4"
 scp-core = { path = "../../scp-core" }
+scp-protocol = { path = "../../scp-protocol" }
+scp-runtime = { path = "../../scp-runtime" }
 scp-media = { path = "../../scp-media" }
 scp-primitives = { path = "../../scp-primitives" }
 scp-identity = { path = "../../scp-identity" }

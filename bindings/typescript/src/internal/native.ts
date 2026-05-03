@@ -34,6 +34,7 @@ import type {
   Bridge,
   BridgeContextHandle,
   BridgeIdentityHandle,
+  BridgeOutletInvocationStream,
   BridgeTransportHandle,
   MessageCallback,
 } from "./bridge";
@@ -905,6 +906,95 @@ export function createNativeBridge(): Bridge {
           proofs: readonly string[] | undefined,
         ) => Promise<string>
       )(handle, sessionId, inputJson, invokerDid, ucanToken, proofTokens);
+    },
+
+    // SCP-OUT-037 — §5.4.5 progressive-output streaming surface
+    async contextOutletInvokeStream(
+      handle: BridgeContextHandle,
+      outletId: string,
+      inputJson: string,
+      identityDid: string,
+      ucanToken: string,
+      caveatsBindingHex: string,
+      streamEpoch: number,
+      proofTokens?: readonly string[],
+      creditWindow?: number,
+      estimatedChunkCount?: number,
+    ): Promise<BridgeOutletInvocationStream> {
+      return await (
+        addon.contextOutletInvokeStream as (
+          h: BridgeContextHandle,
+          o: string,
+          i: string,
+          d: string,
+          u: string,
+          cb: string,
+          se: number,
+          pt: readonly string[] | undefined,
+          cw: number | undefined,
+          ecc: number | undefined,
+        ) => Promise<BridgeOutletInvocationStream>
+      )(
+        handle,
+        outletId,
+        inputJson,
+        identityDid,
+        ucanToken,
+        caveatsBindingHex,
+        streamEpoch,
+        proofTokens,
+        creditWindow,
+        estimatedChunkCount,
+      );
+    },
+
+    async outletStreamGrantCredit(requestIdHex: string, grant: number): Promise<number> {
+      return await (addon.outletStreamGrantCredit as (rid: string, g: number) => Promise<number>)(
+        requestIdHex,
+        grant,
+      );
+    },
+
+    async outletStreamCancel(requestIdHex: string, nextSeq?: number): Promise<number | null> {
+      return await (
+        addon.outletStreamCancel as (rid: string, ns: number | undefined) => Promise<number | null>
+      )(requestIdHex, nextSeq);
+    },
+
+    async verifyChunkSignature(
+      chunkJson: string,
+      operatorPk: Uint8Array,
+      contextId: string,
+      outletId: string,
+      caveatsBinding: Uint8Array,
+    ): Promise<boolean> {
+      return await (
+        addon.verifyChunkSignature as (
+          c: string,
+          pk: Uint8Array,
+          cid: string,
+          oid: string,
+          cb: Uint8Array,
+        ) => Promise<boolean>
+      )(chunkJson, operatorPk, contextId, outletId, caveatsBinding);
+    },
+
+    async computeCaveatsBinding(
+      ucanCid: Uint8Array,
+      requestId: Uint8Array,
+      invokerDid: string,
+      estimatedChunkCount: number,
+      effectiveCaveatsJson: string,
+    ): Promise<Uint8Array> {
+      return await (
+        addon.computeCaveatsBinding as (
+          uc: Uint8Array,
+          rid: Uint8Array,
+          did: string,
+          ecc: number,
+          ec: string,
+        ) => Promise<Uint8Array>
+      )(ucanCid, requestId, invokerDid, estimatedChunkCount, effectiveCaveatsJson);
     },
 
     async toolSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void> {

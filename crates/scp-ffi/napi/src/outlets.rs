@@ -21,7 +21,12 @@ use crate::error::ScpNapiError;
 /// Validates a UCAN token for tool invocation authorization.
 ///
 /// Performs the full 11-step ADR-016 validation pipeline.
-fn validate_ucan_for_tool(
+///
+/// Re-exported as `validate_outlet_invocation_ucan_napi` so the
+/// SCP-OUT-037 streaming bridge (`crate::outlet_stream`) can defence-
+/// in-depth re-validate the UCAN at open time, before allocating any
+/// per-stream registry state.
+pub(crate) fn validate_outlet_invocation_ucan_napi(
     context_id: &str,
     outlet_id: &str,
     identity_did: &str,
@@ -458,7 +463,7 @@ pub async fn outlet_invoke(
                 code: codes::PERM_3001.to_owned(),
             })
         })?;
-    validate_ucan_for_tool(
+    validate_outlet_invocation_ucan_napi(
         &context_id,
         &outlet_id,
         &identity_did,
@@ -735,7 +740,7 @@ pub async fn outlet_invoke_cross_context(
                 code: codes::PERM_3001.to_owned(),
             })
         })?;
-    validate_ucan_for_tool(
+    validate_outlet_invocation_ucan_napi(
         &target_context_id,
         &outlet_id,
         &invoker_did,
@@ -944,7 +949,7 @@ pub async fn outlet_session_invoke(
                 code: codes::PERM_3001.to_owned(),
             })
         })?;
-    validate_ucan_for_tool(
+    validate_outlet_invocation_ucan_napi(
         &context_id,
         &outlet_id_for_ucan,
         &invoker_did,
