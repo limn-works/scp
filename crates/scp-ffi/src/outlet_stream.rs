@@ -28,7 +28,7 @@
 //! — the streaming pump task that bridges chunks from the runtime to
 //! the Python asyncio queue handles eviction.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 use ed25519_dalek::SigningKey;
@@ -95,12 +95,19 @@ pub(crate) struct StreamRegistryEntry {
     pub request_id: [u8; 16],
 }
 
-/// Process-global stream registry. Initialised on first stream open.
-static STREAM_REGISTRY: OnceLock<DashMap<String, Arc<StreamRegistryEntry>>> = OnceLock::new();
-
-/// Returns the registry, initialising on first access.
-fn registry() -> &'static DashMap<String, Arc<StreamRegistryEntry>> {
-    STREAM_REGISTRY.get_or_init(DashMap::new)
+/// Returns a reference to the per-bridge stream registry on the
+/// default [`crate::runtime::PyBridgeInstance`]. Per ADR-048 the
+/// registry lives on the bridge instance (not as a process-global)
+/// so multi-instance fallback / shutdown clearing works uniformly.
+///
+/// Returns an error if the bridge instance has not been initialised
+/// — the streaming bridge functions all require it (and
+/// `context_outlet_invoke_stream` calls
+/// `crate::runtime::ensure_bridge_instance` upstream of this call).
+fn registry() -> Result<Arc<DashMap<String, Arc<StreamRegistryEntry>>>, ScpPyError> {
+    let bi = crate::runtime::bridge_instance_raw()
+        .ok_or_else(|| ScpPyError::context("bridge instance not initialised"))?;
+    Ok(Arc::clone(bi.outlet_stream_registry()))
 }
 
 /// Renders a `request_id` (16 raw bytes) as 32-char lowercase hex —
@@ -112,9 +119,14 @@ fn request_id_hex(request_id: &[u8; 16]) -> String {
 
 /// Removes an entry from the registry — called by the streaming pump
 /// task on terminal-chunk emission. Idempotent: missing keys are a
-/// no-op so a duplicate cancel + terminal cannot double-evict.
+/// no-op so a duplicate cancel + terminal cannot double-evict. A
+/// missing bridge instance is also a no-op (during shutdown the
+/// instance may already be gone; the entry it would have evicted is
+/// already gone with it).
 pub(crate) fn evict_request(request_id_hex: &str) {
-    registry().remove(request_id_hex);
+    if let Ok(reg) = registry() {
+        reg.remove(request_id_hex);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +368,12 @@ pub fn py_outlet_invoke_stream(
         ucan_token,
         proof_tokens.as_deref(),
     )?;
+    // Ensure the default bridge instance exists so the stream registry
+    // is reachable. `with_context` below will fail with a clean
+    // ContextError if the bridge has not been initialised, but we want
+    // the stream-registry insert at the end of this function to succeed
+    // unconditionally — calling ensure here is defensive (idempotent).
+    crate::runtime::ensure_bridge_instance();
     let caveats_binding = decode_caveats_binding(caveats_binding_hex)?;
     let input_json = crate::types::py_dict_to_json(input)?;
 
@@ -454,7 +472,7 @@ pub fn py_outlet_invoke_stream(
         caveats_binding,
         invoker_signing_key: signing_key,
         request_id,
-    });
+    })?;
 
     Ok(PyOutletInvocationStream {
         rx: Arc::new(TokioMutex::new(Some(receiver))),
@@ -530,9 +548,11 @@ fn build_open_stream_params(
 
 /// Inserts an entry into the per-bridge stream registry, keyed by the
 /// 32-char lowercase hex `request_id`.
-fn register_stream_entry(entry: StreamRegistryEntry) {
+fn register_stream_entry(entry: StreamRegistryEntry) -> PyResult<()> {
+    let reg = registry()?;
     let key = request_id_hex(&entry.request_id);
-    registry().insert(key, Arc::new(entry));
+    reg.insert(key, Arc::new(entry));
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -810,8 +830,13 @@ fn decode_caveats_binding(hex_str: &str) -> PyResult<[u8; 32]> {
 }
 
 fn lookup_entry(request_id_hex: &str) -> PyResult<Arc<StreamRegistryEntry>> {
-    registry()
-        .get(request_id_hex)
+    // Ensure the default bridge instance exists so the registry exists
+    // — this lets the unknown-session error path surface even when no
+    // stream has ever been opened (e.g., a test or stale handle on the
+    // SDK side calling `cancel` without prior `invoke_stream`).
+    crate::runtime::ensure_bridge_instance();
+    let reg = registry()?;
+    reg.get(request_id_hex)
         .map(|kv| Arc::clone(kv.value()))
         .ok_or_else(|| {
             ScpPyError::ContextError {
