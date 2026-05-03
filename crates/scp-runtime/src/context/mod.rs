@@ -38,6 +38,7 @@ pub(crate) mod economy_logic;
 pub mod export_import;
 pub mod governance;
 pub(crate) mod governance_helpers;
+pub(crate) mod governance_helpers_legacy;
 pub(crate) mod governance_logic;
 pub mod key_destruction;
 pub(crate) mod lifecycle_helpers;

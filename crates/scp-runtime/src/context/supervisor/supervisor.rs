@@ -2558,7 +2558,7 @@ impl Supervisor {
         &self,
         context_id: &str,
     ) -> Result<Vec<scp_protocol::context::governance::GovernanceProposal>, ContextError> {
-        crate::context::governance_helpers::list_proposals(self, context_id).await
+        crate::context::governance_helpers_legacy::list_proposals_legacy(self, context_id).await
     }
 
     /// Passthrough to
@@ -2574,7 +2574,12 @@ impl Supervisor {
         context_id: &str,
         proposal_id: &scp_protocol::context::governance::ProposalId,
     ) -> Result<scp_protocol::context::governance::GovernanceProposal, ContextError> {
-        crate::context::governance_helpers::get_proposal(self, context_id, proposal_id).await
+        crate::context::governance_helpers_legacy::get_proposal_legacy(
+            self,
+            context_id,
+            proposal_id,
+        )
+        .await
     }
 
     /// Passthrough to
@@ -2605,7 +2610,7 @@ impl Supervisor {
         ),
         ContextError,
     > {
-        crate::context::governance_helpers::propose_governance_action(
+        crate::context::governance_helpers_legacy::propose_governance_action_legacy(
             self,
             context_id,
             proposer_did,
@@ -2628,7 +2633,7 @@ impl Supervisor {
         action: scp_protocol::context::governance::GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<crate::context::state::ProposalOutcome, ContextError> {
-        crate::context::governance_helpers::propose_governance_action_checked(
+        crate::context::governance_helpers_legacy::propose_governance_action_checked_legacy(
             self,
             context_id,
             proposer_did,
@@ -2666,7 +2671,7 @@ impl Supervisor {
         ),
         ContextError,
     > {
-        crate::context::governance_helpers::vote_on_proposal(
+        crate::context::governance_helpers_legacy::vote_on_proposal_legacy(
             self,
             context_id,
             proposal_id,
@@ -2689,7 +2694,7 @@ impl Supervisor {
         proposal_id: &scp_protocol::context::governance::ProposalId,
         voter_did: &DID,
     ) -> Result<scp_protocol::context::governance::ProposalStatus, ContextError> {
-        crate::context::governance_helpers::withdraw_governance_vote(
+        crate::context::governance_helpers_legacy::withdraw_governance_vote_legacy(
             self,
             context_id,
             proposal_id,

@@ -101,7 +101,7 @@ use scp_protocol::economy::budget::MemberBudgetTracker;
 
 use crate::context::ContextHandle;
 use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
-use crate::context::governance_helpers;
+use crate::context::governance_helpers_legacy;
 use crate::context::manager_methods;
 use crate::context::state::{
     self, AccessControlState, CommitOperation, EpochState, GovernanceState, PerContextState,
@@ -584,8 +584,11 @@ pub async fn import_context(
     manager_methods::update_context_gauges(supervisor);
 
     // Start governance timeout task (ADR-031 §5).
-    crate::context::governance_helpers::start_governance_timeout_task(supervisor, &context_id)
-        .await;
+    crate::context::governance_helpers_legacy::start_governance_timeout_task_legacy(
+        supervisor,
+        &context_id,
+    )
+    .await;
 
     // 8. Persist if persistence is configured.
     if manager_methods::has_persistence(supervisor)
@@ -788,7 +791,10 @@ pub async fn finalize_create(
     handle: &ContextHandle,
 ) {
     manager_methods::update_context_gauges(supervisor);
-    crate::context::governance_helpers::start_governance_timeout_task(supervisor, context_id).await;
+    crate::context::governance_helpers_legacy::start_governance_timeout_task_legacy(
+        supervisor, context_id,
+    )
+    .await;
     manager_methods::persist_context_and_broadcast(supervisor, context_id).await;
     if let Some(duration) = ttl_duration {
         crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy(
@@ -1320,7 +1326,7 @@ pub async fn leave_context(
                 "caller lacks permission to remove this member".into(),
             ));
         }
-        governance_helpers::check_commit_fault(ctx)?;
+        governance_helpers_legacy::check_commit_fault_legacy(ctx)?;
         (ctx.broadcast_context.is_some(), generation)
     };
 
@@ -1343,7 +1349,7 @@ pub async fn leave_context(
         // Broadcast the MLS Commit to remaining members so they can
         // advance their group epoch and ratchet key material. PR #1606 C6:
         // on transport failure, the commit is durably enqueued for retry.
-        crate::context::governance_helpers::try_broadcast_commit_or_enqueue(
+        crate::context::governance_helpers_legacy::try_broadcast_commit_or_enqueue_legacy(
             supervisor,
             &context_id,
             remove_output.commit_bytes,
@@ -1975,7 +1981,10 @@ pub async fn restore_context(
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
     // Start governance timeout task (ADR-031 §5).
-    crate::context::governance_helpers::start_governance_timeout_task(supervisor, context_id).await;
+    crate::context::governance_helpers_legacy::start_governance_timeout_task_legacy(
+        supervisor, context_id,
+    )
+    .await;
 
     // Re-spawn TTL timer if there was remaining TTL.
     if let Some(remaining_secs) = ttl_remaining {

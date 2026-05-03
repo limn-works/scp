@@ -15,18 +15,18 @@
 //! [`ContextManager::propose_governance_action`](crate::context::supervisor::Supervisor::propose_governance_action),
 //! [`ContextManager::propose_governance_action_checked`](crate::context::supervisor::Supervisor::propose_governance_action_checked),
 //! [`ContextManager::vote_on_proposal`](crate::context::supervisor::Supervisor::vote_on_proposal),
-//! [`ContextManager::approve_governance_proposal`](crate::context::governance_helpers::approve_governance_proposal),
-//! [`ContextManager::reject_governance_proposal`](crate::context::governance_helpers::reject_governance_proposal),
+//! [`ContextManager::approve_governance_proposal`](crate::context::governance_helpers_legacy::approve_governance_proposal_legacy),
+//! [`ContextManager::reject_governance_proposal`](crate::context::governance_helpers_legacy::reject_governance_proposal_legacy),
 //! [`ContextManager::withdraw_governance_vote`](crate::context::supervisor::Supervisor::withdraw_governance_vote),
-//! [`ContextManager::execute_governance_action`](crate::context::governance_helpers::execute_governance_action),
+//! [`ContextManager::execute_governance_action`](crate::context::governance_helpers_legacy::execute_governance_action_legacy),
 //! [`ContextManager::get_proposal`](crate::context::supervisor::Supervisor::get_proposal),
 //! [`ContextManager::list_proposals`](crate::context::supervisor::Supervisor::list_proposals),
-//! [`ContextManager::apply_pending_ceiling_modification`](crate::context::governance_helpers::apply_pending_ceiling_modification),
-//! [`ContextManager::apply_pending_economic_policy_change`](crate::context::governance_helpers::apply_pending_economic_policy_change),
-//! [`ContextManager::tombstone_migrated_context`](crate::context::governance_helpers::tombstone_migrated_context),
-//! [`ContextManager::migration_state`](crate::context::governance_helpers::migration_state),
+//! [`ContextManager::apply_pending_ceiling_modification`](crate::context::governance_helpers_legacy::apply_pending_ceiling_modification_legacy),
+//! [`ContextManager::apply_pending_economic_policy_change`](crate::context::governance_helpers_legacy::apply_pending_economic_policy_change_legacy),
+//! [`ContextManager::tombstone_migrated_context`](crate::context::governance_helpers_legacy::tombstone_migrated_context_legacy),
+//! [`ContextManager::migration_state`](crate::context::governance_helpers_legacy::migration_state_legacy),
 //! or
-//! [`ContextManager::acknowledge_commit_fault`](crate::context::governance_helpers::acknowledge_commit_fault).
+//! [`ContextManager::acknowledge_commit_fault`](crate::context::governance_helpers_legacy::acknowledge_commit_fault_legacy).
 //! The shim's job is:
 //!
 //! 1. Wrap the delegated call in [`tokio::time::timeout`] with a 30s
@@ -225,7 +225,7 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: GovernanceCommand) -> Outc
 }
 
 /// Handle [`GovernanceCommand::ProposeGovernanceAction`] — delegates to
-/// [`propose_governance_action_inner`](crate::context::governance_helpers::propose_governance_action_inner)
+/// [`propose_governance_action_inner`](crate::context::governance_helpers_legacy::propose_governance_action_inner_legacy)
 /// with `check_propose_capability=true` under a 30s timeout.
 ///
 /// Phase 1 fix-up of ADR-049 (post-review-round-1): the prior wiring
@@ -254,7 +254,7 @@ async fn handle_propose_governance_action(
     // path). Boxing moves the state onto the heap.
     let propose_fut = async move {
         Box::pin(
-            crate::context::governance_helpers::propose_governance_action_inner(
+            crate::context::governance_helpers_legacy::propose_governance_action_inner_legacy(
                 supervisor,
                 &p.context_id,
                 &p.proposer_did,
@@ -303,7 +303,7 @@ async fn handle_propose_governance_action_checked(
     // `handle_propose_governance_action`.
     let propose_fut = async move {
         Box::pin(
-            crate::context::governance_helpers::propose_governance_action_checked(
+            crate::context::governance_helpers_legacy::propose_governance_action_checked_legacy(
                 supervisor,
                 &p.context_id,
                 &p.proposer_did,
@@ -336,7 +336,7 @@ async fn handle_propose_governance_action_checked(
 }
 
 /// Handle [`GovernanceCommand::VoteOnProposal`] — delegates to
-/// [`vote_on_proposal_inner`](crate::context::governance_helpers::vote_on_proposal_inner)
+/// [`vote_on_proposal_inner`](crate::context::governance_helpers_legacy::vote_on_proposal_inner_legacy)
 /// with `check_vote_capability=true` under a 30s timeout.
 ///
 /// Phase 1 fix-up of ADR-049 (post-review-round-1): the prior wiring
@@ -360,15 +360,17 @@ async fn handle_vote_on_proposal(
     // the 12c.3b hoist; boxing inside the `async move` keeps the
     // heap allocation per-call rather than per-handler.
     let vote_fut = async move {
-        Box::pin(crate::context::governance_helpers::vote_on_proposal_inner(
-            supervisor,
-            &p.context_id,
-            &p.proposal_id,
-            &p.voter_did,
-            approve,
-            &signing_key,
-            true,
-        ))
+        Box::pin(
+            crate::context::governance_helpers_legacy::vote_on_proposal_inner_legacy(
+                supervisor,
+                &p.context_id,
+                &p.proposal_id,
+                &p.voter_did,
+                approve,
+                &signing_key,
+                true,
+            ),
+        )
         .await
     };
 
@@ -396,7 +398,7 @@ async fn handle_vote_on_proposal(
 
 /// Handle [`GovernanceCommand::ApproveGovernanceProposal`] — delegates
 /// to
-/// [`ContextManager::approve_governance_proposal`](crate::context::governance_helpers::approve_governance_proposal)
+/// [`ContextManager::approve_governance_proposal`](crate::context::governance_helpers_legacy::approve_governance_proposal_legacy)
 /// under a 30s timeout.
 async fn handle_approve_governance_proposal(
     supervisor: &Supervisor,
@@ -409,7 +411,7 @@ async fn handle_approve_governance_proposal(
     // Box::pin — see sibling `handle_propose_governance_action`.
     let approve_fut = async move {
         Box::pin(
-            crate::context::governance_helpers::approve_governance_proposal(
+            crate::context::governance_helpers_legacy::approve_governance_proposal_legacy(
                 supervisor,
                 &p.context_id,
                 &p.proposal_id,
@@ -444,7 +446,7 @@ async fn handle_approve_governance_proposal(
 
 /// Handle [`GovernanceCommand::RejectGovernanceProposal`] — delegates
 /// to
-/// [`ContextManager::reject_governance_proposal`](crate::context::governance_helpers::reject_governance_proposal)
+/// [`ContextManager::reject_governance_proposal`](crate::context::governance_helpers_legacy::reject_governance_proposal_legacy)
 /// under a 30s timeout.
 async fn handle_reject_governance_proposal(
     supervisor: &Supervisor,
@@ -457,7 +459,7 @@ async fn handle_reject_governance_proposal(
     // Box::pin — see sibling `handle_propose_governance_action`.
     let reject_fut = async move {
         Box::pin(
-            crate::context::governance_helpers::reject_governance_proposal(
+            crate::context::governance_helpers_legacy::reject_governance_proposal_legacy(
                 supervisor,
                 &p.context_id,
                 &p.proposal_id,
@@ -500,7 +502,7 @@ async fn handle_withdraw_governance_vote(
     voter_did: &scp_identity::DID,
     reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
 ) -> Outcome<()> {
-    let withdraw_fut = crate::context::governance_helpers::withdraw_governance_vote(
+    let withdraw_fut = crate::context::governance_helpers_legacy::withdraw_governance_vote_legacy(
         supervisor,
         context_id,
         proposal_id,
@@ -527,7 +529,7 @@ async fn handle_withdraw_governance_vote(
 }
 
 /// Handle [`GovernanceCommand::ExecuteGovernanceAction`] — delegates to
-/// [`ContextManager::execute_governance_action`](crate::context::governance_helpers::execute_governance_action)
+/// [`ContextManager::execute_governance_action`](crate::context::governance_helpers_legacy::execute_governance_action_legacy)
 /// under a 30s timeout.
 async fn handle_execute_governance_action(
     supervisor: &Supervisor,
@@ -538,7 +540,7 @@ async fn handle_execute_governance_action(
     let proposal = p.proposal;
 
     let execute_fut = async move {
-        crate::context::governance_helpers::execute_governance_action(
+        crate::context::governance_helpers_legacy::execute_governance_action_legacy(
             supervisor,
             &p.context_id,
             &proposal,
@@ -576,8 +578,11 @@ async fn handle_get_proposal(
         Result<scp_protocol::context::governance::GovernanceProposal, ContextError>,
     >,
 ) -> Outcome<()> {
-    let get_fut =
-        crate::context::governance_helpers::get_proposal(supervisor, context_id, proposal_id);
+    let get_fut = crate::context::governance_helpers_legacy::get_proposal_legacy(
+        supervisor,
+        context_id,
+        proposal_id,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, get_fut).await {
         Ok(Ok(proposal)) => (Outcome::ok(()), Ok(proposal)),
@@ -609,7 +614,8 @@ async fn handle_list_proposals(
         Result<Vec<scp_protocol::context::governance::GovernanceProposal>, ContextError>,
     >,
 ) -> Outcome<()> {
-    let list_fut = crate::context::governance_helpers::list_proposals(supervisor, context_id);
+    let list_fut =
+        crate::context::governance_helpers_legacy::list_proposals_legacy(supervisor, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, list_fut).await {
         Ok(Ok(proposals)) => (Outcome::ok(()), Ok(proposals)),
@@ -632,7 +638,7 @@ async fn handle_list_proposals(
 
 /// Handle [`GovernanceCommand::ApplyPendingCeilingModification`] —
 /// delegates to
-/// [`ContextManager::apply_pending_ceiling_modification`](crate::context::governance_helpers::apply_pending_ceiling_modification)
+/// [`ContextManager::apply_pending_ceiling_modification`](crate::context::governance_helpers_legacy::apply_pending_ceiling_modification_legacy)
 /// under a 30s timeout.
 async fn handle_apply_pending_ceiling_modification(
     supervisor: &Supervisor,
@@ -640,11 +646,12 @@ async fn handle_apply_pending_ceiling_modification(
     current_timestamp: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let apply_fut = crate::context::governance_helpers::apply_pending_ceiling_modification(
-        supervisor,
-        context_id,
-        current_timestamp,
-    );
+    let apply_fut =
+        crate::context::governance_helpers_legacy::apply_pending_ceiling_modification_legacy(
+            supervisor,
+            context_id,
+            current_timestamp,
+        );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, apply_fut).await {
         Ok(Ok(applied)) => {
@@ -675,7 +682,7 @@ async fn handle_apply_pending_ceiling_modification(
 
 /// Handle [`GovernanceCommand::ApplyPendingEconomicPolicyChange`] —
 /// delegates to
-/// [`ContextManager::apply_pending_economic_policy_change`](crate::context::governance_helpers::apply_pending_economic_policy_change)
+/// [`ContextManager::apply_pending_economic_policy_change`](crate::context::governance_helpers_legacy::apply_pending_economic_policy_change_legacy)
 /// under a 30s timeout.
 async fn handle_apply_pending_economic_policy_change(
     supervisor: &Supervisor,
@@ -683,11 +690,12 @@ async fn handle_apply_pending_economic_policy_change(
     current_timestamp: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let apply_fut = crate::context::governance_helpers::apply_pending_economic_policy_change(
-        supervisor,
-        context_id,
-        current_timestamp,
-    );
+    let apply_fut =
+        crate::context::governance_helpers_legacy::apply_pending_economic_policy_change_legacy(
+            supervisor,
+            context_id,
+            current_timestamp,
+        );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, apply_fut).await {
         Ok(Ok(applied)) => {
@@ -717,7 +725,7 @@ async fn handle_apply_pending_economic_policy_change(
 
 /// Handle [`GovernanceCommand::TombstoneMigratedContext`] — delegates
 /// to
-/// [`ContextManager::tombstone_migrated_context`](crate::context::governance_helpers::tombstone_migrated_context)
+/// [`ContextManager::tombstone_migrated_context`](crate::context::governance_helpers_legacy::tombstone_migrated_context_legacy)
 /// under a 30s timeout.
 async fn handle_tombstone_migrated_context(
     supervisor: &Supervisor,
@@ -725,7 +733,9 @@ async fn handle_tombstone_migrated_context(
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
     let tombstone_fut =
-        crate::context::governance_helpers::tombstone_migrated_context(supervisor, context_id);
+        crate::context::governance_helpers_legacy::tombstone_migrated_context_legacy(
+            supervisor, context_id,
+        );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, tombstone_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
@@ -748,7 +758,7 @@ async fn handle_tombstone_migrated_context(
 
 /// Handle [`GovernanceCommand::MigrationState`] — read-only, delegates
 /// to
-/// [`ContextManager::migration_state`](crate::context::governance_helpers::migration_state)
+/// [`ContextManager::migration_state`](crate::context::governance_helpers_legacy::migration_state_legacy)
 /// under a 30s timeout. The legacy method returns an `Option`
 /// (no error) — timeout is mapped to `TransportTimeout` on the reply
 /// side, consistent with other read handlers.
@@ -757,7 +767,8 @@ async fn handle_migration_state(
     context_id: &str,
     reply: oneshot::Sender<Result<Option<crate::context::state::MigrationState>, ContextError>>,
 ) -> Outcome<()> {
-    let migration_fut = crate::context::governance_helpers::migration_state(supervisor, context_id);
+    let migration_fut =
+        crate::context::governance_helpers_legacy::migration_state_legacy(supervisor, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, migration_fut).await {
         Ok(state) => (Outcome::ok(()), Ok(state)),
@@ -775,15 +786,16 @@ async fn handle_migration_state(
 }
 
 /// Handle [`GovernanceCommand::AcknowledgeCommitFault`] — delegates to
-/// [`ContextManager::acknowledge_commit_fault`](crate::context::governance_helpers::acknowledge_commit_fault)
+/// [`ContextManager::acknowledge_commit_fault`](crate::context::governance_helpers_legacy::acknowledge_commit_fault_legacy)
 /// under a 30s timeout.
 async fn handle_acknowledge_commit_fault(
     supervisor: &Supervisor,
     context_id: &str,
     reply: oneshot::Sender<Result<crate::context::state::CommitFaultMarker, ContextError>>,
 ) -> Outcome<()> {
-    let ack_fut =
-        crate::context::governance_helpers::acknowledge_commit_fault(supervisor, context_id);
+    let ack_fut = crate::context::governance_helpers_legacy::acknowledge_commit_fault_legacy(
+        supervisor, context_id,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, ack_fut).await {
         Ok(Ok(marker)) => (Outcome::ok_mutated(()), Ok(marker)),

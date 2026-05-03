@@ -85,7 +85,7 @@ use scp_protocol::trust::consequence::{ConsequenceRule, evaluate_consequence_rul
 
 use crate::context::ContextHandle;
 use crate::context::builder::ContextEventLogProvider;
-use crate::context::governance_helpers;
+use crate::context::governance_helpers_legacy;
 use crate::context::manager_methods;
 use crate::context::state::{
     self, PSEUDONYM_ANNOUNCEMENT_TAG, PerContextState, PseudonymAnnouncement,
@@ -636,7 +636,7 @@ pub async fn send_message_legacy(
         // mutation's MLS Commit failed to broadcast and exhausted
         // retries, messages encrypted under the divergent epoch may
         // be undecryptable by members who never received the Commit.
-        governance_helpers::check_commit_fault(ctx)?;
+        governance_helpers_legacy::check_commit_fault_legacy(ctx)?;
         // H7: check capability BEFORE budget deduction so a capability
         // failure doesn't leak budget. The suspension-aware
         // member_has_capability check handles both role-based and
