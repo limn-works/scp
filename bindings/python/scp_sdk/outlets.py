@@ -361,6 +361,138 @@ def outlet_catalog_rotation_validator(
 
 
 # ---------------------------------------------------------------------------
+# Streaming bridge helpers (SCP-OUT-037).
+# ---------------------------------------------------------------------------
+
+
+def verify_chunk_signature(
+    chunk_json: str,
+    operator_pk: bytes,
+    context_id: str,
+    outlet_id: str,
+    caveats_binding: bytes,
+) -> bool:
+    """Verify a chunk's ``SCP-OUTLET-CHUNK-SIG-V1:`` signature.
+
+    Pure helper — exposes the §5.4.5 per-chunk signature verifier
+    (SCP-OUT-037 AC10). ``chunk_json`` is the JSON serialisation of a
+    full :data:`OutletStreamChunk`; the bridge round-trips it through
+    the typed wire form so the verification path covers exactly the
+    bytes the operator signed.
+
+    Returns ``True`` when the signature is valid for the supplied
+    preimage components, ``False`` otherwise (including malformed
+    signatures, bad canonicalisation, or any preimage tamper).
+
+    Raises :class:`ValidationError` on malformed inputs (non-32-byte
+    public key / caveats_binding, malformed JSON).
+    """
+    bridge = _require_bridge()
+    try:
+        return bool(
+            bridge.verify_chunk_signature(
+                chunk_json,
+                operator_pk,
+                context_id,
+                outlet_id,
+                caveats_binding,
+            )
+        )
+    except Exception as exc:
+        raise _translate_bridge_error(exc) from exc
+
+
+def compute_caveats_binding(
+    *,
+    ucan_cid: bytes,
+    request_id: bytes,
+    invoker_did: str,
+    estimated_chunk_count: int,
+    effective_caveats: dict[str, Any],
+) -> bytes:
+    """Compute the §5.4.5 32-byte ``caveats_binding`` (SCP-OUT-037 AC11).
+
+    Hashes the ``SCP-OUTLET-CAVEAT-BIND-V1:`` preimage block byte-for-
+    byte: ``len_be32(ucan_cid) || ucan_cid || request_id ||
+    len_be32(invoker_did) || invoker_did ||
+    estimated_chunk_count_be || len_be32(canonical_jcs(caveats)) ||
+    canonical_jcs(caveats)``. The bridge runs RFC 8785 JCS over
+    ``effective_caveats`` (with the round-5 omit-none convention) so
+    SDK callers do not need an in-language JCS implementation.
+
+    Args:
+        ucan_cid: CID of the opening UCAN.
+        request_id: 16-byte stream ``request_id``.
+        invoker_did: Invoker DID string.
+        estimated_chunk_count: Invoker-declared upper bound on
+            billable chunks (``u32``).
+        effective_caveats: Dict matching the
+            :class:`InvocationCaveats` JSON shape (camelCase keys).
+
+    Returns:
+        32-byte SHA-256 hash.
+    """
+    if len(request_id) != 16:
+        raise ValidationError(
+            f"request_id must be exactly 16 bytes, got {len(request_id)}",
+            code="SCP-VALID-7000",
+        )
+    bridge = _require_bridge()
+    try:
+        result = bridge.compute_caveats_binding(
+            ucan_cid,
+            request_id,
+            invoker_did,
+            int(estimated_chunk_count),
+            json.dumps(effective_caveats),
+        )
+    except Exception as exc:
+        raise _translate_bridge_error(exc) from exc
+    return bytes(result)
+
+
+def _native_anext_blocking(stream_obj: Any) -> Any:
+    """Synchronously drive one step of the native PyO3 async iterator.
+
+    ``stream_obj`` is an ``OutletInvocationStream`` instance whose
+    ``__anext__`` returns a Python coroutine — but in our case the
+    bridge implementation is built against ``block_on`` so the
+    coroutine resolves immediately. We invoke ``__anext__`` in a
+    worker thread (via :func:`asyncio.to_thread` from the caller),
+    catch ``StopAsyncIteration``, and return ``None`` to signal
+    completion.
+    """
+    try:
+        return stream_obj.__anext__()
+    except StopAsyncIteration:
+        return None
+
+
+def _chunk_dict_to_dataclass(d: dict[str, Any]) -> OutletStreamChunk:
+    """Translate a bridge-emitted chunk dict to :class:`OutletStreamChunk`.
+
+    The bridge already builds variant-specific dicts (see
+    ``chunk_to_py_dict`` in ``crates/scp-ffi/src/outlet_stream.rs``).
+    This helper maps each variant onto the dataclass fields the SDK
+    expects.
+    """
+    return OutletStreamChunk(
+        request_id=bytes(d["request_id"]),
+        sequence=int(d["sequence"]),
+        payload_type=d["payload_type"],
+        value=d.get("value"),
+        pct=d.get("pct"),
+        note=d.get("note"),
+        aggregate=d.get("aggregate"),
+        provenance=d.get("provenance"),
+        execution_time_ms=d.get("execution_time_ms"),
+        code=d.get("code"),
+        message=d.get("message"),
+        terminal=d.get("terminal"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # InvocationHandle — dual consumption (await aggregate / async for chunks).
 # ---------------------------------------------------------------------------
 
@@ -377,11 +509,34 @@ class InvocationHandle:
 
     The two styles are mutually exclusive per handle: once one is chosen,
     the other raises :class:`ContextError` (API MAJOR 26).
+
+    SCP-OUT-037 control plane (PyO3 portion): when the handle is bound
+    to a ``request_id`` (set by :meth:`OutletNamespace.invoke_stream`)
+    the methods :meth:`grant_credit` and :meth:`cancel` route to the
+    bridge's ``outlet_stream_grant_credit`` / ``outlet_stream_cancel``
+    entry points. Handles produced by the legacy single-shot
+    :meth:`OutletNamespace.invoke` carry ``request_id is None`` and
+    raise :class:`ContextError` from the control-plane methods (the
+    one-shot bridge has no per-stream control surface).
     """
 
-    def __init__(self, chunks: asyncio.Queue[OutletStreamChunk | BaseException | None]) -> None:
+    def __init__(
+        self,
+        chunks: asyncio.Queue[OutletStreamChunk | BaseException | None],
+        *,
+        request_id: str | None = None,
+    ) -> None:
         self._chunks = chunks
         self._consumed: str | None = None
+        self._request_id = request_id
+
+    @property
+    def request_id(self) -> str | None:
+        """Hex-encoded §5.4.5 16-byte ``request_id`` for this stream.
+
+        ``None`` for legacy one-shot handles.
+        """
+        return self._request_id
 
     def _guard(self, mode: str) -> None:
         if self._consumed is not None and self._consumed != mode:
@@ -427,6 +582,64 @@ class InvocationHandle:
         if item.payload_type == "end":
             raise StopAsyncIteration
         return item
+
+    async def grant_credit(self, grant: int) -> int:
+        """Issue an additional ``grant`` chunks of credit (§5.4.5).
+
+        Internally constructs a signed ``OutletStreamCredit`` per
+        ``SCP-OUTLET-CREDIT-V1:`` and forwards it to the runtime via
+        the PyO3 bridge. ``grant == 0`` raises
+        :class:`OutletProtocolError` (the round-6 uniform InvalidGrant
+        rule).
+
+        Returns the new running credit total reported by the runtime.
+        """
+        if self._request_id is None:
+            raise ContextError(
+                "InvocationHandle has no request_id (one-shot invoke does not "
+                "support grant_credit); use invoke_stream instead",
+                code="SCP-CTX-2030",
+            )
+        bridge = _require_bridge()
+        try:
+            return await asyncio.to_thread(
+                bridge.outlet_stream_grant_credit,
+                self._request_id,
+                int(grant),
+            )
+        except Exception as exc:
+            raise _translate_bridge_error(exc) from exc
+
+    async def cancel(self, next_seq: int | None = None) -> int | None:
+        """Cancel an active stream (§5.4.5 cancellation + billing boundary).
+
+        ``next_seq`` is the receiver's view of the next-to-emit
+        sequence — passed verbatim to the runtime's
+        ``apply_outlet_cancel`` so the framework can record
+        ``cancel_ack_seq`` per §5.4.5. Defaults to ``0`` (the runtime
+        records its own current emission cursor; the SDK does not
+        track a per-stream sequence cursor — the framework's cursor is
+        authoritative).
+
+        Returns the recorded cancel-ack sequence, or ``None`` if the
+        stream had already terminated when the cancel arrived (the
+        runtime ignores the cancel per §5.4.5 idempotency rule).
+        """
+        if self._request_id is None:
+            raise ContextError(
+                "InvocationHandle has no request_id (one-shot invoke does not "
+                "support cancel); use invoke_stream instead",
+                code="SCP-CTX-2030",
+            )
+        bridge = _require_bridge()
+        try:
+            return await asyncio.to_thread(
+                bridge.outlet_stream_cancel,
+                self._request_id,
+                next_seq,
+            )
+        except Exception as exc:
+            raise _translate_bridge_error(exc) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -895,6 +1108,115 @@ class OutletNamespace:
         handle._pump_task = loop.create_task(_pump())  # type: ignore[attr-defined]
         return handle
 
+    def invoke_stream(
+        self,
+        outlet_id: str,
+        input: dict[str, Any],
+        ucan_token: str,
+        caveats_binding: bytes,
+        stream_epoch: int,
+        identity: Identity | None = None,
+        proof_tokens: list[str] | None = None,
+        credit_window: int | None = None,
+        estimated_chunk_count: int | None = None,
+    ) -> InvocationHandle:
+        """Open a §5.4.5 streaming outlet invocation (SCP-OUT-037).
+
+        Calls the PyO3 ``context_outlet_invoke_stream`` bridge directly,
+        wraps the resulting native async iterator in an
+        :class:`InvocationHandle`, and returns it. The handle's
+        :attr:`InvocationHandle.request_id` is the §5.4.5 16-byte
+        ``request_id`` rendered as 32-char lowercase hex — the lookup
+        key for :meth:`InvocationHandle.grant_credit` and
+        :meth:`InvocationHandle.cancel`.
+
+        Args:
+            outlet_id: Outlet to invoke.
+            input: JSON-serialisable dict matching the outlet's input
+                schema.
+            ucan_token: UCAN authorising the invocation; the bridge
+                re-runs the 11-step ADR-016 pipeline at open.
+            caveats_binding: 32-byte SHA-256 over the §5.4.5
+                ``SCP-OUTLET-CAVEAT-BIND-V1:`` preimage; pass the
+                output of :meth:`compute_caveats_binding`.
+            stream_epoch: Hosting context's MLS epoch counter at open
+                acceptance, pinned in the runtime's stream record so
+                every credit grant can commit it.
+            identity: Optional invoker identity; falls back to the
+                context creator DID.
+            proof_tokens: Optional encoded parent UCAN tokens for
+                delegation chain traversal (ADR-016 step 3).
+            credit_window: Optional initial credit window override;
+                defaults to §5.4.5 ``DEFAULT_CREDIT_WINDOW`` (32) on
+                the bridge side.
+            estimated_chunk_count: Optional invoker-declared upper
+                bound on billable Data chunks; routes into the
+                §5.4.5 escrow-at-open computation.
+
+        Returns:
+            An :class:`InvocationHandle` that yields chunks via
+            ``async for chunk in handle:`` and supports control-plane
+            methods :meth:`InvocationHandle.grant_credit` and
+            :meth:`InvocationHandle.cancel`.
+        """
+        if len(caveats_binding) != 32:
+            raise ValidationError(
+                f"caveats_binding must be exactly 32 bytes, got {len(caveats_binding)}",
+                code="SCP-VALID-7000",
+            )
+        invoker_did = identity.did if identity is not None else self._creator_did
+        context_id = self._context_id
+        bridge = _require_bridge()
+        try:
+            stream_obj = bridge.context_outlet_invoke_stream(
+                context_id,
+                outlet_id,
+                input,
+                invoker_did,
+                ucan_token,
+                caveats_binding.hex(),
+                int(stream_epoch),
+                proof_tokens,
+                credit_window,
+                estimated_chunk_count,
+            )
+        except Exception as exc:
+            raise _translate_bridge_error(exc) from exc
+
+        request_id_hex = stream_obj.request_id
+
+        # Bridge the native PyO3 async iterator (one chunk per
+        # `__anext__`) into the asyncio.Queue InvocationHandle expects.
+        # We pump in the background so the handle's `_await_aggregate`
+        # / iterator paths are unchanged.
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+
+        async def _pump() -> None:
+            try:
+                while True:
+                    chunk_dict = await asyncio.to_thread(_native_anext_blocking, stream_obj)
+                    if chunk_dict is None:
+                        break
+                    chunk = _chunk_dict_to_dataclass(chunk_dict)
+                    q.put_nowait(chunk)
+                    if chunk.payload_type in ("end",):
+                        break
+                    if chunk.payload_type == "error" and chunk.terminal:
+                        break
+            except Exception as exc:
+                q.put_nowait(_translate_bridge_error(exc))
+            finally:
+                q.put_nowait(None)
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        handle = InvocationHandle(q, request_id=request_id_hex)
+        handle._pump_task = loop.create_task(_pump())  # type: ignore[attr-defined]
+        return handle
+
     async def update(
         self,
         outlet_id: str,
@@ -1059,5 +1381,7 @@ __all__ = [
     "OutletStreamChunk",
     "SessionId",
     "TestVector",
+    "compute_caveats_binding",
     "new_session_id",
+    "verify_chunk_signature",
 ]
