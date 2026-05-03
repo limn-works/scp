@@ -130,6 +130,13 @@ pub mod event_log;
 pub mod identity;
 pub mod mcp;
 pub mod media;
+// SCP-OUT-037 streaming bridge — feature-gated because the credit-grant
+// signing path requires `with_identity` which is only available with
+// `allow_in_memory_custody`. Production custody backends (file,
+// keychain, keystore) ship under different features and will expose
+// streaming through their own signing surfaces in a follow-up.
+#[cfg(feature = "allow_in_memory_custody")]
+pub mod outlet_stream;
 pub mod outlets;
 pub mod provenance;
 pub mod runtime;

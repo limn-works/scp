@@ -38,6 +38,7 @@ import type {
   Bridge,
   BridgeContextHandle,
   BridgeIdentityHandle,
+  BridgeOutletInvocationStream,
   BridgeTransportHandle,
   MessageCallback,
 } from "./bridge";
@@ -1421,6 +1422,65 @@ export function createWasmBridge(): Bridge {
         "toolSessionClose is not available in the WASM bridge (ADR-034). " +
           "Use the native (NAPI) bridge for stateful tool sessions.",
         "SCP-TOOL-6040",
+      );
+    },
+
+    // SCP-OUT-037 — §5.4.5 streaming surface (NAPI-only until WASM portion lands)
+    async contextOutletInvokeStream(
+      _handle: BridgeContextHandle,
+      _outletId: string,
+      _inputJson: string,
+      _identityDid: string,
+      _ucanToken: string,
+      _caveatsBindingHex: string,
+      _streamEpoch: number,
+      _proofTokens?: readonly string[],
+      _creditWindow?: number,
+      _estimatedChunkCount?: number,
+    ): Promise<BridgeOutletInvocationStream> {
+      throw new OutletError(
+        "streaming outlet invocation is not yet implemented in the WASM bridge",
+        "SCP-TOOL-6020",
+      );
+    },
+
+    async outletStreamGrantCredit(_requestIdHex: string, _grant: number): Promise<number> {
+      throw new OutletError(
+        "streaming outlet invocation is not yet implemented in the WASM bridge",
+        "SCP-TOOL-6020",
+      );
+    },
+
+    async outletStreamCancel(_requestIdHex: string, _nextSeq?: number): Promise<number | null> {
+      throw new OutletError(
+        "streaming outlet invocation is not yet implemented in the WASM bridge",
+        "SCP-TOOL-6020",
+      );
+    },
+
+    async verifyChunkSignature(
+      _chunkJson: string,
+      _operatorPk: Uint8Array,
+      _contextId: string,
+      _outletId: string,
+      _caveatsBinding: Uint8Array,
+    ): Promise<boolean> {
+      throw new OutletError(
+        "streaming outlet invocation is not yet implemented in the WASM bridge",
+        "SCP-TOOL-6020",
+      );
+    },
+
+    async computeCaveatsBinding(
+      _ucanCid: Uint8Array,
+      _requestId: Uint8Array,
+      _invokerDid: string,
+      _estimatedChunkCount: number,
+      _effectiveCaveatsJson: string,
+    ): Promise<Uint8Array> {
+      throw new OutletError(
+        "streaming outlet invocation is not yet implemented in the WASM bridge",
+        "SCP-TOOL-6020",
       );
     },
 

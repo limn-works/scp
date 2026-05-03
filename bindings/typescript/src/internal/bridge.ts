@@ -314,6 +314,83 @@ export interface Bridge {
   ): Promise<string>;
   toolSessionClose(handle: BridgeContextHandle, sessionId: string): Promise<void>;
 
+  // ---------------------------------------------------------------------------
+  // §5.4.5 progressive-output streaming (SCP-OUT-037).
+  //
+  // Only the NAPI bridge implements these for now. The WASM bridge throws
+  // `OutletError` with code `SCP-TOOL-6020` and message
+  // `"streaming outlet invocation is not yet implemented in the WASM bridge"`
+  // until the WASM portion of SCP-OUT-037 lands. SDK callers that need
+  // streaming must therefore run on the native (NAPI) bridge.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Opens a §5.4.5 streaming outlet invocation and returns a JS object
+   * that satisfies the async-iterator protocol via its `next()` method
+   * plus a `requestId` getter for the §5.4.5 16-byte `request_id`
+   * (rendered as 32-char lowercase hex).
+   *
+   * Per AC3 the returned object is wrapped at the SDK layer to surface
+   * `Symbol.asyncIterator` (the napi-rs `#[napi]` macro does not expose
+   * Symbol-keyed methods directly, so the iterator-protocol shim lives
+   * in the SDK).
+   */
+  contextOutletInvokeStream(
+    handle: BridgeContextHandle,
+    outletId: string,
+    inputJson: string,
+    identityDid: string,
+    ucanToken: string,
+    caveatsBindingHex: string,
+    streamEpoch: number,
+    proofTokens?: readonly string[],
+    creditWindow?: number,
+    estimatedChunkCount?: number,
+  ): Promise<BridgeOutletInvocationStream>;
+
+  /**
+   * Signs and applies an `OutletStreamCredit` grant against an active
+   * stream (§5.4.5 SCP-OUTLET-CREDIT-V1). Returns the new total credit
+   * remaining at the executor.
+   */
+  outletStreamGrantCredit(requestIdHex: string, grant: number): Promise<number>;
+
+  /**
+   * Applies an `OutletCancel` to an active stream (§5.4.5 cancel-ack).
+   * Returns the recorded `cancel_ack_seq`, or `null` if the stream had
+   * already terminated when the cancel arrived (idempotent).
+   */
+  outletStreamCancel(requestIdHex: string, nextSeq?: number): Promise<number | null>;
+
+  /**
+   * Verifies a chunk's `SCP-OUTLET-CHUNK-SIG-V1:` signature
+   * (§5.4.5 per-chunk operator signature block). `chunkJson` is the
+   * canonical JSON of the full `OutletStreamChunk`. Returns `true` for
+   * valid signatures, `false` otherwise. Throws on malformed inputs
+   * (wrong-length pubkey / caveats_binding, malformed JSON).
+   */
+  verifyChunkSignature(
+    chunkJson: string,
+    operatorPk: Uint8Array,
+    contextId: string,
+    outletId: string,
+    caveatsBinding: Uint8Array,
+  ): Promise<boolean>;
+
+  /**
+   * Recomputes the §5.4.5 `caveats_binding` 32-byte SHA-256 over the
+   * `SCP-OUTLET-CAVEAT-BIND-V1:` preimage. The bridge runs RFC 8785 JCS
+   * over `effectiveCaveatsJson` so SDK callers do not need an
+   * in-language JCS implementation. Returns 32 bytes.
+   */
+  computeCaveatsBinding(
+    ucanCid: Uint8Array,
+    requestId: Uint8Array,
+    invokerDid: string,
+    estimatedChunkCount: number,
+    effectiveCaveatsJson: string,
+  ): Promise<Uint8Array>;
+
   // Transport
   transportConnect(relayUrl: string): Promise<BridgeTransportHandle>;
   transportStatus(handle: BridgeTransportHandle): Promise<TransportStatus>;
@@ -674,6 +751,51 @@ export interface BridgeContextHandle {
 export interface BridgeTransportHandle {
   readonly isConnected: boolean;
   readonly relayUrl: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// §5.4.5 streaming bridge types (SCP-OUT-037)
+// ---------------------------------------------------------------------------
+
+/**
+ * One chunk yielded by `BridgeOutletInvocationStream.next()`.
+ *
+ * Mirrors the §5.4.5 wire form on a per-variant basis. SDK callers branch
+ * on `payloadType` and read variant fields directly. `sequence` and
+ * `executionTimeMs` are surfaced as `number` (lossless within `2^53`).
+ */
+export interface BridgeOutletStreamChunk {
+  readonly requestId: Uint8Array;
+  readonly sequence: number;
+  readonly sig: Uint8Array;
+  readonly payloadType: "data" | "progress" | "end" | "error";
+  readonly valueJson?: string;
+  readonly pct?: number;
+  readonly note?: string;
+  readonly aggregateJson?: string;
+  readonly provenanceJson?: string;
+  readonly executionTimeMs?: number;
+  readonly code?: string;
+  readonly message?: string;
+  readonly terminal?: boolean;
+}
+
+/**
+ * Async-iterator-shaped handle returned by `contextOutletInvokeStream`.
+ *
+ * `next()` resolves to the next chunk or `null` at end-of-stream (terminal
+ * `End` / `Error{terminal:true}` chunk, cancellation, or receiver close).
+ * `requestId` is the §5.4.5 16-byte `request_id` rendered as 32-char
+ * lowercase hex — used to address the stream from `outletStreamGrantCredit`
+ * and `outletStreamCancel`.
+ *
+ * The SDK wraps this object in an `AsyncIterable` adapter that surfaces
+ * `Symbol.asyncIterator` (the napi-rs `#[napi]` macro does not expose
+ * Symbol-keyed methods directly).
+ */
+export interface BridgeOutletInvocationStream {
+  readonly requestId: string;
+  next(): Promise<BridgeOutletStreamChunk | null>;
 }
 
 // ---------------------------------------------------------------------------

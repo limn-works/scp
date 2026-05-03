@@ -14,6 +14,7 @@ import type {
   Bridge,
   BridgeContextHandle,
   BridgeIdentityHandle,
+  BridgeOutletInvocationStream,
   BridgeTransportHandle,
   MessageCallback,
 } from "../src/internal/bridge";
@@ -627,6 +628,61 @@ export function createMockBridge(): Bridge & {
         throw new Error(`[SCP-TOOL-6021] Session '${sessionId}' not found`);
       }
       ctx.sessions.delete(sessionId);
+    },
+
+    // SCP-OUT-037 — streaming surface (mock throws; tests that exercise
+    // streaming hit the real NAPI bridge via the createNativeBridge path)
+    async contextOutletInvokeStream(
+      _handle: BridgeContextHandle,
+      _outletId: string,
+      _inputJson: string,
+      _identityDid: string,
+      _ucanToken: string,
+      _caveatsBindingHex: string,
+      _streamEpoch: number,
+      _proofTokens?: readonly string[],
+      _creditWindow?: number,
+      _estimatedChunkCount?: number,
+    ): Promise<BridgeOutletInvocationStream> {
+      throw new Error(
+        "[SCP-TOOL-6020] streaming outlet invocation is not implemented in the mock bridge",
+      );
+    },
+
+    async outletStreamGrantCredit(_requestIdHex: string, _grant: number): Promise<number> {
+      throw new Error(
+        "[SCP-TOOL-6020] streaming outlet invocation is not implemented in the mock bridge",
+      );
+    },
+
+    async outletStreamCancel(_requestIdHex: string, _nextSeq?: number): Promise<number | null> {
+      throw new Error(
+        "[SCP-TOOL-6020] streaming outlet invocation is not implemented in the mock bridge",
+      );
+    },
+
+    async verifyChunkSignature(
+      _chunkJson: string,
+      _operatorPk: Uint8Array,
+      _contextId: string,
+      _outletId: string,
+      _caveatsBinding: Uint8Array,
+    ): Promise<boolean> {
+      throw new Error(
+        "[SCP-TOOL-6020] streaming outlet invocation is not implemented in the mock bridge",
+      );
+    },
+
+    async computeCaveatsBinding(
+      _ucanCid: Uint8Array,
+      _requestId: Uint8Array,
+      _invokerDid: string,
+      _estimatedChunkCount: number,
+      _effectiveCaveatsJson: string,
+    ): Promise<Uint8Array> {
+      throw new Error(
+        "[SCP-TOOL-6020] streaming outlet invocation is not implemented in the mock bridge",
+      );
     },
 
     // Transport
