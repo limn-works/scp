@@ -544,17 +544,34 @@ pub fn commit_economy_ticket(
 /// Consumes the ticket so the `Drop` guard does not fire.
 pub fn rollback_economy_ticket_inline(
     ctx: &mut super::state::PerContextState,
+    ticket: EconomyTicket,
+) {
+    rollback_economy_ticket_inline_split(&mut ctx.governance, ticket);
+}
+
+/// Actor-shape entry point for in-lock rollback. Drives the same body
+/// as [`rollback_economy_ticket_inline`] but accepts a borrowed
+/// [`super::state::GovernanceState`] directly so the actor can call
+/// without going through the legacy [`super::state::PerContextState`].
+///
+/// ADR-049 Phase 2A.7 — added so the actor-shape `messaging_helpers`
+/// can drain `EconomyTicket`s on Phase 1 error paths without the
+/// supervisor lock.
+///
+/// Consumes the ticket so the `Drop` guard does not fire.
+pub fn rollback_economy_ticket_inline_split(
+    governance: &mut super::state::GovernanceState,
     mut ticket: EconomyTicket,
 ) {
     ticket.consumed = true;
-    ctx.governance
+    governance
         .velocity_tracker
         .rollback(&ticket.actor_did, ticket.velocity_token);
     if ticket.needs_hard_rate_limit_refund {
-        ctx.governance.hard_rate_limit.refund(&ticket.actor_did);
+        governance.hard_rate_limit.refund(&ticket.actor_did);
     }
     if let Some(cost) = ticket.deducted_cost {
-        ctx.governance
+        governance
             .budget_tracker
             .reverse_spend(&ticket.actor_did, cost);
     }

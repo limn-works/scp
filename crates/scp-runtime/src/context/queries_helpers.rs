@@ -769,33 +769,69 @@ pub fn create_checkpoint_if_due(
     let clock = supervisor.clock_ref()?;
     let event_log = supervisor.event_log_ref()?;
     let now = clock.now_secs();
-    let events_due = ctx.checkpoint_events_since >= 50;
+    create_checkpoint_if_due_split(
+        context_id,
+        ctx.broadcast_context.is_none(),
+        ctx.epoch.mls_epoch,
+        &mut ctx.checkpoints,
+        &mut ctx.checkpoint_events_since,
+        &mut ctx.checkpoint_last_time_secs,
+        sender_did,
+        signing_key,
+        now,
+        event_log.as_ref(),
+    )
+}
+
+/// Actor-shape entry point for the checkpoint-due check + creation.
+/// Drives the same body as [`create_checkpoint_if_due`] but accepts
+/// borrowed state subfields directly so the actor can call without
+/// going through the legacy [`PerContextState`].
+///
+/// ADR-049 Phase 2A.7 — added so the actor-shape `messaging_helpers`
+/// can drive checkpoint creation against actor-owned state. `now` is
+/// supplied by the caller so the actor can use `deps.clock.now_secs()`
+/// directly.
+#[allow(clippy::too_many_arguments)] // Required to avoid a per-call wrapper struct allocation.
+pub fn create_checkpoint_if_due_split(
+    context_id: &str,
+    broadcast_context_is_none: bool,
+    mls_epoch: u64,
+    checkpoints: &mut Vec<scp_event_log::checkpoint::ConsistencyCheckpoint>,
+    checkpoint_events_since: &mut u64,
+    checkpoint_last_time_secs: &mut u64,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+    now: u64,
+    event_log: &dyn ContextEventLogProvider,
+) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
+    let events_due = *checkpoint_events_since >= 50;
     // Time-based checkpoints require at least one event — creating a
     // checkpoint for zero events is wasteful and indistinguishable from
     // the previous checkpoint.
     let time_due =
-        ctx.checkpoint_events_since > 0 && now.saturating_sub(ctx.checkpoint_last_time_secs) >= 600;
+        *checkpoint_events_since > 0 && now.saturating_sub(*checkpoint_last_time_secs) >= 600;
 
     if !events_due && !time_due {
         return None;
     }
 
-    let cp = build_checkpoint(
+    let cp = build_checkpoint_split(
         context_id,
-        ctx,
+        broadcast_context_is_none,
+        mls_epoch,
         sender_did,
         signing_key,
         now,
-        event_log.as_ref(),
+        event_log,
     );
 
-    ctx.checkpoint_events_since = 0;
-    ctx.checkpoint_last_time_secs = now;
-    ctx.checkpoints.push(cp.clone());
+    *checkpoint_events_since = 0;
+    *checkpoint_last_time_secs = now;
+    checkpoints.push(cp.clone());
 
-    if ctx.checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
-        ctx.checkpoints
-            .drain(..ctx.checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
+    if checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
+        checkpoints.drain(..checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
     }
 
     tracing::debug!(
@@ -869,6 +905,29 @@ fn build_checkpoint(
     now: u64,
     event_log: &dyn ContextEventLogProvider,
 ) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+    build_checkpoint_split(
+        context_id,
+        ctx.broadcast_context.is_none(),
+        ctx.epoch.mls_epoch,
+        sender_did,
+        signing_key,
+        now,
+        event_log,
+    )
+}
+
+/// Field-disjoint variant of [`build_checkpoint`] used by both the
+/// legacy [`create_checkpoint_if_due`] and the actor-shape
+/// [`create_checkpoint_if_due_split`].
+fn build_checkpoint_split(
+    context_id: &str,
+    broadcast_context_is_none: bool,
+    mls_epoch: u64,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+    now: u64,
+    event_log: &dyn ContextEventLogProvider,
+) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
     let context_id_bytes = context_id_to_bytes(context_id);
     let merkle_root = event_log
         .event_log_merkle_root(&context_id_bytes)
@@ -881,8 +940,8 @@ fn build_checkpoint(
 
     // Encrypted contexts (no broadcast_context) use MLS epochs; broadcast
     // contexts do not use MLS and have no meaningful epoch.
-    let epoch = if ctx.broadcast_context.is_none() {
-        Some(ctx.epoch.mls_epoch)
+    let epoch = if broadcast_context_is_none {
+        Some(mls_epoch)
     } else {
         None
     };

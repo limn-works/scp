@@ -5,14 +5,15 @@
 use scp_identity::DID;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::governance::GovernanceAction;
-use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::membership::{ContextEvent, MembershipState, ReceiveBuffer};
 use scp_protocol::context::params::{Capability, GovernanceModel};
 use scp_protocol::context::roles;
+use scp_protocol::context::roles::ContextRoleState;
 use scp_protocol::trust::consequence::{
     ConsequenceRule, TriggeredConsequence, evaluate_consequence_rules,
 };
 
-use super::state::{PerContextState, context_id_to_bytes};
+use super::state::{GovernanceState, PerContextState, context_id_to_bytes, emit_event_into};
 
 // ---------------------------------------------------------------------------
 // RuntimeConsequenceDispatcher — bridges PerContextState to the shared trait
@@ -169,6 +170,44 @@ fn append_consequence_event(
     }
 }
 
+/// Field-disjoint mutable borrows of the per-context state needed by
+/// the consequence-enforcement chain.
+///
+/// Both [`super::state::PerContextState`] (legacy) and
+/// [`crate::context::actor::state::PerContextState`] (actor) implement
+/// the same `governance: GovernanceState`, `role_state: ContextRoleState`,
+/// `membership: MembershipState`, `receive_buffer: ReceiveBuffer`, and
+/// `checkpoint_events_since: u64` fields with identical types. Splitting
+/// the borrows here lets the enforcement helpers stay generic over the
+/// parent state struct while preserving Rust's ability to disjointly
+/// borrow each subfield (a single trait method returning `&mut Self`
+/// would block the multiple mutable borrows the body actually needs).
+///
+/// ADR-049 Phase 2A.7 — added so the actor-shape `messaging_helpers`
+/// can drive the same enforcement pipeline as the legacy
+/// `&Supervisor`-shape `messaging_helpers_legacy` without duplicating
+/// the ~300 lines of consequence dispatch + escalation logic.
+pub struct ConsequenceStateSplit<'a> {
+    pub governance: &'a mut GovernanceState,
+    pub role_state: &'a mut ContextRoleState,
+    pub membership: &'a MembershipState,
+    pub receive_buffer: &'a mut ReceiveBuffer,
+    pub checkpoint_events_since: &'a mut u64,
+}
+
+impl<'a> ConsequenceStateSplit<'a> {
+    /// Build a split-borrow from the legacy [`PerContextState`].
+    pub fn from_legacy(ctx: &'a mut PerContextState) -> Self {
+        Self {
+            governance: &mut ctx.governance,
+            role_state: &mut ctx.role_state,
+            membership: &ctx.membership,
+            receive_buffer: &mut ctx.receive_buffer,
+            checkpoint_events_since: &mut ctx.checkpoint_events_since,
+        }
+    }
+}
+
 /// Borrowed inputs for `enforce_triggered_consequences`. Bundling the
 /// providers, scope identifiers, and pre-evaluated rule data into one
 /// struct keeps the public function signature within the
@@ -215,16 +254,33 @@ pub fn enforce_triggered_consequences(
     ctx: &mut PerContextState,
     args: &EnforceConsequencesCtx<'_>,
 ) {
+    let mut split = ConsequenceStateSplit::from_legacy(ctx);
+    enforce_triggered_consequences_split(&mut split, args);
+}
+
+/// Actor-shape entry point for the consequence-enforcement chain. Drives
+/// the same body as [`enforce_triggered_consequences`] but accepts a
+/// pre-built [`ConsequenceStateSplit`] so the actor can construct the
+/// split-borrow directly from
+/// [`crate::context::actor::state::PerContextState`] without going
+/// through the legacy [`PerContextState`].
+///
+/// ADR-049 Phase 2A.7 — added so the actor-shape `messaging_helpers`
+/// can call the same enforcement pipeline.
+pub fn enforce_triggered_consequences_split(
+    state: &mut ConsequenceStateSplit<'_>,
+    args: &EnforceConsequencesCtx<'_>,
+) {
     let context_id_bytes = context_id_to_bytes(args.context_id);
     for consequence in args.triggered {
-        process_one_triggered_consequence(ctx, args, &context_id_bytes, consequence);
+        process_one_triggered_consequence(state, args, &context_id_bytes, consequence);
     }
 }
 
 /// Single-consequence body of [`enforce_triggered_consequences`].
 /// Extracted so the public function stays under `clippy::too_many_lines`.
 fn process_one_triggered_consequence(
-    ctx: &mut PerContextState,
+    state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     context_id_bytes: &[u8; 32],
     consequence: &TriggeredConsequence,
@@ -233,7 +289,7 @@ fn process_one_triggered_consequence(
     let now = args.now;
 
     // Cooldown tracking: skip if this rule fired within its window.
-    if let Some(&last_fired) = ctx.governance.cooldown_until.get(&consequence.rule_index)
+    if let Some(&last_fired) = state.governance.cooldown_until.get(&consequence.rule_index)
         && now < last_fired
     {
         return;
@@ -243,7 +299,7 @@ fn process_one_triggered_consequence(
     // there is no evidence that the member ever participated. Members
     // who left mid-flight after accumulating real evidence still emit
     // `ConsequenceTriggered` so observers see the behavioral signal.
-    let member_present = ctx.membership.contains(member_did);
+    let member_present = state.membership.contains(member_did);
     if !member_present && consequence.evidence.is_empty() {
         tracing::debug!(
             member = %member_did,
@@ -261,7 +317,7 @@ fn process_one_triggered_consequence(
     // Always emit `ConsequenceTriggered` (durable + buffer) regardless
     // of whether the member is still present.
     emit_consequence_triggered(
-        ctx,
+        state,
         args,
         context_id_bytes,
         consequence,
@@ -277,7 +333,7 @@ fn process_one_triggered_consequence(
             "skipping consequence enforcement: member is no longer present"
         );
         emit_absent_member_enforcement_failed(
-            ctx,
+            state,
             args,
             context_id_bytes,
             consequence,
@@ -287,12 +343,17 @@ fn process_one_triggered_consequence(
         return;
     }
 
-    let success =
-        dispatch_enforcement_action(ctx, member_did, consequence, args.clock, args.context_id);
+    let success = dispatch_enforcement_action(
+        state.role_state,
+        member_did,
+        consequence,
+        args.clock,
+        args.context_id,
+    );
 
     if !success {
         emit_failure_escalation(
-            ctx,
+            state,
             args,
             context_id_bytes,
             consequence,
@@ -304,14 +365,14 @@ fn process_one_triggered_consequence(
 
     // Record cooldown: prevent re-firing within the rule's window.
     if let Some(rule) = args.rules.get(consequence.rule_index) {
-        ctx.governance.cooldown_until.insert(
+        state.governance.cooldown_until.insert(
             consequence.rule_index,
             now.saturating_add(rule.window.as_secs()),
         );
     }
 
     emit_consequence_enforced_success(
-        ctx,
+        state,
         args,
         context_id_bytes,
         consequence,
@@ -333,7 +394,7 @@ const fn consequence_action_type(
 /// Emits a `ConsequenceTriggered` durable event log entry followed by
 /// the matching receive-buffer push (H4 ordering invariant).
 fn emit_consequence_triggered(
-    ctx: &mut PerContextState,
+    state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     context_id_bytes: &[u8; 32],
     consequence: &TriggeredConsequence,
@@ -354,7 +415,7 @@ fn emit_consequence_triggered(
         args.member_did,
         &payload,
     );
-    ctx.checkpoint_events_since += 1;
+    *state.checkpoint_events_since += 1;
     let event = ContextEvent::ConsequenceTriggered {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
@@ -362,7 +423,7 @@ fn emit_consequence_triggered(
         trigger_type: trigger_kind.to_owned(),
         action_type: action_type.to_owned(),
     };
-    ctx.emit_event(event, args.context_id, args.event_tx);
+    emit_event_into(state.receive_buffer, event, args.context_id, args.event_tx);
 }
 
 /// Emits a `ConsequenceEnforcementFailed` durable entry plus the matching
@@ -371,7 +432,7 @@ fn emit_consequence_triggered(
 /// [`emit_failure_escalation`] because no escalation is applied when the
 /// member is absent — there is nothing to escalate against.
 fn emit_absent_member_enforcement_failed(
-    ctx: &mut PerContextState,
+    state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     context_id_bytes: &[u8; 32],
     consequence: &TriggeredConsequence,
@@ -392,20 +453,20 @@ fn emit_absent_member_enforcement_failed(
         args.member_did,
         &payload,
     );
-    ctx.checkpoint_events_since += 1;
+    *state.checkpoint_events_since += 1;
     let event = ContextEvent::ConsequenceEnforced {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
         action_type: action_type.to_owned(),
         success: false,
     };
-    ctx.emit_event(event, args.context_id, args.event_tx);
+    emit_event_into(state.receive_buffer, event, args.context_id, args.event_tx);
 }
 
 /// Emits a `ConsequenceEnforced { success: true }` durable entry plus the
 /// matching receive-buffer push for the success path.
 fn emit_consequence_enforced_success(
-    ctx: &mut PerContextState,
+    state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     context_id_bytes: &[u8; 32],
     consequence: &TriggeredConsequence,
@@ -426,21 +487,21 @@ fn emit_consequence_enforced_success(
         args.member_did,
         &payload,
     );
-    ctx.checkpoint_events_since += 1;
+    *state.checkpoint_events_since += 1;
     let event = ContextEvent::ConsequenceEnforced {
         context_id: args.context_id.to_owned(),
         member_did: args.member_did.clone(),
         action_type: action_type.to_owned(),
         success: true,
     };
-    ctx.emit_event(event, args.context_id, args.event_tx);
+    emit_event_into(state.receive_buffer, event, args.context_id, args.event_tx);
 }
 
 /// Per-arm enforcement dispatch. Each match arm calls a named function as
 /// an `expression_statement` so the pipeline wiring gates can detect the
 /// `call_expression` per-variant.
 fn dispatch_enforcement_action(
-    ctx: &mut PerContextState,
+    role_state: &mut ContextRoleState,
     member_did: &DID,
     consequence: &TriggeredConsequence,
     clock: &dyn scp_primitives::Clock,
@@ -451,11 +512,11 @@ fn dispatch_enforcement_action(
             use scp_protocol::trust::consequence::EnforcementSeverity;
             match severity {
                 EnforcementSeverity::SuspendCapability { capabilities } => {
-                    enforce_suspend(ctx, member_did, capabilities)
+                    enforce_suspend(role_state, member_did, capabilities)
                 }
                 EnforcementSeverity::SuspendAccess => {
                     // SuspendAccess: suspend all capabilities via role_state.
-                    ctx.role_state.suspend_all(member_did.as_ref());
+                    role_state.suspend_all(member_did.as_ref());
                     true
                 }
                 EnforcementSeverity::RevokeAccess { .. }
@@ -476,7 +537,7 @@ fn dispatch_enforcement_action(
             }
         }
         scp_protocol::trust::consequence::ConsequenceAction::AssignRole { to_role } => {
-            enforce_assign_role(ctx, member_did, to_role, clock)
+            enforce_assign_role(role_state, member_did, to_role, clock)
         }
     }
 }
@@ -491,12 +552,15 @@ fn dispatch_enforcement_action(
 /// With the B1 unification, capabilities are typed [`Capability`] values
 /// (no string parsing needed). The previous string-based
 /// `parse_suspension_capability` round-trip is eliminated.
-fn enforce_suspend(ctx: &mut PerContextState, member_did: &DID, caps: &[Capability]) -> bool {
+fn enforce_suspend(
+    role_state: &mut ContextRoleState,
+    member_did: &DID,
+    caps: &[Capability],
+) -> bool {
     if caps.is_empty() {
         return false;
     }
-    ctx.role_state
-        .suspend_capabilities(member_did.as_ref(), caps.iter().cloned());
+    role_state.suspend_capabilities(member_did.as_ref(), caps.iter().cloned());
     true
 }
 
@@ -510,12 +574,12 @@ fn enforce_suspend(ctx: &mut PerContextState, member_did: &DID, caps: &[Capabili
 /// capability check — the governance engine must be able to demote members
 /// regardless of which member (if any) currently holds `RoleAssign`.
 fn enforce_assign_role(
-    ctx: &mut PerContextState,
+    role_state: &mut ContextRoleState,
     member_did: &DID,
     to_role: &str,
     clock: &dyn scp_primitives::Clock,
 ) -> bool {
-    roles::system_assign_role(&mut ctx.role_state, member_did, to_role, clock).is_ok()
+    roles::system_assign_role(role_state, member_did, to_role, clock).is_ok()
 }
 
 /// H10 + H4: when enforcement fails, escalate to `SuspendAll` AND emit two
@@ -523,7 +587,7 @@ fn enforce_assign_role(
 /// `ConsequenceEscalatedToSuspendAll`) so an audit can reconstruct
 /// (a) which action failed and (b) that escalation was applied.
 fn emit_failure_escalation(
-    ctx: &mut PerContextState,
+    state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
     context_id_bytes: &[u8; 32],
     consequence: &TriggeredConsequence,
@@ -541,7 +605,7 @@ fn emit_failure_escalation(
 
     // H10: escalate to SuspendAll when enforcement fails.
     // Skip cooldown on failure so the escalation fires immediately.
-    ctx.role_state.suspend_all(member_did.as_ref());
+    state.role_state.suspend_all(member_did.as_ref());
 
     // First the failure record, then the escalation record. Both go to
     // the durable log before the receive buffer push.
@@ -559,7 +623,7 @@ fn emit_failure_escalation(
         member_did,
         &failed_payload,
     );
-    ctx.checkpoint_events_since += 1;
+    *state.checkpoint_events_since += 1;
     let escalation_payload = consequence_event_payload(
         member_did,
         consequence.rule_index,
@@ -574,14 +638,14 @@ fn emit_failure_escalation(
         member_did,
         &escalation_payload,
     );
-    ctx.checkpoint_events_since += 1;
+    *state.checkpoint_events_since += 1;
     let event = ContextEvent::ConsequenceEnforced {
         context_id: context_id.to_owned(),
         member_did: member_did.clone(),
         action_type: "SuspendAll(escalated)".to_owned(),
         success: true,
     };
-    ctx.emit_event(event, context_id, args.event_tx);
+    emit_event_into(state.receive_buffer, event, context_id, args.event_tx);
 }
 
 /// Converts receive buffer events into `scp_event_log::Event` format for
@@ -665,9 +729,26 @@ const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 /// `ContextEventLogProvider::event_log_entries()` returns `EventLogEntry`,
 /// not the raw `scp_event_log::Event` that consequence rules consume. The
 /// conversion is done here, bridging the gap between the two formats.
-#[allow(clippy::too_many_lines)]
 pub fn event_log_entries_for_consequences(
     ctx: &PerContextState,
+    context_id: &str,
+    now: u64,
+    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+) -> Vec<scp_event_log::Event> {
+    event_log_entries_for_consequences_split(&ctx.receive_buffer, context_id, now, event_log)
+}
+
+/// Actor-shape entry point for the event-log + receive-buffer merge used
+/// by consequence enforcement. Drives the same body as
+/// [`event_log_entries_for_consequences`] but accepts a borrowed
+/// [`ReceiveBuffer`] directly so the actor can call without going through
+/// the legacy [`PerContextState`].
+///
+/// ADR-049 Phase 2A.7 — added so the actor-shape `messaging_helpers`
+/// can run consequence evaluation against actor-owned buffers.
+#[allow(clippy::too_many_lines)]
+pub fn event_log_entries_for_consequences_split(
+    receive_buffer: &ReceiveBuffer,
     context_id: &str,
     now: u64,
     event_log: &dyn crate::context::builder::ContextEventLogProvider,
@@ -735,7 +816,7 @@ pub fn event_log_entries_for_consequences(
     // only add buffer events whose estimated timestamp is newer than the
     // last event log entry.
     let last_log_ts = events.last().map_or(0, |e| e.timestamp);
-    let all_buffer_events = ctx.receive_buffer.event_log_entries();
+    let all_buffer_events = receive_buffer.event_log_entries();
     let buffer_len = all_buffer_events.len() as u64;
     let next_seq = events.len() as u64;
 

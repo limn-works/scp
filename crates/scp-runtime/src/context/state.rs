@@ -1450,6 +1450,39 @@ impl PerContextState {
     }
 }
 
+/// Pushes a [`ContextEvent`] into the receive buffer and, when a broadcast
+/// channel is provided, sends a sanitized copy on it too.
+///
+/// Free-function form of `PerContextState::emit_event` (legacy) and the
+/// per-helper `emit_event` shims (broadcast, ttl_close). Used by both the
+/// legacy state and the actor [`crate::context::actor::state::PerContextState`]
+/// so the WelcomeGenerated suppression and payload-stripping invariants
+/// stay in one place. ADR-049 Phase 2A.7 — extracted so messaging-domain
+/// helpers can emit events without going through a wrapper method.
+///
+/// **Security invariants (mirrors `PerContextState::emit_event`):**
+/// - `WelcomeGenerated` events carry MLS key material and are NEVER sent
+///   on the broadcast channel (receive buffer only).
+/// - `MessageReceived` / `MessageSent` payloads are stripped (replaced
+///   with empty `Vec`) before broadcast.
+pub(crate) fn emit_event_into(
+    receive_buffer: &mut ReceiveBuffer,
+    event: ContextEvent,
+    context_id: &str,
+    tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+) {
+    if matches!(event, ContextEvent::WelcomeGenerated { .. }) {
+        receive_buffer.push(event);
+        return;
+    }
+
+    receive_buffer.push(event.clone());
+    if let Some(tx) = tx {
+        let sanitized = strip_event_payload(&event);
+        let _ = tx.send((context_id.to_owned(), sanitized));
+    }
+}
+
 /// Strips decrypted plaintext from event variants that carry message payloads.
 ///
 /// The broadcast channel is observable by any subscriber (e.g., webhook
