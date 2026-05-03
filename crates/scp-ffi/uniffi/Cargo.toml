@@ -34,6 +34,11 @@ thiserror = { workspace = true }
 scp-core = { path = "../../scp-core" }
 scp-media = { path = "../../scp-media" }
 scp-primitives = { path = "../../scp-primitives" }
+# Direct deps for the streaming bridge (SCP-OUT-037) — needs typed access
+# to runtime stream-session types and protocol-level signing helpers and
+# error codes. Mirrors `scp-ffi/Cargo.toml` and `scp-ffi/napi/Cargo.toml`.
+scp-protocol = { path = "../../scp-protocol" }
+scp-runtime = { path = "../../scp-runtime" }
 scp-identity = { path = "../../scp-identity", features = ["production-dht"] }
 scp-event-log = { path = "../../scp-event-log" }
 scp-ffi-common = { path = "../common" }
@@ -73,6 +78,11 @@ tempfile = "3"
 [[test]]
 name = "e2e_bridge"
 path = "tests/e2e_bridge.rs"
+required-features = ["allow_in_memory_custody"]
+
+[[test]]
+name = "outlet_streaming"
+path = "tests/outlet_streaming.rs"
 required-features = ["allow_in_memory_custody"]
 
 [build-dependencies]

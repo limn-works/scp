@@ -68,6 +68,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 pub mod bridge;
+pub mod outlet_stream;
 pub mod runtime;
 pub mod scp;
 
@@ -255,6 +256,15 @@ pub use server::{
 // `SCP` — caller-owned bridge instance, exposed to Swift and Kotlin.
 pub use runtime::StorageConfig;
 pub use scp::Scp;
+
+// Outlet streaming surface (SCP-OUT-037 UniFFI portion). Re-exporting at
+// the crate root mirrors the bridge-level free-function pattern so
+// UniFFI scaffolding finds the symbols.
+pub use outlet_stream::{
+    OutletStreamChunkRecord, OutletStreamHandle, OutletStreamSubscriber, compute_caveats_binding,
+    outlet_invoke_stream, outlet_invoke_stream_with_subscriber, outlet_stream_cancel,
+    outlet_stream_grant_credit, verify_chunk_signature,
+};
 
 // Include the minimal UDL-generated scaffolding. The UDL file contains only
 // the namespace anchor. All types and functions are defined via proc-macros.

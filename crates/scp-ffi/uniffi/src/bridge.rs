@@ -4307,7 +4307,10 @@ pub async fn outlet_invoke(
 ///
 /// Runs the full 11-step ADR-016 pipeline, requiring `outlet_call:{outlet_id}`
 /// or `outlet_call:*` capability. Extracted to keep `outlet_invoke` focused.
-fn validate_outlet_ucan_uniffi(
+///
+/// `pub(crate)` so the streaming bridge (`crate::outlet_stream`) can re-use
+/// the same defense-in-depth validation before the runtime stream open.
+pub(crate) fn validate_outlet_ucan_uniffi(
     handle: &ContextHandle,
     outlet_id: &str,
     kind: scp_core::context::outlets::OutletKind,
