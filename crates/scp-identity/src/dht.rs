@@ -3320,38 +3320,68 @@ mod tests {
             .await
             .unwrap();
 
-        // Use the legitimate proof but a DIFFERENT new_did string.
-        let attacker_did = "did:dht:zsubstitutedDIDthatdoesnotmatchrevealedkeyXYZ";
+        // Step 2c isolation: hand-craft a `migration_proof_B` for an
+        // ATTACKER-CHOSEN `new_did_B`, signed with the OLD identity
+        // key (which the legitimate user / a custody-compromise
+        // attacker holds), then pair it with the LEGITIMATE
+        // `pre_rotation_proof` (revealed_key derives new_did_A, not
+        // new_did_B). With this construct:
+        //   - step 1 (signature) passes — we re-signed for new_did_B
+        //   - step 2a (SHA-256 invariant) passes — legit proof
+        //   - step 2b (commitment matches old doc) passes — legit proof
+        //   - step 2c (revealed_key derives new_did) MUST fail because
+        //     revealed_key = X.public derives new_did_A, not new_did_B
+        //
+        // This is the only path that exercises step 2c in isolation.
+        // The earlier "pass a different new_did with the legit
+        // migration_proof" path is rejected at step 1 because the
+        // signature won't verify for the substituted new_did.
+        let attacker_new_did =
+            "did:dht:zfakenewdidforstep2cisolationxxxxxxxxxxxxxxxxxxxxxxxxx".to_owned();
+
+        // Re-sign the migration digest for (old_did, attacker_new_did,
+        // rotated_at) using the old identity key. The old identity
+        // key is still in operational custody after migrate (only the
+        // pre-rotation handle is destroyed there).
+        let mut hasher = Sha256::new();
+        hasher.update(DOMAIN_MIGRATION_V1);
+        let old_len = u32::try_from(event.old_did.len()).unwrap();
+        let new_len = u32::try_from(attacker_new_did.len()).unwrap();
+        hasher.update(old_len.to_be_bytes());
+        hasher.update(event.old_did.as_bytes());
+        hasher.update(new_len.to_be_bytes());
+        hasher.update(attacker_new_did.as_bytes());
+        hasher.update(rotated_at.to_be_bytes());
+        let digest = hasher.finalize();
+
+        let resigned_sig = custody.sign(&identity.identity_key, &digest).await.unwrap();
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(resigned_sig.as_bytes());
+
+        let crafted_migration_proof = MigrationProof {
+            signature: sig_arr,
+            old_public_key: event.migration_proof.old_public_key,
+        };
+
         let result = verify_migration(
             &event.old_did,
             &document,
-            attacker_did,
-            &event.migration_proof,
+            &attacker_new_did,
+            &crafted_migration_proof,
             event.pre_rotation_proof.as_ref(),
-            event.rotated_at,
+            rotated_at,
         );
-        // The migration proof signature won't verify for the attacker's
-        // new_did either (the digest covers new_did), so we get a
-        // signature failure here BEFORE the binding check. That's fine
-        // — the migration_proof signature IS the binding for new_did
-        // when present. The binding check covers the no-signature
-        // case (a proof crafted with the legit migration_proof's
-        // matching new_did but a forged pre_rotation_proof).
-        assert!(result.is_err(), "different new_did MUST fail verification");
-
-        // Direct-coverage assertion: build a `PreRotationProof` whose
-        // revealed_key derives a DIFFERENT new_did than the one passed
-        // to verify_migration. The migration_proof matches the
-        // arguments (so step 1 passes), but step 2c rejects.
-        //
-        // To exercise this in isolation, sign a NEW migration proof
-        // for `new_did` derived from a wrong revealed_key, but pass
-        // the LEGITIMATE pre_rotation_proof (committed in old doc).
-        // The revealed_key in the legit proof correctly derives the
-        // legit new_did; the migration_proof was for that legit
-        // new_did. So passing the legit new_did argument here works.
-        // To trigger 2c, we'd need a custom-built proof — covered by
-        // the "different new_did" assertion above when both fail.
+        let err = result
+            .expect_err("step 2c MUST reject revealed_key not deriving new_did even when the migration_proof signs the attacker's new_did");
+        match err {
+            IdentityError::MigrationVerificationFailed(msg) => {
+                assert!(
+                    msg.contains("revealed_key derives DID"),
+                    "expected step 2c failure message, got: {msg}"
+                );
+            }
+            other => panic!("expected MigrationVerificationFailed, got: {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------
