@@ -210,7 +210,10 @@ describe("InvocationHandle", () => {
     expect(agg.value).toEqual({ result: 42 });
   });
 
-  it("async-iterates chunks (zero non-end chunks in the single-end pump)", async () => {
+  it("async-iterates chunks — yields the End chunk per OUT-038 AC14", async () => {
+    // OUT-038 AC14: iterator yields the End chunk (10 Data + End => 11
+    // chunks). The minimal pump emits only an `end` chunk so we expect
+    // exactly 1 chunk yielded with payloadType "end".
     const handle = new InvocationHandle((sink) => {
       queueMicrotask(() => sink.end({ value: { result: 1 } }));
     });
@@ -218,8 +221,9 @@ describe("InvocationHandle", () => {
     for await (const c of handle) {
       chunks.push(c);
     }
-    // The minimal pump emits only an `end` chunk; iteration stops before yielding it.
-    expect(chunks.every((c) => c.payloadType !== "end")).toBe(true);
+    expect(chunks.length).toBe(1);
+    expect(chunks[0]?.payloadType).toBe("end");
+    expect(chunks[0]?.aggregate).toEqual({ result: 1 });
   });
 
   it("rejects double consumption", async () => {
