@@ -2907,7 +2907,7 @@ pub async fn execute_extend_ttl(
 
     // Respawn the TTL timer with the updated remaining duration.
     if let Some(secs) = new_remaining {
-        crate::context::lifecycle_helpers::spawn_ttl_timer(
+        crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy(
             supervisor,
             context_id,
             std::time::Duration::from_secs(secs),
