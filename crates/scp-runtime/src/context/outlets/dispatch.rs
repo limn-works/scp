@@ -276,6 +276,16 @@ pub struct StreamSessionHandle {
     cancel_wake: Arc<Notify>,
     /// Receiver for the close summary the pump publishes once it has
     /// settled.
+    ///
+    /// The dispatch pump is the authoritative `OutletInvokedEvent`
+    /// emitter (§5.4.5 — owns the outer manifest), but
+    /// [`StreamCloseSummary`] additionally carries the
+    /// `(billed_amount, refund_amount)` pair that the event payload
+    /// does not — those values are economy-layer concerns the FFI
+    /// layer surfaces via `PaymentReceipt` (§19.15.5), not the audit
+    /// log. Tests and bridge surfaces that need the post-settlement
+    /// economy values consume this channel; the event-log audit path
+    /// uses the sink.
     summary_rx: Option<tokio::sync::oneshot::Receiver<StreamCloseSummary>>,
     /// Pinned `request_id` (used by `apply_outlet_cancel` to validate
     /// the inbound message).
@@ -309,7 +319,10 @@ impl StreamSessionHandle {
     }
 
     /// Detaches the close summary future. Resolves when the pump emits
-    /// the terminal chunk.
+    /// the terminal chunk. The summary carries the
+    /// `(billed_amount, refund_amount, billed_count)` triple plus the
+    /// outer chunk manifest — economy-layer values the
+    /// `OutletInvokedEvent` does not carry.
     pub const fn close_summary(
         &mut self,
     ) -> Option<tokio::sync::oneshot::Receiver<StreamCloseSummary>> {
@@ -510,6 +523,36 @@ fn build_shared_state(
     }))
 }
 
+/// Inputs required by the dispatch pump to emit the §5.4.5
+/// `OutletInvokedEvent` at settlement.
+///
+/// Bundled into a struct because the pump's spawn site already runs
+/// against the workspace's `clippy::too_many_arguments` ceiling — and
+/// because the event payload is logically one unit (the pre-snapshot
+/// of identifiers + the input hash + the start instant for execution
+/// timing).
+pub(crate) struct PumpEventEmissionInputs {
+    /// Sink that records the §5.4.5 `OutletInvokedEvent` exactly once
+    /// at terminal-chunk emission. `None` disables emission entirely
+    /// (legacy callers that do not append events to the log).
+    pub sink: Option<Arc<dyn OutletInvokedEventSink>>,
+    /// Hosting context id — committed into the event's request-id
+    /// hex preimage and to the SDK-facing audit log.
+    pub context_id: String,
+    /// Outlet id pinned at acceptance.
+    pub outlet_id: OutletId,
+    /// Immediate-previous-hop DID (the §5.4.5 `invoker_did`).
+    pub invoker_did: DID,
+    /// Pre-computed SHA-256 hex digest of the canonical-JSON input.
+    /// Snapshotted before the input is moved into `invoke_outlet` so
+    /// the recorded hash reflects what the executor saw, not a
+    /// post-mutation value.
+    pub input_hash: String,
+    /// `Instant` captured at acceptance — used to derive
+    /// `execution_time_ms` at terminal-chunk emission.
+    pub start: Instant,
+}
+
 /// Spawns the streaming pump task. Owns the `inner_rx` (chunks coming
 /// from the executor pump) and the `outer_tx` (chunks delivered to the
 /// caller).
@@ -524,6 +567,7 @@ fn spawn_pump_task(
     stream_credit_stall_secs: u32,
     stream_cancel_ack_secs: u32,
     request_id: RequestId,
+    event_inputs: PumpEventEmissionInputs,
 ) {
     let stream_credit_stall = Duration::from_secs(u64::from(stream_credit_stall_secs));
     let stream_cancel_ack = Duration::from_secs(u64::from(stream_cancel_ack_secs));
@@ -538,6 +582,7 @@ fn spawn_pump_task(
             stream_credit_stall,
             stream_cancel_ack,
             request_id,
+            event_inputs,
         )
         .await;
     });
@@ -618,7 +663,27 @@ where
     let grant_wake = Arc::new(Notify::new());
     let cancel_wake = Arc::new(Notify::new());
 
-    // Step 5: launch the underlying executor stream.
+    // §5.4.5 OutletInvokedEvent emission ownership: the dispatch pump
+    // is the authoritative emitter, NOT the inner `invoke_outlet`'s
+    // streaming task. The outer pump renumbers chunks and tracks its
+    // own `cancel_ack_seq`, so the inner manifest does NOT match what
+    // SDK consumers actually receive — recording from the inner path
+    // would commit a `stream_manifest_hash` that disagrees with the
+    // delivered stream. We therefore (i) pass `None` to the inner
+    // `invoke_outlet`'s sink, (ii) snapshot input_hash + identifiers
+    // before forwarding the input value, and (iii) emit the event
+    // ourselves in the pump settlement block over the outer
+    // `emitted_chunks` manifest.
+    let input_hash = scp_protocol::context::outlets::lifecycle::sha256_json(&input);
+    let event_context_id = context.context_id().to_owned();
+    let event_outlet_id: OutletId = outlet_id.clone();
+    let event_invoker_did: DID = invoker_did.clone();
+    let pump_start = Instant::now();
+
+    // Step 5: launch the underlying executor stream. Pass `None` for
+    // the sink — the dispatch pump emits the event itself at
+    // settlement time so the recorded manifest matches the chunks the
+    // outer pump delivered to the SDK.
     let inner_rx = invoke_outlet(
         context,
         registry,
@@ -630,7 +695,7 @@ where
         executor,
         misdeclaration_sink,
         handler_panic_sink,
-        invoked_event_sink,
+        None,
     )
     .await
     .map_err(|err| {
@@ -661,6 +726,14 @@ where
         params.stream_credit_stall_secs,
         params.stream_cancel_ack_secs,
         request_id,
+        PumpEventEmissionInputs {
+            sink: invoked_event_sink,
+            context_id: event_context_id,
+            outlet_id: event_outlet_id,
+            invoker_did: event_invoker_did,
+            input_hash,
+            start: pump_start,
+        },
     );
 
     Ok(StreamSessionHandle {
@@ -689,6 +762,7 @@ async fn run_stream_pump_v2(
     stream_credit_stall: Duration,
     stream_cancel_ack: Duration,
     request_id: RequestId,
+    event_inputs: PumpEventEmissionInputs,
 ) {
     let mut emitted_chunks: Vec<OutletStreamChunk> = Vec::new();
     let mut next_seq: u64 = 0;
@@ -908,6 +982,54 @@ async fn run_stream_pump_v2(
             manifest: emitted_chunks,
         }
     };
+
+    // §5.4.5 OutletInvokedEvent emission. The dispatch pump owns the
+    // outer manifest (renumbered, cancel-ack-truncated) — the only
+    // manifest that matches what SDK consumers actually received. We
+    // (i) verify `chunks_billed` against the manifest before emitting
+    // (matches the §5.4.5 wire-rejection rule the runtime applies at
+    // log-insert time, surfacing drift here rather than in the
+    // event-log appender), and (ii) record exactly one event per
+    // stream via the `OutletInvokedEventSink::record` trait method.
+    if let Some(sink) = event_inputs.sink.as_ref() {
+        if let Err(verify_err) = verify_summary_chunks_billed(&summary) {
+            // Self-consistency drift between the pump's recorded
+            // `billed_count` and the manifest-derivable reference. This
+            // would otherwise be a wire-rejection at event-log insert
+            // time (§5.4.5). Drop the event rather than emit a bogus
+            // record — the SDK already received the chunks, so the
+            // audit log staying silent is preferable to recording a
+            // self-inconsistent event the verifier will reject.
+            tracing::error!(
+                request_id = %hex::encode(request_id),
+                outlet_id = %event_inputs.outlet_id,
+                error = ?verify_err,
+                "OutletInvokedEvent dropped: chunks_billed mismatch against manifest"
+            );
+        } else {
+            let event = super::invoke::build_streaming_outlet_event(
+                request_id,
+                &event_inputs.outlet_id,
+                &event_inputs.invoker_did,
+                event_inputs.input_hash.clone(),
+                u64::try_from(event_inputs.start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                &summary.manifest,
+            );
+            sink.record(event);
+        }
+        // Suppress `event_inputs.context_id` unused-warning until the
+        // event payload extends to include it (currently the
+        // `OutletInvokedEvent` keys only on outlet/invoker/request_id;
+        // context-id is implicit in the event-log namespace per
+        // §5.14.10).
+        let _ = &event_inputs.context_id;
+    }
+
+    // Publish the close summary AFTER the event sink. Tests and
+    // economy-layer integrations consume `(billed_amount,
+    // refund_amount, billed_count)` here — values the
+    // `OutletInvokedEvent` does not carry (per §19.15.5
+    // PaymentReceipt).
     let _ = summary_tx.send(summary);
 }
 

@@ -2336,7 +2336,7 @@ where
 /// - `status`: legacy `OutletStatus` mirror of `stream_terminal_status`
 ///   (Success / Error). Present for backwards compatibility with
 ///   pre-SCP-OUT-035 readers.
-fn build_streaming_outlet_event(
+pub(crate) fn build_streaming_outlet_event(
     request_id: RequestId,
     outlet_id: &OutletId,
     invoker_did: &DID,
@@ -7097,6 +7097,127 @@ mod tests {
         let _: Option<RuntimeAdmissionCaps> = None;
         let _: Option<RuntimeStreamAdmissionTracker> = None;
         let _: Option<RuntimeStreamIdentity> = None;
+    }
+
+    /// Test (SCP-OUT-037 critical fix #1) — the dispatch pump emits
+    /// exactly one `OutletInvokedEvent` to the supplied
+    /// `OutletInvokedEventSink` at terminal-chunk emission, and the
+    /// recorded `chunks_billed` / `stream_manifest_hash` match the
+    /// outer manifest the SDK consumer received.
+    ///
+    /// Before the fix the pump constructed a `StreamCloseSummary`
+    /// for the (unused) summary channel but never invoked the event
+    /// sink, so streaming invocations completed with no audit event
+    /// and no `chunks_billed` commitment. The §5.4.5 wire-rejection
+    /// rule could not be enforced because there was no event to
+    /// reject.
+    #[tokio::test]
+    async fn out037_dispatch_pump_emits_outlet_invoked_event() {
+        // Executor that emits 3 Data chunks then End.
+        struct ThreeDataExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for ThreeDataExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                for i in 0..3u32 {
+                    let _ = tx
+                        .send(ChunkPayload::Data {
+                            value: serde_json::json!({ "tick": i }),
+                        })
+                        .await;
+                }
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(ThreeDataExecutor);
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x37; 32]);
+        let admission = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+        let params = out034_open_params(
+            &outlet_id_owned,
+            creator_did,
+            scp_protocol::economy::types::Amount::new(0),
+            scp_protocol::economy::types::Amount::new(0),
+            Some(8),
+            32,
+            signing.verifying_key(),
+        );
+
+        // Wire a real event sink — this is the surface the fix
+        // targets. The pump MUST invoke `record` exactly once at
+        // terminal-chunk emission.
+        let event_sink = StdArc::new(super::InMemoryOutletInvokedEventSink::new());
+
+        let mut handle = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            Some(StdArc::clone(&event_sink) as StdArc<dyn super::OutletInvokedEventSink>),
+            params,
+            StdArc::clone(&admission),
+        )
+        .await
+        .expect("open should succeed");
+
+        let rx = handle.receiver().expect("receiver");
+        let summary_rx = handle.close_summary().expect("summary");
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+        let summary = summary_rx.await.expect("summary publishes");
+
+        // Sanity: 3 Data + 1 End = 4 chunks.
+        assert_eq!(chunks.len(), 4, "three Data chunks plus terminal End");
+
+        // Drain the sink. The pump MUST have recorded exactly one
+        // event at terminal-chunk emission.
+        let recorded = event_sink.drain();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "dispatch pump records exactly one OutletInvokedEvent at terminal-chunk emission"
+        );
+        let event = &recorded[0];
+
+        // The recorded event MUST commit to the OUTER manifest the
+        // SDK received — chunks_billed matches summary.billed_count
+        // (which is the manifest-derived reference count) AND the
+        // stream_manifest_hash matches the manifest root over the
+        // outer chunk sequence.
+        assert_eq!(
+            event.chunks_billed, summary.billed_count,
+            "event chunks_billed matches outer manifest reference"
+        );
+        let expected_manifest_hash =
+            scp_protocol::context::outlets::stream::compute_chunk_manifest_root(&summary.manifest)
+                .expect("manifest root over outer chunks");
+        assert_eq!(
+            event.stream_manifest_hash, expected_manifest_hash,
+            "event stream_manifest_hash matches outer manifest root"
+        );
+
+        // The recorded event also passes the §5.4.5 wire-rejection
+        // self-check at log-insert time: chunks_billed equals the
+        // reference count derived from the manifest.
+        super::super::dispatch::verify_summary_chunks_billed(&summary)
+            .expect("dispatch summary passes §5.4.5 chunks_billed verification");
     }
 }
 

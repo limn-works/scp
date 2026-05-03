@@ -332,7 +332,7 @@ pub fn outlet_invoke_stream(
     caveats_binding_hex: String,
     stream_epoch: f64,
     _proof_tokens: Option<Vec<JsValue>>,
-    _credit_window: Option<u32>,
+    credit_window: Option<u32>,
     _estimated_chunk_count: Option<u32>,
 ) -> Promise {
     // Mirror `outlet_invoke`'s fail-closed gate — the WASM bridge
@@ -413,6 +413,13 @@ pub fn outlet_invoke_stream(
         let invoker_signing_key =
             crate::identity::export_signing_key(&identity_did).map_err(ScpWasmError::into_js)?;
 
+        // §5.4.5 credit-based backpressure: default to
+        // `stream_window_default` (32) when the SDK does not declare an
+        // explicit window. The value is pinned in the per-session
+        // record at acceptance.
+        let effective_credit_window =
+            credit_window.unwrap_or(scp_protocol::context::outlets::stream::DEFAULT_CREDIT_WINDOW);
+
         let request_id_hex = with_manager(|mgr| {
             mgr.open_outlet_stream(crate::manager::OpenOutletStreamParams {
                 context_id: &context_id,
@@ -422,6 +429,7 @@ pub fn outlet_invoke_stream(
                 caveats_binding,
                 stream_epoch: stream_epoch_u64,
                 invoker_signing_key,
+                credit_window: effective_credit_window,
             })
         })
         .map_err(ScpWasmError::into_js)?;
