@@ -2146,11 +2146,17 @@ impl crate::scp::PyScp {
     #[pyo3(name = "mcp_configure_stdio_allowlist", signature = (additional_binaries=vec![]))]
     #[allow(clippy::needless_pass_by_value)] // PyO3 requires owned Vec for method arguments.
     pub fn mcp_configure_stdio_allowlist(&self, additional_binaries: Vec<String>) -> PyResult<()> {
+        let instance_id = self.inner.core.instance_id();
         self.inner
             .core
             .with_mcp_allowlist(|a| a.configure(&additional_binaries))
             .map_err(|_| allowlist_lock_poisoned())?
             .map_err(allowlist_err)?;
+        tracing::info!(
+            instance_id,
+            added = ?additional_binaries,
+            "MCP stdio allowlist extended"
+        );
         Ok(())
     }
 
@@ -2185,10 +2191,12 @@ impl crate::scp::PyScp {
     /// Raises `TransportError` if the allowlist lock is poisoned.
     #[pyo3(name = "mcp_reset_stdio_allowlist")]
     pub fn mcp_reset_stdio_allowlist(&self) -> PyResult<()> {
+        let instance_id = self.inner.core.instance_id();
         self.inner
             .core
             .with_mcp_allowlist(scp_mcp::allowlist::StdioAllowlist::reset)
             .map_err(|_| allowlist_lock_poisoned())?;
+        tracing::info!(instance_id, "MCP stdio allowlist reset to defaults");
         Ok(())
     }
 

@@ -136,6 +136,25 @@ pub const DEFAULT_ALLOWLIST: &[&str] = &[
 ///
 /// Uses [`BTreeSet`] so entries are always sorted — no per-query sorting
 /// needed for error messages or state snapshots.
+///
+/// # Threat model
+///
+/// The allowlist defends against **binary-name spoofing** at subprocess
+/// spawn: it gates which `basename` (e.g. `node`, `npx`, `uvx`) may reach
+/// `Command::new`, and rejects path-shaped inputs (`/usr/bin/sh`,
+/// `..\bin\sh`, `./node`) regardless of unrestricted mode. The OS still
+/// resolves the binary via `PATH`, so a malicious `PATH` entry that
+/// shadows an allowed name (`/tmp/evil/node`) is **not** caught here —
+/// hosts must keep `PATH` clean of attacker-writable directories.
+///
+/// The allowlist does **not** defend against malicious *arguments* to a
+/// permitted binary. `python3 -c '<code>'`, `node -e '...'`, `npx -y
+/// attacker-package`, and `docker run -v /:/host alpine sh` all pass
+/// validation because the binary basename is in [`DEFAULT_ALLOWLIST`].
+/// Hosts that need argument-level restrictions must add a separate
+/// argument-validation layer above this one. Disabling the allowlist
+/// (or extending it) on a `BridgeInstance` is realm-local — see
+/// `.docs/lessons/process-global-policy-state-is-realm-local-rce.md`.
 #[derive(Debug)]
 pub struct StdioAllowlist {
     /// Allowed binary basenames (sorted by `BTreeSet` invariant).

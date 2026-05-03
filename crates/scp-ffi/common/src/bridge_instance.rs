@@ -2335,33 +2335,10 @@ pub trait BridgeInstanceCore: Send + Sync {
     /// dropped last (after hooks run and transport is gone).
     fn bridge_specific_shutdown(&self) {}
 
-    /// Returns a reference to the per-instance MCP stdio allowlist.
-    ///
-    /// Default implementation forwards to [`CoreFields::mcp_allowlist`] —
-    /// the field lives on `CoreFields` and bridge-specific impls do not
-    /// need to override.
-    ///
-    /// Prefer [`CoreFields::with_mcp_allowlist`] when running a single
-    /// allowlist operation — the helper centralizes poison-handling and
-    /// ensures the guard is always dropped before any FFI / Python-GIL
-    /// work runs. The raw accessor is retained for
-    /// `StdioClientTransport::spawn` paths that need to pass `&Mutex`
-    /// across modules without the closure shape.
-    ///
-    /// # Lock ordering
-    ///
-    /// Do NOT call any other `BridgeInstanceCore` / `CoreFields` locking
-    /// method (e.g. `petname_maps()`, `handle_registries()`,
-    /// `with_transport`) while holding the allowlist guard — the guard is
-    /// short-lived (one allowlist op only) and there is never a reason to
-    /// nest. See [`CoreFields::mcp_allowlist`].
-    fn mcp_allowlist(&self) -> &Mutex<scp_mcp::allowlist::StdioAllowlist> {
-        self.core().mcp_allowlist()
-    }
-
-    // The `with_mcp_allowlist` helper is intentionally NOT on this trait —
-    // adding a generic method would break `dyn BridgeInstanceCore`. Callers
-    // reach the helper through `self.core().with_mcp_allowlist(...)`.
+    // The MCP stdio allowlist is reached via `self.core().mcp_allowlist()` and
+    // `self.core().with_mcp_allowlist(...)` directly. A trait-level forwarder
+    // would break `dyn BridgeInstanceCore` (the helper is generic) and offers
+    // no value because every bridge already touches `core` directly.
 }
 
 /// Error from [`CoreFields::with_mcp_allowlist`].

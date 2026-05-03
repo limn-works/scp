@@ -110,8 +110,8 @@ pub mod bridge_instance;
 // `use scp_ffi_common::bridge_instance::CoreFields`.
 #[cfg(feature = "resolvers")]
 pub use bridge_instance::{
-    BridgeInstanceCore, CoreFields, HandleAffinityError, LifecycleError, ShutdownError,
-    ShutdownOutcome, TransportLockError, UNSET_INSTANCE_ID,
+    AllowlistGuardError, BridgeInstanceCore, CoreFields, HandleAffinityError, LifecycleError,
+    ShutdownError, ShutdownOutcome, TransportLockError, UNSET_INSTANCE_ID,
 };
 
 // Shared runtime helpers (key resolver, BridgeInMemoryStorage, event log provider).

@@ -882,10 +882,16 @@ pub(crate) fn mcp_configure_stdio_allowlist_on(
     bi: &NapiBridgeInstance,
     additional_binaries: Vec<String>,
 ) -> napi::Result<()> {
+    let instance_id = bi.core.instance_id();
     bi.core
         .with_mcp_allowlist(|a| a.configure(&additional_binaries))
         .map_err(|_| napi::Error::from(allowlist_lock_poisoned()))?
         .map_err(|e| napi::Error::from(allowlist_err(e)))?;
+    tracing::info!(
+        instance_id,
+        added = ?additional_binaries,
+        "MCP stdio allowlist extended"
+    );
     Ok(())
 }
 
@@ -905,9 +911,11 @@ pub(crate) fn mcp_disable_stdio_allowlist_on(bi: &NapiBridgeInstance) -> napi::R
 ///
 /// Resets THIS instance's allowlist to defaults; does not affect peers.
 pub(crate) fn mcp_reset_stdio_allowlist_on(bi: &NapiBridgeInstance) -> napi::Result<()> {
+    let instance_id = bi.core.instance_id();
     bi.core
         .with_mcp_allowlist(scp_mcp::allowlist::StdioAllowlist::reset)
         .map_err(|_| napi::Error::from(allowlist_lock_poisoned()))?;
+    tracing::info!(instance_id, "MCP stdio allowlist reset to defaults");
     Ok(())
 }
 

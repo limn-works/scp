@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased] - 2026-04-18
 
+### Per-instance MCP stdio allowlist (PR #1725)
+
+**Security fix.** Closes a realm-local RCE-pivot vulnerability: previously, calling
+`mcp_disable_stdio_allowlist()` on any `SCP` instance unrestricted subprocess
+spawning across every other instance in the same process. The allowlist is now
+owned per-`BridgeInstance` (`CoreFields::mcp_allowlist`), so policy decisions on
+one tenant cannot leak into another. See
+`.docs/lessons/process-global-policy-state-is-realm-local-rce.md`.
+
+**Breaking changes — external SDK consumers:**
+
+- **Python:** the four module-level helpers in `scp_sdk.mcp` are deleted —
+  `configure_stdio_allowlist()`, `disable_stdio_allowlist()`,
+  `reset_stdio_allowlist()`, `get_stdio_allowlist()`. Use the per-instance
+  methods on `SCP` instead:
+  - `scp.mcp_configure_stdio_allowlist([...])`
+  - `scp.mcp_disable_stdio_allowlist(i_trust_all_commands=True)`
+  - `scp.mcp_reset_stdio_allowlist()`
+  - `scp.mcp_get_stdio_allowlist()` → `McpAllowlistState` (TypedDict)
+- **PyO3 extension (`_scp_core`):** the four `py_mcp_*_stdio_allowlist`
+  `#[pyfunction]`s are deleted and replaced by `#[pymethods]` on `PyScp`.
+  Callers reaching into `_scp_core` directly will see `AttributeError`.
+- **TypeScript:** `SCP.mcpDisableStdioAllowlist` now requires
+  `{ iTrustAllCommands: true }`; the snapshot returned by
+  `SCP.mcpGetStdioAllowlist` is a named `McpAllowlistState` interface
+  (was inline anonymous shape).
+- **Swift:** `SCP.mcpDisableStdioAllowlist(iTrustAllCommands: true)` is the
+  required call shape; throws `ScpError.Validation { code: "SCP-MCP-10010" }`
+  when the flag is omitted or false.
+- **Kotlin:** `SCP.mcpDisableStdioAllowlist(iTrustAllCommands = true)` —
+  throws `IllegalArgumentException` when the flag is omitted or false.
+- **UniFFI:** the four top-level `#[uniffi::export] pub fn mcp_*_stdio_allowlist`
+  free functions are deleted; only the per-instance methods on `Scp` remain.
+- **Rust core:** `scp_mcp::allowlist::StdioAllowlist` is now an owned `pub
+  struct` with method-form API (`new_with_defaults`, `validate_command`,
+  `configure`, `disable_enforcement(instance_id)`, `reset`, `snapshot`).
+  The process-global `OnceLock<Mutex<StdioAllowlist>>` and the
+  `AllowlistError::LockPoisoned` variant are deleted (`#[non_exhaustive]`
+  preserved).
+- **`scp-ffi-common`:** `CoreFields::mcp_allowlist`,
+  `CoreFields::with_mcp_allowlist(|a| ...)` helper, and
+  `AllowlistGuardError::Poisoned` typed error are public.
+
+Closes #1543 (PR-D in master plan). See ADR-048 §1 (multi-instance neutrality),
+the new lesson at `.docs/lessons/process-global-policy-state-is-realm-local-rce.md`,
+and the `BridgeInstanceCore` enumeration in `.docs/adrs/ADR-048-scp-multi-instance.md` §2.
+
 ### Phase 4 PR 3 — Persistence + async resume + real UniFFI crypto
 
 **Breaking changes — external SDK consumers migrating from PR 1 behavior:**

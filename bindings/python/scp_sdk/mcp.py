@@ -214,7 +214,12 @@ def validate_client_connect(
         binary = command[0]
         basename = os.path.basename(binary)
 
-        if binary != basename:
+        # Mirror the Rust-side `validate_command` rejection rules so the
+        # SDK pre-flight catches the same shapes the bridge would. On Unix,
+        # `os.path.basename` does not strip backslashes — explicit check
+        # covers ``..\\bin\\sh`` (the same gap `validate_command` documents
+        # in `crates/scp-mcp/src/allowlist.rs`).
+        if binary != basename or "\\" in binary:
             raise ValidationError(
                 f"command must be a bare binary name, not a path: "
                 f"'{binary}'. The OS will resolve it via PATH.",
@@ -222,10 +227,13 @@ def validate_client_connect(
             )
 
         if allowlist_state is not None:
-            if not allowlist_state.get(
-                "unrestricted", False
-            ) and basename not in allowlist_state.get("allowed", []):
-                allowed = sorted(allowlist_state.get("allowed", []))
+            # `McpAllowlistState` is a `TypedDict` with concrete keys —
+            # access them directly so type-checkers can verify the
+            # contract instead of widening to `Any`.
+            unrestricted = allowlist_state["unrestricted"]
+            allowed_set = allowlist_state["allowed"]
+            if not unrestricted and basename not in allowed_set:
+                allowed = sorted(allowed_set)
                 raise ValidationError(
                     f"command '{basename}' is not in the MCP stdio allowlist. "
                     f"Allowed: {allowed}. "

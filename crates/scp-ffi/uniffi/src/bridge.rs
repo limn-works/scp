@@ -11958,11 +11958,17 @@ impl Scp {
         &self,
         additional_binaries: Vec<String>,
     ) -> Result<(), ScpError> {
+        let instance_id = self.inner.core.instance_id();
         self.inner
             .core
             .with_mcp_allowlist(|a| a.configure(&additional_binaries))
             .map_err(|_| mcp_allowlist_lock_poisoned())?
             .map_err(mcp_allowlist_err)?;
+        tracing::info!(
+            instance_id,
+            added = ?additional_binaries,
+            "MCP stdio allowlist extended"
+        );
         Ok(())
     }
 
@@ -11982,10 +11988,12 @@ impl Scp {
     ///
     /// Other `Scp` instances are unaffected.
     pub fn mcp_reset_stdio_allowlist(&self) -> Result<(), ScpError> {
+        let instance_id = self.inner.core.instance_id();
         self.inner
             .core
             .with_mcp_allowlist(scp_mcp::allowlist::StdioAllowlist::reset)
             .map_err(|_| mcp_allowlist_lock_poisoned())?;
+        tracing::info!(instance_id, "MCP stdio allowlist reset to defaults");
         Ok(())
     }
 
