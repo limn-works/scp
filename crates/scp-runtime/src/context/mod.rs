@@ -52,6 +52,7 @@ pub(crate) mod standing_helpers_legacy;
 pub mod state;
 pub mod supervisor;
 pub(crate) mod tools_helpers;
+pub(crate) mod tools_helpers_legacy;
 pub(crate) mod trust_recovery_helpers;
 pub(crate) mod trust_recovery_helpers_legacy;
 pub mod ttl;

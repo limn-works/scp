@@ -24,9 +24,10 @@
 // Production helper modules + domain logic modules. The legacy
 // `manager/<domain>.rs` submodules and `manager/mod.rs` were deleted
 // in ADR-049 commit 12 — every method body that the pipeline-wiring
-// assertions probe now lives in `<domain>_helpers.rs` (forwarder-free)
-// or in `<domain>_logic.rs` (the free-function logic that used to
-// share a file with `impl ContextManager` blocks).
+// assertions probe now lives in `<domain>_helpers.rs` (forwarder-free),
+// `<domain>_helpers_legacy.rs` during Phase 2A actor migration windows,
+// or in `<domain>_logic.rs` (the free-function logic that used to share
+// a file with `impl ContextManager` blocks).
 const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/economy_logic.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/lifecycle_logic.rs"),
@@ -36,6 +37,7 @@ const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/governance_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/standing_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/tools_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/tools_helpers_legacy.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/broadcast_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/queries_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/economy_helpers.rs"),

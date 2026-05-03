@@ -2380,7 +2380,7 @@ impl Supervisor {
         did: &DID,
         now_secs: u64,
     ) -> bool {
-        crate::context::tools_helpers::try_consume_hard_rate_limit_from_any_context(
+        crate::context::tools_helpers_legacy::try_consume_hard_rate_limit_from_any_context(
             self, context_id, did, now_secs,
         )
     }
@@ -2388,7 +2388,7 @@ impl Supervisor {
     /// Refund a hard-rate-limit token from any context (no-op on
     /// missing context).
     pub fn refund_hard_rate_limit_from_any_context(self: &Arc<Self>, context_id: &str, did: &DID) {
-        crate::context::tools_helpers::refund_hard_rate_limit_from_any_context(
+        crate::context::tools_helpers_legacy::refund_hard_rate_limit_from_any_context(
             self, context_id, did,
         );
     }
@@ -2416,7 +2416,7 @@ impl Supervisor {
         F: FnOnce(serde_json::Value) -> Fut,
         Fut: std::future::Future<Output = Result<serde_json::Value, String>>,
     {
-        crate::context::tools_helpers::invoke_tool_with_economy(
+        crate::context::tools_helpers_legacy::invoke_tool_with_economy(
             self,
             context_id,
             registry,

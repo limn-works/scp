@@ -494,7 +494,12 @@ impl ContextActor {
                 handlers::ttl_close::dispatch_from_shim(supervisor, sub).await
             }
             ContextCommand::Tools(sub) => {
-                handlers::tools::dispatch_from_shim(supervisor, sub).await
+                // Phase 2A.4 -- tools domain migrated to the
+                // actor-shape handler for mailbox-routed hard-rate
+                // helpers. Supervisor dispatch still falls back to
+                // `dispatch_from_shim` for missing actors during the
+                // migration window.
+                handlers::tools::dispatch(state, deps, sub).await
             }
             // Queries route through the supervisor's query-shim entry
             // point because the queries handler signature additionally

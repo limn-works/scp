@@ -2,26 +2,14 @@
 //! [`ToolsCommand`](crate::context::actor::commands::ToolsCommand)
 //! and spec §5.16 / §19.7.
 //!
-//! # Commit 11 scope
+//! # Phase 2A.4 -- actor-shape dispatch
 //!
-//! Migrates the dispatch shape for the non-saga tool surface.
-//! Underlying byte-identical implementation still lives on
-//! [`Supervisor`](crate::context::supervisor::Supervisor): each
-//! handler delegates to
-//! [`ContextManager::try_consume_hard_rate_limit`](crate::context::tools_helpers::try_consume_hard_rate_limit)
-//! or
-//! [`ContextManager::refund_hard_rate_limit`](crate::context::tools_helpers::refund_hard_rate_limit).
-//! The shim wraps the delegated call in [`tokio::time::timeout`] with a
-//! 30s budget per ADR-049 §7.
-//!
-//! # ADR-049 commit 12c.7 — direct dispatch
-//!
-//! Prior to 12c.7 the handler took a `MutationStateView<'_>` borrow
-//! adapter that bundled an `Arc<ContextManager>` reference plus a
-//! mutable scratch send-sequence tracker (the tools path never read
-//! the tracker, but the adapter was uniform across handlers). 12c.7
-//! deletes the adapter: the supervisor passes the
-//! `&Arc<ContextManager>` directly and no scratch tracker is allocated.
+//! The handler's primary entry point [`dispatch`] takes
+//! `(&mut PerContextState, &ActorDeps, ToolsCommand)` and routes the
+//! actor-owned hard-rate-limit helpers through
+//! [`crate::context::tools_helpers`]. The shim entry point remains for
+//! missing-actor fallback and routes through
+//! [`crate::context::tools_helpers_legacy`].
 //!
 //! # SAGA WIRING DEFERRED — see
 //! `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
@@ -54,20 +42,21 @@ use tokio::sync::oneshot;
 use crate::context::actor::commands::ToolsCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
+use crate::context::actor::state::PerContextState;
 use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for tools handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch a [`ToolsCommand`] against an attached manager + deps
-/// bundle.
+/// Dispatch a [`ToolsCommand`] against actor-owned state and
+/// capability-reduced dependencies.
 pub async fn dispatch(
-    supervisor: &Supervisor,
+    state: &mut PerContextState,
     _deps: &ActorDeps,
     cmd: ToolsCommand,
 ) -> Outcome<()> {
-    dispatch_inner(supervisor, cmd).await
+    dispatch_inner(state, cmd).await
 }
 
 /// Shim-callable dispatch. Used by
@@ -75,10 +64,28 @@ pub async fn dispatch(
 ///
 /// # Supervisor receiver (ADR-049 commit 12)
 pub(crate) async fn dispatch_from_shim(supervisor: &Supervisor, cmd: ToolsCommand) -> Outcome<()> {
-    dispatch_inner(supervisor, cmd).await
+    dispatch_from_shim_inner(supervisor, cmd).await
 }
 
-async fn dispatch_inner(supervisor: &Supervisor, cmd: ToolsCommand) -> Outcome<()> {
+async fn dispatch_inner(state: &mut PerContextState, cmd: ToolsCommand) -> Outcome<()> {
+    match cmd {
+        ToolsCommand::Placeholder { reply } => reply_not_implemented(reply),
+        ToolsCommand::TryConsumeHardRateLimit {
+            did,
+            now_secs,
+            reply,
+            ..
+        } => handle_try_consume_hard_rate_limit(state, &did, now_secs, reply).await,
+        ToolsCommand::RefundHardRateLimit { did, reply, .. } => {
+            handle_refund_hard_rate_limit(state, &did, reply).await
+        }
+        ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => {
+            reply_saga_deferred(reply)
+        }
+    }
+}
+
+async fn dispatch_from_shim_inner(supervisor: &Supervisor, cmd: ToolsCommand) -> Outcome<()> {
     match cmd {
         ToolsCommand::Placeholder { reply } => reply_not_implemented(reply),
         ToolsCommand::TryConsumeHardRateLimit {
@@ -87,13 +94,14 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: ToolsCommand) -> Outcome<(
             now_secs,
             reply,
         } => {
-            handle_try_consume_hard_rate_limit(supervisor, &context_id, &did, now_secs, reply).await
+            shim_handle_try_consume_hard_rate_limit(supervisor, &context_id, &did, now_secs, reply)
+                .await
         }
         ToolsCommand::RefundHardRateLimit {
             context_id,
             did,
             reply,
-        } => handle_refund_hard_rate_limit(supervisor, &context_id, &did, reply).await,
+        } => shim_handle_refund_hard_rate_limit(supervisor, &context_id, &did, reply).await,
         ToolsCommand::InitiateCrossContextToolInvocation { reply, .. } => {
             reply_saga_deferred(reply)
         }
@@ -101,7 +109,7 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: ToolsCommand) -> Outcome<(
 }
 
 /// Handle [`ToolsCommand::TryConsumeHardRateLimit`] — delegates to
-/// [`ContextManager::try_consume_hard_rate_limit`](crate::context::tools_helpers::try_consume_hard_rate_limit)
+/// [`tools_helpers::try_consume_hard_rate_limit`](crate::context::tools_helpers::try_consume_hard_rate_limit)
 /// under a 30s timeout.
 ///
 /// The legacy method is infallible and returns `bool`. Under timeout we
@@ -110,15 +118,13 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: ToolsCommand) -> Outcome<(
 /// refund attempt on a timed-out consume is unsafe. Surfacing the
 /// timeout is the correct defensive move.
 async fn handle_try_consume_hard_rate_limit(
-    supervisor: &Supervisor,
-    context_id: &str,
+    state: &mut PerContextState,
     did: &scp_identity::DID,
     now_secs: u64,
     reply: oneshot::Sender<Result<bool, ContextError>>,
 ) -> Outcome<()> {
-    let consume_fut = crate::context::tools_helpers::try_consume_hard_rate_limit(
-        supervisor, context_id, did, now_secs,
-    );
+    let consume_fut =
+        async { crate::context::tools_helpers::try_consume_hard_rate_limit(state, did, now_secs) };
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, consume_fut).await {
         Ok(consumed) => {
@@ -127,6 +133,64 @@ async fn handle_try_consume_hard_rate_limit(
             // cases mutate observable state iff the context was known,
             // so flag `ok_mutated` to be safe: a successful `true` on
             // a known context is the dominant path.
+            let outcome = if consumed {
+                Outcome::ok_mutated(())
+            } else {
+                Outcome::ok(())
+            };
+            (outcome, Ok(consumed))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "try_consume_hard_rate_limit exceeded {HANDLER_TIMEOUT:?} budget"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`ToolsCommand::RefundHardRateLimit`] — delegates to
+/// [`tools_helpers::refund_hard_rate_limit`](crate::context::tools_helpers::refund_hard_rate_limit)
+/// under a 30s timeout.
+async fn handle_refund_hard_rate_limit(
+    state: &mut PerContextState,
+    did: &scp_identity::DID,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let refund_fut = async { crate::context::tools_helpers::refund_hard_rate_limit(state, did) };
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, refund_fut).await {
+        Ok(()) => (Outcome::ok_mutated(()), Ok(())),
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "refund_hard_rate_limit exceeded {HANDLER_TIMEOUT:?} budget"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+async fn shim_handle_try_consume_hard_rate_limit(
+    supervisor: &Supervisor,
+    context_id: &str,
+    did: &scp_identity::DID,
+    now_secs: u64,
+    reply: oneshot::Sender<Result<bool, ContextError>>,
+) -> Outcome<()> {
+    let consume_fut = crate::context::tools_helpers_legacy::try_consume_hard_rate_limit_legacy(
+        supervisor, context_id, did, now_secs,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, consume_fut).await {
+        Ok(consumed) => {
             let outcome = if consumed {
                 Outcome::ok_mutated(())
             } else {
@@ -147,17 +211,15 @@ async fn handle_try_consume_hard_rate_limit(
     outcome
 }
 
-/// Handle [`ToolsCommand::RefundHardRateLimit`] — delegates to
-/// [`ContextManager::refund_hard_rate_limit`](crate::context::tools_helpers::refund_hard_rate_limit)
-/// under a 30s timeout.
-async fn handle_refund_hard_rate_limit(
+async fn shim_handle_refund_hard_rate_limit(
     supervisor: &Supervisor,
     context_id: &str,
     did: &scp_identity::DID,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let refund_fut =
-        crate::context::tools_helpers::refund_hard_rate_limit(supervisor, context_id, did);
+    let refund_fut = crate::context::tools_helpers_legacy::refund_hard_rate_limit_legacy(
+        supervisor, context_id, did,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, refund_fut).await {
         Ok(()) => (Outcome::ok_mutated(()), Ok(())),
