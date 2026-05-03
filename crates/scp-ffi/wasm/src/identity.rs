@@ -299,6 +299,39 @@ pub(crate) fn resolve_verification_method_key(did: &str, kid: &str) -> Result<[u
     })
 }
 
+/// Exports the Ed25519 [`SigningKey`] for the identity identified by `did`.
+///
+/// SCP-OUT-037 (WASM portion) — the streaming bridge needs the invoker's
+/// signing key to produce per-chunk and per-credit-grant signatures
+/// (§5.4.5). The key never leaves WASM linear memory; the returned
+/// [`SigningKey`] is consumed in the same `with_manager` closure.
+///
+/// # Errors
+///
+/// Returns `ScpWasmError::Identity` (`SCP-IDENT-1041`) if the DID is not
+/// in the local identity registry. The agent key is never used here —
+/// outlet streaming binds to the identity-key-bound `#active` signing
+/// key per §5.4.5 / §3.5.
+///
+/// # Security
+///
+/// Callers MUST drop the returned [`SigningKey`] promptly. The key
+/// implements `ZeroizeOnDrop` so its memory is overwritten when the
+/// owning binding is dropped.
+pub(crate) fn export_signing_key(did: &str) -> Result<ed25519_dalek::SigningKey, ScpWasmError> {
+    IDENTITY_REGISTRY.with(|reg| {
+        let map = reg.borrow();
+        let entry = map.get(did).ok_or_else(|| ScpWasmError::Identity {
+            message: format!("DID '{did}' not found in identity registry"),
+            code: codes::IDENT_1041.to_owned(),
+        })?;
+        // `signing_key_bytes` is `Zeroizing<[u8; 32]>`. `Deref` yields a
+        // `&[u8; 32]` which `SigningKey::from_bytes` accepts directly.
+        let sk_bytes: &[u8; 32] = &entry.signing_key_bytes;
+        Ok(ed25519_dalek::SigningKey::from_bytes(sk_bytes))
+    })
+}
+
 /// Verifies an HMAC-SHA256 tag over `data` using a key derived from the
 /// signing key of the identity identified by `did`.
 ///

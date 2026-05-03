@@ -749,12 +749,219 @@ impl PerContextState {
 /// WASM is single-threaded, so no `Mutex` or async coordination is needed.
 /// All methods are synchronous (the `async` bridge wrappers in `context.rs`
 /// call these synchronously within `future_to_promise`).
+/// One entry in the per-`WasmContextManager` outlet stream registry
+/// (§5.4.5 SCP-OUT-037 WASM portion).
+///
+/// Mirrors the structure of `StreamRegistryEntry` on the `PyO3` / NAPI /
+/// `UniFFI` bridges, adapted for the WASM single-threaded re-implementation:
+///
+/// - No `tokio::sync::mpsc::Receiver`. WASM cannot depend on
+///   `scp-runtime` (tokio multi-thread per ADR-034); chunks are
+///   pre-materialised into a [`VecDeque`] at open time and drained by
+///   `next()` calls one at a time.
+/// - No outer `Mutex`. WASM is single-threaded with
+///   `thread_local! MANAGER`; `&mut WasmContextManager` already
+///   serialises access.
+/// - No `StreamSessionHandle` — the handle's grant / cancel surface is
+///   re-implemented as plain methods on [`WasmContextManager`] that
+///   mutate this struct directly.
+///
+/// `terminated` flips `true` after the queue has been drained past a
+/// terminal chunk (`End` / `Error { terminal: true }`) or after a
+/// cancel; the entry remains in the registry until `next()` returns
+/// `None` so `requestId`-keyed lookups for the cancel surface remain
+/// addressable across the close handshake.
+#[derive(Debug)]
+pub(crate) struct WasmOutletStreamSession {
+    /// Raw 16-byte `request_id` for chunk signing (§5.4.5
+    /// `SCP-OUTLET-CHUNK-SIG-V1:` preimage requires the wire bytes).
+    pub request_id: [u8; 16],
+    /// Hosting context id pinned at acceptance — committed into every
+    /// chunk and credit-grant preimage.
+    pub context_id: String,
+    /// Outlet id pinned at acceptance — committed into every preimage.
+    pub outlet_id: String,
+    /// MLS epoch counter pinned at acceptance — committed into every
+    /// credit-grant preimage. WASM cannot run real MLS state advance
+    /// out-of-band, so the value the SDK passes at open is the
+    /// authoritative pinned value.
+    pub stream_epoch: u64,
+    /// 32-byte `caveats_binding` pinned at acceptance — committed into
+    /// every chunk and credit-grant preimage.
+    pub caveats_binding: [u8; 32],
+    /// Strictly-monotonic counter incremented on every accepted credit
+    /// grant. Initial state is `0`; the first grant uses `1`. Mirrors
+    /// the `monotonic_seq` on `StreamRegistryEntry` in the other
+    /// bridges.
+    pub monotonic_seq: u64,
+    /// Invoker's Ed25519 signing key — used to sign credit grants. Held
+    /// alongside the session because WASM has no `KeyCustody` indirection
+    /// for the streaming path; the key is exported once at open and
+    /// dropped when the session is evicted.
+    ///
+    /// Operator and invoker are co-located in the WASM bridge: the
+    /// invoker also signs the chunks because there is no separate
+    /// out-of-process operator on the browser target.
+    pub invoker_signing_key: ed25519_dalek::SigningKey,
+    /// Pre-materialised chunks awaiting `next()` consumption.
+    ///
+    /// WASM is single-threaded and the executor closure is sync, so the
+    /// stream pipeline runs to completion at open time and the chunks
+    /// are queued here. `next()` pops from the front so chunk ordering
+    /// matches emission ordering (matching the §5.4.5 strict-monotonic
+    /// `sequence` invariant).
+    pub chunks: VecDeque<scp_protocol::context::outlets::stream::OutletStreamChunk>,
+    /// `true` once a terminal chunk has been pushed onto `chunks`. Used
+    /// by `next()` to flip the JS-side `done` getter once the terminal
+    /// chunk has been consumed.
+    pub terminated: bool,
+    /// `true` once `apply_outlet_cancel` has been observed. The cancel
+    /// surface is idempotent (§5.4.5) so subsequent cancels are no-ops.
+    pub cancelled: bool,
+    /// Cumulative credit budget — sum of all accepted `OutletStreamCredit.grant`
+    /// values. Returned to JS from `outlet_stream_grant_credit` so SDK
+    /// callers see the running total without a separate query path.
+    pub total_credit: u32,
+}
+
+/// Parameters for [`WasmContextManager::open_outlet_stream`] (SCP-OUT-037
+/// WASM portion).
+///
+/// Bundled into a struct to keep the call site under the workspace's
+/// `clippy::too_many_arguments` ceiling — mirrors the
+/// `OpenStreamParams` struct on `scp_runtime::context::outlets::dispatch`.
+pub struct OpenOutletStreamParams<'a> {
+    /// Hosting context id.
+    pub context_id: &'a str,
+    /// Outlet id (must be registered on the context).
+    pub outlet_id: &'a str,
+    /// Pre-parsed input value matching the outlet's input schema.
+    pub input_json: &'a serde_json::Value,
+    /// Invoker DID. The WASM bridge co-locates the invoker and the
+    /// chunk-signing operator (no out-of-process executor — see
+    /// `crate::outlet_stream` module docs).
+    pub identity_did: &'a str,
+    /// 32-byte `caveats_binding` pinned at acceptance — committed into
+    /// every chunk and credit-grant preimage.
+    pub caveats_binding: [u8; 32],
+    /// MLS epoch counter pinned at acceptance — committed into every
+    /// credit-grant preimage.
+    pub stream_epoch: u64,
+    /// Invoker's Ed25519 signing key. Moved into the per-session
+    /// record and dropped (zeroed) when the session is evicted.
+    pub invoker_signing_key: ed25519_dalek::SigningKey,
+}
+
+/// Inputs passed to [`build_stream_chunks`]. Bundled to stay under the
+/// workspace's `clippy::too_many_arguments` ceiling.
+struct BuildStreamChunksInputs<'a> {
+    context_id: &'a str,
+    outlet_id: &'a str,
+    request_id: &'a [u8; 16],
+    caveats_binding: &'a [u8; 32],
+    signing_key: &'a ed25519_dalek::SigningKey,
+}
+
+/// Builds the §5.4.5 chunk queue (Data + End on success, terminal
+/// Error on failure) for a freshly-opened stream session.
+///
+/// Extracted from [`WasmContextManager::open_outlet_stream`] so the
+/// open path stays under the workspace's `clippy::too_many_lines`
+/// ceiling. Signs every chunk under `signing_key` so the
+/// `verify_chunk_signature` round-trip passes against the invoker's
+/// public key.
+fn build_stream_chunks(
+    handler_result: Result<serde_json::Value, ScpWasmError>,
+    inputs: BuildStreamChunksInputs<'_>,
+) -> Result<VecDeque<scp_protocol::context::outlets::stream::OutletStreamChunk>, ScpWasmError> {
+    use scp_protocol::context::outlets::stream::{ChunkPayload, OutletStreamChunk, sign_chunk};
+
+    let mut chunks: VecDeque<OutletStreamChunk> = VecDeque::new();
+
+    let push = |chunks: &mut VecDeque<OutletStreamChunk>,
+                payload: ChunkPayload|
+     -> Result<(), ScpWasmError> {
+        let sequence = chunks.len() as u64;
+        let sig = sign_chunk(
+            inputs.signing_key,
+            inputs.context_id,
+            inputs.outlet_id,
+            inputs.request_id,
+            sequence,
+            inputs.caveats_binding,
+            &payload,
+        )
+        .map_err(|e| ScpWasmError::Tool {
+            message: format!("failed to sign chunk: {e}"),
+            code: codes::TOOL_6002.to_owned(),
+        })?;
+        chunks.push_back(OutletStreamChunk {
+            request_id: *inputs.request_id,
+            sequence,
+            payload,
+            sig,
+        });
+        Ok(())
+    };
+
+    match handler_result {
+        Ok(value) => {
+            // One Data chunk (the only billable chunk on the WASM path —
+            // matches one-shot semantics).
+            push(
+                &mut chunks,
+                ChunkPayload::Data {
+                    value: value.clone(),
+                },
+            )?;
+            // Terminal End chunk. WASM cannot generate a full §3
+            // provenance chain on the fly — synthesise the
+            // minimal valid `DataProvenance` for a freshly-produced
+            // local-context invocation.
+            let provenance = build_minimal_stream_end_provenance(inputs.context_id);
+            push(
+                &mut chunks,
+                ChunkPayload::End {
+                    aggregate: value,
+                    provenance,
+                    execution_time_ms: 0,
+                },
+            )?;
+        }
+        Err(e) => {
+            // Map the bridge error into a terminal Error chunk so the
+            // iterator yields a single chunk and stops.
+            push(
+                &mut chunks,
+                ChunkPayload::Error {
+                    code: e.error_code().to_owned(),
+                    message: e.message().to_owned(),
+                    terminal: true,
+                },
+            )?;
+        }
+    }
+
+    Ok(chunks)
+}
+
 pub struct WasmContextManager {
     contexts: HashMap<String, PerContextState>,
     /// Pending MLS key package holders for encrypted context joins.
     /// Keyed by `"{context_id}:{member_did}"`. Consumed by
     /// `join_context_encrypted`.
     pending_key_packages: HashMap<String, crate::crypto::group::WasmMlsGroup>,
+    /// Active outlet stream sessions keyed by 32-char lowercase hex
+    /// `request_id` (§5.4.5 SCP-OUT-037, WASM portion).
+    ///
+    /// ADR-048 §1: per-bridge state, not a process-global. The
+    /// `WasmContextManager` itself is `thread_local!` so this map already
+    /// lives on a single bridge instance — adding a separate global
+    /// would be the wrong shape on the WASM target. Mirrors the
+    /// `outlet_stream_registry: Arc<DashMap<...>>` field on
+    /// `PyBridgeInstance` / `NapiBridgeInstance` /
+    /// `UniffiBridgeInstance`.
+    pub(crate) outlet_streams: HashMap<String, WasmOutletStreamSession>,
 }
 
 // ---------------------------------------------------------------------------
@@ -808,6 +1015,56 @@ fn validate_imported_did(value: &str, field_name: &str) -> Result<(), ScpWasmErr
         });
     }
     Ok(())
+}
+
+/// Builds a minimal `DataProvenance` for the §5.4.5 terminal `End`
+/// chunk of a streaming outlet invocation (SCP-OUT-037 WASM portion).
+///
+/// The WASM bridge emits Data + End chunks at open time (no async
+/// executor — see `WasmContextManager::open_outlet_stream`). The
+/// terminal End chunk requires a full `DataProvenance` record per
+/// §5.4.5; this helper synthesises the minimal-valid form for a
+/// freshly-produced, local-context invocation:
+///
+/// - `source_context = context_id` — the hosting context.
+/// - `source_type = SourceType::Persistent` — the context is open
+///   (otherwise the outlet would not be invocable).
+/// - `counterparties = []` — the WASM bridge does not enumerate
+///   membership at the streaming boundary; the SDK can re-attach a
+///   richer chain via [`crate::provenance`] if needed.
+/// - `purpose = None`, `discovery_method = OutOfBand` — no protocol
+///   discovery path applies to a local invocation.
+/// - `age = 0`, `chain_depth = 0`, `chain_path = None` — fresh data,
+///   no cross-context hops.
+/// - `memory_scope = MemoryScope::Ephemeral` — conservative default;
+///   the SDK overrides if the context's `memory_scope` is broader.
+/// - All `payment_*` fields `None` — the WASM bridge fails closed on
+///   paid contexts upstream, so streaming is only reachable on the
+///   free path.
+///
+/// This is a defense-in-depth fixture so chunk-signature
+/// verification round-trips against a stable JCS-canonicalised
+/// preimage; SDK consumers that want a richer provenance attach it
+/// at the `End` chunk consumption point.
+fn build_minimal_stream_end_provenance(
+    context_id: &str,
+) -> scp_protocol::provenance::DataProvenance {
+    use scp_protocol::context::params::MemoryScope;
+    use scp_protocol::provenance::{DataProvenance, DiscoveryMethod, SourceType};
+    DataProvenance {
+        source_context: context_id.to_owned(),
+        source_type: SourceType::Persistent,
+        counterparties: Vec::new(),
+        purpose: None,
+        discovery_method: DiscoveryMethod::OutOfBand,
+        age: std::time::Duration::ZERO,
+        memory_scope: MemoryScope::Ephemeral,
+        chain_depth: 0,
+        chain_path: None,
+        payment_amount: None,
+        payment_adapter: None,
+        payment_receipt_id: None,
+    }
 }
 
 /// Validates the v3 anti-replay fields (`seen_nonces_v3`,
@@ -1149,6 +1406,7 @@ impl WasmContextManager {
         Self {
             contexts: HashMap::new(),
             pending_key_packages: HashMap::new(),
+            outlet_streams: HashMap::new(),
         }
     }
 
@@ -2121,6 +2379,390 @@ impl WasmContextManager {
         ctx.append_log_event(EventType::OutletInvoked, identity_did, outlet_id.as_bytes());
 
         Ok(result)
+    }
+
+    /// Opens a §5.4.5 streaming outlet invocation (SCP-OUT-037 WASM
+    /// portion).
+    ///
+    /// Mirrors `ContextManager::open_outlet_stream` from the non-WASM
+    /// bridges, adapted for the WASM single-threaded re-implementation:
+    /// the executor is sync, so the stream pipeline runs to completion
+    /// inline and the chunks are pre-materialised into the session's
+    /// queue. `next()` later pops from that queue one at a time, giving
+    /// the same JS-shaped iterator surface as the non-WASM bridges.
+    ///
+    /// All chunks are signed under `invoker_signing_key` (the WASM
+    /// bridge has no separate operator identity — the local invoker
+    /// also acts as the executor signer per ADR-034 / SCP-OUT-037 WASM
+    /// portion). This matches the §5.4.5 chunk-signature preimage
+    /// byte-for-byte: `verify_chunk_signature` round-trips against
+    /// `invoker_signing_key.verifying_key()`.
+    ///
+    /// Emitted chunks (in order):
+    /// 1. One `Data` chunk carrying the handler's output (or the
+    ///    schema-only echo if no handler is registered, matching
+    ///    `invoke_outlet_one_shot`).
+    /// 2. One terminal `End` chunk carrying the same value as
+    ///    `aggregate`, a minimal `DataProvenance` (source = this
+    ///    context, no chain), and `execution_time_ms = 0` (the WASM
+    ///    bridge does not currently meter handler wall-clock).
+    ///
+    /// On handler error a single terminal `Error { terminal: true }`
+    /// chunk is emitted instead.
+    ///
+    /// # Errors
+    ///
+    /// * `Tool` (`SCP-TOOL-6002`) — outlet not registered, input
+    ///   schema validation failed, or chunk JCS canonicalisation
+    ///   failed.
+    /// * `Context` (`SCP-CTX-2000`) — context not active.
+    ///
+    /// # Returns
+    ///
+    /// The session's 32-char lowercase hex `request_id` — the SDK uses
+    /// this to address the stream from `outlet_stream_grant_credit`
+    /// and `outlet_stream_cancel`.
+    pub fn open_outlet_stream(
+        &mut self,
+        params: OpenOutletStreamParams<'_>,
+    ) -> Result<String, ScpWasmError> {
+        use scp_protocol::context::outlets::stream::OutletStreamChunk;
+
+        let OpenOutletStreamParams {
+            context_id,
+            outlet_id,
+            input_json,
+            identity_did,
+            caveats_binding,
+            stream_epoch,
+            invoker_signing_key,
+        } = params;
+
+        let ctx = self.require_active_context_mut(context_id)?;
+
+        let registration =
+            ctx.outlet_registry
+                .get(outlet_id)
+                .ok_or_else(|| ScpWasmError::Tool {
+                    message: format!("tool '{outlet_id}' not found in context '{context_id}'"),
+                    code: codes::TOOL_6002.to_owned(),
+                })?;
+
+        // Validate the input against the registered input schema —
+        // matches `invoke_outlet_one_shot` so single-shot and streaming
+        // have the same precondition shape.
+        validate_value_against_schema(input_json, &registration.schema.input_schema).map_err(
+            |e| ScpWasmError::Tool {
+                message: format!("input schema validation failed for tool '{outlet_id}': {e}"),
+                code: codes::TOOL_6002.to_owned(),
+            },
+        )?;
+        let output_schema = registration.schema.output_schema.clone();
+
+        // Generate a fresh §5.4.5 16-byte `request_id` via WASM
+        // `getrandom/js` (already wired for `uuid::Uuid::new_v4`).
+        let mut request_id = [0u8; 16];
+        getrandom::getrandom(&mut request_id).map_err(|e| ScpWasmError::Tool {
+            message: format!("failed to generate request_id: {e}"),
+            code: codes::TOOL_6002.to_owned(),
+        })?;
+        let request_id_hex = hex::encode(request_id);
+
+        // Run the registered handler if present, otherwise return the
+        // schema-only echo (same fallback semantics as
+        // `invoke_outlet_one_shot`). `map_or_else` with `Result`
+        // handlers keeps the option_if_let_else lint happy.
+        let handler_result: Result<serde_json::Value, ScpWasmError> =
+            ctx.outlet_handlers.get(outlet_id).map_or_else(
+                || {
+                    Ok(serde_json::json!({
+                        "outlet_id": outlet_id,
+                        "status": "validated",
+                        "input": input_json,
+                    }))
+                },
+                |handler| {
+                    let out = handler(input_json.clone()).map_err(|e| ScpWasmError::Tool {
+                        message: format!("tool handler for '{outlet_id}' failed: {e}"),
+                        code: codes::TOOL_6002.to_owned(),
+                    })?;
+                    validate_value_against_schema(&out, &output_schema).map_err(|msg| {
+                        ScpWasmError::Tool {
+                            message: format!(
+                                "output validation failed for tool '{outlet_id}': {msg}"
+                            ),
+                            code: codes::TOOL_6002.to_owned(),
+                        }
+                    })?;
+                    Ok(out)
+                },
+            );
+
+        // Append the OutletInvoked event regardless of pass/fail —
+        // matches the one-shot path's behaviour so the audit log is
+        // identical.
+        ctx.append_log_event(EventType::OutletInvoked, identity_did, outlet_id.as_bytes());
+
+        // Build the chunk queue from the handler outcome. Bundled
+        // signing is extracted into [`build_stream_chunks`] so the
+        // open path stays under the workspace's
+        // `clippy::too_many_lines` ceiling.
+        let chunks: VecDeque<OutletStreamChunk> = build_stream_chunks(
+            handler_result,
+            BuildStreamChunksInputs {
+                context_id,
+                outlet_id,
+                request_id: &request_id,
+                caveats_binding: &caveats_binding,
+                signing_key: &invoker_signing_key,
+            },
+        )?;
+
+        // Insert the session AFTER all chunks are signed so the
+        // registry never holds a half-built session — if signing fails
+        // above, the SDK sees a clean error and no entry is left
+        // dangling.
+        self.insert_stream_session(
+            WasmOutletStreamSession {
+                request_id,
+                context_id: context_id.to_owned(),
+                outlet_id: outlet_id.to_owned(),
+                stream_epoch,
+                caveats_binding,
+                monotonic_seq: 0,
+                invoker_signing_key,
+                chunks,
+                terminated: false,
+                cancelled: false,
+                total_credit: 0,
+            },
+            &request_id_hex,
+        );
+
+        Ok(request_id_hex)
+    }
+
+    /// Inserts a freshly-built stream session into the per-bridge
+    /// registry. Extracted from [`Self::open_outlet_stream`] so the
+    /// open path stays under the workspace's `clippy::too_many_lines`
+    /// ceiling.
+    fn insert_stream_session(&mut self, session: WasmOutletStreamSession, request_id_hex: &str) {
+        self.outlet_streams
+            .insert(request_id_hex.to_owned(), session);
+    }
+
+    /// Pops the next chunk from a stream session, returning `None`
+    /// when the queue is drained (signalling end-of-stream to the JS
+    /// `next()` caller).
+    ///
+    /// Eviction policy: the session entry is removed once `next()`
+    /// has returned `None`. Until that point the entry stays
+    /// addressable from `outlet_stream_cancel` so a late cancel after
+    /// the terminal chunk has been observed still surfaces the
+    /// idempotent `None` recorded-seq instead of an
+    /// `unknown-session` error (matching the cross-bridge round-6
+    /// idempotency invariant — the WASM path is best-effort here
+    /// because `cancel-after-terminal` is rare on a single-threaded
+    /// pre-materialised stream).
+    pub fn outlet_stream_next(
+        &mut self,
+        request_id_hex: &str,
+    ) -> Option<scp_protocol::context::outlets::stream::OutletStreamChunk> {
+        let session = self.outlet_streams.get_mut(request_id_hex)?;
+        if let Some(chunk) = session.chunks.pop_front() {
+            if matches!(
+                chunk.payload,
+                scp_protocol::context::outlets::stream::ChunkPayload::End { .. }
+                    | scp_protocol::context::outlets::stream::ChunkPayload::Error {
+                        terminal: true,
+                        ..
+                    }
+            ) {
+                session.terminated = true;
+            }
+            Some(chunk)
+        } else {
+            // Queue drained — flip terminated and evict so future
+            // `next()` calls see `None` cleanly without a stale entry.
+            session.terminated = true;
+            self.outlet_streams.remove(request_id_hex);
+            None
+        }
+    }
+
+    /// Returns `true` if the named stream session has flipped
+    /// terminated (queue drained or terminal chunk emitted).
+    /// Used by the `done` getter on `WasmOutletInvocationStream`.
+    /// Returns `true` for missing sessions too — once evicted, the
+    /// stream is unambiguously done from the SDK's perspective.
+    #[must_use]
+    pub fn outlet_stream_is_done(&self, request_id_hex: &str) -> bool {
+        self.outlet_streams
+            .get(request_id_hex)
+            .is_none_or(|s| s.terminated)
+    }
+
+    /// Signs and applies an `OutletStreamCredit` grant against an
+    /// active stream session (§5.4.5 round-5 SCP-OUTLET-CREDIT-V1).
+    ///
+    /// Returns the new running total of granted credits. The WASM
+    /// bridge does not gate chunk emission on credit (chunks are
+    /// pre-materialised at open per ADR-034 — the WASM target has no
+    /// async executor to suspend), but maintains the protocol
+    /// invariants:
+    ///
+    /// - `grant == 0` is rejected with `Validation` (uniform
+    ///   `protocol.invalid-grant`, code
+    ///   [`error_codes::CODE_PROTOCOL_SESSION`] —
+    ///   `SCP-TOOL-6101`).
+    /// - `monotonic_seq` strictly increases per accepted grant. The
+    ///   counter is bumped under the WASM single-threaded
+    ///   `RefCell::borrow_mut` critical section so two re-entrant
+    ///   grant calls cannot collide.
+    /// - Each grant is signed under the invoker's pinned
+    ///   `SigningKey` so `verify_credit_signature` round-trips
+    ///   against the invoker's public key.
+    ///
+    /// # Errors
+    ///
+    /// * `Validation` (`SCP-TOOL-6101`) — `grant == 0`.
+    /// * `Context` (slug `protocol.unknown-session`,
+    ///   `SCP-TOOL-6101`) — `request_id_hex` does not match an
+    ///   active session.
+    /// * `Context` — `monotonic_seq` would overflow `u64` (impossible
+    ///   in practice — `2^64` grants per stream).
+    pub fn outlet_stream_grant_credit(
+        &mut self,
+        request_id_hex: &str,
+        grant: u32,
+    ) -> Result<u32, ScpWasmError> {
+        use scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION;
+        use scp_protocol::context::outlets::stream::{CreditGrantSigningInputs, sign_credit_grant};
+
+        if grant == 0 {
+            return Err(ScpWasmError::Validation {
+                message: "invalid grant 0: must be in (0, 2^32 - 1] (protocol.invalid-grant)"
+                    .to_owned(),
+                code: CODE_PROTOCOL_SESSION.to_owned(),
+            });
+        }
+
+        let session =
+            self.outlet_streams
+                .get_mut(request_id_hex)
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: format!(
+                        "stream '{request_id_hex}' not found in registry (protocol.unknown-session)"
+                    ),
+                    code: CODE_PROTOCOL_SESSION.to_owned(),
+                })?;
+
+        // Bump the counter BEFORE signing — matches the §5.4.5
+        // strict-monotonicity invariant on the other bridges.
+        let next_seq =
+            session
+                .monotonic_seq
+                .checked_add(1)
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: "monotonic_seq overflow: stream has issued u64::MAX grants".to_owned(),
+                    code: codes::CTX_2000.to_owned(),
+                })?;
+        session.monotonic_seq = next_seq;
+
+        let inputs = CreditGrantSigningInputs {
+            context_id: session.context_id.as_str(),
+            outlet_id: session.outlet_id.as_str(),
+            request_id: &session.request_id,
+            grant,
+            monotonic_seq: next_seq,
+            stream_epoch: session.stream_epoch,
+            caveats_binding: &session.caveats_binding,
+        };
+        // Sign the grant for protocol-level cross-SDK conformance.
+        // The signature value is verified inline against the
+        // invoker's pinned public key — `verify_credit_signature`
+        // round-trips against the same preimage on the SDK side, so
+        // any future change to credit-grant signing semantics fails
+        // at this call site rather than silently diverging. The
+        // signature is otherwise discarded because the WASM bridge
+        // has no off-process executor to forward it to.
+        let sig = sign_credit_grant(&session.invoker_signing_key, &inputs);
+        let credit = scp_protocol::context::outlets::stream::OutletStreamCredit {
+            request_id: session.request_id,
+            grant,
+            monotonic_seq: next_seq,
+            sig,
+        };
+        if !scp_protocol::context::outlets::stream::verify_credit_signature(
+            &credit,
+            &session.invoker_signing_key.verifying_key(),
+            session.context_id.as_str(),
+            session.outlet_id.as_str(),
+            session.stream_epoch,
+            &session.caveats_binding,
+        ) {
+            // Self-consistency check — if we just signed a grant that
+            // does not verify under the same invoker key, something
+            // has gone catastrophically wrong with the protocol
+            // crypto layer or the caller has handed us a corrupted
+            // signing key. Fail loud so the SDK sees the divergence.
+            return Err(ScpWasmError::Crypto {
+                message: "internal: freshly-signed credit grant failed self-verification \
+                          — SCP-OUTLET-CREDIT-V1 preimage drift"
+                    .to_owned(),
+                code: codes::CRYPTO_4001.to_owned(),
+            });
+        }
+        // Saturating add: practical totals stay well inside `u32`,
+        // but defend against overflow so the bridge never panics.
+        session.total_credit = session.total_credit.saturating_add(grant);
+        Ok(session.total_credit)
+    }
+
+    /// Applies an `OutletCancel` to an active stream session (§5.4.5).
+    ///
+    /// Returns the recorded `cancel_ack_seq` (the next-to-emit
+    /// sequence at the moment the cancel landed) when the cancel was
+    /// recorded; `None` if the stream had already terminated when the
+    /// cancel arrived (matching the §5.4.5 idempotency rule used by
+    /// the other bridges).
+    ///
+    /// # Errors
+    ///
+    /// * `Context` (slug `protocol.unknown-session`) —
+    ///   `request_id_hex` does not match any active session.
+    pub fn outlet_stream_cancel(
+        &mut self,
+        request_id_hex: &str,
+        next_seq: u64,
+    ) -> Result<Option<u64>, ScpWasmError> {
+        use scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION;
+
+        let session =
+            self.outlet_streams
+                .get_mut(request_id_hex)
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: format!(
+                        "stream '{request_id_hex}' not found in registry (protocol.unknown-session)"
+                    ),
+                    code: CODE_PROTOCOL_SESSION.to_owned(),
+                })?;
+
+        if session.terminated || session.cancelled {
+            // Idempotent — already terminal at cancel receipt.
+            return Ok(None);
+        }
+        session.cancelled = true;
+        // Drop any chunks past the sequence we have not yet emitted —
+        // the cancel-ack semantics in §5.4.5 say the executor must
+        // stop emitting after a cancel, and we model that by clearing
+        // the queue and pushing nothing more. The session entry is
+        // retained until `next()` returns `None` so the
+        // `requestId`-keyed lookup remains valid for the close
+        // handshake.
+        session.chunks.clear();
+        session.terminated = true;
+        Ok(Some(next_seq))
     }
 
     /// Verifies a tool against its test vectors.
