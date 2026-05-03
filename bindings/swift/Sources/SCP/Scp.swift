@@ -613,7 +613,7 @@ public extension SCP {
     func mcpDisableStdioAllowlist(iTrustAllCommands: Bool = false) throws {
         guard iTrustAllCommands else {
             throw ScpError.Validation(
-                message: "Disabling the stdio allowlist allows any binary to be spawned by this SCP instance. Pass iTrustAllCommands: true to confirm.",
+                msg: "Disabling the stdio allowlist allows any binary to be spawned by this SCP instance. Pass iTrustAllCommands: true to confirm.",
                 code: "SCP-MCP-10010"
             )
         }
