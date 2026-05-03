@@ -1642,7 +1642,16 @@ impl Supervisor {
         cmd: BroadcastCommand,
         custody: &C,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12 — see `dispatch_broadcast_command`.
+        // Non-publish variants do not need the custody reference and
+        // can use the mailbox-routed actor path. Publish variants are
+        // intentionally excluded by `broadcast_command_context_id` and
+        // remain on the generic shim below.
+        if let Some(ctx_id) = Self::broadcast_command_context_id(&cmd)
+            && let Some(actor) = self.lookup(ctx_id)
+        {
+            return Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(cmd)).await;
+        }
+
         Ok(
             Box::pin(handlers::broadcast::dispatch_from_shim_with_custody(
                 self, cmd, custody,
@@ -2817,20 +2826,27 @@ impl Supervisor {
     }
 
     /// Extract the target context_id from a [`BroadcastCommand`].
-    /// Only variants with a literal `context_id` field are routed via
-    /// the mailbox; boxed-payload variants stay on the direct-shim path
-    /// until a follow-on Phase 2 chunk destructures them.
-    const fn broadcast_command_context_id(cmd: &BroadcastCommand) -> Option<&str> {
+    /// Publish variants are deliberately excluded because they require
+    /// the custody-generic shim path.
+    fn broadcast_command_context_id(cmd: &BroadcastCommand) -> Option<&str> {
         match cmd {
+            BroadcastCommand::SubscribeBroadcast { payload, .. } => {
+                Some(payload.context_id.as_str())
+            }
+            BroadcastCommand::UnsubscribeBroadcast { payload, .. } => {
+                Some(payload.context_id.as_str())
+            }
+            BroadcastCommand::BlockBroadcastSubscriber { payload, .. }
+            | BroadcastCommand::UnblockBroadcastSubscriber { payload, .. } => {
+                Some(payload.context_id.as_str())
+            }
             BroadcastCommand::HandleBroadcastKeyRequest { context_id, .. }
             | BroadcastCommand::BroadcastSubscriberCount { context_id, .. }
             | BroadcastCommand::IsBroadcastSubscriber { context_id, .. }
             | BroadcastCommand::BroadcastAdmission { context_id, .. } => Some(context_id.as_str()),
-            // SubscribeBroadcast / UnsubscribeBroadcast /
-            // BlockBroadcastSubscriber / UnblockBroadcastSubscriber /
-            // PublishBroadcast / PublishBroadcastContent /
-            // InitiateBroadcastHostingHandshake / Placeholder either
-            // carry context_id inside a boxed payload or have no target.
+            // PublishBroadcast / PublishBroadcastContent need
+            // KeyCustody on the shim; InitiateBroadcastHostingHandshake
+            // and Placeholder have no string target for this router.
             _ => None,
         }
     }

@@ -462,7 +462,11 @@ impl ContextActor {
                 Box::pin(handlers::governance::dispatch_from_shim(supervisor, sub)).await
             }
             ContextCommand::Broadcast(sub) => {
-                Box::pin(handlers::broadcast::dispatch_from_shim(supervisor, sub)).await
+                // Phase 2A.5 — broadcast domain migrated to the
+                // actor-shape handler for non-publish commands.
+                // Publish variants still require the custody-generic
+                // supervisor shim because `KeyCustody` is not dyn-safe.
+                Box::pin(handlers::broadcast::dispatch(state, deps, sub)).await
             }
             ContextCommand::Economy(sub) => {
                 // Phase 2A.3 — economy domain migrated to the

@@ -30,6 +30,7 @@
 pub mod actor;
 pub mod app_sandbox;
 pub(crate) mod broadcast_helpers;
+pub(crate) mod broadcast_helpers_legacy;
 pub mod builder;
 pub(crate) mod economy_helpers;
 pub(crate) mod economy_helpers_legacy;
