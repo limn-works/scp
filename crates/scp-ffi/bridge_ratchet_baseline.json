@@ -1,7 +1,7 @@
 {
   "$schema_version": 1,
   "story": "SCP-OUT-041d",
-  "comment": "Bridge export ratchet for the §5.4.4 outlet redesign per ADR-049 round 5/6. Each new export listed here is enforced as additive — entries can be added but never removed without explicit human approval. Pre-existing exports are tracked elsewhere; this baseline scopes only the SCP-OUT-041d-introduced surface.",
+  "comment": "Bridge export ratchet for the \u00a75.4.4 outlet redesign per ADR-049 round 5/6. Each new export listed here is enforced as additive \u2014 entries can be added but never removed without explicit human approval. Pre-existing exports are tracked elsewhere; this baseline scopes only the SCP-OUT-041d-introduced surface.",
   "exports": {
     "pyo3": [
       {
@@ -15,6 +15,43 @@
         "story": "SCP-OUT-041d",
         "kind": "function",
         "signature": "outlet_catalog_rotation_validator(prior_catalog_json, new_catalog_json, prior_append_time_secs, new_append_time_secs) -> str"
+      },
+      {
+        "name": "context_outlet_invoke_stream",
+        "story": "SCP-OUT-037",
+        "kind": "function",
+        "signature": "context_outlet_invoke_stream(handle, outlet_id, input_json, identity_did, ucan_token, caveats_binding_hex, stream_epoch, proof_tokens=None, credit_window=None, estimated_chunk_count=None) -> OutletInvocationStream"
+      },
+      {
+        "name": "outlet_stream_grant_credit",
+        "story": "SCP-OUT-037",
+        "kind": "function",
+        "signature": "outlet_stream_grant_credit(request_id_hex, grant) -> int"
+      },
+      {
+        "name": "outlet_stream_cancel",
+        "story": "SCP-OUT-037",
+        "kind": "function",
+        "signature": "outlet_stream_cancel(request_id_hex, next_seq=None) -> Optional[int]"
+      },
+      {
+        "name": "verify_chunk_signature",
+        "story": "SCP-OUT-037",
+        "kind": "function",
+        "signature": "verify_chunk_signature(chunk_json, operator_pk: bytes, context_id, outlet_id, caveats_binding: bytes) -> bool"
+      },
+      {
+        "name": "compute_caveats_binding",
+        "story": "SCP-OUT-037",
+        "kind": "function",
+        "signature": "compute_caveats_binding(ucan_cid: bytes, request_id: bytes, invoker_did, estimated_chunk_count, effective_caveats_json) -> bytes"
+      },
+      {
+        "name": "OutletInvocationStream",
+        "story": "SCP-OUT-037",
+        "kind": "class",
+        "signature": "class OutletInvocationStream: __aiter__(); __anext__() -> Awaitable[OutletStreamChunk]; request_id: str",
+        "comment": "Python async iterator returned by context_outlet_invoke_stream; SDK exposes __aiter__/__anext__ per AC1."
       }
     ],
     "napi": [
@@ -29,6 +66,43 @@
         "story": "SCP-OUT-041d",
         "kind": "async_function",
         "signature": "outletCatalogRotationValidator(priorCatalogJson, newCatalogJson, priorAppendTimeSecs, newAppendTimeSecs) -> Promise<string>"
+      },
+      {
+        "name": "contextOutletInvokeStream",
+        "story": "SCP-OUT-037",
+        "kind": "async_function",
+        "signature": "contextOutletInvokeStream(handle, outletId, inputJson, identityDid, ucanToken, caveatsBindingHex, streamEpoch, proofTokens?, creditWindow?, estimatedChunkCount?) -> Promise<OutletInvocationStream>"
+      },
+      {
+        "name": "outletStreamGrantCredit",
+        "story": "SCP-OUT-037",
+        "kind": "async_function",
+        "signature": "outletStreamGrantCredit(requestIdHex, grant) -> Promise<number>"
+      },
+      {
+        "name": "outletStreamCancel",
+        "story": "SCP-OUT-037",
+        "kind": "async_function",
+        "signature": "outletStreamCancel(requestIdHex, nextSeq?) -> Promise<number | null>"
+      },
+      {
+        "name": "verifyChunkSignature",
+        "story": "SCP-OUT-037",
+        "kind": "async_function",
+        "signature": "verifyChunkSignature(chunkJson, operatorPk: Uint8Array, contextId, outletId, caveatsBinding: Uint8Array) -> Promise<boolean>"
+      },
+      {
+        "name": "computeCaveatsBinding",
+        "story": "SCP-OUT-037",
+        "kind": "async_function",
+        "signature": "computeCaveatsBinding(ucanCid: Uint8Array, requestId: Uint8Array, invokerDid, estimatedChunkCount, effectiveCaveatsJson) -> Promise<Uint8Array>"
+      },
+      {
+        "name": "OutletInvocationStream",
+        "story": "SCP-OUT-037",
+        "kind": "class",
+        "signature": "class OutletInvocationStream { readonly requestId: string; next(): Promise<OutletStreamChunk | null> }",
+        "comment": "Async-iterator-shaped class returned by contextOutletInvokeStream; the TypeScript SDK wraps it with Symbol.asyncIterator."
       }
     ],
     "uniffi": [
@@ -43,6 +117,56 @@
         "story": "SCP-OUT-041d",
         "kind": "async_function",
         "signature": "outlet_catalog_rotation_validator(prior_catalog_json: String, new_catalog_json: String, prior_append_time_secs: u64, new_append_time_secs: u64) -> Result<String, ScpError>"
+      },
+      {
+        "name": "outlet_invoke_stream",
+        "story": "SCP-OUT-037",
+        "kind": "async_function",
+        "signature": "outlet_invoke_stream(handle: ContextHandle, outlet_id: String, input_json: String, identity_did: String, ucan_token: String, caveats_binding_hex: String, stream_epoch: u64, proof_tokens: Option<Vec<String>>, credit_window: Option<u32>, estimated_chunk_count: Option<u32>) -> Result<OutletStreamHandle, ScpError>"
+      },
+      {
+        "name": "outlet_invoke_stream_with_subscriber",
+        "story": "SCP-OUT-037",
+        "kind": "async_function",
+        "signature": "outlet_invoke_stream_with_subscriber(handle: ContextHandle, outlet_id: String, input_json: String, identity_did: String, ucan_token: String, caveats_binding_hex: String, stream_epoch: u64, subscriber: Box<dyn OutletStreamSubscriber>, proof_tokens: Option<Vec<String>>, credit_window: Option<u32>, estimated_chunk_count: Option<u32>) -> Result<String, ScpError>"
+      },
+      {
+        "name": "outlet_stream_grant_credit",
+        "story": "SCP-OUT-037",
+        "kind": "async_function",
+        "signature": "outlet_stream_grant_credit(request_id_hex: String, grant: u32) -> Result<u32, ScpError>"
+      },
+      {
+        "name": "outlet_stream_cancel",
+        "story": "SCP-OUT-037",
+        "kind": "async_function",
+        "signature": "outlet_stream_cancel(request_id_hex: String, next_seq: Option<u64>) -> Result<Option<u64>, ScpError>"
+      },
+      {
+        "name": "verify_chunk_signature",
+        "story": "SCP-OUT-037",
+        "kind": "function",
+        "signature": "verify_chunk_signature(chunk_bytes: Vec<u8>, operator_pk: Vec<u8>, context_id: String, outlet_id: String, caveats_binding: Vec<u8>) -> Result<bool, ScpError>"
+      },
+      {
+        "name": "compute_caveats_binding",
+        "story": "SCP-OUT-037",
+        "kind": "function",
+        "signature": "compute_caveats_binding(ucan_cid: Vec<u8>, request_id: Vec<u8>, invoker_did: String, estimated_chunk_count: u32, effective_caveats_json: String) -> Result<Vec<u8>, ScpError>"
+      },
+      {
+        "name": "OutletStreamHandle",
+        "story": "SCP-OUT-037",
+        "kind": "object",
+        "signature": "interface OutletStreamHandle { request_id() -> String; done() -> bool; next() async -> Result<Option<OutletStreamChunkRecord>, ScpError>; cancel(next_seq: Option<u64>) async -> Result<Option<u64>, ScpError> }",
+        "comment": "UniFFI interface object returned by outlet_invoke_stream; Swift wraps with AsyncSequence; Kotlin wraps with Flow<OutletStreamChunk>."
+      },
+      {
+        "name": "OutletStreamSubscriber",
+        "story": "SCP-OUT-037",
+        "kind": "callback_interface",
+        "signature": "callback interface OutletStreamSubscriber { on_chunk(chunk: OutletStreamChunkRecord); on_complete(); on_error(error: ScpError); }",
+        "comment": "UniFFI callback interface for push-style chunk delivery (paired with outlet_invoke_stream_with_subscriber)."
       }
     ],
     "wasm": [
@@ -63,7 +187,7 @@
         "story": "SCP-OUT-041d",
         "kind": "function",
         "signature": "outletStoreMessageKey(context: WasmContextHandle, outletId, registrationEventIdHex, outletMessageKeyHex) -> void",
-        "comment": "WASM-only helper — scp-runtime's GovernanceState::pinned_outlet_message_keys map is mirrored locally because WASM cannot depend on scp-runtime (tokio). Callers (typically the SDK receiver layer) pin the key here at outlet-registration acceptance time so outlet_error_new can compute the §5.4.4 HMAC at the FFI boundary."
+        "comment": "WASM-only helper \u2014 scp-runtime's GovernanceState::pinned_outlet_message_keys map is mirrored locally because WASM cannot depend on scp-runtime (tokio). Callers (typically the SDK receiver layer) pin the key here at outlet-registration acceptance time so outlet_error_new can compute the \u00a75.4.4 HMAC at the FFI boundary."
       },
       {
         "name": "outletInvokeStream",
@@ -100,7 +224,7 @@
         "story": "SCP-OUT-037",
         "kind": "class",
         "signature": "class OutletInvocationStream { readonly requestId: string; readonly done: boolean; next(): Promise<OutletStreamChunk | null> }",
-        "comment": "JS class returned by outletInvokeStream — the WASM bridge surfaces an async-iterator-shaped pull API; the TypeScript SDK wraps it with Symbol.asyncIterator (wasm-bindgen does not expose Symbol-keyed methods directly)."
+        "comment": "JS class returned by outletInvokeStream \u2014 the WASM bridge surfaces an async-iterator-shaped pull API; the TypeScript SDK wraps it with Symbol.asyncIterator (wasm-bindgen does not expose Symbol-keyed methods directly)."
       }
     ]
   }
