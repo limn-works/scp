@@ -57,6 +57,8 @@ pub(crate) mod tools_helpers_legacy;
 pub(crate) mod trust_recovery_helpers;
 pub(crate) mod trust_recovery_helpers_legacy;
 pub mod ttl;
+pub(crate) mod ttl_close_helpers;
+pub(crate) mod ttl_close_helpers_legacy;
 
 pub mod tools;
 
