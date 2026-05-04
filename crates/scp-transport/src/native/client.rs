@@ -440,10 +440,17 @@ impl NativeRelayClient {
                 let receive_time = Instant::now();
                 let rid = crate::traits::RoutingId::new(*routing_id);
 
-                // 1. Deduplication check (read-only, no commit yet). A
-                //    write-locked check + commit here would let an attacker
-                //    poison the dedup LRU with `blob_id`s for unsolicited
-                //    routing_ids, evicting legitimate entries.
+                // 1. Deduplication check (read-only, no commit yet).
+                //    Dedup-cache poisoning defense: check dedup first
+                //    (read-locked, no commit), then check subscription
+                //    presence below, then send, then commit dedup ONLY
+                //    after a successful send to a present subscriber.
+                //    Committing dedup before the subscriber check would
+                //    let unsolicited routing_ids evict legitimate dedup
+                //    entries, suppressing legitimate post-resubscribe
+                //    redelivery for those entries. The load-bearing
+                //    invariant is the step ordering (commit-after-success),
+                //    not the lock kind.
                 {
                     let state = inner.read().await;
                     if state.seen_blob_ids.contains(blob_id) {

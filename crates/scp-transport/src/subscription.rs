@@ -37,11 +37,15 @@ use crate::traits::RoutingId;
 
 /// Maximum concurrent subscriptions tracked per transport adapter.
 ///
-/// Mirrors the server-side SEC-006 per-routing-ID cap but applied at the
-/// transport adapter. Ten thousand entries is far beyond any realistic SCP
-/// transport adapter (a heavy participant might be in hundreds of contexts at
-/// once) while still bounding memory growth from pathological producers or
-/// bugs.
+/// Bounds memory growth from pathological producers or programming bugs
+/// (e.g., a runaway loop calling `subscribe`). Ten thousand entries is well
+/// above any realistic SCP transport-adapter participant -- a heavy
+/// participant might be in hundreds of contexts at once -- while still
+/// capping pathological growth.
+///
+/// This cap is independent of the server-side relay caps in
+/// [`crate::relay::subscription`], which protect relay memory under a
+/// different shape (1:N fan-out, total + per-routing-id limits).
 ///
 /// Adapters that cannot use [`TransportSubscriptionMap`] directly (e.g.,
 /// the WebTransport HTTP/3 path with its `web_sys` value type) must enforce
@@ -139,6 +143,8 @@ impl<V> TransportSubscriptionMap<V> {
     /// recoverable condition.
     pub fn insert(&self, routing_id: RoutingId, value: V) -> Result<(), SubscriptionError> {
         {
+            // Hold the write lock across contains-then-insert to make the
+            // check-and-insert atomic.
             let mut guard = self
                 .inner
                 .write()
