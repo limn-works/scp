@@ -140,6 +140,50 @@ async fn dispatch_state(
         GovernanceCommand::AcknowledgeCommitFault { context_id, reply } => {
             handle_acknowledge_commit_fault_actor(state, &context_id, reply)
         }
+        GovernanceCommand::WithdrawGovernanceVote {
+            context_id,
+            proposal_id,
+            voter_did,
+            reply,
+        } => {
+            handle_withdraw_governance_vote_actor(
+                state,
+                deps,
+                &context_id,
+                &proposal_id,
+                &voter_did,
+                reply,
+            )
+            .await
+        }
+        GovernanceCommand::ApplyPendingCeilingModification {
+            context_id,
+            current_timestamp,
+            reply,
+        } => {
+            handle_apply_pending_ceiling_modification_actor(
+                state,
+                deps,
+                &context_id,
+                current_timestamp,
+                reply,
+            )
+            .await
+        }
+        GovernanceCommand::ApplyPendingEconomicPolicyChange {
+            context_id,
+            current_timestamp,
+            reply,
+        } => {
+            handle_apply_pending_economic_policy_change_actor(
+                state,
+                deps,
+                &context_id,
+                current_timestamp,
+                reply,
+            )
+            .await
+        }
         // ---------- unmigrated variants (escape to legacy via shim) ----------
         cmd => {
             // Re-issue the command through the supervisor's legacy
@@ -983,6 +1027,118 @@ fn handle_acknowledge_commit_fault_actor(
         Err(e) => Outcome::err_mutated(outcome_error_sketch(e)),
     };
     let _ = reply.send(result);
+    outcome
+}
+
+/// Handle [`GovernanceCommand::WithdrawGovernanceVote`] (actor-shape).
+async fn handle_withdraw_governance_vote_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    proposal_id: &scp_protocol::context::governance::ProposalId,
+    voter_did: &scp_identity::DID,
+    reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
+) -> Outcome<()> {
+    let withdraw_fut = crate::context::governance_helpers::withdraw_governance_vote(
+        state,
+        deps,
+        context_id,
+        proposal_id,
+        voter_did,
+    );
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, withdraw_fut).await {
+        Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok(status)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "withdraw_governance_vote exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`GovernanceCommand::ApplyPendingCeilingModification`] (actor-shape).
+async fn handle_apply_pending_ceiling_modification_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    current_timestamp: u64,
+    reply: oneshot::Sender<Result<bool, ContextError>>,
+) -> Outcome<()> {
+    let apply_fut = crate::context::governance_helpers::apply_pending_ceiling_modification(
+        state,
+        deps,
+        context_id,
+        current_timestamp,
+    );
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, apply_fut).await {
+        Ok(Ok(applied)) => {
+            let outcome = if applied {
+                Outcome::ok_mutated(())
+            } else {
+                Outcome::ok(())
+            };
+            (outcome, Ok(applied))
+        }
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "apply_pending_ceiling_modification exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
+    };
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`GovernanceCommand::ApplyPendingEconomicPolicyChange`] (actor-shape).
+async fn handle_apply_pending_economic_policy_change_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    current_timestamp: u64,
+    reply: oneshot::Sender<Result<bool, ContextError>>,
+) -> Outcome<()> {
+    let apply_fut = crate::context::governance_helpers::apply_pending_economic_policy_change(
+        state,
+        deps,
+        context_id,
+        current_timestamp,
+    );
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, apply_fut).await {
+        Ok(Ok(applied)) => {
+            let outcome = if applied {
+                Outcome::ok_mutated(())
+            } else {
+                Outcome::ok(())
+            };
+            (outcome, Ok(applied))
+        }
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "apply_pending_economic_policy_change exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err(sketch), Err(err))
+        }
+    };
+    let _ = reply.send(reply_result);
     outcome
 }
 

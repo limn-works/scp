@@ -42,10 +42,14 @@
 //! [`crate::context::governance_helpers_legacy`] and the supervisor's
 //! `dispatch_from_shim` fallback in one swoop.
 
-use scp_protocol::context::ContextError;
-use scp_protocol::context::ContextState;
-use scp_protocol::context::governance::{GovernanceProposal, ProposalId};
+use scp_identity::DID;
+use scp_primitives::Clock;
+use scp_protocol::context::governance::{
+    GovernanceContext, GovernanceEvent, GovernanceProposal, ProposalId, ProposalStatus,
+};
 use scp_protocol::context::membership::ContextEvent;
+use scp_protocol::context::roles::CapabilityCeiling;
+use scp_protocol::context::{ContextError, ContextState};
 use tracing::instrument;
 
 use crate::context::actor::deps::ActorDeps;
@@ -279,4 +283,202 @@ pub fn acknowledge_commit_fault(
             "context {context_id} has no commit fault to acknowledge"
         ))
     })
+}
+
+// ---------------------------------------------------------------------------
+// build_governance_context (transitive helper, actor-shape)
+// ---------------------------------------------------------------------------
+
+/// Build a [`GovernanceContext`] from actor-owned state + a clock.
+///
+/// Used by every governance engine call that needs membership +
+/// admin + epoch + wall-clock context. Pure projection; no I/O.
+pub fn build_governance_context(state: &PerContextState, clock: &dyn Clock) -> GovernanceContext {
+    let members: Vec<(DID, String)> = state
+        .membership
+        .members()
+        .map(|m| (m.did.clone(), m.role_name.clone()))
+        .collect();
+    let admin_dids: Vec<DID> = state
+        .membership
+        .members()
+        .filter(|m| m.role_name == "admin")
+        .map(|m| m.did.clone())
+        .collect();
+    GovernanceContext {
+        context_id: state.handle.context_id().to_owned(),
+        members,
+        admin_dids,
+        current_epoch: Some(state.epoch.mls_epoch),
+        now: clock.now_secs(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// governance_event_label (transitive helper, actor-shape — pure)
+// ---------------------------------------------------------------------------
+
+/// Returns the event-log label string for a [`GovernanceEvent`] variant.
+///
+/// Pure projection over a borrowed event; no `state`/`deps` needed.
+#[must_use]
+pub const fn governance_event_label(event: &GovernanceEvent) -> &'static str {
+    match event {
+        GovernanceEvent::ProposalCreated { .. } => "GovernanceProposalCreated",
+        GovernanceEvent::VoteCast { .. } => "GovernanceVoteCast",
+        GovernanceEvent::VoteWithdrawn { .. } => "GovernanceVoteWithdrawn",
+        GovernanceEvent::ProposalResolved { .. } => "GovernanceProposalResolved",
+        GovernanceEvent::DeadlockRecovery { .. } => "GovernanceDeadlockRecovery",
+        GovernanceEvent::ConflictDetected { .. } => "GovernanceConflictDetected",
+        GovernanceEvent::ConflictResolved { .. } => "GovernanceConflictResolved",
+        GovernanceEvent::GovernanceActionExecuted { .. } => "GovernanceActionExecuted",
+    }
+}
+
+// ---------------------------------------------------------------------------
+// withdraw_governance_vote (entry point — mutation)
+// ---------------------------------------------------------------------------
+
+/// Withdraw a previously-cast vote from a proposal.
+///
+/// Drives the engine's `withdraw_vote` and emits any returned events
+/// to both the durable event log and best-effort persistence.
+///
+/// Actor-shape: actor owns `state`; the legacy two-lock dance
+/// (engine call → drop lock → event log append → relock for
+/// checkpoint counter → drop lock → persistence relock) collapses to a
+/// single linear sequence.
+///
+/// # Errors
+///
+/// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+/// - [`ContextError::PermissionDenied`] if the engine rejects the
+///   withdrawal (no prior vote, proposal already resolved, etc.).
+/// - [`ContextError::NotInitialized`] if no event-log provider is
+///   attached.
+#[instrument(skip_all, fields(context_id))]
+pub async fn withdraw_governance_vote(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    proposal_id: &ProposalId,
+    voter_did: &DID,
+) -> Result<ProposalStatus, ContextError> {
+    crate::context::state::require_active(&state.handle)?;
+
+    let gov_ctx = build_governance_context(state, &*deps.clock);
+    let (status, events) = state
+        .governance
+        .engine
+        .withdraw_vote(proposal_id, voter_did, &gov_ctx)
+        .map_err(|e| ContextError::PermissionDenied(e.to_string()))?;
+
+    let context_id_bytes = context_id_to_bytes(context_id);
+    let mut event_count: u64 = 0;
+    for event in &events {
+        deps.event_log.append_context_event(
+            &context_id_bytes,
+            governance_event_label(event),
+            voter_did.as_ref(),
+        )?;
+        event_count += 1;
+    }
+    if event_count > 0 {
+        state.checkpoint_events_since += event_count;
+    }
+
+    // Best-effort persist after withdrawal — mirrors legacy ordering.
+    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+
+    Ok(status)
+}
+
+// ---------------------------------------------------------------------------
+// apply_pending_ceiling_modification (entry point — conditional mutation)
+// ---------------------------------------------------------------------------
+
+/// Apply a pending ceiling modification when its notification period
+/// has elapsed (M7, §5.3.2).
+///
+/// Returns `true` when a pending modification was applied, `false`
+/// when there was nothing pending or the notification period has not
+/// yet elapsed.
+///
+/// Actor-shape: single linear sequence over `state`.
+///
+/// # Errors
+///
+/// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+/// - [`ContextError::NotInitialized`] if no event-log provider is
+///   attached.
+#[instrument(skip_all, fields(context_id))]
+pub async fn apply_pending_ceiling_modification(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    current_timestamp: u64,
+) -> Result<bool, ContextError> {
+    crate::context::state::require_active(&state.handle)?;
+
+    let pending = match &state.governance.pending_ceiling_modification {
+        Some(p) if p.is_effective(current_timestamp) => p.clone(),
+        _ => return Ok(false),
+    };
+
+    state.role_state.ceiling = CapabilityCeiling::new(pending.new_capabilities.iter().cloned());
+    state.governance.pending_ceiling_modification = None;
+
+    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+
+    let context_id_bytes = context_id_to_bytes(context_id);
+    deps.event_log
+        .append_context_event(&context_id_bytes, "CeilingModified", "")?;
+    state.checkpoint_events_since += 1;
+
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------------
+// apply_pending_economic_policy_change (entry point — conditional mutation)
+// ---------------------------------------------------------------------------
+
+/// Apply a pending economic-policy change when its notification
+/// period has elapsed.
+///
+/// Returns `true` when a pending change was applied, `false` when
+/// there was nothing pending or the notification period has not yet
+/// elapsed.
+///
+/// Actor-shape: single linear sequence over `state`.
+///
+/// # Errors
+///
+/// - [`ContextError::ContextNotActive`] if the context is not `Active`.
+/// - [`ContextError::NotInitialized`] if no event-log provider is
+///   attached.
+#[instrument(skip_all, fields(context_id))]
+pub async fn apply_pending_economic_policy_change(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    current_timestamp: u64,
+) -> Result<bool, ContextError> {
+    crate::context::state::require_active(&state.handle)?;
+
+    let pending = match &state.governance.pending_economic_policy_change {
+        Some(p) if p.is_effective(current_timestamp) => p.clone(),
+        _ => return Ok(false),
+    };
+
+    state.governance.economic_policy = Some(pending.new_policy);
+    state.governance.pending_economic_policy_change = None;
+
+    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+
+    let context_id_bytes = context_id_to_bytes(context_id);
+    deps.event_log
+        .append_context_event(&context_id_bytes, "EconomicPolicyApplied", "")?;
+    state.checkpoint_events_since += 1;
+
+    Ok(true)
 }
