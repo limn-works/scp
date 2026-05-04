@@ -29,7 +29,7 @@ use crate::error::TransportError;
 use crate::native::protocol::{ClientMessage, RelayMessage};
 use crate::quic::lifecycle::QuicLifecycleManager;
 use crate::quic::streams::{LENGTH_PREFIX_SIZE, MAX_FRAME_SIZE};
-use crate::subscription::TransportSubscriptionMap;
+use crate::subscription::{MAX_TRANSPORT_SUBSCRIPTIONS, TransportSubscriptionMap};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
 
 /// A boxed, pinned, `Send`-safe future -- the return type for all
@@ -315,6 +315,22 @@ impl TransportAdapter for QuicAdapter {
         let routing_id_bytes = *routing_id.as_bytes();
         Box::pin(async move {
             let connection = self.get_connection().await?;
+
+            // Pre-IO capacity check: if the local map is full and this
+            // routing ID is not already present, reject before opening a
+            // QUIC stream and sending SUBSCRIBE. The post-IO insert below
+            // remains the authoritative gate (TOCTOU is acceptable: the
+            // pre-check is a fast-path optimization that avoids relay-side
+            // subscription leaks under non-pathological load).
+            if !self
+                .subscriptions
+                .contains(&RoutingId::new(routing_id_bytes))
+                && self.subscriptions.len() >= MAX_TRANSPORT_SUBSCRIPTIONS
+            {
+                return Err(TransportError::SubscriptionFailed(format!(
+                    "subscription map full (max {MAX_TRANSPORT_SUBSCRIPTIONS} entries)"
+                )));
+            }
 
             let msg = ClientMessage::Subscribe {
                 ref_id: None,

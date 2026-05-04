@@ -38,19 +38,21 @@ use crate::traits::RoutingId;
 /// Maximum concurrent subscriptions tracked per transport adapter.
 ///
 /// Bounds memory growth from pathological producers or programming bugs
-/// (e.g., a runaway loop calling `subscribe`). Ten thousand entries is well
-/// above any realistic SCP transport-adapter participant -- a heavy
-/// participant might be in hundreds of contexts at once -- while still
-/// capping pathological growth.
+/// (e.g., a runaway loop calling `subscribe`). 10,000 is well above the
+/// highest realistic SCP transport-adapter participant footprint (a heavy
+/// participant typically holds ~hundreds of context subscriptions; the cap
+/// leaves >100x headroom). The cap exists to bound memory growth from
+/// pathological producers or bugs. Revisit this constant if real participant
+/// counts approach 1,000.
 ///
 /// This cap is independent of the server-side relay caps in
 /// [`crate::relay::subscription`], which protect relay memory under a
 /// different shape (1:N fan-out, total + per-routing-id limits).
 ///
-/// Adapters that cannot use [`TransportSubscriptionMap`] directly (e.g.,
-/// the WebTransport HTTP/3 path with its `web_sys` value type) must enforce
-/// this cap inline; see `crates/scp-transport/src/webtransport/client.rs`
-/// for the canonical example.
+/// Adapters whose subscription lifecycle requires close-on-unsubscribe with
+/// network IO outside the lock (e.g., the WebTransport HTTP/3 bidi-stream
+/// path) must enforce this cap inline rather than going through the
+/// [`TransportSubscriptionMap`] storage primitive.
 pub const MAX_TRANSPORT_SUBSCRIPTIONS: usize = 10_000;
 
 /// Errors returned by [`TransportSubscriptionMap`] mutation methods.
@@ -58,15 +60,10 @@ pub const MAX_TRANSPORT_SUBSCRIPTIONS: usize = 10_000;
 pub enum SubscriptionError {
     /// A subscription is already registered for this routing ID.
     ///
-    /// Callers that want "replace" semantics should [`remove`] the existing
-    /// entry first (and tear it down as appropriate for the adapter), then
-    /// [`insert`] the new value. Callers always know which routing ID they
-    /// attempted to insert, so the variant carries no payload -- including
-    /// the routing ID would just produce a noisy 100+ char `Debug` blob in
-    /// log output.
-    ///
-    /// [`remove`]: TransportSubscriptionMap::remove
-    /// [`insert`]: TransportSubscriptionMap::insert
+    /// Callers wanting replace semantics should use
+    /// [`insert_or_replace`](TransportSubscriptionMap::insert_or_replace)
+    /// or call [`remove`](TransportSubscriptionMap::remove) then
+    /// [`insert`](TransportSubscriptionMap::insert).
     #[error("subscription already exists for routing id")]
     Duplicate,
 
@@ -82,6 +79,10 @@ pub enum SubscriptionError {
 /// track active subscriptions. See the [module-level documentation](self) for
 /// closure-safety constraints on [`with`](Self::with),
 /// [`with_mut`](Self::with_mut), and [`for_each`](Self::for_each).
+///
+/// All methods recover from lock-poisoning automatically by extracting the
+/// inner state via [`std::sync::PoisonError::into_inner`]. They do not panic
+/// on poison.
 ///
 /// # Type parameter
 ///
@@ -135,12 +136,6 @@ impl<V> TransportSubscriptionMap<V> {
     /// Returns [`SubscriptionError::Duplicate`] if an entry already exists
     /// for `routing_id`, or [`SubscriptionError::CapacityExceeded`] if the
     /// map has reached its configured maximum.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned, which would require a
-    /// previous panic while holding the lock -- a bug rather than a
-    /// recoverable condition.
     pub fn insert(&self, routing_id: RoutingId, value: V) -> Result<(), SubscriptionError> {
         {
             // Hold the write lock across contains-then-insert to make the
@@ -170,10 +165,6 @@ impl<V> TransportSubscriptionMap<V> {
     /// Returns [`SubscriptionError::CapacityExceeded`] if the map is at its
     /// maximum and the insert would grow it (i.e. the routing ID was not
     /// already present).
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned (see [`insert`](Self::insert)).
     pub fn insert_or_replace(
         &self,
         routing_id: RoutingId,
@@ -191,10 +182,6 @@ impl<V> TransportSubscriptionMap<V> {
     }
 
     /// Removes and returns the value at `routing_id`, if any.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
     pub fn remove(&self, routing_id: &RoutingId) -> Option<V> {
         let mut guard = self
             .inner
@@ -204,10 +191,6 @@ impl<V> TransportSubscriptionMap<V> {
     }
 
     /// Returns `true` if the map contains an entry for `routing_id`.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
     #[must_use]
     pub fn contains(&self, routing_id: &RoutingId) -> bool {
         let guard = self
@@ -217,6 +200,28 @@ impl<V> TransportSubscriptionMap<V> {
         guard.contains_key(routing_id)
     }
 
+    /// Returns the count of currently registered subscriptions.
+    ///
+    /// Useful for callers that want to pre-check capacity before doing
+    /// expensive work (e.g. opening a network stream) that would fail at
+    /// insert time. The post-insert capacity gate in
+    /// [`insert`](Self::insert) and [`insert_or_replace`](Self::insert_or_replace)
+    /// remains the authoritative bound; this is a fast-path optimization.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        let guard = self
+            .inner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.len()
+    }
+
+    /// Returns `true` if the map contains no subscriptions.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Applies `f` to the value at `routing_id`, if present.
     ///
     /// Acquires a read lock and calls `f` with a shared reference to the
@@ -224,10 +229,6 @@ impl<V> TransportSubscriptionMap<V> {
     /// `Some(f(&V))`. Used by adapters that need to read a field of `V`
     /// without cloning it. The closure runs while the lock is held; see
     /// [module docs](self) for constraints.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
     pub fn with<R>(&self, routing_id: &RoutingId, f: impl FnOnce(&V) -> R) -> Option<R> {
         let guard = self
             .inner
@@ -243,10 +244,6 @@ impl<V> TransportSubscriptionMap<V> {
     /// the value. Returns `None` if the slot is empty; otherwise returns
     /// `Some(f(&mut V))`. The closure runs while the lock is held; see
     /// [module docs](self) for constraints.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
     pub fn with_mut<R>(&self, routing_id: &RoutingId, f: impl FnOnce(&mut V) -> R) -> Option<R> {
         let mut guard = self
             .inner
@@ -261,10 +258,6 @@ impl<V> TransportSubscriptionMap<V> {
     /// fan-out operations (e.g. notifying every subscription of a reconnect
     /// event). The closure runs while the lock is held; see
     /// [module docs](self) for constraints.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
     pub fn for_each(&self, mut f: impl FnMut(&RoutingId, &V)) {
         let guard = self
             .inner
@@ -281,10 +274,6 @@ impl<V: Clone> TransportSubscriptionMap<V> {
     ///
     /// Used by adapters during reconnection when both the routing ID and
     /// per-subscription state are needed to re-issue SUBSCRIBE.
-    ///
-    /// # Panics
-    ///
-    /// Panics only if the inner lock is poisoned.
     #[must_use]
     pub fn snapshot(&self) -> Vec<(RoutingId, V)> {
         let guard = self
@@ -545,11 +534,20 @@ mod tests {
         );
 
         // Final state is some valid subset of the keyspace -- no orphan or
-        // torn entries.
-        let ids: Vec<RoutingId> = map.snapshot().into_iter().map(|(k, _)| k).collect();
-        assert!(ids.len() <= usize::from(KEYSPACE));
-        for id in &ids {
+        // torn entries. Verify (a) keys live in the configured keyspace, and
+        // (b) every present value decodes back to a `(thread_idx, iter)` pair
+        // we actually wrote, with no torn or interleaved high/low halves.
+        let entries: Vec<(RoutingId, u64)> = map.snapshot();
+        assert!(entries.len() <= usize::from(KEYSPACE));
+        for (id, value) in &entries {
             assert!(id.as_bytes()[0] < KEYSPACE);
+            let thread_idx = (value >> 32) as usize;
+            let iter = (value & 0xFFFF_FFFF) as usize;
+            assert!(
+                thread_idx < THREADS,
+                "torn entry: thread_idx {thread_idx} out of range"
+            );
+            assert!(iter < ITERATIONS, "torn entry: iter {iter} out of range");
         }
     }
 

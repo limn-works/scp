@@ -191,7 +191,6 @@ pub trait TransportAdapter: Send + Sync {
     /// `subscribe` semantics on duplicate routing-id are not uniform across
     /// adapters; callers must not depend on either rejection or replacement.
     /// Track local subscription state and avoid issuing duplicate subscribes.
-    /// See the follow-up tracking issue for the planned uniform contract.
     fn subscribe(
         &self,
         routing_id: &RoutingId,

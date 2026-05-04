@@ -163,9 +163,8 @@ pub struct WebTransportAdapter {
     ws_handle: Arc<Mutex<Option<SendSyncWrapper<web_sys::WebSocket>>>>,
 
     /// Active WebTransport (HTTP/3) bidi-stream handles keyed by routing_id.
-    /// Used by the WT-HTTP/3 subscribe path; the lifecycle re-architecture
-    /// is tracked in a follow-up issue. The minimal cap+duplicate guard in
-    /// `subscribe()` uses a check-do-check pattern around this map.
+    /// Used by the WT-HTTP/3 subscribe path. The minimal cap+duplicate guard
+    /// in `subscribe()` uses a check-do-check pattern around this map.
     #[cfg(target_arch = "wasm32")]
     wt_bidi_handles:
         Arc<Mutex<HashMap<[u8; 32], SendSyncWrapper<web_sys::WebTransportBidirectionalStream>>>>,
@@ -949,14 +948,12 @@ impl TransportAdapter for WebTransportAdapter {
                 FallbackState::Connected(TransportKind::WebTransport) => {
                     // Check-do-check: race semantics under concurrent
                     // subscribe/unsubscribe interleaving are documented as
-                    // known limitations; see the follow-up tracking issue
-                    // for the planned uniform lifecycle contract.
+                    // known limitations.
                     {
-                        let guard = self.wt_bidi_handles.lock().map_err(|_| {
-                            TransportError::ProtocolError(
-                                "wt_bidi_handles lock poisoned".to_owned(),
-                            )
-                        })?;
+                        let guard = self
+                            .wt_bidi_handles
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if guard.contains_key(&routing_id_bytes) {
                             return Err(TransportError::SubscriptionFailed(
                                 "already subscribed to this routing_id".to_owned(),
@@ -973,11 +970,10 @@ impl TransportAdapter for WebTransportAdapter {
                         self.wt_subscribe_stream(routing_id_bytes, since).await?;
 
                     {
-                        let mut guard = self.wt_bidi_handles.lock().map_err(|_| {
-                            TransportError::ProtocolError(
-                                "wt_bidi_handles lock poisoned".to_owned(),
-                            )
-                        })?;
+                        let mut guard = self
+                            .wt_bidi_handles
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         if guard.contains_key(&routing_id_bytes) {
                             drop(guard);
                             if let Ok(writer) = bidi_handle.inner().writable().get_writer() {
@@ -1067,11 +1063,13 @@ impl TransportAdapter for WebTransportAdapter {
         Box::pin(async move {
             match state {
                 FallbackState::Connected(TransportKind::WebTransport) => {
-                    let removed_handle = self
-                        .wt_bidi_handles
-                        .lock()
-                        .ok()
-                        .and_then(|mut guard| guard.remove(&routing_id_bytes));
+                    let removed_handle = {
+                        let mut guard = self
+                            .wt_bidi_handles
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        guard.remove(&routing_id_bytes)
+                    };
 
                     // Close the writable stream outside the lock to signal
                     // the relay that this subscription is done. The relay
