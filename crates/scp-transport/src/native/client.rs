@@ -928,10 +928,16 @@ impl NativeRelayClient {
                     // occurred so the adapter can emit
                     // `TransportEvent::Reconnected`. Reuses the same snapshot
                     // taken above; the senders are already cloned out of the
-                    // map's read lock. A subscription may have been
-                    // unsubscribed between the snapshot and this loop -- skip
-                    // entries no longer present in the live map so receivers
-                    // never see a spurious `Reconnected` after unsubscribe.
+                    // map's read lock.
+                    //
+                    // A subscription may be unsubscribed between the snapshot
+                    // and this loop; the contains() check below skips those
+                    // entries on the common path. A small TOCTOU window
+                    // remains between the contains() check and tx.send().await
+                    // -- receivers must tolerate one final `Reconnected` after
+                    // `unsubscribe` returns, the same way they tolerate one
+                    // final `Relay(...)` per the SubscriptionState::Clone
+                    // documentation above.
                     for (rid, _last_local_receive, tx) in snap {
                         if !self.subscriptions.contains(&rid) {
                             continue;

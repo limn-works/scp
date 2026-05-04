@@ -316,12 +316,15 @@ impl TransportAdapter for QuicAdapter {
         Box::pin(async move {
             let connection = self.get_connection().await?;
 
-            // Pre-IO capacity check: if the local map is full and this
-            // routing ID is not already present, reject before opening a
-            // QUIC stream and sending SUBSCRIBE. The post-IO insert below
-            // remains the authoritative gate (TOCTOU is acceptable: the
-            // pre-check is a fast-path optimization that avoids relay-side
-            // subscription leaks under non-pathological load).
+            // Best-effort pre-IO cap check: avoid opening a QUIC stream +
+            // sending SUBSCRIBE when we already know the post-IO insert
+            // would reject. The post-IO `insert_or_replace` below is the
+            // authoritative gate; this pre-check is a fast-path
+            // optimization that narrows the relay-side leak window when
+            // the cap is hit. A residual TOCTOU between this check and
+            // `insert_or_replace` is acceptable. (Broader QUIC error-path
+            // leak classes -- e.g., not finishing the send stream on
+            // intermediate failures -- are tracked separately.)
             if !self
                 .subscriptions
                 .contains(&RoutingId::new(routing_id_bytes))

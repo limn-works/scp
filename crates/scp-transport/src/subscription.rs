@@ -41,8 +41,7 @@ use crate::traits::RoutingId;
 /// (e.g., a runaway loop calling `subscribe`). 10,000 is well above the
 /// highest realistic SCP transport-adapter participant footprint (a heavy
 /// participant typically holds ~hundreds of context subscriptions; the cap
-/// leaves >100x headroom). The cap exists to bound memory growth from
-/// pathological producers or bugs. Revisit this constant if real participant
+/// leaves >100x headroom). Revisit this constant if real participant
 /// counts approach 1,000.
 ///
 /// This cap is independent of the server-side relay caps in
