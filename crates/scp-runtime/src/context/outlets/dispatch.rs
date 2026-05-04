@@ -1462,5 +1462,176 @@ pub fn reference_chunks_billed(manifest: &[OutletStreamChunk], cancel_ack_seq: O
 }
 
 // ---------------------------------------------------------------------------
-// Tests live under tests/ — see crates/scp-runtime/tests/streaming_dispatch_*.
+// Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use scp_protocol::context::outlets::stream::ChunkPayload;
+    use std::time::Duration;
+
+    fn fixed_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x42; 32])
+    }
+
+    fn build_test_state() -> Arc<Mutex<SharedSessionState>> {
+        let signing = Arc::new(fixed_signing_key());
+        let identity = super::super::stream::StreamIdentity {
+            context_id: "ctx-test".to_owned(),
+            outlet_id: "outlet-test".to_owned(),
+            stream_epoch: 1,
+            caveats_binding: [0xAB; 32],
+        };
+        let credit = CreditTracker::new(32, signing.verifying_key(), identity);
+        let cancel_ack = CancelAckTracker::new(5);
+        let admission = Arc::new(Mutex::new(StreamAdmissionTracker::new()));
+        Arc::new(Mutex::new(SharedSessionState {
+            credit,
+            escrow: super::super::stream::StreamEscrow::zero_escrow(),
+            cancel_ack,
+            admission,
+            admission_release_keys: AdmissionReleaseKeys {
+                invoker_did: "did:dht:invoker".to_owned(),
+                origin_invoker_did: "did:dht:origin".to_owned(),
+                outlet_id: "outlet-test".to_owned(),
+            },
+            cancel_ack_armed: false,
+            credit_stall_armed_at: None,
+            cancel_ack_seq: None,
+            operator_signing_key: Some(signing),
+            pending_terminate: None,
+        }))
+    }
+
+    /// §5.4.5 receiver-side revocation re-check: `terminate_with_error`
+    /// arms `pending_terminate` and the pump emits a synthetic terminal
+    /// `Error{terminal:true}` chunk on its next iteration with the
+    /// caller-supplied code/message and the spec slug-prefixed message.
+    #[tokio::test]
+    async fn terminate_with_error_emits_synthetic_terminal_chunk() {
+        let state = build_test_state();
+        let grant_wake = Arc::new(Notify::new());
+        let cancel_wake = Arc::new(Notify::new());
+        let terminate_wake = Arc::new(Notify::new());
+        let (_inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
+        let request_id: RequestId = [0x77; 16];
+
+        let pump_state = Arc::clone(&state);
+        let pump_grant = Arc::clone(&grant_wake);
+        let pump_cancel = Arc::clone(&cancel_wake);
+        let pump_terminate = Arc::clone(&terminate_wake);
+        let pump_handle = tokio::spawn(async move {
+            run_stream_pump_v2(
+                pump_state,
+                pump_grant,
+                pump_cancel,
+                pump_terminate,
+                inner_rx,
+                outer_tx,
+                summary_tx,
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+                request_id,
+                PumpEventEmissionInputs {
+                    sink: None,
+                    context_id: "ctx-test".to_owned(),
+                    outlet_id: "outlet-test".to_owned(),
+                    invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),
+                    input_hash: "0".repeat(64),
+                    start: Instant::now(),
+                },
+            )
+            .await;
+        });
+
+        // Build a StreamSessionHandle that mirrors what `open_stream_session`
+        // would have constructed, then exercise `terminate_with_error`.
+        let handle = StreamSessionHandle {
+            receiver: None,
+            state: Arc::clone(&state),
+            grant_wake: Arc::clone(&grant_wake),
+            cancel_wake: Arc::clone(&cancel_wake),
+            terminate_wake: Arc::clone(&terminate_wake),
+            summary_rx: None,
+            request_id,
+        };
+
+        handle
+            .terminate_with_error(
+                "authorization.revoked-mid-stream",
+                "SCP-TOOL-6110",
+                "ucan revoked mid-stream",
+            )
+            .expect("terminate accepted");
+
+        // Pump should emit exactly one synthetic terminal Error chunk
+        // and then close the channel after settlement.
+        let chunk = tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
+            .await
+            .expect("pump emits synthetic terminal within 2s")
+            .expect("chunk arrives");
+        let ChunkPayload::Error {
+            code,
+            message,
+            terminal,
+        } = chunk.payload
+        else {
+            // Pump emits exactly one terminal chunk on `terminate_with_error`
+            // — anything else is a regression in the eager-check loop entry.
+            unreachable!("expected terminal Error chunk");
+        };
+        assert_eq!(code, "SCP-TOOL-6110");
+        assert!(
+            message.contains("authorization.revoked-mid-stream"),
+            "message must carry slug prefix: {message}"
+        );
+        assert!(message.contains("ucan revoked mid-stream"));
+        assert!(terminal, "terminate must emit `terminal: true`");
+
+        // Pump exits after settlement.
+        pump_handle
+            .await
+            .expect("pump task settles after terminal emission");
+
+        // Summary published.
+        let summary = summary_rx.await.expect("summary published");
+        assert_eq!(summary.stream_chunk_count, 1);
+        assert_eq!(summary.manifest.len(), 1);
+    }
+
+    /// `terminate_with_error` is idempotent: a second call while the
+    /// first is still pending returns `AlreadyPending`.
+    #[tokio::test]
+    async fn terminate_with_error_returns_already_pending_on_second_call() {
+        let state = build_test_state();
+        let grant_wake = Arc::new(Notify::new());
+        let cancel_wake = Arc::new(Notify::new());
+        let terminate_wake = Arc::new(Notify::new());
+        let request_id: RequestId = [0x33; 16];
+
+        let handle = StreamSessionHandle {
+            receiver: None,
+            state,
+            grant_wake,
+            cancel_wake,
+            terminate_wake,
+            summary_rx: None,
+            request_id,
+        };
+
+        // First call wins.
+        handle
+            .terminate_with_error("a.b", "SCP-TOOL-6110", "first")
+            .expect("first terminate accepted");
+        // Second call sees pending → AlreadyPending.
+        let err = handle
+            .terminate_with_error("a.b", "SCP-TOOL-6110", "second")
+            .expect_err("second terminate rejected");
+        assert!(matches!(err, TerminateError::AlreadyPending));
+    }
+}
