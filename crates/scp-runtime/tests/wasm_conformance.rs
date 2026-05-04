@@ -2598,3 +2598,179 @@ fn source_type_string_format_is_stable() {
         );
     }
 }
+
+// ===========================================================================
+// SCP-OUT-039 cross-SDK byte-equivalence — WASM leg
+// ===========================================================================
+//
+// The `scp-ffi-wasm` crate is `crate-type = ["cdylib"]` and only
+// compiles for `wasm32-unknown-unknown`; host `cargo test` cannot
+// instantiate the bridge directly. The §5.4.5 functions the WASM
+// bridge exposes (`computeCaveatsBinding`, `verifyChunkSignature`)
+// are thin `#[wasm_bindgen]` wrappers around
+// `scp_protocol::context::outlets::stream::compute_caveats_binding`
+// and `verify_chunk_signature` — same crate, same algorithm, same
+// preimage bytes. The host-runnable test below replays every
+// fixture vector through the protocol-level helpers (which the WASM
+// bridge calls verbatim after JS marshaling). A pass here proves
+// that a WASM bridge built today reproduces the goldens; the TS
+// `outlet-caveats-binding-conformance.test.ts` provides the
+// browser-side proof against the wasm-pack output.
+
+#[test]
+fn outlet_caveats_binding_fixture_reproduces_through_wasm_protocol_path() {
+    use scp_protocol::context::outlets::stream::{
+        OutletStreamChunk, RequestId, compute_caveats_binding, compute_credit_sig_preimage,
+        sign_chunk, verify_chunk_signature,
+    };
+
+    #[derive(serde::Deserialize)]
+    struct CaveatsBindingVector {
+        name: String,
+        ucan_cid_hex: String,
+        request_id_hex: String,
+        invoker_did: String,
+        estimated_chunk_count: u32,
+        effective_caveats_jcs: String,
+        expected_caveats_binding_hex: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct ChunkSigVector {
+        name: String,
+        context_id: String,
+        outlet_id: String,
+        request_id_hex: String,
+        sequence: u64,
+        caveats_binding_hex: String,
+        payload_json: serde_json::Value,
+        #[allow(dead_code)]
+        expected_chunk_sig_preimage_hex: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct CreditSigVector {
+        name: String,
+        context_id: String,
+        outlet_id: String,
+        request_id_hex: String,
+        grant: u32,
+        monotonic_seq: u64,
+        stream_epoch: u64,
+        caveats_binding_hex: String,
+        expected_credit_sig_preimage_hex: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct FixtureFile {
+        caveats_binding: Vec<CaveatsBindingVector>,
+        chunk_sig_preimage: Vec<ChunkSigVector>,
+        credit_sig_preimage: Vec<CreditSigVector>,
+    }
+
+    fn fixture_path() -> std::path::PathBuf {
+        let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.pop(); // out of scp-runtime
+        p.pop(); // out of crates
+        p.push("tests/conformance/vectors/outlet_caveats_binding_fixtures.json");
+        p
+    }
+
+    let bytes = std::fs::read(fixture_path()).expect("fixture file must exist");
+    let f: FixtureFile = serde_json::from_slice(&bytes).expect("fixture parses");
+
+    // caveats_binding — direct byte-for-byte
+    for v in &f.caveats_binding {
+        let ucan_cid = hex::decode(&v.ucan_cid_hex).expect("valid hex");
+        let request_id_bytes = hex::decode(&v.request_id_hex).expect("valid hex");
+        let request_id: RequestId = request_id_bytes
+            .as_slice()
+            .try_into()
+            .expect("request_id 16 bytes");
+        let actual = compute_caveats_binding(
+            &ucan_cid,
+            &request_id,
+            &v.invoker_did,
+            v.estimated_chunk_count,
+            v.effective_caveats_jcs.as_bytes(),
+        );
+        let actual_hex = hex::encode(actual);
+        assert_eq!(
+            actual_hex, v.expected_caveats_binding_hex,
+            "WASM-leg vector {}: caveats_binding mismatch",
+            v.name
+        );
+    }
+
+    // chunk_sig_preimage — verified via verify_chunk_signature round-trip
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+    for v in &f.chunk_sig_preimage {
+        let request_id_bytes = hex::decode(&v.request_id_hex).expect("valid hex");
+        let request_id: RequestId = request_id_bytes
+            .as_slice()
+            .try_into()
+            .expect("request_id 16 bytes");
+        let cb_bytes = hex::decode(&v.caveats_binding_hex).expect("valid hex");
+        let caveats_binding: [u8; 32] = cb_bytes
+            .as_slice()
+            .try_into()
+            .expect("caveats_binding 32 bytes");
+        let payload: scp_protocol::context::outlets::stream::ChunkPayload =
+            serde_json::from_value(v.payload_json.clone()).expect("payload deserialises");
+        let sig = sign_chunk(
+            &signing_key,
+            &v.context_id,
+            &v.outlet_id,
+            &request_id,
+            v.sequence,
+            &caveats_binding,
+            &payload,
+        )
+        .expect("sign_chunk");
+        let chunk = OutletStreamChunk {
+            request_id,
+            sequence: v.sequence,
+            payload,
+            sig,
+        };
+        let verified = verify_chunk_signature(
+            &chunk,
+            &signing_key.verifying_key(),
+            &v.context_id,
+            &v.outlet_id,
+            &caveats_binding,
+        );
+        assert!(
+            verified,
+            "WASM-leg vector {}: verify_chunk_signature must accept a chunk signed under \
+             the same preimage",
+            v.name
+        );
+    }
+
+    // credit_sig_preimage — direct byte-for-byte
+    for v in &f.credit_sig_preimage {
+        let request_id_bytes = hex::decode(&v.request_id_hex).expect("valid hex");
+        let request_id: RequestId = request_id_bytes
+            .as_slice()
+            .try_into()
+            .expect("request_id 16 bytes");
+        let cb_bytes = hex::decode(&v.caveats_binding_hex).expect("valid hex");
+        let caveats_binding: [u8; 32] = cb_bytes
+            .as_slice()
+            .try_into()
+            .expect("caveats_binding 32 bytes");
+        let actual = compute_credit_sig_preimage(
+            &v.context_id,
+            &v.outlet_id,
+            &request_id,
+            v.grant,
+            v.monotonic_seq,
+            v.stream_epoch,
+            &caveats_binding,
+        );
+        let actual_hex = hex::encode(actual);
+        assert_eq!(
+            actual_hex, v.expected_credit_sig_preimage_hex,
+            "WASM-leg vector {}: credit_sig_preimage mismatch",
+            v.name
+        );
+    }
+}

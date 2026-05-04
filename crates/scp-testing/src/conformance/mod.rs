@@ -9,6 +9,7 @@ pub mod attestation;
 pub mod blob_store;
 pub mod key_custody;
 pub mod outlet_capability_parse;
+pub mod outlet_caveats_binding;
 pub mod outlet_registration;
 pub mod payment;
 pub mod push;
