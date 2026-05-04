@@ -497,6 +497,46 @@ pub fn outlet_stream_cancel(request_id_hex: String, next_seq: Option<f64>) -> Pr
 }
 
 // ---------------------------------------------------------------------------
+// outletStreamTerminate — receiver-side revocation re-check (§5.4.5)
+// ---------------------------------------------------------------------------
+
+/// Forces a terminal `Error{terminal:true}` chunk into the active stream
+/// identified by `request_id_hex` (§5.4.5 receiver-side revocation
+/// re-check, `RevokedMidStream` / `SCP-TOOL-6110`).
+///
+/// Routes through
+/// [`crate::manager::WasmContextManager::outlet_stream_terminate`] —
+/// because WASM has no executor pump, the manager pushes a synthetic
+/// terminal chunk into the pre-materialised queue under the per-session
+/// signing key. The next `outlet_stream_next` delivers the synthetic
+/// terminal; the one after that resolves to `None` and evicts the
+/// session.
+///
+/// The SDK framework's periodic UCAN re-check loop calls this whenever
+/// it observes the opening UCAN has been revoked since stream open.
+///
+/// Returns a JS `Promise<void>` — resolves on success, rejects only when
+/// the `request_id_hex` does not match any active session.
+///
+/// # Errors
+///
+/// * `SCP-TOOL-6101` — `request_id_hex` does not match any active
+///   stream registry entry (`protocol.unknown-session`).
+#[wasm_bindgen(js_name = "outletStreamTerminate")]
+pub fn outlet_stream_terminate(
+    request_id_hex: String,
+    slug: String,
+    code: String,
+    message: String,
+) -> Promise {
+    future_to_promise(async move {
+        with_manager(|mgr| mgr.outlet_stream_terminate(&request_id_hex, &slug, &code, &message))
+            .map_err(ScpWasmError::into_js)?;
+        Ok(JsValue::UNDEFINED)
+    })
+}
+
+// ---------------------------------------------------------------------------
 // verifyChunkSignature — pure helper
 // ---------------------------------------------------------------------------
 

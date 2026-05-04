@@ -2851,6 +2851,101 @@ impl WasmContextManager {
         Ok(Some(next_seq))
     }
 
+    /// Forces a terminal `Error{terminal:true}` chunk into the active
+    /// stream identified by `request_id_hex` (§5.4.5 receiver-side
+    /// revocation re-check, `RevokedMidStream` / `SCP-TOOL-6110`).
+    ///
+    /// Mirrors the runtime-bridge
+    /// `StreamSessionHandle::terminate_with_error` path on the
+    /// non-WASM bridges. Because the WASM stream pipeline is
+    /// pre-materialised (no executor pump), termination clears any
+    /// remaining chunks past the next-to-emit sequence, signs and
+    /// pushes a synthetic terminal `Error` chunk under the
+    /// per-session signing key, and flips `terminated`. The next
+    /// `outlet_stream_next` call delivers the synthetic chunk; the
+    /// one after that resolves to `None` and evicts the session.
+    ///
+    /// Idempotent: returns `Ok(false)` when the session is already
+    /// terminal (matching the runtime path's `AlreadyTerminated` /
+    /// `AlreadyPending` recoverable errors — both indicate the
+    /// stream has already left the control plane and the SDK's
+    /// recheck loop should stop re-checking).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpWasmError::Context` (`SCP-TOOL-6101`,
+    /// `protocol.unknown-session`) when `request_id_hex` does not
+    /// match any active session.
+    pub fn outlet_stream_terminate(
+        &mut self,
+        request_id_hex: &str,
+        slug: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<bool, ScpWasmError> {
+        use scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION;
+        use scp_protocol::context::outlets::stream::{ChunkPayload, OutletStreamChunk, sign_chunk};
+
+        let session =
+            self.outlet_streams
+                .get_mut(request_id_hex)
+                .ok_or_else(|| ScpWasmError::Context {
+                    message: format!(
+                        "stream '{request_id_hex}' not found in registry (protocol.unknown-session)"
+                    ),
+                    code: CODE_PROTOCOL_SESSION.to_owned(),
+                })?;
+
+        if session.terminated || session.cancelled {
+            // Idempotent — recoverable from the SDK's recheck loop
+            // perspective. Mirrors the runtime path's
+            // `TerminateError::AlreadyTerminated` / `AlreadyPending`.
+            return Ok(false);
+        }
+
+        // Sequence assignment: §5.4.5 mandates strict-monotonic
+        // per-stream sequences. WASM tracks the next-to-emit cursor
+        // implicitly as `total_emitted + queued_chunks_len`. We pin
+        // the synthetic chunk's sequence at "what the next chunk
+        // would have been" so receivers see a contiguous sequence
+        // space. The session's `chunks` already carries pre-built
+        // chunks 0..N at sequences 0..N; the synthetic terminal
+        // takes the slot AFTER any chunk already delivered to the
+        // SDK but REPLACES any chunks not yet delivered (the spec
+        // §5.4.5 says "Already-emitted chunks remain authorized;
+        // the stream closes ... regardless of executor behavior" —
+        // so we drop anything queued but not yet delivered).
+        let next_sequence = u64::try_from(session.chunks.len()).unwrap_or(u64::MAX);
+        session.chunks.clear();
+
+        let payload = ChunkPayload::Error {
+            code: code.to_owned(),
+            message: format!("{slug}: {message}"),
+            terminal: true,
+        };
+        let sig = sign_chunk(
+            &session.invoker_signing_key,
+            &session.context_id,
+            &session.outlet_id,
+            &session.request_id,
+            next_sequence,
+            &session.caveats_binding,
+            &payload,
+        )
+        .map_err(|e| ScpWasmError::Tool {
+            message: format!("failed to sign synthetic terminal chunk: {e}"),
+            code: codes::TOOL_6006.to_owned(),
+        })?;
+        session.chunks.push_back(OutletStreamChunk {
+            request_id: session.request_id,
+            sequence: next_sequence,
+            payload,
+            sig,
+        });
+        session.terminated = true;
+        Ok(true)
+    }
+
     /// Verifies a tool against its test vectors.
     ///
     /// # Errors

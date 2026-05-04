@@ -867,6 +867,57 @@ pub fn outlet_stream_cancel(
     Ok(recorded.map(|seq| seq as f64))
 }
 
+// ---------------------------------------------------------------------------
+// outletStreamTerminate — receiver-side revocation re-check (§5.4.5)
+// ---------------------------------------------------------------------------
+
+/// Forces a terminal `Error{terminal:true}` chunk into the active stream
+/// identified by `request_id_hex` (§5.4.5 receiver-side revocation
+/// re-check, `RevokedMidStream` / `SCP-TOOL-6110`).
+///
+/// Routes through
+/// [`scp_runtime::context::outlets::dispatch::StreamSessionHandle::terminate_with_error`]
+/// — the runtime pump emits a synthetic terminal chunk under the pinned
+/// operator key and runs settlement (admission release, escrow refund,
+/// `OutletInvokedEvent` emission) identically to other framework-emitted
+/// closes.
+///
+/// The SDK framework's periodic UCAN re-check loop calls this whenever
+/// it observes the opening UCAN has been revoked since stream open.
+///
+/// # Errors
+///
+/// * `Context` (slug `protocol.unknown-session`) — `request_id_hex`
+///   does not match any active stream.
+/// * `Context` — the runtime rejected the termination because the pump
+///   has already emitted a terminal chunk
+///   ([`scp_runtime::context::outlets::dispatch::TerminateError::AlreadyTerminated`])
+///   or another terminate is already pending
+///   ([`scp_runtime::context::outlets::dispatch::TerminateError::AlreadyPending`]).
+#[napi(js_name = "outletStreamTerminate")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn outlet_stream_terminate(
+    request_id_hex: String,
+    slug: String,
+    code: String,
+    message: String,
+) -> napi::Result<()> {
+    let entry = lookup_entry(&request_id_hex)?;
+    let handle_guard = entry
+        .handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    handle_guard
+        .terminate_with_error(&slug, &code, &message)
+        .map_err(|err| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("terminate rejected: {err}"),
+                code: code.clone(),
+            })
+        })?;
+    Ok(())
+}
+
 /// Builds and signs an `OutletStreamCancel` for `entry` against
 /// `next_seq` (mirrors [`sign_credit_grant`]).
 fn sign_cancel_for_entry(

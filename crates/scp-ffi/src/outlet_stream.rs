@@ -728,6 +728,60 @@ pub fn py_outlet_stream_cancel(
     Ok(recorded)
 }
 
+// ---------------------------------------------------------------------------
+// outlet_stream_terminate — receiver-side revocation re-check (§5.4.5)
+// ---------------------------------------------------------------------------
+
+/// Forces a terminal `Error{terminal:true}` chunk into the active stream
+/// identified by `request_id_hex` (§5.4.5 receiver-side revocation
+/// re-check, `RevokedMidStream` / `SCP-TOOL-6110`).
+///
+/// Routes through
+/// [`scp_runtime::context::outlets::dispatch::StreamSessionHandle::terminate_with_error`]
+/// — the runtime pump emits a synthetic terminal chunk under the pinned
+/// operator key and runs settlement (admission release, escrow refund,
+/// `OutletInvokedEvent` emission) identically to other framework-emitted
+/// closes.
+///
+/// The SDK framework's periodic UCAN re-check loop calls this whenever
+/// it observes the opening UCAN has been revoked since stream open. The
+/// `slug` / `code` / `message` triple is recorded into the synthetic
+/// `ChunkPayload::Error` and surfaces to the receiver alongside the
+/// signed terminal chunk.
+///
+/// # Errors
+///
+/// * `ContextError` (slug `protocol.unknown-session`) — `request_id_hex`
+///   does not match any active stream registry entry.
+/// * `ContextError` — the runtime rejected the termination because the
+///   pump has already emitted a terminal chunk
+///   ([`scp_runtime::context::outlets::dispatch::TerminateError::AlreadyTerminated`])
+///   or another terminate is already pending
+///   ([`scp_runtime::context::outlets::dispatch::TerminateError::AlreadyPending`]).
+///   These are recoverable from the SDK's perspective — the recheck
+///   loop should treat them as success and stop re-checking.
+#[pyfunction]
+#[pyo3(name = "outlet_stream_terminate")]
+pub fn py_outlet_stream_terminate(
+    request_id_hex: &str,
+    slug: &str,
+    code: &str,
+    message: &str,
+) -> PyResult<()> {
+    let entry = lookup_entry(request_id_hex)?;
+    let handle_guard = entry
+        .handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    handle_guard
+        .terminate_with_error(slug, code, message)
+        .map_err(|err| ScpPyError::ContextError {
+            message: format!("terminate rejected: {err}"),
+            code: code.to_owned(),
+        })?;
+    Ok(())
+}
+
 /// Builds and signs an [`OutletStreamCancel`] for `entry` against
 /// `next_seq`. Mirrors [`sign_credit_grant`].
 fn sign_cancel_for_entry(
@@ -1009,6 +1063,7 @@ pub fn register_outlet_stream(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(py_outlet_invoke_stream, m)?)?;
     m.add_function(wrap_pyfunction!(py_outlet_stream_grant_credit, m)?)?;
     m.add_function(wrap_pyfunction!(py_outlet_stream_cancel, m)?)?;
+    m.add_function(wrap_pyfunction!(py_outlet_stream_terminate, m)?)?;
     m.add_function(wrap_pyfunction!(py_verify_chunk_signature, m)?)?;
     m.add_function(wrap_pyfunction!(py_compute_caveats_binding, m)?)?;
     Ok(())

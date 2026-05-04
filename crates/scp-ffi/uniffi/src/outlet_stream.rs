@@ -431,6 +431,32 @@ impl OutletStreamHandle {
     pub async fn cancel(&self, next_seq: Option<u64>) -> Result<Option<u64>, ScpError> {
         outlet_stream_cancel(self.request_id_hex.clone(), next_seq).await
     }
+
+    /// Forces a terminal `Error{terminal:true}` chunk into this stream
+    /// (§5.4.5 receiver-side revocation re-check, `RevokedMidStream` /
+    /// `SCP-TOOL-6110`).
+    ///
+    /// Convenience wrapper that delegates to
+    /// [`outlet_stream_terminate`] with this handle's `request_id`. The
+    /// SDK framework's periodic UCAN re-check loop calls this whenever
+    /// it observes the opening UCAN has been revoked since stream open.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` (slug `protocol.unknown-session`)
+    /// when the stream has already been evicted from the registry, or
+    /// when the runtime rejected the terminate (already-terminated /
+    /// already-pending). All cases are recoverable from the SDK's
+    /// recheck loop's perspective — they indicate the stream has
+    /// already left the pump's control plane.
+    pub async fn terminate(
+        &self,
+        slug: String,
+        code: String,
+        message: String,
+    ) -> Result<(), ScpError> {
+        outlet_stream_terminate(self.request_id_hex.clone(), slug, code, message).await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1054,60 @@ fn sign_cancel_for_entry(
         next_seq,
         sig,
     }
+}
+
+// ---------------------------------------------------------------------------
+// outlet_stream_terminate — receiver-side revocation re-check (§5.4.5)
+// ---------------------------------------------------------------------------
+
+/// Forces a terminal `Error{terminal:true}` chunk into the active stream
+/// identified by `request_id_hex` (§5.4.5 receiver-side revocation
+/// re-check, `RevokedMidStream` / `SCP-TOOL-6110`).
+///
+/// Routes through
+/// [`scp_runtime::context::outlets::dispatch::StreamSessionHandle::terminate_with_error`]
+/// — the runtime pump emits a synthetic terminal chunk under the pinned
+/// operator key and runs settlement (admission release, escrow refund,
+/// `OutletInvokedEvent` emission) identically to other framework-emitted
+/// closes.
+///
+/// The SDK framework's periodic UCAN re-check loop calls this whenever
+/// it observes the opening UCAN has been revoked since stream open.
+///
+/// # Errors
+///
+/// * `ScpError::Context` (slug `protocol.unknown-session`) —
+///   `request_id_hex` does not match any active stream.
+/// * `ScpError::Context` — the runtime rejected the termination because
+///   the pump has already emitted a terminal chunk
+///   ([`scp_runtime::context::outlets::dispatch::TerminateError::AlreadyTerminated`])
+///   or another terminate is already pending
+///   ([`scp_runtime::context::outlets::dispatch::TerminateError::AlreadyPending`]).
+// UniFFI proc-macros generate the binding glue based on the `async`
+// keyword — the function body is sync (no awaits) because both
+// `lookup_entry` and `terminate_with_error` are sync, but the public
+// surface MUST be `async` so Swift sees `async throws` and Kotlin sees
+// `suspend` (mirroring `outlet_stream_cancel`'s signature shape).
+#[allow(clippy::unused_async)]
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn outlet_stream_terminate(
+    request_id_hex: String,
+    slug: String,
+    code: String,
+    message: String,
+) -> Result<(), ScpError> {
+    let entry = lookup_entry(&request_id_hex)?;
+    let handle_guard = entry
+        .handle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    handle_guard
+        .terminate_with_error(&slug, &code, &message)
+        .map_err(|err| ScpError::Context {
+            msg: format!("terminate rejected: {err}"),
+            code: code.clone(),
+        })?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
