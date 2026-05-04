@@ -44,22 +44,34 @@
 //! # Top-level entry points (actor-handler dispatch targets)
 //!
 //! - [`export_context`] — capture snapshot + event-log + signed export.
-//! - [`import_context`] — validate + restore crypto + register.
-//! - [`create_context`] — two-phase create + register + finalize.
-//! - [`finalize_create`] — gauges + governance timeout + persistence
-//!   + TTL timer.
-//! - [`join_context`] / [`join_context_membership`] /
-//!   [`capture_join_payment`] — F4 escrow dance for join.
+//! - [`import_context`] — validate + restore crypto + register
+//!   (bootstrap entry point).
+//! - [`create_context`] — two-phase create + register + finalize
+//!   (bootstrap entry point).
+//! - [`join_context`] — F4 escrow dance: economy + sybil + hard-rate-
+//!   limit + MLS add + sender-key distribute + membership mutate +
+//!   capture.
 //! - [`leave_context`] — capability check + MLS remove + sender-key
 //!   cleanup + close-on-empty.
 //! - [`drain_and_deliver_sender_keys`] — sender-key distribution drain
 //!   used by join / leave.
-//! - [`close_context`] / [`close_context_with_key`] — gate +
-//!   ttl::close + cancel timers + final checkpoint + persist.
-//! - [`load_persisted_context_state`] — load context snapshot and
-//!   broadcast state from persistence.
-//! - [`restore_context`] — rebuild PerContextState from snapshot +
-//!   register + start governance timeout + spawn TTL.
+//! - [`close_context`] — `SingleAdmin` gate + `ttl::close` + cancel
+//!   timers + final checkpoint + persist.
+//! - [`restore_context`] — rebuild `PerContextState` from snapshot +
+//!   register + start governance timeout + spawn TTL (bootstrap entry
+//!   point).
+//!
+//! # Transitive helpers (live in `_legacy.rs` only)
+//!
+//! `finalize_create`, `join_context_membership`, `capture_join_payment`,
+//! `close_context_with_key`, `load_persisted_context_state` are
+//! body-implementation details of the outer entry points. Because the
+//! actor-shape outer wrappers delegate fully to the `_legacy` bodies
+//! (which compose the transitives internally), the transitives have
+//! no actor-shape caller until Phase 2A finalization replaces the
+//! delegation with direct composition. They live ONLY in
+//! [`crate::context::lifecycle_helpers_legacy`] for the duration of
+//! the migration window.
 //!
 //! # Designated-legacy supervisor-scoped iteration helpers
 //!
@@ -201,41 +213,7 @@ pub async fn create_context(
 }
 
 // ---------------------------------------------------------------------------
-// 4. finalize_create (transitive of create_context)
-// ---------------------------------------------------------------------------
-
-/// Post-creation finalization: gauges, governance timeout, persistence,
-/// TTL timer.
-///
-/// Actor-shape wrapper that delegates to
-/// [`crate::context::lifecycle_helpers_legacy::finalize_create_legacy`]
-/// via the
-/// [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-/// escape. The legacy body spawns the TTL timer through
-/// [`crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy`]
-/// (Phase 2A.6 Option B path); when callers reach this helper from a
-/// migrated bootstrap path, the TTL timer is owned by the supervisor
-/// shim until per-actor TTL ownership lands in a follow-on Phase 2
-/// chunk.
-pub async fn finalize_create(
-    _state: &mut PerContextState,
-    deps: &ActorDeps,
-    context_id: &str,
-    ttl_duration: Option<std::time::Duration>,
-    handle: &ContextHandle,
-) {
-    let supervisor = deps.supervisor.shim_supervisor();
-    crate::context::lifecycle_helpers_legacy::finalize_create_legacy(
-        supervisor.as_ref(),
-        context_id,
-        ttl_duration,
-        handle,
-    )
-    .await;
-}
-
-// ---------------------------------------------------------------------------
-// 5. join_context (top-level)
+// 4. join_context (top-level)
 // ---------------------------------------------------------------------------
 
 /// Joins a member to a context.
@@ -244,9 +222,9 @@ pub async fn finalize_create(
 /// [`crate::context::lifecycle_helpers_legacy::join_context_legacy`]
 /// via the
 /// [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-/// escape. See the legacy body for the full F4 escrow dance: economy
-/// + sybil + hard-rate-limit under lock, then authorize, MLS add,
-/// sender-key distribute, membership mutate, capture.
+/// escape. See the legacy body for the full F4 escrow dance:
+/// economy / sybil / hard-rate-limit under lock, then authorize, MLS
+/// add, sender-key distribute, membership mutate, capture.
 ///
 /// `state` is currently not read here — the legacy body looks up
 /// per-context state through the contexts `DashMap` via
@@ -279,72 +257,7 @@ pub async fn join_context(
 }
 
 // ---------------------------------------------------------------------------
-// 6. join_context_membership (transitive of join_context)
-// ---------------------------------------------------------------------------
-
-/// Performs the membership state mutations for `join_context` (Phase 4).
-///
-/// Actor-shape wrapper that delegates to
-/// [`crate::context::lifecycle_helpers_legacy::join_context_membership_legacy`]
-/// via the
-/// [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-/// escape.
-///
-/// # Errors
-///
-/// Returns [`ContextError`] from the legacy body — most commonly
-/// `MembershipFailed` (role assignment failed) or
-/// `ContextNotRegistered`.
-pub async fn join_context_membership(
-    _state: &mut PerContextState,
-    deps: &ActorDeps,
-    context_id: &str,
-    member_did: &DID,
-    add_output: scp_protocol::context::builder::AddMemberOutput,
-) -> Result<(), ContextError> {
-    let supervisor = deps.supervisor.shim_supervisor();
-    crate::context::lifecycle_helpers_legacy::join_context_membership_legacy(
-        supervisor.as_ref(),
-        context_id,
-        member_did,
-        add_output,
-    )
-    .await
-}
-
-// ---------------------------------------------------------------------------
-// 7. capture_join_payment (transitive of join_context)
-// ---------------------------------------------------------------------------
-
-/// Captures the escrow hold after a successful join (Phase 5 of
-/// `join_context`).
-///
-/// Actor-shape wrapper that delegates to
-/// [`crate::context::lifecycle_helpers_legacy::capture_join_payment_legacy`]
-/// via the
-/// [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-/// escape.
-pub async fn capture_join_payment(
-    _state: &mut PerContextState,
-    deps: &ActorDeps,
-    auth: Option<crate::context::economy_logic::PaidActionAuthorization>,
-    member_did: &DID,
-    context_id: &str,
-    deducted_cost: Option<scp_protocol::economy::types::Amount>,
-) {
-    let supervisor = deps.supervisor.shim_supervisor();
-    crate::context::lifecycle_helpers_legacy::capture_join_payment_legacy(
-        supervisor.as_ref(),
-        auth,
-        member_did,
-        context_id,
-        deducted_cost,
-    )
-    .await;
-}
-
-// ---------------------------------------------------------------------------
-// 8. leave_context (top-level)
+// 5. leave_context (top-level)
 // ---------------------------------------------------------------------------
 
 /// Removes a member from a context.
@@ -450,78 +363,7 @@ pub async fn close_context(
 }
 
 // ---------------------------------------------------------------------------
-// 11. close_context_with_key (transitive of close_context)
-// ---------------------------------------------------------------------------
-
-/// Closes a context with an optional signing key for final checkpoint
-/// generation (§9.9.3).
-///
-/// Actor-shape wrapper that delegates to
-/// [`crate::context::lifecycle_helpers_legacy::close_context_with_key_legacy`]
-/// via the
-/// [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-/// escape. See the legacy body for the full `SingleAdmin` gate, TTL /
-/// governance-timeout cancellation, and final-checkpoint policy.
-///
-/// # Errors
-///
-/// Returns [`ContextError`] for gate failures (multi-admin context),
-/// state-transition failures, or persistence failures.
-pub async fn close_context_with_key(
-    _state: &mut PerContextState,
-    deps: &ActorDeps,
-    handle: &ContextHandle,
-    initiator_did: &DID,
-    signing_key: Option<&ed25519_dalek::SigningKey>,
-) -> Result<CloseResult, ContextError> {
-    let supervisor = deps.supervisor.shim_supervisor();
-    crate::context::lifecycle_helpers_legacy::close_context_with_key_legacy(
-        supervisor.as_ref(),
-        handle,
-        initiator_did,
-        signing_key,
-    )
-    .await
-}
-
-// ---------------------------------------------------------------------------
-// 12. load_persisted_context_state
-// ---------------------------------------------------------------------------
-
-/// Loads a persisted context snapshot and optional broadcast state.
-///
-/// Actor-shape wrapper that delegates to
-/// [`crate::context::lifecycle_helpers_legacy::load_persisted_context_state_legacy`]
-/// via the
-/// [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-/// escape. Sync function — no `state` parameter because callers invoke
-/// this from the bootstrap path before any actor exists for the
-/// context being loaded.
-///
-/// # Errors
-///
-/// Returns [`ContextError::PersistenceFailed`] if no persistence
-/// provider is configured, no snapshot exists, or the load operation
-/// fails.
-pub fn load_persisted_context_state(
-    deps: &ActorDeps,
-    context_id: &str,
-) -> Result<
-    (
-        crate::context::state::ContextSnapshot,
-        Option<scp_protocol::context::broadcast::BroadcastContext>,
-    ),
-    ContextError,
-> {
-    let supervisor = deps.supervisor.shim_supervisor();
-    crate::context::lifecycle_helpers_legacy::load_persisted_context_state_legacy(
-        supervisor.as_ref(),
-        context_id,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// 13. restore_context (bootstrap — constructs fresh PerContextState)
+// 7. restore_context (bootstrap — constructs fresh PerContextState)
 // ---------------------------------------------------------------------------
 
 /// Restores a context into the supervisor from persisted state.

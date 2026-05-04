@@ -38,9 +38,9 @@
 //! 1. [`export_context_legacy`] — full export body (snapshot + event
 //!    log + signed export).
 //! 2. [`import_context_legacy`] — full import body (validate, restore
-//!    crypto, build PerContextState, register).
+//!    crypto, build `PerContextState`, register).
 //! 3. [`create_context_legacy`] — full create body (validate, build
-//!    PerContextState, finalize).
+//!    `PerContextState`, finalize).
 //! 4. [`finalize_create_legacy`] — gauges + governance timeout +
 //!    persistence + TTL timer post-creation.
 //! 5. [`join_context_legacy`] — F4 escrow dance + MLS add + sender-key
@@ -56,10 +56,10 @@
 //! 10. [`close_context_legacy`] — single-arg forwarder into
 //!     [`close_context_with_key_legacy`].
 //! 11. [`close_context_with_key_legacy`] — full close body (gate +
-//!     ttl::close + cancel timers + final checkpoint + persist).
+//!     `ttl::close` + cancel timers + final checkpoint + persist).
 //! 12. [`load_persisted_context_state_legacy`] — load context snapshot
 //!     and broadcast state from persistence.
-//! 13. [`restore_context_legacy`] — rebuild PerContextState from
+//! 13. [`restore_context_legacy`] — rebuild `PerContextState` from
 //!     snapshot + register + start governance timeout + spawn TTL.
 //!
 //! # Designated-legacy supervisor-scoped iteration helpers

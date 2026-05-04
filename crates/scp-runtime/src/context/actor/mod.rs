@@ -462,7 +462,22 @@ impl ContextActor {
                 handlers::messaging::dispatch(state, deps, sub).await
             }
             ContextCommand::Lifecycle(sub) => {
-                Box::pin(handlers::lifecycle::dispatch_from_shim(supervisor, sub)).await
+                // Phase 2A.9 — lifecycle domain migrated to actor-shape.
+                // Variants that don't yet route via the actor mailbox
+                // (Create/Join/Leave/Close/Import/Restore — see
+                // `Supervisor::lifecycle_command_context_id` returning
+                // `None` for those payloads) reach the supervisor-shim
+                // through `Supervisor::dispatch_lifecycle_command`'s
+                // direct-shim fallback. This arm handles mailbox-routed
+                // variants (Export, GenerateContextAccessKey,
+                // RevokeContextAccessKey, RestoreContextAccessKey).
+                // `_supervisor` is unused on this arm because the
+                // actor-shape helpers reach the supervisor through the
+                // capability-reduced
+                // [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
+                // escape internally. Removed in Phase 2A finalization
+                // with the rest of the supervisor shim.
+                Box::pin(handlers::lifecycle::dispatch(state, deps, sub)).await
             }
             ContextCommand::Governance(sub) => {
                 // Phase 2A.8 — governance domain partially migrated to
