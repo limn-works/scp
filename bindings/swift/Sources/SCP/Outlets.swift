@@ -165,23 +165,27 @@ public enum OutletError: Error, Sendable, Equatable {
     // exception class for the `Credit` zero-rejection rule.
     case invalidGrant(Credit)
 
-    /// SCP-OUT-038 lifecycle-violation case — raised when control-plane
-    /// methods are called on an `InvocationHandle` whose stream has
-    /// already emitted a terminal chunk (End / Error{terminal:true}).
-    ///
-    /// Per AC13 the lifecycle error sits at the SAME depth as the
-    /// protocol-class siblings (`.invalidGrant`, catalog-rotation
-    /// entries). Carrying an `OutletEnvelope` keeps the wire-form fields
-    /// (code, slug, retry, message) on the case so callers can inspect
-    /// them uniformly. Default: code `SCP-TOOL-6102`, slug
-    /// `protocol.stream-already-closed`.
-    case streamAlreadyClosed(OutletEnvelope)
+    // SCP-OUT-038 AC13 / Fix #4 — `streamAlreadyClosed` is NOT a
+    // top-level enum case any more. AC13 requires the lifecycle error
+    // to sit at the SAME inheritance depth as the protocol-class
+    // siblings (`StreamAlreadyOpen`, `UnknownSession`,
+    // catalog-rotation entries) which Python / TS / Kotlin nest under
+    // `OutletProtocolError`. The Swift parity is `.protocol(envelope)`.
+    // The factory `OutletError.streamAlreadyClosed(message:)` returns
+    // `.protocol(envelope)` so `if case .protocol = err` matches the
+    // lifecycle error uniformly with every other protocol-class
+    // violation. Existing call sites use the factory; the case is gone
+    // — pattern-match on `.protocol(let env)` and inspect
+    // `env.slug == "protocol.stream-already-closed"`.
 
-    /// Builds a default `streamAlreadyClosed` envelope so SDK callers
-    /// don't have to assemble the wire-form fields themselves. Use this
-    /// to construct the `OutletError.streamAlreadyClosed(_:)` case from
-    /// the SDK's lifecycle-guard call sites.
-    public static func makeStreamAlreadyClosed(message: String? = nil) -> OutletError {
+    /// Builds a default §5.4.4 protocol-class envelope for the
+    /// SCP-OUT-038 stream-already-closed lifecycle violation and
+    /// returns it as `.protocol(envelope)`. The factory exists so the
+    /// SDK's lifecycle-guard call sites do not have to assemble the
+    /// wire-form fields themselves; callers that need to pattern-match
+    /// the lifecycle error use `if case .protocol(let env) = err,
+    /// env.slug == "protocol.stream-already-closed" { ... }`.
+    public static func streamAlreadyClosed(message: String? = nil) -> OutletError {
         let envelope = OutletEnvelope(
             classWire: .protocol,
             code: "SCP-TOOL-6102",
@@ -193,7 +197,14 @@ public enum OutletError: Error, Sendable, Equatable {
             padNonce: nil,
             registrationEventId: nil
         )
-        return .streamAlreadyClosed(envelope)
+        return .protocol(envelope)
+    }
+
+    /// Back-compat alias for the prior factory name. Returns the same
+    /// `.protocol(envelope)` value as `streamAlreadyClosed(message:)`.
+    /// New call sites should use `streamAlreadyClosed(message:)`.
+    public static func makeStreamAlreadyClosed(message: String? = nil) -> OutletError {
+        return streamAlreadyClosed(message: message)
     }
 
     /// Constructs a typed `OutletError` from a keyword-only options struct

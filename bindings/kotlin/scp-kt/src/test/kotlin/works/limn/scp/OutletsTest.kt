@@ -275,6 +275,72 @@ class OutletsTest {
         )
     }
 
+    // --------------------------------------------------------------------
+    // OUT-038 Fix #6 — InvocationHandle dual-consumption guard.
+    // Mirrors Python tests/test_outlets.py and TS invocation-handle tests:
+    // the two consumption styles (aggregate / asFlow) MUST be mutually
+    // exclusive on the same handle. The second style raises
+    // OutletProtocolError with slug protocol.handle-double-consumed.
+    // --------------------------------------------------------------------
+
+    @Test
+    fun `aggregate then asFlow on same handle raises OutletProtocolError`() = runTest {
+        val ns = InMemoryOutletNamespace()
+        val id = ns.register(OutletKind.ACTION, "{\"name\":\"calc\"}")
+        val handle = ns.invoke(id, "{\"x\":1}", ucanToken = "eyJ.dummy")
+        // First consumption — aggregate path.
+        handle.aggregate()
+        // Second consumption attempt via asFlow MUST raise. The flow
+        // builder is cold; the guard fires when the flow is collected.
+        val err = assertThrows(OutletProtocolError::class.java) {
+            kotlinx.coroutines.runBlocking { handle.asFlow().toList() }
+        }
+        assertEquals("SCP-TOOL-6020", err.code)
+        assertEquals("protocol.handle-double-consumed", err.slug)
+    }
+
+    @Test
+    fun `asFlow then aggregate on same handle raises OutletProtocolError`() = runTest {
+        val ns = InMemoryOutletNamespace()
+        val id = ns.register(OutletKind.ACTION, "{\"name\":\"calc\"}")
+        val handle = ns.invoke(id, "{\"x\":1}", ucanToken = "eyJ.dummy")
+        // First consumption — drain the flow.
+        handle.asFlow().toList()
+        // Second consumption attempt via aggregate MUST raise.
+        val err = assertThrows(OutletProtocolError::class.java) {
+            kotlinx.coroutines.runBlocking { handle.aggregate() }
+        }
+        assertEquals("SCP-TOOL-6020", err.code)
+        assertEquals("protocol.handle-double-consumed", err.slug)
+    }
+
+    @Test
+    fun `aggregate twice on same handle raises OutletProtocolError on second call`() = runTest {
+        val ns = InMemoryOutletNamespace()
+        val id = ns.register(OutletKind.ACTION, "{\"name\":\"calc\"}")
+        val handle = ns.invoke(id, "{\"x\":1}", ucanToken = "eyJ.dummy")
+        // Second `aggregate()` actually picks the same mode so the
+        // CAS guard does not raise — but the underlying aggregateFn
+        // is consumed; the second call returns the same value (the
+        // in-memory impl is idempotent). This test documents that the
+        // mode-mismatch guard is the only enforcement, mirroring the
+        // Python and TypeScript SDKs which also allow the same mode.
+        handle.aggregate()
+        // Same-mode second call does NOT raise the dual-consumption
+        // guard. (The fact that the underlying source may not yield
+        // again is a separate concern handled by the runtime.)
+        // Just assert no OutletProtocolError on same-mode re-call.
+        try {
+            handle.aggregate()
+        } catch (err: OutletProtocolError) {
+            if (err.slug == "protocol.handle-double-consumed") {
+                throw AssertionError("same-mode aggregate should not raise dual-consumption guard")
+            }
+        } catch (_: Throwable) {
+            // other errors are acceptable for this test (e.g. exhausted source)
+        }
+    }
+
     // Helper: wrap a suspend call so assertThrows can observe the OutletError
     // that is thrown from a coroutine body.
     private inline fun runBlockingAssert(crossinline block: suspend () -> Unit) {

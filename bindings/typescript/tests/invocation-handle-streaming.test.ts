@@ -92,35 +92,37 @@ function makeHandleWithChunks(
 // ---------------------------------------------------------------------------
 
 describe("Credit factory (OUT-038 AC5/AC6)", () => {
-  test("Credit(0) throws InvalidGrant", () => {
-    expect(() => Credit(0)).toThrow(InvalidGrant);
+  test("Credit.of(0) throws InvalidGrant", () => {
+    expect(() => Credit.of(0)).toThrow(InvalidGrant);
   });
 
-  test("Credit(-1) throws InvalidGrant (not RangeError)", () => {
-    expect(() => Credit(-1)).toThrow(InvalidGrant);
+  test("Credit.of(-1) throws InvalidGrant (not RangeError)", () => {
+    expect(() => Credit.of(-1)).toThrow(InvalidGrant);
   });
 
   test("Credit(2**32) throws InvalidGrant", () => {
-    expect(() => Credit(2 ** 32)).toThrow(InvalidGrant);
+    expect(() => Credit.of(2 ** 32)).toThrow(InvalidGrant);
   });
 
-  test("Credit(10) succeeds and is a number-branded type", () => {
-    const c = Credit(10);
-    // Branded type — the underlying value is the integer 10.
-    expect(c as number).toBe(10);
+  test("Credit.of(10) succeeds and is a Credit instance with raw=10", () => {
+    const c = Credit.of(10);
+    // Real class — instanceof check is meaningful at runtime now.
+    expect(c).toBeInstanceOf(Credit);
+    expect(c.raw).toBe(10);
   });
 
-  test("Credit(2**32 - 1) succeeds (max value)", () => {
-    const c = Credit(2 ** 32 - 1);
-    expect(c as number).toBe(2 ** 32 - 1);
+  test("Credit.of(2**32 - 1) succeeds (max value)", () => {
+    const c = Credit.of(2 ** 32 - 1);
+    expect(c).toBeInstanceOf(Credit);
+    expect(c.raw).toBe(2 ** 32 - 1);
   });
 
   test("Credit(NaN) throws InvalidGrant", () => {
-    expect(() => Credit(Number.NaN)).toThrow(InvalidGrant);
+    expect(() => Credit.of(Number.NaN)).toThrow(InvalidGrant);
   });
 
-  test("Credit(1.5) throws InvalidGrant (non-integer)", () => {
-    expect(() => Credit(1.5)).toThrow(InvalidGrant);
+  test("Credit.of(1.5) throws InvalidGrant (non-integer)", () => {
+    expect(() => Credit.of(1.5)).toThrow(InvalidGrant);
   });
 });
 
@@ -237,7 +239,7 @@ describe("Mid-stream control plane (OUT-038 AC15/AC16)", () => {
     // doesn't pre-empt the bridge.
     let raised: unknown = null;
     try {
-      await handle.grantCredit(Credit(15));
+      await handle.grantCredit(Credit.of(15));
     } catch (err) {
       raised = err;
     }
@@ -269,6 +271,49 @@ describe("Mid-stream control plane (OUT-038 AC15/AC16)", () => {
       expect(raised).not.toBeInstanceOf(StreamAlreadyClosed);
     }
   });
+
+  // Fix #5 regression test — replaces the prior `Promise.resolve().then`
+  // microtask-patch hack. A handle constructed with a `requestIdPromise`
+  // (the streaming-bridge-open closure resolves it once the bridge call
+  // returns) MUST NOT throw StreamAlreadyClosed when grantCredit is
+  // called immediately, before the bridge open completes.
+  test("grantCredit awaits requestIdPromise rather than reading null synchronously", async () => {
+    let resolveRid: (rid: string | null) => void = () => {
+      /* assigned below */
+    };
+    const requestIdPromise = new Promise<string | null>((resolve) => {
+      resolveRid = resolve;
+    });
+    const handle = new InvocationHandle(
+      (sink) => {
+        // Defer the chunk emission AND the bridge-open simulation.
+        // Without the requestIdPromise wiring the prior code would
+        // observe `requestIdHex === null` synchronously and reject
+        // with StreamAlreadyClosed.
+        setTimeout(() => {
+          resolveRid("dd".repeat(16));
+          sink.chunk(dataChunk(0, {}));
+        }, 5);
+      },
+      { requestIdPromise },
+    );
+    // Call grantCredit IMMEDIATELY — before the bridge open closure
+    // has run. The fix: grantCredit awaits requestIdPromise rather
+    // than reading the field synchronously, so it sees the resolved
+    // request id rather than the constructor-time `null`.
+    let raised: unknown = null;
+    try {
+      await handle.grantCredit(Credit.of(1));
+    } catch (err) {
+      raised = err;
+    }
+    // The bridge call itself may reject (mock-bridge throws), but
+    // StreamAlreadyClosed MUST NOT be raised — the request id
+    // resolved before the lifecycle gate read it.
+    if (raised !== null) {
+      expect(raised).not.toBeInstanceOf(StreamAlreadyClosed);
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -288,7 +333,7 @@ describe("Post-terminal lifecycle guard (OUT-038 AC17/AC18)", () => {
 
     let caught: unknown = null;
     try {
-      await handle.grantCredit(Credit(10));
+      await handle.grantCredit(Credit.of(10));
     } catch (err) {
       caught = err;
     }
@@ -333,7 +378,7 @@ describe("Post-terminal lifecycle guard (OUT-038 AC17/AC18)", () => {
     expect(handle.isTerminated).toBe(true);
     let caught: unknown = null;
     try {
-      await handle.grantCredit(Credit(10));
+      await handle.grantCredit(Credit.of(10));
     } catch (err) {
       caught = err;
     }
@@ -356,7 +401,7 @@ describe("Non-streaming handle control plane", () => {
     });
     let caught: unknown = null;
     try {
-      await handle.grantCredit(Credit(10));
+      await handle.grantCredit(Credit.of(10));
     } catch (err) {
       caught = err;
     }
@@ -451,7 +496,9 @@ function _tscRejectsRawNumberForGrantCredit(handle: InvocationHandle): void {
     // @ts-expect-error AC6: numeric literal 10 is not assignable to Credit.
     handle.grantCredit(10 as number);
     // The typed form compiles cleanly.
-    handle.grantCredit(Credit(10));
+    handle.grantCredit(Credit.of(10));
+    // `new Credit(10)` is also accepted at the type level.
+    handle.grantCredit(new Credit(10));
   }
   // Suppress unused-parameter lint.
   void handle;

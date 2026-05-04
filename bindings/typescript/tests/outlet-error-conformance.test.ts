@@ -172,14 +172,18 @@ describe("OutletError sealed hierarchy", () => {
 
 describe("Credit + CatalogKey newtypes", () => {
   it("Credit factory accepts positive in range", () => {
-    expect(Credit(1)).toBe(1 as Credit);
-    expect(Credit(0xff_ff_ff_ff)).toBe(0xff_ff_ff_ff as Credit);
+    const c1 = Credit.of(1);
+    expect(c1).toBeInstanceOf(Credit);
+    expect(c1.raw).toBe(1);
+    const cMax = Credit.of(0xff_ff_ff_ff);
+    expect(cMax).toBeInstanceOf(Credit);
+    expect(cMax.raw).toBe(0xff_ff_ff_ff);
   });
 
   it("Credit factory rejects zero with InvalidGrant under OutletError", () => {
     let caught: unknown;
     try {
-      Credit(0);
+      Credit.of(0);
     } catch (e) {
       caught = e;
     }
@@ -194,8 +198,18 @@ describe("Credit + CatalogKey newtypes", () => {
   });
 
   it("Credit factory rejects negative and over max", () => {
-    expect(() => Credit(-1)).toThrow(InvalidGrant);
-    expect(() => Credit(0x1_0000_0000)).toThrow(InvalidGrant);
+    expect(() => Credit.of(-1)).toThrow(InvalidGrant);
+    expect(() => Credit.of(0x1_0000_0000)).toThrow(InvalidGrant);
+  });
+
+  it("Credit instanceof check rejects raw integer at runtime (instead of brand alias)", () => {
+    // The previous bare-`number & __brand` alias erased at runtime; raw 5
+    // would pass `typeof grant === "number"`. The class form makes this
+    // a real instance check.
+    expect(Credit.of(5)).toBeInstanceOf(Credit);
+    // Plain number is NOT a Credit instance.
+    expect(5 as unknown).not.toBeInstanceOf(Credit);
+    expect(0 as unknown).not.toBeInstanceOf(Credit);
   });
 
   it("CatalogKey factory accepts canonical forms", () => {

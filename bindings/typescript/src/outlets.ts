@@ -22,7 +22,7 @@
  */
 
 import {
-  type Credit,
+  Credit,
   OutletError,
   OutletExecutionError,
   OutputError,
@@ -385,7 +385,20 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
 
   /** §5.4.5 16-byte `request_id` rendered as 32-char lowercase hex.
    * `null` for handles backed by the non-streaming bridge. */
-  private readonly requestIdHex: string | null;
+  private requestIdHex: string | null;
+
+  /** Promise that resolves once the streaming bridge open completes
+   *  and `requestIdHex` is known. Resolves to `null` for the
+   *  non-streaming (degenerate single-shot) path. `undefined` when no
+   *  promise was attached (legacy callers).
+   *
+   *  This replaces the prior `Promise.resolve().then(...)` patch hack:
+   *  the previous code set `requestIdHex` in the next microtask but the
+   *  bridge `await` resolved later, so `captured` was still `null` when
+   *  the patch ran and `grantCredit` always threw `StreamAlreadyClosed`.
+   *  Storing a real promise that the streaming open closure resolves
+   *  closes the race deterministically. */
+  private readonly requestIdPromise: Promise<string | null> | undefined;
 
   /** Optional aggregate-schema for End-chunk validation (AC12). */
   private readonly aggregateSchema: Readonly<Record<string, unknown>> | null;
@@ -397,10 +410,12 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
     pump: (sink: InvocationHandleSink) => void,
     options?: {
       requestIdHex?: string;
+      requestIdPromise?: Promise<string | null>;
       aggregateSchema?: Readonly<Record<string, unknown>>;
     },
   ) {
     this.requestIdHex = options?.requestIdHex ?? null;
+    this.requestIdPromise = options?.requestIdPromise;
     this.aggregateSchema = options?.aggregateSchema ?? null;
     const sink: InvocationHandleSink = {
       chunk: (c) => this.enqueueChunk(c),
@@ -615,25 +630,54 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
    *   already emitted a terminal chunk.
    */
   async grantCredit(grant: Credit): Promise<number> {
-    if (typeof grant !== "number" || !Number.isInteger(grant)) {
+    // Real runtime check — Credit is now a class, so `instanceof` is a
+    // load-bearing guard that rejects raw integers reaching the bridge.
+    if (!(grant instanceof Credit)) {
       throw new ValidationError(
-        `grantCredit requires a typed Credit; pass Credit(n) to wrap a raw number`,
+        `grantCredit requires a typed Credit; pass Credit.of(n) or new Credit(n) to wrap a raw number`,
         "SCP-VALID-7060",
       );
     }
+    // Resolve the request id BEFORE the terminal/null check — the
+    // streaming-mode constructor stores a `requestIdPromise` that
+    // resolves once the bridge open completes. Awaiting first lets a
+    // caller invoke `grantCredit` immediately after `invoke()` returns
+    // without racing the bridge's first chunk.
+    const ridHex = await this.resolveRequestId();
+    // Race-check terminated AFTER the await — a terminal chunk may
+    // have arrived while we were waiting on the bridge open.
     if (this.terminated) {
       throw new StreamAlreadyClosed(
         "grantCredit rejected: stream has already emitted a terminal chunk",
       );
     }
-    if (this.requestIdHex === null) {
+    if (ridHex === null) {
       throw new StreamAlreadyClosed(
         "grantCredit rejected: handle was opened without a streaming session " +
           "(degenerate single-shot invoke; the End chunk arrived synchronously)",
       );
     }
     const bridge = await getBridge();
-    return bridge.outletStreamGrantCredit(this.requestIdHex, grant);
+    return bridge.outletStreamGrantCredit(ridHex, grant.raw);
+  }
+
+  /** Internal — resolves to the streaming `request_id` (32-char hex)
+   *  or `null` for the non-streaming path. Prefers the synchronous
+   *  field when set; otherwise awaits the promise the streaming-mode
+   *  constructor attached. */
+  private async resolveRequestId(): Promise<string | null> {
+    if (this.requestIdHex !== null) {
+      return this.requestIdHex;
+    }
+    if (this.requestIdPromise !== undefined) {
+      const resolved = await this.requestIdPromise;
+      // Cache the resolved value for subsequent calls.
+      if (resolved !== null) {
+        this.requestIdHex = resolved;
+      }
+      return resolved;
+    }
+    return null;
   }
 
   /**
@@ -646,17 +690,21 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
    *   already emitted a terminal chunk.
    */
   async cancel(nextSeq?: number): Promise<number | null> {
+    // Mirror `grantCredit` — resolve the request id (awaiting the
+    // streaming-mode bridge open if necessary), THEN race-check
+    // terminated state.
+    const ridHex = await this.resolveRequestId();
     if (this.terminated) {
       throw new StreamAlreadyClosed("cancel rejected: stream has already emitted a terminal chunk");
     }
-    if (this.requestIdHex === null) {
+    if (ridHex === null) {
       throw new StreamAlreadyClosed(
         "cancel rejected: handle was opened without a streaming session " +
           "(degenerate single-shot invoke; the End chunk arrived synchronously)",
       );
     }
     const bridge = await getBridge();
-    return bridge.outletStreamCancel(this.requestIdHex, nextSeq);
+    return bridge.outletStreamCancel(ridHex, nextSeq);
   }
 }
 
@@ -1031,7 +1079,29 @@ export class OutletNamespace {
         );
       }
       const caveatsBindingHex = bytesToHexString(caveatsBinding);
-      let captured: BridgeOutletInvocationStream | null = null;
+      // Resolver pair for the request-id promise. The streaming open
+      // closure resolves it as soon as the bridge yields its
+      // synchronously-known request_id; `grantCredit` / `cancel` await
+      // this promise before reading `requestIdHex`. This replaces a
+      // prior microtask hack that read `captured` synchronously and
+      // saw `null` because the bridge `await` had not yet resolved.
+      let resolveRid: (value: string | null) => void = () => {
+        /* assigned below */
+      };
+      let rejectRid: (err: unknown) => void = () => {
+        /* assigned below */
+      };
+      const requestIdPromise = new Promise<string | null>((resolve, reject) => {
+        resolveRid = resolve;
+        rejectRid = reject;
+      });
+      // Swallow rejections so an unobserved promise does not surface
+      // as an unhandled-rejection warning. `grantCredit` / `cancel`
+      // will surface the rejection via the await path; aggregate /
+      // iterator paths surface the error through the pump's `sink.error`.
+      requestIdPromise.catch(() => {
+        /* observed lazily by control-plane methods */
+      });
       const handleFactory = (sink: InvocationHandleSink): void => {
         (async () => {
           try {
@@ -1048,33 +1118,23 @@ export class OutletNamespace {
               creditWindow,
               estimatedChunkCount,
             );
-            captured = stream;
+            // Resolve the request-id promise before we start pumping
+            // chunks — control-plane methods that raced to grantCredit
+            // immediately after `invoke()` will now unblock with a
+            // valid request id rather than a stale `null`.
+            resolveRid(stream.requestId);
             await pumpStreamingBridge(stream, sink);
           } catch (err) {
+            // Surface the open failure on BOTH paths: control-plane
+            // (via the request-id promise) and the chunk pump.
+            rejectRid(err);
             sink.error(err);
           }
         })();
       };
-      // We can't determine the requestIdHex synchronously because the
-      // bridge call is async. The InvocationHandle constructor needs
-      // it up front so grantCredit / cancel can route. Provide a
-      // synchronous wrapper that defers requestIdHex resolution to the
-      // pump's first chunk: we pre-construct the handle with no
-      // requestIdHex, then patch it once `captured` is available.
-      // The control-plane methods race-check `terminated` first so the
-      // patch lands before the stream needs to be addressed.
       const sdkHandle = new InvocationHandle(handleFactory, {
+        requestIdPromise,
         ...(aggregateSchema !== undefined && { aggregateSchema }),
-      });
-      // Resolve requestIdHex as soon as the stream is captured. The
-      // bridge resolves synchronously from its own state, so this
-      // microtask runs before the user can call grantCredit / cancel
-      // in any realistic call site (the stream open is awaited below).
-      void Promise.resolve().then(() => {
-        const ridHex = captured?.requestId;
-        if (ridHex !== undefined) {
-          (sdkHandle as unknown as { requestIdHex: string | null }).requestIdHex = ridHex;
-        }
       });
       return sdkHandle;
     }
