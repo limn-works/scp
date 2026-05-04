@@ -661,6 +661,17 @@ export function createMockBridge(): Bridge & {
       );
     },
 
+    async outletStreamTerminate(
+      _requestIdHex: string,
+      _slug: string,
+      _code: string,
+      _message: string,
+    ): Promise<void> {
+      throw new Error(
+        "[SCP-TOOL-6020] streaming outlet invocation is not implemented in the mock bridge",
+      );
+    },
+
     async verifyChunkSignature(
       _chunkJson: string,
       _operatorPk: Uint8Array,

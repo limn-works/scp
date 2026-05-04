@@ -363,6 +363,22 @@ export interface Bridge {
   outletStreamCancel(requestIdHex: string, nextSeq?: number): Promise<number | null>;
 
   /**
+   * Forces a terminal `Error{terminal:true}` chunk into the active
+   * stream (§5.4.5 receiver-side revocation re-check, `RevokedMidStream`
+   * / `SCP-TOOL-6110`). Called by the SDK framework's periodic UCAN
+   * re-check loop when it observes the opening UCAN has been revoked
+   * since stream open. The runtime emits a synthetic terminal Error
+   * chunk under the pinned operator key; the SDK's chunk consumer
+   * receives it as the next chunk and the stream closes naturally.
+   */
+  outletStreamTerminate(
+    requestIdHex: string,
+    slug: string,
+    code: string,
+    message: string,
+  ): Promise<void>;
+
+  /**
    * Verifies a chunk's `SCP-OUTLET-CHUNK-SIG-V1:` signature
    * (§5.4.5 per-chunk operator signature block). `chunkJson` is the
    * canonical JSON of the full `OutletStreamChunk`. Returns `true` for

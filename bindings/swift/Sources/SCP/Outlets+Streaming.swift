@@ -202,6 +202,65 @@ extension Context {
     }
 }
 
+/// Spawns the §5.4.5 receiver-side revocation re-check task that
+/// runs alongside the streaming pump for the lifetime of the stream.
+///
+/// Per spec ("Revocation re-check cadence (receiver-side)") the SDK
+/// framework MUST periodically re-check the opening UCAN's revocation
+/// status during the stream's active lifetime, every
+/// `stream_ucan_recheck_secs`, and on observed revocation MUST
+/// terminate the stream with `RevokedMidStream` / `SCP-TOOL-6110`.
+///
+/// Returns the spawned `Task` so the caller (the streaming pump) can
+/// cancel it via `defer { recheckTask.cancel() }` when the parent pump
+/// resolves naturally — once the stream emits a terminal chunk, the
+/// recheck loop has nothing more to do. Spec: "Already-emitted chunks
+/// remain authorized; the stream closes at or before
+/// `stream_ucan_recheck_secs` after the revocation event regardless of
+/// executor behavior."
+@Sendable
+func makeRevocationRecheckTask(
+    contextHandle: ContextHandle,
+    outletId: String,
+    ucanToken: String,
+    proofTokens: [String]?,
+    recheckSecs: UInt32,
+    requestIdHex: String
+) -> Task<Void, Never> {
+    Task { [weak contextHandle] in
+        guard contextHandle != nil else { return }
+        let capability = "tool_invoke:\(outletId)"
+        let interval = max(UInt64(1), UInt64(recheckSecs))
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: interval * 1_000_000_000)
+            if Task.isCancelled { return }
+            do {
+                guard let ctxHandle = contextHandle else { return }
+                try await ucanValidate(
+                    handle: ctxHandle,
+                    token: ucanToken,
+                    capability: capability,
+                    presentingAgentDid: nil,
+                    proofTokens: proofTokens
+                )
+            } catch {
+                // UCAN no longer valid — terminate the stream with
+                // the spec slug + code. Recoverable failures
+                // (already terminated / pending) stop the loop
+                // naturally because outletStreamTerminate's contract
+                // is idempotent on the runtime side.
+                _ = try? await OutletStream.terminate(
+                    requestIdHex: requestIdHex,
+                    slug: "authorization.revoked-mid-stream",
+                    code: "SCP-TOOL-6110",
+                    message: "ucan revoked or invalid mid-stream"
+                )
+                return
+            }
+        }
+    }
+}
+
 /// Drains an open `OutletStreamHandle` into the InvocationHandle's
 /// pump sink. Called by `OutletNamespace.invoke` in streaming mode —
 /// kept at module scope so the per-mode helper functions in
@@ -350,6 +409,30 @@ public enum OutletsStreaming {
         nextSeq: UInt64? = nil
     ) async throws -> UInt64? {
         try await outletStreamCancel(requestIdHex: requestIdHex, nextSeq: nextSeq)
+    }
+
+    /// Forces a terminal `Error{terminal:true}` chunk into an active
+    /// stream (§5.4.5 receiver-side revocation re-check,
+    /// `RevokedMidStream` / `SCP-TOOL-6110`).
+    ///
+    /// Called by the SDK framework's periodic UCAN re-check loop when
+    /// it observes the opening UCAN has been revoked since stream
+    /// open. The runtime emits a synthetic terminal Error chunk under
+    /// the pinned operator key and runs settlement (admission release,
+    /// escrow refund, OutletInvokedEvent emission) identically to
+    /// other framework-emitted closes.
+    public static func terminate(
+        requestIdHex: String,
+        slug: String,
+        code: String,
+        message: String
+    ) async throws {
+        try await outletStreamTerminate(
+            requestIdHex: requestIdHex,
+            slug: slug,
+            code: code,
+            message: message
+        )
     }
 }
 

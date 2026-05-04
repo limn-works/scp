@@ -1042,7 +1042,8 @@ public actor OutletNamespace {
         proofTokens: [String]?,
         creditWindow: UInt32?,
         estimatedChunkCount: UInt32?,
-        aggregateSchemaJson: String?
+        aggregateSchemaJson: String?,
+        ucanRecheckSecs: UInt32 = 10
     ) -> InvocationHandle {
         let handle = self.handle
         let identity = self.identity
@@ -1064,6 +1065,15 @@ public actor OutletNamespace {
                         creditWindow: creditWindow,
                         estimatedChunkCount: estimatedChunkCount
                     )
+                    let recheckTask = makeRevocationRecheckTask(
+                        contextHandle: handle,
+                        outletId: outletId,
+                        ucanToken: ucanToken,
+                        proofTokens: proofTokens,
+                        recheckSecs: ucanRecheckSecs,
+                        requestIdHex: raw.requestId()
+                    )
+                    defer { recheckTask.cancel() }
                     try await pumpStreamingChunks(
                         from: raw,
                         yieldChunk: yieldChunk,

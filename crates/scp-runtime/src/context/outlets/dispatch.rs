@@ -66,7 +66,7 @@ use scp_primitives::DID;
 use scp_protocol::context::outlets::OutletId;
 use scp_protocol::context::outlets::error_codes;
 use scp_protocol::context::outlets::stream::{
-    OutletStreamCancel, OutletStreamChunk, OutletStreamCredit, RequestId, sign_chunk,
+    ChunkPayload, OutletStreamCancel, OutletStreamChunk, OutletStreamCredit, RequestId, sign_chunk,
     verify_cancel_signature, verify_chunk_signature,
 };
 use scp_protocol::economy::types::Amount;
@@ -265,6 +265,32 @@ pub(crate) struct SharedSessionState {
     /// that do not supply a key — the pump emits the all-zero sig
     /// placeholder and logs a `tracing::error!` so the gap is visible.
     pub operator_signing_key: Option<Arc<SigningKey>>,
+    /// Receiver-side termination request. When `Some`, the pump
+    /// emits a synthetic `Error{terminal:true}` chunk under the
+    /// pinned operator key on its next iteration and breaks the
+    /// loop. Set by [`StreamSessionHandle::terminate_with_error`]
+    /// per §5.4.5 receiver-side revocation re-check (UCAN
+    /// `RevokedMidStream`, `SCP-TOOL-6110`). The pump consumes the
+    /// `Option` (`take()`) so a duplicate notification is a no-op
+    /// and the synthetic chunk is emitted exactly once.
+    pub pending_terminate: Option<PendingTerminate>,
+}
+
+/// Terminal-injection payload supplied by
+/// [`StreamSessionHandle::terminate_with_error`].
+///
+/// Wraps the `(slug, code, message)` triple the SDK framework chose for
+/// the §5.4.5 receiver-side revocation termination so the pump can
+/// build the `ChunkPayload::Error{terminal:true}` chunk under the
+/// pinned operator key without retaking external state.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingTerminate {
+    /// `SCP-TOOL-NNNN` error code recorded into the chunk payload.
+    pub code: String,
+    /// Human-readable message recorded into the chunk payload —
+    /// typically `format!("{slug}: {operator_message}")` per
+    /// §5.4.4 wire shape.
+    pub message: String,
 }
 
 /// The 3-tuple of strings the admission tracker keys on. Kept as a
@@ -276,6 +302,46 @@ pub(crate) struct AdmissionReleaseKeys {
     pub origin_invoker_did: String,
     pub outlet_id: String,
 }
+
+// ---------------------------------------------------------------------------
+// Receiver-side terminate error
+// ---------------------------------------------------------------------------
+
+/// Failure modes for [`StreamSessionHandle::terminate_with_error`]
+/// (§5.4.5 receiver-side revocation re-check, `RevokedMidStream` /
+/// `SCP-TOOL-6110`).
+///
+/// All variants are recoverable from the SDK's perspective — they
+/// indicate the stream has already left the pump's control plane (e.g.
+/// the executor reached its own checkpoint first or the receiver
+/// already drained the terminal chunk). Per §5.4.5 the framework
+/// guarantees the stream closes "at or before `stream_ucan_recheck_secs`
+/// after the revocation event regardless of executor behavior" — the
+/// SDK treats these errors as the runtime having reached terminal
+/// state on its own and stops the recheck loop.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminateError {
+    /// The pump has already emitted a terminal chunk and broken its
+    /// loop. The synthetic chunk is dropped — there is nothing to
+    /// terminate.
+    AlreadyTerminated,
+    /// A prior `terminate_with_error` call already armed
+    /// `pending_terminate` and the pump has not yet consumed it.
+    /// Idempotent — the SDK's recheck loop should treat this as
+    /// success (the terminal chunk is in flight).
+    AlreadyPending,
+}
+
+impl core::fmt::Display for TerminateError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AlreadyTerminated => f.write_str("stream already terminated"),
+            Self::AlreadyPending => f.write_str("terminate already pending"),
+        }
+    }
+}
+
+impl std::error::Error for TerminateError {}
 
 // ---------------------------------------------------------------------------
 // StreamSessionHandle — control surface
@@ -299,6 +365,17 @@ pub struct StreamSessionHandle {
     grant_wake: Arc<Notify>,
     /// Notifier used to wake the pump on `OutletCancel` arrival.
     cancel_wake: Arc<Notify>,
+    /// Notifier used to wake the pump when the receiver-side framework
+    /// requests a forced terminal via
+    /// [`StreamSessionHandle::terminate_with_error`] (§5.4.5
+    /// `RevokedMidStream` / `SCP-TOOL-6110`). The pump's select arm for
+    /// this notifier checks `pending_terminate`, builds the synthetic
+    /// terminal chunk under the pinned operator key, and breaks the
+    /// loop into the settlement block. Settlement runs identically to
+    /// the cancel-ack-timeout / credit-stall paths so admission release,
+    /// escrow refund, and `OutletInvokedEvent` emission are exercised
+    /// end-to-end.
+    terminate_wake: Arc<Notify>,
     /// Receiver for the close summary the pump publishes once it has
     /// settled.
     ///
@@ -481,6 +558,65 @@ impl StreamSessionHandle {
         self.cancel_wake.notify_waiters();
         Ok(recorded)
     }
+
+    /// Forces a terminal `Error{terminal:true}` chunk into the stream
+    /// under the pinned operator key (§5.4.5 receiver-side
+    /// revocation re-check).
+    ///
+    /// Per §5.4.5 "Revocation re-check cadence (receiver-side)" the
+    /// SDK framework MUST re-check the opening UCAN's revocation
+    /// status every `ContextParams::stream_ucan_recheck_secs` and on
+    /// observed revocation MUST terminate the stream with
+    /// `OutletErrorClass::Authorization::RevokedMidStream` (slug
+    /// `authorization.revoked-mid-stream`, code `SCP-TOOL-6110`). This
+    /// method is the runtime entry point that performs that
+    /// termination: it arms `pending_terminate` on the shared session
+    /// state, notifies the pump via `terminate_wake`, and the pump
+    /// emits a synthetic terminal chunk on its next iteration. The
+    /// chunk is signed under the pinned operator key (the same path
+    /// the cancel-ack-timeout / credit-stall framework chunks use) and
+    /// flows through the pump's settlement block so admission release,
+    /// escrow refund, and `OutletInvokedEvent` emission run end-to-end
+    /// — the audit log records the receiver-driven termination
+    /// identically to any other framework-emitted close.
+    ///
+    /// Idempotent: a second call while the first is still pending
+    /// returns [`TerminateError::AlreadyPending`]; calls after the
+    /// pump has already broken its loop return
+    /// [`TerminateError::AlreadyTerminated`]. Both errors are
+    /// recoverable — the SDK's recheck loop treats them as "stream
+    /// already closed" and stops re-checking.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerminateError::AlreadyPending`] when a prior
+    /// `terminate_with_error` call has armed `pending_terminate` but
+    /// the pump has not yet consumed it. Returns
+    /// [`TerminateError::AlreadyTerminated`] when the pump has
+    /// already broken its loop (the close summary has been published)
+    /// — observable when the handle's `summary_rx` resolved before
+    /// this call.
+    pub fn terminate_with_error(
+        &self,
+        slug: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<(), TerminateError> {
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.pending_terminate.is_some() {
+            return Err(TerminateError::AlreadyPending);
+        }
+        guard.pending_terminate = Some(PendingTerminate {
+            code: code.to_owned(),
+            message: format!("{slug}: {message}"),
+        });
+        drop(guard);
+        self.terminate_wake.notify_waiters();
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -582,6 +718,7 @@ fn build_shared_state(
         credit_stall_armed_at: None,
         cancel_ack_seq: None,
         operator_signing_key: params.operator_signing_key.clone(),
+        pending_terminate: None,
     }))
 }
 
@@ -623,6 +760,7 @@ fn spawn_pump_task(
     state: Arc<Mutex<SharedSessionState>>,
     grant_wake: Arc<Notify>,
     cancel_wake: Arc<Notify>,
+    terminate_wake: Arc<Notify>,
     inner_rx: mpsc::Receiver<OutletStreamChunk>,
     outer_tx: mpsc::Sender<OutletStreamChunk>,
     summary_tx: tokio::sync::oneshot::Sender<StreamCloseSummary>,
@@ -638,6 +776,7 @@ fn spawn_pump_task(
             state,
             grant_wake,
             cancel_wake,
+            terminate_wake,
             inner_rx,
             outer_tx,
             summary_tx,
@@ -724,6 +863,7 @@ where
     let shared = build_shared_state(&params, escrow, &admission);
     let grant_wake = Arc::new(Notify::new());
     let cancel_wake = Arc::new(Notify::new());
+    let terminate_wake = Arc::new(Notify::new());
 
     // §5.4.5 OutletInvokedEvent emission ownership: the dispatch pump
     // is the authoritative emitter, NOT the inner `invoke_outlet`'s
@@ -791,6 +931,7 @@ where
         Arc::clone(&shared),
         Arc::clone(&grant_wake),
         Arc::clone(&cancel_wake),
+        Arc::clone(&terminate_wake),
         inner_rx,
         outer_tx,
         summary_tx,
@@ -812,6 +953,7 @@ where
         state: shared,
         grant_wake,
         cancel_wake,
+        terminate_wake,
         summary_rx: Some(summary_rx),
         request_id,
     })
@@ -902,6 +1044,7 @@ async fn run_stream_pump_v2(
     state: Arc<Mutex<SharedSessionState>>,
     grant_wake: Arc<Notify>,
     cancel_wake: Arc<Notify>,
+    terminate_wake: Arc<Notify>,
     mut inner_rx: mpsc::Receiver<OutletStreamChunk>,
     outer_tx: mpsc::Sender<OutletStreamChunk>,
     summary_tx: tokio::sync::oneshot::Sender<StreamCloseSummary>,
@@ -932,6 +1075,41 @@ async fn run_stream_pump_v2(
     };
 
     loop {
+        // §5.4.5 receiver-side revocation re-check: if the SDK
+        // framework armed `pending_terminate` since the last loop
+        // iteration, drain it now, sign + emit the synthetic terminal
+        // chunk under the pinned operator key, and break into the
+        // settlement block. Done eagerly at the top of each iteration
+        // (before timers + inner_rx select) so a notification that
+        // arrives mid-await still takes effect on the very next
+        // iteration. The select arms below ALSO wait on
+        // `terminate_wake.notified()` so a quiescent pump (parked
+        // chunk, no inner traffic) does not have to wait for an
+        // unrelated timer to fire before observing the request.
+        let pending = {
+            let mut guard = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.pending_terminate.take()
+        };
+        if let Some(pt) = pending {
+            let payload = ChunkPayload::Error {
+                code: pt.code,
+                message: pt.message,
+                terminal: true,
+            };
+            let sig = signing_ctx.sign_outer_chunk(&request_id, next_seq, &payload);
+            let chunk = OutletStreamChunk {
+                request_id,
+                sequence: next_seq,
+                payload,
+                sig,
+            };
+            emitted_chunks.push(chunk.clone());
+            let _ = outer_tx.send(chunk).await;
+            break;
+        }
+
         // Calculate timer state.
         let (cancel_ack_armed, credit_stall_armed_at) = {
             let guard = state
@@ -1003,6 +1181,14 @@ async fn run_stream_pump_v2(
                 () = cancel_wake.notified() => {
                     parked.take()
                 }
+                () = terminate_wake.notified() => {
+                    // Loop back so the eager `pending_terminate`
+                    // check at the top emits the synthetic terminal
+                    // and breaks. Keeping the parked chunk alive is
+                    // safe — the eager check fires before the parked
+                    // path re-engages.
+                    continue;
+                }
             }
         } else {
             tokio::select! {
@@ -1037,6 +1223,12 @@ async fn run_stream_pump_v2(
                     continue;
                 }
                 () = cancel_wake.notified() => {
+                    continue;
+                }
+                () = terminate_wake.notified() => {
+                    // Loop back so the eager `pending_terminate`
+                    // check at the top emits the synthetic terminal
+                    // and breaks.
                     continue;
                 }
                 next = inner_rx.recv() => next,
@@ -1270,5 +1462,176 @@ pub fn reference_chunks_billed(manifest: &[OutletStreamChunk], cancel_ack_seq: O
 }
 
 // ---------------------------------------------------------------------------
-// Tests live under tests/ — see crates/scp-runtime/tests/streaming_dispatch_*.
+// Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+    use scp_protocol::context::outlets::stream::ChunkPayload;
+    use std::time::Duration;
+
+    fn fixed_signing_key() -> SigningKey {
+        SigningKey::from_bytes(&[0x42; 32])
+    }
+
+    fn build_test_state() -> Arc<Mutex<SharedSessionState>> {
+        let signing = Arc::new(fixed_signing_key());
+        let identity = super::super::stream::StreamIdentity {
+            context_id: "ctx-test".to_owned(),
+            outlet_id: "outlet-test".to_owned(),
+            stream_epoch: 1,
+            caveats_binding: [0xAB; 32],
+        };
+        let credit = CreditTracker::new(32, signing.verifying_key(), identity);
+        let cancel_ack = CancelAckTracker::new(5);
+        let admission = Arc::new(Mutex::new(StreamAdmissionTracker::new()));
+        Arc::new(Mutex::new(SharedSessionState {
+            credit,
+            escrow: super::super::stream::StreamEscrow::zero_escrow(),
+            cancel_ack,
+            admission,
+            admission_release_keys: AdmissionReleaseKeys {
+                invoker_did: "did:dht:invoker".to_owned(),
+                origin_invoker_did: "did:dht:origin".to_owned(),
+                outlet_id: "outlet-test".to_owned(),
+            },
+            cancel_ack_armed: false,
+            credit_stall_armed_at: None,
+            cancel_ack_seq: None,
+            operator_signing_key: Some(signing),
+            pending_terminate: None,
+        }))
+    }
+
+    /// §5.4.5 receiver-side revocation re-check: `terminate_with_error`
+    /// arms `pending_terminate` and the pump emits a synthetic terminal
+    /// `Error{terminal:true}` chunk on its next iteration with the
+    /// caller-supplied code/message and the spec slug-prefixed message.
+    #[tokio::test]
+    async fn terminate_with_error_emits_synthetic_terminal_chunk() {
+        let state = build_test_state();
+        let grant_wake = Arc::new(Notify::new());
+        let cancel_wake = Arc::new(Notify::new());
+        let terminate_wake = Arc::new(Notify::new());
+        let (_inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
+        let request_id: RequestId = [0x77; 16];
+
+        let pump_state = Arc::clone(&state);
+        let pump_grant = Arc::clone(&grant_wake);
+        let pump_cancel = Arc::clone(&cancel_wake);
+        let pump_terminate = Arc::clone(&terminate_wake);
+        let pump_handle = tokio::spawn(async move {
+            run_stream_pump_v2(
+                pump_state,
+                pump_grant,
+                pump_cancel,
+                pump_terminate,
+                inner_rx,
+                outer_tx,
+                summary_tx,
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+                request_id,
+                PumpEventEmissionInputs {
+                    sink: None,
+                    context_id: "ctx-test".to_owned(),
+                    outlet_id: "outlet-test".to_owned(),
+                    invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),
+                    input_hash: "0".repeat(64),
+                    start: Instant::now(),
+                },
+            )
+            .await;
+        });
+
+        // Build a StreamSessionHandle that mirrors what `open_stream_session`
+        // would have constructed, then exercise `terminate_with_error`.
+        let handle = StreamSessionHandle {
+            receiver: None,
+            state: Arc::clone(&state),
+            grant_wake: Arc::clone(&grant_wake),
+            cancel_wake: Arc::clone(&cancel_wake),
+            terminate_wake: Arc::clone(&terminate_wake),
+            summary_rx: None,
+            request_id,
+        };
+
+        handle
+            .terminate_with_error(
+                "authorization.revoked-mid-stream",
+                "SCP-TOOL-6110",
+                "ucan revoked mid-stream",
+            )
+            .expect("terminate accepted");
+
+        // Pump should emit exactly one synthetic terminal Error chunk
+        // and then close the channel after settlement.
+        let chunk = tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
+            .await
+            .expect("pump emits synthetic terminal within 2s")
+            .expect("chunk arrives");
+        let ChunkPayload::Error {
+            code,
+            message,
+            terminal,
+        } = chunk.payload
+        else {
+            // Pump emits exactly one terminal chunk on `terminate_with_error`
+            // — anything else is a regression in the eager-check loop entry.
+            unreachable!("expected terminal Error chunk");
+        };
+        assert_eq!(code, "SCP-TOOL-6110");
+        assert!(
+            message.contains("authorization.revoked-mid-stream"),
+            "message must carry slug prefix: {message}"
+        );
+        assert!(message.contains("ucan revoked mid-stream"));
+        assert!(terminal, "terminate must emit `terminal: true`");
+
+        // Pump exits after settlement.
+        pump_handle
+            .await
+            .expect("pump task settles after terminal emission");
+
+        // Summary published.
+        let summary = summary_rx.await.expect("summary published");
+        assert_eq!(summary.stream_chunk_count, 1);
+        assert_eq!(summary.manifest.len(), 1);
+    }
+
+    /// `terminate_with_error` is idempotent: a second call while the
+    /// first is still pending returns `AlreadyPending`.
+    #[tokio::test]
+    async fn terminate_with_error_returns_already_pending_on_second_call() {
+        let state = build_test_state();
+        let grant_wake = Arc::new(Notify::new());
+        let cancel_wake = Arc::new(Notify::new());
+        let terminate_wake = Arc::new(Notify::new());
+        let request_id: RequestId = [0x33; 16];
+
+        let handle = StreamSessionHandle {
+            receiver: None,
+            state,
+            grant_wake,
+            cancel_wake,
+            terminate_wake,
+            summary_rx: None,
+            request_id,
+        };
+
+        // First call wins.
+        handle
+            .terminate_with_error("a.b", "SCP-TOOL-6110", "first")
+            .expect("first terminate accepted");
+        // Second call sees pending → AlreadyPending.
+        let err = handle
+            .terminate_with_error("a.b", "SCP-TOOL-6110", "second")
+            .expect_err("second terminate rejected");
+        assert!(matches!(err, TerminateError::AlreadyPending));
+    }
+}

@@ -174,6 +174,12 @@ interface WasmModule {
   ) => Promise<WasmOutletInvocationStream>;
   outletStreamGrantCredit: (requestIdHex: string, grant: number) => Promise<number>;
   outletStreamCancel: (requestIdHex: string, nextSeq: number | undefined) => Promise<number | null>;
+  outletStreamTerminate: (
+    requestIdHex: string,
+    slug: string,
+    code: string,
+    message: string,
+  ) => Promise<void>;
   verifyChunkSignature: (
     chunkJson: string,
     operatorPk: Uint8Array,
@@ -1528,6 +1534,16 @@ export function createWasmBridge(): Bridge {
     async outletStreamCancel(requestIdHex: string, nextSeq?: number): Promise<number | null> {
       const wasm = getWasm();
       return await wasm.outletStreamCancel(requestIdHex, nextSeq);
+    },
+
+    async outletStreamTerminate(
+      requestIdHex: string,
+      slug: string,
+      code: string,
+      message: string,
+    ): Promise<void> {
+      const wasm = getWasm();
+      await wasm.outletStreamTerminate(requestIdHex, slug, code, message);
     },
 
     async verifyChunkSignature(

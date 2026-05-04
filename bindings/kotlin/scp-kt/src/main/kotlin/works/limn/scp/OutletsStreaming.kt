@@ -43,6 +43,7 @@ import uniffi.scp.computeCaveatsBinding as ffiComputeCaveatsBinding
 import uniffi.scp.outletInvokeStream as ffiOutletInvokeStream
 import uniffi.scp.outletInvokeStreamWithSubscriber as ffiOutletInvokeStreamWithSubscriber
 import uniffi.scp.outletStreamCancel as ffiOutletStreamCancel
+import uniffi.scp.outletStreamTerminate as ffiOutletStreamTerminate
 import uniffi.scp.outletStreamGrantCredit as ffiOutletStreamGrantCredit
 import uniffi.scp.verifyChunkSignature as ffiVerifyChunkSignature
 
@@ -270,6 +271,25 @@ class OutletStreamFlow internal constructor(
      */
     suspend fun cancel(nextSeq: ULong? = null): ULong? =
         handle.cancel(nextSeq = nextSeq)
+
+    /**
+     * Forces a terminal `Error{terminal:true}` chunk into this stream
+     * (§5.4.5 receiver-side revocation re-check, `RevokedMidStream` /
+     * `SCP-TOOL-6110`).
+     *
+     * Called by the SDK framework's periodic UCAN re-check loop when
+     * it observes the opening UCAN has been revoked since stream
+     * open. The runtime emits a synthetic terminal Error chunk under
+     * the pinned operator key.
+     */
+    suspend fun terminate(slug: String, code: String, message: String) {
+        ffiOutletStreamTerminate(
+            requestIdHex = requestIdHex,
+            slug = slug,
+            code = code,
+            message = message,
+        )
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +481,33 @@ object OutletStreaming {
     @JvmStatic
     suspend fun cancel(requestIdHex: String, nextSeq: ULong? = null): ULong? =
         ffiOutletStreamCancel(requestIdHex = requestIdHex, nextSeq = nextSeq)
+
+    /**
+     * Forces a terminal `Error{terminal:true}` chunk into an active
+     * stream (§5.4.5 receiver-side revocation re-check,
+     * `RevokedMidStream` / `SCP-TOOL-6110`).
+     *
+     * Called by the SDK framework's periodic UCAN re-check loop when
+     * it observes the opening UCAN has been revoked since stream
+     * open. The runtime emits a synthetic terminal Error chunk under
+     * the pinned operator key and runs settlement (admission release,
+     * escrow refund, OutletInvokedEvent emission) identically to
+     * other framework-emitted closes.
+     */
+    @JvmStatic
+    suspend fun terminate(
+        requestIdHex: String,
+        slug: String,
+        code: String,
+        message: String,
+    ) {
+        ffiOutletStreamTerminate(
+            requestIdHex = requestIdHex,
+            slug = slug,
+            code = code,
+            message = message,
+        )
+    }
 }
 
 /**
@@ -477,3 +524,23 @@ internal suspend fun outletStreamGrantCredit(requestIdHex: String, grant: UInt):
  */
 internal suspend fun outletStreamCancel(requestIdHex: String, nextSeq: ULong? = null): ULong? =
     ffiOutletStreamCancel(requestIdHex = requestIdHex, nextSeq = nextSeq)
+
+/**
+ * Module-internal alias for the UniFFI-generated `outletStreamTerminate`
+ * — exposed at the `works.limn.scp` package scope so SDK code can call
+ * the §5.4.5 receiver-side revocation re-check terminate without
+ * importing from the generated `uniffi.scp` package.
+ */
+internal suspend fun outletStreamTerminate(
+    requestIdHex: String,
+    slug: String,
+    code: String,
+    message: String,
+) {
+    ffiOutletStreamTerminate(
+        requestIdHex = requestIdHex,
+        slug = slug,
+        code = code,
+        message = message,
+    )
+}

@@ -35,6 +35,13 @@
         "signature": "outlet_stream_cancel(request_id_hex, next_seq=None) -> Optional[int]"
       },
       {
+        "name": "outlet_stream_terminate",
+        "story": "SCP-OUT-038",
+        "kind": "function",
+        "signature": "outlet_stream_terminate(request_id_hex, slug, code, message) -> None",
+        "comment": "§5.4.5 receiver-side revocation re-check (RevokedMidStream / SCP-TOOL-6110). SDK framework calls this when its periodic UCAN re-check observes the opening UCAN has been revoked since stream open."
+      },
+      {
         "name": "verify_chunk_signature",
         "story": "SCP-OUT-037",
         "kind": "function",
@@ -84,6 +91,13 @@
         "story": "SCP-OUT-037",
         "kind": "async_function",
         "signature": "outletStreamCancel(requestIdHex, nextSeq?) -> Promise<number | null>"
+      },
+      {
+        "name": "outletStreamTerminate",
+        "story": "SCP-OUT-038",
+        "kind": "function",
+        "signature": "outletStreamTerminate(requestIdHex, slug, code, message) -> void",
+        "comment": "§5.4.5 receiver-side revocation re-check (RevokedMidStream / SCP-TOOL-6110). SDK framework calls this when its periodic UCAN re-check observes the opening UCAN has been revoked since stream open."
       },
       {
         "name": "verifyChunkSignature",
@@ -141,6 +155,13 @@
         "story": "SCP-OUT-037",
         "kind": "async_function",
         "signature": "outlet_stream_cancel(request_id_hex: String, next_seq: Option<u64>) -> Result<Option<u64>, ScpError>"
+      },
+      {
+        "name": "outlet_stream_terminate",
+        "story": "SCP-OUT-038",
+        "kind": "async_function",
+        "signature": "outlet_stream_terminate(request_id_hex: String, slug: String, code: String, message: String) -> Result<(), ScpError>",
+        "comment": "§5.4.5 receiver-side revocation re-check (RevokedMidStream / SCP-TOOL-6110). SDK framework calls this when its periodic UCAN re-check observes the opening UCAN has been revoked since stream open. Convenience wrapper also exposed on OutletStreamHandle.terminate(slug, code, message)."
       },
       {
         "name": "verify_chunk_signature",
@@ -206,6 +227,13 @@
         "story": "SCP-OUT-037",
         "kind": "function",
         "signature": "outletStreamCancel(requestIdHex, nextSeq?) -> Promise<number | null>"
+      },
+      {
+        "name": "outletStreamTerminate",
+        "story": "SCP-OUT-038",
+        "kind": "function",
+        "signature": "outletStreamTerminate(requestIdHex, slug, code, message) -> Promise<void>",
+        "comment": "§5.4.5 receiver-side revocation re-check (RevokedMidStream / SCP-TOOL-6110). WASM has no executor pump — the manager pushes a synthetic terminal Error chunk into the pre-materialised queue under the per-session signing key."
       },
       {
         "name": "verifyChunkSignature",
