@@ -1,0 +1,117 @@
+{
+  "comment": "SCP-OUT-039 cross-SDK byte-equivalence fixture per §5.4.5 line 635 / ADR-049 §5 round-5 JCS Option rule. Three caveats_binding vectors cover: minimal (single field), multifield (lexicographic ordering across amountMaxPerCall < maxCalls < originKind < validUntil), and empty (omit-none JCS rule produces `{}`). Two chunk_sig_preimage vectors cover Data and End payload variants (the @type discriminator must sort to JCS position 0 in every variant). Two credit_sig_preimage vectors cover distinct (grant, monotonic_seq, stream_epoch) tuples to pin the big-endian encoding rule. All four SDKs (PyO3, NAPI, UniFFI Swift/Kotlin, WASM) MUST reproduce the goldens byte-for-byte. SDKs that emit explicit `null` for absent Option fields will fail the cb_empty case immediately.",
+  "spec_section": ".docs/specs/05-contexts.md §5.4.5 caveats_binding / chunk_sig / credit_sig",
+  "story": "SCP-OUT-039 (alignment-review remediation)",
+  "caveats_binding": [
+    {
+      "name": "cb_minimal",
+      "description": "Single-field narrowing — only `amountMaxPerCall` populated. Exercises the §5.4.5 omit-none rule: every other `Option`-typed InvocationCaveats field is absent and MUST be omitted from the JCS encoding (NOT serialized as explicit `null`). An SDK that emits `null` for absent fields produces a distinct caveats_binding and fails this vector immediately.",
+      "ucan_cid_hex": "626166797265696768313233343536373839306162636465662d63622d766563746f722d61",
+      "request_id_hex": "77777777777777777777777777777777",
+      "invoker_did": "did:dht:zCAVEATS-BINDING-INVOKER-A",
+      "estimated_chunk_count": 16,
+      "effective_caveats_jcs": "{\"amountMaxPerCall\":100}",
+      "expected_caveats_binding_hex": "b7422479db013be9d791859799427f220c7bb0fed7710fe1b4eaaddd11746ab7"
+    },
+    {
+      "name": "cb_multifield",
+      "description": "Realistic delegation-narrowing shape — `amountMaxPerCall`, `maxCalls`, `validUntil`, and `originKind` all populated. Exercises RFC 8785 JCS lexicographic key ordering: the four field names sort as amountMaxPerCall < maxCalls < originKind < validUntil. SDKs whose serde default does not lexicographically sort keys produce a distinct binding.",
+      "ucan_cid_hex": "6261667972656968373737373737373737373737373737372d63622d766563746f722d62",
+      "request_id_hex": "a1a2a3a4a5a6a7a8a9aaabacadaeafb0",
+      "invoker_did": "did:dht:zCAVEATS-BINDING-INVOKER-B",
+      "estimated_chunk_count": 128,
+      "effective_caveats_jcs": "{\"amountMaxPerCall\":500,\"maxCalls\":64,\"originKind\":\"action\",\"validUntil\":2000000000}",
+      "expected_caveats_binding_hex": "96eed5642b686f7bb729d0e6984bc732f20a42331fae3ab93c282fb522d631e0"
+    },
+    {
+      "name": "cb_empty",
+      "description": "InvocationCaveats::empty() — every Option field is None. Per §5.4.5 the JCS canonicalization MUST produce the literal `{}` (a two-byte JSON object with no keys). This is the canonical regression for the omit-none rule: SDKs that emit `{\"amountMaxPerCall\":null,...}` for the empty caveat set produce a distinct binding and fail this vector.",
+      "ucan_cid_hex": "6261666b72656966303030303030303030303030303030302d63622d766563746f722d63",
+      "request_id_hex": "0102030405060708090a0b0c0d0e0f10",
+      "invoker_did": "did:dht:zCAVEATS-BINDING-INVOKER-C",
+      "estimated_chunk_count": 1,
+      "effective_caveats_jcs": "{}",
+      "expected_caveats_binding_hex": "02411d51f05a41375f7594a7dbb191ad86094973e3a9ecbf899ac96a74a5451d"
+    }
+  ],
+  "chunk_sig_preimage": [
+    {
+      "name": "chunk_sig_data",
+      "description": "Data variant — the most common chunk shape. Exercises the @type discriminator sort-to-position-0 invariant in JCS (`@` is 0x40, sorts before lowercase `value` 0x76).",
+      "context_id": "ctx-cs-vector",
+      "outlet_id": "outlet-cs-vector",
+      "request_id_hex": "77777777777777777777777777777777",
+      "sequence": 7,
+      "caveats_binding_hex": "abababababababababababababababababababababababababababababababab",
+      "payload_json": {
+        "@type": "data",
+        "value": {
+          "n": 42,
+          "sample": "data"
+        }
+      },
+      "expected_chunk_sig_preimage_hex": "7e5013687102409b7b8f81c91dcc0520dfb3e935be428e68dee6fd14278beb7a"
+    },
+    {
+      "name": "chunk_sig_end",
+      "description": "End variant — terminal aggregate + provenance. Exercises the full provenance block in JCS canonicalization. The four End body keys sort as @type < aggregate < execution_time_ms < provenance under JCS.",
+      "context_id": "ctx-cs-vector",
+      "outlet_id": "outlet-cs-vector",
+      "request_id_hex": "77777777777777777777777777777777",
+      "sequence": 8,
+      "caveats_binding_hex": "abababababababababababababababababababababababababababababababab",
+      "payload_json": {
+        "@type": "end",
+        "aggregate": {
+          "ok": true,
+          "total": 100
+        },
+        "execution_time_ms": 250,
+        "provenance": {
+          "age": {
+            "nanos": 0,
+            "secs": 0
+          },
+          "chain_depth": 0,
+          "chain_path": null,
+          "counterparties": [],
+          "discovery_method": "OutOfBand",
+          "memory_scope": "Full",
+          "payment_adapter": null,
+          "payment_amount": null,
+          "payment_receipt_id": null,
+          "purpose": null,
+          "source_context": "vec-ctx-credit-binding",
+          "source_type": "Persistent"
+        }
+      },
+      "expected_chunk_sig_preimage_hex": "2f9dbdce6c02c41ea5af8b7ba7d6dd67181ca8bfdf43aeb038b5bb86ea3b459e"
+    }
+  ],
+  "credit_sig_preimage": [
+    {
+      "name": "credit_sig_first_grant",
+      "description": "First grant on a fresh stream — monotonic_seq=1 (the §5.4.5 invariant: monotonic_seq starts at 0 in the runtime tracker, first grant uses 1). Exercises the (grant, monotonic_seq, stream_epoch) big-endian encoding.",
+      "context_id": "ctx-credit-vector",
+      "outlet_id": "outlet-credit-vector",
+      "request_id_hex": "77777777777777777777777777777777",
+      "grant": 32,
+      "monotonic_seq": 1,
+      "stream_epoch": 0,
+      "caveats_binding_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "expected_credit_sig_preimage_hex": "f30b76a1ffa356898af04e2318c776ec2649cc61e315f3ecb4d523b96c8f1d20"
+    },
+    {
+      "name": "credit_sig_later_grant_post_epoch_advance",
+      "description": "Later grant after several MLS epoch advances and prior grants. monotonic_seq=42, stream_epoch=7. Exercises distinct big-endian encodings of u32(grant) and u64(monotonic_seq, stream_epoch) relative to the first vector. SDKs that confuse little- and big-endian for any of the three integers fail this vector.",
+      "context_id": "ctx-credit-vector",
+      "outlet_id": "outlet-credit-vector",
+      "request_id_hex": "a1a2a3a4a5a6a7a8a9aaabacadaeafb0",
+      "grant": 1024,
+      "monotonic_seq": 42,
+      "stream_epoch": 7,
+      "caveats_binding_hex": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+      "expected_credit_sig_preimage_hex": "eb84d1b847f20aa1b9053179853c96ed1d0aa18801614e2b2f2560b5eb78b903"
+    }
+  ]
+}

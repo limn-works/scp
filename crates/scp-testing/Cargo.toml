@@ -82,6 +82,10 @@ name = "outlet_stream_conformance"
 path = "tests/integration/outlet_stream_conformance.rs"
 
 [[test]]
+name = "outlet_caveats_binding_conformance"
+path = "tests/integration/outlet_caveats_binding_conformance.rs"
+
+[[test]]
 name = "cross_context_error_wrapping"
 path = "tests/integration/cross_context_error_wrapping.rs"
 

@@ -72,6 +72,7 @@ z-base-32 = { workspace = true }
 # Tests need InMemoryKeyCustody — enable the `testing` feature for dev-deps.
 scp-platform = { path = "../../scp-platform", features = ["testing"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tempfile = "3"
 
@@ -83,6 +84,11 @@ required-features = ["allow_in_memory_custody"]
 [[test]]
 name = "outlet_streaming"
 path = "tests/outlet_streaming.rs"
+required-features = ["allow_in_memory_custody"]
+
+[[test]]
+name = "outlet_stream_vectors"
+path = "tests/outlet_stream_vectors.rs"
 required-features = ["allow_in_memory_custody"]
 
 [build-dependencies]

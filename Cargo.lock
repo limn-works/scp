@@ -5188,6 +5188,7 @@ dependencies = [
  "scp-protocol",
  "scp-runtime",
  "scp-transport",
+ "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",

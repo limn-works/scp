@@ -783,3 +783,37 @@ Independent implementations SHOULD parse `outlet_stream_vectors.json`, drive eac
 ### 25.20.3 Layer separation
 
 The vectors are control-plane fixtures, not wire-format fixtures. The §5.4.5 layer they validate is the receiver/executor state machine and chunk ordering, not the per-chunk `Ed25519Signature` over the `SCP-OUTLET-CHUNK-SIG-V1:` preimage (which is exercised by `verify_chunk_signature` unit tests against synthetic keypairs). The two layers compose: a wire-conforming `OutletStreamChunk` whose `payload` violates the §5.4.5 ordering rule is rejected at the runtime layer regardless of signature validity, and vice versa.
+
+### 25.20.4 Cross-SDK byte-equivalence fixture (`caveats_binding`, `chunk_sig_preimage`, `credit_sig_preimage`)
+
+§5.4.5 line 635 and ADR-049 §5 round-5 promise a **cross-SDK byte-equivalence** invariant for the three streaming preimages: every SDK (PyO3, NAPI, UniFFI Swift / Kotlin, WASM) MUST produce byte-identical 32-byte hashes for the same inputs. The companion fixture lives at:
+
+```
+tests/conformance/vectors/outlet_caveats_binding_fixtures.json
+```
+
+The fixture documents:
+
+- **3 `caveats_binding` vectors** (`cb_minimal`, `cb_multifield`, `cb_empty`) covering the §5.4.5 omit-none rule for absent `Option` fields, RFC 8785 JCS lexicographic key ordering across `amountMaxPerCall < maxCalls < originKind < validUntil`, and the literal `{}` encoding for `InvocationCaveats::empty()`. SDKs that emit explicit `null` for absent fields fail `cb_empty` immediately.
+- **2 `chunk_sig_preimage` vectors** (`chunk_sig_data`, `chunk_sig_end`) covering the `Data` and `End` payload variants. Asserts the `@type` discriminator sorts to JCS position 0 in every variant (ASCII `@` = `0x40`, before lowercase letters `0x61..0x7A`).
+- **2 `credit_sig_preimage` vectors** (`credit_sig_first_grant`, `credit_sig_later_grant_post_epoch_advance`) covering distinct `(grant, monotonic_seq, stream_epoch)` tuples. Pins the big-endian encoding rule for `u32(grant)` and `u64(monotonic_seq, stream_epoch)`.
+
+Conformance:
+
+```bash
+# Rust replay — protocol-level helpers reproduce every golden:
+cargo test -p scp-testing --test outlet_caveats_binding_conformance
+
+# Per-SDK byte-equivalence:
+cargo test -p scp-runtime --test wasm_conformance --features testing \
+  outlet_caveats_binding_fixture                                              # WASM-leg (host-side, protocol path)
+cargo test -p scp-ffi-uniffi --test outlet_stream_vectors --features allow_in_memory_custody  # UniFFI Swift / Kotlin
+python3.12 -m pytest bindings/python/tests/test_outlet_caveats_binding_conformance.py -v       # PyO3
+bun test bindings/typescript/tests/outlet-caveats-binding-conformance.test.ts                  # NAPI + WASM JS marshaling
+
+# Regenerate when goldens intentionally change:
+cargo test -p scp-testing --test outlet_caveats_binding_conformance \
+  conf_outlet_caveats_binding_regen -- --ignored --nocapture
+```
+
+The on-disk fixture is held byte-identical to the in-tree generator at `crates/scp-testing/src/conformance/outlet_caveats_binding.rs` by the `on_disk_fixture_matches_in_tree_generator_byte_for_byte` test. Drift is detected on every CI run; the regenerator is `#[ignore]` by default.
