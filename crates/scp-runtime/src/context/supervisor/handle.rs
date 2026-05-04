@@ -373,8 +373,11 @@ impl SupervisorHandle {
     /// `context_id` if persistence is configured. Best-effort —
     /// errors are logged, not propagated.
     pub(crate) async fn persist_context_and_broadcast(&self, context_id: &str) {
-        crate::context::manager_methods::persist_context_and_broadcast(&self.supervisor, context_id)
-            .await;
+        crate::context::manager_methods::persist_context_and_broadcast(
+            &self.supervisor,
+            context_id,
+        )
+        .await;
     }
 
     /// `true` if the supervisor's contexts map currently registers
@@ -415,7 +418,7 @@ impl SupervisorHandle {
             crate::context::manager_methods::get_context_arc(&self.supervisor, context_id)
         {
             let guard = ctx_arc.lock().await;
-            return f(&*guard);
+            return f(&guard);
         }
         Ok(())
     }

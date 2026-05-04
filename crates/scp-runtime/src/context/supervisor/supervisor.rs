@@ -2155,7 +2155,8 @@ impl Supervisor {
         context_id: &str,
         handle: &crate::context::ContextHandle,
     ) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers_legacy::restore_context_legacy(self, context_id, handle).await
+        crate::context::lifecycle_helpers_legacy::restore_context_legacy(self, context_id, handle)
+            .await
     }
 
     /// Best-effort flush of every context's snapshot to the configured
@@ -2503,7 +2504,10 @@ impl Supervisor {
         caller_did: &DID,
         member_did: &DID,
     ) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers_legacy::leave_context_legacy(self, handle, caller_did, member_did).await
+        crate::context::lifecycle_helpers_legacy::leave_context_legacy(
+            self, handle, caller_did, member_did,
+        )
+        .await
     }
 
     /// Passthrough to

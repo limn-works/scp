@@ -43,23 +43,17 @@
 //! Bootstrap (build fresh state, then register through
 //! [`SupervisorHandle`](crate::context::supervisor::handle::SupervisorHandle)):
 //!
-//! 9. [`create_context`] — full create body; builds and registers a
-//!    fresh `PerContextState`.
-//! 10. [`finalize_create`] — gauges + governance timeout + persistence
-//!     + TTL timer post-creation. Reaches the supervisor through the
-//!     handle for cross-context surfaces (gauges, contexts-arc); the
-//!     designated-legacy `start_governance_timeout_task_legacy` is
-//!     reached via the [shim escape](
-//!     crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-//!     because that helper iterates the contexts `DashMap` and stays
-//!     legacy-shape until the per-context governance-timeout actor
-//!     lands.
-//! 11. [`import_context`] — full import body (validate, restore crypto,
-//!     build `PerContextState`, register).
-//! 12. [`load_persisted_context_state`] — load context snapshot and
-//!     broadcast state from persistence.
-//! 13. [`restore_context`] — rebuild `PerContextState` from snapshot +
-//!     register + start governance timeout + spawn TTL.
+//! - [`create_context`] — full create body; builds and registers a fresh `PerContextState`.
+//! - [`finalize_create`] — gauges + governance timeout + persistence + TTL timer post-creation.
+//! - [`import_context`] — full import body (validate, restore crypto, build `PerContextState`, register).
+//! - [`load_persisted_context_state`] — load context snapshot and broadcast state from persistence.
+//! - [`restore_context`] — rebuild `PerContextState` from snapshot + register + start governance timeout + spawn TTL.
+//!
+//! `finalize_create` reaches the designated-legacy
+//! `start_governance_timeout_task_legacy` via the shim escape (see
+//! [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor))
+//! because that helper iterates the contexts `DashMap` and stays
+//! legacy-shape until the per-context governance-timeout actor lands.
 //!
 //! # Designated-legacy supervisor-scoped iteration helpers
 //!
@@ -675,7 +669,10 @@ pub async fn join_context(
     // Phase 3: MLS add_member + sender key distribution (crypto mutations).
     // On failure: void escrow + rollback ticket. No MLS rollback needed
     // because add_member itself failed (no state change occurred).
-    let add_output = match deps.crypto.add_member(&context_id_bytes, &member_did, kp_bytes) {
+    let add_output = match deps
+        .crypto
+        .add_member(&context_id_bytes, &member_did, kp_bytes)
+    {
         Ok(output) => output,
         Err(e) => {
             if let Some(a) = auth {
@@ -690,7 +687,10 @@ pub async fn join_context(
         }
     };
 
-    if let Err(e) = deps.crypto.distribute_sender_key(&context_id_bytes, &member_did) {
+    if let Err(e) = deps
+        .crypto
+        .distribute_sender_key(&context_id_bytes, &member_did)
+    {
         // Sender key distribution failed after MLS add — rollback MLS state.
         let _ = deps.crypto.remove_member(&context_id_bytes, &member_did);
         let _ = deps
@@ -810,8 +810,9 @@ pub fn join_context_membership(
     // authority (it's the protocol-defined floor), so there is nothing
     // to authorize a second time.
     let creator_did = state.role_state.creator_did.clone();
-    let tokens = roles::system_assign_role(&mut state.role_state, member_did, "member", &*deps.clock)
-        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+    let tokens =
+        roles::system_assign_role(&mut state.role_state, member_did, "member", &*deps.clock)
+            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
     // Add to membership tracking.
     state
@@ -886,9 +887,10 @@ pub async fn capture_join_payment(
     deducted_cost: Option<scp_protocol::economy::types::Amount>,
 ) {
     if let Some(a) = auth
-        && let Err(e) =
-            crate::context::economy_helpers::complete_paid_action(state, deps, a, member_did, context_id)
-                .await
+        && let Err(e) = crate::context::economy_helpers::complete_paid_action(
+            state, deps, a, member_did, context_id,
+        )
+        .await
     {
         // H8: do NOT rollback budget — service was delivered (member joined).
         tracing::warn!(
@@ -1012,8 +1014,9 @@ pub async fn create_context(
     )
     .await?;
     let ceiling = CapabilityCeiling::new(params.ceiling.iter().cloned());
-    let role_state = ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![], &*deps.clock)
-        .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+    let role_state =
+        ContextRoleState::new(&context_id, &*creator_did, ceiling, vec![], &*deps.clock)
+            .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
     let mut membership = MembershipState::new();
     let creator_tokens = role_state
         .assignments
@@ -1021,9 +1024,9 @@ pub async fn create_context(
         .map(|a| a.tokens.clone())
         .unwrap_or_default();
     membership.add_member(creator_did.clone(), "admin".into(), creator_tokens);
-    let broadcast_context = deps
-        .supervisor
-        .init_broadcast_context(&context_id, &params, &creator_did)?;
+    let broadcast_context =
+        deps.supervisor
+            .init_broadcast_context(&context_id, &params, &creator_did)?;
     let (initial_threshold_signers, initial_threshold_value) = match &params.governance {
         GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
         _ => (Vec::new(), 0),
@@ -1290,9 +1293,7 @@ pub async fn import_context(
         deps.crypto
             .restore_crypto_state(&ctx_id_bytes, &export.mls_state)
             .map_err(|e| {
-                ContextError::PersistenceFailed(format!(
-                    "import: crypto state restore failed: {e}"
-                ))
+                ContextError::PersistenceFailed(format!("import: crypto state restore failed: {e}"))
             })?;
     }
 
@@ -1833,4 +1834,3 @@ pub async fn restore_context(
 
     Ok(())
 }
-

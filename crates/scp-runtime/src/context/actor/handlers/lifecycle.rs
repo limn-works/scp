@@ -434,12 +434,8 @@ async fn handle_close_context_actor(
         return Outcome::err(sketch);
     }
 
-    let close_fut = crate::context::lifecycle_helpers::close_context(
-        state,
-        deps,
-        &handle,
-        &initiator_did,
-    );
+    let close_fut =
+        crate::context::lifecycle_helpers::close_context(state, deps, &handle, &initiator_did);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, close_fut).await {
         Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
@@ -627,8 +623,11 @@ async fn handle_close_context_shim(
         return Outcome::err(sketch);
     }
 
-    let close_fut =
-        crate::context::lifecycle_helpers_legacy::close_context_legacy(supervisor, &handle, &initiator_did);
+    let close_fut = crate::context::lifecycle_helpers_legacy::close_context_legacy(
+        supervisor,
+        &handle,
+        &initiator_did,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, close_fut).await {
         Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
@@ -690,9 +689,9 @@ async fn handle_import_context_shim(
     // Box::pin — the per-variant import future crosses clippy's 16 KB
     // stack budget (ContextExport ~2 KB + the full PerContextState-
     // construction locals inside the legacy `import_context` body).
-    let import_fut = Box::pin(crate::context::lifecycle_helpers_legacy::import_context_legacy(
-        supervisor, *export,
-    ));
+    let import_fut = Box::pin(
+        crate::context::lifecycle_helpers_legacy::import_context_legacy(supervisor, *export),
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, import_fut).await {
         Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),
