@@ -61,11 +61,14 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::VerifyingKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use scp_primitives::DID;
 use scp_protocol::context::outlets::OutletId;
 use scp_protocol::context::outlets::error_codes;
-use scp_protocol::context::outlets::stream::{OutletStreamChunk, OutletStreamCredit, RequestId};
+use scp_protocol::context::outlets::stream::{
+    OutletStreamCancel, OutletStreamChunk, OutletStreamCredit, RequestId, sign_chunk,
+    verify_cancel_signature, verify_chunk_signature,
+};
 use scp_protocol::economy::types::Amount;
 use scp_protocol::trust::caveats::InvocationCaveats;
 
@@ -201,6 +204,20 @@ pub struct OpenStreamParams {
     /// Invoker's Ed25519 verifying key. Pinned for the stream's
     /// lifetime; every grant signature verifies under this key.
     pub invoker_pk: VerifyingKey,
+    /// Operator's Ed25519 signing key. Used by the dispatch pump to
+    /// sign every chunk that crosses the outer wire boundary — both
+    /// executor-emitted chunks (renumbered under the pump's sequence)
+    /// and framework-emitted terminal chunks (cancel-ack-timeout,
+    /// credit-stall). Pinned at acceptance.
+    ///
+    /// `None` is reserved for legacy / test callers that have no key
+    /// to sign with. When `None` the pump emits the all-zero signature
+    /// placeholder and logs a `tracing::error!` so the gap is visible
+    /// in production telemetry — preferred over silently corrupting
+    /// the wire form. Production native FFI bridges always pass
+    /// `Some`; WASM passes the invoker key (operator==invoker per
+    /// ADR-034, single-process bridge).
+    pub operator_signing_key: Option<Arc<SigningKey>>,
     /// `ContextParams::stream_credit_stall_secs`.
     pub stream_credit_stall_secs: u32,
     /// `ContextParams::stream_cancel_ack_secs`.
@@ -240,6 +257,14 @@ pub(crate) struct SharedSessionState {
     /// Pinned at acceptance — the executor stops billing chunks above
     /// this `cancel_ack_seq` (§5.4.5 cancel-ack ceiling).
     pub cancel_ack_seq: Option<u64>,
+    /// Operator signing key pinned at acceptance. The pump uses this
+    /// to sign every chunk that crosses the outer wire boundary —
+    /// executor-emitted chunks (re-signed under the pump's renumbered
+    /// sequence) and framework-emitted terminal chunks (cancel-ack-
+    /// timeout, credit-stall). `None` only for legacy / test callers
+    /// that do not supply a key — the pump emits the all-zero sig
+    /// placeholder and logs a `tracing::error!` so the gap is visible.
+    pub operator_signing_key: Option<Arc<SigningKey>>,
 }
 
 /// The 3-tuple of strings the admission tracker keys on. Kept as a
@@ -397,28 +422,64 @@ impl StreamSessionHandle {
         Ok(new_total)
     }
 
-    /// Applies an `OutletCancel`. Records `cancel_ack_seq = next_seq`,
-    /// arms the `stream_cancel_ack_secs` timer, and wakes the pump so
-    /// the executor can emit a terminal chunk within the window. Per
+    /// Applies a signed `OutletStreamCancel` (round-7 cancel-auth).
+    /// Records `cancel_ack_seq = cancel.next_seq`, arms the
+    /// `stream_cancel_ack_secs` timer, and wakes the pump so the
+    /// executor can emit a terminal chunk within the window. Per
     /// §5.4.5 the recorded `cancel_ack_seq` is the runtime's
     /// next-to-emit cursor at the moment the cancel arrives.
     ///
-    /// Returns the recorded `cancel_ack_seq`. If the stream had already
-    /// closed (terminal chunk delivered), returns `None` and the
-    /// cancel is ignored per §5.4.5 idempotency rule.
-    pub fn apply_outlet_cancel(&self, next_seq: u64) -> Option<u64> {
+    /// Verifies the cancel's signature under the invoker's pinned
+    /// `invoker_pk` recorded by the `CreditTracker` at acceptance.
+    /// On signature-verification failure, returns
+    /// [`super::stream::CancelError::SignatureInvalid`]
+    /// and does NOT mutate stream state — neither the cancel-ack timer
+    /// arms nor `cancel_ack_seq` is recorded. This is the §5.4.5
+    /// `Authorization::AuthorizationFailed` path the spec round-7
+    /// cancel-auth tightening introduces.
+    ///
+    /// On success, returns `Ok(Some(seq))` with the recorded
+    /// `cancel_ack_seq`. If the stream had already closed (terminal
+    /// chunk delivered), returns `Ok(None)` and the cancel is ignored
+    /// per §5.4.5 idempotency rule.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`super::stream::CancelError::SignatureInvalid`]
+    /// when the cancel's signature does not verify under the pinned
+    /// invoker key + the stream's pinned `(context_id, outlet_id,
+    /// caveats_binding)` triple.
+    pub fn apply_outlet_cancel(
+        &self,
+        cancel: &OutletStreamCancel,
+    ) -> Result<Option<u64>, super::stream::CancelError> {
         let now = Instant::now();
         let mut guard = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.cancel_ack.record_cancel(next_seq, now);
+        let identity = guard.credit.identity().clone();
+        let invoker_pk = *guard.credit.invoker_pk();
+        // Verify under the pinned key + identity. Per §5.4.5, an
+        // unsigned-or-tampered cancel is `Authorization::AuthorizationFailed`
+        // and MUST NOT mutate stream state.
+        if !verify_cancel_signature(
+            cancel,
+            &invoker_pk,
+            &identity.context_id,
+            &identity.outlet_id,
+            &identity.caveats_binding,
+        ) {
+            return Err(super::stream::CancelError::SignatureInvalid);
+        }
+        guard.cancel_ack.record_cancel(cancel.next_seq, now);
         let recorded = guard.cancel_ack.cancel_ack_seq();
         guard.cancel_ack_armed = true;
         guard.cancel_ack_seq = recorded;
         drop(guard);
         self.cancel_wake.notify_waiters();
-        recorded
+        Ok(recorded)
     }
 }
 
@@ -520,6 +581,7 @@ fn build_shared_state(
         cancel_ack_armed: false,
         credit_stall_armed_at: None,
         cancel_ack_seq: None,
+        operator_signing_key: params.operator_signing_key.clone(),
     }))
 }
 
@@ -684,6 +746,13 @@ where
     // the sink — the dispatch pump emits the event itself at
     // settlement time so the recorded manifest matches the chunks the
     // outer pump delivered to the SDK.
+    //
+    // §5.4.5 round-7: pass the operator signing key through so the
+    // inner pump signs each chunk under
+    // `SCP-OUTLET-CHUNK-SIG-V1:`. The outer pump re-signs under the
+    // renumbered outer sequence; the inner sig closes the
+    // spec-compliance loop for callers (manager-direct,
+    // test-harnesses) that bypass the outer pump.
     let inner_rx = invoke_outlet(
         context,
         registry,
@@ -696,6 +765,8 @@ where
         misdeclaration_sink,
         handler_panic_sink,
         None,
+        params.operator_signing_key.clone(),
+        params.identity.caveats_binding,
     )
     .await
     .map_err(|err| {
@@ -751,6 +822,81 @@ where
 // inner_rx_park = ...` hack above)
 // ---------------------------------------------------------------------------
 
+/// Identity-and-key bundle the pump uses to sign every outer-wire
+/// chunk under the §5.4.5 `SCP-OUTLET-CHUNK-SIG-V1:` preimage.
+///
+/// Snapshotted from [`SharedSessionState`] at pump-task spawn time so
+/// the per-chunk signing path does not retake the session lock for
+/// each emission.
+#[derive(Clone)]
+struct PumpSigningContext {
+    /// Operator signing key. `None` for legacy / test callers; see
+    /// [`OpenStreamParams::operator_signing_key`].
+    operator_signing_key: Option<Arc<SigningKey>>,
+    /// Hosting context id (committed into every preimage).
+    context_id: String,
+    /// Outlet id (committed into every preimage).
+    outlet_id: String,
+    /// 32-byte `caveats_binding` (committed into every preimage).
+    caveats_binding: [u8; 32],
+}
+
+impl PumpSigningContext {
+    /// Signs a `(request_id, sequence, payload)` triple under the
+    /// pinned `(context_id, outlet_id, caveats_binding)` and returns
+    /// the 64-byte signature.
+    ///
+    /// Returns the all-zero placeholder + logs `tracing::error!` when
+    /// the operator key is `None` — this preserves the wire shape but
+    /// makes the gap visible to operators (the receiver will reject
+    /// such a chunk under the §5.4.5 verifier; the placeholder is a
+    /// last-ditch fallback for legacy / test callers that never wired
+    /// the key, never the production path).
+    fn sign_outer_chunk(
+        &self,
+        request_id: &RequestId,
+        sequence: u64,
+        payload: &scp_protocol::context::outlets::stream::ChunkPayload,
+    ) -> [u8; 64] {
+        let Some(key) = self.operator_signing_key.as_ref() else {
+            tracing::error!(
+                request_id = %hex::encode(request_id),
+                outlet_id = %self.outlet_id,
+                context_id = %self.context_id,
+                sequence,
+                "dispatch pump: operator_signing_key is None — emitting unsigned chunk (legacy/test path)"
+            );
+            return [0u8; 64];
+        };
+        match sign_chunk(
+            key,
+            &self.context_id,
+            &self.outlet_id,
+            request_id,
+            sequence,
+            &self.caveats_binding,
+            payload,
+        ) {
+            Ok(sig) => sig,
+            Err(e) => {
+                // JCS canonicalization should never fail for a valid
+                // ChunkPayload; if it ever does, surface the error and
+                // fall back to the placeholder rather than panic the
+                // pump task.
+                tracing::error!(
+                    request_id = %hex::encode(request_id),
+                    outlet_id = %self.outlet_id,
+                    context_id = %self.context_id,
+                    sequence,
+                    error = %e,
+                    "dispatch pump: failed to sign chunk — emitting unsigned placeholder"
+                );
+                [0u8; 64]
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_stream_pump_v2(
     state: Arc<Mutex<SharedSessionState>>,
@@ -767,6 +913,23 @@ async fn run_stream_pump_v2(
     let mut emitted_chunks: Vec<OutletStreamChunk> = Vec::new();
     let mut next_seq: u64 = 0;
     let mut parked: Option<OutletStreamChunk> = None;
+
+    // Snapshot the operator signing context once at task start so the
+    // per-chunk signing path does not retake the session mutex for
+    // each emission. The pinned identity values do not change for the
+    // stream's lifetime (§5.4.5 binding-pinning invariant).
+    let signing_ctx = {
+        let guard = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let identity = guard.credit.identity().clone();
+        PumpSigningContext {
+            operator_signing_key: guard.operator_signing_key.clone(),
+            context_id: identity.context_id,
+            outlet_id: identity.outlet_id,
+            caveats_binding: identity.caveats_binding,
+        }
+    };
 
     loop {
         // Calculate timer state.
@@ -810,11 +973,12 @@ async fn run_stream_pump_v2(
                 biased;
                 () = cancel_timer_fut => {
                     let payload = CancelAckTracker::cancel_ack_timeout_payload();
+                    let sig = signing_ctx.sign_outer_chunk(&request_id, next_seq, &payload);
                     let chunk = OutletStreamChunk {
                         request_id,
                         sequence: next_seq,
                         payload,
-                        sig: [0u8; 64],
+                        sig,
                     };
                     emitted_chunks.push(chunk.clone());
                     let _ = outer_tx.send(chunk).await;
@@ -822,11 +986,12 @@ async fn run_stream_pump_v2(
                 }
                 () = credit_timer_fut => {
                     let payload = CancelAckTracker::credit_stall_payload();
+                    let sig = signing_ctx.sign_outer_chunk(&request_id, next_seq, &payload);
                     let chunk = OutletStreamChunk {
                         request_id,
                         sequence: next_seq,
                         payload,
-                        sig: [0u8; 64],
+                        sig,
                     };
                     emitted_chunks.push(chunk.clone());
                     let _ = outer_tx.send(chunk).await;
@@ -844,11 +1009,12 @@ async fn run_stream_pump_v2(
                 biased;
                 () = cancel_timer_fut => {
                     let payload = CancelAckTracker::cancel_ack_timeout_payload();
+                    let sig = signing_ctx.sign_outer_chunk(&request_id, next_seq, &payload);
                     let chunk = OutletStreamChunk {
                         request_id,
                         sequence: next_seq,
                         payload,
-                        sig: [0u8; 64],
+                        sig,
                     };
                     emitted_chunks.push(chunk.clone());
                     let _ = outer_tx.send(chunk).await;
@@ -856,11 +1022,12 @@ async fn run_stream_pump_v2(
                 }
                 () = credit_timer_fut => {
                     let payload = CancelAckTracker::credit_stall_payload();
+                    let sig = signing_ctx.sign_outer_chunk(&request_id, next_seq, &payload);
                     let chunk = OutletStreamChunk {
                         request_id,
                         sequence: next_seq,
                         payload,
-                        sig: [0u8; 64],
+                        sig,
                     };
                     emitted_chunks.push(chunk.clone());
                     let _ = outer_tx.send(chunk).await;
@@ -913,12 +1080,39 @@ async fn run_stream_pump_v2(
             StreamGateOutcome::Forward => {
                 let seq = next_seq;
                 next_seq = next_seq.saturating_add(1);
+                // §5.4.5 per-chunk operator signature MUST cover the
+                // outer (renumbered) sequence. The inner pump's chunk
+                // bears a sig under the inner-pump sequence which the
+                // outer wire form no longer matches; we re-sign every
+                // forwarded chunk under the outer sequence so receivers
+                // can verify each chunk against `chunk.sequence` as
+                // delivered. Without this, the inner sig is dead weight
+                // (verifies under a sequence the wire never carries).
+                let sig = signing_ctx.sign_outer_chunk(&request_id, seq, &chunk.payload);
                 let final_chunk = OutletStreamChunk {
                     request_id,
                     sequence: seq,
                     payload: chunk.payload.clone(),
-                    sig: chunk.sig,
+                    sig,
                 };
+                // Crisp invariant: every chunk reaching a bridge consumer
+                // verifies under the pinned operator key. In debug
+                // builds we re-verify the sig we just produced, so a
+                // signing-vs-verifying preimage drift surfaces in tests
+                // before any production member observes a bad chunk.
+                debug_assert!(
+                    signing_ctx.operator_signing_key.as_ref().is_none_or(|key| {
+                        verify_chunk_signature(
+                            &final_chunk,
+                            &key.verifying_key(),
+                            &signing_ctx.context_id,
+                            &signing_ctx.outlet_id,
+                            &signing_ctx.caveats_binding,
+                        )
+                    }),
+                    "dispatch pump: just-signed chunk fails to verify under the pinned operator key — \
+                     signing/verifying preimage drift",
+                );
                 {
                     let mut guard = state
                         .lock()

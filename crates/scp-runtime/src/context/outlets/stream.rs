@@ -127,6 +127,37 @@ pub const fn grant_error_to_slug(err: GrantError) -> &'static str {
     }
 }
 
+/// Reasons a streaming `OutletStreamCancel` may be rejected (§5.4.5
+/// round-7 cancel-auth tightening).
+///
+/// All variants map to `OutletErrorClass::Authorization::AuthorizationFailed`
+/// per the spec — the runtime collapses the granular reasons to the
+/// uniform authorization-denied slug so an unauthenticated cancel does
+/// not leak whether the failure was signature-invalid vs identity-
+/// mismatch vs unknown-stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelError {
+    /// Ed25519 signature verification failed under the pinned
+    /// `invoker_pk`. Maps to `authorization.denied`.
+    SignatureInvalid,
+}
+
+/// Routes a [`CancelError`] to its §5.4.4 slug.
+#[must_use]
+pub const fn cancel_error_to_slug(err: CancelError) -> &'static str {
+    match err {
+        CancelError::SignatureInvalid => error_codes::SLUG_AUTHORIZATION_DENIED,
+    }
+}
+
+/// Routes a [`CancelError`] to its §5.4.4 code.
+#[must_use]
+pub const fn cancel_error_to_code(err: CancelError) -> &'static str {
+    match err {
+        CancelError::SignatureInvalid => error_codes::CODE_AUTHORIZATION_DENIED,
+    }
+}
+
 /// Routes a [`GrantError`] to its §5.4.4 code.
 #[must_use]
 pub const fn grant_error_to_code(err: GrantError) -> &'static str {
@@ -225,6 +256,18 @@ impl CreditTracker {
     #[must_use]
     pub const fn identity(&self) -> &StreamIdentity {
         &self.identity
+    }
+
+    /// Pinned invoker Ed25519 verifying key (read-only).
+    ///
+    /// Exposed so downstream callers (the dispatch pump's cancel-auth
+    /// path) can verify `OutletStreamCancel` signatures against the
+    /// same key the credit tracker pinned at acceptance — closing the
+    /// round-7 cancel-auth gap without duplicating the pinned key in a
+    /// second piece of state.
+    #[must_use]
+    pub const fn invoker_pk(&self) -> &VerifyingKey {
+        &self.invoker_pk
     }
 
     /// Decrements credit by one for an emitted `Data` or `Progress`

@@ -1960,25 +1960,96 @@ fn placeholder_data_provenance(context_id: &str) -> scp_protocol::provenance::Da
 /// [`OutletStreamChunk`] with the next monotonic sequence number for
 /// this `request_id` (SCP-OUT-033 AC4).
 ///
-/// The signature field is the all-zero placeholder (`[0u8; 64]`). Per
-/// §5.4.5, the operator-side signature is computed at the wire boundary
-/// (cross-MLS-group emission via `compute_chunk_sig_preimage`); the
-/// runtime-internal `invoke_outlet` is the inner driver and does not
-/// hold the operator's signing key. Manager and FFI bridges that emit
-/// chunks across MLS groups sign the chunk with the per-context
-/// operator key before transmission.
-const fn wrap_chunk(
+/// Signs the chunk under the §5.4.5 `SCP-OUTLET-CHUNK-SIG-V1:`
+/// preimage with the supplied operator signing key when present
+/// (round-7 wire-signing closure for the local-context invoke path).
+/// When `signing_ctx.operator_signing_key` is `None`, emits the
+/// all-zero placeholder and logs `tracing::error!` so the gap is
+/// visible — production native paths always pass `Some`. When the
+/// chunk is later forwarded by the dispatch pump
+/// ([`crate::context::outlets::dispatch::run_stream_pump_v2`]) the
+/// outer pump re-signs under the renumbered outer sequence.
+fn wrap_chunk(
+    signing_ctx: &InnerPumpSigningContext,
     request_id: RequestId,
     sequence: &mut u64,
     payload: ChunkPayload,
 ) -> OutletStreamChunk {
     let seq = *sequence;
     *sequence = sequence.saturating_add(1);
+    let sig = signing_ctx.sign_inner_chunk(&request_id, seq, &payload);
     OutletStreamChunk {
         request_id,
         sequence: seq,
         payload,
-        sig: [0u8; 64],
+        sig,
+    }
+}
+
+/// Identity-and-key bundle the inner pump uses to sign every chunk
+/// under the §5.4.5 `SCP-OUTLET-CHUNK-SIG-V1:` preimage.
+///
+/// Mirror of `dispatch::PumpSigningContext` — kept distinct to
+/// preserve the layer boundary between the inner executor pump
+/// (`invoke.rs`, no admission/credit gate) and the outer dispatch
+/// pump (`dispatch.rs`, owns admission + credit + cancel-ack).
+#[derive(Clone)]
+pub(crate) struct InnerPumpSigningContext {
+    /// Operator signing key. `None` for legacy / test callers that did
+    /// not wire a key — `wrap_chunk` falls back to the all-zero
+    /// placeholder + a `tracing::error!` log so the gap is visible.
+    pub(crate) operator_signing_key: Option<std::sync::Arc<ed25519_dalek::SigningKey>>,
+    /// Hosting context id (committed into the preimage).
+    pub(crate) context_id: String,
+    /// Outlet id (committed into the preimage).
+    pub(crate) outlet_id: String,
+    /// 32-byte `caveats_binding` (committed into the preimage).
+    pub(crate) caveats_binding: [u8; 32],
+}
+
+impl InnerPumpSigningContext {
+    /// Signs a `(request_id, sequence, payload)` triple under the
+    /// pinned `(context_id, outlet_id, caveats_binding)`. Returns the
+    /// 64-byte signature, or the all-zero placeholder + a
+    /// `tracing::error!` log when the key is `None` / when JCS fails.
+    fn sign_inner_chunk(
+        &self,
+        request_id: &RequestId,
+        sequence: u64,
+        payload: &ChunkPayload,
+    ) -> [u8; 64] {
+        let Some(key) = self.operator_signing_key.as_ref() else {
+            tracing::error!(
+                request_id = %hex::encode(request_id),
+                outlet_id = %self.outlet_id,
+                context_id = %self.context_id,
+                sequence,
+                "invoke pump: operator_signing_key is None — emitting unsigned chunk (legacy/test path)"
+            );
+            return [0u8; 64];
+        };
+        match scp_protocol::context::outlets::stream::sign_chunk(
+            key,
+            &self.context_id,
+            &self.outlet_id,
+            request_id,
+            sequence,
+            &self.caveats_binding,
+            payload,
+        ) {
+            Ok(sig) => sig,
+            Err(e) => {
+                tracing::error!(
+                    request_id = %hex::encode(request_id),
+                    outlet_id = %self.outlet_id,
+                    context_id = %self.context_id,
+                    sequence,
+                    error = %e,
+                    "invoke pump: failed to sign chunk — emitting unsigned placeholder"
+                );
+                [0u8; 64]
+            }
+        }
     }
 }
 
@@ -2043,6 +2114,15 @@ pub async fn invoke_outlet<E>(
     misdeclaration_sink: Option<std::sync::Arc<dyn QueryMisdeclarationSink>>,
     handler_panic_sink: Option<std::sync::Arc<dyn HandlerPanicSink>>,
     invoked_event_sink: Option<std::sync::Arc<dyn OutletInvokedEventSink>>,
+    // Operator signing key used to sign every chunk under §5.4.5
+    // `SCP-OUTLET-CHUNK-SIG-V1:`. `None` is reserved for legacy / test
+    // callers; production native paths always supply `Some`. See
+    // `InnerPumpSigningContext` for the fallback behaviour.
+    operator_signing_key: Option<std::sync::Arc<ed25519_dalek::SigningKey>>,
+    // 32-byte `caveats_binding` pinned at acceptance — committed into
+    // the per-chunk-signature preimage. `[0u8; 32]` for legacy / test
+    // callers; production paths supply the real binding.
+    caveats_binding: [u8; 32],
 ) -> Result<mpsc::Receiver<OutletStreamChunk>, InvocationError>
 where
     E: OutletExecutor + ?Sized + 'static,
@@ -2101,6 +2181,12 @@ where
     let effective_timeout = timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS);
     let timeout_duration = Duration::from_millis(u64::from(effective_timeout));
 
+    let signing_ctx = InnerPumpSigningContext {
+        operator_signing_key,
+        context_id: context_id_owned.clone(),
+        outlet_id: outlet_id_owned.clone(),
+        caveats_binding,
+    };
     let task_inputs = StreamingTaskInputs {
         context: context_handle_owned,
         role_state: role_state_owned,
@@ -2121,6 +2207,7 @@ where
         payload_rx,
         timeout_duration,
         effective_timeout,
+        signing_ctx,
     };
     tokio::spawn(run_streaming_executor_task(task_inputs));
 
@@ -2161,6 +2248,13 @@ struct StreamingTaskInputs<E: ?Sized> {
     payload_rx: mpsc::Receiver<ChunkPayload>,
     timeout_duration: Duration,
     effective_timeout: u32,
+    /// Operator signing context for per-chunk signing under
+    /// `SCP-OUTLET-CHUNK-SIG-V1:`. When the dispatch pump wraps this
+    /// task it will re-sign every chunk under the renumbered outer
+    /// sequence; the inner sig closes the spec-compliance loop for
+    /// callers that bypass the dispatch pump (manager-direct or test
+    /// callers).
+    signing_ctx: InnerPumpSigningContext,
 }
 
 /// Drives the streaming executor under panic guard + timeout, pumps
@@ -2195,6 +2289,7 @@ where
         mut payload_rx,
         timeout_duration,
         effective_timeout,
+        signing_ctx,
     } = inputs;
 
     let start = std::time::Instant::now();
@@ -2240,6 +2335,7 @@ where
         executor_future,
         timeout_duration,
         &mut emitted_chunks,
+        &signing_ctx,
     )
     .await;
 
@@ -2257,7 +2353,7 @@ where
     // where the executor finished simultaneously with the deadline.
     if !pump_outcome.timed_out {
         while let Ok(payload) = payload_rx.try_recv() {
-            let chunk = wrap_chunk(request_id, &mut sequence, payload);
+            let chunk = wrap_chunk(&signing_ctx, request_id, &mut sequence, payload);
             emitted_chunks.push(chunk.clone());
             if chunk_tx.send(chunk).await.is_err() {
                 // Receiver dropped during late drain; same rationale
@@ -2279,7 +2375,7 @@ where
         handler_panic_sink: handler_panic_sink.as_deref(),
     });
 
-    let terminal_chunk = wrap_chunk(request_id, &mut sequence, terminal_payload);
+    let terminal_chunk = wrap_chunk(&signing_ctx, request_id, &mut sequence, terminal_payload);
     emitted_chunks.push(terminal_chunk.clone());
     let delivered = chunk_tx.send(terminal_chunk).await.is_ok();
 
@@ -2411,6 +2507,7 @@ pub(crate) fn build_streaming_outlet_event(
 /// close. The original `pump_payload_stream` is retained for callers
 /// that don't need the recording — see the comment on
 /// [`run_streaming_executor_task`] for why both helpers exist.
+#[allow(clippy::too_many_arguments)] // signing_ctx is the round-7 wire-signing addition; bundling it would require a wrapper struct that obscures the small parameter set.
 async fn pump_payload_stream_capture<F>(
     payload_rx: &mut mpsc::Receiver<ChunkPayload>,
     chunk_tx: &mpsc::Sender<OutletStreamChunk>,
@@ -2419,6 +2516,7 @@ async fn pump_payload_stream_capture<F>(
     executor_future: std::pin::Pin<&mut F>,
     timeout_duration: Duration,
     recorded_chunks: &mut Vec<OutletStreamChunk>,
+    signing_ctx: &InnerPumpSigningContext,
 ) -> PumpOutcome
 where
     F: Future<Output = Result<Result<(), OutletExecutorError>, Box<dyn std::any::Any + Send>>>
@@ -2443,7 +2541,7 @@ where
             next_payload = payload_rx.recv() => {
                 match next_payload {
                     Some(payload) => {
-                        let chunk = wrap_chunk(request_id, sequence, payload);
+                        let chunk = wrap_chunk(signing_ctx, request_id, sequence, payload);
                         recorded_chunks.push(chunk.clone());
                         if chunk_tx.send(chunk).await.is_err() {
                             chunk_tx_alive = false;
@@ -5962,6 +6060,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            [0u8; 32],
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -6038,6 +6138,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            [0u8; 32],
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -6105,6 +6207,8 @@ mod tests {
             None,
             Some(panic_sink_dyn),
             None,
+            None,
+            [0u8; 32],
         )
         .await
         .expect("synchronous validation must pass before the panic fires");
@@ -6196,6 +6300,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            [0u8; 32],
         )
         .await
         .expect("synchronous validation must pass before the timeout fires");
@@ -6445,6 +6551,8 @@ mod tests {
             None,
             None,
             Some(event_sink_dyn),
+            None,
+            [0u8; 32],
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -6519,6 +6627,8 @@ mod tests {
             None,
             None,
             Some(event_sink_dyn),
+            None,
+            [0u8; 32],
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -6676,6 +6786,8 @@ mod tests {
             None,
             None,
             Some(event_sink_dyn),
+            None,
+            [0u8; 32],
         )
         .await
         .expect("invoke_outlet should accept a well-formed open");
@@ -6753,6 +6865,11 @@ mod tests {
             credit_window,
             caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
             invoker_pk: verifying_key,
+            // OUT-034 unit-test fixtures: no operator key wired —
+            // exercises the dispatch pump's None-fallback behaviour.
+            // Round-7 round-trip / verification tests construct their
+            // own params with an explicit `Some(...)` instead.
+            operator_signing_key: None,
             stream_credit_stall_secs: 1,
             stream_cancel_ack_secs: 1,
         }
@@ -6855,10 +6972,11 @@ mod tests {
         drop(admission_guard);
     }
 
-    /// Test 2 — Mid-stream OutletCancel at next-to-emit seq = 5 →
-    /// cancel_ack_seq = 5, chunks at seq > 5 NOT billed, refund covers
-    /// the unbilled portion (PRD AC25).
+    /// Test 2 — Mid-stream `OutletCancel` at next-to-emit seq = 5 →
+    /// `cancel_ack_seq` = 5, chunks at seq > 5 NOT billed, refund
+    /// covers the unbilled portion (PRD AC25).
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // round-7 cancel-auth wiring extends the narrative
     async fn out034_integration_mid_stream_cancel_at_seq_5_bills_five() {
         // Executor that emits 8 Data chunks then End.
         struct EightDataExecutor;
@@ -6940,7 +7058,29 @@ mod tests {
         // seq=4 so chunks 0..=4 (5 chunks) are billable but seq 5,6,7
         // are above the ceiling.
         let _ = received_count;
-        let recorded_seq = handle.apply_outlet_cancel(4);
+        // Round-7 cancel-auth: build a signed `OutletStreamCancel`
+        // under the same invoker key the test pinned at
+        // `out034_open_params`. The runtime verifies under the
+        // pinned `(context_id, outlet_id, caveats_binding)`.
+        let test_identity = out034_identity(&outlet_id_owned);
+        let cancel_sig = scp_protocol::context::outlets::stream::sign_cancel(
+            &signing,
+            &scp_protocol::context::outlets::stream::CancelSigningInputs {
+                context_id: &test_identity.context_id,
+                outlet_id: &test_identity.outlet_id,
+                request_id: handle.request_id(),
+                next_seq: 4,
+                caveats_binding: &test_identity.caveats_binding,
+            },
+        );
+        let cancel = scp_protocol::context::outlets::stream::OutletStreamCancel {
+            request_id: *handle.request_id(),
+            next_seq: 4,
+            sig: cancel_sig,
+        };
+        let recorded_seq = handle
+            .apply_outlet_cancel(&cancel)
+            .expect("signed cancel verifies under pinned invoker key");
         assert_eq!(
             recorded_seq,
             Some(4),
@@ -7218,6 +7358,687 @@ mod tests {
         // reference count derived from the manifest.
         super::super::dispatch::verify_summary_chunks_billed(&summary)
             .expect("dispatch summary passes §5.4.5 chunks_billed verification");
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-037 round-7 CRITICAL #2 / #3 / #4 — wire-signing closure +
+    // cancel-auth tightening.
+    // -----------------------------------------------------------------------
+
+    /// Helper: build `out034_open_params` with an explicit operator
+    /// signing key (round-7 wire-signing path).
+    #[allow(clippy::needless_pass_by_value)] // by-value Arc clone simplifies test callsites
+    fn out037_open_params_with_operator_key(
+        outlet_id: &str,
+        invoker_did: &str,
+        cost_per_chunk: scp_protocol::economy::types::Amount,
+        available_balance: scp_protocol::economy::types::Amount,
+        declared_estimated: Option<u32>,
+        credit_window: u32,
+        operator_signing_key: StdArc<ed25519_dalek::SigningKey>,
+    ) -> super::super::dispatch::OpenStreamParams {
+        super::super::dispatch::OpenStreamParams {
+            identity: out034_identity(outlet_id),
+            caps: out034_admission_caps(),
+            invoker_did: invoker_did.to_owned(),
+            origin_invoker_did: invoker_did.to_owned(),
+            cost_per_chunk,
+            available_balance,
+            declared_estimated_chunk_count: declared_estimated,
+            credit_window,
+            caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
+            invoker_pk: operator_signing_key.verifying_key(),
+            operator_signing_key: Some(StdArc::clone(&operator_signing_key)),
+            stream_credit_stall_secs: 1,
+            stream_cancel_ack_secs: 1,
+        }
+    }
+
+    /// CRITICAL #2 — credit-stall terminal chunk emitted by the
+    /// dispatch pump verifies under the pinned operator key. Before
+    /// the round-7 fix, framework-emitted terminal chunks carried
+    /// `sig: [0u8; 64]` and would fail any receiver-side verification.
+    #[tokio::test]
+    async fn out037_credit_stall_terminal_chunk_is_signed() {
+        struct FiveDataExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for FiveDataExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                for i in 0..5u32 {
+                    let _ = tx
+                        .send(ChunkPayload::Data {
+                            value: serde_json::json!({ "tick": i }),
+                        })
+                        .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(FiveDataExecutor);
+
+        let signing = StdArc::new(ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]));
+        let operator_pk = signing.verifying_key();
+        let admission = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+        let params = out037_open_params_with_operator_key(
+            &outlet_id_owned,
+            creator_did,
+            scp_protocol::economy::types::Amount::new(10),
+            scp_protocol::economy::types::Amount::new(1000),
+            Some(3),
+            3,
+            StdArc::clone(&signing),
+        );
+        let identity = out034_identity(&outlet_id_owned);
+
+        let mut handle = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            params,
+            StdArc::clone(&admission),
+        )
+        .await
+        .expect("OUT-034 open should succeed");
+
+        let rx = handle.receiver().expect("receiver");
+        let summary_rx = handle.close_summary().expect("summary");
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+        let _summary = summary_rx.await.expect("summary publishes");
+
+        // Every chunk delivered by the dispatch pump (including the
+        // framework-emitted credit-stall terminal) MUST verify under
+        // the pinned operator key.
+        for chunk in &chunks {
+            assert!(
+                scp_protocol::context::outlets::stream::verify_chunk_signature(
+                    chunk,
+                    &operator_pk,
+                    &identity.context_id,
+                    &identity.outlet_id,
+                    &identity.caveats_binding,
+                ),
+                "chunk at sequence {} (payload={:?}) must verify under operator key",
+                chunk.sequence,
+                chunk.payload,
+            );
+        }
+
+        // The terminal chunk is the SCP-TOOL-6133 credit-stall — same
+        // assertion as the OUT-034 test, but here we additionally
+        // confirm its `sig` is non-zero (round-7 wire-signing).
+        let terminal = chunks.last().expect("terminal chunk");
+        assert!(
+            terminal.sig != [0u8; 64],
+            "framework-emitted terminal chunk MUST be signed (round-7)"
+        );
+        match &terminal.payload {
+            ChunkPayload::Error {
+                code, terminal: t, ..
+            } => {
+                assert!(*t, "terminal flag set");
+                assert_eq!(
+                    code,
+                    scp_protocol::context::outlets::error_codes::CODE_EXECUTION_CREDIT_STALL,
+                    "credit-stall code"
+                );
+            }
+            other => panic!("expected terminal Error{{credit-stall}}, got {other:?}"),
+        }
+    }
+
+    /// CRITICAL #2 — cancel-ack-timeout terminal chunk is also signed.
+    /// The round-7 fix wires both timer paths through
+    /// `signing_ctx.sign_outer_chunk`.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // narrative round-7 cancel-ack-timeout test
+    async fn out037_cancel_ack_timeout_terminal_chunk_is_signed() {
+        // Executor that emits 1 Data chunk then sleeps long enough
+        // for the cancel-ack timer to fire.
+        struct SlowExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for SlowExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                let _ = tx
+                    .send(ChunkPayload::Data {
+                        value: serde_json::json!({ "first": true }),
+                    })
+                    .await;
+                // Sleep > stream_cancel_ack_secs (set to 1 in
+                // out034_open_params via out037_open_params_with_operator_key).
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(SlowExecutor);
+
+        let signing = StdArc::new(ed25519_dalek::SigningKey::from_bytes(&[0x66; 32]));
+        let operator_pk = signing.verifying_key();
+        let admission = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+        let params = out037_open_params_with_operator_key(
+            &outlet_id_owned,
+            creator_did,
+            scp_protocol::economy::types::Amount::new(0),
+            scp_protocol::economy::types::Amount::new(0),
+            Some(8),
+            8,
+            StdArc::clone(&signing),
+        );
+        let identity = out034_identity(&outlet_id_owned);
+
+        let mut handle = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            params,
+            StdArc::clone(&admission),
+        )
+        .await
+        .expect("OUT-034 open should succeed");
+
+        // Receive the first Data chunk so the request_id is fresh, then
+        // deliver a signed cancel that arms the cancel-ack timer.
+        let mut rx = handle.receiver().expect("receiver");
+        let first_chunk = rx.recv().await.expect("first data chunk");
+        let cancel_sig = scp_protocol::context::outlets::stream::sign_cancel(
+            &signing,
+            &scp_protocol::context::outlets::stream::CancelSigningInputs {
+                context_id: &identity.context_id,
+                outlet_id: &identity.outlet_id,
+                request_id: handle.request_id(),
+                next_seq: 1,
+                caveats_binding: &identity.caveats_binding,
+            },
+        );
+        let cancel = scp_protocol::context::outlets::stream::OutletStreamCancel {
+            request_id: *handle.request_id(),
+            next_seq: 1,
+            sig: cancel_sig,
+        };
+        handle
+            .apply_outlet_cancel(&cancel)
+            .expect("signed cancel accepted");
+
+        // Drain remaining chunks. The slow executor never emits a
+        // terminal — the cancel-ack timer fires at +1s and the pump
+        // emits its own terminal Error{cancel-ack-timeout}.
+        let mut received: Vec<scp_protocol::context::outlets::stream::OutletStreamChunk> =
+            vec![first_chunk];
+        while let Some(chunk) = rx.recv().await {
+            received.push(chunk);
+        }
+        let terminal = received.last().expect("terminal");
+        assert!(
+            terminal.sig != [0u8; 64],
+            "cancel-ack-timeout terminal chunk MUST be signed (round-7)"
+        );
+        // Verify it under the pinned operator key.
+        assert!(
+            scp_protocol::context::outlets::stream::verify_chunk_signature(
+                terminal,
+                &operator_pk,
+                &identity.context_id,
+                &identity.outlet_id,
+                &identity.caveats_binding,
+            ),
+            "cancel-ack-timeout terminal chunk verifies under operator key"
+        );
+    }
+
+    /// CRITICAL #3 — Data chunks emitted by the local-context invoke
+    /// path verify under the pinned operator key. Before the round-7
+    /// fix, `wrap_chunk` always set `sig: [0u8; 64]`.
+    #[tokio::test]
+    async fn out037_local_invoke_chunks_verify_under_operator_key() {
+        struct ThreeDataExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for ThreeDataExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                for i in 0..3u32 {
+                    let _ = tx
+                        .send(ChunkPayload::Data {
+                            value: serde_json::json!({ "i": i }),
+                        })
+                        .await;
+                }
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(ThreeDataExecutor);
+
+        let signing = StdArc::new(ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]));
+        let operator_pk = signing.verifying_key();
+        let caveats_binding: [u8; 32] = [0xCC; 32];
+
+        let rx = super::invoke_outlet(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            Some(StdArc::clone(&signing)),
+            caveats_binding,
+        )
+        .await
+        .expect("invoke_outlet should accept a well-formed open");
+
+        let chunks = drain_stream_with_sequence_invariant(rx).await;
+
+        // Every chunk verifies under the operator key + the binding
+        // values supplied to invoke_outlet.
+        let context_id = context.context_id();
+        for chunk in &chunks {
+            assert!(
+                scp_protocol::context::outlets::stream::verify_chunk_signature(
+                    chunk,
+                    &operator_pk,
+                    context_id,
+                    &outlet_id_owned,
+                    &caveats_binding,
+                ),
+                "invoke_outlet chunk at sequence {} must verify under operator key",
+                chunk.sequence,
+            );
+            assert!(
+                chunk.sig != [0u8; 64],
+                "invoke_outlet chunks must be signed (round-7), not zero-filled"
+            );
+        }
+    }
+
+    /// CRITICAL #4 — `apply_outlet_cancel` rejects a cancel with an
+    /// invalid signature as `CancelError::SignatureInvalid` and does
+    /// NOT mutate stream state.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // narrative round-7 cancel-auth test
+    async fn out037_cancel_with_invalid_signature_rejected() {
+        struct OneDataExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for OneDataExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                let _ = tx
+                    .send(ChunkPayload::Data {
+                        value: serde_json::json!({ "x": 1 }),
+                    })
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let _ = tx
+                    .send(ChunkPayload::End {
+                        aggregate: serde_json::Value::Null,
+                        provenance: super::placeholder_data_provenance("ctx"),
+                        execution_time_ms: 50,
+                    })
+                    .await;
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(OneDataExecutor);
+
+        let signing = StdArc::new(ed25519_dalek::SigningKey::from_bytes(&[0x88; 32]));
+        let admission = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+        let params = out037_open_params_with_operator_key(
+            &outlet_id_owned,
+            creator_did,
+            scp_protocol::economy::types::Amount::new(0),
+            scp_protocol::economy::types::Amount::new(0),
+            Some(8),
+            8,
+            StdArc::clone(&signing),
+        );
+
+        let handle = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            params,
+            StdArc::clone(&admission),
+        )
+        .await
+        .expect("OUT-034 open should succeed");
+
+        // Build a cancel signed under the WRONG key — runtime MUST reject.
+        let attacker = ed25519_dalek::SigningKey::from_bytes(&[0xFF; 32]);
+        let identity = out034_identity(&outlet_id_owned);
+        let bad_sig = scp_protocol::context::outlets::stream::sign_cancel(
+            &attacker,
+            &scp_protocol::context::outlets::stream::CancelSigningInputs {
+                context_id: &identity.context_id,
+                outlet_id: &identity.outlet_id,
+                request_id: handle.request_id(),
+                next_seq: 1,
+                caveats_binding: &identity.caveats_binding,
+            },
+        );
+        let bad_cancel = scp_protocol::context::outlets::stream::OutletStreamCancel {
+            request_id: *handle.request_id(),
+            next_seq: 1,
+            sig: bad_sig,
+        };
+        let result = handle.apply_outlet_cancel(&bad_cancel);
+        assert!(
+            matches!(
+                result,
+                Err(super::super::stream::CancelError::SignatureInvalid)
+            ),
+            "wrong-key cancel must be rejected as SignatureInvalid, got {result:?}"
+        );
+
+        // Now build a valid cancel — runtime MUST accept.
+        let good_sig = scp_protocol::context::outlets::stream::sign_cancel(
+            &signing,
+            &scp_protocol::context::outlets::stream::CancelSigningInputs {
+                context_id: &identity.context_id,
+                outlet_id: &identity.outlet_id,
+                request_id: handle.request_id(),
+                next_seq: 1,
+                caveats_binding: &identity.caveats_binding,
+            },
+        );
+        let good_cancel = scp_protocol::context::outlets::stream::OutletStreamCancel {
+            request_id: *handle.request_id(),
+            next_seq: 1,
+            sig: good_sig,
+        };
+        let result_ok = handle.apply_outlet_cancel(&good_cancel);
+        assert!(
+            matches!(result_ok, Ok(Some(1))),
+            "well-signed cancel must be accepted, got {result_ok:?}"
+        );
+    }
+
+    /// CRITICAL #4 — tampering with each preimage field flips the
+    /// signature verification to `false`, surfacing as
+    /// `CancelError::SignatureInvalid` at the runtime boundary.
+    /// Preimage fields: `(context_id, outlet_id, request_id,
+    /// next_seq, caveats_binding)`.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // narrative round-7 5-field tampering matrix
+    async fn out037_cancel_preimage_tampering_rejected() {
+        struct OneDataExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for OneDataExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                let _ = tx
+                    .send(ChunkPayload::Data {
+                        value: serde_json::json!({ "x": 1 }),
+                    })
+                    .await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(OneDataExecutor);
+
+        let signing = StdArc::new(ed25519_dalek::SigningKey::from_bytes(&[0xAA; 32]));
+        let admission = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+        let params = out037_open_params_with_operator_key(
+            &outlet_id_owned,
+            creator_did,
+            scp_protocol::economy::types::Amount::new(0),
+            scp_protocol::economy::types::Amount::new(0),
+            Some(8),
+            8,
+            StdArc::clone(&signing),
+        );
+
+        let handle = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            params,
+            StdArc::clone(&admission),
+        )
+        .await
+        .expect("OUT-034 open should succeed");
+
+        let identity = out034_identity(&outlet_id_owned);
+        let request_id = *handle.request_id();
+        let make_sig = |ctx: &str, outlet: &str, rid: &[u8; 16], next: u64, cb: &[u8; 32]| {
+            scp_protocol::context::outlets::stream::sign_cancel(
+                &signing,
+                &scp_protocol::context::outlets::stream::CancelSigningInputs {
+                    context_id: ctx,
+                    outlet_id: outlet,
+                    request_id: rid,
+                    next_seq: next,
+                    caveats_binding: cb,
+                },
+            )
+        };
+
+        // Each tampering case below: the signature was produced for a
+        // different value of one preimage field than what the wire
+        // struct carries, so the runtime's verifier (which rebuilds
+        // the preimage from the pinned identity + the wire struct)
+        // sees a mismatch.
+
+        // Tamper request_id: sign for one rid, send for a different rid.
+        let other_rid: [u8; 16] = [0x99; 16];
+        let sig_other_rid = make_sig(
+            &identity.context_id,
+            &identity.outlet_id,
+            &other_rid,
+            1,
+            &identity.caveats_binding,
+        );
+        let cancel_tampered_rid = scp_protocol::context::outlets::stream::OutletStreamCancel {
+            request_id, // <-- the actual stream's request_id, NOT what was signed
+            next_seq: 1,
+            sig: sig_other_rid,
+        };
+        assert!(
+            matches!(
+                handle.apply_outlet_cancel(&cancel_tampered_rid),
+                Err(super::super::stream::CancelError::SignatureInvalid)
+            ),
+            "tampered request_id must be rejected"
+        );
+
+        // Tamper next_seq: sign for next=1, send for next=2.
+        let sig_next1 = make_sig(
+            &identity.context_id,
+            &identity.outlet_id,
+            &request_id,
+            1,
+            &identity.caveats_binding,
+        );
+        let cancel_tampered_next = scp_protocol::context::outlets::stream::OutletStreamCancel {
+            request_id,
+            next_seq: 2,
+            sig: sig_next1,
+        };
+        assert!(
+            matches!(
+                handle.apply_outlet_cancel(&cancel_tampered_next),
+                Err(super::super::stream::CancelError::SignatureInvalid)
+            ),
+            "tampered next_seq must be rejected"
+        );
+
+        // Tamper context_id: sign for "OTHER", runtime rebuilds with
+        // the pinned `identity.context_id`.
+        let sig_other_ctx = make_sig(
+            "OTHER",
+            &identity.outlet_id,
+            &request_id,
+            3,
+            &identity.caveats_binding,
+        );
+        let cancel_tampered_ctx = scp_protocol::context::outlets::stream::OutletStreamCancel {
+            request_id,
+            next_seq: 3,
+            sig: sig_other_ctx,
+        };
+        assert!(
+            matches!(
+                handle.apply_outlet_cancel(&cancel_tampered_ctx),
+                Err(super::super::stream::CancelError::SignatureInvalid)
+            ),
+            "tampered context_id must be rejected"
+        );
+
+        // Tamper outlet_id: sign for "OTHER".
+        let sig_other_outlet = make_sig(
+            &identity.context_id,
+            "OTHER",
+            &request_id,
+            4,
+            &identity.caveats_binding,
+        );
+        let cancel_tampered_outlet = scp_protocol::context::outlets::stream::OutletStreamCancel {
+            request_id,
+            next_seq: 4,
+            sig: sig_other_outlet,
+        };
+        assert!(
+            matches!(
+                handle.apply_outlet_cancel(&cancel_tampered_outlet),
+                Err(super::super::stream::CancelError::SignatureInvalid)
+            ),
+            "tampered outlet_id must be rejected"
+        );
+
+        // Tamper caveats_binding: sign for [0xEE; 32], runtime rebuilds
+        // under the pinned `identity.caveats_binding`.
+        let other_cb: [u8; 32] = [0xEE; 32];
+        let sig_other_cb = make_sig(
+            &identity.context_id,
+            &identity.outlet_id,
+            &request_id,
+            5,
+            &other_cb,
+        );
+        let cancel_tampered_cb = scp_protocol::context::outlets::stream::OutletStreamCancel {
+            request_id,
+            next_seq: 5,
+            sig: sig_other_cb,
+        };
+        assert!(
+            matches!(
+                handle.apply_outlet_cancel(&cancel_tampered_cb),
+                Err(super::super::stream::CancelError::SignatureInvalid)
+            ),
+            "tampered caveats_binding must be rejected"
+        );
+
+        // Finally, an honest cancel signed correctly is accepted.
+        let good_sig = make_sig(
+            &identity.context_id,
+            &identity.outlet_id,
+            &request_id,
+            6,
+            &identity.caveats_binding,
+        );
+        let good = scp_protocol::context::outlets::stream::OutletStreamCancel {
+            request_id,
+            next_seq: 6,
+            sig: good_sig,
+        };
+        assert!(
+            matches!(handle.apply_outlet_cancel(&good), Ok(Some(6))),
+            "honest cancel accepted at next_seq=6"
+        );
     }
 }
 
