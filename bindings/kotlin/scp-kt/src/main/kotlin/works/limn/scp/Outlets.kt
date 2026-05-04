@@ -399,12 +399,45 @@ class InvocationHandle internal constructor(
 ) {
     private val terminatedFlag = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    /**
+     * Tracks the consumption mode chosen by the caller — one of
+     * `"aggregate"` (the `aggregate()` await path) or `"stream"` (the
+     * `asFlow()` iterator path). Per Python / TypeScript parity the two
+     * styles are mutually exclusive: a handle backed by a single
+     * underlying source cannot be drained twice. Calling the second
+     * style raises [OutletProtocolError] with slug
+     * `protocol.handle-double-consumed` and code `SCP-TOOL-6020`.
+     *
+     * `null` until the first `aggregate()` / `asFlow()` call wins the
+     * compareAndSet race.
+     */
+    private val consumedMode = java.util.concurrent.atomic.AtomicReference<String?>(null)
+
+    /** OUT-038 dual-consumption guard. Mirrors Python `_consumed` and
+     *  TypeScript `consumed`. If the caller has already started consuming
+     *  the handle in another mode, raise [OutletProtocolError]. */
+    private fun guard(mode: String) {
+        if (!consumedMode.compareAndSet(null, mode)) {
+            val current = consumedMode.get()
+            if (current != mode) {
+                throw OutletProtocolError(
+                    message = "InvocationHandle already consumed as $current; cannot switch to $mode",
+                    code = "SCP-TOOL-6020",
+                    slug = "protocol.handle-double-consumed",
+                )
+            }
+        }
+    }
+
     /** `true` once a terminal chunk has been observed (AC13). */
     val isTerminated: Boolean
         get() = terminatedFlag.get()
 
-    /** Suspends until the terminal `End` chunk and returns the aggregate. */
+    /** Suspends until the terminal `End` chunk and returns the aggregate.
+     *  Throws [OutletProtocolError] (slug `protocol.handle-double-consumed`)
+     *  when the handle has already been iterated via [asFlow]. */
     suspend fun aggregate(): Aggregate {
+        guard("aggregate")
         val agg = aggregateFn()
         terminatedFlag.set(true)
         validateAggregate(agg)
@@ -415,8 +448,16 @@ class InvocationHandle internal constructor(
      *  OUT-038 AC14 the flow yields the terminal End chunk; the flow
      *  is augmented with a side effect that flips the lifecycle flag
      *  on terminal observation so subsequent control-plane calls
-     *  fail-fast with [StreamAlreadyClosed]. */
+     *  fail-fast with [StreamAlreadyClosed].
+     *
+     *  Throws [OutletProtocolError] (slug
+     *  `protocol.handle-double-consumed`) when the handle has already
+     *  been awaited via [aggregate]. The guard fires when the flow's
+     *  cold builder is *collected* — not when [asFlow] itself returns —
+     *  so callers may obtain the cold `Flow<...>` reference and only
+     *  trip the guard at `.collect { }` time. */
     fun asFlow(): Flow<OutletStreamChunk> = flow {
+        guard("stream")
         flowFn().collect { chunk ->
             if (chunk is OutletStreamChunk.End ||
                 (chunk is OutletStreamChunk.Error && chunk.terminal)
@@ -578,12 +619,65 @@ interface OutletNamespace {
     suspend fun registerAction(definitionJson: String): String =
         register(OutletKind.ACTION, definitionJson)
 
+    /**
+     * Invoke an outlet — the SOLE public verb (SCP-OUT-038 AC1).
+     *
+     * Returns an [InvocationHandle] that exposes both
+     * `handle.aggregate()` and `handle.asFlow()`, plus the SCP-OUT-038
+     * control-plane methods `handle.grantCredit(...)` and
+     * `handle.cancel()`.
+     *
+     * When [caveatsBindingHex] AND [streamEpoch] are both supplied,
+     * the handle routes to the §5.4.5 streaming bridge
+     * (`outletInvokeStream`); the resulting handle carries a real
+     * `request_id` and `grantCredit` / `cancel` route to the runtime.
+     * When either is absent, the handle uses the non-streaming bridge
+     * (degenerate single-chunk per §5.4.5) and the lifecycle ends
+     * synchronously — control-plane methods then raise
+     * [StreamAlreadyClosed] per AC13.
+     *
+     * Parity with PyO3 / NAPI / Swift: the streaming-mode parameters
+     * are MUTUALLY DEPENDENT — supplying one without the other is a
+     * runtime [ScpException.Validation] at the bridge boundary.
+     *
+     * @param outletId Outlet to invoke.
+     * @param inputJson JSON-encoded input matching the outlet's input
+     *   schema.
+     * @param ucanToken UCAN authorising the invocation. REQUIRED when
+     *   [caveatsBindingHex] is supplied (the bridge re-runs the
+     *   11-step ADR-016 pipeline at open).
+     * @param proofTokens Optional encoded parent UCANs for delegation
+     *   chain traversal (ADR-016 step 3).
+     * @param spendingUcanJwt Optional spending-cap UCAN for paid
+     *   outlets. Streaming-mode ignores this (the streaming bridge
+     *   wires economy via the credit grant path).
+     * @param caveatsBindingHex 32-byte SHA-256 binding rendered as
+     *   64-char lowercase hex. When supplied with [streamEpoch], opens
+     *   a real streaming session.
+     * @param streamEpoch Hosting context's MLS epoch counter at open
+     *   acceptance. REQUIRED when [caveatsBindingHex] is supplied.
+     * @param creditWindow Optional initial credit-window override;
+     *   defaults to §5.4.5 `DEFAULT_CREDIT_WINDOW` when `null`.
+     *   Streaming-mode only.
+     * @param estimatedChunkCount Optional invoker-declared upper bound
+     *   on billable Data chunks. Streaming-mode only.
+     * @param aggregateSchemaJson Optional JSON Schema for the End
+     *   chunk's `aggregate` value (§5.4.5). When supplied, the handle
+     *   validates the End chunk's aggregate against this schema before
+     *   resolving (AC12).
+     */
+    @Suppress("LongParameterList")
     fun invoke(
         outletId: String,
         inputJson: String,
         ucanToken: String? = null,
         proofTokens: List<String>? = null,
         spendingUcanJwt: String? = null,
+        caveatsBindingHex: String? = null,
+        streamEpoch: ULong? = null,
+        creditWindow: UInt? = null,
+        estimatedChunkCount: UInt? = null,
+        aggregateSchemaJson: String? = null,
     ): InvocationHandle
     suspend fun update(
         outletId: String,
@@ -681,13 +775,32 @@ internal class InMemoryOutletNamespace(
         return id
     }
 
+    @Suppress("LongParameterList")
     override fun invoke(
         outletId: String,
         inputJson: String,
         ucanToken: String?,
         proofTokens: List<String>?,
         spendingUcanJwt: String?,
+        caveatsBindingHex: String?,
+        streamEpoch: ULong?,
+        creditWindow: UInt?,
+        estimatedChunkCount: UInt?,
+        aggregateSchemaJson: String?,
     ): InvocationHandle {
+        // OUT-038 AC1 — streaming-mode params must be MUTUALLY supplied.
+        if ((caveatsBindingHex == null) != (streamEpoch == null)) {
+            throw OutletError.Validation(
+                "streaming-mode invoke requires BOTH caveatsBindingHex (64 hex chars) " +
+                    "and streamEpoch; pass them together or omit both for the degenerate " +
+                    "single-shot path",
+            )
+        }
+        // The in-memory namespace does not run the §5.4.5 streaming
+        // bridge; it always returns a synthesized End chunk so tests
+        // can drive aggregate / flow without a Rust backend. The real
+        // production OutletNamespace impl (in `bridge/`) consumes the
+        // streaming params and routes through `ffiOutletInvokeStream`.
         val registered = registry.containsKey(outletId)
         return InvocationHandle(
             aggregateFn = {
@@ -709,6 +822,7 @@ internal class InMemoryOutletNamespace(
                     )
                 }
             },
+            aggregateSchemaJson = aggregateSchemaJson,
         )
     }
 

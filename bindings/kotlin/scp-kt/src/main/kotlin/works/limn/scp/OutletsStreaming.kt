@@ -193,7 +193,21 @@ data class OutletStreamChunkData(
  * underlying handle is owned by the Rust bridge and freed on JVM
  * garbage-collection of this wrapper (UniFFI emits a `Disposable`
  * lifecycle; the Kotlin SDK relies on default GC semantics).
+ *
+ * **DEPRECATED for direct use** — Per SCP-OUT-038 AC1 the SOLE public
+ * verb is `ctx.outlets.invoke(...)`. Pass the streaming-mode
+ * parameters (`caveatsBindingHex`, `streamEpoch`, `creditWindow`,
+ * `estimatedChunkCount`, `aggregateSchemaJson`) to that method to
+ * obtain an [InvocationHandle] which exposes the same control-plane
+ * surface (`grantCredit` / `cancel`). This class is retained for
+ * advanced callers that need direct access to the UniFFI-shaped chunk
+ * record (`OutletStreamChunkData`) but should not be used for new
+ * call sites.
  */
+@Deprecated(
+    message = "Use ctx.outlets.invoke(streaming params) per SCP-OUT-038 AC1; " +
+        "control-plane via the returned InvocationHandle.",
+)
 class OutletStreamFlow internal constructor(
     private val handle: OutletStreamHandle,
 ) {
@@ -236,13 +250,16 @@ class OutletStreamFlow internal constructor(
     /**
      * Signs and applies an `OutletStreamCredit` grant for this stream.
      *
-     * @throws ScpException.Validation when [grant] == 0u (round-6
-     *   uniform `InvalidGrant` rule).
+     * Takes a typed [Credit] to keep parity with [InvocationHandle.grantCredit]
+     * and the §5.4.4 round-6 zero-rejection rule. The compiler rejects
+     * passing a raw [UInt]; [Credit]'s constructor itself raises
+     * [InvalidGrant] for `raw == 0u`.
+     *
      * @throws ScpException.Context when the runtime tracker rejects
      *   the grant or the stream has already terminated.
      */
-    suspend fun grantCredit(grant: UInt): UInt =
-        ffiOutletStreamGrantCredit(requestIdHex = requestIdHex, grant = grant)
+    suspend fun grantCredit(grant: Credit): UInt =
+        ffiOutletStreamGrantCredit(requestIdHex = requestIdHex, grant = grant.raw)
 
     /**
      * Applies an `OutletCancel` to this stream.
@@ -288,7 +305,12 @@ class OutletStreamFlow internal constructor(
  *   Use [OutletStreamFlow.grantCredit] / [OutletStreamFlow.cancel] to
  *   manage flow.
  */
-@Suppress("LongParameterList")
+@Suppress("LongParameterList", "DEPRECATION")
+@Deprecated(
+    message = "Use ctx.outlets.invoke(streaming params) per SCP-OUT-038 AC1; " +
+        "the returned InvocationHandle exposes grantCredit / cancel as " +
+        "control-plane methods.",
+)
 suspend fun openOutletStreamSession(
     contextHandle: ContextHandle,
     outletId: String,
@@ -419,12 +441,16 @@ object OutletStreaming {
      * Signs and applies an `OutletStreamCredit` grant against an active
      * stream identified by [requestIdHex].
      *
-     * @throws ScpException.Validation when [grant] == 0u.
+     * Takes a typed [Credit] to keep parity with the per-handle form
+     * and the §5.4.4 round-6 zero-rejection rule. The compiler rejects
+     * passing a raw [UInt]; [Credit]'s constructor itself raises
+     * [InvalidGrant] for `raw == 0u`.
+     *
      * @throws ScpException.Context when the runtime rejects the grant.
      */
     @JvmStatic
-    suspend fun grantCredit(requestIdHex: String, grant: UInt): UInt =
-        ffiOutletStreamGrantCredit(requestIdHex = requestIdHex, grant = grant)
+    suspend fun grantCredit(requestIdHex: String, grant: Credit): UInt =
+        ffiOutletStreamGrantCredit(requestIdHex = requestIdHex, grant = grant.raw)
 
     /**
      * Applies an `OutletCancel` to an active stream by [requestIdHex].

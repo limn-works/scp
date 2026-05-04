@@ -81,14 +81,20 @@ struct CreditConstructionTests {
     }
 }
 
-// MARK: - AC13: OutletError.streamAlreadyClosed depth
+// MARK: - AC13 / OUT-038 Fix #4: streamAlreadyClosed nests under .protocol
 
 struct StreamAlreadyClosedDepthTests {
-    @Test("streamAlreadyClosed wraps a Protocol-class envelope")
+    // Fix #4 — the lifecycle error is now carried by `.protocol(envelope)`
+    // (NOT a top-level `.streamAlreadyClosed` case). This puts it at the
+    // SAME inheritance depth as the other protocol-class siblings
+    // (`StreamAlreadyOpen`, `UnknownSession`, catalog-rotation entries),
+    // matching the Python / TS / Kotlin nesting under `OutletProtocolError`.
+
+    @Test("streamAlreadyClosed factory returns .protocol(envelope) — AC13 / Fix #4")
     func wrapsProtocolEnvelope() {
-        let err = OutletError.makeStreamAlreadyClosed()
-        guard case let .streamAlreadyClosed(env) = err else {
-            #expect(Bool(false), "expected .streamAlreadyClosed case")
+        let err = OutletError.streamAlreadyClosed()
+        guard case let .protocol(env) = err else {
+            #expect(Bool(false), "expected .protocol case (lifecycle error nests under .protocol per Fix #4)")
             return
         }
         #expect(env.classWire == .protocol)
@@ -98,12 +104,35 @@ struct StreamAlreadyClosedDepthTests {
 
     @Test("custom message overrides default")
     func customMessage() {
-        let err = OutletError.makeStreamAlreadyClosed(message: "custom-reason")
-        guard case let .streamAlreadyClosed(env) = err else {
-            #expect(Bool(false), "expected .streamAlreadyClosed case")
+        let err = OutletError.streamAlreadyClosed(message: "custom-reason")
+        guard case let .protocol(env) = err else {
+            #expect(Bool(false), "expected .protocol case")
             return
         }
         #expect(env.message == "custom-reason")
+    }
+
+    @Test("if case .protocol = err matches streamAlreadyClosed (Fix #4 invariant)")
+    func protocolPatternMatchesLifecycle() {
+        let err = OutletError.streamAlreadyClosed()
+        // The Fix #4 acceptance invariant: a generic `.protocol`
+        // pattern-match MUST capture the lifecycle error. The prior
+        // shape carried it on a sibling case so this check failed.
+        if case .protocol = err {
+            // expected
+        } else {
+            #expect(Bool(false), "if case .protocol = err must match streamAlreadyClosed (Fix #4)")
+        }
+    }
+
+    @Test("makeStreamAlreadyClosed back-compat alias still returns .protocol(envelope)")
+    func backCompatAliasMatchesProtocol() {
+        let err = OutletError.makeStreamAlreadyClosed()
+        if case .protocol = err {
+            // expected — back-compat alias delegates to the new factory
+        } else {
+            #expect(Bool(false), "back-compat alias must also return .protocol(envelope)")
+        }
     }
 }
 
@@ -177,8 +206,9 @@ struct PostTerminalLifecycleTests {
         do {
             _ = try await handle.grantCredit(Credit(10))
             #expect(Bool(false), "expected throw")
-        } catch OutletError.streamAlreadyClosed {
-            // expected
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            // expected — Fix #4: lifecycle error nests under .protocol(envelope)
+            #expect(env.code == "SCP-TOOL-6102")
         } catch {
             #expect(Bool(false), "wrong error: \(error)")
         }
@@ -198,8 +228,9 @@ struct PostTerminalLifecycleTests {
         do {
             _ = try await handle.cancel(nextSeq: 0)
             #expect(Bool(false), "expected throw")
-        } catch OutletError.streamAlreadyClosed {
-            // expected
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            // expected — Fix #4: lifecycle error nests under .protocol(envelope)
+            #expect(env.code == "SCP-TOOL-6102")
         } catch {
             #expect(Bool(false), "wrong error: \(error)")
         }
@@ -226,8 +257,9 @@ struct PostTerminalLifecycleTests {
         do {
             _ = try await handle.grantCredit(Credit(10))
             #expect(Bool(false), "expected throw")
-        } catch OutletError.streamAlreadyClosed {
-            // expected
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            // expected — Fix #4: lifecycle error nests under .protocol(envelope)
+            #expect(env.code == "SCP-TOOL-6102")
         } catch {
             #expect(Bool(false), "wrong error: \(error)")
         }
@@ -247,8 +279,9 @@ struct NonStreamingControlPlaneTests {
         do {
             _ = try await handle.grantCredit(Credit(10))
             #expect(Bool(false), "expected throw")
-        } catch OutletError.streamAlreadyClosed {
-            // expected
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            // expected — Fix #4: lifecycle error nests under .protocol(envelope)
+            #expect(env.code == "SCP-TOOL-6102")
         } catch {
             #expect(Bool(false), "wrong error: \(error)")
         }
@@ -264,8 +297,9 @@ struct NonStreamingControlPlaneTests {
         do {
             _ = try await handle.cancel()
             #expect(Bool(false), "expected throw")
-        } catch OutletError.streamAlreadyClosed {
-            // expected
+        } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
+            // expected — Fix #4: lifecycle error nests under .protocol(envelope)
+            #expect(env.code == "SCP-TOOL-6102")
         } catch {
             #expect(Bool(false), "wrong error: \(error)")
         }
