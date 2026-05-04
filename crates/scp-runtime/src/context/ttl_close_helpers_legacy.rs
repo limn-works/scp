@@ -38,13 +38,15 @@
 //! # `spawn_ttl_timer_legacy` — out-of-domain callers
 //!
 //! `spawn_ttl_timer_legacy` is also reached by lifecycle restore /
-//! finalize-create / import paths (`lifecycle_helpers::restore_context`,
-//! `lifecycle_helpers::finalize_create`,
-//! `lifecycle_helpers::import_context`) and by the governance TTL
-//! extension proposal handler
-//! (`governance_helpers::handle_ttl_extension_proposal`). Those callers
-//! continue to spawn through the legacy path until Phase 2A.9 (lifecycle
-//! migration) revisits timer ownership end-to-end.
+//! finalize-create / import paths
+//! (`lifecycle_helpers_legacy::restore_context_legacy`,
+//! `lifecycle_helpers_legacy::finalize_create_legacy`,
+//! `lifecycle_helpers_legacy::import_context_legacy`) and by the
+//! governance TTL extension proposal handler
+//! (`governance_helpers::handle_ttl_extension_proposal`). Phase 2A.9
+//! migrated the lifecycle outer entry points to actor-shape; the bodies
+//! still spawn the TTL timer through this legacy path until per-actor
+//! TTL ownership lands in a follow-on Phase 2 chunk.
 
 use std::sync::Arc;
 
