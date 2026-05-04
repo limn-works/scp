@@ -869,6 +869,35 @@ impl DidDocument {
         self.also_known_as = vec![new_did.to_owned()];
     }
 
+    /// Retires the `#active` and `#agent` operational keys for a
+    /// migrated identity (spec §9.12, "compromise recovery").
+    ///
+    /// Removes both verification methods from `verification_method`
+    /// and from the `authentication` / `assertion_method` arrays.
+    /// `#0` (Identity Key) and any `#retired-*` / `#retired-agent-*`
+    /// entries from prior Layer-1 rotations are preserved — `#0`
+    /// continues to authorize `alsoKnownAs` republishes, and the
+    /// retired-key history remains auditable.
+    ///
+    /// Used by [`DidDht::migrate_identity`] when republishing the
+    /// OLD DID document with `alsoKnownAs` pointing at the new
+    /// identity. After migration the OLD document's purpose is
+    /// forwarding only; leaving `#active` / `#agent` listed as
+    /// current verification methods would let a verifier resolving
+    /// the OLD doc still treat those keys as authoritative even
+    /// though their private bytes have been destroyed in custody
+    /// (step 7b).
+    pub fn retire_operational_keys_for_migration(&mut self) {
+        // Remove `#active` and `#agent` verification methods.
+        // Retired entries (`#retired-*`, `#retired-agent-*`) remain.
+        self.verification_method
+            .retain(|vm| !vm.id.ends_with("#active") && !vm.id.ends_with("#agent"));
+        self.authentication
+            .retain(|reference| !reference.ends_with("#active") && !reference.ends_with("#agent"));
+        self.assertion_method
+            .retain(|reference| !reference.ends_with("#active") && !reference.ends_with("#agent"));
+    }
+
     // --- Agent key management (ADR-039) ---
 
     /// Returns `true` if this document contains an `#agent` verification method.

@@ -173,6 +173,20 @@ const MAX_FUTURE_SKEW_SECS: u64 = 300;
 /// past `rotated_at` is a strong signal of a forged proof. Set to 5 years.
 const MAX_PAST_WINDOW_SECS: u64 = 5 * 365 * 24 * 3600;
 
+/// Hard epoch floor (Unix seconds) for `migration_proof.rotated_at`. Even when
+/// the verifier's clock is broken — `now < MAX_PAST_WINDOW_SECS` clamps the
+/// `now.saturating_sub(...)` past-window bound to zero, accepting any
+/// `rotated_at >= 0` — `rotated_at` strictly older than this floor is rejected.
+///
+/// Value: `1_700_000_000` Unix seconds — `2023-11-14T22:13:20Z UTC`. Chosen as
+/// a fixed point well before any conceivable real SCP migration could have
+/// taken place: the protocol's earliest source artifacts and ADRs post-date
+/// this anchor, so no honest holder will ever produce a `rotated_at` below it.
+/// Choosing a relative bound (e.g., "always reject the year 1970") would let a
+/// faulty-clock verifier still accept absurd timestamps; this absolute anchor
+/// makes the past-window bound robust to clock corruption.
+const MIGRATION_EPOCH_FLOOR_UNIX_SECS: u64 = 1_700_000_000;
+
 /// Type alias for the signing function stored in `DidDht`.
 ///
 /// Takes a key handle ID and data to sign, returns the 64-byte Ed25519
@@ -866,8 +880,10 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // (ADR-046 byte parity). Order matters: identity → active →
         // pre-rotation, MATCHING the seed-byte windows
         // [0..32]/[32..64]/[64..96] that cross-bridge tests pin. The
-        // agent key follows after, since pre-the-add-agent-key seed
-        // sequence already has agent at byte window [96..128].
+        // agent key follows after pre-rotation; no cross-bridge
+        // byte-parity contract is currently asserted for the agent
+        // slot ([96..128]), so adding a fifth seed-window consumer
+        // before the agent slot would not break any existing test.
         let pre_rotation_seed = key_custody
             .generate_ephemeral_ed25519_seed()
             .await
@@ -1216,16 +1232,19 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         IdentityError,
     > {
         // Step 0: Pre-flight `import_ed25519_signing_key` capability on
-        // the operational custody. Step 6 below consumes the old
-        // pre-rotation private bytes and imports them as the new `#0`.
-        // If `import_ed25519_signing_key` is unsupported on this
-        // backend (e.g., HSM-bound `CallbackKeyCustody` today), we
-        // would fail AFTER publishing the old DID document with
-        // `alsoKnownAs[new_did]` — leaving the OLD doc on the DHT
-        // pointing at a successor DID that has no holder, and the
-        // OLD pre-rotation key destroyed (consumed by step 6). The
-        // probe here converts that corruption failure into a clean
-        // fail-fast before any externally-visible mutation.
+        // the operational custody. Step 6 below imports the OLD
+        // pre-rotation private bytes (returned by step 5's
+        // `destroy_after_migration`) into operational custody as the
+        // new `#0`. If `import_ed25519_signing_key` is unsupported on
+        // this backend (e.g., HSM-bound `CallbackKeyCustody` today),
+        // step 6 would fail BEFORE any DHT publish (steps 7 and 8) —
+        // but only AFTER step 5 has already consumed the OLD
+        // pre-rotation entry. Once consumed, the only key whose hash
+        // satisfies `SHA-256(revealed_key) == commitment` is gone, so
+        // the user cannot retry `migrate_identity`. The probe here
+        // converts that pre-publish-yet-already-corrupting failure
+        // into a clean fail-fast BEFORE any registry or cold-custody
+        // mutation, leaving the source identity wholly intact.
         //
         // Probe seed is drawn from the OS CSPRNG, never a fixed pattern.
         // Content-addressed custody backends (e.g. `FileKeyCustody`'s
@@ -1275,6 +1294,22 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // step 7. Publishing the OLD doc with `alsoKnownAs` is deferred
         // to step 8 (chain-forward order) so a failure in steps 4-7
         // leaves the OLD identity wholly intact and recoverable.
+        //
+        // Note: steps 3-4 allocate fresh `new_active_key` and
+        // `new_pre_rotation_handle` BEFORE step 5's irreversible
+        // `destroy_after_migration` runs. If steps 5-8 fail after
+        // these allocations, the freshly-allocated handles remain in
+        // operational and pre-rotation custody as orphaned entries
+        // (storage leak with no security impact: the keys are fresh,
+        // never published, and never bound to any DID). Storage cost
+        // is bounded — a small, fixed-size set of unreferenced
+        // entries per failed migration attempt — and recovery in
+        // pathological cases is a user-driven custody wipe. A future
+        // enhancement (Drop-with-rollback wrapper, or moving the
+        // fallible publishes ahead of cold-custody allocations) would
+        // close this gap without changing any externally-visible
+        // semantic; deliberately deferred to keep this change
+        // doc-only.
         let new_pre_rotation_seed = key_custody
             .generate_ephemeral_ed25519_seed()
             .await
@@ -1367,12 +1402,36 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
 
         // Step 8: Update the OLD DID document with `alsoKnownAs` pointing
         // at the now-published new DID, and publish. A failure here
-        // leaves the new identity fully published and the old identity
-        // unchanged — a worse-but-recoverable degraded state (the user
-        // can republish the old `alsoKnownAs` update on retry without
-        // any cryptographic concern).
+        // leaves the new identity fully published and the OLD document
+        // unchanged on the DHT.
+        //
+        // Recovery is NOT a simple `migrate_identity` retry: by the
+        // time control reaches step 8, step 5 has consumed the OLD
+        // pre-rotation key (`destroy_after_migration`) and step 7b
+        // has destroyed the OLD `#active` (and `#agent` if present).
+        // A second call to `migrate_identity` would fail at step 1
+        // (`reveal_public_key` against a missing pre-rotation handle)
+        // and at step 2 (`build_migration_proof` cannot sign with a
+        // destroyed `#active`).
+        //
+        // Manual recovery requires calling `set_also_known_as` plus
+        // `publish_document` directly on this `DidDht` instance,
+        // signed with `old_identity.identity_key` (`#0`) which is
+        // intentionally retained in operational custody for exactly
+        // this case. A future SDK API surfacing
+        // partial-migration recovery is deliberately deferred to
+        // keep this fix scope-bounded.
         let mut updated_old_doc = old_document.clone();
         updated_old_doc.set_also_known_as(&new_did);
+        // Defense-in-depth (spec §9.12): the OLD document post-migration
+        // serves as a forwarding record only. Step 7b destroyed the
+        // OLD `#active` (and `#agent` if present) in operational
+        // custody; leaving those verification methods listed in the
+        // republished document would let a verifier still treat the
+        // destroyed keys as authoritative. `#0` is preserved (it
+        // signs this republish) and any `#retired-*` history from
+        // earlier Layer-1 rotations remains auditable.
+        updated_old_doc.retire_operational_keys_for_migration();
         self.publish_document(identity, &updated_old_doc).await?;
 
         // Step 9: Build and return the rotation event.
@@ -1734,6 +1793,52 @@ pub fn verify_did(did_string: &str, public_key: &[u8]) -> bool {
     DidDht::new().verify(did_string, public_key)
 }
 
+/// Validates that a migration's `rotated_at` timestamp is within the
+/// accepted sanity window relative to the verifier's clock and above
+/// the protocol epoch floor.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::MigrationVerificationFailed`] when:
+/// - `rotated_at > now + MAX_FUTURE_SKEW_SECS` (forged near-future).
+/// - `rotated_at < MIGRATION_EPOCH_FLOOR_UNIX_SECS` (pre-protocol;
+///   defends against the saturating-past-window edge case where
+///   `now < MAX_PAST_WINDOW_SECS` clamps the lower bound to zero).
+/// - `rotated_at < now - MAX_PAST_WINDOW_SECS` (forged ancient,
+///   relative to a well-clocked verifier).
+fn check_rotated_at_window(rotated_at: u64, now: u64) -> Result<(), IdentityError> {
+    if rotated_at > now.saturating_add(MAX_FUTURE_SKEW_SECS) {
+        return Err(IdentityError::MigrationVerificationFailed(format!(
+            "migration_proof.rotated_at ({rotated_at}) is more than {MAX_FUTURE_SKEW_SECS}s in the future of now ({now})"
+        )));
+    }
+    // Hard epoch floor: a `rotated_at` strictly older than the
+    // SCP protocol's earliest plausible date is rejected regardless
+    // of `now`. This closes the gap that the saturating
+    // `now - MAX_PAST_WINDOW_SECS` check leaves on a clock that
+    // reads before approximately 1975-01-01 UTC — without this
+    // floor, such a verifier would accept any `rotated_at >= 0`,
+    // including an attacker-forged `rotated_at = 0` (1970-01-01).
+    if rotated_at < MIGRATION_EPOCH_FLOOR_UNIX_SECS {
+        return Err(IdentityError::MigrationVerificationFailed(format!(
+            "migration_proof.rotated_at ({rotated_at}) is below the protocol epoch floor \
+             ({MIGRATION_EPOCH_FLOOR_UNIX_SECS}) — pre-protocol timestamp"
+        )));
+    }
+    // Sliding 5-year past window: reject migrations claimed to be
+    // older than `MAX_PAST_WINDOW_SECS` relative to the verifier's
+    // clock. When `now < MAX_PAST_WINDOW_SECS` the `saturating_sub`
+    // clamps to 0 and this bound is no-op — but the epoch floor
+    // above already rejected all plausible-attack `rotated_at`
+    // values for that case.
+    if rotated_at < now.saturating_sub(MAX_PAST_WINDOW_SECS) {
+        return Err(IdentityError::MigrationVerificationFailed(format!(
+            "migration_proof.rotated_at ({rotated_at}) is more than {MAX_PAST_WINDOW_SECS}s in the past of now ({now})"
+        )));
+    }
+    Ok(())
+}
+
 /// Verifies a DID identity migration (Layer 3).
 ///
 /// Checks the cryptographic proofs that an identity migration from `old_did`
@@ -1772,17 +1877,21 @@ pub fn verify_did(did_string: &str, public_key: &[u8]) -> bool {
 ///   `rotated_at`: callers should pass a real `Clock`-derived value so the
 ///   sanity-window check is testable. The verifier rejects `rotated_at`
 ///   values further than [`MAX_FUTURE_SKEW_SECS`] in the future of `now`
-///   (forged near-future proofs) or further than [`MAX_PAST_WINDOW_SECS`]
-///   in the past (forged ancient proofs). Without this bound a holder of a
-///   briefly-captured old `#0` key could mint a `migration_proof` with an
-///   absurd `rotated_at` (e.g. `0` or `u64::MAX`) and the verifier would
-///   still return `Ok(true)`.
+///   (forged near-future proofs), strictly below
+///   [`MIGRATION_EPOCH_FLOOR_UNIX_SECS`] (pre-protocol timestamps,
+///   robust to a faulty verifier clock), or further than
+///   [`MAX_PAST_WINDOW_SECS`] in the past relative to `now` (forged
+///   ancient proofs against a well-clocked verifier). Without these
+///   bounds a holder of a briefly-captured old `#0` key could mint a
+///   `migration_proof` with an absurd `rotated_at` (e.g. `0` or
+///   `u64::MAX`) and the verifier would still return `Ok(true)`.
 ///
 /// # Errors
 ///
 /// Returns [`IdentityError::MigrationVerificationFailed`] if:
-/// - `rotated_at` is more than [`MAX_FUTURE_SKEW_SECS`] ahead of `now`, or
-///   more than [`MAX_PAST_WINDOW_SECS`] behind `now`.
+/// - `rotated_at` is more than [`MAX_FUTURE_SKEW_SECS`] ahead of `now`,
+///   strictly below [`MIGRATION_EPOCH_FLOOR_UNIX_SECS`], or more than
+///   [`MAX_PAST_WINDOW_SECS`] behind `now`.
 /// - The old public key in the migration proof is invalid.
 /// - The migration proof signature does not verify.
 /// - The pre-rotation proof's `SHA-256(revealed_key) != commitment`.
@@ -1825,22 +1934,7 @@ pub fn verify_migration(
     // 5-minute future skew tolerance from spec §9.8.2(c) and a 5-year past
     // window keeps verification cheap and rejects implausible timestamps
     // before the signature check is even attempted.
-    if rotated_at > now.saturating_add(MAX_FUTURE_SKEW_SECS) {
-        return Err(IdentityError::MigrationVerificationFailed(format!(
-            "migration_proof.rotated_at ({rotated_at}) is more than {MAX_FUTURE_SKEW_SECS}s in the future of now ({now})"
-        )));
-    }
-    // Saturating and lenient near the Unix epoch: when `now` is below
-    // `MAX_PAST_WINDOW_SECS`, `now.saturating_sub(...)` clamps to 0 and
-    // every `rotated_at >= 0` passes. This means a verifier whose clock
-    // reads before approximately 1975-01-01 UTC will accept any non-future
-    // `rotated_at` — only reachable on a misconfigured/faulty clock, and
-    // strictly more permissive than the documented 5-year past window.
-    if rotated_at < now.saturating_sub(MAX_PAST_WINDOW_SECS) {
-        return Err(IdentityError::MigrationVerificationFailed(format!(
-            "migration_proof.rotated_at ({rotated_at}) is more than {MAX_PAST_WINDOW_SECS}s in the past of now ({now})"
-        )));
-    }
+    check_rotated_at_window(rotated_at, now)?;
 
     let verifying_key = VerifyingKey::from_bytes(&migration_proof.old_public_key).map_err(|e| {
         IdentityError::MigrationVerificationFailed(format!("invalid old public key: {e}"))
@@ -3022,6 +3116,101 @@ mod tests {
         assert_eq!(old_resolved.document.also_known_as, vec![new_identity.did]);
     }
 
+    /// Defense-in-depth (spec §9.12): the OLD DID document
+    /// republished by `migrate_identity` MUST drop its `#active`
+    /// (and any `#agent`) verification methods. The OLD `#active`
+    /// has been destroyed in operational custody (step 7b); leaving
+    /// it listed as a current verification method would let a
+    /// verifier resolving the OLD doc still treat the destroyed key
+    /// as authoritative.
+    #[tokio::test]
+    async fn migrate_identity_retires_active_in_old_document() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        // Sanity: the pre-migration document has `#active`.
+        assert!(
+            document
+                .verification_method
+                .iter()
+                .any(|vm| vm.id.ends_with("#active")),
+            "pre-migration document MUST contain #active"
+        );
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (_new_identity, _new_doc, _event, _new_pre_rotation_handle) = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .unwrap();
+
+        // Re-resolve the OLD DID and assert the republished doc has
+        // no `#active` (or `#agent`) verification method, and no
+        // `#active` reference in `authentication` / `assertionMethod`.
+        dht.cache().remove(&identity.did).await;
+        let old_resolved = dht.resolve_did(&identity.did).await.unwrap();
+        let old_doc = &old_resolved.document;
+
+        assert!(
+            !old_doc
+                .verification_method
+                .iter()
+                .any(|vm| vm.id.ends_with("#active")),
+            "OLD doc MUST NOT contain #active after migration; got verification_method = {:?}",
+            old_doc.verification_method,
+        );
+        assert!(
+            !old_doc
+                .verification_method
+                .iter()
+                .any(|vm| vm.id.ends_with("#agent")),
+            "OLD doc MUST NOT contain #agent after migration; got verification_method = {:?}",
+            old_doc.verification_method,
+        );
+        assert!(
+            !old_doc
+                .authentication
+                .iter()
+                .any(|r| r.ends_with("#active")),
+            "OLD doc authentication MUST NOT reference #active after migration; got {:?}",
+            old_doc.authentication,
+        );
+        assert!(
+            !old_doc
+                .assertion_method
+                .iter()
+                .any(|r| r.ends_with("#active")),
+            "OLD doc assertionMethod MUST NOT reference #active after migration; got {:?}",
+            old_doc.assertion_method,
+        );
+
+        // `#0` (Identity Key) MUST remain — it signs the
+        // `alsoKnownAs` republish and is the verifier's anchor.
+        assert!(
+            old_doc
+                .verification_method
+                .iter()
+                .any(|vm| vm.id.ends_with("#0")),
+            "OLD doc MUST retain #0 after migration; got verification_method = {:?}",
+            old_doc.verification_method,
+        );
+
+        // `alsoKnownAs` MUST still be present (this is what the
+        // OLD doc post-migration is for).
+        assert_eq!(old_doc.also_known_as.len(), 1);
+    }
+
     #[tokio::test]
     async fn migrate_identity_produces_valid_rotation_event() {
         let custody = Arc::new(InMemoryKeyCustody::new());
@@ -3724,6 +3913,154 @@ mod tests {
         }
     }
 
+    /// Hard epoch floor: a `rotated_at` strictly older than the
+    /// SCP protocol's earliest plausible date MUST be rejected, even
+    /// when the verifier's clock is so broken that the sliding
+    /// `now - MAX_PAST_WINDOW_SECS` window clamps to zero. Without
+    /// this floor, a faulty-clock verifier (`now < MAX_PAST_WINDOW_SECS`)
+    /// would accept any `rotated_at >= 0`, including
+    /// `rotated_at = 0` (1970-01-01).
+    #[tokio::test]
+    async fn verify_migration_rejects_rotated_at_below_epoch_floor_with_zero_now() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        // `rotated_at = 0` would pass the past-window check when
+        // `now = 0` (saturating_sub clamps to 0). The epoch floor
+        // must reject it regardless.
+        let rotated_at: u64 = 0;
+        let now: u64 = 0;
+
+        let (_new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .unwrap();
+
+        let result = verify_migration(
+            &event.old_did,
+            &document,
+            &event.new_did,
+            &event.migration_proof,
+            event.pre_rotation_proof.as_ref(),
+            event.rotated_at,
+            now,
+        );
+        let err = result.expect_err(
+            "rotated_at = 0 with now = 0 MUST be rejected by the epoch floor, \
+             not silently passed through the saturating past-window check",
+        );
+        match err {
+            IdentityError::MigrationVerificationFailed(msg) => {
+                assert!(
+                    msg.contains("epoch floor") || msg.contains("pre-protocol"),
+                    "expected epoch-floor error, got: {msg}"
+                );
+            }
+            other => panic!("expected MigrationVerificationFailed, got: {other:?}"),
+        }
+    }
+
+    /// Hard epoch floor boundary: `rotated_at` exactly one second
+    /// below the floor MUST be rejected; `rotated_at` exactly equal
+    /// to the floor MUST be accepted (when other bounds pass). Pins
+    /// the inclusive/exclusive contract on the floor.
+    #[tokio::test]
+    async fn verify_migration_epoch_floor_boundary_is_inclusive() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        // `rotated_at` exactly one second below the floor MUST fail.
+        let rotated_at_below = MIGRATION_EPOCH_FLOOR_UNIX_SECS - 1;
+        // Use `now = rotated_at_below` so the sliding past-window
+        // bound is satisfied; only the epoch floor should fire.
+        let now_for_below = rotated_at_below;
+
+        let (_, _, event_below, _) = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at_below,
+            )
+            .await
+            .unwrap();
+
+        let err = verify_migration(
+            &event_below.old_did,
+            &document,
+            &event_below.new_did,
+            &event_below.migration_proof,
+            event_below.pre_rotation_proof.as_ref(),
+            event_below.rotated_at,
+            now_for_below,
+        )
+        .expect_err("rotated_at < MIGRATION_EPOCH_FLOOR_UNIX_SECS MUST be rejected");
+        match err {
+            IdentityError::MigrationVerificationFailed(msg) => {
+                assert!(
+                    msg.contains("epoch floor") || msg.contains("pre-protocol"),
+                    "expected epoch-floor error, got: {msg}"
+                );
+            }
+            other => panic!("expected MigrationVerificationFailed, got: {other:?}"),
+        }
+
+        // `rotated_at` exactly equal to the floor MUST pass (with
+        // `now` set so other bounds also pass).
+        let rotated_at_floor = MIGRATION_EPOCH_FLOOR_UNIX_SECS;
+        let now_for_floor = rotated_at_floor;
+
+        // Need fresh identity for the second migration since the
+        // first consumed the pre-rotation key.
+        let (identity2, document2, pre_rotation_handle2, pre_rotation_custody2) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity2, &document2).await.unwrap();
+
+        let (_, _, event_floor, _) = dht
+            .migrate_identity(
+                &identity2,
+                &document2,
+                &pre_rotation_handle2,
+                &*pre_rotation_custody2,
+                &*custody,
+                rotated_at_floor,
+            )
+            .await
+            .unwrap();
+
+        let ok = verify_migration(
+            &event_floor.old_did,
+            &document2,
+            &event_floor.new_did,
+            &event_floor.migration_proof,
+            event_floor.pre_rotation_proof.as_ref(),
+            event_floor.rotated_at,
+            now_for_floor,
+        )
+        .expect("rotated_at exactly equal to MIGRATION_EPOCH_FLOOR_UNIX_SECS MUST pass");
+        assert!(
+            ok,
+            "verify_migration must return Ok(true) at the floor boundary"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // SCP-008 tests — Document-level rotation helpers
     // -----------------------------------------------------------------------
@@ -3753,6 +4090,92 @@ mod tests {
         // #0 should still exist.
         let identity = rotated_doc.verification_method_by_fragment("0");
         assert!(identity.is_some());
+    }
+
+    #[test]
+    fn retire_operational_keys_for_migration_drops_active_and_agent() {
+        let did = "did:dht:zTestRetireMigration";
+        let mut doc = DidDocument::new_with_agent_key(
+            did,
+            &[1u8; 32],
+            &[2u8; 32],
+            &[3u8; 32],
+            Some(&[4u8; 32]),
+        );
+
+        // Sanity: pre-retire doc has #0, #active, #agent (and the
+        // pre-rotation service, which is unaffected).
+        assert!(doc.verification_method_by_fragment("0").is_some());
+        assert!(doc.verification_method_by_fragment("active").is_some());
+        assert!(doc.verification_method_by_fragment("agent").is_some());
+
+        doc.retire_operational_keys_for_migration();
+
+        // #0 retained; #active and #agent dropped.
+        assert!(
+            doc.verification_method_by_fragment("0").is_some(),
+            "#0 MUST be retained — it signs the alsoKnownAs republish"
+        );
+        assert!(
+            doc.verification_method_by_fragment("active").is_none(),
+            "#active MUST be dropped"
+        );
+        assert!(
+            doc.verification_method_by_fragment("agent").is_none(),
+            "#agent MUST be dropped"
+        );
+
+        // Authentication / assertionMethod arrays must not reference
+        // the dropped fragments.
+        assert!(
+            !doc.authentication.iter().any(|r| r.ends_with("#active")),
+            "authentication MUST NOT reference #active; got {:?}",
+            doc.authentication,
+        );
+        assert!(
+            !doc.authentication.iter().any(|r| r.ends_with("#agent")),
+            "authentication MUST NOT reference #agent; got {:?}",
+            doc.authentication,
+        );
+        assert!(
+            !doc.assertion_method.iter().any(|r| r.ends_with("#active")),
+            "assertion_method MUST NOT reference #active; got {:?}",
+            doc.assertion_method,
+        );
+        assert!(
+            !doc.assertion_method.iter().any(|r| r.ends_with("#agent")),
+            "assertion_method MUST NOT reference #agent; got {:?}",
+            doc.assertion_method,
+        );
+    }
+
+    #[test]
+    fn retire_operational_keys_for_migration_preserves_retired_history() {
+        let did = "did:dht:zTestRetireHistory";
+        let mut doc = DidDocument::new(did, &[1u8; 32], &[2u8; 32], &[3u8; 32]);
+
+        // Layer-1 rotation: retire #active to #retired-1, install new #active.
+        doc.retire_active_key(&[4u8; 32], 1);
+        assert!(
+            doc.verification_method
+                .iter()
+                .any(|vm| vm.id.ends_with("#retired-1")),
+            "Layer-1 rotation must produce a #retired-1 entry"
+        );
+
+        // Now retire-for-migration: #active dropped, but #retired-1
+        // history must remain auditable.
+        doc.retire_operational_keys_for_migration();
+        assert!(
+            doc.verification_method_by_fragment("active").is_none(),
+            "#active MUST be dropped after migration retirement"
+        );
+        assert!(
+            doc.verification_method
+                .iter()
+                .any(|vm| vm.id.ends_with("#retired-1")),
+            "Layer-1 #retired-1 history MUST be preserved across migration retirement"
+        );
     }
 
     #[test]

@@ -82,8 +82,24 @@ pub struct PreRotationKeyHandle(u64);
 impl PreRotationKeyHandle {
     /// Creates a new pre-rotation key handle from a raw identifier.
     ///
-    /// Intended for [`PreRotationCustody`] implementations only — SDK code
-    /// receives handles via [`PreRotationCustody::store_committed_pre_rotation_key`].
+    /// Two narrow use sites are sanctioned; SDK code MUST NOT construct
+    /// handles directly:
+    ///
+    /// 1. [`PreRotationCustody`] implementations allocating a fresh
+    ///    handle inside their own backing store (e.g., the in-memory
+    ///    test custody, the file-backed custody, future HSM-bound
+    ///    backends).
+    /// 2. FFI bridge code constructing a placeholder handle (`new(0)`)
+    ///    for an `Identity` record that has no associated
+    ///    [`PreRotationCustody`] — e.g., the externally-loaded DID
+    ///    path in the `UniFFI` bridge, where `migrate_identity` is
+    ///    rejected before the field is ever consulted.
+    ///
+    /// Outside those sites, route handles through
+    /// [`PreRotationCustody::store_committed_pre_rotation_key`] and
+    /// pass them by value. Cross-instance handles are not
+    /// interchangeable — a `u64` minted by one custody impl is
+    /// meaningless to another.
     #[must_use]
     pub const fn new(id: u64) -> Self {
         Self(id)

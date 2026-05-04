@@ -885,11 +885,22 @@ impl KeyCustody for FileKeyCustody {
                 if *kt != StoredKeyType::Ed25519 {
                     continue;
                 }
-                if let Ok(existing_bytes) = self.decrypt_entry(&data, *idx) {
-                    let existing = SigningKey::from_bytes(&existing_bytes);
-                    if existing.verifying_key().to_bytes() == target_pub {
-                        return Ok(KeyHandle::new(*id));
-                    }
+                // Surface decrypt failure rather than silently skipping
+                // the entry. A failed decrypt at this point indicates
+                // file corruption (mismatched MAC, truncated ciphertext,
+                // or wrong passphrase-derived key) — not a "this entry
+                // doesn't match"; treating it as the latter would
+                // permit a corrupted file to silently re-grow with
+                // duplicate entries on every retry.
+                let existing_bytes = self.decrypt_entry(&data, *idx).map_err(|e| {
+                    PlatformError::CustodyError(format!(
+                        "import dedup scan: failed to decrypt entry {idx} \
+                         (handle {id}) — file may be corrupted: {e}"
+                    ))
+                })?;
+                let existing = SigningKey::from_bytes(&existing_bytes);
+                if existing.verifying_key().to_bytes() == target_pub {
+                    return Ok(KeyHandle::new(*id));
                 }
             }
             drop(data);

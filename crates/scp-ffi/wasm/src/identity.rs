@@ -1798,8 +1798,12 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
         // DID-deriving), `#active` (rotatable), pre-rotation (commitment
         // for next migration), and `#agent`. Generate all four
         // independently from `OsRng` in the order
-        // `DidDht::create_with_agent_key` uses, so cross-bridge seeded
-        // parity (ADR-046) holds when seeding paths are added later.
+        // `DidDht::create_with_agent_key` uses (identity → active →
+        // pre-rotation → agent). No cross-bridge seeded byte-parity
+        // test exists for the four-key path today; if seeded paths
+        // are added (e.g., a `testing_seed` parameter under the
+        // `testing` feature), this ordering should be the input to
+        // that test.
         let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
         let verifying_key = signing_key.verifying_key();
         let pub_bytes = verifying_key.to_bytes();
@@ -2205,45 +2209,66 @@ fn from_did_inner(did: String) -> Result<WasmIdentity, ScpWasmError> {
     // If the DID is already registered as `Local`, preserve its
     // agent-key state in the returned handle so JS callers see
     // the actual record's shape, not a fresh-Resolved placeholder.
-    let (has_agent_key, agent_public_key_multibase) = IDENTITY_REGISTRY.with(|reg| {
-        let mut map = reg.borrow_mut();
-        if !map.contains_key(&did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
-            return Err(ScpWasmError::Validation {
-                message: format!(
-                    "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
-                     — cannot register additional resolved DIDs"
-                ),
-                code: codes::VALID_7400.to_owned(),
-            });
-        }
-        let entry = map
-            .entry(did.clone())
-            .or_insert_with(|| IdentityRecord::Resolved {
-                public_key_bytes,
-                custody_type: "js_custody".to_owned(),
-            });
-        // Mirror the existing record's agent-key state so the
-        // returned `WasmIdentity` doesn't lie about it.
-        Ok(match entry {
-            IdentityRecord::Local {
-                agent_signing_key_bytes,
-                ..
-            } => agent_signing_key_bytes
-                .as_ref()
-                .map_or((false, None), |sk_bytes| {
-                    let signing_key = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
-                    let multibase = format!(
-                        "z{}",
-                        zbase32_encode(&signing_key.verifying_key().to_bytes())
-                    );
-                    (true, Some(multibase))
-                }),
-            IdentityRecord::Resolved { .. } => (false, None),
-        })
-    })?;
+    let (has_agent_key, agent_public_key_multibase, custody_type) =
+        IDENTITY_REGISTRY.with(|reg| {
+            // Cap-rejection is a read-only check; only escalate to
+            // `borrow_mut` when we know we'll insert. Defense-in-depth
+            // against a future re-entrant call (e.g., via a JS
+            // callback custody) inside `or_insert_with` that would
+            // otherwise hit `BorrowMutError`. WASM is single-threaded
+            // so no concurrent-access race exists today; this matches
+            // the contract to the actual access pattern.
+            {
+                let map = reg.borrow();
+                if !map.contains_key(&did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
+                    return Err(ScpWasmError::Validation {
+                        message: format!(
+                            "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
+                             — cannot register additional resolved DIDs"
+                        ),
+                        code: codes::VALID_7400.to_owned(),
+                    });
+                }
+            }
+            let mut map = reg.borrow_mut();
+            let entry = map
+                .entry(did.clone())
+                .or_insert_with(|| IdentityRecord::Resolved {
+                    public_key_bytes,
+                    custody_type: "js_custody".to_owned(),
+                });
+            // Mirror the existing record's agent-key state AND
+            // custody_type so the returned `WasmIdentity` doesn't lie
+            // about either. Hardcoding `js_custody` here would
+            // contradict a `Local` record stored under a different
+            // custody (e.g., `in_memory`).
+            Ok(match entry {
+                IdentityRecord::Local {
+                    agent_signing_key_bytes,
+                    custody_type,
+                    ..
+                } => {
+                    let (has_agent, agent_mb) =
+                        agent_signing_key_bytes
+                            .as_ref()
+                            .map_or((false, None), |sk_bytes| {
+                                let signing_key = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                                let multibase = format!(
+                                    "z{}",
+                                    zbase32_encode(&signing_key.verifying_key().to_bytes())
+                                );
+                                (true, Some(multibase))
+                            });
+                    (has_agent, agent_mb, custody_type.clone())
+                }
+                IdentityRecord::Resolved { custody_type, .. } => {
+                    (false, None, custody_type.clone())
+                }
+            })
+        })?;
     Ok(WasmIdentity {
         did,
-        custody_type: "js_custody".to_owned(),
+        custody_type,
         has_agent_key,
         agent_public_key_multibase,
         // The decoded bytes ARE the public key — surface them as
@@ -2375,8 +2400,13 @@ const DOMAIN_MIGRATION_V1: &[u8] = b"SCP-MIGRATION-V1:";
 /// document's `#pre-rotation` commitment so verifiers can check
 /// `SHA-256(revealed_key) == commitment` (STRONG assurance).
 ///
-/// If the source identity has an agent key, a new agent key is generated
-/// for the migrated identity (preserving the `has_agent_key` state).
+/// Migration drops the agent key (matching native semantics). The
+/// returned handle has `has_agent_key = false` and
+/// `agent_public_key_multibase = None` regardless of the source
+/// identity's agent-key state. Callers MUST call
+/// `identity_add_agent_key` on the returned handle to re-establish
+/// agent delegation; auto-minting was rejected because it would
+/// silently grant the new DID's agent key the same scope as the old.
 /// Link attestations are ported to the new DID, and a `MIGRATION_LINKS`
 /// entry is recorded so `identity_resolve` can surface `alsoKnownAs`.
 ///
@@ -2745,6 +2775,18 @@ fn migrate_inner(
     //     orphaned entries);
     // (b) a capacity failure here leaves the source identity intact
     //     and recoverable.
+    //
+    // Honest scope of this ordering: it is sufficient against the
+    // capacity-failure class. It does NOT defend against
+    // `HandleNotFound` between `pre_rotation_store` and
+    // `pre_rotation_destroy_after_migration`, because the consume
+    // step always reads from `PRE_ROTATION_REGISTRY` after the store
+    // step has succeeded. WASM is single-threaded, so under normal
+    // operation the source handle cannot disappear between the two
+    // steps; this guarantee can only be broken by external registry
+    // corruption (e.g., a future `pre_rotation_destroy` exposed to JS
+    // and called concurrently from a re-entrant callback). No such
+    // path exists today.
     let new_pre_rotation_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let new_pre_rotation_public_bytes = new_pre_rotation_key.verifying_key().to_bytes();
     let new_pre_rotation_signing_key_bytes =
@@ -5730,26 +5772,29 @@ mod tests {
     }
 
     /// Regression: `migrate_inner` MUST keep both registries
-    /// consistent if a step AFTER `pre_rotation_store` (here, the
-    /// `build_migration_signature` path's signature-build) fails. The
-    /// landed fix reorders so `pre_rotation_store` runs only after
-    /// every fallible local computation succeeds. This test injects
-    /// a failure mode the synchronous body can hit
-    /// (`build_migration_signature` rejecting an over-long DID) and
-    /// asserts that `PRE_ROTATION_REGISTRY` does NOT grow.
+    /// consistent for every error path that fires BEFORE the
+    /// `pre_rotation_store` call. The landed ordering places
+    /// `pre_rotation_store` after every fallible local computation
+    /// (signature build, JSON encoding) — so any of those failures
+    /// leaves `PRE_ROTATION_REGISTRY` unchanged.
     ///
-    /// The injection works because `build_migration_signature` performs
-    /// `u32::try_from(did.len())` and the WASM bridge enforces the
-    /// length check. We can't directly drive `migrate_inner` to that
-    /// failure off-wasm without forging a >4GiB DID, but the
-    /// equivalent structural invariant holds: with the new ordering,
-    /// `PRE_ROTATION_REGISTRY` is unchanged on any error path that
-    /// fires before the `pre_rotation_store` call. We therefore
-    /// assert the structural invariant directly: the new
-    /// `pre_rotation_store` call site sits AFTER the proof/JSON
-    /// builds in the source.
+    /// Honest scope: this test exercises the
+    /// `lookup_migration_source` path (unknown-DID → `IDENT_1002`),
+    /// which is a concrete representative of the broader "fails
+    /// before `pre_rotation_store`" class. It does NOT exercise
+    /// failure modes between `pre_rotation_store` and the final
+    /// `install_migrated_identity` insert — those are structurally
+    /// unreachable in the current `migrate_inner` body because every
+    /// step in that interval is infallible (the JSON build and the
+    /// signature already ran). A FUTURE refactor that introduces a
+    /// fallible step inside `install_migrated_identity` between
+    /// `pre_rotation_destroy_after_migration` and the final
+    /// `IDENTITY_REGISTRY` inserts would silently break the
+    /// invariant — and this test is NOT a guard against that. A
+    /// reviewer adding such a step MUST add a dedicated regression
+    /// at that call site.
     #[test]
-    fn migrate_inner_does_not_leak_new_pre_rotation_on_pre_store_failure() {
+    fn migrate_inner_failure_before_pre_rotation_store_does_not_leak() {
         cleanup_registries();
         let pre_call_size = pre_rotation_registry_len();
         assert_eq!(pre_call_size, 0);
