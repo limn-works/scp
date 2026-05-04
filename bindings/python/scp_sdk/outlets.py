@@ -1162,6 +1162,7 @@ class OutletNamespace:
         credit_window: int | None = None,
         estimated_chunk_count: int | None = None,
         aggregate_schema: dict[str, Any] | None = None,
+        ucan_recheck_secs: int = 10,
     ) -> InvocationHandle:
         """Invoke an outlet in the context — the ONE public verb (OUT-038 AC1).
 
@@ -1229,6 +1230,7 @@ class OutletNamespace:
                 credit_window=credit_window,
                 estimated_chunk_count=estimated_chunk_count,
                 aggregate_schema=aggregate_schema,
+                ucan_recheck_secs=ucan_recheck_secs,
             )
         if caveats_binding is not None or stream_epoch is not None:
             raise ValidationError(
@@ -1330,6 +1332,7 @@ class OutletNamespace:
         credit_window: int | None,
         estimated_chunk_count: int | None,
         aggregate_schema: dict[str, Any] | None,
+        ucan_recheck_secs: int = 10,
     ) -> InvocationHandle:
         """Open a §5.4.5 streaming outlet invocation (OUT-038 internal).
 
@@ -1411,6 +1414,82 @@ class OutletNamespace:
             aggregate_schema=aggregate_schema,
         )
         handle._pump_task = loop.create_task(_pump())  # type: ignore[attr-defined]
+
+        # §5.4.5 receiver-side revocation re-check (RevokedMidStream /
+        # SCP-TOOL-6110). Per spec the SDK framework MUST periodically
+        # re-check the opening UCAN's revocation status during the
+        # stream's active lifetime, every `stream_ucan_recheck_secs`,
+        # and on observed revocation MUST terminate the stream.
+        # Re-validates the UCAN against the same context — a token
+        # revoked since open surfaces as `UcanError::TokenRevoked` from
+        # the bridge's 11-step pipeline. The recheck loop calls
+        # `outlet_stream_terminate` which routes through
+        # `StreamSessionHandle::terminate_with_error` on the runtime
+        # and emits a synthetic terminal Error chunk under the pinned
+        # operator key. Already-emitted chunks remain authorized; the
+        # stream closes at or before `ucan_recheck_secs` after the
+        # revocation event regardless of executor behavior.
+        async def _recheck_loop() -> None:
+            from scp_sdk.errors import UcanError as _UcanError
+
+            capability = f"tool_invoke:{outlet_id}"
+            bridge = _scp_core
+            if bridge is None or ucan_token is None:
+                # No bridge or no token — re-check is impossible. The
+                # streaming open path already requires `ucan_token` so
+                # this is defense-in-depth.
+                return
+            try:
+                while not handle.is_terminated:
+                    await asyncio.sleep(max(1, ucan_recheck_secs))
+                    if handle.is_terminated:
+                        break
+                    try:
+                        await asyncio.to_thread(
+                            bridge.ucan_validate,
+                            context_id,
+                            ucan_token,
+                            capability,
+                            invoker_did,
+                            proof_tokens,
+                        )
+                    except _UcanError as exc:
+                        # Revocation surfaces from the bridge as a
+                        # `UcanError`. Other UcanError modes (expired,
+                        # malformed) also indicate the token is no
+                        # longer valid for this stream — the spec ties
+                        # the receiver-side check to revocation
+                        # specifically, but any UCAN failure is a
+                        # superset signal. Terminate with the spec's
+                        # `RevokedMidStream` slug + code regardless of
+                        # the underlying UcanError variant.
+                        try:
+                            await asyncio.to_thread(
+                                bridge.outlet_stream_terminate,
+                                request_id_hex,
+                                "authorization.revoked-mid-stream",
+                                "SCP-TOOL-6110",
+                                str(exc),
+                            )
+                        except Exception:
+                            # Terminate is recoverable from the SDK's
+                            # perspective — `AlreadyTerminated` /
+                            # `AlreadyPending` indicate the stream
+                            # has already left the runtime control
+                            # plane. Stop the recheck loop either way.
+                            pass
+                        break
+                    except Exception:
+                        # Non-UCAN errors (network, runtime) are NOT
+                        # revocation signals — keep re-checking on the
+                        # next tick. The stream continues normally.
+                        pass
+            except asyncio.CancelledError:
+                # Task cancellation (e.g. parent loop shutdown) —
+                # propagate cleanly.
+                raise
+
+        handle._recheck_task = loop.create_task(_recheck_loop())  # type: ignore[attr-defined]
         return handle
 
     async def update(
