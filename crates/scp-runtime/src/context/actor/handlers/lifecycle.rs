@@ -234,7 +234,7 @@ async fn handle_create_context(
     local_pseudonym: Option<[u8; 32]>,
     reply: CreateContextReply,
 ) -> Outcome<()> {
-    let create_fut = crate::context::lifecycle_helpers::create_context(
+    let create_fut = crate::context::lifecycle_helpers_legacy::create_context_legacy(
         supervisor,
         context_id.clone(),
         params,
@@ -293,7 +293,7 @@ async fn handle_join_context(
         return Outcome::err(sketch);
     }
 
-    let join_fut = crate::context::lifecycle_helpers::join_context(
+    let join_fut = crate::context::lifecycle_helpers_legacy::join_context_legacy(
         supervisor,
         &handle,
         key_package,
@@ -341,7 +341,7 @@ async fn handle_leave_context(
         return Outcome::err(sketch);
     }
 
-    let leave_fut = crate::context::lifecycle_helpers::leave_context(
+    let leave_fut = crate::context::lifecycle_helpers_legacy::leave_context_legacy(
         supervisor,
         &handle,
         &caller_did,
@@ -390,8 +390,11 @@ async fn handle_close_context(
         return Outcome::err(sketch);
     }
 
-    let close_fut =
-        crate::context::lifecycle_helpers::close_context(supervisor, &handle, &initiator_did);
+    let close_fut = crate::context::lifecycle_helpers_legacy::close_context_legacy(
+        supervisor,
+        &handle,
+        &initiator_did,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, close_fut).await {
         Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
@@ -421,8 +424,11 @@ async fn handle_export_context(
     exporter_did: scp_identity::DID,
     reply: ExportContextReply,
 ) -> Outcome<()> {
-    let export_fut =
-        crate::context::lifecycle_helpers::export_context(supervisor, &context_id, exporter_did);
+    let export_fut = crate::context::lifecycle_helpers_legacy::export_context_legacy(
+        supervisor,
+        &context_id,
+        exporter_did,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, export_fut).await {
         Ok(Ok(export)) => (Outcome::ok(()), Ok(export)),
@@ -460,9 +466,9 @@ async fn handle_import_context(
     // hoisted `lifecycle_helpers::import_context` body's 12 KB+ locals
     // do not inflate `handle_import_context`'s own future past clippy's
     // 16 KB stack budget (ADR-049 commit 12).
-    let import_fut = Box::pin(crate::context::lifecycle_helpers::import_context(
-        supervisor, *export,
-    ));
+    let import_fut = Box::pin(
+        crate::context::lifecycle_helpers_legacy::import_context_legacy(supervisor, *export),
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, import_fut).await {
         Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),
@@ -512,7 +518,11 @@ async fn handle_restore_context(
     // &Supervisor (replacing the prior `manager.restore_context(...)`
     // delegation now that the bridge is gone).
     let restore_fut =
-        crate::context::lifecycle_helpers::restore_context(supervisor, &context_id, &handle);
+        crate::context::lifecycle_helpers_legacy::restore_context_legacy(
+            supervisor,
+            &context_id,
+            &handle,
+        );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, restore_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
