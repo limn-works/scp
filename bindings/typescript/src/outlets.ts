@@ -1038,6 +1038,13 @@ export class OutletNamespace {
        * aggregate against this schema before resolving the awaitable
        * (AC12). */
       aggregateSchema?: Readonly<Record<string, unknown>>;
+      /** Period (seconds) for the receiver-side framework to re-check
+       * the opening UCAN's revocation status during the lifetime of
+       * an active stream (§5.4.5 receiver-side revocation re-check).
+       * On observed revocation the stream closes with
+       * `RevokedMidStream` (SCP-TOOL-6110). Default 10, range
+       * `[1, 60]`. Streaming-mode only. */
+      ucanRecheckSecs?: number;
     },
   ): InvocationHandle {
     const invokerDid = options?.invokerDid ?? this.creatorDid;
@@ -1136,6 +1143,69 @@ export class OutletNamespace {
         requestIdPromise,
         ...(aggregateSchema !== undefined && { aggregateSchema }),
       });
+
+      // §5.4.5 receiver-side revocation re-check (RevokedMidStream /
+      // SCP-TOOL-6110). Per spec the SDK framework MUST periodically
+      // re-check the opening UCAN's revocation status during the
+      // stream's active lifetime, every `stream_ucan_recheck_secs`,
+      // and on observed revocation MUST terminate the stream.
+      //
+      // Re-validates the UCAN against the same context — a token
+      // revoked since open surfaces as a UcanError from the bridge's
+      // 11-step pipeline (Step 10 revocation check). The recheck loop
+      // calls `bridge.outletStreamTerminate` which routes through
+      // `StreamSessionHandle::terminate_with_error` on the runtime and
+      // emits a synthetic terminal Error chunk under the pinned operator
+      // key. Already-emitted chunks remain authorized; the stream
+      // closes at or before `ucanRecheckSecs` after the revocation
+      // event regardless of executor behavior.
+      const ucanRecheckSecs = options?.ucanRecheckSecs ?? 10;
+      const capability = `tool_invoke:${outletId}`;
+      void (async () => {
+        try {
+          const rid = await requestIdPromise;
+          if (rid === null) {
+            return;
+          }
+          const bridge = await getBridge();
+          while (!sdkHandle.isTerminated) {
+            await new Promise<void>((resolve) =>
+              setTimeout(resolve, Math.max(1, ucanRecheckSecs) * 1000),
+            );
+            if (sdkHandle.isTerminated) {
+              break;
+            }
+            try {
+              await bridge.ucanValidate(handle, ucanToken, capability);
+            } catch {
+              // Any UcanError signals the token is no longer
+              // valid — terminate with the spec's RevokedMidStream
+              // slug + code. Bridge surfaces revocation as
+              // UcanError; treat the broader UcanError class as
+              // sufficient signal so expired/malformed tokens that
+              // also indicate "no longer authorized" close the
+              // stream too.
+              try {
+                await bridge.outletStreamTerminate(
+                  rid,
+                  "authorization.revoked-mid-stream",
+                  "SCP-TOOL-6110",
+                  "ucan revoked or invalid mid-stream",
+                );
+              } catch {
+                // Terminate is recoverable from the SDK's
+                // perspective — AlreadyTerminated/AlreadyPending
+                // mean the stream has already left the runtime
+                // control plane. Stop the recheck loop either way.
+              }
+              break;
+            }
+          }
+        } catch {
+          // Open path failed; recheck has nothing to do.
+        }
+      })();
+
       return sdkHandle;
     }
 
