@@ -1226,7 +1226,19 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // OLD pre-rotation key destroyed (consumed by step 6). The
         // probe here converts that corruption failure into a clean
         // fail-fast before any externally-visible mutation.
-        let probe_seed = zeroize::Zeroizing::new([0u8; 32]);
+        //
+        // Probe seed is drawn from the OS CSPRNG, never a fixed pattern.
+        // Content-addressed custody backends (e.g. `FileKeyCustody`'s
+        // SHA-256-of-seed dedup) treat `import_ed25519_signing_key`
+        // calls with identical seed bytes as references to the same
+        // underlying entry. A fixed probe seed would alias any
+        // pre-existing entry whose private bytes happen to match —
+        // and the trailing `destroy_key` would then delete the user's
+        // real key. CSPRNG-sourced bytes have negligible birthday
+        // probability of colliding with any prior entry.
+        let mut probe_bytes = [0u8; 32];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut probe_bytes);
+        let probe_seed = zeroize::Zeroizing::new(probe_bytes);
         let probe_handle = key_custody
             .import_ed25519_signing_key(&probe_seed)
             .await
@@ -1334,6 +1346,24 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
         // new document — there is no window where the old doc claims
         // a successor that doesn't exist on the DHT yet.
         self.publish_document(&new_identity, &new_document).await?;
+
+        // Step 7b (spec §9.12, "compromise recovery"): destroy the OLD
+        // identity's `#active` and (when present) `#agent` operational
+        // keys. After migration the new identity is published and the
+        // old DID document (after step 8) explicitly delegates via
+        // `alsoKnownAs`; the old `#active` and `#agent` are revoked
+        // verification methods and must not remain decryptable from
+        // operational custody. Destroy is best-effort (`.ok()`) — the
+        // migration is otherwise already committed (new doc published),
+        // and a destroy failure here surfaces as orphaned key material
+        // rather than as a failed migration. The OLD `identity_key`
+        // (`#0`) is intentionally retained: step 8 below republishes
+        // the OLD document with the updated `alsoKnownAs`, and that
+        // publish is signed by `#0`.
+        let _ = key_custody.destroy_key(&identity.active_signing_key).await;
+        if let Some(agent_handle) = identity.agent_signing_key.as_ref() {
+            let _ = key_custody.destroy_key(agent_handle).await;
+        }
 
         // Step 8: Update the OLD DID document with `alsoKnownAs` pointing
         // at the now-published new DID, and publish. A failure here
@@ -1714,7 +1744,7 @@ pub fn verify_did(did_string: &str, public_key: &[u8]) -> bool {
 /// 1. **Migration proof (MODERATE assurance):** Verifies that the old Identity
 ///    Key signed `SHA-256("SCP-MIGRATION-V1:" || old_did || new_did || rotated_at)`.
 /// 2. **Pre-rotation proof (STRONG assurance, optional):** If present, verifies
-///    BOTH:
+///    ALL OF:
 ///    - `SHA-256(pre_rot.revealed_key) == pre_rot.commitment` — the
 ///      cryptographic invariant.
 ///    - `pre_rot.commitment` matches the `PreRotationCommitment` service
@@ -1800,6 +1830,12 @@ pub fn verify_migration(
             "migration_proof.rotated_at ({rotated_at}) is more than {MAX_FUTURE_SKEW_SECS}s in the future of now ({now})"
         )));
     }
+    // Saturating and lenient near the Unix epoch: when `now` is below
+    // `MAX_PAST_WINDOW_SECS`, `now.saturating_sub(...)` clamps to 0 and
+    // every `rotated_at >= 0` passes. This means a verifier whose clock
+    // reads before approximately 1975-01-01 UTC will accept any non-future
+    // `rotated_at` — only reachable on a misconfigured/faulty clock, and
+    // strictly more permissive than the documented 5-year past window.
     if rotated_at < now.saturating_sub(MAX_PAST_WINDOW_SECS) {
         return Err(IdentityError::MigrationVerificationFailed(format!(
             "migration_proof.rotated_at ({rotated_at}) is more than {MAX_PAST_WINDOW_SECS}s in the past of now ({now})"
@@ -4446,6 +4482,212 @@ mod tests {
         // The agent relationship must be re-established with add_agent_key.
         assert!(new_identity.agent_signing_key.is_none());
         assert!(!new_doc.has_agent_key());
+    }
+
+    /// Records every `publish` call's DID (derived from the public key)
+    /// in arrival order. Used by the step-7-before-step-8 ordering
+    /// regression test below to assert that `migrate_identity` publishes
+    /// the NEW DID document BEFORE updating the OLD document with
+    /// `alsoKnownAs`. A storage-layer record is the only honest signal —
+    /// in-memory mutation order in `migrate_identity` is not directly
+    /// observable from tests, so the only acceptable assertion is on
+    /// what hits the wire.
+    #[derive(Default)]
+    struct PublishOrderRecorder {
+        published: tokio::sync::Mutex<Vec<String>>,
+        inner: InMemoryDhtClient,
+    }
+
+    impl PublishOrderRecorder {
+        fn new() -> Self {
+            Self {
+                published: tokio::sync::Mutex::new(Vec::new()),
+                inner: InMemoryDhtClient::new(),
+            }
+        }
+
+        async fn snapshot(&self) -> Vec<String> {
+            self.published.lock().await.clone()
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl DhtClient for PublishOrderRecorder {
+        fn publish(
+            &self,
+            public_key: &[u8; 32],
+            signature: &[u8; 64],
+            value: &[u8],
+            seq: u64,
+        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+            let pk = *public_key;
+            let sig = *signature;
+            let val = value.to_vec();
+            async move {
+                // Reconstruct the DID string from the public key bytes
+                // exactly the way `migrate_identity` does — this is what
+                // a remote verifier would observe on the wire.
+                let did = format!("did:dht:z{}", zbase32::encode(&pk));
+                self.published.lock().await.push(did);
+                self.inner.publish(&pk, &sig, &val, seq).await
+            }
+        }
+
+        fn resolve(
+            &self,
+            public_key: &[u8; 32],
+        ) -> impl Future<Output = Result<Option<crate::dht_client::DhtRecord>, IdentityError>> + Send
+        {
+            let pk = *public_key;
+            async move { self.inner.resolve(&pk).await }
+        }
+    }
+
+    /// `migrate_identity` MUST publish the NEW DID document FIRST and
+    /// THEN update the OLD DID document with `alsoKnownAs`. The reverse
+    /// order would briefly leave verifiers following `alsoKnownAs[new_did]`
+    /// against an unpublished new document, breaking the chain-forward
+    /// invariant from `dht.rs::migrate_identity` step-7-vs-step-8 commentary.
+    /// This test records the `publish` arrival order at the wire layer
+    /// and asserts the sequence is exactly `[new_did, old_did]`.
+    #[tokio::test]
+    async fn migrate_identity_publishes_new_did_before_old_alsoknownas() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let recorder = Arc::new(PublishOrderRecorder::new());
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(clock));
+        let sign_fn =
+            DidDht::<PublishOrderRecorder, Arc<TestClock>>::make_sign_fn(Arc::clone(&custody));
+        let dht: DidDht<PublishOrderRecorder, Arc<TestClock>> =
+            DidDht::with_client_and_signer(Arc::clone(&recorder), cache, sign_fn);
+
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, pre_rotation_handle) =
+            dht.create(&*custody, &*pre_rotation_custody).await.unwrap();
+        // Publish the OLD document before migration so the recorder
+        // starts with a clean slate after migration alone.
+        dht.publish_document(&identity, &document).await.unwrap();
+        let pre_migration_publishes = recorder.snapshot().await.len();
+
+        let rotated_at = 1_700_000_000u64;
+        let (new_identity, _new_doc, _event, _new_handle) = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .unwrap();
+
+        let after = recorder.snapshot().await;
+        let migration_publishes = &after[pre_migration_publishes..];
+        assert_eq!(
+            migration_publishes.len(),
+            2,
+            "migrate_identity must publish exactly two documents (new DID, then OLD with alsoKnownAs); got {migration_publishes:?}"
+        );
+        assert_eq!(
+            migration_publishes[0], new_identity.did,
+            "step 7 (publish new DID document) MUST occur before step 8 (publish old doc with alsoKnownAs); recorded order: {migration_publishes:?}"
+        );
+        assert_eq!(
+            migration_publishes[1], identity.did,
+            "step 8 (publish old doc with alsoKnownAs) MUST occur after step 7; recorded order: {migration_publishes:?}"
+        );
+    }
+
+    /// `migrate_identity` MUST destroy the old `#active` operational key
+    /// after the migration commits. Spec §9.12 ("compromise recovery")
+    /// requires that revoked verification methods do not remain
+    /// decryptable from operational custody — leaving the old `#active`
+    /// usable would let a holder of the operational substrate continue
+    /// signing under the now-revoked key. The `#0` (`identity_key`) MUST
+    /// be retained because step 8 (publishing the old document with
+    /// `alsoKnownAs`) signs with it.
+    #[tokio::test]
+    async fn migrate_identity_destroys_old_active_key() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let old_active = identity.active_signing_key;
+        let old_identity_key = identity.identity_key;
+
+        let rotated_at = 1_700_000_000u64;
+        let _ = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .unwrap();
+
+        // Old #active MUST be destroyed — `public_key` MUST surface
+        // `KeyNotFound` (the documented post-`destroy_key` contract).
+        let after_active = custody.public_key(&old_active).await;
+        assert!(
+            matches!(after_active, Err(scp_platform::PlatformError::KeyNotFound)),
+            "old #active must be destroyed after migrate_identity; got {after_active:?}"
+        );
+        // Old `#0` MUST remain — step 8 used it to republish the old
+        // document. Destroying it would break the `alsoKnownAs`
+        // signing path (and any future republish for forwarding).
+        let after_identity = custody.public_key(&old_identity_key).await;
+        assert!(
+            after_identity.is_ok(),
+            "old #0 (identity_key) must be RETAINED after migrate_identity (needed to re-sign old document); got {after_identity:?}"
+        );
+    }
+
+    /// Migration of an identity that carries an `#agent` key MUST
+    /// destroy the old `#agent` handle alongside the old `#active`.
+    #[tokio::test]
+    async fn migrate_identity_destroys_old_agent_key_when_present() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, pre_rotation_handle) = dht
+            .create_with_agent_key(&*custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let old_agent = *identity
+            .agent_signing_key
+            .as_ref()
+            .expect("create_with_agent_key produces an agent handle");
+
+        let rotated_at = 1_700_000_000u64;
+        let _ = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .unwrap();
+
+        let after_agent = custody.public_key(&old_agent).await;
+        assert!(
+            matches!(after_agent, Err(scp_platform::PlatformError::KeyNotFound)),
+            "old #agent must be destroyed after migrate_identity; got {after_agent:?}"
+        );
     }
 
     // -----------------------------------------------------------------------

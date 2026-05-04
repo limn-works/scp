@@ -5265,6 +5265,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+ "z-base-32",
  "zeroize",
 ]
 
@@ -5277,6 +5278,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "hex",
  "mainline",
+ "rand 0.8.5",
  "reqwest",
  "scp-platform",
  "scp-primitives",

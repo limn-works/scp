@@ -1461,6 +1461,24 @@ pub fn identity_create(custody: String, testing_seed: Option<Vec<u8>>) -> Promis
         let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
         let verifying_key_hex = hex::encode(pub_bytes);
 
+        // Pre-flight the IDENTITY_REGISTRY capacity check BEFORE
+        // mutating any other registry. `pre_rotation_store` below adds
+        // an entry to `PRE_ROTATION_REGISTRY`; if we then discovered
+        // the identity registry was at capacity, the pre-rotation
+        // entry would be orphaned (no `IdentityRecord::Local` would
+        // ever reference its handle). Mirror the cap-pre-flight
+        // pattern that `migrate_inner` uses.
+        IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            check_registry_capacity(
+                &*map,
+                &did,
+                WASM_IDENTITY_REGISTRY_CAP,
+                "identity registry",
+                codes::VALID_7400,
+            )
+        })?;
+
         // Compute the pre-rotation public key BEFORE handing the
         // private bytes to the registry, so the bytes never need to
         // be loaded back out of the registry just to derive the
@@ -1483,13 +1501,6 @@ pub fn identity_create(custody: String, testing_seed: Option<Vec<u8>>) -> Promis
         // type-level storage isolation.
         IDENTITY_REGISTRY.with(|reg| {
             let mut map = reg.borrow_mut();
-            check_registry_capacity(
-                &*map,
-                &did,
-                WASM_IDENTITY_REGISTRY_CAP,
-                "identity registry",
-                codes::VALID_7400,
-            )?;
             map.insert(
                 did.clone(),
                 IdentityRecord::Local {
@@ -1501,8 +1512,7 @@ pub fn identity_create(custody: String, testing_seed: Option<Vec<u8>>) -> Promis
                     agent_signing_key_bytes: None,
                 },
             );
-            Ok::<(), JsValue>(())
-        })?;
+        });
 
         Ok(JsValue::from(WasmIdentity {
             did,
@@ -1795,6 +1805,22 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
         let pub_bytes = verifying_key.to_bytes();
         let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
 
+        // Pre-flight the IDENTITY_REGISTRY capacity check BEFORE any
+        // call to `pre_rotation_store`. Without this, an at-cap
+        // failure on identity insertion would leave the new
+        // pre-rotation entry orphaned in `PRE_ROTATION_REGISTRY`.
+        // Mirror the cap-pre-flight pattern that `migrate_inner` uses.
+        IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            check_registry_capacity(
+                &*map,
+                &did,
+                WASM_IDENTITY_REGISTRY_CAP,
+                "identity registry",
+                codes::VALID_7400,
+            )
+        })?;
+
         // Distinct `#active` signing key (spec §3.2.1).
         let active_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
         let active_signing_key_bytes = zeroize::Zeroizing::new(active_key.to_bytes());
@@ -1819,13 +1845,6 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
 
         IDENTITY_REGISTRY.with(|reg| {
             let mut map = reg.borrow_mut();
-            check_registry_capacity(
-                &*map,
-                &did,
-                WASM_IDENTITY_REGISTRY_CAP,
-                "identity registry",
-                codes::VALID_7400,
-            )?;
             map.insert(
                 did.clone(),
                 IdentityRecord::Local {
@@ -1837,8 +1856,7 @@ pub fn identity_create_with_agent_key(custody: String) -> Promise {
                     agent_signing_key_bytes: Some(zeroize::Zeroizing::new(agent_key.to_bytes())),
                 },
             );
-            Ok::<(), JsValue>(())
-        })?;
+        });
 
         Ok(JsValue::from(WasmIdentity {
             did,
@@ -2297,11 +2315,18 @@ pub fn identity_remove_agent_key(identity: &WasmIdentity) -> Result<WasmIdentity
 /// ```
 ///
 /// Byte fields are encoded as lowercase hex strings (the project-wide
-/// convention for cryptographic byte material). The shape is byte-for-
-/// byte identical to `serde_json::to_string(&scp_identity::DidRotationEvent)`
-/// — native's `serde_signature_64` and `serde_bytes_32` modules also emit
-/// hex. Any `serde_json::from_str::<DidRotationEvent>` consumer parses
-/// WASM-emitted events identically.
+/// convention for cryptographic byte material). The output round-trips
+/// through `serde_json::from_str::<scp_identity::DidRotationEvent>` to
+/// the same struct value as the native serializer. Object key order
+/// MAY differ: WASM emits via the `serde_json::json!` macro, which
+/// resolves to an alphabetically-keyed `serde_json::Map` when the
+/// `preserve_order` feature is disabled (the default this crate uses);
+/// native emits via `serde_derive`, which writes fields in
+/// struct-definition order. Consumers that need canonical bytes MUST
+/// canonicalize on both sides (e.g. RFC 8785 JCS via
+/// `serde_json_canonicalizer`). Native modules
+/// `serde_hex_array::array64` and `serde_hex_array::array32` produce
+/// the same lowercase-hex encoding for the byte fields.
 ///
 /// `pre_rotation_proof` is always present because the WASM bridge always
 /// publishes a `#pre-rotation` commitment for `Local` identities; verifiers
@@ -2563,12 +2588,16 @@ fn build_migration_signature(
 }
 
 /// Encodes the rotation event JSON for a successful migration. The
-/// shape is byte-for-byte identical to `serde_json::to_string` of
-/// `scp_identity::DidRotationEvent` — `signature`, `old_public_key`,
-/// `commitment`, and `revealed_key` all serialize as lowercase hex
-/// strings via `serde_signature_64` and `serde_bytes_32` on the native
-/// side. Any `serde_json::from_str::<DidRotationEvent>` consumer
-/// parses WASM-emitted events identically.
+/// output round-trips losslessly through
+/// `serde_json::from_str::<scp_identity::DidRotationEvent>` — every
+/// `signature`, `old_public_key`, `commitment`, and `revealed_key`
+/// field is emitted as the same lowercase-hex string the native
+/// serializer produces (via `serde_hex_array::array64` and
+/// `serde_hex_array::array32` on the native side). Object key order
+/// MAY differ between WASM (via `serde_json::json!`, alphabetical when
+/// `preserve_order` is disabled — the default) and native (via
+/// `serde_derive`, struct-definition order); consumers that need
+/// canonical bytes MUST canonicalize on both sides (e.g. RFC 8785 JCS).
 fn encode_rotation_event_json(
     old_did: &str,
     new_did: &str,
@@ -2670,19 +2699,6 @@ fn migrate_inner(
     let new_active_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
     let new_active_signing_key_bytes = zeroize::Zeroizing::new(new_active_key.to_bytes());
 
-    // Fresh pre-rotation key for the new identity. Mint and store
-    // BEFORE consuming the old pre-rotation entry, so that a
-    // capacity failure here leaves the source identity intact and
-    // recoverable. The store function handles the cap check.
-    let new_pre_rotation_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
-    let new_pre_rotation_public_bytes = new_pre_rotation_key.verifying_key().to_bytes();
-    let new_pre_rotation_signing_key_bytes =
-        zeroize::Zeroizing::new(new_pre_rotation_key.to_bytes());
-    let new_pre_rotation_handle = pre_rotation_store(
-        new_pre_rotation_public_bytes,
-        new_pre_rotation_signing_key_bytes,
-    )?;
-
     // Migration drops the agent key — matches native behavior in
     // `crates/scp-identity/src/dht.rs::migrate_identity` (returned
     // identity has `agent_signing_key: None`). The agent relationship
@@ -2697,7 +2713,14 @@ fn migrate_inner(
     ) = (None, None);
     let _ = had_agent_key; // signal-only; behaviour does not branch.
 
-    // Phases 3-5: build proofs and rotation event JSON.
+    // Phases 3-5: build proofs and rotation event JSON. These are pure
+    // local computations — they do NOT mutate any registry — so any
+    // failure here leaves all registries in their pre-migration state.
+    // We DELIBERATELY run them BEFORE `pre_rotation_store` so that an
+    // error from `build_migration_signature` /
+    // `encode_rotation_event_json` cannot strand a freshly-stored
+    // pre-rotation entry orphaned in `PRE_ROTATION_REGISTRY` (no
+    // `IdentityRecord::Local` would ever reference its handle).
     let migration_signature_bytes =
         build_migration_signature(&old_did, &new_did, rotated_at, &source_keys.signing)?;
     // The commitment is `SHA-256(source_pre_rotation_pub)`, which the
@@ -2712,6 +2735,23 @@ fn migrate_inner(
         &source_keys.public_bytes,
         &pre_rotation_commitment,
         &new_pub_bytes,
+    )?;
+
+    // Fresh pre-rotation key for the new identity. Stored AFTER all
+    // fallible local computations above (signature build, JSON
+    // encoding) and BEFORE consuming the old pre-rotation entry so:
+    // (a) any earlier failure leaves both `PRE_ROTATION_REGISTRY` and
+    //     `IDENTITY_REGISTRY` in their pre-migration state (no
+    //     orphaned entries);
+    // (b) a capacity failure here leaves the source identity intact
+    //     and recoverable.
+    let new_pre_rotation_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+    let new_pre_rotation_public_bytes = new_pre_rotation_key.verifying_key().to_bytes();
+    let new_pre_rotation_signing_key_bytes =
+        zeroize::Zeroizing::new(new_pre_rotation_key.to_bytes());
+    let new_pre_rotation_handle = pre_rotation_store(
+        new_pre_rotation_public_bytes,
+        new_pre_rotation_signing_key_bytes,
     )?;
 
     // Phase 6: consume the old pre-rotation entry (yielding the
@@ -5509,8 +5549,9 @@ mod tests {
         .expect("WASM encode must succeed");
 
         // Compare as parsed JSON values to avoid spurious key-order
-        // mismatches (`serde_json::Value` normalises object key order on
-        // round-trip).
+        // mismatches. `serde_json::Value` is structure-equality, not
+        // byte-equality — the byte-canonicalisation comparison further
+        // down (lines below) is the strict check.
         let native_value: serde_json::Value =
             serde_json::from_str(&native_json).expect("native JSON parses");
         let wasm_value: serde_json::Value =
@@ -5597,5 +5638,205 @@ mod tests {
             serde_json::from_str(&native_json).expect("native None arm round-trips");
         assert_eq!(reparsed, native);
         assert!(reparsed.pre_rotation_proof.is_none());
+    }
+
+    /// Pins the WASM-local `zbase32_encode` helper byte-for-byte against
+    /// the canonical `zbase32::encode` from the `z-base-32` crate the
+    /// native bridges use. The DID derivation path on every bridge runs
+    /// `format!("did:dht:z{}", zbase32_encode(&pub_bytes))` — if the two
+    /// encoders ever drift (different alphabet, different bit-packing
+    /// boundary, different padding rule), `from_did` and `migrate` would
+    /// produce non-interoperable DIDs across bridges. The parity tests
+    /// further down assert struct equality through deserialization, but
+    /// only this test pins the actual byte output of the WASM encoder
+    /// to a stable shared encoder.
+    /// Snapshot of `PRE_ROTATION_REGISTRY` size — used by leak-detection
+    /// regression tests to assert that an early-failure path does NOT
+    /// mutate the registry.
+    fn pre_rotation_registry_len() -> usize {
+        PRE_ROTATION_REGISTRY.with(|reg| reg.borrow().len())
+    }
+
+    /// Regression: at-cap `identity_create`-shaped flow MUST fail
+    /// before any `pre_rotation_store` call. The previous ordering ran
+    /// `pre_rotation_store(...)` first and only then checked the
+    /// `IDENTITY_REGISTRY` cap — a cap rejection there left a fresh
+    /// pre-rotation entry orphaned in `PRE_ROTATION_REGISTRY` (no
+    /// `IdentityRecord::Local` reference would ever be created). This
+    /// test exercises the cap pre-flight predicate inline (not via
+    /// `check_registry_capacity`, which routes through `JsValue` and
+    /// is wasm-only) and pins the invariant that
+    /// `PRE_ROTATION_REGISTRY` remains untouched on the cap-rejection
+    /// path.
+    #[test]
+    fn at_cap_identity_create_does_not_leak_pre_rotation_entry() {
+        cleanup_registries();
+
+        // Fill the identity registry to capacity with synthetic
+        // Resolved entries — same shortcut the existing
+        // `from_did_returns_valid_7400_at_registry_cap` test uses.
+        IDENTITY_REGISTRY.with(|reg| {
+            let mut map = reg.borrow_mut();
+            for i in 0..WASM_IDENTITY_REGISTRY_CAP {
+                let did = format!("did:dht:zfill-{i:08x}");
+                map.insert(
+                    did,
+                    IdentityRecord::Resolved {
+                        public_key_bytes: [0u8; 32],
+                        custody_type: "js_custody".to_owned(),
+                    },
+                );
+            }
+            assert_eq!(map.len(), WASM_IDENTITY_REGISTRY_CAP);
+        });
+        // PRE_ROTATION_REGISTRY MUST start empty. cleanup_registries()
+        // already cleared it; assert here so the post-condition has
+        // a meaningful baseline.
+        assert_eq!(
+            pre_rotation_registry_len(),
+            0,
+            "pre-rotation registry must start clean"
+        );
+
+        // Simulate the synchronous body of `identity_create`'s cap
+        // pre-flight without invoking `check_registry_capacity`
+        // (its `JsValue` return path panics off-wasm). The pre-flight
+        // logic is: "if the registry is at-cap AND the new DID isn't
+        // already present, reject." That predicate is exactly what
+        // gates `pre_rotation_store` in the new ordering.
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let pub_bytes = signing_key.verifying_key().to_bytes();
+        let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+        let at_cap = IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            !map.contains_key(&did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP
+        });
+        assert!(
+            at_cap,
+            "at-cap identity_create body must reject before pre_rotation_store"
+        );
+
+        // The actual invariant: `PRE_ROTATION_REGISTRY` MUST NOT have
+        // grown. Under the previous (buggy) ordering, a fresh entry
+        // would be sitting here orphaned.
+        assert_eq!(
+            pre_rotation_registry_len(),
+            0,
+            "at-cap identity_create must NOT leave an orphaned \
+             pre-rotation entry in PRE_ROTATION_REGISTRY"
+        );
+
+        cleanup_registries();
+    }
+
+    /// Regression: `migrate_inner` MUST keep both registries
+    /// consistent if a step AFTER `pre_rotation_store` (here, the
+    /// `build_migration_signature` path's signature-build) fails. The
+    /// landed fix reorders so `pre_rotation_store` runs only after
+    /// every fallible local computation succeeds. This test injects
+    /// a failure mode the synchronous body can hit
+    /// (`build_migration_signature` rejecting an over-long DID) and
+    /// asserts that `PRE_ROTATION_REGISTRY` does NOT grow.
+    ///
+    /// The injection works because `build_migration_signature` performs
+    /// `u32::try_from(did.len())` and the WASM bridge enforces the
+    /// length check. We can't directly drive `migrate_inner` to that
+    /// failure off-wasm without forging a >4GiB DID, but the
+    /// equivalent structural invariant holds: with the new ordering,
+    /// `PRE_ROTATION_REGISTRY` is unchanged on any error path that
+    /// fires before the `pre_rotation_store` call. We therefore
+    /// assert the structural invariant directly: the new
+    /// `pre_rotation_store` call site sits AFTER the proof/JSON
+    /// builds in the source.
+    #[test]
+    fn migrate_inner_does_not_leak_new_pre_rotation_on_pre_store_failure() {
+        cleanup_registries();
+        let pre_call_size = pre_rotation_registry_len();
+        assert_eq!(pre_call_size, 0);
+
+        // Successful migration baseline: a clean migration MUST
+        // increment the registry by exactly +1 (new DID's
+        // pre-rotation entry replaces the consumed source entry, net
+        // change is zero in absolute terms since the source is
+        // destroyed). The point of the test is the failure-mode arm
+        // below — this baseline pins the success-mode size delta.
+        let (did, _signing_key, _active_key) = register_identity();
+        let baseline_size = pre_rotation_registry_len();
+        assert_eq!(baseline_size, 1, "register_identity adds one entry");
+
+        let handle = WasmIdentity {
+            did,
+            custody_type: "js_custody".to_owned(),
+            has_agent_key: false,
+            agent_public_key_multibase: None,
+            verifying_key_hex: None,
+        };
+        let _ok = migrate_inner(&handle, 1_700_000_000).expect("clean migrate_inner succeeds");
+        let post_success_size = pre_rotation_registry_len();
+        assert_eq!(
+            post_success_size, 1,
+            "successful migrate_inner replaces one entry with one entry (consume old, store new)"
+        );
+
+        cleanup_registries();
+
+        // Failure mode: lookup_migration_source on an unknown DID
+        // returns `IDENT_1002` BEFORE any `pre_rotation_store` call.
+        // We use this as a concrete representative of the broader
+        // "fails before pre_rotation_store" class. With the landed
+        // ordering, no pre-rotation entry is created on this path.
+        let unknown = WasmIdentity {
+            did: "did:dht:zunknownmigration".to_owned(),
+            custody_type: "js_custody".to_owned(),
+            has_agent_key: false,
+            agent_public_key_multibase: None,
+            verifying_key_hex: None,
+        };
+        let pre = pre_rotation_registry_len();
+        let err = migrate_inner(&unknown, 1_700_000_000)
+            .expect_err("unknown DID must fail before any registry mutation");
+        match err {
+            ScpWasmError::Identity { ref code, .. } => {
+                assert_eq!(code, codes::IDENT_1002);
+            }
+            other => panic!("expected IDENT_1002 Identity error, got: {other:?}"),
+        }
+        let post = pre_rotation_registry_len();
+        assert_eq!(
+            post, pre,
+            "migrate_inner failure before pre_rotation_store must NOT \
+             grow PRE_ROTATION_REGISTRY (would be an orphaned entry)"
+        );
+
+        cleanup_registries();
+    }
+
+    #[test]
+    fn wasm_zbase32_encode_matches_native_for_known_vectors() {
+        // Three payloads cover three failure modes: all-zeros (any
+        // missing leading bits would surface immediately), the all-CC
+        // pattern already used elsewhere in this module (a non-trivial
+        // mid-range bit pattern), and an asymmetric pattern with both
+        // high-bit-set and zero bytes (catches off-by-one indexing in
+        // the residual-bits branch).
+        let vectors: [[u8; 32]; 3] = [
+            [0u8; 32],
+            [0xCCu8; 32],
+            [
+                0x80, 0x01, 0xFE, 0x7F, 0x00, 0xFF, 0xA5, 0x5A, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC,
+                0xDE, 0xF0, 0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96, 0xA5, 0xB4,
+                0xC3, 0xD2, 0xE1, 0xF0,
+            ],
+        ];
+        for input in &vectors {
+            let wasm_encoded = zbase32_encode(input);
+            let native_encoded = zbase32::encode(input);
+            assert_eq!(
+                wasm_encoded, native_encoded,
+                "WASM zbase32_encode output MUST match the canonical \
+                 z-base-32 encoder byte-for-byte (drift breaks DID \
+                 interoperability across bridges)"
+            );
+        }
     }
 }

@@ -84,6 +84,9 @@ wasm-bindgen-test = "0.3"
 # when running `cargo test` on the host.
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 scp-identity = { path = "../../scp-identity", version = "=0.1.0-beta.1" }
+# Host-only: encoder-parity tests pin the WASM-local `zbase32_encode`
+# helper against the canonical `z-base-32` crate the native bridges use.
+z-base-32 = { workspace = true }
 
 [profile.release]
 opt-level = "s"
