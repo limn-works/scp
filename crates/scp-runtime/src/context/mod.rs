@@ -42,6 +42,7 @@ pub(crate) mod governance_helpers_legacy;
 pub(crate) mod governance_logic;
 pub mod key_destruction;
 pub(crate) mod lifecycle_helpers;
+pub(crate) mod lifecycle_helpers_legacy;
 pub(crate) mod lifecycle_logic;
 pub(crate) mod manager_methods;
 pub(crate) mod messaging_helpers;
