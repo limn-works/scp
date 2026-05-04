@@ -935,3 +935,45 @@ fn sync_merkle_tree(
         }
     }
 }
+
+// ===========================================================================
+// Supervisor-scoped helpers (designated-legacy — no per-context twin)
+// ===========================================================================
+//
+// These helpers operate on supervisor-wide state (`local_dids` ArcSwap +
+// `write_lock`), not per-context state. They have no `&mut PerContextState`
+// twin because the actor model serializes per-context, not supervisor-wide.
+// Relocated from `queries_helpers_legacy` in Phase 2A finalization.
+
+/// Registers a DID as controlled by the local node/SDK.
+///
+/// Supervisor-scoped — mutates `supervisor.local_dids` under the
+/// supervisor's write lock. No per-context actor-shape twin exists
+/// because the actor model serializes per-context, not supervisor-wide.
+pub async fn register_local_did(supervisor: &crate::context::supervisor::Supervisor, did: DID) {
+    // ArcSwap+write_lock pattern (ADR-049 §Decision 12). Reads are
+    // lock-free; writes serialize on the supervisor write_lock to
+    // avoid lost updates against the cloned snapshot.
+    let _guard = supervisor.write_lock.lock().await;
+    let snapshot = supervisor.local_dids_ref().load_full();
+    let mut updated: std::collections::HashSet<DID> = (*snapshot).clone();
+    updated.insert(did);
+    supervisor
+        .local_dids_ref()
+        .store(std::sync::Arc::new(updated));
+}
+
+/// Returns `true` if the given DID is registered as locally controlled.
+///
+/// Supervisor-scoped read. No actor-shape twin.
+///
+/// `async` is preserved (despite no `await` after the §12 lock-free
+/// read migration) to keep the signature symmetric with
+/// [`register_local_did`] and the legacy method, matching the call
+/// shape the FFI bridges + `Supervisor::is_local_did` passthrough
+/// expect.
+#[allow(clippy::unused_async)]
+pub async fn is_local_did(supervisor: &crate::context::supervisor::Supervisor, did: &DID) -> bool {
+    // Lock-free read (ADR-049 §Decision 12).
+    supervisor.local_dids_ref().load().contains(did)
+}
