@@ -727,6 +727,7 @@ async fn open_stream_internal(
 
     let signing_key = resolve_invoker_signing_key(handle, identity).await?;
     let invoker_pk = signing_key.verifying_key();
+    let signing_key_arc = Arc::new(signing_key.clone());
 
     let executor: Arc<dyn scp_runtime::context::outlets::invoke::OutletExecutor> =
         Arc::new(ClosureExecutor {
@@ -745,6 +746,7 @@ async fn open_stream_internal(
         credit_window,
         estimated_chunk_count,
         invoker_pk,
+        Arc::clone(&signing_key_arc),
     );
     let admission = Arc::new(std::sync::Mutex::new(
         scp_runtime::context::outlets::stream::StreamAdmissionTracker::new(),
@@ -822,6 +824,7 @@ fn build_open_stream_params(
     credit_window: Option<u32>,
     estimated_chunk_count: Option<u32>,
     invoker_pk: ed25519_dalek::VerifyingKey,
+    operator_signing_key: Arc<ed25519_dalek::SigningKey>,
 ) -> scp_runtime::context::outlets::dispatch::OpenStreamParams {
     let credit_window_value =
         credit_window.unwrap_or(scp_protocol::context::outlets::stream::DEFAULT_CREDIT_WINDOW);
@@ -845,6 +848,10 @@ fn build_open_stream_params(
         credit_window: credit_window_value,
         caveats: InvocationCaveats::empty(),
         invoker_pk,
+        // Native FFI bridges: invoker == operator in the local
+        // single-context streaming path. See PyO3 bridge for full
+        // rationale (§5.4.5 / §6.2.0.5).
+        operator_signing_key: Some(operator_signing_key),
         stream_credit_stall_secs:
             scp_protocol::context::outlets::stream::DEFAULT_STREAM_CREDIT_STALL_SECS,
         stream_cancel_ack_secs: 5,
@@ -960,30 +967,67 @@ fn sign_credit_grant(
 // outlet_stream_cancel
 // ---------------------------------------------------------------------------
 
-/// Applies an `OutletCancel` to an active stream by `request_id_hex`.
+/// Applies a signed `OutletStreamCancel` to an active stream by
+/// `request_id_hex` (round-7 cancel-auth).
 ///
-/// Calls
-/// [`scp_runtime::context::outlets::dispatch::StreamSessionHandle::apply_outlet_cancel`]
-/// with the supplied `next_seq` (the receiver's view of the next-to-emit
-/// chunk sequence). A returning `Some(seq)` indicates the cancel was
-/// recorded; `None` means the stream was already terminal at cancel
-/// receipt (the runtime ignored the cancel per §5.4.5 idempotency).
+/// Builds and signs the cancel under the entry's pinned identity +
+/// the invoker's signing key, then forwards to
+/// [`scp_runtime::context::outlets::dispatch::StreamSessionHandle::apply_outlet_cancel`].
+/// A returning `Some(seq)` indicates the cancel was recorded; `None`
+/// means the stream was already terminal at cancel receipt (the
+/// runtime ignored the cancel per §5.4.5 idempotency).
 ///
 /// # Errors
 ///
 /// * `ScpError::Context` (slug `protocol.unknown-session`) —
 ///   `request_id_hex` does not match any active stream.
+/// * `ScpError::Context` (slug `authorization.denied`) — runtime
+///   rejected the cancel signature (cannot happen via this bridge
+///   under normal operation).
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn outlet_stream_cancel(
     request_id_hex: String,
     next_seq: Option<u64>,
 ) -> Result<Option<u64>, ScpError> {
     let entry = lookup_entry(&request_id_hex)?;
+    let cancel = sign_cancel_for_entry(&entry, next_seq.unwrap_or(0));
     let handle_guard = entry
         .handle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    Ok(handle_guard.apply_outlet_cancel(next_seq.unwrap_or(0)))
+    handle_guard
+        .apply_outlet_cancel(&cancel)
+        .map_err(|err| ScpError::Context {
+            msg: format!(
+                "cancel rejected ({}): {err:?}",
+                scp_runtime::context::outlets::stream::cancel_error_to_slug(err)
+            ),
+            code: scp_runtime::context::outlets::stream::cancel_error_to_code(err).to_owned(),
+        })
+}
+
+/// Builds and signs an `OutletStreamCancel` for `entry` against
+/// `next_seq` (mirrors [`sign_credit_grant`]).
+fn sign_cancel_for_entry(
+    entry: &StreamRegistryEntry,
+    next_seq: u64,
+) -> scp_protocol::context::outlets::stream::OutletStreamCancel {
+    use scp_protocol::context::outlets::stream::{
+        CancelSigningInputs, OutletStreamCancel, sign_cancel,
+    };
+    let inputs = CancelSigningInputs {
+        context_id: entry.context_id.as_str(),
+        outlet_id: entry.outlet_id.as_str(),
+        request_id: &entry.request_id,
+        next_seq,
+        caveats_binding: &entry.caveats_binding,
+    };
+    let sig = sign_cancel(&entry.invoker_signing_key, &inputs);
+    OutletStreamCancel {
+        request_id: entry.request_id,
+        next_seq,
+        sig,
+    }
 }
 
 // ---------------------------------------------------------------------------

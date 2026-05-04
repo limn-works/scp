@@ -711,6 +711,23 @@ The executor's credit accounting admits a grant only if (a) the signature verifi
 
 **Cancellation and billing boundary.** The existing `OutletCancel` message cancels a stream by `request_id`. The executor-side framework handles `OutletCancel` receipt as follows: (1) it records `cancel_ack_seq = current emission cursor` (the next-to-emit sequence number, pinned at the moment of cancel arrival, so chunks already in flight at that sequence are NOT counted as billable above the cutoff); (2) it arms the `stream_cancel_ack_secs` timer (default 5s); (3) it emits exactly one terminal chunk (`End` or `Error { terminal: true }`) within the window — this terminal chunk is the **cancel-ack**, and its `sequence` is the authoritative **cancel-ack sequence** written into the event log; (4) on terminal chunk emission the framework flushes stream state (clears the pinning record from the stream table, releases escrow, releases the chain-depth slot). If the timer fires before the executor emits a terminal chunk, the framework forces the stream closed with `OutletErrorClass::Execution::CancelAckTimeout` (code `SCP-TOOL-6135`, slug `execution.cancel-ack-timeout`) and writes its own terminal `Error { terminal: true }` chunk at the next-to-emit sequence. A receiver MAY ignore chunks with sequence greater than the cancel-ack sequence, but the executor MUST NOT emit Data/Progress chunks with sequence greater than the cancel-ack sequence.
 
+**Cancel signature (round 7 cancel-auth tightening).** Every streaming `OutletCancel` MUST carry the invoker's Ed25519 signature in `sig`, over the preimage:
+
+```
+SHA-256(
+  "SCP-OUTLET-CANCEL-V1:"
+  || len_be32(context_id)         // 4-byte big-endian length
+  || context_id                    // UTF-8 bytes of the hosting context's id
+  || len_be32(outlet_id)           // 4-byte big-endian length
+  || outlet_id                     // UTF-8 bytes of the outlet id
+  || request_id                    // 16 bytes, fixed width
+  || next_seq_be                   // 8 bytes, big-endian (u64 next-to-emit cursor)
+  || caveats_binding               // 32 bytes, the stream's caveats_binding
+)
+```
+
+The runtime accepts a streaming cancel only if the signature verifies under the invoker's public key pinned at stream open (the same `invoker_pk` recorded for credit-grant verification). A cancel whose signature does not verify, or whose preimage fields do not match the pinned `(context_id, outlet_id, caveats_binding)` triple for this `request_id`, is rejected as `OutletErrorClass::Authorization::AuthorizationFailed` and does NOT mutate stream state — neither the cancel-ack timer arms nor `cancel_ack_seq` is recorded. Without this signature, a malicious relay or eavesdropping member could forge cancels keyed only on observed `request_id` values and force-terminate streams the invoker did not authorize. Binding stream identity (`context_id`, `outlet_id`, `caveats_binding`) into the preimage closes the cross-stream replay surface — a cancel signed for stream A in context X cannot be replayed against stream B or against a different caveat shape, even under contrived `request_id` collisions. The `SCP-OUTLET-CANCEL-V1:` separator is registered in §9.18.2.
+
 **Billing semantics.** Streaming-native invocation uses an escrow-and-reconcile model so early termination does not leave the economic layer inconsistent.
 
 - **At open** (Action outlets with non-zero cost only): the runtime escrows an upper-bound estimate from the invoker's balance. The estimate is `cost.amount × estimated_chunk_count`, computed via `checked_mul` — an arithmetic overflow is rejected as `OutletErrorClass::Economic::EscrowOverflow` before any state is committed. `estimated_chunk_count` is declared in the open and is structurally bounded by `min(credit_window, caveats.max_calls.unwrap_or(u32::MAX))` — a declared estimate exceeding that bound is rejected at open with `OutletErrorClass::Input::EstimateExceedsBound` (the bound is the protocol's upper limit on how many billable chunks CAN flow regardless of executor behavior, so the escrow must not over-reserve beyond it). For outlets without declared cost or for Query outlets, escrow is zero and `estimated_chunk_count` is advisory.

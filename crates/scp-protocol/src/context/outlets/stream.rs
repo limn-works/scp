@@ -119,6 +119,15 @@ pub const SCP_OUTLET_CAVEAT_BIND_V1: &[u8] = b"SCP-OUTLET-CAVEAT-BIND-V1:";
 /// one (stream, epoch) cannot be replayed against another.
 pub const SCP_OUTLET_CREDIT_V1: &[u8] = b"SCP-OUTLET-CREDIT-V1:";
 
+/// `SCP-OUTLET-CANCEL-V1:` — `OutletStreamCancel.sig` preimage prefix
+/// (round-7 cancel-auth tightening).
+///
+/// (§5.4.5 streaming cancel signature.) Binds stream identity
+/// (`context_id`, `outlet_id`, `caveats_binding`) plus the receiver-side
+/// next-to-emit cursor (`next_seq`) and `request_id` so a cancel signed
+/// for one stream / cursor cannot be replayed across streams or cursors.
+pub const SCP_OUTLET_CANCEL_V1: &[u8] = b"SCP-OUTLET-CANCEL-V1:";
+
 // ---------------------------------------------------------------------------
 // Runtime defaults — §5.4.5 / §9.18.B
 // ---------------------------------------------------------------------------
@@ -699,6 +708,137 @@ pub fn verify_credit_signature(
         caveats_binding,
     );
     let signature = ed25519_dalek::Signature::from_bytes(&credit.sig);
+    invoker_pk.verify_strict(&preimage, &signature).is_ok()
+}
+
+// ---------------------------------------------------------------------------
+// OutletStreamCancel — §5.4.5 round-7 cancel-auth
+// ---------------------------------------------------------------------------
+
+/// Streaming-form `OutletCancel` carrying the invoker's Ed25519 signature
+/// over the §5.4.5 cancel preimage (round-7 cancel-auth tightening).
+///
+/// Distinct from the legacy [`crate::context::outlets::lifecycle::OutletCancel`]
+/// (which carries `request_id: String` + free-form timestamp and is used
+/// by the non-streaming cancellation surface). The streaming wire form
+/// requires fixed-width identifiers and a signature that binds stream
+/// identity into the preimage so a cancel signed for one stream cannot
+/// be replayed against another.
+///
+/// The runtime accepts a streaming cancel only when (a) the signature
+/// verifies under the invoker's public key recorded at stream open, and
+/// (b) `(context_id, outlet_id, caveats_binding)` bound into the preimage
+/// match the pinned values for this `request_id`. A failure returns
+/// `OutletErrorClass::Authorization::AuthorizationFailed` and does NOT
+/// mutate stream state — the cancel-ack timer does not arm and
+/// `cancel_ack_seq` is not recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutletStreamCancel {
+    /// Stream identifier — same 16-byte raw form as
+    /// [`OutletStreamCredit::request_id`].
+    #[serde(with = "serde_id_16")]
+    pub request_id: RequestId,
+    /// Receiver-side next-to-emit cursor at the moment the cancel is
+    /// constructed. Committed into the preimage so a cancel cannot be
+    /// replayed at a different cursor position.
+    pub next_seq: u64,
+    /// Invoker's Ed25519 signature over the §5.4.5 cancel preimage.
+    /// Verify with [`verify_cancel_signature`].
+    #[serde(with = "serde_signature_64")]
+    pub sig: Ed25519Signature,
+}
+
+/// Computes the SHA-256 preimage hash the invoker signs for a streaming
+/// cancel (§5.4.5 round-7 cancel signature).
+///
+/// # Preimage
+///
+/// ```text
+/// SHA-256(
+///   "SCP-OUTLET-CANCEL-V1:"
+///   || len_be32(context_id) || context_id
+///   || len_be32(outlet_id)  || outlet_id
+///   || request_id                       // 16 bytes
+///   || next_seq_be                      // 8 bytes, BE
+///   || caveats_binding                  // 32 bytes
+/// )
+/// ```
+#[must_use]
+pub fn compute_cancel_sig_preimage(
+    context_id: &str,
+    outlet_id: &str,
+    request_id: &RequestId,
+    next_seq: u64,
+    caveats_binding: &[u8; 32],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(SCP_OUTLET_CANCEL_V1);
+    update_with_len_prefix(&mut hasher, context_id.as_bytes());
+    update_with_len_prefix(&mut hasher, outlet_id.as_bytes());
+    hasher.update(request_id);
+    hasher.update(next_seq.to_be_bytes());
+    hasher.update(caveats_binding);
+    hasher.finalize().into()
+}
+
+/// Bundle of fields the invoker signs in a streaming cancel.
+///
+/// Grouped so [`sign_cancel`] stays under the workspace's
+/// `clippy::too_many_arguments` ceiling and matches the §5.4.5 cancel
+/// preimage shape verbatim.
+#[derive(Debug, Clone, Copy)]
+pub struct CancelSigningInputs<'a> {
+    /// Hosting context's id.
+    pub context_id: &'a str,
+    /// Outlet id (matches `OutletStreamOpen.outlet_id`).
+    pub outlet_id: &'a str,
+    /// Stream identifier.
+    pub request_id: &'a RequestId,
+    /// Receiver-side next-to-emit cursor.
+    pub next_seq: u64,
+    /// Stream's `caveats_binding`.
+    pub caveats_binding: &'a [u8; 32],
+}
+
+/// Signs a streaming-cancel preimage with the invoker's Ed25519 signing
+/// key. Returns the 64-byte signature — caller composes it into an
+/// [`OutletStreamCancel`].
+#[must_use]
+pub fn sign_cancel(signing_key: &SigningKey, inputs: &CancelSigningInputs<'_>) -> Ed25519Signature {
+    let preimage = compute_cancel_sig_preimage(
+        inputs.context_id,
+        inputs.outlet_id,
+        inputs.request_id,
+        inputs.next_seq,
+        inputs.caveats_binding,
+    );
+    signing_key.sign(&preimage).to_bytes()
+}
+
+/// Verifies a streaming cancel's `sig` against the invoker's
+/// `VerifyingKey` and the §5.4.5 cancel preimage. Returns `true` on a
+/// valid signature, `false` otherwise (including malformed signatures).
+///
+/// Callers must pass the SAME `(context_id, outlet_id, caveats_binding)`
+/// pinned at stream open. Mismatch on any field flips the verifier to
+/// `false` even when the signature is otherwise valid — that is the
+/// cross-stream replay closure.
+#[must_use]
+pub fn verify_cancel_signature(
+    cancel: &OutletStreamCancel,
+    invoker_pk: &VerifyingKey,
+    context_id: &str,
+    outlet_id: &str,
+    caveats_binding: &[u8; 32],
+) -> bool {
+    let preimage = compute_cancel_sig_preimage(
+        context_id,
+        outlet_id,
+        &cancel.request_id,
+        cancel.next_seq,
+        caveats_binding,
+    );
+    let signature = ed25519_dalek::Signature::from_bytes(&cancel.sig);
     invoker_pk.verify_strict(&preimage, &signature).is_ok()
 }
 
@@ -1706,6 +1846,225 @@ mod tests {
             "out",
             5,
             &caveats_binding
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-7 cancel signature — preimage round-trip + tamper-on-each-field
+    // -----------------------------------------------------------------------
+
+    /// Reference vector: the cancel preimage matches the byte-for-byte
+    /// SCP-OUTLET-CANCEL-V1 spec block.
+    #[test]
+    fn cancel_sig_preimage_matches_spec() {
+        let request_id: RequestId = [0x33; 16];
+        let caveats_binding: [u8; 32] = [0x44; 32];
+        let mut hasher = Sha256::new();
+        hasher.update(b"SCP-OUTLET-CANCEL-V1:");
+        let ctx = "ctx";
+        let outlet = "out";
+        hasher.update(u32::try_from(ctx.len()).unwrap().to_be_bytes());
+        hasher.update(ctx.as_bytes());
+        hasher.update(u32::try_from(outlet.len()).unwrap().to_be_bytes());
+        hasher.update(outlet.as_bytes());
+        hasher.update(request_id);
+        hasher.update(7u64.to_be_bytes());
+        hasher.update(caveats_binding);
+        let expected: [u8; 32] = hasher.finalize().into();
+        let computed = compute_cancel_sig_preimage(ctx, outlet, &request_id, 7, &caveats_binding);
+        assert_eq!(computed, expected);
+    }
+
+    /// Round-trip: a freshly signed cancel verifies under the matching key.
+    #[test]
+    fn verify_cancel_signature_accepts_valid() {
+        let signing_key = fixed_signing_key();
+        let verifying_key = signing_key.verifying_key();
+        let request_id: RequestId = [0x22; 16];
+        let caveats_binding = fixed_caveats_binding();
+        let sig = sign_cancel(
+            &signing_key,
+            &CancelSigningInputs {
+                context_id: "ctx",
+                outlet_id: "out",
+                request_id: &request_id,
+                next_seq: 11,
+                caveats_binding: &caveats_binding,
+            },
+        );
+        let cancel = OutletStreamCancel {
+            request_id,
+            next_seq: 11,
+            sig,
+        };
+        assert!(verify_cancel_signature(
+            &cancel,
+            &verifying_key,
+            "ctx",
+            "out",
+            &caveats_binding
+        ));
+    }
+
+    /// Tampering with `context_id` flips verification to `false`.
+    #[test]
+    fn verify_cancel_signature_rejects_wrong_context() {
+        let signing_key = fixed_signing_key();
+        let verifying_key = signing_key.verifying_key();
+        let request_id: RequestId = [0x44; 16];
+        let caveats_binding = fixed_caveats_binding();
+        let sig = sign_cancel(
+            &signing_key,
+            &CancelSigningInputs {
+                context_id: "ctx",
+                outlet_id: "out",
+                request_id: &request_id,
+                next_seq: 3,
+                caveats_binding: &caveats_binding,
+            },
+        );
+        let cancel = OutletStreamCancel {
+            request_id,
+            next_seq: 3,
+            sig,
+        };
+        assert!(!verify_cancel_signature(
+            &cancel,
+            &verifying_key,
+            "OTHER",
+            "out",
+            &caveats_binding
+        ));
+    }
+
+    /// Tampering with `outlet_id` flips verification to `false`.
+    #[test]
+    fn verify_cancel_signature_rejects_wrong_outlet() {
+        let signing_key = fixed_signing_key();
+        let verifying_key = signing_key.verifying_key();
+        let request_id: RequestId = [0x55; 16];
+        let caveats_binding = fixed_caveats_binding();
+        let sig = sign_cancel(
+            &signing_key,
+            &CancelSigningInputs {
+                context_id: "ctx",
+                outlet_id: "out",
+                request_id: &request_id,
+                next_seq: 9,
+                caveats_binding: &caveats_binding,
+            },
+        );
+        let cancel = OutletStreamCancel {
+            request_id,
+            next_seq: 9,
+            sig,
+        };
+        assert!(!verify_cancel_signature(
+            &cancel,
+            &verifying_key,
+            "ctx",
+            "OTHER",
+            &caveats_binding
+        ));
+    }
+
+    /// Tampering with `request_id` flips verification to `false` (the
+    /// preimage carries the `request_id` verbatim, so the verifier
+    /// re-derives it from the cancel struct).
+    #[test]
+    fn verify_cancel_signature_rejects_wrong_request_id() {
+        let signing_key = fixed_signing_key();
+        let verifying_key = signing_key.verifying_key();
+        let request_id: RequestId = [0x66; 16];
+        let caveats_binding = fixed_caveats_binding();
+        let sig = sign_cancel(
+            &signing_key,
+            &CancelSigningInputs {
+                context_id: "ctx",
+                outlet_id: "out",
+                request_id: &request_id,
+                next_seq: 4,
+                caveats_binding: &caveats_binding,
+            },
+        );
+        // Tamper: same `next_seq` and signature but a different
+        // `request_id` in the wire struct.
+        let cancel = OutletStreamCancel {
+            request_id: [0x77; 16],
+            next_seq: 4,
+            sig,
+        };
+        assert!(!verify_cancel_signature(
+            &cancel,
+            &verifying_key,
+            "ctx",
+            "out",
+            &caveats_binding
+        ));
+    }
+
+    /// Tampering with `next_seq` flips verification to `false`.
+    #[test]
+    fn verify_cancel_signature_rejects_wrong_next_seq() {
+        let signing_key = fixed_signing_key();
+        let verifying_key = signing_key.verifying_key();
+        let request_id: RequestId = [0x88; 16];
+        let caveats_binding = fixed_caveats_binding();
+        let sig = sign_cancel(
+            &signing_key,
+            &CancelSigningInputs {
+                context_id: "ctx",
+                outlet_id: "out",
+                request_id: &request_id,
+                next_seq: 100,
+                caveats_binding: &caveats_binding,
+            },
+        );
+        // Tamper: same signature, different next_seq.
+        let cancel = OutletStreamCancel {
+            request_id,
+            next_seq: 101,
+            sig,
+        };
+        assert!(!verify_cancel_signature(
+            &cancel,
+            &verifying_key,
+            "ctx",
+            "out",
+            &caveats_binding
+        ));
+    }
+
+    /// Tampering with `caveats_binding` flips verification to `false`.
+    #[test]
+    fn verify_cancel_signature_rejects_wrong_caveats_binding() {
+        let signing_key = fixed_signing_key();
+        let verifying_key = signing_key.verifying_key();
+        let request_id: RequestId = [0x99; 16];
+        let caveats_binding_a: [u8; 32] = [0xAA; 32];
+        let caveats_binding_b: [u8; 32] = [0xBB; 32];
+        let sig = sign_cancel(
+            &signing_key,
+            &CancelSigningInputs {
+                context_id: "ctx",
+                outlet_id: "out",
+                request_id: &request_id,
+                next_seq: 0,
+                caveats_binding: &caveats_binding_a,
+            },
+        );
+        let cancel = OutletStreamCancel {
+            request_id,
+            next_seq: 0,
+            sig,
+        };
+        // Verifier rebuilds the preimage with the wrong caveats_binding.
+        assert!(!verify_cancel_signature(
+            &cancel,
+            &verifying_key,
+            "ctx",
+            "out",
+            &caveats_binding_b
         ));
     }
 

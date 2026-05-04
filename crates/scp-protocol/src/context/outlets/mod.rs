@@ -79,13 +79,14 @@ pub use registry::{
 };
 pub use schema::{SchemaValidationError, validate_schema, validate_value_against_schema};
 pub use stream::{
-    ChunkPayload, CreditGrantSigningInputs, DEFAULT_CREDIT_WINDOW,
+    CancelSigningInputs, ChunkPayload, CreditGrantSigningInputs, DEFAULT_CREDIT_WINDOW,
     DEFAULT_STREAM_CREDIT_STALL_SECS, DEFAULT_STREAM_UCAN_RECHECK_SECS, Ed25519Signature, MlsEpoch,
-    OpenObservation, OutletStreamChunk, OutletStreamCredit, OutletStreamOpen, RequestId,
-    SCP_OUTLET_CAVEAT_BIND_V1, SCP_OUTLET_CHUNK_SIG_V1, SCP_OUTLET_CHUNK_V1, SCP_OUTLET_CREDIT_V1,
-    SessionState, StreamRejection, StreamTerminalStatus, compute_caveats_binding,
-    compute_chunk_sig_preimage, compute_credit_sig_preimage, evaluate_open_pinning,
-    evaluate_revocation_recheck, evaluate_session_open, sign_chunk, sign_credit_grant,
+    OpenObservation, OutletStreamCancel, OutletStreamChunk, OutletStreamCredit, OutletStreamOpen,
+    RequestId, SCP_OUTLET_CANCEL_V1, SCP_OUTLET_CAVEAT_BIND_V1, SCP_OUTLET_CHUNK_SIG_V1,
+    SCP_OUTLET_CHUNK_V1, SCP_OUTLET_CREDIT_V1, SessionState, StreamRejection, StreamTerminalStatus,
+    compute_cancel_sig_preimage, compute_caveats_binding, compute_chunk_sig_preimage,
+    compute_credit_sig_preimage, evaluate_open_pinning, evaluate_revocation_recheck,
+    evaluate_session_open, sign_cancel, sign_chunk, sign_credit_grant, verify_cancel_signature,
     verify_chunk_signature, verify_credit_signature,
 };
 
