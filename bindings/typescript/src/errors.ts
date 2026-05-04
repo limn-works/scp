@@ -227,27 +227,49 @@ const CATALOG_KEY_MAX_BYTES = 256;
 
 // --- Branded newtypes -----------------------------------------------------
 
-/**
- * Branded numeric newtype for an Outlet credit grant.
- *
- * Use `Credit(raw)` (the factory below) to construct. Passing a raw `number`
- * where `Credit` is expected fails to type-check. Round-5 used per-language
- * `RangeError` for out-of-range input; round-6 unified the rejection error
- * to `InvalidGrant` under the `OutletError` hierarchy.
- */
-export type Credit = number & { readonly __brand: "Credit" };
-
 const CREDIT_MAX = 0xff_ff_ff_ff;
 
 /**
- * Construct a `Credit` from a raw number; throws `InvalidGrant` on
- * `raw <= 0` or `raw > 2^32 - 1`.
+ * Real runtime class for an Outlet credit grant — replaces the prior
+ * `number & __brand` type alias.
+ *
+ * The previous bare-`number` brand was erased at runtime: `typeof grant ===
+ * "number"` passed for any plain integer, so the runtime guard in
+ * `grantCredit` accepted unwrapped numbers and the brand was security
+ * theater. `Credit` is now a real class, so `instanceof Credit` is a
+ * load-bearing runtime check that rejects raw integers reaching
+ * `bridge.outletStreamGrantCredit`.
+ *
+ * Construct via `Credit.of(raw)` (preferred, type-safe) or
+ * `new Credit(raw)`. Round-5 used per-language `RangeError` for
+ * out-of-range input; round-6 unified the rejection error to
+ * `InvalidGrant` under the `OutletError` hierarchy.
  */
-export function Credit(raw: number): Credit {
-  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0 || raw > CREDIT_MAX) {
-    throw new InvalidGrant(typeof raw === "number" ? raw : 0);
+export class Credit {
+  readonly raw: number;
+
+  constructor(raw: number) {
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0 || raw > CREDIT_MAX) {
+      throw new InvalidGrant(typeof raw === "number" ? raw : 0);
+    }
+    this.raw = raw;
   }
-  return raw as Credit;
+
+  /** Static factory — equivalent to `new Credit(raw)`. Reads more naturally
+   *  at call sites that previously used `Credit(raw)` as a function. */
+  static of(raw: number): Credit {
+    return new Credit(raw);
+  }
+
+  /** Stable string form for logs / equality checks. */
+  toString(): string {
+    return `Credit(${this.raw})`;
+  }
+
+  /** JSON helper — serializes to the underlying integer so wire shapes are unchanged. */
+  toJSON(): number {
+    return this.raw;
+  }
 }
 
 /**
