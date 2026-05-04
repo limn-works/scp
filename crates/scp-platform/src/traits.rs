@@ -657,25 +657,37 @@ pub enum PreRotationCustodyKind {
 /// any error as "key may or may not still exist" and surface a recovery
 /// prompt.
 ///
-/// # SDK presentation (spec §9.7.4.1 §5) is OUTSIDE this trait
+/// # SDK presentation (spec §9.7.4.1 §5) lives ABOVE this trait
 ///
-/// The protocol layer covered by this trait implements §9.7.4.1 §5(a)
-/// (generation), §5(e) (commitment publication after the trait round-trip
-/// returns), and §5(f) (operational copy destruction). Steps §5(b)
-/// (present custody options to the user), §5(c) (guide the user through
-/// the selected method), and §5(d) (verify the backup before publishing
-/// the commitment) are SDK-layer concerns that the trait does NOT model.
-/// SDK consumers are responsible for layering those steps over a
-/// concrete [`PreRotationCustody`] backend before calling
-/// [`store_committed_pre_rotation_key`](Self::store_committed_pre_rotation_key).
+/// The trait covers steps §9.7.4.1 §5(a) (generation) and §5(f)
+/// (operational copy destruction) directly. The protocol API
+/// `DidDht::create` returns the identity + document + handle in
+/// memory; `DidDht::publish_document` is a SEPARATE call. That seam
+/// is where the SDK layers in §5(b) (present custody options),
+/// §5(c) (guide the user through the selected method), and §5(d)
+/// (verify the backup before commitment publish) — by:
+///
+/// 1. Picking the concrete [`PreRotationCustody`] implementation
+///    based on the user's choice (§5(b)).
+/// 2. Driving the per-backend onboarding flow during/after
+///    `dht.create()` returns (§5(c) — e.g., "tap your `YubiKey`",
+///    "scan this QR", "write down these 24 words").
+/// 3. For paper / Shamir / encrypted-backup methods: prompting the
+///    user to re-enter the backup and verifying it matches before
+///    calling `dht.publish_document()` (§5(d) — the commitment
+///    isn't on the DHT until publish).
+///
+/// The protocol-level hooks already exist — the trait deliberately
+/// stays UX-agnostic so it works across all six §9.7.4.1 §4
+/// substrates (FIDO2, secondary-device enclave, platform cloud key
+/// store, encrypted offline backup, Shamir 3-of-5, BIP39 paper
+/// backup). Modeling UX inside the trait would force concrete
+/// flows that don't generalize.
 ///
 /// Today's shipped backend ([`InMemoryPreRotationCustody`](super::testing::InMemoryPreRotationCustody))
-/// has no user-facing flow and is testing-only. Production backends
-/// (FIDO2, passkey-PRF, Apple Keychain entry under a separate access
-/// control class, Android Keystore alias with separate authentication
-/// flow, encrypted offline backup, Shamir 3-of-5, BIP39 paper backup —
-/// the six methods §9.7.4.1 §4 enumerates) need the SDK layer to
-/// implement §5(b)-(d) before this trait sees the seed bytes.
+/// is process-memory only — it satisfies the trait's type-level
+/// isolation but not §9.7.4.1 §3 substrate isolation. Production
+/// backends are a separate workstream.
 ///
 /// # Concurrency
 ///
