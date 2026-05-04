@@ -1384,21 +1384,8 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
 
         // Step 7b (spec §9.12, "compromise recovery"): destroy the OLD
         // identity's `#active` and (when present) `#agent` operational
-        // keys. After migration the new identity is published and the
-        // old DID document (after step 8) explicitly delegates via
-        // `alsoKnownAs`; the old `#active` and `#agent` are revoked
-        // verification methods and must not remain decryptable from
-        // operational custody. Destroy is best-effort (`.ok()`) — the
-        // migration is otherwise already committed (new doc published),
-        // and a destroy failure here surfaces as orphaned key material
-        // rather than as a failed migration. The OLD `identity_key`
-        // (`#0`) is intentionally retained: step 8 below republishes
-        // the OLD document with the updated `alsoKnownAs`, and that
-        // publish is signed by `#0`.
-        let _ = key_custody.destroy_key(&identity.active_signing_key).await;
-        if let Some(agent_handle) = identity.agent_signing_key.as_ref() {
-            let _ = key_custody.destroy_key(agent_handle).await;
-        }
+        // keys. See `destroy_old_operational_keys` for the rationale.
+        destroy_old_operational_keys(key_custody, identity).await;
 
         // Step 8: Update the OLD DID document with `alsoKnownAs` pointing
         // at the now-published new DID, and publish. A failure here
@@ -1839,6 +1826,44 @@ fn check_rotated_at_window(rotated_at: u64, now: u64) -> Result<(), IdentityErro
     Ok(())
 }
 
+/// Best-effort destruction of the OLD identity's operational
+/// signing keys (`#active` and, when present, `#agent`) after a
+/// successful migration.
+///
+/// Spec §9.12 ("compromise recovery"): once the new identity is
+/// published and the old DID document delegates via `alsoKnownAs`,
+/// the old `#active` and `#agent` verification methods are revoked
+/// and must not remain decryptable from operational custody. The
+/// OLD identity key (`#0`) is intentionally retained: the
+/// post-step-7b code path re-publishes the OLD document with the
+/// updated `alsoKnownAs`, and that publish is signed by `#0`.
+///
+/// Failures are logged via `tracing::warn!` rather than propagated:
+/// the migration is already committed (new doc published), so a
+/// destroy failure surfaces as orphaned key material rather than as
+/// a failed migration. Operators can audit `tracing` output to clean
+/// up out-of-band.
+async fn destroy_old_operational_keys<C: KeyCustody>(key_custody: &C, identity: &ScpIdentity) {
+    if let Err(e) = key_custody.destroy_key(&identity.active_signing_key).await {
+        tracing::warn!(
+            old_did = %identity.did,
+            error = %e,
+            "step 7b: failed to destroy old #active key during migration; \
+             migration completed but old operational key remains in custody"
+        );
+    }
+    if let Some(agent_handle) = identity.agent_signing_key.as_ref()
+        && let Err(e) = key_custody.destroy_key(agent_handle).await
+    {
+        tracing::warn!(
+            old_did = %identity.did,
+            error = %e,
+            "step 7b: failed to destroy old #agent key during migration; \
+             migration completed but old operational key remains in custody"
+        );
+    }
+}
+
 /// Verifies a DID identity migration (Layer 3).
 ///
 /// Checks the cryptographic proofs that an identity migration from `old_did`
@@ -1894,6 +1919,10 @@ fn check_rotated_at_window(rotated_at: u64, now: u64) -> Result<(), IdentityErro
 ///   [`MAX_PAST_WINDOW_SECS`] behind `now`.
 /// - The old public key in the migration proof is invalid.
 /// - The migration proof signature does not verify.
+/// - `pre_rotation_proof` is `None` AND the old DID document publishes
+///   a `PreRotationCommitment` service entry. The OLD identity holder
+///   committed to STRONG assurance at creation time; verifiers MUST
+///   refuse to silently fall back to MODERATE-only.
 /// - The pre-rotation proof's `SHA-256(revealed_key) != commitment`.
 /// - The pre-rotation proof's `commitment` does not match the
 ///   `PreRotationCommitment` service in the old DID document.
@@ -1971,6 +2000,30 @@ pub fn verify_migration(
             "migration_proof.old_public_key derives DID {expected_old_did:?} \
              but the migration is from {old_did:?}"
         )));
+    }
+
+    // Step 1c: enforce STRONG-assurance pre-rotation proof presence
+    // when the OLD document committed to it. did:dht migrations
+    // honour the published commitment: if the OLD document publishes
+    // a `PreRotationCommitment` service entry, the OLD identity's
+    // holder pre-committed at creation time to STRONG assurance, and
+    // the verifier MUST refuse to silently fall back to the
+    // MODERATE-only path. Without this check, an attacker who briefly
+    // captured the OLD `#0` key could mint a valid `migration_proof`
+    // for any `new_did` they control, omit the pre-rotation proof,
+    // and pass verification at MODERATE — defeating the entire
+    // pre-rotation chain that the OLD identity advertised.
+    //
+    // The MODERATE-only path remains valid only when the OLD document
+    // has no `PreRotationCommitment` service (legacy or non-committing
+    // identities — see ADR-003 §4c).
+    if pre_rotation_proof.is_none() && old_document.pre_rotation_service().is_some() {
+        return Err(IdentityError::MigrationVerificationFailed(
+            "OLD DID document publishes a PreRotationCommitment service; \
+             migration verification REQUIRES a PreRotationProof — STRONG \
+             assurance was committed but not provided"
+                .to_owned(),
+        ));
     }
 
     // Step 2: Verify the pre-rotation proof if present.
@@ -3479,8 +3532,12 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// MODERATE-only path is valid only when the OLD document publishes
+    /// no `PreRotationCommitment` service. Strip the service to model a
+    /// legacy / non-committing identity, then verify with
+    /// `pre_rotation_proof = None`.
     #[tokio::test]
-    async fn verify_migration_works_without_pre_rotation_proof() {
+    async fn verify_migration_accepts_missing_pre_rotation_proof_when_old_doc_lacks_commitment() {
         let custody = Arc::new(InMemoryKeyCustody::new());
         let dht = make_dht_with_custody(&custody);
 
@@ -3502,7 +3559,63 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify with no pre-rotation proof (MODERATE assurance only).
+        // Model a legacy OLD document that did NOT commit to a
+        // pre-rotation key — strip the service entry. With no
+        // commitment service published, MODERATE-only verification is
+        // permissible (ADR-003 §4c).
+        let mut doc_no_commitment = document.clone();
+        doc_no_commitment
+            .service
+            .retain(|s| s.service_type != "PreRotationCommitment");
+        assert!(doc_no_commitment.pre_rotation_service().is_none());
+
+        let result = verify_migration(
+            &event.old_did,
+            &doc_no_commitment,
+            &event.new_did,
+            &event.migration_proof,
+            None,
+            event.rotated_at,
+            event.rotated_at + 1,
+        );
+        assert!(
+            result.is_ok(),
+            "MODERATE-only verification must accept a None proof when the OLD \
+             document has no PreRotationCommitment service: {result:?}"
+        );
+        assert!(result.unwrap());
+    }
+
+    /// When the OLD document publishes a `PreRotationCommitment`
+    /// service, MODERATE-only verification (`pre_rotation_proof = None`)
+    /// MUST be rejected. STRONG assurance was committed to at creation
+    /// and cannot be silently downgraded — see ADR-003 §4c invariant 6.
+    #[tokio::test]
+    async fn verify_migration_rejects_missing_pre_rotation_proof_when_old_doc_has_commitment() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+        // The OLD document MUST carry a PreRotationCommitment service —
+        // that's the precondition this test exercises.
+        assert!(document.pre_rotation_service().is_some());
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (_new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .unwrap();
+
         let result = verify_migration(
             &event.old_did,
             &document,
@@ -3512,8 +3625,17 @@ mod tests {
             event.rotated_at,
             event.rotated_at + 1,
         );
-        assert!(result.is_ok());
-        assert!(result.unwrap());
+        assert!(
+            result.is_err(),
+            "verify_migration must reject None proof when the OLD document \
+             publishes a PreRotationCommitment service: {result:?}"
+        );
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("PreRotationCommitment") && msg.contains("REQUIRES"),
+            "rejection message should name the missing proof requirement: {msg}"
+        );
     }
 
     #[tokio::test]

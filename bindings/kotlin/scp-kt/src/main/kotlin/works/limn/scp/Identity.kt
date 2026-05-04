@@ -81,6 +81,25 @@ interface IdentityAdvancedBindings {
     fun identityMigrate(identityHandle: Long): Long
 
     /**
+     * Returns the JSON-serialized `DidRotationEvent` produced when the
+     * given handle was minted by [identityMigrate]. SDK callers MUST
+     * distribute the event to active context members per spec
+     * §3.2.1 step 4b. Returns `null` for handles that did not change
+     * the DID (e.g., create, rotate-key, agent-key ops, load).
+     *
+     * Mirrors the UniFFI-generated `Identity.rotationEventJson()`
+     * accessor on the auto-generated Kotlin binding (and the
+     * equivalent Swift `Identity.rotationEventJson()` /
+     * Python `Identity.rotation_event_json` /
+     * TypeScript `BridgeIdentityHandle.rotationEventJson`).
+     *
+     * @param identityHandle Handle from a migration operation.
+     * @return JSON-serialized `DidRotationEvent` or `null`.
+     * @throws BridgeException if the handle is invalid.
+     */
+    fun identityRotationEventJson(identityHandle: Long): String?
+
+    /**
      * Generates a device attestation token for an identity.
      *
      * @param identityHandle Handle from identity create.
@@ -206,6 +225,7 @@ interface IdentityAdvancedBindings {
  *
  * See §3.2 (Key Custody), §3.4 (Linking Identities), ADR-039.
  */
+@Suppress("TooManyFunctions")
 class IdentityAdvancedBridge internal constructor(
     private val bindings: IdentityAdvancedBindings,
     private val bridge: CoroutineBridge,
@@ -260,10 +280,40 @@ class IdentityAdvancedBridge internal constructor(
     /**
      * Migrates an identity to a new DID.
      *
+     * Convenience overload returning only the new identity handle. Use
+     * [migrateWithRotationEvent] when the caller needs to distribute
+     * the `DidRotationEvent` to active context members.
+     *
      * @param identityHandle Handle from identity create or load.
      * @return Updated opaque identity handle with new DID.
      */
     suspend fun migrate(identityHandle: Long): Long = bridge.ffiCall { bindings.identityMigrate(identityHandle) }
+
+    /**
+     * Migrates an identity to a new DID and returns both the new
+     * handle and the JSON-serialized `DidRotationEvent`.
+     *
+     * SDK callers MUST distribute
+     * [IdentityMigrateResult.rotationEventJson] to all active
+     * contexts where the OLD DID is a member (spec §3.2.1 step 4b).
+     * Without distribution, peers will reject subsequent messages
+     * signed by the new DID's `#active` key as unauthorized.
+     *
+     * Mirrors the rotation-event accessor exposed on the other
+     * SDKs: Python `Identity.rotation_event_json`, TypeScript
+     * `BridgeIdentityHandle.rotationEventJson`, Swift
+     * `Identity.rotationEventJson()`.
+     *
+     * @param identityHandle Handle from identity create or load.
+     * @return The new identity handle paired with the rotation
+     *   event JSON.
+     */
+    suspend fun migrateWithRotationEvent(identityHandle: Long): IdentityMigrateResult =
+        bridge.ffiCall {
+            val newHandle = bindings.identityMigrate(identityHandle)
+            val eventJson = bindings.identityRotationEventJson(newHandle)
+            IdentityMigrateResult(handle = newHandle, rotationEventJson = eventJson)
+        }
 
     /**
      * Generates a device attestation token for an identity.
@@ -399,6 +449,34 @@ class IdentityAdvancedBridge internal constructor(
     ): Boolean =
         bridge.ffiCall { bindings.identityVerifyLinkAttestation(attestationJson, issuerPublicKeyHex) }
 }
+
+// ---------------------------------------------------------------------------
+// Identity migration result (§3.2.1, ADR-003 §4b)
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of [IdentityAdvancedBridge.migrateWithRotationEvent].
+ *
+ * The new opaque identity handle PLUS the JSON-serialized
+ * `DidRotationEvent` that SDK callers MUST distribute to active
+ * context members (spec §3.2.1 step 4b).
+ *
+ * Mirrors the rotation-event accessor on the other SDKs:
+ * Python `Identity.rotation_event_json`, TypeScript
+ * `BridgeIdentityHandle.rotationEventJson`, Swift
+ * `Identity.rotationEventJson()`.
+ *
+ * @property handle Opaque handle for the migrated identity (new DID).
+ * @property rotationEventJson JSON-serialized `DidRotationEvent`,
+ *   or `null` if the underlying handle did not change the DID
+ *   (which is unusual for `migrate` and indicates an upstream FFI
+ *   issue — production callers should treat `null` here as a
+ *   distribution-skipped warning, not a normal case).
+ */
+data class IdentityMigrateResult(
+    val handle: Long,
+    val rotationEventJson: String?,
+)
 
 // ---------------------------------------------------------------------------
 // Identity Link Attestation (§3.5)

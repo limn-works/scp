@@ -117,6 +117,17 @@ pub struct ScpIdentity {
     /// the pre-rotation key MUST be on a separate custody provider /
     /// authentication flow from daily operations, so that compromise of
     /// the operational custody path does not compromise the recovery path.
+    ///
+    /// **Snapshot semantics — not authoritative for verification.** This
+    /// field is captured at `create_identity` / `migrate_identity` time
+    /// and is a convenience cache only. The authoritative source for
+    /// migration verification is the `PreRotationCommitment` service
+    /// entry on the published [`DidDocument`](crate::DidDocument)
+    /// (consulted by [`crate::dht::verify_migration`]). If a future SDK
+    /// path were to mutate pre-rotation custody outside
+    /// `migrate_identity` and the cached value drifted from the
+    /// document, the document is canonical — verifiers MUST consult
+    /// the document service entry, not this snapshot.
     pub pre_rotation_commitment: [u8; 32],
 
     /// The DID string: `did:dht:z<z-base-32(identity_key.public)>`.

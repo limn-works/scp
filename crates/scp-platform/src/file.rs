@@ -1299,8 +1299,15 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let custody = Arc::new(make_custody(&dir, "concurrent-dedup-passphrase"));
 
-        // Use the all-zero probe seed that migrate_identity step-0
-        // shares across concurrent migrations.
+        // A fixed all-zero seed is used purely to deterministically
+        // exercise the concurrent same-content code path of
+        // `import_ed25519_signing_key`'s dedup logic — two tasks
+        // import IDENTICAL bytes simultaneously and must collapse to
+        // a single content-keyed entry. This test does NOT mirror
+        // `migrate_identity`'s probe behaviour: that probe draws
+        // OS-CSPRNG bytes precisely so it cannot alias any
+        // pre-existing entry. The fixed seed here is a test
+        // affordance, not a representation of any production caller.
         let seed = Zeroizing::new([0u8; 32]);
 
         let custody_a = Arc::clone(&custody);

@@ -288,7 +288,7 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
 
 ### Acceptance Criteria
 
-1. **`create_identity(key_custody, pre_rotation_custody) -> (Identity, PreRotationKeyHandle)`**
+1. **`create_identity(key_custody, pre_rotation_custody) -> (Identity, DidDocument, PreRotationKeyHandle)`**
    - Generates the operational keypairs via `key_custody` (`#0`, `#active`,
      and optional `#agent`).
    - Generates the pre-rotation seed bytes via the operational custody's
@@ -298,8 +298,11 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
      persisted in operational custody — spec §9.7.4.1 §3 (storage
      isolation) and §5(f) (destroy after backup) MANDATE separation.
    - Returns the `Identity` (containing operational handles + the
-     `pre_rotation_commitment` hash) AND a `PreRotationKeyHandle`
-     referencing the cold-custody entry. The caller persists both.
+     `pre_rotation_commitment` hash), the constructed `DidDocument`
+     (with `#0`, `#active`, optional `#agent`, and the
+     `PreRotationCommitment` service entry) AND a
+     `PreRotationKeyHandle` referencing the cold-custody entry. The
+     caller persists all three.
    - **Key roles:**
      - **Identity Key** (Ed25519, in `key_custody`): derives the DID
        string. Stored in highest-security operational custody.
@@ -402,14 +405,17 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
      1. **Migration proof signature.** `migration_proof.signature` is a strict Ed25519 verification (`verify_strict`) of `SHA-256(DOMAIN_MIGRATION_V1 || u32_be(len(old_did)) || old_did || u32_be(len(new_did)) || new_did || u64_be(rotated_at))` under `migration_proof.old_public_key`.
      2. **Self-cert binding of `old_did`.** `migration_proof.old_public_key` MUST z-base-32-encode (with the `did:dht:z` prefix) to exactly the `old_did` argument. did:dht is self-certifying — without this check, an attacker could substitute their own pubkey and a valid signature and forge "MODERATE assurance" migrations.
      3. **`rotated_at` future-skew bound (saturating).** `rotated_at` MUST NOT exceed `now + MAX_FUTURE_SKEW_SECS` (5 minutes). Bound is computed via `saturating_add` so verifiers cannot be tricked by an extreme `now`.
-     4. **`rotated_at` past-window bound (saturating).** `rotated_at` MUST NOT be earlier than `now - MAX_PAST_WINDOW_SECS` (5 years). Bound is computed via `saturating_sub` so the check is lenient near the Unix epoch (a clock at or before ~1975 UTC accepts every `rotated_at`); on any properly-set clock this corresponds to the documented 5-year past window.
+     4. **`rotated_at` past-window bound (saturating).** `rotated_at` MUST NOT be earlier than `now - MAX_PAST_WINDOW_SECS` (5 years). Bound is computed via `saturating_sub`, so on a properly-set clock this enforces the documented 5-year past window. A faulty verifier whose clock reads before the protocol epoch would otherwise satisfy this bound trivially — invariant 5 below closes that gap.
+     5. **Hard epoch floor on `rotated_at`.** `rotated_at` MUST be at least `MIGRATION_EPOCH_FLOOR_UNIX_SECS = 1_700_000_000` (2023-11-14 UTC, before any SCP migration could plausibly have occurred). Rejection is unconditional on `now`, so a verifier whose clock reads before ~1975 UTC (the saturating-zero region of invariant 4) still rejects attacker-forged pre-protocol timestamps such as `rotated_at = 0`.
+     6. **Pre-rotation proof presence enforced by OLD document.** If the OLD DID document publishes a `PreRotationCommitment` service entry, `pre_rotation_proof` MUST be `Some(_)`. The OLD identity's holder committed to STRONG assurance at creation time; accepting a `None` here would let an attacker who captured the OLD `#0` key migrate to any `new_did` they control under the MODERATE-only path, bypassing the pre-rotation chain. When the OLD document has no `PreRotationCommitment` service, `pre_rotation_proof` MAY be `None` and verification falls through to MODERATE assurance.
    - Conditional invariants — applied only when `pre_rotation_proof` is `Some(_)` (STRONG assurance):
-     5. **Commitment integrity.** `SHA-256(pre_rotation_proof.revealed_key) == pre_rotation_proof.commitment`. Verifies the revealed preimage matches the published commitment.
-     6. **Commitment binding to the OLD document.** `pre_rotation_proof.commitment` MUST equal the 32-byte preimage published in the old DID document's `PreRotationCommitment` service entry (parsed from the `sha256:<hex>` `serviceEndpoint`). Without this, an attacker who captured a single valid `(commitment, revealed_key)` pair could substitute a `commitment` the victim never published.
-     7. **Self-cert binding of `new_did`.** `pre_rotation_proof.revealed_key` MUST z-base-32-encode (with the `did:dht:z` prefix) to exactly the `new_did` argument — preventing a valid proof for one new DID from being substituted under a different `new_did` string.
+     7. **Commitment integrity.** `SHA-256(pre_rotation_proof.revealed_key) == pre_rotation_proof.commitment`. Verifies the revealed preimage matches the published commitment.
+     8. **Commitment binding to the OLD document.** `pre_rotation_proof.commitment` MUST equal the 32-byte preimage published in the old DID document's `PreRotationCommitment` service entry (parsed from the `sha256:<hex>` `serviceEndpoint`). Without this, an attacker who captured a single valid `(commitment, revealed_key)` pair could substitute a `commitment` the victim never published.
+     9. **Self-cert binding of `new_did`.** `pre_rotation_proof.revealed_key` MUST z-base-32-encode (with the `did:dht:z` prefix) to exactly the `new_did` argument — preventing a valid proof for one new DID from being substituted under a different `new_did` string.
    - **Assurance levels.**
-     - With `pre_rotation_proof = Some(_)`: invariants 1-7 enforced. STRONG assurance — the old identity holder pre-committed to the next identity key at creation time, and any verifier can confirm the rotation lands at exactly that committed key.
-     - With `pre_rotation_proof = None`: invariants 1-4 enforced, plus the `new_did` self-cert (the signed digest contains `new_did` and the migration_proof binds the signer to `old_did`). MODERATE assurance — the rotation is signed by the holder of the old identity key, but no pre-commitment guarantees the new identity key was selected before compromise. Used as a fallback when the original creator did not publish a pre-rotation commitment.
+     - With `pre_rotation_proof = Some(_)`: invariants 1-9 enforced. STRONG assurance — the old identity holder pre-committed to the next identity key at creation time, and any verifier can confirm the rotation lands at exactly that committed key.
+     - With `pre_rotation_proof = None` AND the OLD document has no `PreRotationCommitment` service: invariants 1-5 enforced, plus the `new_did` self-cert (the signed digest contains `new_did` and the migration_proof binds the signer to `old_did`). MODERATE assurance — the rotation is signed by the holder of the old identity key, but no pre-commitment guarantees the new identity key was selected before compromise. Used as a fallback when the original creator did not publish a pre-rotation commitment.
+     - With `pre_rotation_proof = None` AND the OLD document HAS a `PreRotationCommitment` service: rejected by invariant 6 — STRONG assurance was committed to and MUST be presented.
 
    **Identity structure at creation:**
 

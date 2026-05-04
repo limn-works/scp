@@ -2230,6 +2230,12 @@ fn from_did_inner(did: String) -> Result<WasmIdentity, ScpWasmError> {
                     });
                 }
             }
+            // DO NOT inline the cap-rejection check above into this
+            // borrow_mut block. The current split (read borrow → drop
+            // → write borrow) is intentional defense-in-depth: a
+            // future re-entrant JS callback inside `or_insert_with`
+            // would `BorrowMutError` if the cap check also held a
+            // mutable borrow. Keep the two borrows separate.
             let mut map = reg.borrow_mut();
             let entry = map
                 .entry(did.clone())
