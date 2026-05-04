@@ -44,6 +44,7 @@ use zeroize::Zeroizing;
 use super::protocol::{ClientMessage, RelayMessage};
 use crate::backoff::ReconnectBackoff;
 use crate::error::TransportError;
+use crate::subscription::TransportSubscriptionMap;
 
 /// Keepalive interval: client sends PING every 30 seconds.
 const PING_INTERVAL: Duration = Duration::from_secs(30);
@@ -107,11 +108,17 @@ pub enum SubscriptionMessage {
 }
 
 /// Subscription state tracked for reconnection recovery.
+///
+/// Stored as the value type in the [`TransportSubscriptionMap`]; the routing
+/// ID is the map key, not duplicated here.
+///
+/// `Clone` is required because [`TransportSubscriptionMap::snapshot`] returns
+/// owned `(RoutingId, V)` pairs (used by [`NativeRelayClient::reconnect`]).
+/// Snapshots may yield one final clone of the sender that delivers a message
+/// after the caller has invoked `unsubscribe` -- receivers tolerate this in
+/// the same way `mpsc::Receiver` already tolerates the close race.
 #[derive(Debug, Clone)]
 struct SubscriptionState {
-    /// The routing ID this subscription is for (used during reconnection).
-    #[allow(dead_code)]
-    routing_id: [u8; 32],
     /// The last relay-provided `stored_at` timestamp (untrusted metadata, used
     /// only for logging/diagnostics -- never for security decisions).
     last_stored_at: Option<u64>,
@@ -130,13 +137,11 @@ struct ClientInner {
     pending: HashMap<String, PendingRequest>,
     /// Next `ref_id` counter for generating unique request IDs.
     next_ref_id: u64,
-    /// Active subscriptions keyed by routing ID.
-    subscriptions: HashMap<[u8; 32], SubscriptionState>,
     /// LRU cache of blob IDs already seen (for deduplication on reconnect).
     ///
     /// Bounded to [`DEDUP_CACHE_CAPACITY`] entries to prevent unbounded memory
-    /// growth in long-lived connections (#1466). Oldest entries are evicted
-    /// when the cache is full.
+    /// growth in long-lived connections. Oldest entries are evicted when the
+    /// cache is full.
     seen_blob_ids: lru::LruCache<[u8; 32], ()>,
     /// Whether the client is currently connected.
     connected: bool,
@@ -175,6 +180,12 @@ pub struct NativeRelayClient {
     bearer_token: Option<Arc<Zeroizing<String>>>,
     /// Shared mutable inner state.
     inner: Arc<RwLock<ClientInner>>,
+    /// Active subscriptions keyed by routing ID.
+    ///
+    /// Lives as a sibling of [`ClientInner`] (rather than a field within it)
+    /// because [`TransportSubscriptionMap`] manages its own internal lock;
+    /// nesting it inside `RwLock<ClientInner>` would double-lock.
+    subscriptions: Arc<TransportSubscriptionMap<SubscriptionState>>,
     /// The WebSocket sink (write half), protected by a mutex for exclusive
     /// write access across concurrent callers.
     ws_sink: Arc<Mutex<Option<WsSink>>>,
@@ -231,7 +242,6 @@ impl NativeRelayClient {
         let inner = Arc::new(RwLock::new(ClientInner {
             pending: HashMap::new(),
             next_ref_id: 1,
-            subscriptions: HashMap::new(),
             seen_blob_ids: lru::LruCache::new(
                 NonZeroUsize::new(DEDUP_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN),
             ),
@@ -244,6 +254,7 @@ impl NativeRelayClient {
             url: url.to_string(),
             bearer_token: bearer_token.map(Arc::new),
             inner,
+            subscriptions: Arc::new(TransportSubscriptionMap::new()),
             ws_sink: Arc::new(Mutex::new(None)),
             reader_handle: Arc::new(Mutex::new(None)),
             keepalive_handle: Arc::new(Mutex::new(None)),
@@ -313,6 +324,7 @@ impl NativeRelayClient {
         let reader_handle = tokio::spawn(Self::reader_loop(
             source,
             Arc::clone(&self.inner),
+            Arc::clone(&self.subscriptions),
             shutdown_rx,
         ));
         *self.reader_handle.lock().await = Some(reader_handle);
@@ -334,6 +346,7 @@ impl NativeRelayClient {
     async fn reader_loop(
         mut source: WsSource,
         inner: Arc<RwLock<ClientInner>>,
+        subscriptions: Arc<TransportSubscriptionMap<SubscriptionState>>,
         mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
     ) {
         loop {
@@ -352,7 +365,7 @@ impl NativeRelayClient {
                     match msg {
                         Message::Binary(data) => {
                             if let Ok(relay_msg) = RelayMessage::from_bytes(&data) {
-                                Self::dispatch_relay_message(&inner, relay_msg).await;
+                                Self::dispatch_relay_message(&inner, &subscriptions, relay_msg).await;
                             }
                         }
                         Message::Close(_) => {
@@ -373,7 +386,11 @@ impl NativeRelayClient {
 
     /// Dispatches a relay message to the appropriate pending request or
     /// subscription channel.
-    async fn dispatch_relay_message(inner: &Arc<RwLock<ClientInner>>, msg: RelayMessage) {
+    async fn dispatch_relay_message(
+        inner: &Arc<RwLock<ClientInner>>,
+        subscriptions: &Arc<TransportSubscriptionMap<SubscriptionState>>,
+        msg: RelayMessage,
+    ) {
         match &msg {
             // OK and ERR responses are correlated by `ref_id`.
             RelayMessage::Ok { ref_id, .. } | RelayMessage::Err { ref_id, .. } => {
@@ -386,7 +403,8 @@ impl NativeRelayClient {
             }
 
             // BLOB messages are delivered to the subscription channel for the
-            // matching routing ID.
+            // matching routing ID. The reader_loop is single-task, so a stalled
+            // `tx.send().await` here also stalls subsequent BLOB and OK dispatch.
             RelayMessage::Blob {
                 routing_id,
                 blob_id,
@@ -407,12 +425,10 @@ impl NativeRelayClient {
                     );
 
                     // Emit BlobIntegrityError to the subscription channel if one exists.
-                    let maybe_tx = inner
-                        .read()
-                        .await
-                        .subscriptions
-                        .get(routing_id)
-                        .map(|sub| sub.tx.clone());
+                    let maybe_tx = subscriptions
+                        .with(&crate::traits::RoutingId::new(*routing_id), |sub| {
+                            sub.tx.clone()
+                        });
                     if let Some(tx) = maybe_tx {
                         let _ = tx
                             .send(SubscriptionMessage::BlobIntegrityError { expected, actual })
@@ -422,46 +438,78 @@ impl NativeRelayClient {
                 }
 
                 let receive_time = Instant::now();
-                let mut state = inner.write().await;
+                let rid = crate::traits::RoutingId::new(*routing_id);
 
-                // Deduplication: skip if we've already seen this `blob_id`.
-                // `LruCache::contains` does NOT promote the entry (no LRU
-                // reorder), which is correct — we just want to check presence.
-                if state.seen_blob_ids.contains(blob_id) {
-                    return;
+                // 1. Deduplication check (read-only, no commit yet). A
+                //    write-locked check + commit here would let an attacker
+                //    poison the dedup LRU with `blob_id`s for unsolicited
+                //    routing_ids, evicting legitimate entries.
+                {
+                    let state = inner.read().await;
+                    if state.seen_blob_ids.contains(blob_id) {
+                        return;
+                    }
                 }
-                state.seen_blob_ids.put(*blob_id, ());
 
-                if let Some(sub) = state.subscriptions.get_mut(routing_id) {
+                // 2. Plausibility check: warn if relay timestamp deviates
+                //    significantly from local wall-clock time. Independent of
+                //    dedup; runs whether or not the routing_id is subscribed.
+                {
+                    let local_now = scp_primitives::SystemClock.now_secs();
+                    let deviation = local_now.abs_diff(*stored_at);
+                    if deviation > RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS {
+                        tracing::warn!(
+                            relay_stored_at = *stored_at,
+                            local_time = local_now,
+                            deviation_secs = deviation,
+                            "relay stored_at deviates from local time by more \
+                             than {RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS}s; \
+                             possible malicious relay"
+                        );
+                    }
+                }
+
+                // 3. Mutate subscription state and clone its sender. If no
+                //    subscription exists for this routing_id, return WITHOUT
+                //    committing the dedup mark. Returning without committing
+                //    means a future legitimate redelivery (e.g. after an
+                //    unsubscribe-then-resubscribe race) is still deliverable.
+                let maybe_tx = subscriptions.with_mut(&rid, |sub| {
                     // Record local monotonic receive time for reconnection
                     // window calculations (immune to relay timestamp
                     // manipulation).
                     sub.last_local_receive = Some(receive_time);
-
                     // Update relay-provided `stored_at` as untrusted metadata
                     // (informational/logging only).
                     if sub.last_stored_at.is_none_or(|prev| *stored_at > prev) {
                         sub.last_stored_at = Some(*stored_at);
                     }
+                    sub.tx.clone()
+                });
 
-                    // Plausibility check: warn if relay timestamp deviates
-                    // significantly from local wall-clock time.
-                    {
-                        let local_now = scp_primitives::SystemClock.now_secs();
-                        let deviation = local_now.abs_diff(*stored_at);
-                        if deviation > RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS {
-                            tracing::warn!(
-                                relay_stored_at = *stored_at,
-                                local_time = local_now,
-                                deviation_secs = deviation,
-                                "relay stored_at deviates from local time by more \
-                                 than {RELAY_TIMESTAMP_DEVIATION_THRESHOLD_SECS}s; \
-                                 possible malicious relay"
-                            );
-                        }
+                let Some(tx) = maybe_tx else {
+                    // No subscriber: do not pollute the dedup cache so future
+                    // redelivery for this blob_id remains possible.
+                    return;
+                };
+
+                // 4. Send outside any lock. A slow or stalled subscriber here
+                //    blocks the reader_loop (see the note on the BLOB arm),
+                //    but does not contend with `inner.write()`-holders such
+                //    as `send_request`'s pending-map mutation.
+                //
+                //    On `Err`: the receiver was dropped between `with_mut`
+                //    (which cloned the sender) and `tx.send`. We must NOT
+                //    commit dedup -- a future redelivery (e.g. after
+                //    resubscribe) for this `blob_id` must remain deliverable.
+                let blob_id_copy = *blob_id;
+                if tx.send(SubscriptionMessage::Relay(msg)).await.is_ok() {
+                    // Double-check guards the static dispatch_relay_message helper when
+                    // invoked concurrently from tests; the production reader_loop is single-task.
+                    let mut state = inner.write().await;
+                    if !state.seen_blob_ids.contains(&blob_id_copy) {
+                        state.seen_blob_ids.put(blob_id_copy, ());
                     }
-
-                    let _ = sub.tx.send(SubscriptionMessage::Relay(msg)).await;
                 }
             }
 
@@ -477,9 +525,10 @@ impl NativeRelayClient {
                     drop(state);
                 }
 
-                // Broadcast event to all subscriptions.
-                let state = inner.read().await;
-                for sub in state.subscriptions.values() {
+                // Broadcast event to all subscriptions. Snapshot senders first
+                // so the map's read lock is dropped before each `send().await`.
+                let snap = subscriptions.snapshot();
+                for (_rid, sub) in snap {
                     let _ = sub.tx.send(SubscriptionMessage::Relay(msg.clone())).await;
                 }
             }
@@ -611,16 +660,22 @@ impl NativeRelayClient {
     ) -> Result<mpsc::Receiver<SubscriptionMessage>, TransportError> {
         let (tx, rx) = mpsc::channel(256);
 
+        let rid = crate::traits::RoutingId::new(*routing_id);
+
         // Register subscription state before sending to avoid race conditions.
-        self.inner.write().await.subscriptions.insert(
-            *routing_id,
-            SubscriptionState {
-                routing_id: *routing_id,
-                last_stored_at: None,
-                last_local_receive: None,
-                tx,
-            },
-        );
+        // Use `insert` (not `insert_or_replace`): a duplicate routing ID
+        // surfaces as an error rather than silently overwriting (and leaking
+        // the prior subscriber's `mpsc::Sender`).
+        self.subscriptions
+            .insert(
+                rid,
+                SubscriptionState {
+                    last_stored_at: None,
+                    last_local_receive: None,
+                    tx,
+                },
+            )
+            .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
 
         let msg = ClientMessage::Subscribe {
             ref_id: None,
@@ -629,24 +684,20 @@ impl NativeRelayClient {
         };
 
         let response = self.send_request(msg).await.map_err(|e| {
-            let inner = Arc::clone(&self.inner);
-            let rid = *routing_id;
-            tokio::spawn(async move {
-                inner.write().await.subscriptions.remove(&rid);
-            });
+            self.subscriptions.remove(&rid);
             TransportError::SubscriptionFailed(e.to_string())
         })?;
 
         match response {
             RelayMessage::Ok { .. } => Ok(rx),
             RelayMessage::Err { code, msg, .. } => {
-                self.inner.write().await.subscriptions.remove(routing_id);
+                self.subscriptions.remove(&rid);
                 Err(TransportError::SubscriptionFailed(format!(
                     "relay error {code}: {msg}"
                 )))
             }
             _ => {
-                self.inner.write().await.subscriptions.remove(routing_id);
+                self.subscriptions.remove(&rid);
                 Err(TransportError::SubscriptionFailed(
                     "unexpected response to SUBSCRIBE".to_string(),
                 ))
@@ -671,7 +722,8 @@ impl NativeRelayClient {
         let response = self.send_request(msg).await?;
 
         // Remove subscription regardless of response.
-        self.inner.write().await.subscriptions.remove(routing_id);
+        self.subscriptions
+            .remove(&crate::traits::RoutingId::new(*routing_id));
 
         match response {
             RelayMessage::Err { code, msg, .. } => Err(TransportError::SendFailed(format!(
@@ -696,14 +748,10 @@ impl NativeRelayClient {
         routing_id: &[u8; 32],
         since: Option<u64>,
     ) -> Result<Vec<OuterEnvelope>, TransportError> {
+        let rid = crate::traits::RoutingId::new(*routing_id);
+
         // Check if there's already an active subscription for this `routing_id`.
-        if self
-            .inner
-            .read()
-            .await
-            .subscriptions
-            .contains_key(routing_id)
-        {
+        if self.subscriptions.contains(&rid) {
             // When there's an active subscription, just send the QUERY.
             // Results will be delivered through the existing subscription.
             let msg = ClientMessage::Query {
@@ -719,15 +767,20 @@ impl NativeRelayClient {
         let (tx, mut rx) = mpsc::channel::<SubscriptionMessage>(256);
 
         // Register a temporary subscription for receiving BLOB messages.
-        self.inner.write().await.subscriptions.insert(
-            *routing_id,
-            SubscriptionState {
-                routing_id: *routing_id,
-                last_stored_at: None,
-                last_local_receive: None,
-                tx,
-            },
-        );
+        // `Duplicate` may occur under concurrent `subscribe`+`query` for the
+        // same routing_id; the check/insert is intentionally racy because the
+        // cost of a brief misorder is just a `SubscriptionFailed` to the
+        // caller.
+        self.subscriptions
+            .insert(
+                rid,
+                SubscriptionState {
+                    last_stored_at: None,
+                    last_local_receive: None,
+                    tx,
+                },
+            )
+            .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
 
         // Send the QUERY command.
         let msg = ClientMessage::Query {
@@ -738,15 +791,11 @@ impl NativeRelayClient {
         };
 
         let response = self.send_request(msg).await.inspect_err(|_| {
-            let inner = Arc::clone(&self.inner);
-            let rid = *routing_id;
-            tokio::spawn(async move {
-                inner.write().await.subscriptions.remove(&rid);
-            });
+            self.subscriptions.remove(&rid);
         })?;
 
         if let RelayMessage::Err { code, msg, .. } = &response {
-            self.inner.write().await.subscriptions.remove(routing_id);
+            self.subscriptions.remove(&rid);
             return Err(TransportError::SendFailed(format!(
                 "relay error {code}: {msg}"
             )));
@@ -783,7 +832,7 @@ impl NativeRelayClient {
         }
 
         // Clean up temporary subscription.
-        self.inner.write().await.subscriptions.remove(routing_id);
+        self.subscriptions.remove(&rid);
 
         Ok(envelopes)
     }
@@ -834,17 +883,19 @@ impl NativeRelayClient {
 
             match self.establish_connection().await {
                 Ok(()) => {
-                    // Re-subscribe to all active routing IDs.
-                    let subs_snapshot: Vec<_> = self
-                        .inner
-                        .read()
-                        .await
+                    // Single snapshot reused for both re-subscribe and the
+                    // post-reconnect Reconnected notification, avoiding two
+                    // independent walks of the map.
+                    let snap: Vec<_> = self
                         .subscriptions
-                        .values()
-                        .map(|s| (s.routing_id, s.last_local_receive))
+                        .snapshot()
+                        .into_iter()
+                        .map(|(rid, s)| (rid, s.last_local_receive, s.tx))
                         .collect();
 
-                    for (routing_id, last_local_receive) in subs_snapshot {
+                    // Re-subscribe to all active routing IDs first so any
+                    // backfill begins flowing before we notify subscribers.
+                    for (rid, last_local_receive, _tx) in &snap {
                         // Use local receive time (immune to relay timestamp
                         // manipulation) to compute the reconnect window.
                         let since = last_local_receive.map(|instant| {
@@ -857,7 +908,7 @@ impl NativeRelayClient {
 
                         let msg = ClientMessage::Subscribe {
                             ref_id: None,
-                            routing_id,
+                            routing_id: *rid.as_bytes(),
                             since,
                         };
 
@@ -868,12 +919,12 @@ impl NativeRelayClient {
 
                     // Notify all active subscriptions that a reconnection
                     // occurred so the adapter can emit
-                    // `TransportEvent::Reconnected`.
-                    let state = self.inner.read().await;
-                    for sub in state.subscriptions.values() {
-                        let _ = sub.tx.send(SubscriptionMessage::Reconnected).await;
+                    // `TransportEvent::Reconnected`. Reuses the same snapshot
+                    // taken above; the senders are already cloned out of the
+                    // map's read lock.
+                    for (_rid, _last_local_receive, tx) in snap {
+                        let _ = tx.send(SubscriptionMessage::Reconnected).await;
                     }
-                    drop(state);
 
                     return Ok(());
                 }
@@ -888,18 +939,6 @@ impl NativeRelayClient {
                 "reconnection failed after all backoff steps".to_string(),
             )
         }))
-    }
-
-    /// Returns a snapshot of the current subscription routing IDs.
-    #[allow(dead_code)]
-    pub async fn active_subscriptions(&self) -> Vec<[u8; 32]> {
-        self.inner
-            .read()
-            .await
-            .subscriptions
-            .keys()
-            .copied()
-            .collect()
     }
 
     /// Clears the deduplication cache. Useful after a successful reconnect
@@ -1073,33 +1112,37 @@ mod tests {
     // Blob integrity verification tests (SCP-193)
     // -----------------------------------------------------------------------
 
-    /// Helper: creates a `ClientInner` with a subscription for the given
-    /// routing ID, returning the inner state and the subscription receiver.
+    /// Helper: creates a `ClientInner` and a sibling subscription map with a
+    /// subscription registered for the given routing ID. Returns the inner
+    /// state, the subscriptions map, and the subscription receiver.
     fn setup_inner_with_subscription(
         routing_id: [u8; 32],
     ) -> (
         Arc<RwLock<ClientInner>>,
+        Arc<TransportSubscriptionMap<SubscriptionState>>,
         mpsc::Receiver<SubscriptionMessage>,
     ) {
         let (tx, rx) = mpsc::channel(16);
         let inner = Arc::new(RwLock::new(ClientInner {
             pending: HashMap::new(),
             next_ref_id: 1,
-            subscriptions: HashMap::from([(
-                routing_id,
-                SubscriptionState {
-                    routing_id,
-                    last_stored_at: None,
-                    last_local_receive: None,
-                    tx,
-                },
-            )]),
             seen_blob_ids: lru::LruCache::new(
                 NonZeroUsize::new(DEDUP_CACHE_CAPACITY).unwrap_or(NonZeroUsize::MIN),
             ),
             connected: true,
         }));
-        (inner, rx)
+        let subscriptions = Arc::new(TransportSubscriptionMap::<SubscriptionState>::new());
+        subscriptions
+            .insert(
+                crate::traits::RoutingId::new(routing_id),
+                SubscriptionState {
+                    last_stored_at: None,
+                    last_local_receive: None,
+                    tx,
+                },
+            )
+            .unwrap();
+        (inner, subscriptions, rx)
     }
 
     /// Computes SHA-256 of the given data, returning a 32-byte array.
@@ -1112,7 +1155,7 @@ mod tests {
         let routing_id = [0xAA; 32];
         let blob_data = vec![0x01, 0x02, 0x03];
         let correct_blob_id = sha256(&blob_data);
-        let (inner, mut rx) = setup_inner_with_subscription(routing_id);
+        let (inner, subscriptions, mut rx) = setup_inner_with_subscription(routing_id);
 
         let msg = RelayMessage::Blob {
             routing_id,
@@ -1123,7 +1166,7 @@ mod tests {
             blob: blob_data,
         };
 
-        NativeRelayClient::dispatch_relay_message(&inner, msg.clone()).await;
+        NativeRelayClient::dispatch_relay_message(&inner, &subscriptions, msg.clone()).await;
 
         // The blob should be delivered to the subscription channel.
         let received = rx.try_recv().unwrap();
@@ -1145,7 +1188,7 @@ mod tests {
         let original_blob = vec![0x01, 0x02, 0x03];
         let original_blob_id = sha256(&original_blob);
         let tampered_blob = vec![0xFF, 0xFE, 0xFD]; // Different content.
-        let (inner, mut rx) = setup_inner_with_subscription(routing_id);
+        let (inner, subscriptions, mut rx) = setup_inner_with_subscription(routing_id);
 
         let msg = RelayMessage::Blob {
             routing_id,
@@ -1156,7 +1199,7 @@ mod tests {
             blob: tampered_blob,
         };
 
-        NativeRelayClient::dispatch_relay_message(&inner, msg).await;
+        NativeRelayClient::dispatch_relay_message(&inner, &subscriptions, msg).await;
 
         // Should receive a BlobIntegrityError, not a Blob.
         let received = rx.try_recv().unwrap();
@@ -1174,7 +1217,7 @@ mod tests {
         let routing_id = [0xCC; 32];
         let empty_blob: Vec<u8> = vec![];
         let correct_blob_id = sha256(&empty_blob);
-        let (inner, mut rx) = setup_inner_with_subscription(routing_id);
+        let (inner, subscriptions, mut rx) = setup_inner_with_subscription(routing_id);
 
         let msg = RelayMessage::Blob {
             routing_id,
@@ -1185,7 +1228,7 @@ mod tests {
             blob: empty_blob,
         };
 
-        NativeRelayClient::dispatch_relay_message(&inner, msg).await;
+        NativeRelayClient::dispatch_relay_message(&inner, &subscriptions, msg).await;
 
         // Empty blob with correct hash should be accepted.
         let received = rx.try_recv().unwrap();
@@ -1198,6 +1241,164 @@ mod tests {
         );
 
         assert!(inner.read().await.seen_blob_ids.contains(&correct_blob_id));
+    }
+
+    /// Regression: a BLOB delivered for a `routing_id` we have no
+    /// subscription for must NOT poison the dedup LRU. The early return
+    /// at step 3 (`with_mut` returns `None`) means we never reach the
+    /// commit step.
+    #[tokio::test]
+    async fn dedup_not_committed_for_unsubscribed_routing_id() {
+        // Subscribe routing_id A.
+        let routing_id_a = [0xAAu8; 32];
+        let routing_id_b = [0xBBu8; 32];
+        let (inner, subscriptions, mut rx) = setup_inner_with_subscription(routing_id_a);
+
+        // Build a well-formed BLOB for routing_id B (NOT subscribed) with a
+        // payload chosen so that the same payload would also be valid on A.
+        let blob_payload = vec![0x01u8, 0x02, 0x03, 0x04];
+        let blob_id = sha256(&blob_payload);
+
+        let msg_for_b = RelayMessage::Blob {
+            routing_id: routing_id_b,
+            blob_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            stored_at: 1_700_000_000,
+            blob: blob_payload.clone(),
+        };
+
+        NativeRelayClient::dispatch_relay_message(&inner, &subscriptions, msg_for_b).await;
+
+        // The unsolicited BLOB must NOT have committed to dedup -- there
+        // was no subscriber for routing_id B, so we never made it past
+        // step 3 (the `with_mut` early return) into the commit step.
+        assert!(
+            !inner.read().await.seen_blob_ids.contains(&blob_id),
+            "unsolicited routing_id must not pollute dedup cache"
+        );
+
+        // A's subscriber must not have received B's BLOB.
+        assert!(
+            rx.try_recv().is_err(),
+            "subscriber for routing_id A must not receive a BLOB addressed to B"
+        );
+
+        // Now an identical BLOB (same blob_id) for routing_id A. Because
+        // dedup was not poisoned by the prior delivery, this must reach
+        // A's subscription channel.
+        let msg_for_a = RelayMessage::Blob {
+            routing_id: routing_id_a,
+            blob_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            stored_at: 1_700_000_000,
+            blob: blob_payload,
+        };
+
+        NativeRelayClient::dispatch_relay_message(&inner, &subscriptions, msg_for_a).await;
+
+        let received = rx.try_recv().unwrap();
+        assert!(
+            matches!(
+                received,
+                SubscriptionMessage::Relay(RelayMessage::Blob { .. })
+            ),
+            "expected Relay(Blob) for routing_id A, got {received:?}"
+        );
+
+        // After successful delivery, dedup commits.
+        assert!(inner.read().await.seen_blob_ids.contains(&blob_id));
+    }
+
+    /// Regression for the unsubscribe-during-dispatch race: if `with_mut`
+    /// finds a live subscription and clones its sender but the receiver is
+    /// dropped before `tx.send().await` completes, the dispatcher must
+    /// commit the dedup mark only when the send succeeds. Otherwise a
+    /// future resubscribe-then-redelivery for the same `blob_id` would be
+    /// silently suppressed.
+    #[tokio::test]
+    async fn dedup_not_committed_when_send_fails_after_unsubscribe() {
+        let routing_id = [0xCDu8; 32];
+
+        // Subscriber A is registered with a live (tx, rx) pair. Drop rx
+        // immediately: the subscription entry is still present in the map
+        // (with_mut will find it and clone tx), but the next
+        // tx.send().await will return Err.
+        let (inner, subscriptions, rx_a) = setup_inner_with_subscription(routing_id);
+        drop(rx_a);
+
+        // Build a well-formed BLOB for the still-mapped routing_id.
+        let blob_payload = vec![0x10u8, 0x11, 0x12, 0x13];
+        let blob_id = sha256(&blob_payload);
+
+        let msg = RelayMessage::Blob {
+            routing_id,
+            blob_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            stored_at: 1_700_000_000,
+            blob: blob_payload.clone(),
+        };
+
+        NativeRelayClient::dispatch_relay_message(&inner, &subscriptions, msg).await;
+
+        // The send failed (rx dropped), so the dedup mark must NOT have
+        // been committed. This is the load-bearing assertion: pre-fix
+        // (dedup committed before send) this would be `true`.
+        assert!(
+            !inner.read().await.seen_blob_ids.contains(&blob_id),
+            "dedup must not commit when tx.send fails after unsubscribe"
+        );
+
+        // Resubscribe: fresh (tx, rx) pair under the same routing_id.
+        // First clear the existing subscription entry, then insert a
+        // fresh one (insert rejects duplicates).
+        subscriptions.remove(&crate::traits::RoutingId::new(routing_id));
+        let (tx_a2, mut rx_a2) = mpsc::channel::<SubscriptionMessage>(16);
+        subscriptions
+            .insert(
+                crate::traits::RoutingId::new(routing_id),
+                SubscriptionState {
+                    last_stored_at: None,
+                    last_local_receive: None,
+                    tx: tx_a2,
+                },
+            )
+            .unwrap();
+
+        // Redeliver the SAME blob_id. If the dedup mark had been
+        // poisoned by the prior failed send, the dispatcher would
+        // early-return at step 1 and the new subscriber would never
+        // see the message.
+        let msg2 = RelayMessage::Blob {
+            routing_id,
+            blob_id,
+            recipient_hint: None,
+            blob_ttl: 3600,
+            stored_at: 1_700_000_000,
+            blob: blob_payload,
+        };
+        NativeRelayClient::dispatch_relay_message(&inner, &subscriptions, msg2).await;
+
+        // Robust against future async refactors that decouple `tx.send().await`
+        // completion from the rest of dispatch: wait on the channel rather
+        // than `try_recv`.
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), rx_a2.recv())
+            .await
+            .expect("timeout waiting for redelivery")
+            .expect("channel closed before redelivery");
+        assert!(
+            matches!(
+                received,
+                SubscriptionMessage::Relay(RelayMessage::Blob { .. })
+            ),
+            "fresh subscriber must receive the redelivered BLOB; \
+             got {received:?}. Dedup was poisoned by the prior failed send."
+        );
+
+        // After the successful delivery, dedup now commits.
+        assert!(inner.read().await.seen_blob_ids.contains(&blob_id));
     }
 
     // -----------------------------------------------------------------------
@@ -1346,5 +1547,58 @@ mod tests {
 
         // Pending map must be empty after successful response.
         assert_eq!(client.pending_len().await, 0);
+    }
+
+    #[tokio::test]
+    async fn subscribe_twice_to_same_routing_id_returns_error() {
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, addr) = server.start().await.unwrap();
+        let url = format!("ws://{addr}/scp/v1");
+
+        let client = NativeRelayClient::connect(&url).await.unwrap();
+
+        let routing_id = [0x77u8; 32];
+
+        // First subscribe should succeed.
+        let _rx1 = client
+            .subscribe(&routing_id, None)
+            .await
+            .expect("first subscribe should succeed");
+
+        // Second subscribe to the same routing ID must fail with
+        // SubscriptionFailed -- the underlying TransportSubscriptionMap
+        // surfaces duplicates rather than silently overwriting.
+        let err = client
+            .subscribe(&routing_id, None)
+            .await
+            .expect_err("second subscribe should fail");
+        assert!(
+            matches!(err, TransportError::SubscriptionFailed(_)),
+            "expected SubscriptionFailed, got {err:?}"
+        );
+
+        // The first subscriber's receiver is still live (rx1 above), so
+        // the original subscription remains active. A third subscribe
+        // would still fail for the same reason.
+        let err2 = client
+            .subscribe(&routing_id, None)
+            .await
+            .expect_err("third subscribe should still fail");
+        assert!(
+            matches!(err2, TransportError::SubscriptionFailed(_)),
+            "expected SubscriptionFailed on third attempt, got {err2:?}"
+        );
     }
 }

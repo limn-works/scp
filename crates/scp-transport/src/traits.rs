@@ -185,6 +185,13 @@ pub trait TransportAdapter: Send + Sync {
     /// Returns [`TransportError::SubscriptionFailed`] if the subscription
     /// cannot be established, or [`TransportError::NotConnected`] if the
     /// adapter has no active connection.
+    ///
+    /// # Behavior on duplicate `routing_id`
+    ///
+    /// `subscribe` semantics on duplicate routing-id are not uniform across
+    /// adapters; callers must not depend on either rejection or replacement.
+    /// Track local subscription state and avoid issuing duplicate subscribes.
+    /// See the follow-up tracking issue for the planned uniform contract.
     fn subscribe(
         &self,
         routing_id: &RoutingId,

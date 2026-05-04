@@ -58,6 +58,9 @@ use crate::native::protocol::{ClientMessage, RelayMessage};
 use crate::quic::streams::{
     QuicClientFrame, QuicRelayFrame, decode_frame_from_buf, decode_relay_frame, encode_client_frame,
 };
+use crate::subscription::{
+    MAX_TRANSPORT_SUBSCRIPTIONS, SubscriptionError, TransportSubscriptionMap,
+};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
 
 /// A boxed, pinned, `Send`-safe future -- the return type for all
@@ -159,9 +162,10 @@ pub struct WebTransportAdapter {
     /// Active WebSocket handle, wrapped for Send+Sync.
     ws_handle: Arc<Mutex<Option<SendSyncWrapper<web_sys::WebSocket>>>>,
 
-    /// WebTransport bidi stream handles for active subscriptions, keyed
-    /// by routing_id. Stored so that `unsubscribe()` can close the stream
-    /// to signal the relay.
+    /// Active WebTransport (HTTP/3) bidi-stream handles keyed by routing_id.
+    /// Used by the WT-HTTP/3 subscribe path; the lifecycle re-architecture
+    /// is tracked in a follow-up issue. The minimal cap+duplicate guard in
+    /// `subscribe()` uses a check-do-check pattern around this map.
     #[cfg(target_arch = "wasm32")]
     wt_bidi_handles:
         Arc<Mutex<HashMap<[u8; 32], SendSyncWrapper<web_sys::WebTransportBidirectionalStream>>>>,
@@ -169,7 +173,7 @@ pub struct WebTransportAdapter {
     /// WebSocket subscription routing: routing_id -> event sender.
     /// The WebSocket onmessage handler dispatches BLOB messages to the
     /// appropriate subscription sender based on the routing_id.
-    subscriptions: Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<TransportEvent>>>>,
+    subscriptions: Arc<TransportSubscriptionMap<mpsc::UnboundedSender<TransportEvent>>>,
 
     /// Pending request-response correlation for WebSocket path.
     /// Maps ref_id -> oneshot sender for the response.
@@ -233,7 +237,7 @@ impl WebTransportAdapter {
             ws_handle: Arc::new(Mutex::new(None)),
             #[cfg(target_arch = "wasm32")]
             wt_bidi_handles: Arc::new(Mutex::new(HashMap::new())),
-            subscriptions: Arc::new(Mutex::new(HashMap::new())),
+            subscriptions: Arc::new(TransportSubscriptionMap::new()),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             subscribe_ref_ids: Arc::new(Mutex::new(HashMap::new())),
             next_ref_id: Arc::new(Mutex::new(1)),
@@ -451,11 +455,14 @@ impl WebTransportAdapter {
                 return;
             };
 
-            // Deserialize as RelayMessage (MessagePack).
+            // Deserialize as RelayMessage (MessagePack). The relay's bytes
+            // are attacker-controlled; deliberately do not surface the
+            // serde error in any user-visible string -- it can include
+            // byte excerpts in `Display`.
             let relay_msg = match RelayMessage::from_bytes(&bytes) {
                 Ok(msg) => msg,
-                Err(e) => {
-                    tracing::warn!("failed to deserialize relay message: {e}");
+                Err(_) => {
+                    tracing::warn!("relay message deserialization failed");
                     return;
                 }
             };
@@ -940,14 +947,58 @@ impl TransportAdapter for WebTransportAdapter {
         Box::pin(async move {
             match state {
                 FallbackState::Connected(TransportKind::WebTransport) => {
-                    // WebTransport path: open a long-lived bidirectional stream,
-                    // send SUBSCRIBE frame, return event stream.
+                    // Check-do-check: race semantics under concurrent
+                    // subscribe/unsubscribe interleaving are documented as
+                    // known limitations; see the follow-up tracking issue
+                    // for the planned uniform lifecycle contract.
+                    {
+                        let guard = self.wt_bidi_handles.lock().map_err(|_| {
+                            TransportError::ProtocolError(
+                                "wt_bidi_handles lock poisoned".to_owned(),
+                            )
+                        })?;
+                        if guard.contains_key(&routing_id_bytes) {
+                            return Err(TransportError::SubscriptionFailed(
+                                "already subscribed to this routing_id".to_owned(),
+                            ));
+                        }
+                        if guard.len() >= MAX_TRANSPORT_SUBSCRIPTIONS {
+                            return Err(TransportError::SubscriptionFailed(format!(
+                                "subscription map full (max {MAX_TRANSPORT_SUBSCRIPTIONS} entries)"
+                            )));
+                        }
+                    }
+
                     let (stream, bidi_handle) =
                         self.wt_subscribe_stream(routing_id_bytes, since).await?;
-                    // Store the bidi handle so unsubscribe() can close it.
-                    if let Ok(mut guard) = self.wt_bidi_handles.lock() {
+
+                    {
+                        let mut guard = self.wt_bidi_handles.lock().map_err(|_| {
+                            TransportError::ProtocolError(
+                                "wt_bidi_handles lock poisoned".to_owned(),
+                            )
+                        })?;
+                        if guard.contains_key(&routing_id_bytes) {
+                            drop(guard);
+                            if let Ok(writer) = bidi_handle.inner().writable().get_writer() {
+                                let _ = writer.close();
+                            }
+                            return Err(TransportError::SubscriptionFailed(
+                                "concurrent subscribe completed for this routing_id".to_owned(),
+                            ));
+                        }
+                        if guard.len() >= MAX_TRANSPORT_SUBSCRIPTIONS {
+                            drop(guard);
+                            if let Ok(writer) = bidi_handle.inner().writable().get_writer() {
+                                let _ = writer.close();
+                            }
+                            return Err(TransportError::SubscriptionFailed(format!(
+                                "subscription map full (max {MAX_TRANSPORT_SUBSCRIPTIONS} entries)"
+                            )));
+                        }
                         guard.insert(routing_id_bytes, bidi_handle);
                     }
+
                     Ok(stream)
                 }
                 FallbackState::Connected(TransportKind::WebSocket) => {
@@ -968,18 +1019,18 @@ impl TransportAdapter for WebTransportAdapter {
                     // messages between send and registration. If a subscription
                     // already exists for this routing_id, reject the request
                     // to prevent clobbering the existing subscription's sender.
-                    {
-                        let mut guard = self
-                            .subscriptions
-                            .lock()
-                            .map_err(|_| TransportError::NotConnected)?;
-                        if guard.contains_key(&routing_id_bytes) {
-                            return Err(TransportError::SubscriptionFailed(
+                    self.subscriptions
+                        .insert(RoutingId::new(routing_id_bytes), tx)
+                        .map_err(|e| match e {
+                            SubscriptionError::Duplicate => TransportError::SubscriptionFailed(
                                 "already subscribed to this routing_id".to_owned(),
-                            ));
-                        }
-                        guard.insert(routing_id_bytes, tx);
-                    }
+                            ),
+                            SubscriptionError::CapacityExceeded(n) => {
+                                TransportError::SubscriptionFailed(format!(
+                                    "subscription map full ({n} entries)"
+                                ))
+                            }
+                        })?;
 
                     // Register ref_id -> routing_id mapping so that
                     // backfill_complete events can be routed to this specific
@@ -1016,25 +1067,25 @@ impl TransportAdapter for WebTransportAdapter {
         Box::pin(async move {
             match state {
                 FallbackState::Connected(TransportKind::WebTransport) => {
-                    // Remove the bidi handle and close its writable stream
-                    // to signal the relay that this subscription is done.
-                    // The relay recognizes closing the writer as an implicit
+                    let removed_handle = self
+                        .wt_bidi_handles
+                        .lock()
+                        .ok()
+                        .and_then(|mut guard| guard.remove(&routing_id_bytes));
+
+                    // Close the writable stream outside the lock to signal
+                    // the relay that this subscription is done. The relay
+                    // recognizes closing the writer as an implicit
                     // unsubscribe per the QUIC stream-per-operation model.
-                    if let Ok(mut guard) = self.wt_bidi_handles.lock() {
-                        if let Some(handle) = guard.remove(&routing_id_bytes) {
-                            // Close the writable stream to signal the relay.
-                            let writable = handle.inner().writable();
-                            if let Ok(writer) = writable.get_writer() {
-                                let _ = writer.close();
-                            }
-                        }
+                    if let Some(handle) = removed_handle
+                        && let Ok(writer) = handle.inner().writable().get_writer()
+                    {
+                        let _ = writer.close();
                     }
 
                     // Remove from local subscriptions (the background reader
                     // task will exit when the sender is dropped).
-                    if let Ok(mut guard) = self.subscriptions.lock() {
-                        guard.remove(&routing_id_bytes);
-                    }
+                    self.subscriptions.remove(&RoutingId::new(routing_id_bytes));
 
                     Ok(())
                 }
@@ -1051,9 +1102,7 @@ impl TransportAdapter for WebTransportAdapter {
                     self.ws_send_fire_and_forget(&msg)?;
 
                     // Remove from local subscriptions.
-                    if let Ok(mut guard) = self.subscriptions.lock() {
-                        guard.remove(&routing_id_bytes);
-                    }
+                    self.subscriptions.remove(&RoutingId::new(routing_id_bytes));
 
                     Ok(())
                 }
@@ -1179,9 +1228,14 @@ impl TransportAdapter for WebTransportAdapter {
                                         QuicRelayFrame::Blob { blob, .. } => {
                                             match OuterEnvelope::from_bytes(&blob) {
                                                 Ok(env) => envelopes.push(env),
-                                                Err(e) => {
+                                                Err(_) => {
+                                                    // Sanitized: do not log the
+                                                    // serde error; the byte
+                                                    // payload is relay-supplied
+                                                    // and some codecs include
+                                                    // byte excerpts in `Display`.
                                                     tracing::warn!(
-                                                        "failed to deserialize envelope: {e}"
+                                                        "envelope deserialization failed"
                                                     );
                                                 }
                                             }
@@ -1224,16 +1278,13 @@ impl TransportAdapter for WebTransportAdapter {
                     // registration to avoid clobbering it -- query results
                     // will still arrive via the pending_request for
                     // query_complete, and we accept potentially fewer results.
-                    let registered_temp_sub;
-                    {
-                        let mut guard = self
-                            .subscriptions
-                            .lock()
-                            .map_err(|_| TransportError::NotConnected)?;
-                        registered_temp_sub = !guard.contains_key(&routing_id_bytes);
-                        if registered_temp_sub {
-                            guard.insert(routing_id_bytes, tx);
-                        }
+                    let registered_temp_sub = !self
+                        .subscriptions
+                        .contains(&RoutingId::new(routing_id_bytes));
+                    if registered_temp_sub {
+                        self.subscriptions
+                            .insert(RoutingId::new(routing_id_bytes), tx)
+                            .map_err(|e| TransportError::SubscriptionFailed(e.to_string()))?;
                     }
 
                     // Also register a pending request for the query_complete
@@ -1270,9 +1321,7 @@ impl TransportAdapter for WebTransportAdapter {
                     // Clean up the temporary subscription only if we
                     // registered it (i.e., no pre-existing subscription).
                     if registered_temp_sub {
-                        if let Ok(mut guard) = self.subscriptions.lock() {
-                            guard.remove(&routing_id_bytes);
-                        }
+                        self.subscriptions.remove(&RoutingId::new(routing_id_bytes));
                     }
 
                     Ok(envelopes)
@@ -1355,7 +1404,7 @@ impl TransportAdapter for WebTransportAdapter {
 /// to prevent broadcasting to all subscribers.
 fn dispatch_relay_message(
     msg: &RelayMessage,
-    subscriptions: &Arc<Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<TransportEvent>>>>,
+    subscriptions: &Arc<TransportSubscriptionMap<mpsc::UnboundedSender<TransportEvent>>>,
     pending_requests: &Arc<Mutex<HashMap<String, oneshot::Sender<RelayMessage>>>>,
     subscribe_ref_ids: &Arc<Mutex<HashMap<String, [u8; 32]>>>,
 ) {
@@ -1376,22 +1425,31 @@ fn dispatch_relay_message(
         }
     }
 
-    // Route BLOB messages to subscriptions by routing_id.
+    // Route BLOB messages to subscriptions by routing_id. Decoding only
+    // runs after a presence check so malformed BLOBs at unsolicited
+    // routing_ids cannot drive log spam or attacker-controlled bytes
+    // toward error surfaces (sanitized regardless on the failure path).
     if let RelayMessage::Blob {
         routing_id, blob, ..
     } = msg
     {
-        if let Ok(guard) = subscriptions.lock() {
-            if let Some(tx) = guard.get(routing_id) {
-                let event = match OuterEnvelope::from_bytes(blob) {
-                    Ok(env) => TransportEvent::Envelope(env),
-                    Err(e) => TransportEvent::Error(TransportError::ProtocolError(format!(
-                        "failed to deserialize envelope from blob: {e}"
-                    ))),
-                };
-                let _ = tx.unbounded_send(event);
-            }
+        let rid = RoutingId::new(*routing_id);
+        if !subscriptions.contains(&rid) {
+            return;
         }
+        let event = match OuterEnvelope::from_bytes(blob) {
+            Ok(env) => TransportEvent::Envelope(env),
+            Err(_) => {
+                // The blob is attacker-controlled. Some serde codecs include
+                // raw byte excerpts in their `Display`; do not include `e` in
+                // the surfaced error message.
+                tracing::warn!("envelope deserialization failed");
+                TransportEvent::Error(TransportError::ProtocolError(
+                    "failed to deserialize envelope from blob".to_owned(),
+                ))
+            }
+        };
+        let _ = subscriptions.with(&rid, |tx| tx.unbounded_send(event));
     }
 
     // Route backfill_complete events to the specific subscription that
@@ -1410,20 +1468,16 @@ fn dispatch_relay_message(
 
             if let Some(routing_id) = target_routing_id {
                 // Scoped delivery: only the subscription that requested backfill.
-                if let Ok(guard) = subscriptions.lock() {
-                    if let Some(tx) = guard.get(&routing_id) {
-                        let _ = tx.unbounded_send(TransportEvent::BackfillComplete);
-                    }
-                }
+                let _ = subscriptions.with(&RoutingId::new(routing_id), |tx| {
+                    tx.unbounded_send(TransportEvent::BackfillComplete)
+                });
             } else {
                 // Fallback: no ref_id mapping available. Broadcast to all
                 // subscriptions for backwards compatibility with relays that
                 // send backfill_complete without a ref_id.
-                if let Ok(guard) = subscriptions.lock() {
-                    for tx in guard.values() {
-                        let _ = tx.unbounded_send(TransportEvent::BackfillComplete);
-                    }
-                }
+                subscriptions.for_each(|_rid, tx| {
+                    let _ = tx.unbounded_send(TransportEvent::BackfillComplete);
+                });
             }
         }
     }
@@ -1438,9 +1492,16 @@ fn relay_frame_to_event(frame: QuicRelayFrame) -> Option<TransportEvent> {
     match frame {
         QuicRelayFrame::Blob { blob, .. } => match OuterEnvelope::from_bytes(&blob) {
             Ok(env) => Some(TransportEvent::Envelope(env)),
-            Err(e) => Some(TransportEvent::Error(TransportError::ProtocolError(
-                format!("failed to deserialize envelope: {e}"),
-            ))),
+            Err(_) => {
+                // Sanitized: do not propagate the serde error message into the
+                // TransportEvent. The byte payload is relay-supplied and some
+                // codecs include byte excerpts in `Display`, which would leak
+                // attacker-controlled bytes into SDK error surfaces.
+                tracing::warn!("envelope deserialization failed");
+                Some(TransportEvent::Error(TransportError::ProtocolError(
+                    "failed to deserialize envelope from blob".to_owned(),
+                )))
+            }
         },
         QuicRelayFrame::Event { event_type } => match event_type.as_str() {
             "backfill_complete" => Some(TransportEvent::BackfillComplete),
@@ -1600,5 +1661,69 @@ mod tests {
         let frame = QuicRelayFrame::Ok { blob_id: None };
         let event = relay_frame_to_event(frame);
         assert!(event.is_none());
+    }
+
+    #[test]
+    fn dispatch_blob_routes_to_correct_subscription() {
+        // Verify that a BLOB message addressed to one routing_id is delivered
+        // only to the matching subscription's sender, not to every subscriber.
+        let routing_a = [0xAAu8; 32];
+        let routing_b = [0xBBu8; 32];
+
+        let subscriptions: Arc<TransportSubscriptionMap<mpsc::UnboundedSender<TransportEvent>>> =
+            Arc::new(TransportSubscriptionMap::new());
+        let pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<RelayMessage>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let subscribe_ref_ids: Arc<Mutex<HashMap<String, [u8; 32]>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let (tx_a, mut rx_a) = mpsc::unbounded::<TransportEvent>();
+        let (tx_b, mut rx_b) = mpsc::unbounded::<TransportEvent>();
+        subscriptions
+            .insert(RoutingId::new(routing_a), tx_a)
+            .unwrap();
+        subscriptions
+            .insert(RoutingId::new(routing_b), tx_b)
+            .unwrap();
+
+        // Build a valid envelope addressed to routing_a so that
+        // OuterEnvelope::from_bytes succeeds.
+        let envelope = scp_core::envelope::create_outer_envelope(
+            &routing_a,
+            None,
+            3600,
+            vec![0x01, 0x02, 0x03],
+        )
+        .unwrap();
+        let blob_bytes = envelope.to_bytes().unwrap();
+
+        let blob_msg = RelayMessage::Blob {
+            routing_id: routing_a,
+            blob_id: *crate::traits::BlobId::from_sha256(&blob_bytes).as_bytes(),
+            recipient_hint: None,
+            blob_ttl: 3600,
+            stored_at: 1_700_000_000,
+            blob: blob_bytes,
+        };
+
+        dispatch_relay_message(
+            &blob_msg,
+            &subscriptions,
+            &pending_requests,
+            &subscribe_ref_ids,
+        );
+
+        // routing_a's subscription must receive the envelope.
+        let event_a = rx_a.try_next().expect("rx_a should have an event").unwrap();
+        assert!(
+            matches!(event_a, TransportEvent::Envelope(_)),
+            "expected Envelope on rx_a, got {event_a:?}"
+        );
+
+        // routing_b's subscription must NOT receive anything.
+        assert!(
+            rx_b.try_next().is_err(),
+            "rx_b should be empty after dispatch to routing_a"
+        );
     }
 }

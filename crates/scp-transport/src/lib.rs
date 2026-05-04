@@ -53,6 +53,7 @@ pub mod relay;
 pub mod scoring;
 #[cfg(feature = "startup")]
 pub mod startup;
+pub mod subscription;
 pub mod traits;
 #[cfg(feature = "udp")]
 pub mod udp;
@@ -82,4 +83,5 @@ pub use pool::{ConnectionPool, PoolKey, TransportType};
 pub use profile::{CoverTrafficTier, TransportProfile};
 pub use provider::RelayTransportProvider;
 pub use scoring::SuppressionWarning;
+pub use subscription::{MAX_TRANSPORT_SUBSCRIPTIONS, SubscriptionError, TransportSubscriptionMap};
 pub use traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
