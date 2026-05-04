@@ -1428,7 +1428,7 @@ pub async fn finalize_send_legacy(
             // create a checkpoint if the event or time threshold is met.
             ctx.checkpoint_events_since += 1;
             if let Some(sk) = signing_key {
-                crate::context::queries_helpers::create_checkpoint_if_due(
+                crate::context::queries_helpers_legacy::create_checkpoint_if_due_legacy(
                     supervisor, context_id, ctx, sender_did, sk,
                 );
             }

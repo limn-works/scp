@@ -2115,7 +2115,7 @@ impl Supervisor {
     /// the legacy method's signature so callers can keep their
     /// `?`-style propagation untouched.
     pub async fn register_local_did(&self, did: DID) -> Result<(), ContextError> {
-        crate::context::queries_helpers::register_local_did(self, did).await;
+        crate::context::queries_helpers_legacy::register_local_did_legacy(self, did).await;
         Ok(())
     }
 
@@ -2125,7 +2125,7 @@ impl Supervisor {
     ///
     /// Currently always returns `Ok(_)`.
     pub async fn is_local_did(&self, did: &DID) -> Result<bool, ContextError> {
-        Ok(crate::context::queries_helpers::is_local_did(self, did).await)
+        Ok(crate::context::queries_helpers_legacy::is_local_did_legacy(self, did).await)
     }
 
     /// Restore every persisted context from the configured persistence
@@ -2278,14 +2278,14 @@ impl Supervisor {
     /// is not registered.
     #[must_use]
     pub async fn member_count(&self, context_id: &str) -> Option<usize> {
-        crate::context::queries_helpers::member_count(self, context_id).await
+        crate::context::queries_helpers_legacy::member_count_legacy(self, context_id).await
     }
 
     /// Passthrough to [`crate::context::queries_helpers::is_member`] —
     /// returns `true` iff `did` is a member of `context_id`.
     #[must_use]
     pub async fn is_member(&self, context_id: &str, did: &str) -> bool {
-        crate::context::queries_helpers::is_member(self, context_id, did).await
+        crate::context::queries_helpers_legacy::is_member_legacy(self, context_id, did).await
     }
 
     /// Passthrough to
@@ -2294,7 +2294,7 @@ impl Supervisor {
     /// context is unknown).
     #[must_use]
     pub async fn member_dids(&self, context_id: &str) -> Vec<String> {
-        crate::context::queries_helpers::member_dids(self, context_id).await
+        crate::context::queries_helpers_legacy::member_dids_legacy(self, context_id).await
     }
 
     /// Passthrough to
@@ -2307,7 +2307,7 @@ impl Supervisor {
         context_id: &str,
         did: &str,
     ) -> Option<scp_protocol::context::roles::RoleAssignment> {
-        crate::context::queries_helpers::member_role(self, context_id, did).await
+        crate::context::queries_helpers_legacy::member_role_legacy(self, context_id, did).await
     }
 
     /// Passthrough to
@@ -2319,7 +2319,7 @@ impl Supervisor {
         &self,
         context_id: &str,
     ) -> Option<scp_protocol::context::ContextParams> {
-        crate::context::queries_helpers::context_params(self, context_id).await
+        crate::context::queries_helpers_legacy::context_params_legacy(self, context_id).await
     }
 
     /// Passthrough to
@@ -2331,7 +2331,7 @@ impl Supervisor {
         &self,
         context_id: &str,
     ) -> Option<scp_protocol::context::roles::ContextRoleState> {
-        crate::context::queries_helpers::get_role_state(self, context_id).await
+        crate::context::queries_helpers_legacy::get_role_state_legacy(self, context_id).await
     }
 
     /// Passthrough to
@@ -2339,7 +2339,7 @@ impl Supervisor {
     /// returns every event currently buffered for `context_id`.
     #[must_use]
     pub async fn drain_events(&self, context_id: &str) -> Vec<ContextEvent> {
-        crate::context::queries_helpers::drain_events(self, context_id).await
+        crate::context::queries_helpers_legacy::drain_events_legacy(self, context_id).await
     }
 
     /// Passthrough to
@@ -2356,7 +2356,7 @@ impl Supervisor {
         context_id_bytes: &[u8; 32],
     ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
     {
-        crate::context::queries_helpers::event_log_entries(self, context_id_bytes)
+        crate::context::queries_helpers_legacy::event_log_entries_legacy(self, context_id_bytes)
     }
 
     /// Passthrough to
@@ -2373,7 +2373,7 @@ impl Supervisor {
         context_id: &str,
         author_did: &str,
     ) -> Result<(Zeroizing<[u8; 32]>, u64), ContextError> {
-        crate::context::queries_helpers::get_broadcast_key_for_local_author(
+        crate::context::queries_helpers_legacy::get_broadcast_key_for_local_author_legacy(
             self, context_id, author_did,
         )
         .await
@@ -2724,7 +2724,7 @@ impl Supervisor {
         &self,
         context_id: &str,
     ) -> Result<Option<[u8; 32]>, ContextError> {
-        crate::context::queries_helpers::local_pseudonym(self, context_id).await
+        crate::context::queries_helpers_legacy::local_pseudonym_legacy(self, context_id).await
     }
 
     /// Passthrough to
@@ -2735,7 +2735,7 @@ impl Supervisor {
         &self,
         context_id: &str,
     ) -> Vec<crate::context::state::PendingCommit> {
-        crate::context::queries_helpers::pending_commits(self, context_id).await
+        crate::context::queries_helpers_legacy::pending_commits_legacy(self, context_id).await
     }
 
     /// Passthrough to
@@ -2746,7 +2746,7 @@ impl Supervisor {
         &self,
         context_id: &str,
     ) -> Option<crate::context::state::CommitFaultMarker> {
-        crate::context::queries_helpers::commit_fault(self, context_id).await
+        crate::context::queries_helpers_legacy::commit_fault_legacy(self, context_id).await
     }
 
     /// Passthrough to
@@ -2760,7 +2760,7 @@ impl Supervisor {
         compat: scp_protocol::envelope::VersionCompatibility,
         unsupported_features: Vec<String>,
     ) {
-        crate::context::queries_helpers::report_degraded_mode(
+        crate::context::queries_helpers_legacy::report_degraded_mode_legacy(
             self,
             context_id,
             compat,

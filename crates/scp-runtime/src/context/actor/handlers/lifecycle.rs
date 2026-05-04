@@ -760,7 +760,7 @@ async fn handle_generate_context_access_key_shim(
     caller_did: String,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let fut = crate::context::queries_helpers::generate_context_access_key(
+    let fut = crate::context::queries_helpers_legacy::generate_context_access_key_legacy(
         supervisor,
         &context_id,
         &member_did,
@@ -793,7 +793,7 @@ async fn handle_revoke_context_access_key_shim(
     caller_did: String,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let fut = crate::context::queries_helpers::revoke_context_access_key(
+    let fut = crate::context::queries_helpers_legacy::revoke_context_access_key_legacy(
         supervisor,
         &context_id,
         &member_did,
@@ -826,7 +826,7 @@ async fn handle_restore_context_access_key_shim(
     caller_did: String,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    let fut = crate::context::queries_helpers::restore_context_access_key(
+    let fut = crate::context::queries_helpers_legacy::restore_context_access_key_legacy(
         supervisor,
         &context_id,
         &member_did,
