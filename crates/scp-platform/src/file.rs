@@ -859,6 +859,39 @@ impl KeyCustody for FileKeyCustody {
         seed: &Zeroizing<[u8; 32]>,
     ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
         async move {
+            // Dedup by content: if the seed's verifying key already
+            // matches an existing Ed25519 entry, return that handle
+            // instead of appending a duplicate. Without this guard a
+            // retry of import (e.g. on transient failure higher up the
+            // stack) would create a parallel encrypted entry holding the
+            // same private key — wasting space and producing a phantom
+            // handle on reopen that the registry can no longer reach.
+            let signing_key = SigningKey::from_bytes(seed);
+            let target_pub = signing_key.verifying_key().to_bytes();
+
+            // Snapshot the handle map so we don't hold the lock across
+            // `decrypt_ed25519_key`, which acquires the same lock and
+            // would otherwise deadlock.
+            let entries: Vec<(u64, StoredKeyType)> = {
+                let map = self.handle_map.lock().await;
+                map.entries
+                    .iter()
+                    .map(|(id, (kt, _idx))| (*id, *kt))
+                    .collect()
+            };
+
+            for (id, kt) in entries {
+                if kt != StoredKeyType::Ed25519 {
+                    continue;
+                }
+                let candidate = KeyHandle::new(id);
+                if let Ok((_bytes, existing)) = self.decrypt_ed25519_key(&candidate).await
+                    && existing.verifying_key().to_bytes() == target_pub
+                {
+                    return Ok(candidate);
+                }
+            }
+
             // Persist the seed bytes via the same encrypted append-only
             // log used by `generate_keypair`. After this call the bytes
             // are encrypted-at-rest under the same passphrase-derived key.
@@ -1164,5 +1197,78 @@ mod tests {
             custody2.public_key(&rh3).await.unwrap().as_bytes(),
             pk3.as_bytes()
         );
+    }
+
+    /// Importing the same Ed25519 seed twice must return the existing
+    /// handle rather than appending a duplicate encrypted entry. Without
+    /// this guard a retry of import would create an orphan entry that
+    /// the registry can no longer reach but reload would resurrect as a
+    /// phantom handle.
+    #[tokio::test]
+    async fn import_ed25519_signing_key_dedups_by_content() {
+        let dir = TempDir::new().unwrap();
+        let custody = make_custody(&dir, "dedup-passphrase");
+
+        let seed = Zeroizing::new([0x42u8; 32]);
+
+        let first = custody.import_ed25519_signing_key(&seed).await.unwrap();
+        let second = custody.import_ed25519_signing_key(&seed).await.unwrap();
+
+        // Same content -> same handle.
+        assert_eq!(
+            first.id(),
+            second.id(),
+            "second import of identical seed must return the existing handle"
+        );
+
+        // Handle map must hold exactly one entry for this seed.
+        let map = custody.handle_map.lock().await;
+        assert_eq!(
+            map.entries.len(),
+            1,
+            "duplicate import must not add a new handle map entry"
+        );
+        drop(map);
+
+        // The encrypted file must contain exactly one entry — the
+        // header records `entry_count` at offset `1 + SALT_LEN`.
+        let bytes = std::fs::read(&custody.path).unwrap();
+        let count_offset = 1 + SALT_LEN;
+        let count = u32::from_le_bytes(bytes[count_offset..count_offset + 4].try_into().unwrap());
+        assert_eq!(count, 1, "duplicate import must not append a file entry");
+
+        // Sanity: the public key must match what the seed derives to.
+        let derived = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let pk = custody.public_key(&first).await.unwrap();
+        assert_eq!(pk.as_bytes(), &derived);
+    }
+
+    /// Importing a *different* Ed25519 seed after the first one must
+    /// allocate a fresh handle and append a new entry — dedup is
+    /// content-keyed, not blanket suppression.
+    #[tokio::test]
+    async fn import_ed25519_signing_key_distinct_seeds_allocate_distinct_handles() {
+        let dir = TempDir::new().unwrap();
+        let custody = make_custody(&dir, "distinct-passphrase");
+
+        let seed_a = Zeroizing::new([0x11u8; 32]);
+        let seed_b = Zeroizing::new([0x22u8; 32]);
+
+        let h_a = custody.import_ed25519_signing_key(&seed_a).await.unwrap();
+        let h_b = custody.import_ed25519_signing_key(&seed_b).await.unwrap();
+
+        assert_ne!(
+            h_a.id(),
+            h_b.id(),
+            "distinct seeds must produce distinct handles"
+        );
+
+        let map = custody.handle_map.lock().await;
+        assert_eq!(
+            map.entries.len(),
+            2,
+            "distinct seeds must produce two handle map entries"
+        );
+        drop(map);
     }
 }

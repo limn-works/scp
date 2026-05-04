@@ -160,6 +160,19 @@ pub trait PostResolveHook: Send + Sync {
 /// signature confusion. See issue #78.
 const DOMAIN_MIGRATION_V1: &[u8] = b"SCP-MIGRATION-V1:";
 
+/// Maximum future-clock-skew tolerance (seconds) for a `migration_proof.rotated_at`
+/// timestamp during verification. Mirrors the 5-minute tolerance spec §9.8.2(c)
+/// applies to SCP envelope timestamps: enough headroom for legitimate clock skew
+/// across federated nodes, tight enough that an attacker cannot trivially mint
+/// a far-future migration claim.
+const MAX_FUTURE_SKEW_SECS: u64 = 300;
+
+/// Maximum past window (seconds) for a `migration_proof.rotated_at` timestamp
+/// during verification. Migrations claimed to be older than this are rejected:
+/// any reasonable offline-recovery flow will publish far sooner, so a deeply
+/// past `rotated_at` is a strong signal of a forged proof. Set to 5 years.
+const MAX_PAST_WINDOW_SECS: u64 = 5 * 365 * 24 * 3600;
+
 /// Type alias for the signing function stored in `DidDht`.
 ///
 /// Takes a key handle ID and data to sign, returns the 64-byte Ed25519
@@ -1725,10 +1738,21 @@ pub fn verify_did(did_string: &str, public_key: &[u8]) -> bool {
 /// * `migration_proof` - The migration proof (signature + old public key).
 /// * `pre_rotation_proof` - Optional pre-rotation proof for STRONG assurance.
 /// * `rotated_at` - The timestamp that was signed in the migration proof.
+/// * `now` - The verifier's current Unix-seconds timestamp. Used to bound
+///   `rotated_at`: callers should pass a real `Clock`-derived value so the
+///   sanity-window check is testable. The verifier rejects `rotated_at`
+///   values further than [`MAX_FUTURE_SKEW_SECS`] in the future of `now`
+///   (forged near-future proofs) or further than [`MAX_PAST_WINDOW_SECS`]
+///   in the past (forged ancient proofs). Without this bound a holder of a
+///   briefly-captured old `#0` key could mint a `migration_proof` with an
+///   absurd `rotated_at` (e.g. `0` or `u64::MAX`) and the verifier would
+///   still return `Ok(true)`.
 ///
 /// # Errors
 ///
 /// Returns [`IdentityError::MigrationVerificationFailed`] if:
+/// - `rotated_at` is more than [`MAX_FUTURE_SKEW_SECS`] ahead of `now`, or
+///   more than [`MAX_PAST_WINDOW_SECS`] behind `now`.
 /// - The old public key in the migration proof is invalid.
 /// - The migration proof signature does not verify.
 /// - The pre-rotation proof's `SHA-256(revealed_key) != commitment`.
@@ -1744,6 +1768,7 @@ pub fn verify_migration(
     migration_proof: &MigrationProof,
     pre_rotation_proof: Option<&PreRotationProof>,
     rotated_at: u64,
+    now: u64,
 ) -> Result<bool, IdentityError> {
     // Step 1: Verify the migration proof signature.
     // Reconstruct the signed digest:
@@ -1762,6 +1787,24 @@ pub fn verify_migration(
     hasher.update(new_did.as_bytes());
     hasher.update(rotated_at.to_be_bytes());
     let digest = hasher.finalize();
+
+    // Sanity-window bound on `rotated_at`. A holder of a briefly-captured
+    // old `#0` key could otherwise mint a `migration_proof` with an absurd
+    // `rotated_at` (e.g. `0`, claiming the rotation happened in 1970, or
+    // `u64::MAX`, claiming it happened in year 584 billion). Mirroring the
+    // 5-minute future skew tolerance from spec §9.8.2(c) and a 5-year past
+    // window keeps verification cheap and rejects implausible timestamps
+    // before the signature check is even attempted.
+    if rotated_at > now.saturating_add(MAX_FUTURE_SKEW_SECS) {
+        return Err(IdentityError::MigrationVerificationFailed(format!(
+            "migration_proof.rotated_at ({rotated_at}) is more than {MAX_FUTURE_SKEW_SECS}s in the future of now ({now})"
+        )));
+    }
+    if rotated_at < now.saturating_sub(MAX_PAST_WINDOW_SECS) {
+        return Err(IdentityError::MigrationVerificationFailed(format!(
+            "migration_proof.rotated_at ({rotated_at}) is more than {MAX_PAST_WINDOW_SECS}s in the past of now ({now})"
+        )));
+    }
 
     let verifying_key = VerifyingKey::from_bytes(&migration_proof.old_public_key).map_err(|e| {
         IdentityError::MigrationVerificationFailed(format!("invalid old public key: {e}"))
@@ -3117,6 +3160,7 @@ mod tests {
             &event.migration_proof,
             event.pre_rotation_proof.as_ref(),
             event.rotated_at,
+            event.rotated_at + 1,
         );
         assert!(result.is_ok(), "verify_migration failed: {result:?}");
         assert!(result.unwrap());
@@ -3163,6 +3207,7 @@ mod tests {
             &tampered_proof,
             event.pre_rotation_proof.as_ref(),
             event.rotated_at,
+            event.rotated_at + 1,
         );
         assert!(result.is_err());
         assert!(matches!(
@@ -3194,7 +3239,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Use a different timestamp — the digest won't match.
+        // Use a different timestamp — the digest won't match. `now` is
+        // chosen so both bounds pass and the failure is the signature
+        // mismatch, not the sanity-window check.
         let result = verify_migration(
             &event.old_did,
             &document,
@@ -3202,6 +3249,7 @@ mod tests {
             &event.migration_proof,
             event.pre_rotation_proof.as_ref(),
             rotated_at + 1,
+            rotated_at + 2,
         );
         assert!(result.is_err());
     }
@@ -3237,6 +3285,7 @@ mod tests {
             &event.migration_proof,
             None,
             event.rotated_at,
+            event.rotated_at + 1,
         );
         assert!(result.is_ok());
         assert!(result.unwrap());
@@ -3278,6 +3327,7 @@ mod tests {
             &event.migration_proof,
             Some(&tampered_pre_rot),
             event.rotated_at,
+            event.rotated_at + 1,
         );
         assert!(result.is_err());
         assert!(matches!(
@@ -3364,6 +3414,7 @@ mod tests {
             &crafted_proof,
             None,
             rotated_at,
+            rotated_at + 1,
         );
         let err = result.expect_err(
             "step 1b MUST reject migration_proof whose old_public_key does not derive old_did",
@@ -3428,6 +3479,7 @@ mod tests {
             &event.migration_proof,
             Some(&substituted),
             event.rotated_at,
+            event.rotated_at + 1,
         );
         let err = result.expect_err("substituted commitment MUST be rejected");
         match err {
@@ -3519,6 +3571,7 @@ mod tests {
             &crafted_migration_proof,
             event.pre_rotation_proof.as_ref(),
             rotated_at,
+            rotated_at + 1,
         );
         let err = result
             .expect_err("step 2c MUST reject revealed_key not deriving new_did even when the migration_proof signs the attacker's new_did");
@@ -3527,6 +3580,108 @@ mod tests {
                 assert!(
                     msg.contains("revealed_key derives DID"),
                     "expected step 2c failure message, got: {msg}"
+                );
+            }
+            other => panic!("expected MigrationVerificationFailed, got: {other:?}"),
+        }
+    }
+
+    /// `rotated_at` more than [`MAX_FUTURE_SKEW_SECS`] ahead of `now`
+    /// MUST be rejected. A holder of a briefly-captured old `#0` key
+    /// could otherwise mint a far-future migration claim. The
+    /// `migration_proof` is fully valid (signature, key binding,
+    /// pre-rotation proof) — only the timestamp is implausible.
+    #[tokio::test]
+    async fn verify_migration_rejects_rotated_at_in_future() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        // Pick a `now` and a `rotated_at` that is `now + 600` (10 minutes
+        // future, beyond the 5-minute future-skew tolerance).
+        let now = 1_700_000_000u64;
+        let rotated_at = now + 600;
+
+        let (_new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .unwrap();
+
+        let result = verify_migration(
+            &event.old_did,
+            &document,
+            &event.new_did,
+            &event.migration_proof,
+            event.pre_rotation_proof.as_ref(),
+            event.rotated_at,
+            now,
+        );
+        let err = result.expect_err("rotated_at beyond future-skew tolerance MUST be rejected");
+        match err {
+            IdentityError::MigrationVerificationFailed(msg) => {
+                assert!(
+                    msg.contains("future"),
+                    "expected future-skew error, got: {msg}"
+                );
+            }
+            other => panic!("expected MigrationVerificationFailed, got: {other:?}"),
+        }
+    }
+
+    /// `rotated_at` more than [`MAX_PAST_WINDOW_SECS`] behind `now` MUST
+    /// be rejected. Migrations claimed to be older than the past window
+    /// are beyond any reasonable offline-recovery flow.
+    #[tokio::test]
+    async fn verify_migration_rejects_rotated_at_too_far_in_past() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        // 6 years past, beyond the 5-year window.
+        let six_years_secs: u64 = 6 * 365 * 24 * 3600;
+        let rotated_at = 1_700_000_000u64;
+        let now = rotated_at + six_years_secs;
+
+        let (_new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .unwrap();
+
+        let result = verify_migration(
+            &event.old_did,
+            &document,
+            &event.new_did,
+            &event.migration_proof,
+            event.pre_rotation_proof.as_ref(),
+            event.rotated_at,
+            now,
+        );
+        let err = result.expect_err("rotated_at beyond past window MUST be rejected");
+        match err {
+            IdentityError::MigrationVerificationFailed(msg) => {
+                assert!(
+                    msg.contains("past"),
+                    "expected past-window error, got: {msg}"
                 );
             }
             other => panic!("expected MigrationVerificationFailed, got: {other:?}"),
