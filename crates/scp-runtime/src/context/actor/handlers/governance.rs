@@ -185,20 +185,48 @@ async fn dispatch_state(
             .await
         }
         GovernanceCommand::ExecuteGovernanceAction { payload, reply } => {
-            Box::pin(handle_execute_governance_action_actor(state, deps, *payload, reply)).await
+            Box::pin(handle_execute_governance_action_actor(
+                state, deps, *payload, reply,
+            ))
+            .await
         }
-        // ---------- unmigrated variants (escape to legacy via shim) ----------
-        cmd => {
-            // Re-issue the command through the supervisor's legacy
-            // shim path. The escape hatch produces an `Arc<Supervisor>`
-            // that the legacy helpers can lock-and-call against the
-            // legacy `state::PerContextState` registered for this
-            // context_id. Behaviorally identical to the pre-migration
-            // path; deleted in Phase 2A finalization once every variant
-            // has an actor-shape twin.
-            let supervisor = deps.supervisor.shim_supervisor();
-            Box::pin(dispatch_inner(supervisor.as_ref(), cmd)).await
+        GovernanceCommand::ProposeGovernanceAction { payload, reply } => {
+            Box::pin(handle_propose_governance_action_actor(
+                state, deps, *payload, reply, false,
+            ))
+            .await
         }
+        GovernanceCommand::ProposeGovernanceActionChecked { payload, reply } => {
+            Box::pin(handle_propose_governance_action_checked_actor(
+                state, deps, *payload, reply,
+            ))
+            .await
+        }
+        GovernanceCommand::VoteOnProposal {
+            payload,
+            approve,
+            reply,
+        } => {
+            Box::pin(handle_vote_on_proposal_actor(
+                state, deps, *payload, approve, reply,
+            ))
+            .await
+        }
+        GovernanceCommand::ApproveGovernanceProposal { payload, reply } => {
+            Box::pin(handle_approve_governance_proposal_actor(
+                state, deps, *payload, reply,
+            ))
+            .await
+        }
+        GovernanceCommand::RejectGovernanceProposal { payload, reply } => {
+            Box::pin(handle_reject_governance_proposal_actor(
+                state, deps, *payload, reply,
+            ))
+            .await
+        }
+        // Placeholder is a no-op handshake target reserved for mailbox
+        // tests. Returns NotImplemented synchronously; no state mutation.
+        GovernanceCommand::Placeholder { reply } => reply_not_implemented(reply),
     }
 }
 
@@ -1106,6 +1134,246 @@ async fn handle_apply_pending_ceiling_modification_actor(
     outcome
 }
 
+/// Handle [`GovernanceCommand::ProposeGovernanceAction`] (actor-shape).
+async fn handle_propose_governance_action_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    p: ProposeGovernanceActionPayload,
+    reply: ProposeGovernanceActionReply,
+    _checked: bool,
+) -> Outcome<()> {
+    let context_id = p.context_id.clone();
+    let signing_key = p.signing_key.to_signing_key();
+    let proposer_did = p.proposer_did.clone();
+    let action = p.action;
+
+    // Phase 1 fix-up of ADR-049 (post-review-round-1): the propose path
+    // MUST run the suspension-aware capability check (check=true) because
+    // engine-side enforcement does not see suspension overlays.
+    let propose_fut = async move {
+        Box::pin(
+            crate::context::governance_helpers::propose_governance_action_inner(
+                state,
+                deps,
+                &p.context_id,
+                &proposer_did,
+                action,
+                &signing_key,
+                true,
+            ),
+        )
+        .await
+    };
+
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, propose_fut))
+        .await
+    {
+        Ok(Ok(tuple)) => (Outcome::ok_mutated(()), Ok(tuple)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "propose_governance_action exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`GovernanceCommand::ProposeGovernanceActionChecked`] (actor-shape).
+async fn handle_propose_governance_action_checked_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    p: ProposeGovernanceActionPayload,
+    reply: ProposeGovernanceActionCheckedReply,
+) -> Outcome<()> {
+    let context_id = p.context_id.clone();
+    let signing_key = p.signing_key.to_signing_key();
+    let proposer_did = p.proposer_did.clone();
+    let action = p.action;
+
+    let propose_fut = async move {
+        Box::pin(
+            crate::context::governance_helpers::propose_governance_action_checked(
+                state,
+                deps,
+                &p.context_id,
+                &proposer_did,
+                action,
+                &signing_key,
+            ),
+        )
+        .await
+    };
+
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, propose_fut))
+        .await
+    {
+        Ok(Ok(outcome_val)) => (Outcome::ok_mutated(()), Ok(outcome_val)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "propose_governance_action_checked exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`GovernanceCommand::VoteOnProposal`] (actor-shape).
+async fn handle_vote_on_proposal_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    p: VoteOnProposalPayload,
+    approve: bool,
+    reply: VoteOnProposalReply,
+) -> Outcome<()> {
+    let context_id = p.context_id.clone();
+    let signing_key = p.signing_key.to_signing_key();
+    let voter_did = p.voter_did.clone();
+    let proposal_id = p.proposal_id;
+
+    let vote_fut = async move {
+        Box::pin(crate::context::governance_helpers::vote_on_proposal_inner(
+            state,
+            deps,
+            &p.context_id,
+            &proposal_id,
+            &voter_did,
+            approve,
+            &signing_key,
+            true,
+        ))
+        .await
+    };
+
+    let (outcome, reply_result) =
+        match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, vote_fut)).await {
+            Ok(Ok(tuple)) => (Outcome::ok_mutated(()), Ok(tuple)),
+            Ok(Err(e)) => {
+                let sketch = outcome_error_sketch(&e);
+                (Outcome::err_mutated(sketch), Err(e))
+            }
+            Err(_elapsed) => {
+                let err = ContextError::TransportTimeout(format!(
+                    "vote_on_proposal exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+                ));
+                let sketch = outcome_error_sketch(&err);
+                (Outcome::err_mutated(sketch), Err(err))
+            }
+        };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`GovernanceCommand::ApproveGovernanceProposal`] (actor-shape).
+async fn handle_approve_governance_proposal_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    p: VoteOnProposalPayload,
+    reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
+) -> Outcome<()> {
+    let context_id = p.context_id.clone();
+    let signing_key = p.signing_key.to_signing_key();
+    let voter_did = p.voter_did.clone();
+    let proposal_id = p.proposal_id;
+
+    let approve_fut = async move {
+        Box::pin(
+            crate::context::governance_helpers::approve_governance_proposal(
+                state,
+                deps,
+                &p.context_id,
+                &proposal_id,
+                &voter_did,
+                &signing_key,
+            ),
+        )
+        .await
+    };
+
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, approve_fut))
+        .await
+    {
+        Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok(status)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "approve_governance_proposal exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`GovernanceCommand::RejectGovernanceProposal`] (actor-shape).
+async fn handle_reject_governance_proposal_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    p: VoteOnProposalPayload,
+    reply: oneshot::Sender<Result<scp_protocol::context::governance::ProposalStatus, ContextError>>,
+) -> Outcome<()> {
+    let context_id = p.context_id.clone();
+    let signing_key = p.signing_key.to_signing_key();
+    let voter_did = p.voter_did.clone();
+    let proposal_id = p.proposal_id;
+
+    let reject_fut = async move {
+        Box::pin(
+            crate::context::governance_helpers::reject_governance_proposal(
+                state,
+                deps,
+                &p.context_id,
+                &proposal_id,
+                &voter_did,
+                &signing_key,
+            ),
+        )
+        .await
+    };
+
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, reject_fut))
+        .await
+    {
+        Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok(status)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "reject_governance_proposal exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
 /// Handle [`GovernanceCommand::ExecuteGovernanceAction`] (actor-shape).
 async fn handle_execute_governance_action_actor(
     state: &mut crate::context::actor::state::PerContextState,
@@ -1117,12 +1385,14 @@ async fn handle_execute_governance_action_actor(
     let proposal = payload.proposal;
 
     let execute_fut = async move {
-        Box::pin(crate::context::governance_helpers::execute_governance_action(
-            state,
-            deps,
-            &payload.context_id,
-            &proposal,
-        ))
+        Box::pin(
+            crate::context::governance_helpers::execute_governance_action(
+                state,
+                deps,
+                &payload.context_id,
+                &proposal,
+            ),
+        )
         .await
     };
 

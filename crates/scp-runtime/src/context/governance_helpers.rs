@@ -49,21 +49,20 @@ use tracing::instrument;
 
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
-use crate::context::governance_logic::{
-    EnforceConsequencesCtx, check_proposer_eligibility, dispatch_consequences,
-    enforce_triggered_consequences_split, event_log_entries_for_consequences_split,
-};
 use crate::context::governance_logic::ConsequenceStateSplit;
+use crate::context::governance_logic::{
+    EnforceConsequencesCtx, enforce_triggered_consequences_split,
+    event_log_entries_for_consequences_split,
+};
 use crate::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
     ContentKeysRotatedResult, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
     EXECUTED_PROPOSALS_TTL_SECS, GovernanceActionResult, GovernanceReconfiguredResult,
-    MAX_COMMIT_AGE_SECS, MAX_COMMIT_RETRIES, MAX_PENDING_COMMITS, MAX_REGISTERED_TOOLS,
-    MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES, MigrationProposedResult, MigrationState,
-    PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange, ProposalOutcome,
-    RestoreAccessResult, RevokeResult, SuspendMemberResult, commit_retry_backoff,
-    context_id_to_bytes, emit_event_into, push_welcome_event, require_active,
-    require_migrating_out, strip_event_payload,
+    MAX_PENDING_COMMITS, MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES,
+    MigrationProposedResult, MigrationState, PendingCeilingModification, PendingCommit,
+    PendingEconomicPolicyChange, ProposalOutcome, RestoreAccessResult, RevokeResult,
+    SuspendMemberResult, commit_retry_backoff, context_id_to_bytes, emit_event_into,
+    require_active, require_migrating_out, strip_event_payload,
 };
 
 // ---------------------------------------------------------------------------
@@ -169,77 +168,14 @@ pub const fn governance_event_label(event: &GovernanceEvent) -> &'static str {
 // translate_timeout_events (pure)
 // ---------------------------------------------------------------------------
 
-/// Translates governance timeout events into [`ContextEvent`]s for the
-/// receive buffer. Pure projection.
-pub fn translate_timeout_events(
-    result_events: &[GovernanceEvent],
-    mls_epoch: u64,
-    conditions: &[crate::context::governance::timeout::DeadlockCondition],
-    recovery_in_progress: bool,
-) -> Vec<ContextEvent> {
-    let mut ctx_events = Vec::new();
-    for event in result_events {
-        let ctx_event = match event {
-            GovernanceEvent::ProposalResolved {
-                proposal_id,
-                status,
-            } => ContextEvent::ProposalTimedOut {
-                proposal_id: *proposal_id,
-                resolution_summary: format!("ProposalResolved({status:?})"),
-                resulting_epoch: Some(mls_epoch),
-            },
-            GovernanceEvent::VoteWithdrawn {
-                proposal_id,
-                voter_did,
-            } => ContextEvent::VoteWithdrawn {
-                proposal_id: *proposal_id,
-                voter_did: voter_did.clone(),
-            },
-            GovernanceEvent::GovernanceActionExecuted {
-                proposal_id,
-                action,
-                executor_did,
-                resulting_epoch,
-            } => ContextEvent::GovernanceActionExecuted {
-                proposal_id: *proposal_id,
-                action_summary: action.variant_name().to_owned(),
-                executor_did: executor_did.clone(),
-                resulting_epoch: *resulting_epoch,
-                target_did: action.target_did().cloned(),
-            },
-            // These variants are not expected from timeout processing;
-            // listed explicitly so the compiler warns on new variants.
-            GovernanceEvent::ProposalCreated { .. }
-            | GovernanceEvent::VoteCast { .. }
-            | GovernanceEvent::DeadlockRecovery { .. }
-            | GovernanceEvent::ConflictDetected { .. }
-            | GovernanceEvent::ConflictResolved { .. } => continue,
-        };
-        ctx_events.push(ctx_event);
-    }
-
-    if !conditions.is_empty() && !recovery_in_progress {
-        for condition in conditions {
-            let summary = match condition {
-                crate::context::governance::timeout::DeadlockCondition::ThresholdInsufficient {
-                    ..
-                } => "ThresholdInsufficient",
-                crate::context::governance::timeout::DeadlockCondition::MajorityUnresponsive {
-                    ..
-                } => "MajorityUnresponsive",
-                crate::context::governance::timeout::DeadlockCondition::UnanimityOffline {
-                    ..
-                } => "UnanimityOffline",
-            };
-            ctx_events.push(ContextEvent::DeadlockDetected {
-                condition_summary: summary.to_owned(),
-                resulting_epoch: Some(mls_epoch),
-            });
-        }
-    }
-
-    ctx_events
-}
+// `translate_timeout_events` (the actor-shape twin of
+// `governance_helpers_legacy::translate_timeout_events_legacy`) is
+// intentionally NOT migrated yet. The only production caller is the
+// supervisor-scoped governance timeout task
+// (`start_governance_timeout_task_legacy`), which inherently iterates
+// the contexts `DashMap` and stays legacy-shape until the per-context
+// actor periodic-tick lands in Phase 2A.9. When that migration lands,
+// the actor-shape twin can be re-introduced here next to its consumer.
 
 // ---------------------------------------------------------------------------
 // Read entry points
@@ -697,7 +633,7 @@ fn fail_close_remove_member(
 // ---------------------------------------------------------------------------
 
 /// Executes a `SuspendMember` governance action.
-pub async fn execute_suspend_member(
+pub fn execute_suspend_member(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -748,7 +684,7 @@ pub async fn execute_suspend_member(
 ///
 /// Returns the number of rotated authors (for broadcast contexts).
 #[allow(clippy::too_many_lines)]
-pub async fn execute_revoke(
+pub fn execute_revoke(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -833,8 +769,8 @@ pub async fn execute_revoke(
         );
     }
 
-    let needs_sender_key_rotation =
-        matches!(access, AccessScope::Write | AccessScope::Both) && state.broadcast_context.is_none();
+    let needs_sender_key_rotation = matches!(access, AccessScope::Write | AccessScope::Both)
+        && state.broadcast_context.is_none();
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
     if let Some(ref bc) = bc_snap {
@@ -881,7 +817,7 @@ pub async fn execute_revoke(
 // ---------------------------------------------------------------------------
 
 /// Executes a `RestoreAccess` governance action.
-pub async fn execute_restore_access(
+pub fn execute_restore_access(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -978,7 +914,7 @@ pub async fn execute_restore_access(
 // execute_add_member (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_add_member(
+pub fn execute_add_member(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1055,7 +991,7 @@ pub async fn execute_add_member(
 // execute_remove_member (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_remove_member(
+pub fn execute_remove_member(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1128,12 +1064,11 @@ pub async fn execute_remove_member(
         deps,
         context_id,
         remove_output.commit_bytes,
-        CommitOperation::RemoveMember {
+        &CommitOperation::RemoveMember {
             target_did: did.clone(),
         },
         actor_did,
-    )
-    .await?;
+    )?;
 
     // drain_and_deliver_sender_keys still lives in lifecycle_helpers
     // (legacy supervisor-shape until Phase 2A.9).
@@ -1161,7 +1096,7 @@ pub async fn execute_remove_member(
 // execute_change_role (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_change_role(
+pub fn execute_change_role(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1197,7 +1132,7 @@ pub async fn execute_change_role(
 // execute_register_tool (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_register_tool(
+pub fn execute_register_tool(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1233,7 +1168,7 @@ pub async fn execute_register_tool(
 // execute_remove_tool (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_remove_tool(
+pub fn execute_remove_tool(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1261,7 +1196,7 @@ pub async fn execute_remove_tool(
 // execute_modify_ceiling (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_modify_ceiling(
+pub fn execute_modify_ceiling(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1453,7 +1388,7 @@ pub async fn execute_extend_ttl(
 // execute_transfer_admin (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_transfer_admin(
+pub fn execute_transfer_admin(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1483,9 +1418,8 @@ pub async fn execute_transfer_admin(
             "member".clone_into(&mut info.role_name);
         }
     }
-    let tokens =
-        roles::system_assign_role(&mut state.role_state, new_admin, "admin", &*deps.clock)
-            .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+    let tokens = roles::system_assign_role(&mut state.role_state, new_admin, "admin", &*deps.clock)
+        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
     if let Some(info) = state.membership.get_mut(new_admin) {
         "admin".clone_into(&mut info.role_name);
         info.tokens = tokens;
@@ -1502,7 +1436,7 @@ pub async fn execute_transfer_admin(
 // execute_create_child_context (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_create_child_context(
+pub fn execute_create_child_context(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1534,7 +1468,7 @@ pub async fn execute_create_child_context(
 // execute_modify_pruning_policy (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_modify_pruning_policy(
+pub fn execute_modify_pruning_policy(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1595,7 +1529,7 @@ pub async fn execute_modify_pruning_policy(
 // execute_add_signer (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_add_signer(
+pub fn execute_add_signer(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1658,7 +1592,7 @@ pub async fn execute_add_signer(
 // execute_remove_signer (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_remove_signer(
+pub fn execute_remove_signer(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1676,8 +1610,7 @@ pub async fn execute_remove_signer(
         return Err(ContextError::MemberNotFound(did.to_string()));
     }
     if state.governance.threshold_value > 0 {
-        let remaining =
-            u32::try_from(state.governance.threshold_signers.len()).unwrap_or(u32::MAX);
+        let remaining = u32::try_from(state.governance.threshold_signers.len()).unwrap_or(u32::MAX);
         if state.governance.threshold_value > remaining {
             state.governance.threshold_signers.push(did.clone());
             return Err(ContextError::PermissionDenied(format!(
@@ -1714,7 +1647,7 @@ pub async fn execute_remove_signer(
 // execute_modify_threshold (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_modify_threshold(
+pub fn execute_modify_threshold(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1726,8 +1659,7 @@ pub async fn execute_modify_threshold(
 
     require_active(&state.handle)?;
 
-    let signer_count =
-        u32::try_from(state.governance.threshold_signers.len()).unwrap_or(u32::MAX);
+    let signer_count = u32::try_from(state.governance.threshold_signers.len()).unwrap_or(u32::MAX);
     if new_threshold == 0 || new_threshold > signer_count {
         return Err(ContextError::PermissionDenied(format!(
             "threshold must be 1..={signer_count}, got {new_threshold}"
@@ -1746,7 +1678,7 @@ pub async fn execute_modify_threshold(
 // execute_establish_tool_interface (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_establish_tool_interface(
+pub fn execute_establish_tool_interface(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1758,7 +1690,11 @@ pub async fn execute_establish_tool_interface(
 
     require_active(&state.handle)?;
 
-    if !state.role_state.ceiling.contains(&Capability::ToolInterface) {
+    if !state
+        .role_state
+        .ceiling
+        .contains(&Capability::ToolInterface)
+    {
         return Err(ContextError::PermissionDenied(
             "context ceiling does not include tool interface capability".into(),
         ));
@@ -1785,7 +1721,7 @@ pub async fn execute_establish_tool_interface(
 // execute_reset_member (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_reset_member(
+pub fn execute_reset_member(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1817,25 +1753,23 @@ pub async fn execute_reset_member(
         deps,
         context_id,
         remove_output.commit_bytes,
-        CommitOperation::ResetMember {
+        &CommitOperation::ResetMember {
             target_did: did.clone(),
             is_remove: true,
         },
         actor_did,
-    )
-    .await?;
+    )?;
     try_broadcast_commit_or_enqueue(
         state,
         deps,
         context_id,
         add_output.commit_bytes,
-        CommitOperation::ResetMember {
+        &CommitOperation::ResetMember {
             target_did: did.clone(),
             is_remove: false,
         },
         actor_did,
-    )
-    .await?;
+    )?;
 
     if let Err(e) = deps
         .crypto
@@ -1887,7 +1821,7 @@ pub async fn execute_reset_member(
     reason = "single-pipeline conflict-resolution scope"
 )]
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_resolve_conflict(
+pub fn execute_resolve_conflict(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -1933,8 +1867,12 @@ pub async fn execute_resolve_conflict(
         ));
     };
 
-    let proposer_a = &state.governance.approved_proposals[proposal_a].0.proposer_did;
-    let proposer_b = &state.governance.approved_proposals[proposal_b].0.proposer_did;
+    let proposer_a = &state.governance.approved_proposals[proposal_a]
+        .0
+        .proposer_did;
+    let proposer_b = &state.governance.approved_proposals[proposal_b]
+        .0
+        .proposer_did;
     if !scp_protocol::sync::conflict_resolution::actions_conflict(
         act_a, proposer_a, act_b, proposer_b,
     ) {
@@ -1969,8 +1907,11 @@ pub async fn execute_resolve_conflict(
     state.governance.freeze = None;
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    deps.event_log
-        .append_context_event(&context_id_bytes, "GovernanceConflictResolved", actor_did)?;
+    deps.event_log.append_context_event(
+        &context_id_bytes,
+        "GovernanceConflictResolved",
+        actor_did,
+    )?;
     state.checkpoint_events_since += 1;
     Ok(())
 }
@@ -1979,7 +1920,7 @@ pub async fn execute_resolve_conflict(
 // execute_promote_context (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_promote_context(
+pub fn execute_promote_context(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -2029,7 +1970,7 @@ pub async fn execute_promote_context(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
-pub async fn execute_rotate_content_keys(
+pub fn execute_rotate_content_keys(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -2048,8 +1989,11 @@ pub async fn execute_rotate_content_keys(
     } else {
         let epoch_out = deps.crypto.advance_epoch(&context_id_bytes)?;
 
-        let member_dids: Vec<String> =
-            state.membership.member_dids().map(|d| d.0.clone()).collect();
+        let member_dids: Vec<String> = state
+            .membership
+            .member_dids()
+            .map(|d| d.0.clone())
+            .collect();
         let current_epoch = state
             .access
             .access_key_store
@@ -2087,12 +2031,11 @@ pub async fn execute_rotate_content_keys(
             deps,
             context_id,
             epoch_out.commit_bytes,
-            CommitOperation::RotateContentKeys {
+            &CommitOperation::RotateContentKeys {
                 reason: reason.map(String::from),
             },
             actor_did,
-        )
-        .await?;
+        )?;
     }
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
@@ -2111,7 +2054,7 @@ pub async fn execute_rotate_content_keys(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_reconfigure_governance(
+pub fn execute_reconfigure_governance(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -2192,7 +2135,7 @@ pub async fn execute_reconfigure_governance(
 // execute_set_economic_policy (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_set_economic_policy(
+pub fn execute_set_economic_policy(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -2253,7 +2196,7 @@ pub async fn execute_set_economic_policy(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-pub async fn execute_approve_spend(
+pub fn execute_approve_spend(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -2289,7 +2232,7 @@ pub async fn execute_approve_spend(
 // execute_lock_economic_policy (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_lock_economic_policy(
+pub fn execute_lock_economic_policy(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -2327,7 +2270,7 @@ pub async fn execute_lock_economic_policy(
 // execute_modify_hard_rate_limit (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
-pub async fn execute_modify_hard_rate_limit(
+pub fn execute_modify_hard_rate_limit(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -2486,11 +2429,8 @@ pub async fn execute_propose_context_migration(
     }
 
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    deps.event_log.append_context_event(
-        &context_id_bytes,
-        "ContextMigrationStarted",
-        actor_did,
-    )?;
+    deps.event_log
+        .append_context_event(&context_id_bytes, "ContextMigrationStarted", actor_did)?;
     state.checkpoint_events_since += 1;
 
     Ok(MigrationProposedResult {
@@ -2566,13 +2506,562 @@ pub async fn execute_cancel_context_migration(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
+// propose_governance_action_inner (entry point — internal)
+// ---------------------------------------------------------------------------
+
+/// Inner implementation of proposal submission with auto-execution.
+///
+/// Returns the proposal, events, and optional execution result. The
+/// execution result is `Some` when the proposal was auto-approved
+/// (`SingleAdmin`) and the action was successfully executed.
+///
+/// When `check_propose_capability` is `true`, the `GovernancePropose`
+/// capability is verified under the same path as the proposal
+/// submission (actor-owned state — no TOCTOU window).
+#[allow(clippy::too_many_lines)]
+pub async fn propose_governance_action_inner(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    proposer_did: &DID,
+    action: GovernanceAction,
+    signing_key: &ed25519_dalek::SigningKey,
+    check_propose_capability: bool,
+) -> Result<
+    (
+        GovernanceProposal,
+        Vec<GovernanceEvent>,
+        Option<GovernanceActionResult>,
+    ),
+    ContextError,
+> {
+    // CancelContextMigration is allowed during MigratingOut (§5.11A);
+    // all other actions require Active state.
+    if matches!(action, GovernanceAction::CancelContextMigration) {
+        require_migrating_out(&state.handle)?;
+    } else {
+        require_active(&state.handle)?;
+    }
+
+    if check_propose_capability
+        && !state
+            .role_state
+            .member_has_capability(proposer_did.as_ref(), &Capability::GovernancePropose)
+    {
+        return Err(ContextError::PermissionDenied(format!(
+            "member {proposer_did} does not have governance:propose capability"
+        )));
+    }
+
+    // Presence-only members (read + write both suspended) lose
+    // GovernancePropose capability.
+    if state
+        .role_state
+        .suspended_capabilities
+        .get(proposer_did.as_ref())
+        .is_some_and(|s| {
+            s.contains(&Capability::MessagesRead) && s.contains(&Capability::MessagesWrite)
+        })
+    {
+        return Err(ContextError::PermissionDenied(
+            "presence-only members cannot propose governance actions".into(),
+        ));
+    }
+
+    // Eligibility check (#1530). check_proposer_eligibility takes legacy
+    // `&mut PerContextState`; the actor `PerContextState` shares the
+    // same `governance` field so we can construct an inline check via
+    // the same field set. To avoid a cross-state-type call, inline the
+    // logic by calling participation/pending-removal helpers from the
+    // governance crate. For Phase 2A.8 we keep the eligibility check
+    // through a split-borrow construction by reaching into governance
+    // helpers directly — but `check_proposer_eligibility` is the only
+    // entry point for the composite check. Provide an actor-shape
+    // adaptation by inlining the body here.
+    actor_check_proposer_eligibility(state, proposer_did, deps.clock.now_secs(), &*deps.event_log)?;
+
+    // SCP-272: Check and auto-resolve expired governance freezes.
+    let freeze_events = check_and_resolve_expired_freezes(state, deps);
+    if !freeze_events.is_empty() {
+        let cid_bytes = context_id_to_bytes(context_id);
+        for event in &freeze_events {
+            if let GovernanceEvent::ConflictResolved { .. } = event {
+                deps.event_log.append_context_event(
+                    &cid_bytes,
+                    "GovernanceFreezeExpired",
+                    proposer_did.as_ref(),
+                )?;
+                state.checkpoint_events_since += 1;
+            }
+        }
+    }
+
+    if state.governance.freeze.is_some()
+        && !matches!(action, GovernanceAction::ResolveConflict { .. })
+    {
+        return Err(ContextError::GovernanceFailed(
+            "governance is frozen due to simultaneous conflict — only ResolveConflict proposals are accepted".into(),
+        ));
+    }
+
+    let gov_ctx = build_governance_context(state, &*deps.clock);
+    let (proposal, events) = state
+        .governance
+        .engine
+        .propose(proposer_did, action, &gov_ctx, signing_key)
+        .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?;
+
+    state
+        .governance
+        .proposal_timestamps
+        .entry(proposer_did.to_string())
+        .or_default()
+        .push(deps.clock.now_secs());
+
+    let should_execute = proposal.status == ProposalStatus::Approved;
+
+    let conflict_events = if should_execute {
+        detect_and_handle_conflicts(state, deps, &proposal)
+    } else {
+        Vec::new()
+    };
+
+    let invalidated_by_conflict = conflict_events.iter().any(|e| {
+        matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == proposal.proposal_id)
+    });
+
+    let in_freeze = state.governance.freeze.is_some();
+
+    // Emit conflict events to the event log.
+    if !conflict_events.is_empty() {
+        let context_id_bytes = context_id_to_bytes(context_id);
+        let mut conflict_event_count: u64 = 0;
+        for event in &conflict_events {
+            match event {
+                GovernanceEvent::ConflictDetected { .. } => {
+                    deps.event_log.append_context_event(
+                        &context_id_bytes,
+                        "GovernanceConflictDetected",
+                        proposer_did.as_ref(),
+                    )?;
+                    conflict_event_count += 1;
+                }
+                GovernanceEvent::ConflictResolved { .. } => {
+                    deps.event_log.append_context_event(
+                        &context_id_bytes,
+                        "GovernanceConflictResolved",
+                        proposer_did.as_ref(),
+                    )?;
+                    conflict_event_count += 1;
+                }
+                _ => {}
+            }
+        }
+        if conflict_event_count > 0 {
+            state.checkpoint_events_since += conflict_event_count;
+        }
+    }
+
+    // If the proposal was auto-approved (SingleAdmin), execute
+    // immediately — unless invalidated by conflict or in freeze.
+    let execution_result = if should_execute && !invalidated_by_conflict && !in_freeze {
+        Some(
+            Box::pin(execute_governance_action(
+                state, deps, context_id, &proposal,
+            ))
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+
+    Ok((proposal, events, execution_result))
+}
+
+/// Actor-shape adaptation of
+/// [`crate::context::governance_logic::check_proposer_eligibility`].
+/// The shared helper takes `&mut crate::context::state::PerContextState`,
+/// which the actor cannot construct from its own
+/// `actor::state::PerContextState`. Inline the same composite
+/// pending-removal + `SingleAdmin` bypass + participation gate +
+/// earned-capacity gate against the actor-owned fields.
+#[allow(clippy::too_many_lines)]
+fn actor_check_proposer_eligibility(
+    state: &mut PerContextState,
+    proposer_did: &DID,
+    now: u64,
+    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+) -> Result<(), ContextError> {
+    use scp_protocol::context::params::GovernanceModel;
+    use scp_protocol::trust::participation::{compute_participation_record, meets_threshold};
+
+    // Pending-removal defense-in-depth.
+    for (proposal, _seq, _ts) in state.governance.approved_proposals.values() {
+        if let GovernanceAction::RemoveMember { did, .. } = &proposal.action
+            && did == proposer_did
+        {
+            return Err(ContextError::PermissionDenied(
+                "member has a pending ejection — cannot propose governance actions".into(),
+            ));
+        }
+    }
+
+    // SingleAdmin bypass: the sole authority is always eligible.
+    if matches!(
+        state.handle.params().governance,
+        GovernanceModel::SingleAdmin
+    ) {
+        return Ok(());
+    }
+
+    // Participation refresh + cache + threshold.
+    let context_id = state.handle.context_id().to_owned();
+    if !state
+        .governance
+        .participation_cache
+        .contains_key(proposer_did.as_ref())
+    {
+        let context_id_bytes = context_id_to_bytes(&context_id);
+        let merkle_root = event_log
+            .event_log_merkle_root(&context_id_bytes)
+            .unwrap_or([0u8; 32]);
+        let events = event_log_entries_for_consequences_split(
+            &state.receive_buffer,
+            &context_id,
+            now,
+            event_log,
+        );
+        if !events.is_empty() {
+            match compute_participation_record(
+                &events,
+                proposer_did.as_ref(),
+                &context_id,
+                merkle_root,
+                now,
+            ) {
+                Err(e) => {
+                    tracing::warn!(
+                        proposer = %proposer_did,
+                        error = %e,
+                        "compute_participation_record failed — denying proposal"
+                    );
+                    return Err(ContextError::PermissionDenied(
+                    "SCP-GOV-11021: participation record computation failed — cannot verify proposer eligibility"
+                        .into(),
+                ));
+                }
+                Ok(record) => {
+                    if record.participation_count > 0 {
+                        state
+                            .governance
+                            .participation_cache
+                            .insert(proposer_did.to_string(), record);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(record) = state
+        .governance
+        .participation_cache
+        .get(proposer_did.as_ref())
+        && !meets_threshold(record)
+    {
+        return Err(ContextError::PermissionDenied(
+            "member participation below threshold — cannot propose governance actions (SCP-GOV-11020)"
+                .into(),
+        ));
+    }
+
+    // Earned capacity enforcement (§9.3).
+    if let Some(sybil_policy) = state.handle.params().sybil_policy.as_ref() {
+        let assessment = crate::context::lifecycle_logic::build_identity_assessment(
+            proposer_did,
+            &state.governance,
+            now,
+        );
+        let (_level, capacity) =
+            scp_protocol::trust::sybil::evaluate_earned_capacity(&assessment, sybil_policy, now);
+
+        let window_secs = capacity.governance_proposal_window_secs;
+        let max_proposals = capacity.max_governance_proposals_per_window;
+        let window_start = now.saturating_sub(window_secs);
+
+        let timestamps = state
+            .governance
+            .proposal_timestamps
+            .entry(proposer_did.to_string())
+            .or_default();
+
+        timestamps.retain(|&ts| ts > window_start);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let recent_count = timestamps.len() as u32;
+        if recent_count >= max_proposals {
+            return Err(ContextError::PermissionDenied(format!(
+                "earned capacity limit reached: {recent_count}/{max_proposals} governance proposals \
+                 in {window_secs}s window (SCP-GOV-11030)"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// propose_governance_action (entry point — unchecked) — NOT MIGRATED
+// ---------------------------------------------------------------------------
+//
+// Unchecked actor-shape twin of
+// `governance_helpers_legacy::propose_governance_action_legacy` is not
+// migrated here yet. Production callers always route through
+// `propose_governance_action_checked` because spec §5.9 capability
+// suspension overlays must apply on the propose path. The unchecked
+// variant exists in the legacy module for the supervisor passthrough
+// (`Supervisor::propose_governance_action`) which keeps the legacy
+// shape until Phase 2A finalization. The actor-shape unchecked twin
+// lands here when a non-test caller appears.
+
+// ---------------------------------------------------------------------------
+// propose_governance_action_checked (entry point)
+// ---------------------------------------------------------------------------
+
+/// Submits a new governance proposal with capability validation.
+///
+/// Validates the `GovernancePropose` capability under the same atomic
+/// path as the proposal submission (no TOCTOU).
+#[instrument(skip_all, fields(context_id))]
+pub async fn propose_governance_action_checked(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    proposer_did: &DID,
+    action: GovernanceAction,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<ProposalOutcome, ContextError> {
+    let (proposal, _events, execution_result) = propose_governance_action_inner(
+        state,
+        deps,
+        context_id,
+        proposer_did,
+        action,
+        signing_key,
+        true,
+    )
+    .await?;
+
+    let status = proposal.status.clone();
+    Ok(ProposalOutcome {
+        proposal,
+        status,
+        execution_result,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// vote_on_proposal_inner (entry point — internal)
+// ---------------------------------------------------------------------------
+
+/// Inner vote implementation. When `check_vote_capability` is `true`,
+/// additionally verifies `GovernanceVote` via `member_has_capability`
+/// (actor-owned — no TOCTOU window).
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+#[instrument(skip_all, fields(context_id))]
+pub async fn vote_on_proposal_inner(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    proposal_id: &ProposalId,
+    voter_did: &DID,
+    approve: bool,
+    signing_key: &ed25519_dalek::SigningKey,
+    check_vote_capability: bool,
+) -> Result<(ProposalStatus, Vec<GovernanceEvent>), ContextError> {
+    require_active(&state.handle)?;
+
+    let suspended = state
+        .role_state
+        .suspended_capabilities
+        .get(voter_did.as_ref());
+    if suspended.is_some_and(|s| s.contains(&Capability::GovernanceVote)) {
+        return Err(ContextError::PermissionDenied(
+            "member does not have governance:vote capability".into(),
+        ));
+    }
+    if suspended.is_some_and(|s| {
+        s.contains(&Capability::MessagesRead) && s.contains(&Capability::MessagesWrite)
+    }) {
+        return Err(ContextError::PermissionDenied(
+            "presence-only members cannot vote on governance proposals".into(),
+        ));
+    }
+
+    if check_vote_capability
+        && !state
+            .role_state
+            .member_has_capability(voter_did.as_ref(), &Capability::GovernanceVote)
+    {
+        return Err(ContextError::PermissionDenied(format!(
+            "member {voter_did} does not have governance:vote capability"
+        )));
+    }
+
+    let gov_ctx = build_governance_context(state, &*deps.clock);
+    let (status, events) = if approve {
+        state
+            .governance
+            .engine
+            .approve(proposal_id, voter_did, &gov_ctx, signing_key)
+            .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
+    } else {
+        state
+            .governance
+            .engine
+            .reject(proposal_id, voter_did, &gov_ctx, signing_key)
+            .map_err(|e| ContextError::GovernanceFailed(e.to_string()))?
+    };
+
+    let proposal_for_execution = if status == ProposalStatus::Approved {
+        state.governance.engine.get_proposal(proposal_id).cloned()
+    } else {
+        None
+    };
+
+    let conflict_events = proposal_for_execution
+        .as_ref()
+        .map_or_else(Vec::new, |proposal| {
+            detect_and_handle_conflicts(state, deps, proposal)
+        });
+
+    // Emit conflict events to the event log.
+    if !conflict_events.is_empty() {
+        let context_id_bytes = context_id_to_bytes(context_id);
+        let mut conflict_event_count: u64 = 0;
+        for event in &conflict_events {
+            match event {
+                GovernanceEvent::ConflictDetected { .. } => {
+                    deps.event_log.append_context_event(
+                        &context_id_bytes,
+                        "GovernanceConflictDetected",
+                        voter_did.as_ref(),
+                    )?;
+                    conflict_event_count += 1;
+                }
+                GovernanceEvent::ConflictResolved { .. } => {
+                    deps.event_log.append_context_event(
+                        &context_id_bytes,
+                        "GovernanceConflictResolved",
+                        voter_did.as_ref(),
+                    )?;
+                    conflict_event_count += 1;
+                }
+                _ => {}
+            }
+        }
+        if conflict_event_count > 0 {
+            state.checkpoint_events_since += conflict_event_count;
+        }
+    }
+
+    let invalidated_by_conflict = conflict_events.iter().any(|e| {
+        matches!(e, GovernanceEvent::ConflictResolved { loser_id, .. } if *loser_id == *proposal_id)
+    });
+
+    if let Some(proposal) = proposal_for_execution {
+        let in_freeze = state.governance.freeze.is_some();
+        if !in_freeze && !invalidated_by_conflict {
+            Box::pin(execute_governance_action(
+                state, deps, context_id, &proposal,
+            ))
+            .await?;
+        }
+    }
+
+    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+
+    Ok((status, events))
+}
+
+// `vote_on_proposal` (the unchecked actor-shape twin of
+// `governance_helpers_legacy::vote_on_proposal_legacy`) is not
+// migrated here yet. Production callers always route through
+// `approve_governance_proposal` / `reject_governance_proposal` because
+// spec §5.9 suspension overlays must apply on the vote path. The
+// unchecked variant exists in the legacy module for the supervisor
+// passthrough (`Supervisor::vote_on_proposal`) which keeps the legacy
+// shape until Phase 2A finalization.
+
+// ---------------------------------------------------------------------------
+// approve_governance_proposal (entry point — checked)
+// ---------------------------------------------------------------------------
+
+/// Casts an approval vote on a pending governance proposal with
+/// `GovernanceVote` capability validation under the same atomic path
+/// as the vote.
+#[instrument(skip_all, fields(context_id))]
+pub async fn approve_governance_proposal(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    proposal_id: &ProposalId,
+    voter_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<ProposalStatus, ContextError> {
+    let (status, _events) = vote_on_proposal_inner(
+        state,
+        deps,
+        context_id,
+        proposal_id,
+        voter_did,
+        true,
+        signing_key,
+        true,
+    )
+    .await?;
+    Ok(status)
+}
+
+// ---------------------------------------------------------------------------
+// reject_governance_proposal (entry point — checked)
+// ---------------------------------------------------------------------------
+
+/// Casts a rejection vote on a pending governance proposal with
+/// `GovernanceVote` capability validation under the same atomic path
+/// as the vote.
+#[instrument(skip_all, fields(context_id))]
+pub async fn reject_governance_proposal(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    proposal_id: &ProposalId,
+    voter_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> Result<ProposalStatus, ContextError> {
+    let (status, _events) = vote_on_proposal_inner(
+        state,
+        deps,
+        context_id,
+        proposal_id,
+        voter_did,
+        false,
+        signing_key,
+        true,
+    )
+    .await?;
+    Ok(status)
+}
+
+// ---------------------------------------------------------------------------
 // dispatch_content_governance_action (orchestrator)
 // ---------------------------------------------------------------------------
 
 /// Dispatches content access, structural, and reconfiguration governance
 /// actions. Companion to [`dispatch_context_governance_action`].
 #[allow(clippy::too_many_lines)]
-pub async fn dispatch_content_governance_action(
+pub fn dispatch_content_governance_action(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -2582,25 +3071,23 @@ pub async fn dispatch_content_governance_action(
 ) -> Result<GovernanceActionResult, ContextError> {
     match action {
         GovernanceAction::AddSigner { did } => {
-            execute_add_signer(state, deps, context_id, did, pid, actor_did).await?;
+            execute_add_signer(state, deps, context_id, did, pid, actor_did)?;
             Ok(GovernanceActionResult::SignerAdded)
         }
         GovernanceAction::RemoveSigner { did } => {
-            execute_remove_signer(state, deps, context_id, did, pid, actor_did).await?;
+            execute_remove_signer(state, deps, context_id, did, pid, actor_did)?;
             Ok(GovernanceActionResult::SignerRemoved)
         }
         GovernanceAction::ModifyThreshold { new_threshold } => {
-            execute_modify_threshold(state, deps, context_id, *new_threshold, pid, actor_did)
-                .await?;
+            execute_modify_threshold(state, deps, context_id, *new_threshold, pid, actor_did)?;
             Ok(GovernanceActionResult::ThresholdModified)
         }
         GovernanceAction::EstablishToolInterface { interface } => {
-            execute_establish_tool_interface(state, deps, context_id, interface, pid, actor_did)
-                .await?;
+            execute_establish_tool_interface(state, deps, context_id, interface, pid, actor_did)?;
             Ok(GovernanceActionResult::ToolInterfaceEstablished)
         }
         GovernanceAction::ResetMember { did, reason } => {
-            execute_reset_member(state, deps, context_id, did, reason, pid, actor_did).await?;
+            execute_reset_member(state, deps, context_id, did, reason, pid, actor_did)?;
             Ok(GovernanceActionResult::MemberReset)
         }
         GovernanceAction::ResolveConflict {
@@ -2610,8 +3097,7 @@ pub async fn dispatch_content_governance_action(
         } => {
             execute_resolve_conflict(
                 state, deps, context_id, proposal_a, proposal_b, resolution, pid, actor_did,
-            )
-            .await?;
+            )?;
             Ok(GovernanceActionResult::ConflictResolved)
         }
         GovernanceAction::RotateContentKeys { reason } => {
@@ -2622,8 +3108,7 @@ pub async fn dispatch_content_governance_action(
                 reason.as_deref(),
                 pid,
                 actor_did,
-            )
-            .await?;
+            )?;
             Ok(GovernanceActionResult::ContentKeysRotated(
                 ContentKeysRotatedResult {
                     reason: reason.clone(),
@@ -2642,8 +3127,7 @@ pub async fn dispatch_content_governance_action(
                 justification,
                 pid,
                 actor_did,
-            )
-            .await?;
+            )?;
             Ok(GovernanceActionResult::GovernanceReconfigured(
                 GovernanceReconfiguredResult {
                     changes_applied: changes.len(),
@@ -2699,27 +3183,27 @@ pub async fn dispatch_context_governance_action(
 ) -> Result<GovernanceActionResult, ContextError> {
     match action {
         GovernanceAction::AddMember { did, role } => {
-            execute_add_member(state, deps, context_id, did, role, pid, actor_did).await?;
+            execute_add_member(state, deps, context_id, did, role, pid, actor_did)?;
             Ok(GovernanceActionResult::MemberAdded)
         }
         GovernanceAction::RemoveMember { did, .. } => {
-            execute_remove_member(state, deps, context_id, did, pid, actor_did).await?;
+            execute_remove_member(state, deps, context_id, did, pid, actor_did)?;
             Ok(GovernanceActionResult::MemberRemoved)
         }
         GovernanceAction::ChangeRole { did, new_role } => {
-            execute_change_role(state, deps, context_id, did, new_role, pid, actor_did).await?;
+            execute_change_role(state, deps, context_id, did, new_role, pid, actor_did)?;
             Ok(GovernanceActionResult::RoleChanged)
         }
         GovernanceAction::RegisterTool { registration } => {
-            execute_register_tool(state, deps, context_id, registration, pid, actor_did).await?;
+            execute_register_tool(state, deps, context_id, registration, pid, actor_did)?;
             Ok(GovernanceActionResult::ToolRegistered)
         }
         GovernanceAction::RemoveTool { tool_id } => {
-            execute_remove_tool(state, deps, context_id, tool_id, pid, actor_did).await?;
+            execute_remove_tool(state, deps, context_id, tool_id, pid, actor_did)?;
             Ok(GovernanceActionResult::ToolRemoved)
         }
         GovernanceAction::ModifyCeiling { new_ceiling } => {
-            execute_modify_ceiling(state, deps, context_id, new_ceiling, pid, actor_did).await?;
+            execute_modify_ceiling(state, deps, context_id, new_ceiling, pid, actor_did)?;
             Ok(GovernanceActionResult::CeilingModified)
         }
         GovernanceAction::CloseContext { reason } => {
@@ -2728,16 +3212,15 @@ pub async fn dispatch_context_governance_action(
             Ok(GovernanceActionResult::ContextClosed)
         }
         GovernanceAction::TransferAdmin { new_admin } => {
-            execute_transfer_admin(state, deps, context_id, new_admin, pid, actor_did).await?;
+            execute_transfer_admin(state, deps, context_id, new_admin, pid, actor_did)?;
             Ok(GovernanceActionResult::AdminTransferred)
         }
         GovernanceAction::CreateChildContext { params } => {
-            execute_create_child_context(state, deps, context_id, params, pid, actor_did).await?;
+            execute_create_child_context(state, deps, context_id, params, pid, actor_did)?;
             Ok(GovernanceActionResult::ChildContextCreated)
         }
         GovernanceAction::ModifyPruningPolicy { new_policy } => {
-            execute_modify_pruning_policy(state, deps, context_id, new_policy, pid, actor_did)
-                .await?;
+            execute_modify_pruning_policy(state, deps, context_id, new_policy, pid, actor_did)?;
             Ok(GovernanceActionResult::PruningPolicyModified)
         }
         GovernanceAction::ProposeContextMigration {
@@ -2773,7 +3256,6 @@ pub async fn dispatch_context_governance_action(
         | GovernanceAction::RotateContentKeys { .. }
         | GovernanceAction::ReconfigureGovernance { .. } => {
             dispatch_content_governance_action(state, deps, context_id, action, pid, actor_did)
-                .await
         }
         GovernanceAction::PromoteContext
         | GovernanceAction::ExtendTtl { .. }
@@ -2806,7 +3288,7 @@ pub async fn dispatch_governance_action(
     let actor = proposal.proposer_did.as_ref();
     match &proposal.action {
         GovernanceAction::SuspendCapability { did, capabilities } => {
-            execute_suspend_member(state, deps, context_id, did, capabilities, pid, actor).await?;
+            execute_suspend_member(state, deps, context_id, did, capabilities, pid, actor)?;
             Ok(GovernanceActionResult::MemberSuspended(
                 SuspendMemberResult {
                     did: did.clone(),
@@ -2841,16 +3323,13 @@ pub async fn dispatch_governance_action(
 
             crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
             let context_id_bytes = context_id_to_bytes(context_id);
-            deps.event_log.append_context_event(
-                &context_id_bytes,
-                "MemberSuspendedAll",
-                actor,
-            )?;
+            deps.event_log
+                .append_context_event(&context_id_bytes, "MemberSuspendedAll", actor)?;
             state.checkpoint_events_since += 1;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::RevokeAccess { did, access } => {
-            let r = execute_revoke(state, deps, context_id, did, *access, pid, actor).await?;
+            let r = execute_revoke(state, deps, context_id, did, *access, pid, actor)?;
             Ok(GovernanceActionResult::AccessRevoked(RevokeResult {
                 did: did.clone(),
                 access: *access,
@@ -2858,7 +3337,7 @@ pub async fn dispatch_governance_action(
             }))
         }
         GovernanceAction::RestoreAccess { did, capabilities } => {
-            execute_restore_access(state, deps, context_id, did, capabilities, pid, actor).await?;
+            execute_restore_access(state, deps, context_id, did, capabilities, pid, actor)?;
             Ok(GovernanceActionResult::AccessRestored(
                 RestoreAccessResult {
                     did: did.clone(),
@@ -2867,8 +3346,7 @@ pub async fn dispatch_governance_action(
             ))
         }
         GovernanceAction::PromoteContext => {
-            execute_promote_context(state, deps, context_id, &proposal.approvals, pid, actor)
-                .await?;
+            execute_promote_context(state, deps, context_id, &proposal.approvals, pid, actor)?;
             Ok(GovernanceActionResult::ContextPromoted)
         }
         GovernanceAction::ExtendTtl { additional_secs } => {
@@ -2885,7 +3363,7 @@ pub async fn dispatch_governance_action(
             Ok(GovernanceActionResult::TtlExtended)
         }
         GovernanceAction::SetEconomicPolicy { policy } => {
-            execute_set_economic_policy(state, deps, context_id, policy, pid, actor).await?;
+            execute_set_economic_policy(state, deps, context_id, policy, pid, actor)?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::ApproveSpend {
@@ -2893,17 +3371,17 @@ pub async fn dispatch_governance_action(
             amount,
             purpose,
         } => {
-            execute_approve_spend(state, deps, context_id, spender, *amount, purpose, pid, actor)
-                .await?;
+            execute_approve_spend(
+                state, deps, context_id, spender, *amount, purpose, pid, actor,
+            )?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::LockEconomicPolicy => {
-            execute_lock_economic_policy(state, deps, context_id, pid, actor).await?;
+            execute_lock_economic_policy(state, deps, context_id, pid, actor)?;
             Ok(GovernanceActionResult::Executed)
         }
         GovernanceAction::ModifyHardRateLimit { new_config } => {
-            execute_modify_hard_rate_limit(state, deps, context_id, new_config, pid, actor)
-                .await?;
+            execute_modify_hard_rate_limit(state, deps, context_id, new_config, pid, actor)?;
             Ok(GovernanceActionResult::Executed)
         }
         // Remaining actions dispatched to context-level handler.
@@ -2950,7 +3428,7 @@ pub async fn dispatch_governance_action(
 /// (PRD SCP-269/SCP-270), checkpoint cosignature triggering (ADR-031 §9),
 /// and cleanup of approved proposals (ADR-031 §7).
 #[allow(clippy::too_many_lines, clippy::option_if_let_else)]
-pub async fn finalize_governance_action(
+pub fn finalize_governance_action(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
@@ -3024,8 +3502,10 @@ pub async fn finalize_governance_action(
 
     // 2. Trigger checkpoint cosignature collection for multi-admin
     //    contexts (ADR-031 §9).
-    let (required_signers, minimum_count) =
-        state.governance.engine.checkpoint_cosignature_requirements();
+    let (required_signers, minimum_count) = state
+        .governance
+        .engine
+        .checkpoint_cosignature_requirements();
     if minimum_count > 0 {
         emit(
             state,
@@ -3237,7 +3717,7 @@ pub async fn execute_governance_action(
         }
     };
 
-    finalize_governance_action(state, deps, context_id, proposal).await?;
+    finalize_governance_action(state, deps, context_id, proposal)?;
 
     Ok(result)
 }
@@ -3257,12 +3737,12 @@ pub async fn execute_governance_action(
     clippy::too_many_lines,
     reason = "single-pipeline broadcast-enqueue scope — splitting fragments the failure path"
 )]
-pub async fn try_broadcast_commit_or_enqueue(
+pub fn try_broadcast_commit_or_enqueue(
     state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
     commit_bytes: Vec<u8>,
-    operation: CommitOperation,
+    operation: &CommitOperation,
     actor_did: &str,
 ) -> Result<(), ContextError> {
     if commit_bytes.is_empty() {
@@ -3307,7 +3787,7 @@ pub async fn try_broadcast_commit_or_enqueue(
                 emit(
                     state,
                     ContextEvent::CommitBroadcastFailed {
-                        operation: label.clone(),
+                        operation: label,
                         reason: format!("queue full ({MAX_PENDING_COMMITS}): {error_str}"),
                         attempts: 1,
                     },
@@ -3317,10 +3797,11 @@ pub async fn try_broadcast_commit_or_enqueue(
                 return Ok(());
             }
             state.pending_commits.push_back(pending);
+            let label_for_event = label.clone();
             emit(
                 state,
                 ContextEvent::CommitBroadcastPending {
-                    operation: label.clone(),
+                    operation: label_for_event,
                     error: error_str.clone(),
                     attempt: 1,
                 },
