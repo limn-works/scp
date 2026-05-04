@@ -236,7 +236,7 @@ pub async fn leave_context(
                  remaining members retain old sender key"
             );
         }
-        if let Err(e) = drain_and_deliver_sender_keys(state, deps, &context_id, &context_id_bytes) {
+        if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes) {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -330,7 +330,6 @@ pub async fn leave_context(
 /// catastrophically. Per-recipient send failures are logged but not
 /// propagated (the receiver can recover via `SenderKeyRequest`).
 pub fn drain_and_deliver_sender_keys(
-    _state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
     context_id_bytes: &[u8; 32],
@@ -709,7 +708,7 @@ pub async fn join_context(
     // Drain pending HPKE-sealed sender key distribution messages and
     // deliver them via the MLS management channel (§9.16.2). MLS-wrap
     // is mandatory — see comment on `drain_and_deliver_sender_keys`.
-    if let Err(e) = drain_and_deliver_sender_keys(state, deps, &context_id, &context_id_bytes) {
+    if let Err(e) = drain_and_deliver_sender_keys(deps, &context_id, &context_id_bytes) {
         // Drain failed catastrophically — roll back MLS state, sender
         // key, escrow, and economy ticket so the join is fully aborted.
         let _ = deps.crypto.remove_member(&context_id_bytes, &member_did);

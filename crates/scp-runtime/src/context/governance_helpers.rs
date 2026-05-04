@@ -796,7 +796,6 @@ pub fn execute_revoke(
         // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape
         // and operates directly on `state` + `deps`.
         if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-            state,
             deps,
             context_id,
             &context_id_bytes,
@@ -1072,7 +1071,6 @@ pub fn execute_remove_member(
 
     // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
     if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-        state,
         deps,
         context_id,
         &context_id_bytes,
@@ -1792,7 +1790,6 @@ pub fn execute_reset_member(
 
     // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
     if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-        state,
         deps,
         context_id,
         &context_id_bytes,
