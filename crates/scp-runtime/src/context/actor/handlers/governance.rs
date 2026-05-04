@@ -184,6 +184,9 @@ async fn dispatch_state(
             )
             .await
         }
+        GovernanceCommand::ExecuteGovernanceAction { payload, reply } => {
+            Box::pin(handle_execute_governance_action_actor(state, deps, *payload, reply)).await
+        }
         // ---------- unmigrated variants (escape to legacy via shim) ----------
         cmd => {
             // Re-issue the command through the supervisor's legacy
@@ -1099,6 +1102,47 @@ async fn handle_apply_pending_ceiling_modification_actor(
             (Outcome::err(sketch), Err(err))
         }
     };
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`GovernanceCommand::ExecuteGovernanceAction`] (actor-shape).
+async fn handle_execute_governance_action_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    payload: ExecuteGovernanceActionPayload,
+    reply: oneshot::Sender<Result<crate::context::state::GovernanceActionResult, ContextError>>,
+) -> Outcome<()> {
+    let context_id = payload.context_id.clone();
+    let proposal = payload.proposal;
+
+    let execute_fut = async move {
+        Box::pin(crate::context::governance_helpers::execute_governance_action(
+            state,
+            deps,
+            &payload.context_id,
+            &proposal,
+        ))
+        .await
+    };
+
+    let (outcome, reply_result) = match Box::pin(tokio::time::timeout(HANDLER_TIMEOUT, execute_fut))
+        .await
+    {
+        Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "execute_governance_action exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
     let _ = reply.send(reply_result);
     outcome
 }
