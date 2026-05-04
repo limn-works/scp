@@ -138,15 +138,8 @@ async fn dispatch_state(
         }
         LifecycleCommand::CloseContext { payload, reply } => {
             let p = *payload;
-            handle_close_context_actor(
-                state,
-                deps,
-                p.context_id,
-                p.params,
-                p.initiator_did,
-                reply,
-            )
-            .await
+            handle_close_context_actor(state, deps, p.context_id, p.params, p.initiator_did, reply)
+                .await
         }
         LifecycleCommand::ExportContext {
             context_id,
@@ -193,10 +186,8 @@ async fn dispatch_state(
             caller_did,
             reply,
         } => {
-            handle_revoke_context_access_key_actor(
-                deps, context_id, member_did, caller_did, reply,
-            )
-            .await
+            handle_revoke_context_access_key_actor(deps, context_id, member_did, caller_did, reply)
+                .await
         }
         LifecycleCommand::RestoreContextAccessKey {
             context_id,
@@ -204,10 +195,8 @@ async fn dispatch_state(
             caller_did,
             reply,
         } => {
-            handle_restore_context_access_key_actor(
-                deps, context_id, member_did, caller_did, reply,
-            )
-            .await
+            handle_restore_context_access_key_actor(deps, context_id, member_did, caller_did, reply)
+                .await
         }
     }
 }
@@ -910,12 +899,8 @@ async fn handle_export_context_actor(
     exporter_did: scp_identity::DID,
     reply: ExportContextReply,
 ) -> Outcome<()> {
-    let export_fut = crate::context::lifecycle_helpers::export_context(
-        state,
-        deps,
-        &context_id,
-        exporter_did,
-    );
+    let export_fut =
+        crate::context::lifecycle_helpers::export_context(state, deps, &context_id, exporter_did);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, export_fut).await {
         Ok(Ok(export)) => (Outcome::ok(()), Ok(export)),
@@ -946,8 +931,9 @@ async fn handle_import_context_actor(
 ) -> Outcome<()> {
     let context_id = export.snapshot.context_id.clone();
 
-    let import_fut =
-        Box::pin(crate::context::lifecycle_helpers::import_context(deps, *export));
+    let import_fut = Box::pin(crate::context::lifecycle_helpers::import_context(
+        deps, *export,
+    ));
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, import_fut).await {
         Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),

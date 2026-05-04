@@ -1924,11 +1924,13 @@ pub async fn execute_revoke_legacy(
                 "rotate_sender_key failed after access revocation"
             );
         }
-        if let Err(e) = crate::context::lifecycle_helpers_legacy::drain_and_deliver_sender_keys_legacy(
-            supervisor,
-            context_id,
-            &context_id_bytes,
-        ) {
+        if let Err(e) =
+            crate::context::lifecycle_helpers_legacy::drain_and_deliver_sender_keys_legacy(
+                supervisor,
+                context_id,
+                &context_id_bytes,
+            )
+        {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,

@@ -2516,10 +2516,7 @@ impl Supervisor {
         member_did: &DID,
     ) -> Result<(), ContextError> {
         crate::context::lifecycle_helpers_legacy::leave_context_legacy(
-            self,
-            handle,
-            caller_did,
-            member_did,
+            self, handle, caller_did, member_did,
         )
         .await
     }

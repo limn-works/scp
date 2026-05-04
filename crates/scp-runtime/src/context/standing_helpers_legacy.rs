@@ -62,8 +62,8 @@ use scp_protocol::context::{ContextError, ContextState, TemplateId};
 use sha2::{Digest, Sha256};
 
 use crate::context::ContextHandle;
-use crate::context::supervisor::Supervisor;
 use crate::context::manager_methods;
+use crate::context::supervisor::Supervisor;
 
 // Phase 1 fix-up of ADR-049 (post-review-round-1): per-helper
 // `ATTACHED_EXPECT` constants consolidated to the single

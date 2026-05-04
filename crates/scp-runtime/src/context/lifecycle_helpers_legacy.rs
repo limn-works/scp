@@ -679,7 +679,8 @@ pub async fn create_context_legacy(
         GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
         _ => (Vec::new(), 0),
     };
-    let initial_access_key_store = generate_initial_access_key_store_legacy(&context_id, &creator_did);
+    let initial_access_key_store =
+        generate_initial_access_key_store_legacy(&context_id, &creator_did);
     let initial_members: HashSet<DID> = membership.members().map(|m| m.did.clone()).collect();
     let per_context = PerContextState {
         generation: next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -1058,7 +1059,8 @@ pub async fn join_context_legacy(
     // management message before the Welcome, their `crypto.open()`
     // call fails to decrypt and the `SenderKeyRequest` fallback
     // recovers the key.
-    if let Err(e) = drain_and_deliver_sender_keys_legacy(supervisor, &context_id, &context_id_bytes) {
+    if let Err(e) = drain_and_deliver_sender_keys_legacy(supervisor, &context_id, &context_id_bytes)
+    {
         // Drain failed catastrophically — roll back MLS state, sender
         // key, escrow, and economy ticket so the join is fully aborted.
         let _ = crypto.remove_member(&context_id_bytes, &member_did);
@@ -1083,7 +1085,8 @@ pub async fn join_context_legacy(
 
     // Phase 4: Membership mutation under lock. On failure: void escrow +
     // rollback ticket + rollback MLS state.
-    if let Err(e) = join_context_membership_legacy(supervisor, &context_id, &member_did, add_output).await
+    if let Err(e) =
+        join_context_membership_legacy(supervisor, &context_id, &member_did, add_output).await
     {
         let _ = crypto.remove_member(&context_id_bytes, &member_did);
         let _ = crypto.remove_member_sender_key(&context_id_bytes, &member_did);
@@ -1361,7 +1364,9 @@ pub async fn leave_context_legacy(
                  remaining members retain old sender key"
             );
         }
-        if let Err(e) = drain_and_deliver_sender_keys_legacy(supervisor, &context_id, &context_id_bytes) {
+        if let Err(e) =
+            drain_and_deliver_sender_keys_legacy(supervisor, &context_id, &context_id_bytes)
+        {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
@@ -1790,7 +1795,8 @@ pub async fn restore_context_legacy(
         .ok_or_else(|| ContextError::NotInitialized(ATTACHED.to_owned()))?
         .clone();
 
-    let (mut ctx_snapshot, broadcast_ctx) = load_persisted_context_state_legacy(supervisor, context_id)?;
+    let (mut ctx_snapshot, broadcast_ctx) =
+        load_persisted_context_state_legacy(supervisor, context_id)?;
     restore_event_log_best_effort_legacy(supervisor, context_id);
 
     validate_consequence_rules_for_import(
@@ -2007,7 +2013,9 @@ pub async fn restore_context_legacy(
 /// contexts fails (no persistence provider configured, or list call
 /// fails).
 #[tracing::instrument(skip_all)]
-pub async fn restore_all_contexts_legacy(supervisor: &Supervisor) -> Result<Vec<String>, ContextError> {
+pub async fn restore_all_contexts_legacy(
+    supervisor: &Supervisor,
+) -> Result<Vec<String>, ContextError> {
     let Some(persistence) = supervisor.persistence_ref() else {
         return Err(ContextError::PersistenceFailed(
             "no persistence provider configured".into(),
