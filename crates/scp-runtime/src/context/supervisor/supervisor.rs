@@ -1535,6 +1535,36 @@ impl Supervisor {
         handle
     }
 
+    /// Despawn the actor registered for `context_id`, removing the
+    /// entry from [`Self::actors`] under the supervisor's
+    /// [`Self::write_lock`] so a concurrent re-registration cannot
+    /// race the removal.
+    ///
+    /// The removed [`ContextActorHandle`] is dropped at the end of
+    /// this function; that drop closes the underlying
+    /// `mpsc::Sender`, which signals the actor task's `run()` loop
+    /// to exit on the next inbox-empty poll.
+    ///
+    /// Returns `true` if a handle was registered and removed,
+    /// `false` if no entry existed for `context_id`.
+    ///
+    /// # Visibility
+    ///
+    /// `pub(in crate::context)` — exposed through
+    /// [`SupervisorHandle::despawn_actor`](crate::context::supervisor::handle::SupervisorHandle::despawn_actor)
+    /// so lifecycle bootstrap (`import_context`) can perform the
+    /// despawn-then-respawn dance without holding `&Supervisor`
+    /// directly.
+    ///
+    /// `dead_code` allow: the first production caller is the Phase
+    /// 2A finalization keystone wiring of
+    /// [`crate::context::lifecycle_helpers::import_context`].
+    #[allow(dead_code)]
+    pub(in crate::context) async fn despawn_actor(&self, context_id: &str) -> bool {
+        let _guard = self.write_lock.lock().await;
+        self.actors.remove(context_id).is_some()
+    }
+
     /// Dispatch a [`StandingCommand`] through the migration shim
     /// (ADR-049 commit 11 / plan row 11).
     ///

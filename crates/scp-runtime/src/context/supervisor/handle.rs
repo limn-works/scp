@@ -468,6 +468,67 @@ impl SupervisorHandle {
     pub(in crate::context) fn shim_supervisor(&self) -> Arc<Supervisor> {
         Arc::clone(&self.supervisor)
     }
+
+    /// Spawn a per-context [`ContextActor`](crate::context::actor::ContextActor)
+    /// task that owns the supplied
+    /// [`PerContextState`](crate::context::actor::state::PerContextState) +
+    /// [`ActorDeps`](crate::context::actor::deps::ActorDeps) bundle and
+    /// register the resulting handle in the supervisor's actor registry.
+    ///
+    /// Capability-reduced wrapper around
+    /// [`Supervisor::spawn_actor_with_state`](crate::context::supervisor::Supervisor::spawn_actor_with_state).
+    /// Phase 2A finalization keystone: lifecycle bootstrap entry points
+    /// in [`crate::context::lifecycle_helpers`] (`create_context`,
+    /// `restore_context`, `import_context`) call this after building the
+    /// actor-shape state so production paths populate
+    /// `Supervisor::actors` instead of going through the legacy
+    /// contexts-map insert. Subsequent finalization commits delete the
+    /// legacy DashMap once every consumer is ported.
+    ///
+    /// # Visibility
+    ///
+    /// `pub(in crate::context)` — only lifecycle bootstrap callers
+    /// (`crate::context::lifecycle_helpers`) reach this. The
+    /// `private_interfaces` allow mirrors the discipline used by
+    /// [`Self::insert_context`] / [`Self::replace_context`]:
+    /// `PerContextState` and `ActorDeps` are `pub(crate)` while the
+    /// method itself is reachable from inside the `context` module
+    /// tree.
+    #[allow(private_interfaces, dead_code)]
+    pub(in crate::context) async fn spawn_actor_with_state(
+        &self,
+        state: crate::context::actor::state::PerContextState,
+        deps: crate::context::actor::deps::ActorDeps,
+        mailbox_capacity: Option<usize>,
+    ) -> crate::context::actor::handle::ContextActorHandle {
+        self.supervisor
+            .spawn_actor_with_state(state, deps, mailbox_capacity)
+            .await
+    }
+
+    /// Despawn the actor registered for `context_id`, removing the
+    /// entry from `Supervisor::actors` under the supervisor's
+    /// `write_lock` so concurrent registrations cannot race.
+    ///
+    /// Used by [`crate::context::lifecycle_helpers::import_context`] —
+    /// import overwrites an existing context, so the prior actor's
+    /// mailbox is shut down before the fresh actor is spawned. The
+    /// handle's [`Drop`](crate::context::actor::handle::ContextActorHandle)
+    /// closes the underlying `mpsc::Sender`, which causes the actor
+    /// task's `run()` loop to exit on the next inbox-empty poll.
+    ///
+    /// Returns `true` if a handle was registered and removed,
+    /// `false` if no entry existed for `context_id`.
+    ///
+    /// # Visibility
+    ///
+    /// `pub(in crate::context)` — the import-bootstrap path is the
+    /// only caller. Removed when the actor map is the sole context
+    /// registry and `Supervisor::contexts` is deleted.
+    #[allow(dead_code)]
+    pub(in crate::context) async fn despawn_actor(&self, context_id: &str) -> bool {
+        self.supervisor.despawn_actor(context_id).await
+    }
 }
 
 // Explicit non-exposure check: ensure no public method returns
