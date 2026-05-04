@@ -1,55 +1,28 @@
 //! Lifecycle handlers — see
 //! [`LifecycleCommand`](crate::context::actor::commands::LifecycleCommand)
-//! and plan §"Submodule organization" / row 9 of the commit ladder.
+//! and ADR-049 Phase 2A.9 (`lifecycle` domain migration).
 //!
-//! # Commit 9 scope
+//! # Two dispatch entry points
 //!
-//! Migrates the dispatch shape: the handler takes
-//! `&Arc<ContextManager>` + [`ActorDeps`] + [`LifecycleCommand`], returns
-//! `Outcome<()>`.
+//! - [`dispatch`] — actor-shape entry point. Takes `(&mut state,
+//!   &deps, cmd)` and routes to actor-shape helpers in
+//!   [`crate::context::lifecycle_helpers`]. Used from the actor's
+//!   [`dispatch_state`](crate::context::actor::ContextActor::dispatch_state)
+//!   loop once the per-context actor owns state.
+//! - [`dispatch_from_shim`] — legacy shim entry point. Takes
+//!   `(supervisor, cmd)` and routes to the legacy `&Supervisor`-shaped
+//!   helpers in
+//!   [`crate::context::lifecycle_helpers_legacy`]. Used during the
+//!   Phase 2A migration window for callers without an attached actor
+//!   (FFI fallback, integration tests).
 //!
-//! The underlying byte-identical implementation still lives on
-//! [`Supervisor`](crate::context::supervisor::Supervisor): each
-//! handler delegates to
-//! [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context),
-//! [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context),
-//! [`ContextManager::leave_context`](crate::context::supervisor::Supervisor::leave_context),
-//! [`ContextManager::close_context`](crate::context::lifecycle_helpers::close_context),
-//! [`ContextManager::export_context`](crate::context::lifecycle_helpers::export_context),
-//! or
-//! [`ContextManager::import_context`](crate::context::lifecycle_helpers::import_context).
-//! The shim's job is:
-//!
-//! 1. Wrap every delegated call in [`tokio::time::timeout`] with a 30s
-//!    budget per ADR-049 §7 / plan §"Transport timeouts inside actor
-//!    handlers". Timeout maps to
-//!    [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout).
-//! 2. Preserve byte-identical on-the-wire behaviour — creation,
-//!    membership, close, and export/import bytes are produced by the
-//!    legacy method unchanged.
-//!
-//! **Create-as-prepare.** `create_context` and `join_context` are
-//! legitimate saga entry points in later commits (standing-pair
-//! creation, migration). In commit 9 the handler still goes through
-//! `ContextManager::create_context` / `join_context` directly — saga
-//! wiring lands with `handlers/standing.rs` in commit 11.
-//!
-//! # ADR-049 commit 12c.7 — direct dispatch
-//!
-//! Prior to 12c.7 the handler took a `MutationStateView<'_>` borrow
-//! adapter that bundled an `Arc<ContextManager>` reference plus a
-//! mutable scratch send-sequence tracker (the lifecycle path never read
-//! the tracker, but the adapter was uniform across handlers). 12c.7
-//! deletes the adapter: the supervisor passes the
-//! `&Arc<ContextManager>` directly and no scratch tracker is allocated.
-//!
-//! # Transport-timeout budget
-//!
-//! [`HANDLER_TIMEOUT`] is the handler-level budget. The legacy
-//! `ContextManager` methods do not carry their own deadline — this is
-//! the new behaviour introduced by ADR-049 §7. 30 seconds matches the
-//! plan's "every transport and storage call inside a handler wraps
-//! `tokio::time::timeout(30s, ...)`" contract.
+//! Each entry point carries a 30-second per-call transport budget per
+//! ADR-049 §7. Bootstrap commands (`CreateContext`,
+//! `RestoreContext`, `ImportContext`) construct fresh `PerContextState`
+//! and register through
+//! [`SupervisorHandle`](crate::context::supervisor::handle::SupervisorHandle)
+//! on the actor path; on the shim path they call the legacy `_legacy`
+//! twin directly against the supervisor's contexts map.
 
 use std::time::Duration;
 
@@ -62,65 +35,195 @@ use crate::context::actor::commands::{
 };
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
+use crate::context::actor::state::PerContextState;
 use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for lifecycle handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch a [`LifecycleCommand`] against an attached manager + deps
-/// bundle.
+// ---------------------------------------------------------------------------
+// Actor-shape dispatch (used from `dispatch_state`)
+// ---------------------------------------------------------------------------
+
+/// Actor-shape dispatch — routes `LifecycleCommand` against actor-owned
+/// state.
 ///
-/// Plan-conforming dispatch signature: matches the post-refactor actor
-/// `run()` loop's call shape
-/// (`handlers::lifecycle::dispatch(&mgr, &self.deps, cmd).await`).
-/// `deps` is accepted for symmetry — the lifecycle handler does not yet
-/// touch deps during the shim period (the transport, event log, crypto
-/// providers, and persistence live on the legacy
-/// [`Supervisor`](crate::context::supervisor::Supervisor)). Commit
-/// 12 rewires these paths to use `deps` directly once the manager
-/// surface is deleted.
+/// Bootstrap commands (`CreateContext`, `RestoreContext`,
+/// `ImportContext`) do NOT take `&mut state` — they construct fresh
+/// state. They cannot be routed against a per-context actor that does
+/// not yet exist; they remain on the shim path until the supervisor's
+/// actor-spawn pipeline lands.
+///
+/// Per-context commands (`JoinContext`, `LeaveContext`, `CloseContext`,
+/// `ExportContext`) operate against `&mut state` directly.
+///
+/// Access-key commands (`GenerateContextAccessKey`,
+/// `RevokeContextAccessKey`, `RestoreContextAccessKey`) live in
+/// `queries_helpers` (Phase 2A.10) and continue to route through the
+/// shim until that domain migrates.
 pub async fn dispatch(
-    supervisor: &Supervisor,
-    _deps: &ActorDeps,
+    state: &mut PerContextState,
+    deps: &ActorDeps,
     cmd: LifecycleCommand,
 ) -> Outcome<()> {
-    // `Box::pin` the dispatch future — the total size of the
-    // per-variant locals (ContextParams ~1KB, ContextExport ~2KB, the
-    // rebuilt ContextHandle, a signing key, and the 30s-timeout future
-    // inside each handler) crosses clippy's 16-KB stack budget for
-    // async futures. Boxing here moves the per-variant state onto the
-    // heap once per dispatch.
-    Box::pin(dispatch_inner(supervisor, cmd)).await
+    Box::pin(dispatch_actor_inner(state, deps, cmd)).await
 }
 
-/// Shim-callable dispatch. Used by
-/// [`Supervisor::dispatch_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_command)
-/// during the commits-9-to-11 migration window — deleted in commit 12
-/// when the shim dissolves and the actor's `run()` loop is the only
-/// caller of [`dispatch`].
+#[allow(clippy::too_many_lines)]
+async fn dispatch_actor_inner(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    cmd: LifecycleCommand,
+) -> Outcome<()> {
+    match cmd {
+        LifecycleCommand::Placeholder { reply } => reply_not_implemented(reply),
+        LifecycleCommand::CreateContext { payload, reply } => {
+            // Bootstrap — constructs new state, no per-actor mutation.
+            // Route through the shim; the actor model spawns a fresh
+            // actor for the new context after registration.
+            let p = *payload;
+            handle_create_context_shim(
+                deps.supervisor.shim_supervisor().as_ref(),
+                p.context_id,
+                p.params,
+                p.creator_did,
+                p.local_pseudonym,
+                reply,
+            )
+            .await
+        }
+        LifecycleCommand::JoinContext { payload, reply } => {
+            let p = *payload;
+            handle_join_context_actor(
+                state,
+                deps,
+                p.context_id,
+                p.params,
+                p.key_package,
+                p.spending_ucan.as_ref(),
+                p.local_pseudonym,
+                reply,
+            )
+            .await
+        }
+        LifecycleCommand::LeaveContext { payload, reply } => {
+            let p = *payload;
+            handle_leave_context_actor(
+                state,
+                deps,
+                p.context_id,
+                p.params,
+                p.caller_did,
+                p.member_did,
+                reply,
+            )
+            .await
+        }
+        LifecycleCommand::CloseContext { payload, reply } => {
+            let p = *payload;
+            handle_close_context_actor(state, deps, p.context_id, p.params, p.initiator_did, reply)
+                .await
+        }
+        LifecycleCommand::ExportContext {
+            context_id,
+            exporter_did,
+            reply,
+        } => handle_export_context_actor(state, deps, context_id, exporter_did, reply),
+        LifecycleCommand::ImportContext { export, reply } => {
+            // Bootstrap — constructs new state. Route through the shim.
+            Box::pin(handle_import_context_shim(
+                deps.supervisor.shim_supervisor().as_ref(),
+                export,
+                reply,
+            ))
+            .await
+        }
+        LifecycleCommand::RestoreContext { payload, reply } => {
+            // Bootstrap — constructs new state. Route through the shim.
+            let p = *payload;
+            Box::pin(handle_restore_context_shim(
+                deps.supervisor.shim_supervisor().as_ref(),
+                p.context_id,
+                p.params,
+                reply,
+            ))
+            .await
+        }
+        LifecycleCommand::GenerateContextAccessKey {
+            context_id,
+            member_did,
+            caller_did,
+            reply,
+        } => {
+            handle_generate_context_access_key_shim(
+                deps.supervisor.shim_supervisor().as_ref(),
+                context_id,
+                member_did,
+                caller_did,
+                reply,
+            )
+            .await
+        }
+        LifecycleCommand::RevokeContextAccessKey {
+            context_id,
+            member_did,
+            caller_did,
+            reply,
+        } => {
+            handle_revoke_context_access_key_shim(
+                deps.supervisor.shim_supervisor().as_ref(),
+                context_id,
+                member_did,
+                caller_did,
+                reply,
+            )
+            .await
+        }
+        LifecycleCommand::RestoreContextAccessKey {
+            context_id,
+            member_did,
+            caller_did,
+            reply,
+        } => {
+            handle_restore_context_access_key_shim(
+                deps.supervisor.shim_supervisor().as_ref(),
+                context_id,
+                member_did,
+                caller_did,
+                reply,
+            )
+            .await
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shim dispatch (used by Supervisor::dispatch_command for callers without
+// an attached per-context actor)
+// ---------------------------------------------------------------------------
+
+/// Shim dispatch entry point. Routes every `LifecycleCommand` variant
+/// through the legacy `&Supervisor`-shaped helpers in
+/// [`crate::context::lifecycle_helpers_legacy`].
 ///
-/// Lifecycle commands do not yet touch [`ActorDeps`] during the shim
-/// period (every resource the legacy lifecycle methods need lives on
-/// the [`Supervisor`](crate::context::supervisor::Supervisor)). This
-/// entry point exists so callers can route lifecycle operations through
-/// the shim without synthesizing an [`ActorDeps`] — matching the pattern
-/// established for queries (commit 7) and messaging (commit 8).
+/// Removed when the actor model owns every per-context entry point and
+/// the supervisor's contexts-map fallback path goes away in Phase 2A
+/// finalization.
 pub(crate) async fn dispatch_from_shim(
     supervisor: &Supervisor,
     cmd: LifecycleCommand,
 ) -> Outcome<()> {
-    // See the comment on [`dispatch`] for the `Box::pin` rationale.
-    Box::pin(dispatch_inner(supervisor, cmd)).await
+    Box::pin(dispatch_shim_inner(supervisor, cmd)).await
 }
 
-#[allow(clippy::too_many_lines)] // Flat match over every LifecycleCommand variant.
-async fn dispatch_inner(supervisor: &Supervisor, cmd: LifecycleCommand) -> Outcome<()> {
+#[allow(clippy::too_many_lines)]
+async fn dispatch_shim_inner(supervisor: &Supervisor, cmd: LifecycleCommand) -> Outcome<()> {
     match cmd {
         LifecycleCommand::Placeholder { reply } => reply_not_implemented(reply),
         LifecycleCommand::CreateContext { payload, reply } => {
             let p = *payload;
-            handle_create_context(
+            handle_create_context_shim(
                 supervisor,
                 p.context_id,
                 p.params,
@@ -132,7 +235,7 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: LifecycleCommand) -> Outco
         }
         LifecycleCommand::JoinContext { payload, reply } => {
             let p = *payload;
-            handle_join_context(
+            handle_join_context_shim(
                 supervisor,
                 p.context_id,
                 p.params,
@@ -145,7 +248,7 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: LifecycleCommand) -> Outco
         }
         LifecycleCommand::LeaveContext { payload, reply } => {
             let p = *payload;
-            handle_leave_context(
+            handle_leave_context_shim(
                 supervisor,
                 p.context_id,
                 p.params,
@@ -157,29 +260,20 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: LifecycleCommand) -> Outco
         }
         LifecycleCommand::CloseContext { payload, reply } => {
             let p = *payload;
-            handle_close_context(supervisor, p.context_id, p.params, p.initiator_did, reply).await
+            handle_close_context_shim(supervisor, p.context_id, p.params, p.initiator_did, reply)
+                .await
         }
         LifecycleCommand::ExportContext {
             context_id,
             exporter_did,
             reply,
-        } => handle_export_context(supervisor, context_id, exporter_did, reply).await,
+        } => handle_export_context_shim(supervisor, context_id, exporter_did, reply).await,
         LifecycleCommand::ImportContext { export, reply } => {
-            // Box::pin — the per-variant import future crosses clippy's
-            // 16 KB stack budget (ContextExport ~2 KB + the full
-            // PerContextState-construction locals inside the hoisted
-            // `lifecycle_helpers::import_context` body). Boxing moves the
-            // state onto the heap for this variant only.
-            Box::pin(handle_import_context(supervisor, export, reply)).await
+            Box::pin(handle_import_context_shim(supervisor, export, reply)).await
         }
         LifecycleCommand::RestoreContext { payload, reply } => {
             let p = *payload;
-            // Box::pin — restore_context's body is large (rebuilds the
-            // full PerContextState from the persisted snapshot,
-            // including governance / membership / broadcast / MLS
-            // crypto state). The per-variant locals plus the timeout
-            // future cross clippy's 16 KB stack-future budget.
-            Box::pin(handle_restore_context(
+            Box::pin(handle_restore_context_shim(
                 supervisor,
                 p.context_id,
                 p.params,
@@ -193,7 +287,7 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: LifecycleCommand) -> Outco
             caller_did,
             reply,
         } => {
-            handle_generate_context_access_key(
+            handle_generate_context_access_key_shim(
                 supervisor, context_id, member_did, caller_did, reply,
             )
             .await
@@ -204,8 +298,10 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: LifecycleCommand) -> Outco
             caller_did,
             reply,
         } => {
-            handle_revoke_context_access_key(supervisor, context_id, member_did, caller_did, reply)
-                .await
+            handle_revoke_context_access_key_shim(
+                supervisor, context_id, member_did, caller_did, reply,
+            )
+            .await
         }
         LifecycleCommand::RestoreContextAccessKey {
             context_id,
@@ -213,20 +309,179 @@ async fn dispatch_inner(supervisor: &Supervisor, cmd: LifecycleCommand) -> Outco
             caller_did,
             reply,
         } => {
-            handle_restore_context_access_key(supervisor, context_id, member_did, caller_did, reply)
-                .await
+            handle_restore_context_access_key_shim(
+                supervisor, context_id, member_did, caller_did, reply,
+            )
+            .await
         }
     }
 }
 
-/// Handle [`LifecycleCommand::CreateContext`]: delegate to
-/// [`ContextManager::create_context`](crate::context::supervisor::Supervisor::create_context)
-/// under a 30s timeout.
-///
-/// Saga-compatible: create-as-prepare support lands with
-/// `handlers/standing.rs` in commit 11; commit 9's shim routes the
-/// command through the legacy method directly.
-async fn handle_create_context(
+// ---------------------------------------------------------------------------
+// Actor-shape per-context handlers
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_join_context_actor(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: String,
+    params: scp_protocol::context::params::ContextParams,
+    key_package: scp_protocol::context::membership::KeyPackage,
+    spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+    local_pseudonym: Option<[u8; 32]>,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let handle = ContextHandle::new(context_id.clone(), params);
+    if let Err(e) = handle
+        .transition_to(&scp_protocol::context::ContextState::Active)
+        .await
+    {
+        let sketch = outcome_error_sketch(&e);
+        let _ = reply.send(Err(e));
+        return Outcome::err(sketch);
+    }
+
+    let join_fut = crate::context::lifecycle_helpers::join_context(
+        state,
+        deps,
+        &handle,
+        key_package,
+        spending_ucan,
+        local_pseudonym,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, join_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "join_context exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+async fn handle_leave_context_actor(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: String,
+    params: scp_protocol::context::params::ContextParams,
+    caller_did: scp_identity::DID,
+    member_did: scp_identity::DID,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let handle = ContextHandle::new(context_id.clone(), params);
+    if let Err(e) = handle
+        .transition_to(&scp_protocol::context::ContextState::Active)
+        .await
+    {
+        let sketch = outcome_error_sketch(&e);
+        let _ = reply.send(Err(e));
+        return Outcome::err(sketch);
+    }
+
+    let leave_fut = crate::context::lifecycle_helpers::leave_context(
+        state,
+        deps,
+        &handle,
+        &caller_did,
+        &member_did,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, leave_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "leave_context exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+async fn handle_close_context_actor(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: String,
+    params: scp_protocol::context::params::ContextParams,
+    initiator_did: scp_identity::DID,
+    reply: CloseContextReply,
+) -> Outcome<()> {
+    let handle = ContextHandle::new(context_id.clone(), params);
+    if let Err(e) = handle
+        .transition_to(&scp_protocol::context::ContextState::Active)
+        .await
+    {
+        let sketch = outcome_error_sketch(&e);
+        let _ = reply.send(Err(e));
+        return Outcome::err(sketch);
+    }
+
+    let close_fut = crate::context::lifecycle_helpers::close_context(
+        state,
+        deps,
+        &handle,
+        &initiator_did,
+    );
+
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, close_fut).await {
+        Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "close_context exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+fn handle_export_context_actor(
+    state: &PerContextState,
+    deps: &ActorDeps,
+    _context_id: String,
+    exporter_did: scp_identity::DID,
+    reply: ExportContextReply,
+) -> Outcome<()> {
+    // Export is sync and read-only — no timeout wrapping needed.
+    let result = crate::context::lifecycle_helpers::export_context(state, deps, exporter_did);
+    let outcome = match &result {
+        Ok(_) => Outcome::ok(()),
+        Err(e) => Outcome::err(outcome_error_sketch(e)),
+    };
+    let _ = reply.send(result);
+    outcome
+}
+
+// ---------------------------------------------------------------------------
+// Shim per-context handlers (delegate to lifecycle_helpers_legacy)
+// ---------------------------------------------------------------------------
+
+async fn handle_create_context_shim(
     supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -234,7 +489,7 @@ async fn handle_create_context(
     local_pseudonym: Option<[u8; 32]>,
     reply: CreateContextReply,
 ) -> Outcome<()> {
-    let create_fut = crate::context::lifecycle_helpers::create_context(
+    let create_fut = crate::context::lifecycle_helpers_legacy::create_context_legacy(
         supervisor,
         context_id.clone(),
         params,
@@ -245,11 +500,6 @@ async fn handle_create_context(
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, create_fut).await {
         Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),
         Ok(Err(e)) => {
-            // Creation errors carry their own dedicated `ContextCreationError`
-            // type. The Outcome sink translates them into the generic
-            // `ContextError::CryptoFailed(..)` bucket — the actor's dirty
-            // tracking cares only about `mutated`. Callers observe the
-            // typed `ContextCreationError` through the oneshot reply.
             let sketch = ContextError::CryptoFailed(format!("create_context: {e}"));
             (Outcome::err_mutated(sketch), Err(e))
         }
@@ -269,11 +519,8 @@ async fn handle_create_context(
     outcome
 }
 
-/// Handle [`LifecycleCommand::JoinContext`]: delegate to
-/// [`ContextManager::join_context`](crate::context::supervisor::Supervisor::join_context)
-/// under a 30s timeout.
-#[allow(clippy::too_many_arguments)] // mirrors the legacy method's signature surface
-async fn handle_join_context(
+#[allow(clippy::too_many_arguments)]
+async fn handle_join_context_shim(
     supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -282,7 +529,6 @@ async fn handle_join_context(
     local_pseudonym: Option<[u8; 32]>,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
-    // Rebuild an ephemeral handle for the legacy method's signature.
     let handle = ContextHandle::new(context_id.clone(), params);
     if let Err(e) = handle
         .transition_to(&scp_protocol::context::ContextState::Active)
@@ -293,7 +539,7 @@ async fn handle_join_context(
         return Outcome::err(sketch);
     }
 
-    let join_fut = crate::context::lifecycle_helpers::join_context(
+    let join_fut = crate::context::lifecycle_helpers_legacy::join_context_legacy(
         supervisor,
         &handle,
         key_package,
@@ -320,10 +566,7 @@ async fn handle_join_context(
     outcome
 }
 
-/// Handle [`LifecycleCommand::LeaveContext`]: delegate to
-/// [`ContextManager::leave_context`](crate::context::supervisor::Supervisor::leave_context)
-/// under a 30s timeout.
-async fn handle_leave_context(
+async fn handle_leave_context_shim(
     supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -341,7 +584,7 @@ async fn handle_leave_context(
         return Outcome::err(sketch);
     }
 
-    let leave_fut = crate::context::lifecycle_helpers::leave_context(
+    let leave_fut = crate::context::lifecycle_helpers_legacy::leave_context_legacy(
         supervisor,
         &handle,
         &caller_did,
@@ -367,13 +610,7 @@ async fn handle_leave_context(
     outcome
 }
 
-/// Handle [`LifecycleCommand::CloseContext`]: delegate to
-/// [`ContextManager::close_context`](crate::context::lifecycle_helpers::close_context)
-/// under a 30s timeout. Only valid on `SingleAdmin` governance
-/// contexts; multi-admin contexts must use the governance path
-/// (`GovernanceAction::CloseContext`) — the legacy method enforces
-/// that gate, we just delegate.
-async fn handle_close_context(
+async fn handle_close_context_shim(
     supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -391,7 +628,7 @@ async fn handle_close_context(
     }
 
     let close_fut =
-        crate::context::lifecycle_helpers::close_context(supervisor, &handle, &initiator_did);
+        crate::context::lifecycle_helpers_legacy::close_context_legacy(supervisor, &handle, &initiator_did);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, close_fut).await {
         Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
@@ -412,17 +649,17 @@ async fn handle_close_context(
     outcome
 }
 
-/// Handle [`LifecycleCommand::ExportContext`]: delegate to
-/// [`ContextManager::export_context`](crate::context::lifecycle_helpers::export_context)
-/// under a 30s timeout.
-async fn handle_export_context(
+async fn handle_export_context_shim(
     supervisor: &Supervisor,
     context_id: String,
     exporter_did: scp_identity::DID,
     reply: ExportContextReply,
 ) -> Outcome<()> {
-    let export_fut =
-        crate::context::lifecycle_helpers::export_context(supervisor, &context_id, exporter_did);
+    let export_fut = crate::context::lifecycle_helpers_legacy::export_context_legacy(
+        supervisor,
+        &context_id,
+        exporter_did,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, export_fut).await {
         Ok(Ok(export)) => (Outcome::ok(()), Ok(export)),
@@ -443,24 +680,17 @@ async fn handle_export_context(
     outcome
 }
 
-/// Handle [`LifecycleCommand::ImportContext`]: delegate to
-/// [`ContextManager::import_context`](crate::context::lifecycle_helpers::import_context)
-/// under a 30s timeout. The C3 per-instance wipe policy is enforced
-/// by the legacy method; the handler passes the parsed export through
-/// verbatim.
-async fn handle_import_context(
+async fn handle_import_context_shim(
     supervisor: &Supervisor,
     export: Box<crate::context::export_import::ContextExport>,
     reply: ImportContextReply,
 ) -> Outcome<()> {
     let context_id = export.snapshot.context_id.clone();
 
-    // Unbox at the last possible moment to minimize stack-held size
-    // across the delegated await. `Box::pin` the inner future so the
-    // hoisted `lifecycle_helpers::import_context` body's 12 KB+ locals
-    // do not inflate `handle_import_context`'s own future past clippy's
-    // 16 KB stack budget (ADR-049 commit 12).
-    let import_fut = Box::pin(crate::context::lifecycle_helpers::import_context(
+    // Box::pin — the per-variant import future crosses clippy's 16 KB
+    // stack budget (ContextExport ~2 KB + the full PerContextState-
+    // construction locals inside the legacy `import_context` body).
+    let import_fut = Box::pin(crate::context::lifecycle_helpers_legacy::import_context_legacy(
         supervisor, *export,
     ));
 
@@ -483,16 +713,7 @@ async fn handle_import_context(
     outcome
 }
 
-/// Handle [`LifecycleCommand::RestoreContext`]: rebuild an ephemeral
-/// handle from the supplied params and delegate to
-/// [`lifecycle_helpers::restore_context`](crate::context::lifecycle_helpers::restore_context)
-/// under a 30s timeout.
-///
-/// Calls the hoisted helper free function directly with the
-/// supervisor reference. The handler is the actor-side dispatch entry
-/// point for the production restore path; FFI bridges reach it through
-/// the supervisor's command-dispatch surface.
-async fn handle_restore_context(
+async fn handle_restore_context_shim(
     supervisor: &Supervisor,
     context_id: String,
     params: scp_protocol::context::params::ContextParams,
@@ -508,11 +729,11 @@ async fn handle_restore_context(
         return Outcome::err(sketch);
     }
 
-    // ADR-049 commit 12 — calls the hoisted free function on
-    // &Supervisor (replacing the prior `manager.restore_context(...)`
-    // delegation now that the bridge is gone).
-    let restore_fut =
-        crate::context::lifecycle_helpers::restore_context(supervisor, &context_id, &handle);
+    let restore_fut = crate::context::lifecycle_helpers_legacy::restore_context_legacy(
+        supervisor,
+        &context_id,
+        &handle,
+    );
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, restore_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
@@ -533,12 +754,7 @@ async fn handle_restore_context(
     outcome
 }
 
-/// Handle [`LifecycleCommand::GenerateContextAccessKey`]: delegate to
-/// the hoisted
-/// [`queries_helpers::generate_context_access_key`](crate::context::queries_helpers::generate_context_access_key)
-/// under a 30s timeout. Caller capability check (ContextClose) lives
-/// inside the helper body.
-async fn handle_generate_context_access_key(
+async fn handle_generate_context_access_key_shim(
     supervisor: &Supervisor,
     context_id: String,
     member_did: String,
@@ -571,11 +787,7 @@ async fn handle_generate_context_access_key(
     outcome
 }
 
-/// Handle [`LifecycleCommand::RevokeContextAccessKey`]: delegate to
-/// the hoisted
-/// [`queries_helpers::revoke_context_access_key`](crate::context::queries_helpers::revoke_context_access_key)
-/// under a 30s timeout.
-async fn handle_revoke_context_access_key(
+async fn handle_revoke_context_access_key_shim(
     supervisor: &Supervisor,
     context_id: String,
     member_did: String,
@@ -608,11 +820,7 @@ async fn handle_revoke_context_access_key(
     outcome
 }
 
-/// Handle [`LifecycleCommand::RestoreContextAccessKey`]: delegate to
-/// the hoisted
-/// [`queries_helpers::restore_context_access_key`](crate::context::queries_helpers::restore_context_access_key)
-/// under a 30s timeout.
-async fn handle_restore_context_access_key(
+async fn handle_restore_context_access_key_shim(
     supervisor: &Supervisor,
     context_id: String,
     member_did: String,
@@ -645,6 +853,10 @@ async fn handle_restore_context_access_key(
     outcome
 }
 
+// ---------------------------------------------------------------------------
+// Shared utilities
+// ---------------------------------------------------------------------------
+
 /// Produce a best-effort clone-equivalent `ContextError` for the
 /// handler's [`Outcome`] sink given a borrowed error that cannot be
 /// cloned. Mirrors the pattern used in
@@ -665,11 +877,9 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
 }
 
 fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
-    const MSG: &str = "LifecycleCommand::Placeholder — real variants \
-                       CreateContext/JoinContext/LeaveContext/CloseContext/\
-                       ExportContext/ImportContext land in commit 9 of ADR-049; \
-                       Placeholder retained for commit-6 compile stability and \
-                       deleted in commit 12 with the shim";
+    const MSG: &str = "LifecycleCommand::Placeholder — placeholder variant; \
+                       real variants land in commit 9 / Phase 2A.9 of \
+                       ADR-049";
     let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
     Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
 }

@@ -304,6 +304,150 @@ impl SupervisorHandle {
             .map(|r| r.value().clone())
     }
 
+    // -----------------------------------------------------------------
+    // Lifecycle bootstrap surface (Phase 2A.9).
+    //
+    // These methods wrap the supervisor's contexts-map operations
+    // through a capability-reduced interface so the actor-shape
+    // bootstrap entry points in
+    // [`crate::context::lifecycle_helpers`] (`create_context`,
+    // `restore_context`, `import_context`) can register fresh
+    // `PerContextState` without holding `&Supervisor` directly.
+    // -----------------------------------------------------------------
+
+    /// Insert a fresh `PerContextState` into the supervisor's contexts
+    /// map. Stamps the generation counter atomically.
+    ///
+    /// Capability-reduced wrapper around
+    /// [`crate::context::manager_methods::insert_context`] so actor
+    /// bootstrap helpers do not need to hold `&Supervisor` directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns
+    /// [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed)
+    /// if `context_id` is already registered.
+    #[allow(private_interfaces)]
+    pub(crate) fn insert_context(
+        &self,
+        context_id: String,
+        state: crate::context::state::PerContextState,
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        crate::context::manager_methods::insert_context(&self.supervisor, context_id, state)
+    }
+
+    /// Initialize a `BroadcastContext` (SCP-227) and persist its
+    /// initial state if persistence is configured. Capability-reduced
+    /// wrapper around
+    /// [`crate::context::manager_methods::init_broadcast_context`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed)
+    /// if the broadcast context construction or initial author
+    /// registration fails.
+    pub(crate) fn init_broadcast_context(
+        &self,
+        context_id: &str,
+        params: &scp_protocol::context::ContextParams,
+        creator_did: &DID,
+    ) -> Result<
+        Option<scp_protocol::context::broadcast::BroadcastContext>,
+        scp_protocol::context::builder::ContextCreationError,
+    > {
+        crate::context::manager_methods::init_broadcast_context(
+            &self.supervisor,
+            context_id,
+            params,
+            creator_did,
+        )
+    }
+
+    /// Update operational gauges (active contexts, buffer occupancy).
+    /// Best-effort: skipped if no metrics recorder is installed.
+    pub(crate) fn update_context_gauges(&self) {
+        crate::context::manager_methods::update_context_gauges(&self.supervisor);
+    }
+
+    /// Persist the per-context state and broadcast snapshot for
+    /// `context_id` if persistence is configured. Best-effort —
+    /// errors are logged, not propagated.
+    pub(crate) async fn persist_context_and_broadcast(&self, context_id: &str) {
+        crate::context::manager_methods::persist_context_and_broadcast(&self.supervisor, context_id)
+            .await;
+    }
+
+    /// `true` if the supervisor's contexts map currently registers
+    /// `context_id`. Used by the import path to distinguish the
+    /// no-existing-context branch from the replace-existing branch.
+    #[must_use]
+    pub(crate) fn has_context(&self, context_id: &str) -> bool {
+        self.supervisor.contexts_ref().contains_key(context_id)
+    }
+
+    /// Run `f` against the per-context state for an existing context if
+    /// one is registered, with the supervisor's write-lock held across
+    /// the callback. Used by the import path to perform the
+    /// replaceability gate + crypto cleanup atomically — the
+    /// write-lock prevents a concurrent caller from inserting an
+    /// Active context after the gate.
+    ///
+    /// If no context is registered for `context_id`, `f` is not
+    /// invoked and `Ok(())` is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever error `f` returns. Propagates the per-context
+    /// lookup failure mode as `Ok(())` because the no-existing branch
+    /// is the legitimate "fresh slot" path the caller must handle on
+    /// its own.
+    #[allow(private_interfaces)]
+    pub(crate) async fn with_existing_context_for_import<F>(
+        &self,
+        context_id: &str,
+        f: F,
+    ) -> Result<(), ContextError>
+    where
+        F: FnOnce(&crate::context::state::PerContextState) -> Result<(), ContextError>,
+    {
+        let _write_guard = self.supervisor.write_lock.lock().await;
+        if let Ok(ctx_arc) =
+            crate::context::manager_methods::get_context_arc(&self.supervisor, context_id)
+        {
+            let guard = ctx_arc.lock().await;
+            return f(&*guard);
+        }
+        Ok(())
+    }
+
+    /// Replace an existing context in the contexts map atomically
+    /// under the supervisor's `write_lock`. Used by the import path's
+    /// step 7 to swap in the freshly-built `PerContextState` after
+    /// the replaceability gate has already passed.
+    ///
+    /// If the context does not exist, this is equivalent to a fresh
+    /// insert. If it does exist, the existing entry is removed and
+    /// replaced — the per-context lock on the prior entry is dropped
+    /// inside the swap (the write-lock keeps the remove+insert
+    /// atomic with respect to other writers).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed)
+    /// if the insert fails after the remove (only possible under a
+    /// hostile concurrent insert — `write_lock` makes this impossible
+    /// in normal operation).
+    #[allow(private_interfaces)]
+    pub(crate) async fn replace_context(
+        &self,
+        context_id: String,
+        state: crate::context::state::PerContextState,
+    ) -> Result<(), scp_protocol::context::builder::ContextCreationError> {
+        let _write_guard = self.supervisor.write_lock.lock().await;
+        crate::context::manager_methods::remove_context(&self.supervisor, &context_id);
+        crate::context::manager_methods::insert_context(&self.supervisor, context_id, state)
+    }
+
     /// **TRANSITIONAL — shim dispatch period only.** Returns the inner
     /// `Arc<Supervisor>` so the actor's `run()` loop can route commands
     /// through the legacy `dispatch_from_shim` handler entry points

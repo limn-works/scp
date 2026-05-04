@@ -2140,7 +2140,7 @@ impl Supervisor {
     /// - [`ContextError::PersistenceFailed`] if the persistence
     ///   provider is unconfigured or `list_persisted_contexts` fails.
     pub async fn restore_all_contexts(&self) -> Result<Vec<String>, ContextError> {
-        crate::context::lifecycle_helpers::restore_all_contexts(self).await
+        crate::context::lifecycle_helpers_legacy::restore_all_contexts_legacy(self).await
     }
 
     /// Passthrough to
@@ -2155,7 +2155,7 @@ impl Supervisor {
         context_id: &str,
         handle: &crate::context::ContextHandle,
     ) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::restore_context(self, context_id, handle).await
+        crate::context::lifecycle_helpers_legacy::restore_context_legacy(self, context_id, handle).await
     }
 
     /// Best-effort flush of every context's snapshot to the configured
@@ -2170,7 +2170,7 @@ impl Supervisor {
     /// `?`. Per-context flush failures are logged via `tracing::warn!`
     /// inside the helper.
     pub async fn flush_all_contexts(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::flush_all_contexts(self).await;
+        crate::context::lifecycle_helpers_legacy::flush_all_contexts_legacy(self).await;
         Ok(())
     }
 
@@ -2186,7 +2186,7 @@ impl Supervisor {
     /// Currently always returns `Ok(())`. Per-context flush failures
     /// are logged via `tracing::warn!` inside the helper.
     pub fn flush_all_contexts_sync(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::flush_all_contexts_sync(self);
+        crate::context::lifecycle_helpers_legacy::flush_all_contexts_sync_legacy(self);
         Ok(())
     }
 
@@ -2212,7 +2212,7 @@ impl Supervisor {
     /// Currently always returns `Ok(())`. Best-effort cleanup logs
     /// per-context failures via `tracing::warn!` inside the helper.
     pub async fn shutdown_all_contexts(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::shutdown_all_contexts(self).await;
+        crate::context::lifecycle_helpers_legacy::shutdown_all_contexts_legacy(self).await;
         Ok(())
     }
 
@@ -2231,7 +2231,7 @@ impl Supervisor {
     /// Currently always returns `Ok(())`. Per-context cleanup failures
     /// are logged via `tracing` inside the helper.
     pub fn shutdown_all_contexts_sync(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::shutdown_all_contexts_sync(self);
+        crate::context::lifecycle_helpers_legacy::shutdown_all_contexts_sync_legacy(self);
         Ok(())
     }
 
@@ -2456,7 +2456,7 @@ impl Supervisor {
         local_pseudonym: Option<[u8; 32]>,
     ) -> Result<crate::context::ContextHandle, scp_protocol::context::builder::ContextCreationError>
     {
-        crate::context::lifecycle_helpers::create_context(
+        crate::context::lifecycle_helpers_legacy::create_context_legacy(
             self,
             context_id,
             params,
@@ -2480,7 +2480,7 @@ impl Supervisor {
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
         local_pseudonym: Option<[u8; 32]>,
     ) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::join_context(
+        crate::context::lifecycle_helpers_legacy::join_context_legacy(
             self,
             handle,
             key_package,
@@ -2503,7 +2503,7 @@ impl Supervisor {
         caller_did: &DID,
         member_did: &DID,
     ) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers::leave_context(self, handle, caller_did, member_did).await
+        crate::context::lifecycle_helpers_legacy::leave_context_legacy(self, handle, caller_did, member_did).await
     }
 
     /// Passthrough to

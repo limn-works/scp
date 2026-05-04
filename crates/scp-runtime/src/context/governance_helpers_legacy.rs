@@ -1924,7 +1924,7 @@ pub async fn execute_revoke_legacy(
                 "rotate_sender_key failed after access revocation"
             );
         }
-        if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+        if let Err(e) = crate::context::lifecycle_helpers_legacy::drain_and_deliver_sender_keys_legacy(
             supervisor,
             context_id,
             &context_id_bytes,
@@ -2327,7 +2327,7 @@ pub async fn execute_remove_member_legacy(
 
     // Drain pending sender key distribution messages queued by
     // rotate_sender_key, MLS-encrypt, and deliver via transport (§9.16.2).
-    if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+    if let Err(e) = crate::context::lifecycle_helpers_legacy::drain_and_deliver_sender_keys_legacy(
         supervisor,
         context_id,
         &context_id_bytes,
@@ -3522,7 +3522,7 @@ pub async fn execute_reset_member_legacy(
 
     // Drain pending sender key distribution messages, MLS-encrypt,
     // and deliver via transport (same pattern as lifecycle leave).
-    if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
+    if let Err(e) = crate::context::lifecycle_helpers_legacy::drain_and_deliver_sender_keys_legacy(
         supervisor,
         context_id,
         &context_id_bytes,
@@ -4565,7 +4565,7 @@ pub async fn execute_propose_context_migration_legacy(
 
     // Create the destination context AFTER the source has been
     // transitioned to MigratingOut. If creation fails, roll back.
-    if let Err(e) = crate::context::lifecycle_helpers::create_context(
+    if let Err(e) = crate::context::lifecycle_helpers_legacy::create_context_legacy(
         supervisor,
         destination_context_id.clone(),
         dest_params,

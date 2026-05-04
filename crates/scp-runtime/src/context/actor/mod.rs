@@ -462,7 +462,17 @@ impl ContextActor {
                 handlers::messaging::dispatch(state, deps, sub).await
             }
             ContextCommand::Lifecycle(sub) => {
-                Box::pin(handlers::lifecycle::dispatch_from_shim(supervisor, sub)).await
+                // Phase 2A.9 — lifecycle domain migrated to actor-shape
+                // for per-context commands (`JoinContext`,
+                // `LeaveContext`, `CloseContext`, `ExportContext`).
+                // Bootstrap commands (`CreateContext`, `RestoreContext`,
+                // `ImportContext`) and access-key commands stay on the
+                // shim path inside `handlers::lifecycle::dispatch`
+                // because they construct fresh state or live in
+                // queries_helpers. `_supervisor` is unused on this arm
+                // because the shim escape happens through the
+                // capability-reduced handle inside the dispatch body.
+                Box::pin(handlers::lifecycle::dispatch(state, deps, sub)).await
             }
             ContextCommand::Governance(sub) => {
                 // Phase 2A.8 — governance domain partially migrated to

@@ -793,11 +793,11 @@ pub fn execute_revoke(
                 "rotate_sender_key failed after access revocation"
             );
         }
-        // drain_and_deliver_sender_keys still lives in lifecycle_helpers
-        // (legacy supervisor-shape until Phase 2A.9). Reach via shim.
-        let supervisor = deps.supervisor.shim_supervisor();
+        // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape
+        // and operates directly on `state` + `deps`.
         if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-            supervisor.as_ref(),
+            state,
+            deps,
             context_id,
             &context_id_bytes,
         ) {
@@ -1070,11 +1070,10 @@ pub fn execute_remove_member(
         actor_did,
     )?;
 
-    // drain_and_deliver_sender_keys still lives in lifecycle_helpers
-    // (legacy supervisor-shape until Phase 2A.9).
-    let supervisor = deps.supervisor.shim_supervisor();
+    // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
     if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-        supervisor.as_ref(),
+        state,
+        deps,
         context_id,
         &context_id_bytes,
     ) {
@@ -1791,9 +1790,10 @@ pub fn execute_reset_member(
         );
     }
 
-    let supervisor = deps.supervisor.shim_supervisor();
+    // Phase 2A.9: drain_and_deliver_sender_keys is now actor-shape.
     if let Err(e) = crate::context::lifecycle_helpers::drain_and_deliver_sender_keys(
-        supervisor.as_ref(),
+        state,
+        deps,
         context_id,
         &context_id_bytes,
     ) {
@@ -2401,11 +2401,11 @@ pub async fn execute_propose_context_migration(
     state.receive_buffer.push(proposed_event.clone());
     state.receive_buffer.push(started_event.clone());
 
-    // Create the destination context. lifecycle_helpers::create_context
-    // is still &Supervisor-shaped; reach via shim until Phase 2A.9.
-    let supervisor = deps.supervisor.shim_supervisor();
+    // Phase 2A.9: lifecycle_helpers::create_context is now actor-shape
+    // (bootstrap form — constructs fresh PerContextState, registers
+    // through SupervisorHandle).
     if let Err(e) = crate::context::lifecycle_helpers::create_context(
-        supervisor.as_ref(),
+        deps,
         destination_context_id.clone(),
         dest_params,
         creator,

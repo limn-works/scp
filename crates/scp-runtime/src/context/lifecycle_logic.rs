@@ -300,3 +300,129 @@ pub fn enforce_join_economy(
         key_resolver,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Actor-shape `_split` variants (Phase 2A.9 — `lifecycle_helpers` migration)
+// ---------------------------------------------------------------------------
+
+/// Actor-shape variant of [`evaluate_sybil_resistance`].
+///
+/// Drives the same body but takes the underlying fields directly so the
+/// actor-shape per-context state can call without going through the
+/// legacy [`PerContextState`].
+///
+/// # Errors
+///
+/// Returns [`ContextError::PermissionDenied`] if the sybil policy is
+/// configured and the assessment fails.
+pub fn evaluate_sybil_resistance_split(
+    sybil_policy: Option<&scp_protocol::trust::sybil::ContextSybilPolicy>,
+    governance: &super::state::GovernanceState,
+    member_did: &DID,
+    now: u64,
+) -> Result<(), ContextError> {
+    let Some(policy) = sybil_policy else {
+        tracing::trace!(
+            member = %member_did,
+            "sybil resistance check: no policy configured, passing"
+        );
+        return Ok(());
+    };
+
+    let assessment = build_identity_assessment(member_did, governance, now);
+
+    scp_protocol::trust::sybil::evaluate_sybil_resistance(&assessment, policy, now, None)
+        .map_err(|e| ContextError::PermissionDenied(format!("sybil resistance check failed: {e}")))
+}
+
+/// Actor-shape variant of [`post_join_bookkeeping`].
+///
+/// Drives the same participation-record initialization as the legacy
+/// helper, but takes a `&mut GovernanceState` and a `&ReceiveBuffer`
+/// directly so the actor-shape state can call without going through the
+/// legacy [`PerContextState`].
+pub fn post_join_bookkeeping_split(
+    governance: &mut super::state::GovernanceState,
+    receive_buffer: &scp_protocol::context::membership::ReceiveBuffer,
+    context_id: &str,
+    member_did: &DID,
+    now: u64,
+    event_log: &dyn crate::context::builder::ContextEventLogProvider,
+) {
+    let context_id_bytes = super::state::context_id_to_bytes(context_id);
+    let merkle_root = event_log
+        .event_log_merkle_root(&context_id_bytes)
+        .unwrap_or([0u8; 32]);
+    let join_events = super::governance_logic::event_log_entries_for_consequences_split(
+        receive_buffer,
+        context_id,
+        now,
+        event_log,
+    );
+    if !join_events.is_empty()
+        && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
+            &join_events,
+            member_did.as_ref(),
+            context_id,
+            merkle_root,
+            now,
+        )
+    {
+        governance
+            .participation_cache
+            .insert(member_did.to_string(), record);
+    }
+}
+
+/// Actor-shape variant of [`enforce_join_economy`].
+///
+/// Drives the same body as the legacy helper but takes the
+/// `GovernanceState` and `member_count` directly. The actor passes
+/// `state.governance` and `state.membership.count()`; the legacy path
+/// continues to call [`enforce_join_economy`].
+///
+/// # Errors
+///
+/// See [`enforce_join_economy`].
+#[allow(clippy::too_many_arguments)]
+pub fn enforce_join_economy_split(
+    governance: &mut super::state::GovernanceState,
+    member_count: usize,
+    joiner_did: &DID,
+    now: u64,
+    spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
+    context_id: &str,
+    clock: &dyn scp_primitives::Clock,
+    key_resolver: &scp_protocol::context::governance::KeyResolver,
+) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
+    if scp_protocol::economy::policy::auto_accept_blocked_by_economics(
+        governance.economic_policy.as_ref(),
+    ) {
+        return Err(ContextError::PermissionDenied(
+            "SCP-ECON-12030: paid context requires explicit acceptance".into(),
+        ));
+    }
+    let pricing_default =
+        scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default();
+    let pricing = governance
+        .message_pricing
+        .as_ref()
+        .unwrap_or(&pricing_default);
+    super::economy_logic::enforce_economy(super::economy_logic::EnforceEconomyRequest {
+        economic_policy: governance.economic_policy.as_ref(),
+        budget_tracker: &mut governance.budget_tracker,
+        velocity_tracker: &governance.velocity_tracker,
+        member_count,
+        action_type: scp_protocol::economy::types::PaidActionType::ContextJoin,
+        actor_did: joiner_did,
+        now,
+        spending_ucan,
+        action_label: "context:join",
+        context_id,
+        clock,
+        pricing,
+        nonce_tracker: &mut governance.spending_nonce_tracker,
+        revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
+        key_resolver,
+    })
+}

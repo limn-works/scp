@@ -63,7 +63,7 @@ use sha2::{Digest, Sha256};
 
 use crate::context::ContextHandle;
 use crate::context::supervisor::Supervisor;
-use crate::context::{lifecycle_helpers, manager_methods};
+use crate::context::{lifecycle_helpers_legacy, manager_methods};
 
 // Phase 1 fix-up of ADR-049 (post-review-round-1): per-helper
 // `ATTACHED_EXPECT` constants consolidated to the single
@@ -180,7 +180,7 @@ pub async fn standing_context_legacy(
     // Step 3/4: Create a new bilateral-persistent context via the full
     // create_context flow (membership, roles, governance).
     let params = template_params(&TemplateId::BilateralPersistent);
-    match lifecycle_helpers::create_context(
+    match lifecycle_helpers_legacy::create_context_legacy(
         supervisor,
         context_id.clone(),
         params,

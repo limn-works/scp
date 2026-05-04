@@ -889,6 +889,88 @@ pub fn force_create_checkpoint(
     Some(cp)
 }
 
+/// Actor-shape (legacy `PerContextState`) variant of
+/// [`force_create_checkpoint`]. Drives the same body without going
+/// through `&Supervisor`.
+///
+/// Used by callers that already dereferenced
+/// `supervisor.event_log_ref()` and own the legacy state directly.
+pub fn force_create_checkpoint_split(
+    context_id: &str,
+    ctx: &mut PerContextState,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+    now: u64,
+    event_log: &dyn ContextEventLogProvider,
+) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+    let cp = build_checkpoint(context_id, ctx, sender_did, signing_key, now, event_log);
+
+    ctx.checkpoint_events_since = 0;
+    ctx.checkpoint_last_time_secs = now;
+    ctx.checkpoints.push(cp.clone());
+
+    if ctx.checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
+        ctx.checkpoints
+            .drain(..ctx.checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
+    }
+
+    tracing::info!(
+        context_id,
+        event_count = cp.event_count,
+        "forced final checkpoint on context close (§9.9.3)"
+    );
+
+    cp
+}
+
+/// Actor-shape variant of [`force_create_checkpoint_split`] that takes
+/// the field-disjoint slice directly so callers can pass either the
+/// legacy `state::PerContextState` or the actor-shape
+/// `actor::state::PerContextState` without an adapter.
+///
+/// ADR-049 Phase 2A.9 — added so the actor-shape
+/// [`crate::context::lifecycle_helpers::close_context_with_key`] can
+/// force the §9.9.3 final checkpoint operating on actor-shape state.
+#[allow(clippy::too_many_arguments)]
+pub fn force_create_checkpoint_fields(
+    context_id: &str,
+    broadcast_context_is_none: bool,
+    mls_epoch: u64,
+    checkpoint_events_since: &mut u64,
+    checkpoint_last_time_secs: &mut u64,
+    checkpoints: &mut Vec<scp_event_log::checkpoint::ConsistencyCheckpoint>,
+    sender_did: &DID,
+    signing_key: &ed25519_dalek::SigningKey,
+    now: u64,
+    event_log: &dyn ContextEventLogProvider,
+) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
+    let cp = build_checkpoint_split(
+        context_id,
+        broadcast_context_is_none,
+        mls_epoch,
+        sender_did,
+        signing_key,
+        now,
+        event_log,
+    );
+
+    *checkpoint_events_since = 0;
+    *checkpoint_last_time_secs = now;
+    checkpoints.push(cp.clone());
+
+    if checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
+        checkpoints.drain(..checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
+    }
+
+    tracing::info!(
+        context_id,
+        event_count = cp.event_count,
+        "forced final checkpoint on context close (§9.9.3)"
+    );
+
+    cp
+}
+
 /// Builds a signed checkpoint from the current event log and context state.
 ///
 /// Hoisted body of the legacy private
