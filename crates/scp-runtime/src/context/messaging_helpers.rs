@@ -1087,7 +1087,7 @@ pub fn finalize_send(
 
 /// Best-effort persist of the current actor state. Mirrors the legacy
 /// Phase 3 snapshot persistence path, but reads from actor-owned state.
-fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_id: &str) {
+pub fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_id: &str) {
     let mut snapshot = build_snapshot_from_state(state);
     let ctx_id_bytes = scp_protocol::context::context_id_bytes(context_id);
     match deps.crypto.export_crypto_state(&ctx_id_bytes) {
@@ -1115,7 +1115,9 @@ fn persist_state_best_effort(state: &PerContextState, deps: &ActorDeps, context_
 }
 
 #[allow(clippy::too_many_lines)]
-fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::ContextSnapshot {
+pub fn build_snapshot_from_state(
+    state: &PerContextState,
+) -> crate::context::state::ContextSnapshot {
     use crate::context::state::VelocityTrackerSnapshot;
     use scp_protocol::context::ContextState;
 

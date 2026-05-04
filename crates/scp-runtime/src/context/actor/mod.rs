@@ -465,7 +465,16 @@ impl ContextActor {
                 Box::pin(handlers::lifecycle::dispatch_from_shim(supervisor, sub)).await
             }
             ContextCommand::Governance(sub) => {
-                Box::pin(handlers::governance::dispatch_from_shim(supervisor, sub)).await
+                // Phase 2A.8 — governance domain partially migrated to
+                // actor-shape. Migrated variants take the actor-shape
+                // path off `state` + `deps`; unmigrated variants fall
+                // through to the legacy lock-and-call path via
+                // `deps.supervisor.shim_supervisor()` inside the
+                // handler. `_supervisor` is unused on this arm because
+                // the escape happens through the capability-reduced
+                // handle. Removed in Phase 2A finalization with the
+                // rest of the supervisor shim.
+                Box::pin(handlers::governance::dispatch(state, deps, sub)).await
             }
             ContextCommand::Broadcast(sub) => {
                 // Phase 2A.5 — broadcast domain migrated to the

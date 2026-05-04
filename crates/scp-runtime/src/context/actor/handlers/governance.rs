@@ -75,18 +75,27 @@ use crate::context::supervisor::Supervisor;
 /// §"Transport timeouts inside actor handlers": 30 seconds.
 pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Dispatch a [`GovernanceCommand`] against an attached manager + deps
-/// bundle.
+/// Dispatch a [`GovernanceCommand`] against actor-owned state and deps.
 ///
 /// Plan-conforming dispatch signature: matches the post-refactor actor
 /// `run()` loop's call shape
-/// (`handlers::governance::dispatch(&supervisor, &self.deps, cmd).await`).
-/// `deps` is accepted for symmetry — the governance handler does not
-/// yet touch deps during the shim period. Commit 12 rewires these paths
-/// once the manager surface is deleted.
+/// (`handlers::governance::dispatch(state, deps, cmd).await`).
+///
+/// # Phase 2A.8 — partial actor-shape migration
+///
+/// The Phase 2A.8 ladder migrates the 14 governance entry-point
+/// helpers from `&Supervisor` shape to `(&mut PerContextState,
+/// &ActorDeps, ...)`. Migrated variants take the actor-shape path
+/// directly off `state` + `deps`. Unmigrated variants route through
+/// the supervisor escape hatch
+/// ([`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor))
+/// so they can drive the legacy lock-and-call helpers in
+/// [`crate::context::governance_helpers_legacy`] until their actor-
+/// shape twin lands. The escape route is removed (and `dispatch_from_shim`
+/// deleted) at Phase 2A finalization.
 pub async fn dispatch(
-    supervisor: &Supervisor,
-    _deps: &ActorDeps,
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
     cmd: GovernanceCommand,
 ) -> Outcome<()> {
     // `Box::pin` the dispatch future — the combined per-variant locals
@@ -94,7 +103,56 @@ pub async fn dispatch(
     // future each variant wraps) cross clippy's 16-KB stack budget for
     // async futures. Boxing here moves the per-variant state onto the
     // heap once per dispatch.
-    Box::pin(dispatch_inner(supervisor, cmd)).await
+    Box::pin(dispatch_state(state, deps, cmd)).await
+}
+
+/// Actor-shape variant dispatch. Migrated variants take state + deps
+/// directly; unmigrated variants escape through
+/// `deps.supervisor.shim_supervisor()` to drive the legacy helpers.
+#[allow(
+    clippy::too_many_lines,
+    reason = "exhaustive GovernanceCommand match — splitting loses the \
+              unified dispatch surface that pipeline-wiring tests assert"
+)]
+async fn dispatch_state(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    cmd: GovernanceCommand,
+) -> Outcome<()> {
+    match cmd {
+        // ---------- migrated variants (actor-shape) ----------
+        GovernanceCommand::GetProposal {
+            context_id: _,
+            proposal_id,
+            reply,
+        } => handle_get_proposal_actor(state, &proposal_id, reply),
+        GovernanceCommand::ListProposals {
+            context_id: _,
+            reply,
+        } => handle_list_proposals_actor(state, reply),
+        GovernanceCommand::MigrationState {
+            context_id: _,
+            reply,
+        } => handle_migration_state_actor(state, reply),
+        GovernanceCommand::TombstoneMigratedContext { context_id, reply } => {
+            handle_tombstone_migrated_context_actor(state, deps, &context_id, reply).await
+        }
+        GovernanceCommand::AcknowledgeCommitFault { context_id, reply } => {
+            handle_acknowledge_commit_fault_actor(state, &context_id, reply)
+        }
+        // ---------- unmigrated variants (escape to legacy via shim) ----------
+        cmd => {
+            // Re-issue the command through the supervisor's legacy
+            // shim path. The escape hatch produces an `Arc<Supervisor>`
+            // that the legacy helpers can lock-and-call against the
+            // legacy `state::PerContextState` registered for this
+            // context_id. Behaviorally identical to the pre-migration
+            // path; deleted in Phase 2A finalization once every variant
+            // has an actor-shape twin.
+            let supervisor = deps.supervisor.shim_supervisor();
+            Box::pin(dispatch_inner(supervisor.as_ref(), cmd)).await
+        }
+    }
 }
 
 /// Shim-callable dispatch. Used by
@@ -836,6 +894,96 @@ fn outcome_error_sketch(err: &ContextError) -> ContextError {
         ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
         other => ContextError::CryptoFailed(format!("{other}")),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Actor-shape handlers (Phase 2A.8 ladder; one per migrated entry point)
+// ---------------------------------------------------------------------------
+
+/// Handle [`GovernanceCommand::GetProposal`] (actor-shape, read-only).
+///
+/// Delegates to
+/// [`get_proposal`](crate::context::governance_helpers::get_proposal),
+/// which reads directly off `state.governance.engine`. Sync — no
+/// transport-timeout wrapping needed because there are no awaits.
+fn handle_get_proposal_actor(
+    state: &crate::context::actor::state::PerContextState,
+    proposal_id: &scp_protocol::context::governance::ProposalId,
+    reply: oneshot::Sender<
+        Result<scp_protocol::context::governance::GovernanceProposal, ContextError>,
+    >,
+) -> Outcome<()> {
+    let result = crate::context::governance_helpers::get_proposal(state, proposal_id);
+    let outcome = match &result {
+        Ok(_) => Outcome::ok(()),
+        Err(e) => Outcome::err(outcome_error_sketch(e)),
+    };
+    let _ = reply.send(result);
+    outcome
+}
+
+/// Handle [`GovernanceCommand::ListProposals`] (actor-shape, read-only).
+fn handle_list_proposals_actor(
+    state: &crate::context::actor::state::PerContextState,
+    reply: oneshot::Sender<
+        Result<Vec<scp_protocol::context::governance::GovernanceProposal>, ContextError>,
+    >,
+) -> Outcome<()> {
+    let proposals = crate::context::governance_helpers::list_proposals(state);
+    let _ = reply.send(Ok(proposals));
+    Outcome::ok(())
+}
+
+/// Handle [`GovernanceCommand::MigrationState`] (actor-shape, read-only).
+fn handle_migration_state_actor(
+    state: &crate::context::actor::state::PerContextState,
+    reply: oneshot::Sender<Result<Option<crate::context::state::MigrationState>, ContextError>>,
+) -> Outcome<()> {
+    let migration = crate::context::governance_helpers::migration_state(state);
+    let _ = reply.send(Ok(migration));
+    Outcome::ok(())
+}
+
+/// Handle [`GovernanceCommand::TombstoneMigratedContext`] (actor-shape).
+async fn handle_tombstone_migrated_context_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    let tombstone_fut =
+        crate::context::governance_helpers::tombstone_migrated_context(state, deps, context_id);
+    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, tombstone_fut).await {
+        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            (Outcome::err_mutated(sketch), Err(e))
+        }
+        Err(_elapsed) => {
+            let err = ContextError::TransportTimeout(format!(
+                "tombstone_migrated_context exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            (Outcome::err_mutated(sketch), Err(err))
+        }
+    };
+    let _ = reply.send(reply_result);
+    outcome
+}
+
+/// Handle [`GovernanceCommand::AcknowledgeCommitFault`] (actor-shape).
+fn handle_acknowledge_commit_fault_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    context_id: &str,
+    reply: oneshot::Sender<Result<crate::context::state::CommitFaultMarker, ContextError>>,
+) -> Outcome<()> {
+    let result = crate::context::governance_helpers::acknowledge_commit_fault(state, context_id);
+    let outcome = match &result {
+        Ok(_) => Outcome::ok_mutated(()),
+        Err(e) => Outcome::err_mutated(outcome_error_sketch(e)),
+    };
+    let _ = reply.send(result);
+    outcome
 }
 
 fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Outcome<()> {
