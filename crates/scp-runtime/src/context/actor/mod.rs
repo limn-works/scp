@@ -406,24 +406,27 @@ impl ContextActor {
             return;
         }
 
-        // Take the state/deps/supervisor out so we can pass them as
-        // exclusive borrows without re-borrow conflicts. The pre-check
-        // above partitions skeleton actors from state-bearing actors;
-        // any missing field after that point is an internal invariant
+        // Take the state/deps out so we can pass them as exclusive
+        // borrows without re-borrow conflicts. The pre-check above
+        // partitions skeleton actors from state-bearing actors; any
+        // missing field after that point is an internal invariant
         // violation and should fail loudly, not degrade to skeleton
-        // dispatch.
-        let (mut state, deps, supervisor) = {
+        // dispatch. The `shim_supervisor` field is not consumed here —
+        // every handler reaches the supervisor through
+        // `deps.supervisor` (the capability-reduced
+        // [`SupervisorHandle`](crate::context::supervisor::SupervisorHandle))
+        // and individual handler bodies call `shim_supervisor()` on the
+        // handle when they need the legacy `Arc<Supervisor>` for
+        // unmigrated paths.
+        let (mut state, deps) = {
             #[allow(clippy::expect_used)]
             (
                 self.state.take().expect("state-bearing actor lost state"),
                 self.deps.take().expect("state-bearing actor lost deps"),
-                self.shim_supervisor
-                    .clone()
-                    .expect("state-bearing actor lost supervisor shim"),
             )
         };
 
-        let outcome = Self::dispatch_state(&mut state, &deps, &supervisor, cmd).await;
+        let outcome = Self::dispatch_state(&mut state, &deps, cmd).await;
         if outcome.mutated {
             self.dirty = true;
         }
@@ -434,20 +437,20 @@ impl ContextActor {
     }
 
     /// State-owning dispatch. Routes each `ContextCommand` variant to
-    /// the matching handler's entry point. During the Phase 2A → 2I
-    /// transition, most arms call `dispatch_from_shim(supervisor, ...)`
-    /// — `supervisor` is `Arc<Supervisor>` cloned from
-    /// `deps.supervisor.shim_supervisor()`. Domains that have already
-    /// migrated to the state-owning signature
-    /// (`lifecycle_control`, `saga`) call the actor-shape `dispatch`
-    /// entry point with `&mut state, &deps`.
+    /// the matching handler's entry point. Every Phase 2A handler reaches
+    /// any required cross-actor state through
+    /// [`deps::ActorDeps::supervisor`] (the capability-reduced
+    /// [`SupervisorHandle`](crate::context::supervisor::SupervisorHandle))
+    /// rather than through a separate `&Supervisor` parameter — the
+    /// final `&Supervisor` consumer (the queries shim path) was removed
+    /// in Phase 2A.10 when the queries domain migrated to the actor-shape
+    /// handler.
     ///
     /// Returns the handler's [`Outcome`]; the run-loop reads
     /// `outcome.mutated` to decide whether to set `self.dirty`.
     async fn dispatch_state(
         state: &mut state::PerContextState,
         deps: &deps::ActorDeps,
-        supervisor: &Arc<crate::context::supervisor::Supervisor>,
         cmd: ContextCommand,
     ) -> Outcome<()> {
         match cmd {
@@ -535,19 +538,17 @@ impl ContextActor {
                 // migration window.
                 handlers::tools::dispatch(state, deps, sub).await
             }
-            // Queries route through the supervisor's query-shim entry
-            // point because the queries handler signature additionally
-            // takes the event-log provider Arc. The supervisor's
-            // `dispatch_query` resolves the per-context state and
-            // event_log together; piping through it preserves the
-            // soft-fallback semantics for missing-context cases.
-            ContextCommand::Queries(sub) => match supervisor.dispatch_query(sub).await {
-                Ok(o) => Outcome {
-                    result: o.result,
-                    mutated: false,
-                },
-                Err(e) => Outcome::err(e),
-            },
+            // Phase 2A.10 — queries domain migrated to the actor-shape
+            // handler. The actor's owned `state` + `deps.event_log` +
+            // `deps.local_dids` are sufficient for every read variant;
+            // no supervisor shim is needed on the actor path. The
+            // supervisor's `dispatch_query` is preserved for the FFI /
+            // shim-fallback path during the Phase 2A migration window
+            // (callers without an attached actor) and routes through
+            // `handlers::queries::dispatch_from_shim` against the
+            // legacy locked state. `_supervisor` is unused on this arm
+            // because the actor owns everything the read needs.
+            ContextCommand::Queries(sub) => handlers::queries::dispatch(state, deps, sub).await,
             // SagaPhase + LifecycleControl already migrated to the
             // state-owning signature.
             ContextCommand::SagaPhase(msg) => handlers::saga::dispatch(state, deps, msg).await,

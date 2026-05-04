@@ -1,38 +1,44 @@
 //! Query handlers — pure-read surface over per-context state.
 //!
 //! See [`QueriesCommand`](crate::context::actor::commands::QueriesCommand)
-//! for the full variant set. Every handler takes a borrowed
-//! [`PerContextState`](crate::context::state::PerContextState) plus the
-//! shared event-log provider, and returns
-//! `Outcome { mutated: false }` by construction — the dispatch function
-//! uses [`Outcome::ok(())`](crate::context::actor::outcome::Outcome::ok)
-//! on every arm. Mutating operations historically colocated in
-//! `manager/queries.rs` (e.g. `drain_events`, `compare_remote_checkpoint`,
-//! access-key management) are explicitly **not** migrated here: they
-//! continue to route through the legacy `ContextManager` until their
-//! owning handler file migrates in commits 8-11.
+//! for the full variant set. Every handler takes a borrowed actor-owned
+//! [`PerContextState`](crate::context::actor::state::PerContextState)
+//! plus the capability-reduced [`ActorDeps`](crate::context::actor::deps::ActorDeps),
+//! and returns `Outcome { mutated: false }` by construction — the
+//! dispatch function uses [`Outcome::ok(())`](crate::context::actor::outcome::Outcome::ok)
+//! on every arm.
 //!
-//! # ADR-049 commit 12c.7 — direct dispatch
+//! # Two dispatch entry points
 //!
-//! Prior to 12c.7 each handler took a `QueryStateView<'_>` borrow
-//! adapter that bundled per-field references plus the shared event-log
-//! provider. Commit 12c.7 deletes that adapter: the supervisor now
-//! passes the locked `&PerContextState` and the
-//! `&Arc<dyn ContextEventLogProvider>` directly, and the handler reads
-//! the same accessor methods (`state.membership()`, `state.role_state()`,
-//! …) the adapter wrapped. Behaviour is byte-identical — the field set
-//! the dispatch arms read is unchanged.
+//! - [`dispatch`] — actor-shape entry point. Takes `(&state, &deps,
+//!   cmd)` and routes to the actor-shape helpers in
+//!   [`crate::context::queries_helpers`] which operate on
+//!   actor-owned `PerContextState` directly. Wired into the actor's
+//!   [`dispatch_state`](crate::context::actor::ContextActor::dispatch_state)
+//!   loop in Phase 2A.10.
+//! - [`dispatch_from_shim`] — legacy shim entry point. Takes the locked
+//!   legacy `&crate::context::state::PerContextState` borrow plus the
+//!   shared event-log provider and inlines the read bodies directly
+//!   against the locked legacy state. Used by
+//!   [`Supervisor::dispatch_query`](crate::context::supervisor::supervisor::Supervisor::dispatch_query)
+//!   during the Phase 2A migration window for callers without an
+//!   attached per-context actor.
 //!
 //! # Pre-lookup validation
 //!
 //! The shim on [`Supervisor::dispatch_query`](crate::context::supervisor::supervisor::Supervisor::dispatch_query)
-//! resolves the `context_id` to a state borrow BEFORE calling this
-//! dispatch fn. A missing context is routed directly by the shim to the
-//! variant's legacy default (e.g. `MemberCount::Ok(None)`,
-//! `IsMember::Ok(false)`, `MemberDids::Ok(Vec::new())`, etc.) — the
-//! handler functions here never see a missing-context case. Variants
-//! whose legacy method returns `ContextError::ContextNotRegistered` also
-//! route that error through the shim before reaching the handler.
+//! resolves the `context_id` to a state borrow BEFORE calling the
+//! shim entry point. A missing context is routed directly by the
+//! supervisor to the variant's legacy default
+//! (e.g. `MemberCount::Ok(None)`, `IsMember::Ok(false)`,
+//! `MemberDids::Ok(Vec::new())`, etc.) — the shim handler functions here
+//! never see a missing-context case. Variants whose legacy method
+//! returns `ContextError::ContextNotRegistered` also route that error
+//! through the supervisor before reaching the handler.
+//!
+//! For the actor-shape [`dispatch`], the per-context actor IS the
+//! generation — `state` is always present once the actor has spawned
+//! and bootstrap (Create / Join / Restore / Import) populated it.
 
 use std::sync::Arc;
 
@@ -42,73 +48,216 @@ use zeroize::Zeroizing;
 use crate::context::actor::commands::QueriesCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
+use crate::context::actor::state::PerContextState as ActorPerContextState;
 use crate::context::builder::ContextEventLogProvider;
-use crate::context::state::PerContextState;
+use crate::context::queries_helpers;
+use crate::context::state::PerContextState as LegacyPerContextState;
 
-/// Dispatch a [`QueriesCommand`] against a per-context read borrow. Every
-/// arm sends a typed reply on the variant's oneshot and returns
-/// `Outcome::ok(())` — handlers never mutate state and therefore never
-/// flip the actor's `dirty` flag.
+/// Actor-shape dispatch — routes a [`QueriesCommand`] against the
+/// actor's owned `&PerContextState` and `&ActorDeps`.
 ///
-/// Plan-conforming dispatch signature — matches the actor's
-/// `run()` loop call shape (`handlers::queries::dispatch(&self.state,
-/// &self.deps, cmd).await`). `deps` is accepted for symmetry with the
-/// mutating handler contract landing in commits 8-11. Queries are
-/// pure-read and do not use `deps`; the per-context state plus the
-/// shared event-log provider carry every borrow the handler needs.
+/// Each variant calls the matching actor-shape helper in
+/// [`crate::context::queries_helpers`], which carries the read body
+/// (no `&Supervisor`, no shim escape). Returns `Outcome { mutated:
+/// false }` on every arm — read-only by construction.
 ///
-/// This entry point is unused during the commits-7-to-11 migration
-/// window — the live dispatch path goes through
-/// [`dispatch_from_shim`], which is `fn` (sync) since no handler arm
-/// awaits. The signature here is preserved so that commit 12's
-/// actor-`run()` migration wires this function into the `select!` arm
-/// without further churn.
+/// # `local_dids` gate
 ///
-/// `pub(crate)` because the parameter type
-/// [`PerContextState`](crate::context::state::PerContextState) is
-/// `pub(crate)` (it lives on the legacy `ContextManager` shim and is
-/// deleted in commit 12). The actor's `run()` loop lives in the same
-/// crate so this visibility is sufficient.
+/// [`QueriesCommand::GetBroadcastKeyForLocalAuthor`] requires the
+/// `author_did` to be locally controlled. The actor reads its own
+/// `deps.local_dids` snapshot to enforce this gate before calling the
+/// per-context body — `local_dids` is supervisor-scoped (an `ArcSwap`
+/// shared across all actors) and is not part of `state`.
 ///
-/// `dead_code` allow: the live dispatch path during the commits-7-to-11
-/// migration window goes through [`dispatch_from_shim`] (sync, no
-/// `ActorDeps` plumbing needed). This `dispatch` entry point is the
-/// post-refactor signature the actor's `run()` loop will call in commit
-/// 12; it has no production caller until then.
-///
-/// `future_not_send` allow: the body is synchronous (no awaits) — the
-/// `async fn` shape only exists to match the post-refactor actor `run()`
-/// loop's call site, which awaits each handler dispatch uniformly.
-/// `PerContextState` is not `Sync` (the legacy manager's per-context
-/// state holds an event-broadcast `dyn FnMut + Send` callback whose
-/// type does not bound on Sync), so the captured `&PerContextState`
-/// makes the future non-`Send`. The actor's run loop in commit 12 will
-/// own the state by move, eliminating the borrow and this allow.
-#[allow(dead_code, clippy::future_not_send)]
+/// `state` is taken as `&mut` even though every read variant only
+/// borrows immutably, so the resulting future is `Send` (an `&PerContextState`
+/// borrow makes the captured future non-`Send` because `PerContextState`
+/// is not `Sync` — the per-context event callback is `dyn FnMut + Send`,
+/// not `Send + Sync`). The actor's run loop owns `state` exclusively so
+/// the upgraded borrow does not race; the body still treats `state` as
+/// read-only — every helper called here takes `&PerContextState`.
+#[allow(clippy::too_many_lines, clippy::needless_pass_by_ref_mut)]
 pub(crate) async fn dispatch(
-    state: &PerContextState,
-    _deps: &ActorDeps,
-    event_log: &Arc<dyn ContextEventLogProvider>,
+    state: &mut ActorPerContextState,
+    deps: &ActorDeps,
     cmd: QueriesCommand,
 ) -> Outcome<()> {
-    dispatch_from_shim(state, event_log, cmd)
+    match cmd {
+        QueriesCommand::LocalPseudonym {
+            context_id: _,
+            reply,
+        } => {
+            let answer = queries_helpers::local_pseudonym(state);
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
+        QueriesCommand::GetBroadcastKeyForLocalAuthor {
+            context_id: _,
+            author_did,
+            reply,
+        } => {
+            // local_dids gate: the author must be locally controlled.
+            // local_dids lives on the supervisor (ArcSwap shared across
+            // actors); read it from `deps`.
+            let result = if deps.local_dids.load().contains(author_did.as_str()) {
+                queries_helpers::get_broadcast_key_for_local_author(state, &author_did)
+            } else {
+                Err(ContextError::PermissionDenied(format!(
+                    "author DID is not controlled by the local node: {author_did}"
+                )))
+            };
+            let _ = reply.send(result);
+            Outcome::ok(())
+        }
+
+        QueriesCommand::MemberCount {
+            context_id: _,
+            reply,
+        } => {
+            let answer = Some(queries_helpers::member_count(state));
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
+        QueriesCommand::IsMember {
+            context_id: _,
+            did,
+            reply,
+        } => {
+            let answer = queries_helpers::is_member(state, did.as_str());
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
+        QueriesCommand::MemberDids {
+            context_id: _,
+            reply,
+        } => {
+            let answer = queries_helpers::member_dids(state);
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
+        QueriesCommand::MemberRole {
+            context_id: _,
+            did,
+            reply,
+        } => {
+            let answer = queries_helpers::member_role(state, did.as_str());
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
+        QueriesCommand::ContextParams {
+            context_id: _,
+            reply,
+        } => {
+            let answer = Some(queries_helpers::context_params(state));
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
+        QueriesCommand::GetRoleState {
+            context_id: _,
+            reply,
+        } => {
+            let answer = Some(queries_helpers::get_role_state(state));
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
+        QueriesCommand::PendingCommits {
+            context_id: _,
+            reply,
+        } => {
+            let answer = queries_helpers::pending_commits(state);
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
+        QueriesCommand::CommitFault {
+            context_id: _,
+            reply,
+        } => {
+            let answer = queries_helpers::commit_fault(state);
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
+        QueriesCommand::EventLogEntries {
+            context_id_bytes,
+            reply,
+        } => {
+            // Shared event-log provider on `deps` — no per-context
+            // state involved.
+            let answer = queries_helpers::event_log_entries(deps, &context_id_bytes);
+            let _ = reply.send(answer);
+            Outcome::ok(())
+        }
+
+        #[cfg(feature = "testing")]
+        QueriesCommand::GetAccessKey {
+            context_id,
+            member_did,
+            reply,
+        } => {
+            let answer =
+                queries_helpers::get_access_key(state, context_id.as_str(), member_did.as_str());
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
+        #[cfg(feature = "testing")]
+        QueriesCommand::GetAllAccessKeys { context_id, reply } => {
+            let answer = queries_helpers::get_all_access_keys(state, context_id.as_str());
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
+        #[cfg(feature = "testing")]
+        QueriesCommand::RemainingBudgetForTest {
+            context_id: _,
+            member_did,
+            reply,
+        } => {
+            let answer = queries_helpers::remaining_budget_for_test(state, &member_did);
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+
+        #[cfg(feature = "testing")]
+        QueriesCommand::VelocityForTest {
+            context_id: _,
+            member_did,
+            now_secs,
+            reply,
+        } => {
+            let answer = queries_helpers::velocity_for_test(state, &member_did, now_secs);
+            let _ = reply.send(Ok(answer));
+            Outcome::ok(())
+        }
+    }
 }
 
 /// Shim-callable dispatch. Used by
 /// [`Supervisor::dispatch_query`](crate::context::supervisor::supervisor::Supervisor::dispatch_query)
-/// during the commits-7-to-11 migration window — deleted in commit 12
-/// when the shim dissolves and the actor's `run()` loop is the only
-/// caller of [`dispatch`].
+/// during the Phase 2A migration window — deleted in Phase 2A
+/// finalization when the supervisor's contexts `DashMap` shim
+/// dissolves and the actor's `run()` loop is the only caller of
+/// [`dispatch`].
 ///
-/// Queries do not touch `ActorDeps`; requiring callers to synthesize an
-/// `ActorDeps` instance just to read a member count would force the shim
-/// into constructing every actor dependency (transport, MLS/HPKE
-/// backends, KP store) before answering a no-op query. This entry point
-/// exists to avoid that churn — it takes the state borrow + the
-/// shared event-log provider directly.
+/// Reads inline against the locked legacy
+/// `&crate::context::state::PerContextState` borrow plus the shared
+/// event-log provider — `ActorDeps` is not synthesized for the shim
+/// path because the supervisor would have to construct every actor
+/// dependency (transport, MLS/HPKE backends, KP store) just to answer
+/// a no-op query. The legacy state's accessor methods
+/// (`state.local_pseudonym()`, `state.broadcast_context()`, …) carry
+/// every borrow the read needs.
 #[allow(clippy::too_many_lines)] // flat match over every query variant
 pub(crate) fn dispatch_from_shim(
-    state: &PerContextState,
+    state: &LegacyPerContextState,
     event_log: &Arc<dyn ContextEventLogProvider>,
     cmd: QueriesCommand,
 ) -> Outcome<()> {
@@ -239,7 +388,7 @@ pub(crate) fn dispatch_from_shim(
         } => {
             // Shared event-log provider passed in directly — the shim
             // populates the parameter from
-            // `ContextManager::event_log_provider_arc()`. The handler
+            // `Supervisor::event_log_provider_arc()`. The handler
             // delegates without cloning.
             let answer = event_log.event_log_entries(&context_id_bytes);
             let _ = reply.send(answer);

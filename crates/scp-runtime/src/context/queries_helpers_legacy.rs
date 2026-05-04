@@ -42,7 +42,7 @@
 //! # Designated-legacy supervisor-scoped helpers
 //!
 //! Some helpers inherently operate on supervisor-scoped state (the
-//! `local_dids` ArcSwap, the cross-context event-log provider) rather
+//! `local_dids` `ArcSwap`, the cross-context event-log provider) rather
 //! than per-context state. These have no actor-shape twin in
 //! [`crate::context::queries_helpers`]:
 //!
@@ -66,7 +66,9 @@ use zeroize::Zeroizing;
 
 use crate::context::manager_methods;
 use crate::context::providers::event_log::EventLogEntry;
-use crate::context::state::{CommitFaultMarker, PendingCommit, PerContextState, context_id_to_bytes};
+use crate::context::state::{
+    CommitFaultMarker, PendingCommit, PerContextState, context_id_to_bytes,
+};
 use crate::context::supervisor::Supervisor;
 
 // Phase 1 fix-up of ADR-049 (post-review-round-1): per-helper
@@ -471,11 +473,7 @@ pub async fn set_access_key_legacy(
 }
 
 /// Removes a member's access key from a context's access key store.
-pub async fn remove_access_key_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-    member_did: &str,
-) {
+pub async fn remove_access_key_legacy(supervisor: &Supervisor, context_id: &str, member_did: &str) {
     if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
         let mut guard = ctx_arc.lock().await;
         let ctx = &mut *guard;

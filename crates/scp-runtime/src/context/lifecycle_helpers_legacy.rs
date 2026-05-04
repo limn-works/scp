@@ -1617,13 +1617,14 @@ pub async fn close_context_with_key_legacy(
             // ensures equivocation detection covers the full context
             // lifetime. Best-effort: skip if no signing key is available.
             if let Some(sk) = signing_key
-                && let Some(cp) = crate::context::queries_helpers_legacy::force_create_checkpoint_legacy(
-                    supervisor,
-                    &context_id,
-                    ctx,
-                    initiator_did,
-                    sk,
-                )
+                && let Some(cp) =
+                    crate::context::queries_helpers_legacy::force_create_checkpoint_legacy(
+                        supervisor,
+                        &context_id,
+                        ctx,
+                        initiator_did,
+                        sk,
+                    )
             {
                 tracing::debug!(
                     context_id = %context_id,

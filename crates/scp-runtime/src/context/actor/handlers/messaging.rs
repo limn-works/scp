@@ -470,7 +470,8 @@ async fn shim_handle_drain_events(
     context_id: &str,
     reply: crate::context::actor::commands::DrainEventsReply,
 ) -> Outcome<()> {
-    let drain_fut = crate::context::queries_helpers_legacy::drain_events_legacy(supervisor, context_id);
+    let drain_fut =
+        crate::context::queries_helpers_legacy::drain_events_legacy(supervisor, context_id);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, drain_fut).await {
         Ok(events) => (Outcome::ok_mutated(()), Ok(events)),

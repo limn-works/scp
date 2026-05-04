@@ -80,7 +80,7 @@
 //! ONLY in [`crate::context::queries_helpers_legacy`]:
 //!
 //! - `register_local_did_legacy` / `is_local_did_legacy` — supervisor-
-//!   scoped (write_lock + `local_dids` ArcSwap).
+//!   scoped (`write_lock` + `local_dids` `ArcSwap`).
 
 use std::collections::HashMap;
 
@@ -110,7 +110,7 @@ const MAX_RETAINED_CHECKPOINTS: usize = 100;
 /// Pure read — no `deps` reach. The actor's `state` already carries
 /// the per-context pseudonym slot.
 #[must_use]
-pub fn local_pseudonym(state: &PerContextState) -> Option<[u8; 32]> {
+pub const fn local_pseudonym(state: &PerContextState) -> Option<[u8; 32]> {
     state.local_pseudonym
 }
 
@@ -393,10 +393,7 @@ pub fn set_access_key(
 /// Removes a member's access key. Best-effort — silently no-op if the
 /// key is absent.
 pub fn remove_access_key(state: &mut PerContextState, context_id: &str, member_did: &str) {
-    state
-        .access
-        .access_key_store
-        .remove(context_id, member_did);
+    state.access.access_key_store.remove(context_id, member_did);
 }
 
 // ===========================================================================
@@ -591,7 +588,7 @@ pub fn force_create_checkpoint(
 /// Field-disjoint variant of [`force_create_checkpoint`] taking the
 /// supervisor's legacy `&mut state::PerContextState` field slice
 /// indirectly. Kept for the legacy path's `force_create_checkpoint_legacy`
-/// entry point, which already dereferenced clock + event_log.
+/// entry point, which already dereferenced clock + `event_log`.
 pub fn force_create_checkpoint_split(
     context_id: &str,
     ctx: &mut crate::context::state::PerContextState,

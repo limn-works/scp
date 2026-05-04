@@ -44,6 +44,7 @@ const MANAGER_SRC: &str = concat!(
     include_str!("../../../../crates/scp-runtime/src/context/broadcast_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/broadcast_helpers_legacy.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/queries_helpers.rs"),
+    include_str!("../../../../crates/scp-runtime/src/context/queries_helpers_legacy.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/economy_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/trust_recovery_helpers.rs"),
     include_str!("../../../../crates/scp-runtime/src/context/ttl_close_helpers.rs"),
