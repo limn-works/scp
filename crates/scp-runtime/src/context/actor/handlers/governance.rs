@@ -106,9 +106,11 @@ pub async fn dispatch(
     Box::pin(dispatch_state(state, deps, cmd)).await
 }
 
-/// Actor-shape variant dispatch. Migrated variants take state + deps
-/// directly; unmigrated variants escape through
-/// `deps.supervisor.shim_supervisor()` to drive the legacy helpers.
+/// Actor-shape variant dispatch. Every governance variant now takes
+/// state + deps directly. Only the no-op `Placeholder` variant
+/// (commit-6 mailbox-test handshake) returns `NotImplemented`
+/// synchronously; deleted with the `Placeholder` itself at Phase 2A
+/// finalization.
 #[allow(
     clippy::too_many_lines,
     reason = "exhaustive GovernanceCommand match — splitting loses the \
