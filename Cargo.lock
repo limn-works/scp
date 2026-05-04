@@ -5288,6 +5288,7 @@ dependencies = [
  "tokio",
  "tracing",
  "z-base-32",
+ "zeroize",
 ]
 
 [[package]]

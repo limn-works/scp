@@ -70,12 +70,12 @@ impl KeyHandle {
 /// same custody provider or authentication flow used for daily operations".
 /// This newtype enforces the rule mechanically.
 ///
-/// The inner identifier is reachable via [`PreRotationKeyHandle::id`] for
-/// FFI serialization (`UniFFI` string handle, NAPI numeric handle), but
-/// SDK code SHOULD treat the handle as opaque — pass it back to
-/// [`PreRotationCustody`] methods by value rather than reconstructing
-/// from the raw `u64`. [`PreRotationCustody`] implementations allocate
-/// identifiers privately; cross-instance handles are not interchangeable.
+/// The inner identifier is reachable via [`PreRotationKeyHandle::id`] as a
+/// diagnostic / log-only accessor. SDK code MUST treat the handle as opaque —
+/// pass it back to [`PreRotationCustody`] methods by value rather than
+/// reconstructing from the raw `u64`. [`PreRotationCustody`] implementations
+/// allocate identifiers privately; cross-instance handles are not
+/// interchangeable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PreRotationKeyHandle(u64);
 
@@ -91,8 +91,10 @@ impl PreRotationKeyHandle {
 
     /// Returns the raw integer identifier for this handle.
     ///
-    /// Intended for serialization to FFI callbacks (`UniFFI` string handle,
-    /// NAPI numeric handle). SDK code should treat the handle as opaque.
+    /// Diagnostic / log-only accessor. SDK code MUST treat the handle as
+    /// opaque — never reconstruct a [`PreRotationKeyHandle`] from a raw
+    /// `u64`. [`PreRotationCustody`] implementations allocate identifiers
+    /// privately, and cross-instance handles are not interchangeable.
     #[must_use]
     pub const fn id(&self) -> u64 {
         self.0
@@ -568,10 +570,13 @@ pub enum PreRotationCustodyError {
 /// boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreRotationCustodyKind {
-    /// Testing-only in-process registry. NOT SUITABLE for production —
-    /// satisfies the §9.7.4.1 §3 type-isolation requirement (separate
-    /// custody object) but does not satisfy the substrate isolation
-    /// requirement (single process memory). Tests only.
+    /// Shipped-but-degraded default backend: in-process registry. Satisfies
+    /// the §9.7.4.1 §3 type-level isolation requirement (separate custody
+    /// object, distinct handle type) but does NOT satisfy the substrate
+    /// isolation requirement — the pre-rotation key co-resides in the same
+    /// process memory as operational keys. Used as the default in production
+    /// FFI/SDK paths until passkey-PRF / hardware-token / Shamir backends
+    /// are wired in as a follow-up workstream.
     InMemory,
     /// FIDO2/U2F hardware security key. Highest security per §9.7.4.1 §4.
     HardwareSecurityKey,

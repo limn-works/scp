@@ -968,9 +968,12 @@ impl WasmIdentity {
     ///   input string. Non-canonical encodings (the encoder is not
     ///   strictly injective on the trailing bit-padding) are rejected
     ///   to prevent DID-string-distinguishability attacks.
-    /// - The decoded 32 bytes must form a canonical Ed25519 verifying
-    ///   key (no small-subgroup / non-curve points). Validated via
-    ///   `ed25519_dalek::VerifyingKey::from_bytes`.
+    /// - The decoded 32 bytes must successfully decompress to an
+    ///   Edwards-curve point (ZIP-215 rules). Validated via
+    ///   `ed25519_dalek::VerifyingKey::from_bytes`. Note this rejects
+    ///   non-curve payloads only — low-order / small-subgroup points
+    ///   are NOT rejected here; they are caught at signature
+    ///   verification time via `verify_strict`.
     ///
     /// # Side effects
     ///
@@ -998,119 +1001,7 @@ impl WasmIdentity {
     /// identity registry has reached `WASM_IDENTITY_REGISTRY_CAP`.
     #[wasm_bindgen(js_name = "fromDid")]
     pub fn from_did(did: String) -> Result<Self, JsError> {
-        let payload = did.strip_prefix("did:dht:z").ok_or_else(|| {
-            ScpWasmError::Identity {
-                message: format!(
-                    "did:dht must use the z-base-32 'z' multibase prefix \
-                     (and only did:dht is supported): {did:?}"
-                ),
-                code: codes::IDENT_1014.to_owned(),
-            }
-            .into_js()
-        })?;
-        let decoded = zbase32_decode(payload).ok_or_else(|| {
-            ScpWasmError::Identity {
-                message: format!("invalid z-base-32 in DID: {did:?}"),
-                code: codes::IDENT_1014.to_owned(),
-            }
-            .into_js()
-        })?;
-        let public_key_bytes: [u8; 32] = decoded.try_into().map_err(|_: Vec<u8>| {
-            ScpWasmError::Identity {
-                message: format!("did:dht payload must decode to 32 bytes: {did:?}"),
-                code: codes::IDENT_1014.to_owned(),
-            }
-            .into_js()
-        })?;
-        // Canonicality check: re-encode the decoded bytes and compare
-        // against the input payload. The z-base-32 encoder is not
-        // strictly injective on its trailing bit-padding (4 bits of
-        // padding for a 32-byte input → 16 alternate encodings decode
-        // to the same bytes); accepting non-canonical inputs would let
-        // an attacker plant Resolved records under near-duplicate DID
-        // strings that point at a victim's public key.
-        let canonical_payload = zbase32_encode(&public_key_bytes);
-        if canonical_payload != payload {
-            return Err(ScpWasmError::Identity {
-                message: format!(
-                    "did:dht z-base-32 payload is not canonical (expected {canonical_payload:?}, got {payload:?})"
-                ),
-                code: codes::IDENT_1014.to_owned(),
-            }
-            .into_js());
-        }
-        // Curve-point validation: any 32-byte string is a candidate
-        // Ed25519 public key under RFC 8032's encoding, but
-        // `ed25519-dalek` rejects low-order, non-canonical, and
-        // small-subgroup points at `from_bytes`. Reject early so
-        // downstream signature verification cannot be silently
-        // confused.
-        ed25519_dalek::VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
-            ScpWasmError::Identity {
-                message: format!("did:dht payload is not a valid Ed25519 public key: {e}: {did:?}"),
-                code: codes::IDENT_1014.to_owned(),
-            }
-            .into_js()
-        })?;
-        // Registry insert with the documented capacity guard. Other
-        // write paths (`identity_create`, `identity_create_with_agent_key`,
-        // migration) all gate the registry on `WASM_IDENTITY_REGISTRY_CAP`;
-        // doing the same here ensures `from_did` cannot be used as an
-        // unbounded-DoS amplifier against legitimate identity creation.
-        //
-        // If the DID is already registered as `Local`, preserve its
-        // agent-key state in the returned handle so JS callers see
-        // the actual record's shape, not a fresh-Resolved placeholder.
-        let registry_view: Result<(bool, Option<String>), ScpWasmError> =
-            IDENTITY_REGISTRY.with(|reg| {
-                let mut map = reg.borrow_mut();
-                if !map.contains_key(&did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
-                    return Err(ScpWasmError::Validation {
-                        message: format!(
-                            "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
-                             — cannot register additional resolved DIDs"
-                        ),
-                        code: codes::VALID_7400.to_owned(),
-                    });
-                }
-                let entry = map
-                    .entry(did.clone())
-                    .or_insert_with(|| IdentityRecord::Resolved {
-                        public_key_bytes,
-                        custody_type: "js_custody".to_owned(),
-                    });
-                // Mirror the existing record's agent-key state so the
-                // returned `WasmIdentity` doesn't lie about it.
-                Ok(match entry {
-                    IdentityRecord::Local {
-                        agent_signing_key_bytes,
-                        ..
-                    } => agent_signing_key_bytes
-                        .as_ref()
-                        .map_or((false, None), |sk_bytes| {
-                            let signing_key = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
-                            let multibase = format!(
-                                "z{}",
-                                zbase32_encode(&signing_key.verifying_key().to_bytes())
-                            );
-                            (true, Some(multibase))
-                        }),
-                    IdentityRecord::Resolved { .. } => (false, None),
-                })
-            });
-        let (has_agent_key, agent_public_key_multibase) =
-            registry_view.map_err(ScpWasmError::into_js)?;
-        Ok(Self {
-            did,
-            custody_type: "js_custody".to_owned(),
-            has_agent_key,
-            agent_public_key_multibase,
-            // The decoded bytes ARE the public key — surface them as
-            // the hex parity field. Callers reading
-            // `identity.verifyingKey` get the same shape as
-            // locally-created identities.
-            verifying_key_hex: Some(hex::encode(public_key_bytes)),
-        })
+        from_did_inner(did).map_err(ScpWasmError::into_js)
     }
 
     /// Returns whether this identity has an agent signing key (`#agent` VM).
@@ -2230,6 +2121,118 @@ fn rotate_active_key_inner(identity: &WasmIdentity) -> Result<WasmIdentity, ScpW
         // `verifying_key_hex` snapshot of `#0`) is unchanged — the input
         // handle's value carries through.
         verifying_key_hex: identity.verifying_key_hex.clone(),
+    })
+}
+
+/// Inner implementation of [`WasmIdentity::from_did`] that surfaces
+/// [`ScpWasmError`] directly. Splitting the function this way lets the
+/// non-wasm `#[test]` build inspect typed error variants — the
+/// `wasm-bindgen` wrapper above can only return `JsError`, which cannot
+/// be unwrapped outside a real wasm runtime.
+fn from_did_inner(did: String) -> Result<WasmIdentity, ScpWasmError> {
+    let payload = did
+        .strip_prefix("did:dht:z")
+        .ok_or_else(|| ScpWasmError::Identity {
+            message: format!(
+                "did:dht must use the z-base-32 'z' multibase prefix \
+                 (and only did:dht is supported): {did:?}"
+            ),
+            code: codes::IDENT_1014.to_owned(),
+        })?;
+    let decoded = zbase32_decode(payload).ok_or_else(|| ScpWasmError::Identity {
+        message: format!("invalid z-base-32 in DID: {did:?}"),
+        code: codes::IDENT_1014.to_owned(),
+    })?;
+    let public_key_bytes: [u8; 32] =
+        decoded
+            .try_into()
+            .map_err(|_: Vec<u8>| ScpWasmError::Identity {
+                message: format!("did:dht payload must decode to 32 bytes: {did:?}"),
+                code: codes::IDENT_1014.to_owned(),
+            })?;
+    // Canonicality check: re-encode the decoded bytes and compare
+    // against the input payload. The z-base-32 encoder is not
+    // strictly injective on its trailing bit-padding (4 bits of
+    // padding for a 32-byte input → 16 alternate encodings decode
+    // to the same bytes); accepting non-canonical inputs would let
+    // an attacker plant Resolved records under near-duplicate DID
+    // strings that point at a victim's public key.
+    let canonical_payload = zbase32_encode(&public_key_bytes);
+    if canonical_payload != payload {
+        return Err(ScpWasmError::Identity {
+            message: format!(
+                "did:dht z-base-32 payload is not canonical (expected {canonical_payload:?}, got {payload:?})"
+            ),
+            code: codes::IDENT_1014.to_owned(),
+        });
+    }
+    // Curve-point validation: ed25519-dalek's `from_bytes` rejects
+    // byte strings that don't decompress to an Edwards-curve point
+    // (ZIP-215 rules). Low-order / small-subgroup points are NOT
+    // rejected here — they are caught at signature verification
+    // time via `verify_strict`. Reject early so a non-curve payload
+    // fails fast rather than at later signature verification.
+    ed25519_dalek::VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
+        ScpWasmError::Identity {
+            message: format!("did:dht payload is not a valid Ed25519 public key: {e}: {did:?}"),
+            code: codes::IDENT_1014.to_owned(),
+        }
+    })?;
+    // Registry insert with the documented capacity guard. Other
+    // write paths (`identity_create`, `identity_create_with_agent_key`,
+    // migration) all gate the registry on `WASM_IDENTITY_REGISTRY_CAP`;
+    // doing the same here ensures `from_did` cannot be used as an
+    // unbounded-DoS amplifier against legitimate identity creation.
+    //
+    // If the DID is already registered as `Local`, preserve its
+    // agent-key state in the returned handle so JS callers see
+    // the actual record's shape, not a fresh-Resolved placeholder.
+    let (has_agent_key, agent_public_key_multibase) = IDENTITY_REGISTRY.with(|reg| {
+        let mut map = reg.borrow_mut();
+        if !map.contains_key(&did) && map.len() >= WASM_IDENTITY_REGISTRY_CAP {
+            return Err(ScpWasmError::Validation {
+                message: format!(
+                    "identity registry has reached capacity ({WASM_IDENTITY_REGISTRY_CAP}) \
+                     — cannot register additional resolved DIDs"
+                ),
+                code: codes::VALID_7400.to_owned(),
+            });
+        }
+        let entry = map
+            .entry(did.clone())
+            .or_insert_with(|| IdentityRecord::Resolved {
+                public_key_bytes,
+                custody_type: "js_custody".to_owned(),
+            });
+        // Mirror the existing record's agent-key state so the
+        // returned `WasmIdentity` doesn't lie about it.
+        Ok(match entry {
+            IdentityRecord::Local {
+                agent_signing_key_bytes,
+                ..
+            } => agent_signing_key_bytes
+                .as_ref()
+                .map_or((false, None), |sk_bytes| {
+                    let signing_key = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+                    let multibase = format!(
+                        "z{}",
+                        zbase32_encode(&signing_key.verifying_key().to_bytes())
+                    );
+                    (true, Some(multibase))
+                }),
+            IdentityRecord::Resolved { .. } => (false, None),
+        })
+    })?;
+    Ok(WasmIdentity {
+        did,
+        custody_type: "js_custody".to_owned(),
+        has_agent_key,
+        agent_public_key_multibase,
+        // The decoded bytes ARE the public key — surface them as
+        // the hex parity field. Callers reading
+        // `identity.verifyingKey` get the same shape as
+        // locally-created identities.
+        verifying_key_hex: Some(hex::encode(public_key_bytes)),
     })
 }
 
@@ -5151,6 +5154,178 @@ mod tests {
                 );
             }
             other => panic!("expected Identity error, got: {other:?}"),
+        }
+
+        cleanup_registries();
+    }
+
+    /// `from_did` MUST reject DIDs whose z-base-32 payload re-encodes to
+    /// a different canonical form. The encoder is not strictly injective
+    /// on its trailing 4 padding bits — 16 alternate encodings of any
+    /// 32-byte payload all decode to the same bytes. Accepting any
+    /// non-canonical form would let an attacker plant `Resolved` records
+    /// under near-duplicate DID strings pointing at a victim's public
+    /// key. Mirrors the native check at
+    /// `scp_identity::dht::DidDht::extract_public_key`.
+    #[test]
+    fn from_did_rejects_non_canonical_zbase32_padding() {
+        // The z-base-32 alphabet. The 52nd char of a canonical 32-byte
+        // encoding carries 1 payload bit + 4 padding bits = 5 bits
+        // total. Toggling the lowest bit (a padding bit) yields a
+        // different char that still decodes to the same bytes — that's
+        // the attack vector we're rejecting.
+        const ALPHABET: &[u8; 32] = b"ybndrfg8ejkmcpqxot1uwisza345h769";
+
+        cleanup_registries();
+        // Generate a real Ed25519 verifying key so the curve-point
+        // check passes — we want to isolate the canonicality failure.
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let pub_bytes = signing_key.verifying_key().to_bytes();
+        let canonical_encoded = zbase32_encode(&pub_bytes);
+
+        let last_char = canonical_encoded.as_bytes()[canonical_encoded.len() - 1];
+        let last_idx = ALPHABET
+            .iter()
+            .position(|&c| c == last_char)
+            .expect("canonical char must be in alphabet");
+        let mutated_idx = last_idx ^ 1;
+        let mut mutated_bytes = canonical_encoded.as_bytes().to_vec();
+        let last_pos = mutated_bytes.len() - 1;
+        mutated_bytes[last_pos] = ALPHABET[mutated_idx];
+        let mutated_encoded =
+            String::from_utf8(mutated_bytes).expect("z-base-32 alphabet is ASCII");
+        let mutated_did = format!("did:dht:z{mutated_encoded}");
+
+        // Sanity: the mutated input still decodes to the same 32 bytes
+        // (proving it's a real non-canonical alternate).
+        assert_eq!(
+            zbase32_decode(&mutated_encoded)
+                .expect("alternate decodes")
+                .as_slice(),
+            &pub_bytes[..],
+            "non-canonical alternate must decode to the same bytes — otherwise this test is not exercising the canonicality guard"
+        );
+
+        let err = from_did_inner(mutated_did)
+            .expect_err("non-canonical z-base-32 padding must be rejected");
+        match err {
+            ScpWasmError::Identity { ref code, .. } => {
+                assert_eq!(
+                    code,
+                    codes::IDENT_1014,
+                    "non-canonical DID must surface IDENT_1014; got {code}"
+                );
+            }
+            other => panic!("expected Identity error, got: {other:?}"),
+        }
+
+        cleanup_registries();
+    }
+
+    /// `from_did` MUST reject DIDs whose decoded payload does not
+    /// decompress to an Edwards-curve point. ed25519-dalek's
+    /// `from_bytes` enforces ZIP-215 curve-point decompression. About
+    /// half of random 32-byte strings fail this check, so we search
+    /// for one rather than hardcoding a specific value.
+    #[test]
+    fn from_did_rejects_non_ed25519_curve_point() {
+        cleanup_registries();
+        // Search for a 32-byte payload that encodes canonically (so the
+        // canonicality guard is not the one rejecting it) but does not
+        // decompress to a valid Ed25519 point.
+        let non_curve_bytes: [u8; 32] = {
+            let mut found: Option<[u8; 32]> = None;
+            for _ in 0..512 {
+                let mut candidate = [0u8; 32];
+                rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut candidate);
+                if ed25519_dalek::VerifyingKey::from_bytes(&candidate).is_err() {
+                    found = Some(candidate);
+                    break;
+                }
+            }
+            found.expect(
+                "should find a non-curve 32-byte payload within 512 tries (≈50% rejection rate)",
+            )
+        };
+        let encoded = zbase32_encode(&non_curve_bytes);
+        // Sanity: encode-decode round-trips canonically (so the
+        // canonicality guard does not pre-empt the curve-point check).
+        let canonical_check = zbase32_encode(
+            &<[u8; 32]>::try_from(zbase32_decode(&encoded).expect("decodes").as_slice())
+                .expect("32-byte len"),
+        );
+        assert_eq!(canonical_check, encoded, "fresh encoding must be canonical");
+        let did = format!("did:dht:z{encoded}");
+
+        let err = from_did_inner(did).expect_err("non-curve payload must be rejected by from_did");
+        match err {
+            ScpWasmError::Identity {
+                ref code,
+                ref message,
+                ..
+            } => {
+                assert_eq!(
+                    code,
+                    codes::IDENT_1014,
+                    "non-curve DID must surface IDENT_1014; got {code}"
+                );
+                assert!(
+                    message.contains("not a valid Ed25519 public key"),
+                    "expected curve-point error message; got: {message}"
+                );
+            }
+            other => panic!("expected Identity error, got: {other:?}"),
+        }
+
+        cleanup_registries();
+    }
+
+    /// `from_did` MUST refuse to register a fresh DID once the WASM
+    /// identity registry has reached `WASM_IDENTITY_REGISTRY_CAP`. Cap
+    /// enforcement is the `DoS` guard against `from_did`-driven
+    /// registry exhaustion (other write paths gate the same way).
+    /// Returns `[SCP-VALID-7400]`.
+    #[test]
+    fn from_did_returns_valid_7400_at_registry_cap() {
+        cleanup_registries();
+
+        // Fill the registry up to capacity with synthetic Resolved
+        // entries — cheaper than running the full `from_did` path
+        // 10,000 times. Public-key bytes don't need to be on-curve
+        // for these placeholder entries; they only need to occupy
+        // a slot.
+        IDENTITY_REGISTRY.with(|reg| {
+            let mut map = reg.borrow_mut();
+            for i in 0..WASM_IDENTITY_REGISTRY_CAP {
+                let did = format!("did:dht:zfill-{i:08x}");
+                map.insert(
+                    did,
+                    IdentityRecord::Resolved {
+                        public_key_bytes: [0u8; 32],
+                        custody_type: "js_custody".to_owned(),
+                    },
+                );
+            }
+            assert_eq!(map.len(), WASM_IDENTITY_REGISTRY_CAP);
+        });
+
+        // Construct a fresh, valid DID for an Ed25519 key not yet in
+        // the registry. The canonicality and curve-point checks must
+        // pass so we isolate the cap rejection.
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rand_core::OsRng);
+        let pub_bytes = signing_key.verifying_key().to_bytes();
+        let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+
+        let err = from_did_inner(did).expect_err("at-cap from_did must refuse fresh DIDs");
+        match err {
+            ScpWasmError::Validation { ref code, .. } => {
+                assert_eq!(
+                    code,
+                    codes::VALID_7400,
+                    "at-cap from_did must surface VALID_7400; got {code}"
+                );
+            }
+            other => panic!("expected Validation error, got: {other:?}"),
         }
 
         cleanup_registries();

@@ -116,10 +116,11 @@ impl PreRotationCustody for InMemoryPreRotationCustody {
                 .await
                 .remove(&id)
                 .map(|entry| {
-                    let bytes: [u8; 32] = *entry.private_key;
-                    Zeroizing::new(bytes)
-                    // `entry` drops here → ZeroizeOnDrop wipes both
+                    let copy = Zeroizing::new(*entry.private_key);
+                    drop(entry);
+                    // `entry` dropped here → ZeroizeOnDrop wipes both
                     // public_key and private_key fields.
+                    copy
                 })
                 .ok_or(PreRotationCustodyError::HandleNotFound)
         }

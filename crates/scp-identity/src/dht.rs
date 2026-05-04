@@ -1187,7 +1187,7 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     /// - `new_identity` — The new [`ScpIdentity`] with new DID and keys.
     /// - `new_document` — The DID document for the new identity.
     /// - `rotation_event` — The [`DidRotationEvent`] to distribute to all
-    ///   active contexts (spec §3.2.1 step 4b).
+    ///   active contexts (ADR-003 §4b).
     /// - `new_pre_rotation_handle` — Handle for the freshly-minted
     ///   pre-rotation key in `pre_rotation_custody` (per §9.7.4.1 §6
     ///   "post-rotation key cycling"). Caller persists this for the next

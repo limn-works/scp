@@ -869,37 +869,40 @@ impl KeyCustody for FileKeyCustody {
             let signing_key = SigningKey::from_bytes(seed);
             let target_pub = signing_key.verifying_key().to_bytes();
 
-            // Snapshot the handle map so we don't hold the lock across
-            // `decrypt_ed25519_key`, which acquires the same lock and
-            // would otherwise deadlock.
-            let entries: Vec<(u64, StoredKeyType)> = {
-                let map = self.handle_map.lock().await;
-                map.entries
-                    .iter()
-                    .map(|(id, (kt, _idx))| (*id, *kt))
-                    .collect()
-            };
+            // Hold `handle_map.lock()` across the entire scan-and-insert
+            // path so that two concurrent imports of the same seed
+            // cannot both observe a non-matching snapshot and both
+            // append. We do NOT call `self.decrypt_ed25519_key` from
+            // here (that method re-acquires `handle_map` and would
+            // deadlock). Instead, read the file once and decrypt
+            // candidate Ed25519 entries directly via `decrypt_entry`.
+            // `append_entry` takes the separate `file_write_lock`,
+            // never `handle_map`, so there is no inversion.
+            let mut map = self.handle_map.lock().await;
 
-            for (id, kt) in entries {
-                if kt != StoredKeyType::Ed25519 {
+            let data = self.read_file()?;
+            for (id, (kt, idx)) in &map.entries {
+                if *kt != StoredKeyType::Ed25519 {
                     continue;
                 }
-                let candidate = KeyHandle::new(id);
-                if let Ok((_bytes, existing)) = self.decrypt_ed25519_key(&candidate).await
-                    && existing.verifying_key().to_bytes() == target_pub
-                {
-                    return Ok(candidate);
+                if let Ok(existing_bytes) = self.decrypt_entry(&data, *idx) {
+                    let existing = SigningKey::from_bytes(&existing_bytes);
+                    if existing.verifying_key().to_bytes() == target_pub {
+                        return Ok(KeyHandle::new(*id));
+                    }
                 }
             }
+            drop(data);
 
             // Persist the seed bytes via the same encrypted append-only
             // log used by `generate_keypair`. After this call the bytes
             // are encrypted-at-rest under the same passphrase-derived key.
+            // `append_entry` takes only `file_write_lock` — safe to call
+            // while holding `handle_map`.
             let key_bytes = Zeroizing::new(**seed);
             let entry_index = self.append_entry(StoredKeyType::Ed25519, &key_bytes)?;
 
             let handle = self.next_handle();
-            let mut map = self.handle_map.lock().await;
             map.entries
                 .insert(handle.id(), (StoredKeyType::Ed25519, entry_index));
             drop(map);
@@ -1270,5 +1273,63 @@ mod tests {
             "distinct seeds must produce two handle map entries"
         );
         drop(map);
+    }
+
+    /// Two concurrent imports of the same seed must dedup correctly:
+    /// both calls return the same handle and the handle map ends up
+    /// with exactly one entry. Without holding `handle_map` across the
+    /// scan-and-insert path, both tasks could observe a non-matching
+    /// snapshot and both append, yielding two parallel encrypted
+    /// entries pointing at the same private key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn import_ed25519_signing_key_concurrent_dedups_correctly() {
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let custody = Arc::new(make_custody(&dir, "concurrent-dedup-passphrase"));
+
+        // Use the all-zero probe seed that migrate_identity step-0
+        // shares across concurrent migrations.
+        let seed = Zeroizing::new([0u8; 32]);
+
+        let custody_a = Arc::clone(&custody);
+        let seed_a = seed.clone();
+        let task_a =
+            tokio::spawn(
+                async move { custody_a.import_ed25519_signing_key(&seed_a).await.unwrap() },
+            );
+
+        let custody_b = Arc::clone(&custody);
+        let seed_b = seed.clone();
+        let task_b =
+            tokio::spawn(
+                async move { custody_b.import_ed25519_signing_key(&seed_b).await.unwrap() },
+            );
+
+        let h_a = task_a.await.unwrap();
+        let h_b = task_b.await.unwrap();
+
+        assert_eq!(
+            h_a.id(),
+            h_b.id(),
+            "concurrent imports of the same seed must return the same handle"
+        );
+
+        let map = custody.handle_map.lock().await;
+        assert_eq!(
+            map.entries.len(),
+            1,
+            "concurrent dedup must not produce parallel handle map entries"
+        );
+        drop(map);
+
+        // File-level check: exactly one entry persisted.
+        let bytes = std::fs::read(&custody.path).unwrap();
+        let count_offset = 1 + SALT_LEN;
+        let count = u32::from_le_bytes(bytes[count_offset..count_offset + 4].try_into().unwrap());
+        assert_eq!(
+            count, 1,
+            "concurrent dedup must not append a parallel encrypted entry"
+        );
     }
 }
