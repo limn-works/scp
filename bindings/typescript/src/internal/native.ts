@@ -961,6 +961,22 @@ export function createNativeBridge(): Bridge {
       )(requestIdHex, nextSeq);
     },
 
+    async outletStreamTerminate(
+      requestIdHex: string,
+      slug: string,
+      code: string,
+      message: string,
+    ): Promise<void> {
+      await (
+        addon.outletStreamTerminate as (
+          rid: string,
+          s: string,
+          c: string,
+          m: string,
+        ) => Promise<void>
+      )(requestIdHex, slug, code, message);
+    },
+
     async verifyChunkSignature(
       chunkJson: string,
       operatorPk: Uint8Array,
