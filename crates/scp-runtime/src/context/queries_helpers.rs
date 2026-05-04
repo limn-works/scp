@@ -74,13 +74,18 @@
 //!
 //! - [`verify_event_inclusion`], [`verify_event_consistency`].
 //!
-//! # Designated-legacy
+//! # Supervisor-scoped (designated-legacy)
 //!
-//! These helpers have NO actor-shape twin in this module — they live
-//! ONLY in [`crate::context::queries_helpers_legacy`]:
+//! These helpers operate on supervisor-wide state, not per-context
+//! state, so they take `&Supervisor` rather than
+//! `&[mut] PerContextState`:
 //!
-//! - `register_local_did_legacy` / `is_local_did_legacy` — supervisor-
-//!   scoped (`write_lock` + `local_dids` `ArcSwap`).
+//! - [`register_local_did`] / [`is_local_did`] — `local_dids` `ArcSwap` +
+//!   `write_lock` mutations.
+//!
+//! Relocated from `queries_helpers_legacy` during Phase 2A
+//! finalization; the `_legacy` suffix is dropped because there is no
+//! per-context actor-shape twin to disambiguate against.
 
 use std::collections::HashMap;
 

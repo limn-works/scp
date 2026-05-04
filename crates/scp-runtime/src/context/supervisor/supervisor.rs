@@ -2115,7 +2115,7 @@ impl Supervisor {
     /// the legacy method's signature so callers can keep their
     /// `?`-style propagation untouched.
     pub async fn register_local_did(&self, did: DID) -> Result<(), ContextError> {
-        crate::context::queries_helpers_legacy::register_local_did_legacy(self, did).await;
+        crate::context::queries_helpers::register_local_did(self, did).await;
         Ok(())
     }
 
@@ -2125,7 +2125,7 @@ impl Supervisor {
     ///
     /// Currently always returns `Ok(_)`.
     pub async fn is_local_did(&self, did: &DID) -> Result<bool, ContextError> {
-        Ok(crate::context::queries_helpers_legacy::is_local_did_legacy(self, did).await)
+        Ok(crate::context::queries_helpers::is_local_did(self, did).await)
     }
 
     /// Restore every persisted context from the configured persistence

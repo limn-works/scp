@@ -41,20 +41,16 @@
 //!
 //! # Designated-legacy supervisor-scoped helpers
 //!
-//! Some helpers inherently operate on supervisor-scoped state (the
-//! `local_dids` `ArcSwap`, the cross-context event-log provider) rather
-//! than per-context state. These have no actor-shape twin in
-//! [`crate::context::queries_helpers`]:
+//! `register_local_did` and `is_local_did` were relocated to
+//! [`crate::context::queries_helpers`] (without the `_legacy` suffix)
+//! during Phase 2A finalization — they ARE supervisor-scoped (no
+//! per-context twin) but no longer live in the legacy module.
 //!
-//! - [`register_local_did_legacy`] — mutates `supervisor.local_dids`
-//!   under the supervisor's `write_lock`. Supervisor-scoped.
-//! - [`is_local_did_legacy`] — reads `supervisor.local_dids`.
-//!   Supervisor-scoped.
-//! - [`event_log_entries_legacy`] — reads the shared event-log
-//!   provider; the actor-shape twin
-//!   [`crate::context::queries_helpers::event_log_entries`] takes
-//!   `&deps` directly so the actor path does not synthesize a
-//!   `&Supervisor`.
+//! [`event_log_entries_legacy`] remains here until the supervisor
+//! passthrough callers migrate; the actor-shape twin
+//! [`crate::context::queries_helpers::event_log_entries`] takes
+//! `&deps` directly so the actor path does not synthesize a
+//! `&Supervisor`.
 
 use std::collections::HashMap;
 
@@ -75,43 +71,6 @@ use crate::context::supervisor::Supervisor;
 // `ATTACHED_EXPECT` constants consolidated to the single
 // `PROVIDER_NOT_INITIALIZED` definition in `manager_methods`.
 use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT;
-
-// ===========================================================================
-// Local DID / identity management — supervisor-scoped (designated-legacy)
-// ===========================================================================
-
-/// Registers a DID as controlled by the local node/SDK.
-///
-/// Supervisor-scoped — mutates `supervisor.local_dids` under the
-/// supervisor's write lock. No per-context actor-shape twin exists
-/// because the actor model serializes per-context, not supervisor-wide.
-pub async fn register_local_did_legacy(supervisor: &Supervisor, did: DID) {
-    // ArcSwap+write_lock pattern (ADR-049 §Decision 12). Reads are
-    // lock-free; writes serialize on the supervisor write_lock to
-    // avoid lost updates against the cloned snapshot.
-    let _guard = supervisor.write_lock.lock().await;
-    let snapshot = supervisor.local_dids_ref().load_full();
-    let mut updated: std::collections::HashSet<DID> = (*snapshot).clone();
-    updated.insert(did);
-    supervisor
-        .local_dids_ref()
-        .store(std::sync::Arc::new(updated));
-}
-
-/// Returns `true` if the given DID is registered as locally controlled.
-///
-/// Supervisor-scoped read. No actor-shape twin.
-///
-/// `async` is preserved (despite no `await` after the §12 lock-free
-/// read migration) to keep the signature symmetric with
-/// `register_local_did_legacy` and the legacy method, matching the call
-/// shape the FFI bridges + `Supervisor::is_local_did` passthrough
-/// expect.
-#[allow(clippy::unused_async)]
-pub async fn is_local_did_legacy(supervisor: &Supervisor, did: &DID) -> bool {
-    // Lock-free read (ADR-049 §Decision 12).
-    supervisor.local_dids_ref().load().contains(did)
-}
 
 // ===========================================================================
 // Per-context read queries
