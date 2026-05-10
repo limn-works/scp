@@ -1276,8 +1276,11 @@ fn out037_compute_caveats_binding_determinism() {
 #[test]
 fn out037_grant_credit_rejects_zero() {
     setup();
-    let result =
-        _scp_core::outlet_stream::py_outlet_stream_grant_credit("00".repeat(16).as_str(), 0);
+    let result = _scp_core::outlet_stream::py_outlet_stream_grant_credit(
+        "00".repeat(16).as_str(),
+        "did:dht:z6MkInvoker",
+        0,
+    );
     assert!(result.is_err());
     let err_str = format!("{}", result.unwrap_err());
     assert!(
@@ -1293,7 +1296,8 @@ fn out037_grant_credit_rejects_zero() {
 fn out037_grant_credit_and_cancel_unknown_session() {
     setup();
     let unknown = "ff".repeat(16);
-    let grant_err = _scp_core::outlet_stream::py_outlet_stream_grant_credit(&unknown, 5);
+    let grant_err =
+        _scp_core::outlet_stream::py_outlet_stream_grant_credit(&unknown, "did:dht:z6MkInvoker", 5);
     assert!(grant_err.is_err());
     let grant_err_str = format!("{}", grant_err.unwrap_err());
     assert!(
@@ -1301,7 +1305,8 @@ fn out037_grant_credit_and_cancel_unknown_session() {
         "expected unknown-session in grant error: {grant_err_str}"
     );
 
-    let cancel_err = _scp_core::outlet_stream::py_outlet_stream_cancel(&unknown, Some(0));
+    let cancel_err =
+        _scp_core::outlet_stream::py_outlet_stream_cancel(&unknown, "did:dht:z6MkInvoker");
     assert!(cancel_err.is_err());
     let cancel_err_str = format!("{}", cancel_err.unwrap_err());
     assert!(

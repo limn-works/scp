@@ -351,16 +351,26 @@ export interface Bridge {
   /**
    * Signs and applies an `OutletStreamCredit` grant against an active
    * stream (§5.4.5 SCP-OUTLET-CREDIT-V1). Returns the new total credit
-   * remaining at the executor.
+   * remaining at the executor. `callerDid` MUST match the pinned
+   * invoker DID recorded at stream open — CRITICAL #1: any in-process
+   * code with a `requestIdHex` could otherwise drain credit on any
+   * concurrent stream because the bridge wields the invoker's signing
+   * key. The bridge rejects mismatched callers as
+   * `authorization.denied`.
    */
-  outletStreamGrantCredit(requestIdHex: string, grant: number): Promise<number>;
+  outletStreamGrantCredit(requestIdHex: string, callerDid: string, grant: number): Promise<number>;
 
   /**
    * Applies an `OutletCancel` to an active stream (§5.4.5 cancel-ack).
    * Returns the recorded `cancel_ack_seq`, or `null` if the stream had
    * already terminated when the cancel arrived (idempotent).
+   *
+   * `callerDid` MUST match the pinned invoker DID. CRITICAL #3 fix:
+   * `next_seq` is no longer caller-supplied — the bridge derives the
+   * canonical next-emission cursor from runtime state (a caller-input
+   * value let the caller forge `cancel_ack_seq`).
    */
-  outletStreamCancel(requestIdHex: string, nextSeq?: number): Promise<number | null>;
+  outletStreamCancel(requestIdHex: string, callerDid: string): Promise<number | null>;
 
   /**
    * Forces a terminal `Error{terminal:true}` chunk into the active
@@ -370,9 +380,12 @@ export interface Bridge {
    * since stream open. The runtime emits a synthetic terminal Error
    * chunk under the pinned operator key; the SDK's chunk consumer
    * receives it as the next chunk and the stream closes naturally.
+   *
+   * `callerDid` MUST match the pinned invoker DID at stream open.
    */
   outletStreamTerminate(
     requestIdHex: string,
+    callerDid: string,
     slug: string,
     code: string,
     message: string,

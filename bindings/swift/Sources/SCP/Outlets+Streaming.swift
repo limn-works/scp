@@ -101,19 +101,27 @@ public struct OutletStreamSequence: AsyncSequence, Sendable {
     /// Signs and applies an `OutletStreamCredit` grant for this stream.
     ///
     /// `grant` must be > 0 (round-6 uniform `InvalidGrant` rule).
-    /// Returns the new total credit budget on success.
+    /// Returns the new total credit budget on success. `callerDid`
+    /// MUST match the pinned invoker DID at stream open — CRITICAL #1
+    /// fix: the bridge rejects mismatched callers as
+    /// `authorization.denied`.
     @discardableResult
-    public func grantCredit(_ grant: UInt32) async throws -> UInt32 {
-        try await outletStreamGrantCredit(requestIdHex: requestIdHex, grant: grant)
+    public func grantCredit(_ grant: UInt32, callerDid: String) async throws -> UInt32 {
+        try await outletStreamGrantCredit(
+            requestIdHex: requestIdHex,
+            callerDid: callerDid,
+            grant: grant
+        )
     }
 
     /// Applies an `OutletCancel` to this stream.
     ///
-    /// `nextSeq` is the receiver's view of the next-to-emit chunk
-    /// sequence (defaults to `0`).
+    /// CRITICAL #3 — `next_seq` is no longer accepted; the bridge
+    /// derives the canonical next-emission cursor from runtime state.
+    /// CRITICAL #1 — `callerDid` MUST match the pinned invoker DID.
     @discardableResult
-    public func cancel(nextSeq: UInt64? = nil) async throws -> UInt64? {
-        try await handle.cancel(nextSeq: nextSeq)
+    public func cancel(callerDid: String) async throws -> UInt64? {
+        try await handle.cancel(callerDid: callerDid)
     }
 }
 
@@ -225,7 +233,8 @@ func makeRevocationRecheckTask(
     ucanToken: String,
     proofTokens: [String]?,
     recheckSecs: UInt32,
-    requestIdHex: String
+    requestIdHex: String,
+    invokerDid: String
 ) -> Task<Void, Never> {
     Task { [weak contextHandle] in
         guard contextHandle != nil else { return }
@@ -251,6 +260,7 @@ func makeRevocationRecheckTask(
                 // is idempotent on the runtime side.
                 _ = try? await OutletStream.terminate(
                     requestIdHex: requestIdHex,
+                    callerDid: invokerDid,
                     slug: "authorization.revoked-mid-stream",
                     code: "SCP-TOOL-6110",
                     message: "ucan revoked or invalid mid-stream"
@@ -393,42 +403,51 @@ public enum OutletsStreaming {
     }
 
     /// Signs and applies an `OutletStreamCredit` grant against an active
-    /// stream identified by `requestIdHex`.
+    /// stream identified by `requestIdHex`. `callerDid` MUST match the
+    /// pinned invoker DID at stream open (CRITICAL #1).
     @discardableResult
     public static func grantCredit(
         requestIdHex: String,
+        callerDid: String,
         grant: UInt32
     ) async throws -> UInt32 {
-        try await outletStreamGrantCredit(requestIdHex: requestIdHex, grant: grant)
+        try await outletStreamGrantCredit(
+            requestIdHex: requestIdHex,
+            callerDid: callerDid,
+            grant: grant
+        )
     }
 
     /// Applies an `OutletCancel` to an active stream by `requestIdHex`.
+    /// `callerDid` MUST match the pinned invoker DID. CRITICAL #3 —
+    /// `next_seq` is no longer caller-supplied; the bridge derives
+    /// the canonical next-emission cursor from runtime state.
     @discardableResult
     public static func cancel(
         requestIdHex: String,
-        nextSeq: UInt64? = nil
+        callerDid: String
     ) async throws -> UInt64? {
-        try await outletStreamCancel(requestIdHex: requestIdHex, nextSeq: nextSeq)
+        try await outletStreamCancel(
+            requestIdHex: requestIdHex,
+            callerDid: callerDid
+        )
     }
 
     /// Forces a terminal `Error{terminal:true}` chunk into an active
     /// stream (§5.4.5 receiver-side revocation re-check,
     /// `RevokedMidStream` / `SCP-TOOL-6110`).
     ///
-    /// Called by the SDK framework's periodic UCAN re-check loop when
-    /// it observes the opening UCAN has been revoked since stream
-    /// open. The runtime emits a synthetic terminal Error chunk under
-    /// the pinned operator key and runs settlement (admission release,
-    /// escrow refund, OutletInvokedEvent emission) identically to
-    /// other framework-emitted closes.
+    /// `callerDid` MUST match the pinned invoker DID (CRITICAL #1).
     public static func terminate(
         requestIdHex: String,
+        callerDid: String,
         slug: String,
         code: String,
         message: String
     ) async throws {
         try await outletStreamTerminate(
             requestIdHex: requestIdHex,
+            callerDid: callerDid,
             slug: slug,
             code: code,
             message: message

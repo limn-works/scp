@@ -406,16 +406,23 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
   /** True once a terminal chunk has been observed (AC13). */
   private terminated = false;
 
+  /** Pinned invoker DID; threaded through to every control-plane
+   *  bridge call as `callerDid` so the bridge can verify against its
+   *  registry's pinned identity. CRITICAL #1 fix. */
+  private readonly invokerDid: string | null;
+
   constructor(
     pump: (sink: InvocationHandleSink) => void,
     options?: {
       requestIdHex?: string;
       requestIdPromise?: Promise<string | null>;
+      invokerDid?: string;
       aggregateSchema?: Readonly<Record<string, unknown>>;
     },
   ) {
     this.requestIdHex = options?.requestIdHex ?? null;
     this.requestIdPromise = options?.requestIdPromise;
+    this.invokerDid = options?.invokerDid ?? null;
     this.aggregateSchema = options?.aggregateSchema ?? null;
     const sink: InvocationHandleSink = {
       chunk: (c) => this.enqueueChunk(c),
@@ -657,8 +664,14 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
           "(degenerate single-shot invoke; the End chunk arrived synchronously)",
       );
     }
+    if (this.invokerDid === null) {
+      throw new StreamAlreadyClosed(
+        "grantCredit rejected: handle has no pinned invoker DID — bridge " +
+          "caller authentication unavailable",
+      );
+    }
     const bridge = await getBridge();
-    return bridge.outletStreamGrantCredit(ridHex, grant.raw);
+    return bridge.outletStreamGrantCredit(ridHex, this.invokerDid, grant.raw);
   }
 
   /** Internal — resolves to the streaming `request_id` (32-char hex)
@@ -689,10 +702,13 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
    * @throws {@link StreamAlreadyClosed} (AC13) when the stream has
    *   already emitted a terminal chunk.
    */
-  async cancel(nextSeq?: number): Promise<number | null> {
+  async cancel(): Promise<number | null> {
     // Mirror `grantCredit` — resolve the request id (awaiting the
     // streaming-mode bridge open if necessary), THEN race-check
     // terminated state.
+    //
+    // CRITICAL #3: caller-supplied `nextSeq` is removed. The bridge
+    // derives the canonical next-emission cursor from runtime state.
     const ridHex = await this.resolveRequestId();
     if (this.terminated) {
       throw new StreamAlreadyClosed("cancel rejected: stream has already emitted a terminal chunk");
@@ -703,8 +719,14 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
           "(degenerate single-shot invoke; the End chunk arrived synchronously)",
       );
     }
+    if (this.invokerDid === null) {
+      throw new StreamAlreadyClosed(
+        "cancel rejected: handle has no pinned invoker DID — bridge " +
+          "caller authentication unavailable",
+      );
+    }
     const bridge = await getBridge();
-    return bridge.outletStreamCancel(ridHex, nextSeq);
+    return bridge.outletStreamCancel(ridHex, this.invokerDid);
   }
 }
 
@@ -1141,6 +1163,7 @@ export class OutletNamespace {
       };
       const sdkHandle = new InvocationHandle(handleFactory, {
         requestIdPromise,
+        invokerDid,
         ...(aggregateSchema !== undefined && { aggregateSchema }),
       });
 
@@ -1188,6 +1211,7 @@ export class OutletNamespace {
               try {
                 await bridge.outletStreamTerminate(
                   rid,
+                  invokerDid,
                   "authorization.revoked-mid-stream",
                   "SCP-TOOL-6110",
                   "ucan revoked or invalid mid-stream",

@@ -172,10 +172,15 @@ interface WasmModule {
     creditWindow: number | undefined,
     estimatedChunkCount: number | undefined,
   ) => Promise<WasmOutletInvocationStream>;
-  outletStreamGrantCredit: (requestIdHex: string, grant: number) => Promise<number>;
-  outletStreamCancel: (requestIdHex: string, nextSeq: number | undefined) => Promise<number | null>;
+  outletStreamGrantCredit: (
+    requestIdHex: string,
+    callerDid: string,
+    grant: number,
+  ) => Promise<number>;
+  outletStreamCancel: (requestIdHex: string, callerDid: string) => Promise<number | null>;
   outletStreamTerminate: (
     requestIdHex: string,
+    callerDid: string,
     slug: string,
     code: string,
     message: string,
@@ -1526,24 +1531,29 @@ export function createWasmBridge(): Bridge {
       };
     },
 
-    async outletStreamGrantCredit(requestIdHex: string, grant: number): Promise<number> {
+    async outletStreamGrantCredit(
+      requestIdHex: string,
+      callerDid: string,
+      grant: number,
+    ): Promise<number> {
       const wasm = getWasm();
-      return await wasm.outletStreamGrantCredit(requestIdHex, grant);
+      return await wasm.outletStreamGrantCredit(requestIdHex, callerDid, grant);
     },
 
-    async outletStreamCancel(requestIdHex: string, nextSeq?: number): Promise<number | null> {
+    async outletStreamCancel(requestIdHex: string, callerDid: string): Promise<number | null> {
       const wasm = getWasm();
-      return await wasm.outletStreamCancel(requestIdHex, nextSeq);
+      return await wasm.outletStreamCancel(requestIdHex, callerDid);
     },
 
     async outletStreamTerminate(
       requestIdHex: string,
+      callerDid: string,
       slug: string,
       code: string,
       message: string,
     ): Promise<void> {
       const wasm = getWasm();
-      await wasm.outletStreamTerminate(requestIdHex, slug, code, message);
+      await wasm.outletStreamTerminate(requestIdHex, callerDid, slug, code, message);
     },
 
     async verifyChunkSignature(

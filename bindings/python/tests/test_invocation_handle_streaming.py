@@ -149,8 +149,9 @@ class TestMidStreamGrantCredit:
 
         captured: dict[str, Any] = {}
 
-        def fake_grant(request_id_hex: str, grant_int: int) -> int:
+        def fake_grant(request_id_hex: str, caller_did: str, grant_int: int) -> int:
             captured["request_id"] = request_id_hex
+            captured["caller_did"] = caller_did
             captured["grant"] = grant_int
             return 99  # synthetic new total
 
@@ -163,7 +164,11 @@ class TestMidStreamGrantCredit:
         q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
         # Inject a Data chunk so the stream is "active" (no terminal yet).
         await q.put(_data_chunk(seq=0, value={"i": 0}))
-        handle = InvocationHandle(q, request_id="bb" * 16)
+        handle = InvocationHandle(
+            q,
+            request_id="bb" * 16,
+            invoker_did="did:dht:z6MkInvoker",
+        )
         # Pull one chunk — the iterator must NOT see a terminal.
         chunk = await handle.__anext__()
         assert chunk.payload_type == "data"
@@ -173,6 +178,7 @@ class TestMidStreamGrantCredit:
         new_total = await handle.grant_credit(Credit(15))
         assert new_total == 99
         assert captured["request_id"] == "bb" * 16
+        assert captured["caller_did"] == "did:dht:z6MkInvoker"
         assert captured["grant"] == 15
 
 
@@ -190,9 +196,9 @@ class TestMidStreamCancel:
 
         captured: dict[str, Any] = {}
 
-        def fake_cancel(request_id_hex: str, next_seq: int | None) -> int | None:
+        def fake_cancel(request_id_hex: str, caller_did: str) -> int | None:
             captured["request_id"] = request_id_hex
-            captured["next_seq"] = next_seq
+            captured["caller_did"] = caller_did
             return 5  # synthetic cancel-ack seq
 
         class _FakeBridge:
@@ -202,14 +208,20 @@ class TestMidStreamCancel:
 
         q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
         await q.put(_data_chunk(seq=0, value={}))
-        handle = InvocationHandle(q, request_id="cc" * 16)
+        handle = InvocationHandle(
+            q,
+            request_id="cc" * 16,
+            invoker_did="did:dht:z6MkInvoker",
+        )
         await handle.__anext__()  # consume the Data chunk
         assert handle.is_terminated is False
 
-        ack = await handle.cancel(next_seq=3)
+        # CRITICAL #3 — cancel no longer takes next_seq; the bridge
+        # derives it from the runtime's emission cursor.
+        ack = await handle.cancel()
         assert ack == 5
         assert captured["request_id"] == "cc" * 16
-        assert captured["next_seq"] == 3
+        assert captured["caller_did"] == "did:dht:z6MkInvoker"
 
 
 # ---------------------------------------------------------------------------

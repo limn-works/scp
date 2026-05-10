@@ -411,6 +411,23 @@ pub struct PyBridgeInstance {
     /// streams' handles drop during instance shutdown.
     pub(crate) outlet_stream_registry:
         Arc<DashMap<String, Arc<crate::outlet_stream::StreamRegistryEntry>>>,
+    /// SCP-OUT-037 — per-context streaming admission tracker (§5.4.5
+    /// concurrent-stream caps). Keyed by `context_id`. Lifted to the
+    /// bridge instance so `max_concurrent_inbound_streams_per_invoker`
+    /// (and the origin-invoker / outlet caps) actually trip across
+    /// successive `open_outlet_stream` calls — constructing a fresh
+    /// `StreamAdmissionTracker` per open (the prior bug) reset the
+    /// counter every time, making the caps vacuous. Each context's
+    /// tracker is created lazily on first stream open via
+    /// `outlet_stream_admission_for_context` and stays for the lifetime
+    /// of the bridge instance (cleared by
+    /// `BridgeInstanceCore::bridge_specific_shutdown`).
+    pub(crate) outlet_stream_admission: Arc<
+        DashMap<
+            String,
+            Arc<std::sync::Mutex<scp_runtime::context::outlets::stream::StreamAdmissionTracker>>,
+        >,
+    >,
 }
 
 impl PyBridgeInstance {
@@ -433,6 +450,7 @@ impl PyBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
             outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_stream_admission: Arc::new(DashMap::new()),
         }
     }
 
@@ -456,6 +474,7 @@ impl PyBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
             outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_stream_admission: Arc::new(DashMap::new()),
         }
     }
 
@@ -525,6 +544,7 @@ impl PyBridgeInstance {
                             #[cfg(feature = "allow_in_memory_custody")]
                             network: std::sync::Mutex::new(None),
                             outlet_stream_registry: Arc::new(DashMap::new()),
+                            outlet_stream_admission: Arc::new(DashMap::new()),
                         };
                         let _ = instance
                             .storage_provider
@@ -595,6 +615,26 @@ impl PyBridgeInstance {
         &self,
     ) -> &Arc<DashMap<String, Arc<crate::outlet_stream::StreamRegistryEntry>>> {
         &self.outlet_stream_registry
+    }
+
+    /// Returns the per-context `StreamAdmissionTracker`, creating it
+    /// lazily on first call. Used by `open_outlet_stream` so the
+    /// §5.4.5 admission caps persist across successive opens within a
+    /// single context — the prior implementation constructed a fresh
+    /// tracker per open and the caps never tripped.
+    pub(crate) fn outlet_stream_admission_for_context(
+        &self,
+        context_id: &str,
+    ) -> Arc<std::sync::Mutex<scp_runtime::context::outlets::stream::StreamAdmissionTracker>> {
+        let entry = self
+            .outlet_stream_admission
+            .entry(context_id.to_owned())
+            .or_insert_with(|| {
+                Arc::new(std::sync::Mutex::new(
+                    scp_runtime::context::outlets::stream::StreamAdmissionTracker::default(),
+                ))
+            });
+        Arc::clone(entry.value())
     }
 
     /// Returns a reference to the MCP client registry.
@@ -733,6 +773,9 @@ impl BridgeInstanceCore for PyBridgeInstance {
         // Clear the SCP-OUT-037 outlet-stream registry so any in-flight
         // `StreamSessionHandle` entries drop — ending background pump tasks.
         self.outlet_stream_registry.clear();
+        // Clear per-context admission trackers so a fresh bridge instance
+        // starts at zero counters (multi-process / per-test isolation).
+        self.outlet_stream_admission.clear();
     }
 }
 

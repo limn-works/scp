@@ -229,6 +229,16 @@ pub struct NapiBridgeInstance {
     #[cfg(feature = "allow_in_memory_custody")]
     pub(crate) outlet_stream_registry:
         Arc<DashMap<String, Arc<crate::outlet_stream::StreamRegistryEntry>>>,
+    /// SCP-OUT-037 — per-context streaming admission tracker. See
+    /// `PyBridgeInstance::outlet_stream_admission` for rationale (CRITICAL #4
+    /// fix: a fresh tracker per open made the §5.4.5 caps vacuous).
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub(crate) outlet_stream_admission: Arc<
+        DashMap<
+            String,
+            Arc<std::sync::Mutex<scp_runtime::context::outlets::stream::StreamAdmissionTracker>>,
+        >,
+    >,
 }
 
 impl NapiBridgeInstance {
@@ -254,6 +264,8 @@ impl NapiBridgeInstance {
             network: std::sync::Mutex::new(None),
             #[cfg(feature = "allow_in_memory_custody")]
             outlet_stream_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "allow_in_memory_custody")]
+            outlet_stream_admission: Arc::new(DashMap::new()),
         }
     }
 
@@ -279,6 +291,8 @@ impl NapiBridgeInstance {
             network: std::sync::Mutex::new(None),
             #[cfg(feature = "allow_in_memory_custody")]
             outlet_stream_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "allow_in_memory_custody")]
+            outlet_stream_admission: Arc::new(DashMap::new()),
         }
     }
 
@@ -376,6 +390,8 @@ impl NapiBridgeInstance {
             network: std::sync::Mutex::new(None),
             #[cfg(feature = "allow_in_memory_custody")]
             outlet_stream_registry: Arc::new(DashMap::new()),
+            #[cfg(feature = "allow_in_memory_custody")]
+            outlet_stream_admission: Arc::new(DashMap::new()),
         }
     }
 
@@ -427,6 +443,27 @@ impl NapiBridgeInstance {
         &self,
     ) -> &Arc<DashMap<String, Arc<crate::outlet_stream::StreamRegistryEntry>>> {
         &self.outlet_stream_registry
+    }
+
+    /// Returns the per-context `StreamAdmissionTracker`, creating it
+    /// lazily on first call. CRITICAL #4 fix — the prior implementation
+    /// constructed a fresh tracker per `open_outlet_stream` call so the
+    /// §5.4.5 caps (`max_concurrent_inbound_streams_per_invoker` etc.)
+    /// never tripped.
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub(crate) fn outlet_stream_admission_for_context(
+        &self,
+        context_id: &str,
+    ) -> Arc<std::sync::Mutex<scp_runtime::context::outlets::stream::StreamAdmissionTracker>> {
+        let entry = self
+            .outlet_stream_admission
+            .entry(context_id.to_owned())
+            .or_insert_with(|| {
+                Arc::new(std::sync::Mutex::new(
+                    scp_runtime::context::outlets::stream::StreamAdmissionTracker::default(),
+                ))
+            });
+        Arc::clone(entry.value())
     }
 }
 
@@ -480,6 +517,8 @@ impl BridgeInstanceCore for NapiBridgeInstance {
         // tasks and dropping receivers cleanly.
         #[cfg(feature = "allow_in_memory_custody")]
         self.outlet_stream_registry.clear();
+        #[cfg(feature = "allow_in_memory_custody")]
+        self.outlet_stream_admission.clear();
     }
 }
 

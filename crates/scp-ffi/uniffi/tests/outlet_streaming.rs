@@ -167,7 +167,8 @@ fn compute_caveats_binding_uniffi_helper_deterministic() {
 /// of registry state.
 #[tokio::test]
 async fn grant_credit_rejects_zero_grant_through_uniffi_export() {
-    let result = outlet_stream_grant_credit("00".repeat(16), 0).await;
+    let result =
+        outlet_stream_grant_credit("00".repeat(16), "did:dht:z6MkInvoker".to_owned(), 0).await;
     assert!(result.is_err(), "grant=0 must be rejected");
     let err = format!("{:?}", result.unwrap_err());
     assert!(
@@ -180,7 +181,7 @@ async fn grant_credit_rejects_zero_grant_through_uniffi_export() {
 /// `request_id_hex` not in the per-bridge registry.
 #[tokio::test]
 async fn cancel_unknown_request_returns_protocol_unknown_session() {
-    let result = outlet_stream_cancel("dd".repeat(16), Some(0)).await;
+    let result = outlet_stream_cancel("dd".repeat(16), "did:dht:z6MkInvoker".to_owned()).await;
     assert!(result.is_err(), "missing request_id must be rejected");
     let err = format!("{:?}", result.unwrap_err());
     assert!(
