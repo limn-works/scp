@@ -303,7 +303,7 @@ class IdentityAdvancedBridge internal constructor(
                 "all active contexts where the OLD DID is a member; pre-context callers " +
                 "may discard the event explicitly.",
         replaceWith = ReplaceWith("migrateWithRotationEvent(identityHandle)"),
-        level = DeprecationLevel.WARNING,
+        level = DeprecationLevel.ERROR,
     )
     suspend fun migrate(identityHandle: Long): Long = bridge.ffiCall { bindings.identityMigrate(identityHandle) }
 

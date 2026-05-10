@@ -1920,7 +1920,9 @@ fn bind_old_document_to_old_did(
     old_did: &str,
     old_document: &DidDocument,
 ) -> Result<(), IdentityError> {
-    let old_did_pubkey = extract_public_key(old_did)?;
+    let old_did_pubkey = extract_public_key(old_did).map_err(|e| {
+        IdentityError::MigrationVerificationFailed(format!("old_did is not a valid did:dht: {e}"))
+    })?;
     let old_doc_vm0 = old_document
         .verification_method_by_fragment("0")
         .ok_or_else(|| {
@@ -1928,11 +1930,19 @@ fn bind_old_document_to_old_did(
                 "old_document has no #0 verification method".to_owned(),
             )
         })?;
-    let old_doc_vm0_pubkey = decode_multibase_key(&old_doc_vm0.public_key_multibase)?;
+    let old_doc_vm0_pubkey =
+        decode_multibase_key(&old_doc_vm0.public_key_multibase).map_err(|e| {
+            IdentityError::MigrationVerificationFailed(format!(
+                "old_document #0 verification method has malformed publicKeyMultibase: {e}"
+            ))
+        })?;
     if old_doc_vm0_pubkey != old_did_pubkey {
-        return Err(IdentityError::MigrationVerificationFailed(
-            "old_document does not derive old_did".to_owned(),
-        ));
+        return Err(IdentityError::MigrationVerificationFailed(format!(
+            "old_document #0 verification method does not derive old_did \
+             (did-derived: {}..., document-derived: {}...)",
+            hex::encode(&old_did_pubkey[..12]),
+            hex::encode(&old_doc_vm0_pubkey[..12]),
+        )));
     }
     Ok(())
 }
@@ -3985,8 +3995,15 @@ mod tests {
         match err {
             IdentityError::MigrationVerificationFailed(msg) => {
                 assert!(
-                    msg.contains("old_document does not derive old_did"),
+                    msg.contains("does not derive old_did"),
                     "expected step 0 binding error, got: {msg}"
+                );
+                // The error message MUST surface short hex prefixes of
+                // both the DID-derived and document-derived public keys
+                // so operators can eyeball which side disagrees.
+                assert!(
+                    msg.contains("did-derived:") && msg.contains("document-derived:"),
+                    "expected hex-prefixed mismatch operability hint, got: {msg}"
                 );
             }
             other => panic!("expected MigrationVerificationFailed, got: {other:?}"),
@@ -4056,6 +4073,82 @@ mod tests {
                 );
             }
             other => panic!("expected MigrationVerificationFailed, got: {other:?}"),
+        }
+    }
+
+    /// Step 0's `decode_multibase_key` failure path MUST surface as
+    /// `MigrationVerificationFailed`, not the raw `InvalidDidFormat`
+    /// error the underlying helper returns. The `verify_migration`
+    /// rustdoc promises callers that Step 0 failures are uniformly
+    /// reported as `MigrationVerificationFailed`; a forged document
+    /// with a malformed `publicKeyMultibase` on `#0` (no `z` prefix,
+    /// truncated payload, non-base58 characters, etc.) must not leak
+    /// through as a different error variant.
+    #[tokio::test]
+    async fn verify_migration_rejects_old_document_with_malformed_vm0_multibase() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+        let (_new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .unwrap();
+
+        // Document whose `id` matches the legitimate `old_did` but
+        // whose `#0` verification method has a malformed
+        // `publicKeyMultibase`: missing the `z` base58btc prefix that
+        // `decode_multibase_key` requires.
+        let malformed_vm0 = crate::document::VerificationMethod {
+            id: format!("{}#0", event.old_did),
+            method_type: "Ed25519VerificationKey2020".to_owned(),
+            controller: event.old_did.clone(),
+            public_key_multibase: "not-a-multibase-encoded-key".to_owned(),
+        };
+        let malformed_doc = DidDocument {
+            context: document.context.clone(),
+            id: event.old_did.clone(),
+            verification_method: vec![malformed_vm0],
+            authentication: Vec::new(),
+            assertion_method: Vec::new(),
+            also_known_as: Vec::new(),
+            service: Vec::new(),
+        };
+
+        let result = verify_migration(
+            &event.old_did,
+            &malformed_doc,
+            &event.new_did,
+            &event.migration_proof,
+            event.pre_rotation_proof.as_ref(),
+            event.rotated_at,
+            event.rotated_at + 1,
+        );
+        let err = result.expect_err(
+            "step 0 MUST reject an old_document whose #0 publicKeyMultibase is malformed",
+        );
+        match err {
+            IdentityError::MigrationVerificationFailed(msg) => {
+                assert!(
+                    msg.contains("malformed publicKeyMultibase"),
+                    "expected malformed-multibase error, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected MigrationVerificationFailed, got: {other:?} \
+                 (Step 0 must not surface InvalidDidFormat to callers)"
+            ),
         }
     }
 
