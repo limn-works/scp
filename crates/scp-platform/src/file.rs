@@ -647,8 +647,16 @@ impl KeyCustody for FileKeyCustody {
     ) -> impl Future<Output = Result<(), PlatformError>> + Send {
         let key_id = key.id();
         async move {
-            // Remove from pseudonym keys if present.
+            // Standardized lock order: `handle_map` first, then
+            // `pseudonym_keys`. Other call sites that touch both
+            // (`sign`, `public_key`) release `pseudonym_keys` before
+            // acquiring `handle_map`, so they do not hold the locks
+            // concurrently and remain compatible with this ordering.
+            let mut map = self.handle_map.lock().await;
+
             // Pseudonym keys are in-memory only — no disk rewrite needed.
+            // Check them under the held `handle_map` lock so destroy_key
+            // is atomic with concurrent map readers.
             {
                 let mut pseudonyms = self.pseudonym_keys.lock().await;
                 if pseudonyms.remove(&key_id).is_some() {
@@ -656,12 +664,16 @@ impl KeyCustody for FileKeyCustody {
                 }
             }
 
-            let mut map = self.handle_map.lock().await;
-            let Some((_, removed_index)) = map.entries.remove(&key_id) else {
+            // Look up — do NOT mutate the map yet. Map mutation is
+            // deferred until after the file rewrite succeeds, so a
+            // failed `read_file` or `atomic_write` cannot orphan
+            // encrypted material on disk (the in-memory map would
+            // otherwise have lost the only handle pointing at it).
+            let Some(&(_, removed_index)) = map.entries.get(&key_id) else {
                 return Err(PlatformError::KeyNotFound);
             };
 
-            // Rewrite the key file without the destroyed entry (#1469).
+            // Rewrite the key file without the destroyed entry.
             // This ensures key material is removed from disk, not just from
             // the in-memory handle map.
             let _lock = self
@@ -680,7 +692,18 @@ impl KeyCustody for FileKeyCustody {
                     .map_err(|_| PlatformError::CustodyError("invalid entry count".into()))?,
             );
 
-            let new_count = current_count.saturating_sub(1);
+            // Defend against in-memory/on-disk desynchronization: if the
+            // handle map says the entry lives at an index the file
+            // doesn't contain, refuse to write rather than emitting a
+            // malformed file with a clamped count.
+            if removed_index >= current_count as usize {
+                return Err(PlatformError::CustodyError(format!(
+                    "handle map desynchronized with key file: entry index {removed_index} \
+                     out of bounds for on-disk entry count {current_count}"
+                )));
+            }
+
+            let new_count = current_count - 1;
             let mut new_data = Vec::with_capacity(HEADER_SIZE + (new_count as usize) * ENTRY_SIZE);
 
             // Copy header (version + salt).
@@ -697,10 +720,15 @@ impl KeyCustody for FileKeyCustody {
                 new_data.extend_from_slice(&data[entry_offset..entry_offset + ENTRY_SIZE]);
             }
 
+            // Commit to disk BEFORE mutating the in-memory map. If
+            // `atomic_write` fails, the map still references the
+            // (unmodified) on-disk entry — no orphaned ciphertext.
             atomic_write(&self.path, &new_data)?;
 
-            // Update indices in handle_map: entries after the removed index
-            // shift down by one.
+            // Now that disk state is updated, mutate the in-memory
+            // map: drop the destroyed entry and shift indices for
+            // entries that lived after it.
+            map.entries.remove(&key_id);
             for (_key_type, entry_index) in map.entries.values_mut() {
                 if *entry_index > removed_index {
                     *entry_index -= 1;
@@ -1092,6 +1120,75 @@ mod tests {
         assert!(custody.sign(&handle, b"test").await.is_err());
         assert!(custody.public_key(&handle).await.is_err());
         assert!(custody.destroy_key(&handle).await.is_err());
+    }
+
+    /// `destroy_key` MUST refuse to rewrite the file when the in-memory
+    /// handle map is desynchronized with the on-disk entry count
+    /// (i.e. the map points at an entry index that the file does not
+    /// contain). Silently clamping with `saturating_sub` would emit a
+    /// malformed file whose header count is smaller than the entry
+    /// payload — corrupting the custody store. The handle map must be
+    /// preserved on this error so the failed call does not orphan
+    /// material.
+    #[tokio::test]
+    async fn destroy_key_rejects_out_of_bounds_entry_index() {
+        let dir = TempDir::new().unwrap();
+        let custody = make_custody(&dir, "out-of-bounds-passphrase");
+
+        // Populate two real entries so the file is non-empty and the
+        // bounds check is the only thing that can fail.
+        let real_a = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let real_b = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        // Inject a desynchronized entry: a handle the map claims lives
+        // at an out-of-bounds index relative to the on-disk count (2).
+        let desync_id = custody.next_handle().id();
+        {
+            let mut map = custody.handle_map.lock().await;
+            map.entries
+                .insert(desync_id, (StoredKeyType::Ed25519, 9_999));
+        }
+        let desync_handle = KeyHandle::new(desync_id);
+
+        let err = custody
+            .destroy_key(&desync_handle)
+            .await
+            .expect_err("destroy_key MUST refuse desynchronized entry index");
+        match err {
+            PlatformError::CustodyError(msg) => {
+                assert!(
+                    msg.contains("handle map desynchronized with key file"),
+                    "expected desync error, got: {msg}"
+                );
+                assert!(
+                    msg.contains("9999"),
+                    "error message must surface the offending index, got: {msg}"
+                );
+            }
+            other => panic!("expected CustodyError, got: {other:?}"),
+        }
+
+        // The real entries MUST still be usable — the failed call must
+        // not have corrupted the on-disk file or shifted any indices.
+        custody
+            .public_key(&real_a)
+            .await
+            .expect("real_a must still decrypt after failed destroy");
+        custody
+            .public_key(&real_b)
+            .await
+            .expect("real_b must still decrypt after failed destroy");
+
+        // And the desynchronized map entry must still be present
+        // (destroy_key returned Err before any map mutation).
+        let preserved = {
+            let map = custody.handle_map.lock().await;
+            map.entries.contains_key(&desync_id)
+        };
+        assert!(
+            preserved,
+            "handle map MUST be preserved when destroy_key fails"
+        );
     }
 
     #[tokio::test]

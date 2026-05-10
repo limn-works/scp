@@ -250,6 +250,11 @@ class IdentityAdvancedBridgeTest {
 
     @Nested
     inner class Migrate {
+        // The simpler `migrate` overload is deprecated because it drops
+        // the rotation event required by spec §3.2.1 step 4b. We still
+        // test that the underlying binding plumbing works for any
+        // legacy in-tree caller until the overload is removed.
+        @Suppress("DEPRECATION")
         @Test
         fun `migrate delegates handle to bindings`() =
             runTest(testDispatcher) {

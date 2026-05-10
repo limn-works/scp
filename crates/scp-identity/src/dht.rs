@@ -1444,6 +1444,20 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     /// Identity Key. Length prefixes (u32 big-endian for the DID strings
     /// and the implicit u64 big-endian width of `rotated_at`) prevent
     /// concatenation ambiguity between variable-length DID strings.
+    ///
+    /// Note on digest scope: the signed digest covers
+    /// `(DOMAIN_MIGRATION_V1, old_did, new_did, rotated_at)` only — it
+    /// does NOT include the `(commitment, revealed_key)` pair carried in
+    /// `pre_rotation_proof`. Layered verification provides equivalent
+    /// binding for the current proof shape: `verify_migration` Step 2b
+    /// binds `commitment` to the old document's `PreRotationCommitment`
+    /// service entry (which itself is BEP44-signed under the old `#0`),
+    /// and Step 2c binds `revealed_key` to `new_did` via self-cert
+    /// derivation. Any future field added to `PreRotationProof` — for
+    /// example an attestation timestamp or a substrate identifier —
+    /// would NOT be automatically covered by the migration signature
+    /// and MUST be wired into either the digest input or a dedicated
+    /// `verify_migration` invariant.
     async fn build_migration_proof(
         identity: &ScpIdentity,
         new_did: &str,
@@ -1890,20 +1904,18 @@ async fn destroy_old_operational_keys<C: KeyCustody>(key_custody: &C, identity: 
     }
 }
 
-/// Defense-in-depth: binds a caller-supplied `old_document` to `old_did`
-/// by checking that the document's `#0` verification method derives the
-/// DID string. did:dht is self-certifying — the DID string is z-base-32
-/// of the `#0` identity-key public — so byte-comparing the DID-derived
-/// public key against the document's `#0` VM closes the gap.
+/// Verifies that the supplied `old_document`'s `#0` verification method
+/// byte-matches the public key derivable from `old_did` (did:dht is
+/// self-certifying — the DID string is z-base-32 of the `#0`
+/// identity-key public). This catches mismatched documents passed by
+/// mistake, but does NOT verify document authenticity: an attacker who
+/// knows `old_did` can publicly derive its `#0` public key and forge a
+/// document with a matching VM (and arbitrary other VMs/services).
 ///
-/// Without this check, a forged document — e.g. one whose `id` field is
-/// `old_did` but whose VMs/services are attacker-controlled, notably one
-/// that omits the `PreRotationCommitment` service — would silently
-/// downgrade `verify_migration`'s STRONG-when-committed enforcement
-/// (which consults `old_document.pre_rotation_service()`) to
-/// MODERATE-only. The downgrade is precisely the scenario the
-/// pre-rotation chain is designed to defend against (briefly-captured
-/// OLD `#0` key).
+/// Callers MUST obtain `old_document` from the authoritative DHT (or a
+/// BEP44-signature-verified cache) for the pre-rotation-chain
+/// enforcement in `verify_migration` to be sound. See `verify_migration`
+/// rustdoc `# Caller contract` for the trusted-resolution paths.
 fn bind_old_document_to_old_did(
     old_did: &str,
     old_document: &DidDocument,
@@ -1981,11 +1993,9 @@ fn bind_old_document_to_old_did(
 /// Returns [`IdentityError::MigrationVerificationFailed`] if:
 /// - `old_document` does not derive `old_did` via self-certification
 ///   (the document's `#0` verification method does not match the
-///   z-base-32 encoded public key in the `old_did` string). This
-///   defense-in-depth check binds the caller-supplied `old_document`
-///   to `old_did` so a forged document — e.g. one with no
-///   `PreRotationCommitment` service — cannot silently downgrade
-///   STRONG-assurance enforcement to MODERATE.
+///   z-base-32 encoded public key in the `old_did` string). See
+///   [`bind_old_document_to_old_did`] and the `# Caller contract`
+///   section below for the scope and limitations of this binding.
 /// - `rotated_at` is more than [`MAX_FUTURE_SKEW_SECS`] ahead of `now`,
 ///   strictly below [`MIGRATION_EPOCH_FLOOR_UNIX_SECS`], or more than
 ///   [`MAX_PAST_WINDOW_SECS`] behind `now`.
@@ -1999,6 +2009,21 @@ fn bind_old_document_to_old_did(
 /// - The pre-rotation proof's `commitment` does not match the
 ///   `PreRotationCommitment` service in the old DID document.
 /// - The pre-rotation proof's `revealed_key` does not derive `new_did`.
+///
+/// # Caller contract
+///
+/// Callers MUST supply `old_document` from a verified resolution path
+/// — [`DidDht::resolve_did`], [`crate::resolver::verify_and_deserialize`],
+/// or [`crate::resolution::relay_resolve`] — so the document's BEP44
+/// signature has been validated against the published DHT record (or
+/// an authoritative cache thereof). This function trusts its
+/// `old_document` argument: the Step 0 self-cert binding catches
+/// mismatched documents passed by mistake, but does NOT re-verify
+/// BEP44 authenticity. An attacker who knows `old_did` can publicly
+/// derive its `#0` public key and forge a document with a matching
+/// `#0` VM but arbitrary other VMs/services (notably an omitted
+/// `PreRotationCommitment`), so calling `verify_migration` with an
+/// unverified document forfeits the STRONG-when-committed defence.
 ///
 /// See ADR-003 acceptance criterion 4c.
 pub fn verify_migration(
@@ -3962,6 +3987,72 @@ mod tests {
                 assert!(
                     msg.contains("old_document does not derive old_did"),
                     "expected step 0 binding error, got: {msg}"
+                );
+            }
+            other => panic!("expected MigrationVerificationFailed, got: {other:?}"),
+        }
+    }
+
+    /// `verify_migration` MUST reject a caller-supplied `old_document`
+    /// that does not contain a `#0` verification method at all. This is
+    /// the sibling case to `verify_migration_rejects_forged_old_document`
+    /// (WRONG-#0): without a `#0` VM the Step 0 self-cert binding cannot
+    /// proceed and the function MUST return a typed
+    /// `MigrationVerificationFailed` describing the missing fragment
+    /// rather than falling through.
+    #[tokio::test]
+    async fn verify_migration_rejects_old_document_without_vm0() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        // Legitimate migration: produce a real `DidRotationEvent` we
+        // can replay against a degenerate document.
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity, &document).await.unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+        let (_new_identity, _new_doc, event, _new_pre_rotation_handle) = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .unwrap();
+
+        // Construct a degenerate document whose `id` matches the
+        // legitimate `old_did` but whose `verification_method` list is
+        // empty — there is no `#0` fragment to bind against.
+        let degenerate = DidDocument {
+            context: document.context.clone(),
+            id: event.old_did.clone(),
+            verification_method: Vec::new(),
+            authentication: Vec::new(),
+            assertion_method: Vec::new(),
+            also_known_as: Vec::new(),
+            service: Vec::new(),
+        };
+
+        let result = verify_migration(
+            &event.old_did,
+            &degenerate,
+            &event.new_did,
+            &event.migration_proof,
+            event.pre_rotation_proof.as_ref(),
+            event.rotated_at,
+            event.rotated_at + 1,
+        );
+        let err = result
+            .expect_err("step 0 MUST reject an old_document that has no #0 verification method");
+        match err {
+            IdentityError::MigrationVerificationFailed(msg) => {
+                assert!(
+                    msg.contains("old_document has no #0 verification method"),
+                    "expected missing-#0 error, got: {msg}"
                 );
             }
             other => panic!("expected MigrationVerificationFailed, got: {other:?}"),

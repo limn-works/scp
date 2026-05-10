@@ -12,6 +12,7 @@ package works.limn.scp
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -280,13 +281,30 @@ class IdentityAdvancedBridge internal constructor(
     /**
      * Migrates an identity to a new DID.
      *
-     * Convenience overload returning only the new identity handle. Use
-     * [migrateWithRotationEvent] when the caller needs to distribute
-     * the `DidRotationEvent` to active context members.
+     * **Deprecated.** This overload silently drops the
+     * `DidRotationEvent` that spec §3.2.1 step 4b requires the caller
+     * to distribute to every active context where the OLD DID is a
+     * member. Without distribution, peers will reject subsequent
+     * messages signed by the new DID's `#active` key as unauthorized,
+     * and the migration is protocol-incomplete.
+     *
+     * Use [migrateWithRotationEvent] instead and forward the returned
+     * [IdentityMigrateResult.rotationEventJson] to every active
+     * context. Pre-context callers (no active contexts) may discard
+     * the rotation event explicitly.
      *
      * @param identityHandle Handle from identity create or load.
      * @return Updated opaque identity handle with new DID.
      */
+    @Deprecated(
+        message =
+            "Drops the DidRotationEvent required by spec §3.2.1 step 4b. " +
+                "Use migrateWithRotationEvent and distribute the rotation event to " +
+                "all active contexts where the OLD DID is a member; pre-context callers " +
+                "may discard the event explicitly.",
+        replaceWith = ReplaceWith("migrateWithRotationEvent(identityHandle)"),
+        level = DeprecationLevel.WARNING,
+    )
     suspend fun migrate(identityHandle: Long): Long = bridge.ffiCall { bindings.identityMigrate(identityHandle) }
 
     /**
@@ -544,11 +562,22 @@ data class IdentityAttestation(
     val platformId: String? = null,
 ) {
     internal companion object {
-        /** Parse an [IdentityAttestation] from a bridge JSON object. */
+        /**
+         * Parse an [IdentityAttestation] from a bridge JSON object.
+         *
+         * Revocation status decoding fails closed: unknown JSON shapes
+         * throw [IllegalArgumentException] rather than defaulting to
+         * [RevocationStatus.Active]. If the Rust enum adds a new
+         * variant (e.g. `Suspended`), Kotlin SDK callers MUST see the
+         * decode failure rather than silently mis-categorize a
+         * suspended attestation as active — that would be a
+         * security-relevant fail-open default.
+         */
         fun fromJsonObject(obj: JsonObject): IdentityAttestation {
             val rsElement = obj["revocation_status"]
             val revocationStatus = when {
                 rsElement == null -> RevocationStatus.Active
+                rsElement is JsonPrimitive && rsElement.content == "Active" -> RevocationStatus.Active
                 rsElement is JsonObject && rsElement.containsKey("Revoked") -> {
                     val revoked = rsElement["Revoked"]!!.jsonObject
                     RevocationStatus.Revoked(
@@ -556,7 +585,11 @@ data class IdentityAttestation(
                         reason = revoked["reason"]?.jsonPrimitive?.content,
                     )
                 }
-                else -> RevocationStatus.Active
+                else -> throw IllegalArgumentException(
+                    "Unrecognized revocation_status JSON shape: $rsElement. " +
+                        "Expected JsonPrimitive(\"Active\") or JsonObject({\"Revoked\": {...}}). " +
+                        "Failing closed rather than defaulting to Active.",
+                )
             }
             return IdentityAttestation(
                 id = obj["id"]!!.jsonPrimitive.content,
