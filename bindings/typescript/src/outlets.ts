@@ -1209,11 +1209,14 @@ export class OutletNamespace {
               // also indicate "no longer authorized" close the
               // stream too.
               try {
+                // The bridge accepts a closed-set
+                // `TerminateReasonSlug` and derives the §5.4.4 code
+                // from it; the message extension is the only caller-
+                // supplied human text.
                 await bridge.outletStreamTerminate(
                   rid,
                   invokerDid,
                   "authorization.revoked-mid-stream",
-                  "SCP-TOOL-6110",
                   "ucan revoked or invalid mid-stream",
                 );
               } catch {

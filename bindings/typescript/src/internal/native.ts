@@ -37,6 +37,7 @@ import type {
   BridgeOutletInvocationStream,
   BridgeTransportHandle,
   MessageCallback,
+  TerminateReasonSlug,
 } from "./bridge";
 import { safeJsonParse } from "./json-utils";
 
@@ -967,19 +968,21 @@ export function createNativeBridge(): Bridge {
     async outletStreamTerminate(
       requestIdHex: string,
       callerDid: string,
-      slug: string,
-      code: string,
-      message: string,
+      reason: TerminateReasonSlug,
+      messageOverride: string | null,
     ): Promise<void> {
+      // NAPI bridge accepts a string slug and matches to its
+      // protocol-layer `TerminateReason` enum; pass empty string
+      // when no message override is supplied (the NAPI bridge
+      // treats empty as "use canonical default").
       await (
         addon.outletStreamTerminate as (
           rid: string,
           cd: string,
-          s: string,
-          c: string,
+          r: string,
           m: string,
         ) => Promise<void>
-      )(requestIdHex, callerDid, slug, code, message);
+      )(requestIdHex, callerDid, reason, messageOverride ?? "");
     },
 
     async verifyChunkSignature(

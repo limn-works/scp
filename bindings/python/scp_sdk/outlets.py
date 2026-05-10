@@ -1481,12 +1481,16 @@ class OutletNamespace:
                         # `RevokedMidStream` slug + code regardless of
                         # the underlying UcanError variant.
                         try:
+                            # PyO3 bridge accepts the closed-set
+                            # `TerminateReason` slug as a string and
+                            # derives the §5.4.4 code from it; the
+                            # `message` extension is the only caller-
+                            # supplied human text.
                             await asyncio.to_thread(
                                 bridge.outlet_stream_terminate,
                                 request_id_hex,
                                 invoker_did,
                                 "authorization.revoked-mid-stream",
-                                "SCP-TOOL-6110",
                                 str(exc),
                             )
                         except Exception:

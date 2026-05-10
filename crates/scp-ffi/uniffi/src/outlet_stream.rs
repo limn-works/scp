@@ -444,13 +444,15 @@ impl OutletStreamHandle {
     }
 
     /// Forces a terminal `Error{terminal:true}` chunk into this stream
-    /// (§5.4.5 receiver-side revocation re-check, `RevokedMidStream` /
-    /// `SCP-TOOL-6110`).
+    /// (§5.4.5 framework-initiated stream termination).
     ///
     /// Convenience wrapper that delegates to
     /// [`outlet_stream_terminate`] with this handle's `request_id`. The
-    /// SDK framework's periodic UCAN re-check loop calls this whenever
-    /// it observes the opening UCAN has been revoked since stream open.
+    /// SDK framework's periodic UCAN re-check loop calls this with
+    /// [`TerminateReason::RevokedMidStream`] whenever it observes the
+    /// opening UCAN has been revoked since stream open. The
+    /// `message_override` is an optional human-readable suffix — pass
+    /// `None` to use the spec's canonical default message.
     ///
     /// # Errors
     ///
@@ -462,16 +464,14 @@ impl OutletStreamHandle {
     /// already left the pump's control plane.
     pub async fn terminate(
         &self,
-        slug: String,
-        code: String,
-        message: String,
+        reason: TerminateReason,
+        message_override: Option<String>,
     ) -> Result<(), ScpError> {
         outlet_stream_terminate(
             self.request_id_hex.clone(),
             self.invoker_did.clone(),
-            slug,
-            code,
-            message,
+            reason,
+            message_override,
         )
         .await
     }
@@ -902,8 +902,9 @@ fn build_open_stream_params(
         invoker_pk,
         // Native FFI bridges: invoker == operator in the local
         // single-context streaming path. See PyO3 bridge for full
-        // rationale (§5.4.5 / §6.2.0.5).
-        operator_signing_key: Some(operator_signing_key),
+        // rationale (§5.4.5 / §6.2.0.5). The runtime now requires a
+        // non-optional key (all-zero-sig placeholder deleted).
+        operator_signing_key,
         stream_credit_stall_secs:
             scp_protocol::context::outlets::stream::DEFAULT_STREAM_CREDIT_STALL_SECS,
         stream_cancel_ack_secs: 5,
@@ -1098,9 +1099,45 @@ fn sign_cancel_for_entry(
 // outlet_stream_terminate — receiver-side revocation re-check (§5.4.5)
 // ---------------------------------------------------------------------------
 
+/// Closed set of framework-emitted stream termination causes (§5.4.5).
+///
+/// Exposed to Swift / Kotlin via `UniFFI`. Mirrors
+/// [`scp_protocol::context::outlets::stream::TerminateReason`] — kept
+/// as a `UniFFI`-local enum so Swift/Kotlin see an idiomatic
+/// `enum TerminateReason { case revokedMidStream, ... }` /
+/// `sealed class TerminateReason { object RevokedMidStream : ... }`
+/// surface instead of a raw integer or slug string.
+///
+/// Conversion to the protocol enum is total (no error path) —
+/// every `UniFFI` variant maps to exactly one protocol variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TerminateReason {
+    /// `authorization.revoked-mid-stream` / `SCP-TOOL-6110`. The
+    /// receiver-side periodic UCAN re-check observed the opening
+    /// token revoked since stream open.
+    RevokedMidStream,
+    /// `execution.cancel-ack-timeout` / `SCP-TOOL-6135`. The executor
+    /// failed to emit a terminal chunk within `stream_cancel_ack_secs`
+    /// after `OutletCancel` arrival.
+    CancelAckTimeout,
+    /// `execution.credit-stall` / `SCP-TOOL-6133`. The credit window
+    /// remained at zero past `stream_credit_stall_secs`.
+    CreditStall,
+}
+
+impl From<TerminateReason> for scp_protocol::context::outlets::stream::TerminateReason {
+    fn from(r: TerminateReason) -> Self {
+        match r {
+            TerminateReason::RevokedMidStream => Self::RevokedMidStream,
+            TerminateReason::CancelAckTimeout => Self::CancelAckTimeout,
+            TerminateReason::CreditStall => Self::CreditStall,
+        }
+    }
+}
+
 /// Forces a terminal `Error{terminal:true}` chunk into the active stream
-/// identified by `request_id_hex` (§5.4.5 receiver-side revocation
-/// re-check, `RevokedMidStream` / `SCP-TOOL-6110`).
+/// identified by `request_id_hex` (§5.4.5 framework-initiated stream
+/// termination).
 ///
 /// Routes through
 /// [`scp_runtime::context::outlets::dispatch::StreamSessionHandle::terminate_with_error`]
@@ -1109,8 +1146,14 @@ fn sign_cancel_for_entry(
 /// `OutletInvokedEvent` emission) identically to other framework-emitted
 /// closes.
 ///
-/// The SDK framework's periodic UCAN re-check loop calls this whenever
-/// it observes the opening UCAN has been revoked since stream open.
+/// The SDK framework's periodic UCAN re-check loop calls this with
+/// [`TerminateReason::RevokedMidStream`] whenever it observes the
+/// opening UCAN has been revoked since stream open. The reason enum
+/// is closed — Swift `enum` / Kotlin `sealed class` make adding a
+/// new variant a compile-time event in the SDK. `message_override`
+/// is the only caller-controllable string and is appended to the
+/// canonical slug prefix; passing `None` uses the spec's default
+/// message for the variant.
 ///
 /// # Errors
 ///
@@ -1131,21 +1174,21 @@ fn sign_cancel_for_entry(
 pub async fn outlet_stream_terminate(
     request_id_hex: String,
     caller_did: String,
-    slug: String,
-    code: String,
-    message: String,
+    reason: TerminateReason,
+    message_override: Option<String>,
 ) -> Result<(), ScpError> {
     scp_ffi_common::validate::validate_did(&caller_did).map_err(ScpError::from)?;
     let entry = lookup_entry_authenticated(&request_id_hex, &caller_did)?;
+    let reason_proto: scp_protocol::context::outlets::stream::TerminateReason = reason.into();
     let handle_guard = entry
         .handle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     handle_guard
-        .terminate_with_error(&slug, &code, &message)
+        .terminate_with_error(reason_proto, message_override)
         .map_err(|err| ScpError::Context {
             msg: format!("terminate rejected: {err}"),
-            code: code.clone(),
+            code: reason_proto.code().to_owned(),
         })?;
     Ok(())
 }

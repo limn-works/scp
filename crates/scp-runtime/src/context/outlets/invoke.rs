@@ -6865,11 +6865,12 @@ mod tests {
             credit_window,
             caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
             invoker_pk: verifying_key,
-            // OUT-034 unit-test fixtures: no operator key wired —
-            // exercises the dispatch pump's None-fallback behaviour.
-            // Round-7 round-trip / verification tests construct their
-            // own params with an explicit `Some(...)` instead.
-            operator_signing_key: None,
+            // OUT-034 unit-test fixtures: every stream needs an
+            // operator key (Option<_> was deleted to close the
+            // all-zero-sig placeholder hole). These fixtures exercise
+            // admission/escrow/credit accounting only — they do not
+            // verify the signature, so any throwaway key works.
+            operator_signing_key: StdArc::new(ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32])),
             stream_credit_stall_secs: 1,
             stream_cancel_ack_secs: 1,
         }
@@ -7388,7 +7389,7 @@ mod tests {
             credit_window,
             caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
             invoker_pk: operator_signing_key.verifying_key(),
-            operator_signing_key: Some(StdArc::clone(&operator_signing_key)),
+            operator_signing_key: StdArc::clone(&operator_signing_key),
             stream_credit_stall_secs: 1,
             stream_cancel_ack_secs: 1,
         }

@@ -3125,12 +3125,21 @@ impl WasmContextManager {
         &mut self,
         request_id_hex: &str,
         caller_did: &str,
-        slug: &str,
-        code: &str,
-        message: &str,
+        reason: scp_protocol::context::outlets::stream::TerminateReason,
+        message_override: Option<&str>,
     ) -> Result<bool, ScpWasmError> {
         use scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION;
         use scp_protocol::context::outlets::stream::{ChunkPayload, OutletStreamChunk, sign_chunk};
+
+        // Slug and code derived from the enum — never caller-supplied.
+        // Mirrors the runtime bridge's `terminate_with_error` contract
+        // (PR #1700 + this PR): the wire chunk carries the canonical
+        // §5.4.4 slug+code regardless of any caller string. The only
+        // caller-controllable field is the human-readable message
+        // suffix (`message_override`).
+        let slug = reason.slug();
+        let code = reason.code();
+        let suffix = message_override.unwrap_or_else(|| reason.default_message());
 
         let session =
             self.outlet_streams
@@ -3176,7 +3185,7 @@ impl WasmContextManager {
 
         let payload = ChunkPayload::Error {
             code: code.to_owned(),
-            message: format!("{slug}: {message}"),
+            message: format!("{slug}: {suffix}"),
             terminal: true,
         };
         let sig = sign_chunk(

@@ -572,8 +572,11 @@ fn build_open_stream_params(
         // are the same key custody-side. The cross-context bridge
         // path that distinguishes these two roles is the §6.2.0.5
         // re-encryption boundary; this single-context streaming path
-        // is the degenerate case where invoker == operator.
-        operator_signing_key: Some(operator_signing_key),
+        // is the degenerate case where invoker == operator. The
+        // runtime now requires a non-optional key (the all-zero-sig
+        // placeholder fallback was deleted to close the wire-corruption
+        // path).
+        operator_signing_key,
         stream_credit_stall_secs:
             scp_protocol::context::outlets::stream::DEFAULT_STREAM_CREDIT_STALL_SECS,
         stream_cancel_ack_secs: 5,
@@ -762,8 +765,8 @@ pub fn py_outlet_stream_cancel(request_id_hex: &str, caller_did: &str) -> PyResu
 // ---------------------------------------------------------------------------
 
 /// Forces a terminal `Error{terminal:true}` chunk into the active stream
-/// identified by `request_id_hex` (§5.4.5 receiver-side revocation
-/// re-check, `RevokedMidStream` / `SCP-TOOL-6110`).
+/// identified by `request_id_hex` (§5.4.5 framework-initiated stream
+/// termination).
 ///
 /// Routes through
 /// [`scp_runtime::context::outlets::dispatch::StreamSessionHandle::terminate_with_error`]
@@ -773,13 +776,26 @@ pub fn py_outlet_stream_cancel(request_id_hex: &str, caller_did: &str) -> PyResu
 /// closes.
 ///
 /// The SDK framework's periodic UCAN re-check loop calls this whenever
-/// it observes the opening UCAN has been revoked since stream open. The
-/// `slug` / `code` / `message` triple is recorded into the synthetic
-/// `ChunkPayload::Error` and surfaces to the receiver alongside the
-/// signed terminal chunk.
+/// it observes the opening UCAN has been revoked since stream open
+/// (`reason = "authorization.revoked-mid-stream"`).
+///
+/// `reason` MUST be one of the closed-set §5.4.4 slugs registered in
+/// [`scp_protocol::context::outlets::stream::TerminateReason`]:
+/// - `authorization.revoked-mid-stream` (`RevokedMidStream`)
+/// - `execution.cancel-ack-timeout` (`CancelAckTimeout`)
+/// - `execution.credit-stall` (`CreditStall`)
+///
+/// Unknown slugs are rejected with a `ValidationError` — the bridge
+/// fails closed so attacker-controlled slug strings cannot enter the
+/// provenance record. The runtime derives the canonical code from the
+/// matched enum variant; the caller does not supply it. `message` is
+/// an optional human-readable extension (pass an empty string for
+/// "use the canonical default").
 ///
 /// # Errors
 ///
+/// * `ValidationError` — `reason` is not in the closed `TerminateReason`
+///   set. Caller MUST surface a structured error rather than retry.
 /// * `ContextError` (slug `protocol.unknown-session`) — `request_id_hex`
 ///   does not match any active stream registry entry.
 /// * `ContextError` — the runtime rejected the termination because the
@@ -794,21 +810,35 @@ pub fn py_outlet_stream_cancel(request_id_hex: &str, caller_did: &str) -> PyResu
 pub fn py_outlet_stream_terminate(
     request_id_hex: &str,
     caller_did: &str,
-    slug: &str,
-    code: &str,
+    reason: &str,
     message: &str,
 ) -> PyResult<()> {
+    use scp_protocol::context::outlets::stream::TerminateReason;
     validate::validate_did(caller_did)?;
+    let reason_variant =
+        TerminateReason::from_slug(reason).ok_or_else(|| ScpPyError::ValidationError {
+            message: format!(
+                "unknown TerminateReason slug {reason:?}; expected one of \
+                 'authorization.revoked-mid-stream', 'execution.cancel-ack-timeout', \
+                 'execution.credit-stall' (§5.4.4 closed set)"
+            ),
+            code: scp_protocol::context::outlets::error_codes::CODE_INPUT_VIOLATION.to_owned(),
+        })?;
+    let message_override = if message.is_empty() {
+        None
+    } else {
+        Some(message.to_owned())
+    };
     let entry = lookup_entry_authenticated(request_id_hex, caller_did)?;
     let handle_guard = entry
         .handle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     handle_guard
-        .terminate_with_error(slug, code, message)
+        .terminate_with_error(reason_variant, message_override)
         .map_err(|err| ScpPyError::ContextError {
             message: format!("terminate rejected: {err}"),
-            code: code.to_owned(),
+            code: reason_variant.code().to_owned(),
         })?;
     Ok(())
 }

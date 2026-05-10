@@ -17,6 +17,7 @@ import type {
   BridgeOutletInvocationStream,
   BridgeTransportHandle,
   MessageCallback,
+  TerminateReasonSlug,
 } from "../src/internal/bridge";
 import type {
   BroadcastAdmissionPolicy,
@@ -668,9 +669,8 @@ export function createMockBridge(): Bridge & {
     async outletStreamTerminate(
       _requestIdHex: string,
       _callerDid: string,
-      _slug: string,
-      _code: string,
-      _message: string,
+      _reason: TerminateReasonSlug,
+      _messageOverride: string | null,
     ): Promise<void> {
       throw new Error(
         "[SCP-TOOL-6020] streaming outlet invocation is not implemented in the mock bridge",

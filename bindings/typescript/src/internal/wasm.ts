@@ -42,7 +42,37 @@ import type {
   BridgeOutletStreamChunk,
   BridgeTransportHandle,
   MessageCallback,
+  TerminateReasonSlug,
 } from "./bridge";
+
+/**
+ * Wire-stable `u32` codes the WASM `outletStreamTerminate` bridge
+ * accepts. Mirrors the `TERMINATE_REASON_*` constants exported by
+ * `crates/scp-ffi/wasm/src/outlet_stream.rs`. Allocation is
+ * monotonically-increasing — a retired code MUST NOT be reused.
+ */
+const WASM_TERMINATE_REASON_REVOKED_MID_STREAM = 0;
+const WASM_TERMINATE_REASON_CANCEL_ACK_TIMEOUT = 1;
+const WASM_TERMINATE_REASON_CREDIT_STALL = 2;
+
+function wasmTerminateReasonCode(reason: TerminateReasonSlug): number {
+  switch (reason) {
+    case "authorization.revoked-mid-stream":
+      return WASM_TERMINATE_REASON_REVOKED_MID_STREAM;
+    case "execution.cancel-ack-timeout":
+      return WASM_TERMINATE_REASON_CANCEL_ACK_TIMEOUT;
+    case "execution.credit-stall":
+      return WASM_TERMINATE_REASON_CREDIT_STALL;
+    default: {
+      // Exhaustiveness: TypeScript's never-type narrowing catches a
+      // missing arm at compile time. Surface-level guard here in
+      // case a runtime caller bypasses the type system.
+      const exhaustive: never = reason;
+      throw new Error(`unknown TerminateReasonSlug: ${String(exhaustive)} (closed set: §5.4.4)`);
+    }
+  }
+}
+
 import { safeJsonParse } from "./json-utils";
 
 // ---------------------------------------------------------------------------
@@ -181,9 +211,8 @@ interface WasmModule {
   outletStreamTerminate: (
     requestIdHex: string,
     callerDid: string,
-    slug: string,
-    code: string,
-    message: string,
+    reason: number,
+    messageOverride: string | null | undefined,
   ) => Promise<void>;
   verifyChunkSignature: (
     chunkJson: string,
@@ -1548,12 +1577,18 @@ export function createWasmBridge(): Bridge {
     async outletStreamTerminate(
       requestIdHex: string,
       callerDid: string,
-      slug: string,
-      code: string,
-      message: string,
+      reason: TerminateReasonSlug,
+      messageOverride: string | null,
     ): Promise<void> {
+      // WASM bridge accepts a wire-stable u32 code (the slug
+      // strings are matched here on the JS side so the unified
+      // `Bridge` interface presents the canonical slug union to
+      // SDK callers regardless of backend). Codes are wire-stable
+      // (see `TERMINATE_REASON_*` constants in
+      // `crates/scp-ffi/wasm/src/outlet_stream.rs`).
+      const reasonCode = wasmTerminateReasonCode(reason);
       const wasm = getWasm();
-      await wasm.outletStreamTerminate(requestIdHex, callerDid, slug, code, message);
+      await wasm.outletStreamTerminate(requestIdHex, callerDid, reasonCode, messageOverride);
     },
 
     async verifyChunkSignature(

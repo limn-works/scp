@@ -39,6 +39,7 @@ import uniffi.scp.ContextHandle
 import uniffi.scp.Identity
 import uniffi.scp.OutletStreamHandle
 import uniffi.scp.OutletStreamSubscriber
+import uniffi.scp.TerminateReason
 import uniffi.scp.computeCaveatsBinding as ffiComputeCaveatsBinding
 import uniffi.scp.outletInvokeStream as ffiOutletInvokeStream
 import uniffi.scp.outletInvokeStreamWithSubscriber as ffiOutletInvokeStreamWithSubscriber
@@ -285,21 +286,24 @@ class OutletStreamFlow internal constructor(
 
     /**
      * Forces a terminal `Error{terminal:true}` chunk into this stream
-     * (§5.4.5 receiver-side revocation re-check, `RevokedMidStream` /
-     * `SCP-TOOL-6110`).
+     * (§5.4.5 framework-initiated stream termination).
      *
-     * Called by the SDK framework's periodic UCAN re-check loop when
-     * it observes the opening UCAN has been revoked since stream
-     * open. The runtime emits a synthetic terminal Error chunk under
-     * the pinned operator key.
+     * Called by the SDK framework's periodic UCAN re-check loop with
+     * [TerminateReason.RevokedMidStream] when it observes the opening
+     * UCAN has been revoked since stream open. The runtime emits a
+     * synthetic terminal Error chunk under the pinned operator key.
+     *
+     * @param reason Closed-set termination cause — the bridge derives
+     *   the canonical §5.4.4 slug + code from this value.
+     * @param messageOverride Optional human-readable suffix; `null`
+     *   uses the spec's canonical default message for the variant.
      */
-    suspend fun terminate(slug: String, code: String, message: String) {
+    suspend fun terminate(reason: TerminateReason, messageOverride: String?) {
         ffiOutletStreamTerminate(
             requestIdHex = requestIdHex,
             callerDid = invokerDid,
-            slug = slug,
-            code = code,
-            message = message,
+            reason = reason,
+            messageOverride = messageOverride,
         )
     }
 }
@@ -520,16 +524,14 @@ object OutletStreaming {
     suspend fun terminate(
         requestIdHex: String,
         callerDid: String,
-        slug: String,
-        code: String,
-        message: String,
+        reason: TerminateReason,
+        messageOverride: String?,
     ) {
         ffiOutletStreamTerminate(
             requestIdHex = requestIdHex,
             callerDid = callerDid,
-            slug = slug,
-            code = code,
-            message = message,
+            reason = reason,
+            messageOverride = messageOverride,
         )
     }
 }
@@ -576,15 +578,13 @@ internal suspend fun outletStreamCancel(
 internal suspend fun outletStreamTerminate(
     requestIdHex: String,
     callerDid: String,
-    slug: String,
-    code: String,
-    message: String,
+    reason: TerminateReason,
+    messageOverride: String?,
 ) {
     ffiOutletStreamTerminate(
         requestIdHex = requestIdHex,
         callerDid = callerDid,
-        slug = slug,
-        code = code,
-        message = message,
+        reason = reason,
+        messageOverride = messageOverride,
     )
 }
