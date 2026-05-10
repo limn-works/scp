@@ -211,6 +211,11 @@ data class OutletStreamChunkData(
 )
 class OutletStreamFlow internal constructor(
     private val handle: OutletStreamHandle,
+    /**
+     * Pinned invoker DID — required by the bridge's CRITICAL #1
+     * caller-authentication gate on every control-plane call.
+     */
+    private val invokerDid: String,
 ) {
     /** 32-char lowercase hex `request_id`. */
     val requestIdHex: String
@@ -260,17 +265,23 @@ class OutletStreamFlow internal constructor(
      *   the grant or the stream has already terminated.
      */
     suspend fun grantCredit(grant: Credit): UInt =
-        ffiOutletStreamGrantCredit(requestIdHex = requestIdHex, grant = grant.raw)
+        ffiOutletStreamGrantCredit(
+            requestIdHex = requestIdHex,
+            callerDid = invokerDid,
+            grant = grant.raw,
+        )
 
     /**
      * Applies an `OutletCancel` to this stream.
+     *
+     * CRITICAL #3 — `next_seq` is no longer accepted; the bridge
+     * derives the canonical next-emission cursor from runtime state.
      *
      * @return Recorded cancel-ack sequence number, or `null` when the
      *   stream had already reached a terminal chunk (idempotent per
      *   §5.4.5).
      */
-    suspend fun cancel(nextSeq: ULong? = null): ULong? =
-        handle.cancel(nextSeq = nextSeq)
+    suspend fun cancel(): ULong? = handle.cancel(callerDid = invokerDid)
 
     /**
      * Forces a terminal `Error{terminal:true}` chunk into this stream
@@ -285,6 +296,7 @@ class OutletStreamFlow internal constructor(
     suspend fun terminate(slug: String, code: String, message: String) {
         ffiOutletStreamTerminate(
             requestIdHex = requestIdHex,
+            callerDid = invokerDid,
             slug = slug,
             code = code,
             message = message,
@@ -355,7 +367,7 @@ suspend fun openOutletStreamSession(
         creditWindow = creditWindow,
         estimatedChunkCount = estimatedChunkCount,
     )
-    return OutletStreamFlow(raw)
+    return OutletStreamFlow(raw, invokerDid = identity.did())
 }
 
 /**
@@ -469,24 +481,34 @@ object OutletStreaming {
      * @throws ScpException.Context when the runtime rejects the grant.
      */
     @JvmStatic
-    suspend fun grantCredit(requestIdHex: String, grant: Credit): UInt =
-        ffiOutletStreamGrantCredit(requestIdHex = requestIdHex, grant = grant.raw)
+    suspend fun grantCredit(requestIdHex: String, callerDid: String, grant: Credit): UInt =
+        ffiOutletStreamGrantCredit(
+            requestIdHex = requestIdHex,
+            callerDid = callerDid,
+            grant = grant.raw,
+        )
 
     /**
      * Applies an `OutletCancel` to an active stream by [requestIdHex].
+     *
+     * `callerDid` MUST match the pinned invoker DID at stream open.
+     * CRITICAL #3 — `next_seq` is no longer caller-supplied; the
+     * bridge derives the canonical next-emission cursor from runtime
+     * state.
      *
      * @return Recorded cancel-ack sequence, or `null` when the stream
      *   had already reached a terminal chunk.
      */
     @JvmStatic
-    suspend fun cancel(requestIdHex: String, nextSeq: ULong? = null): ULong? =
-        ffiOutletStreamCancel(requestIdHex = requestIdHex, nextSeq = nextSeq)
+    suspend fun cancel(requestIdHex: String, callerDid: String): ULong? =
+        ffiOutletStreamCancel(requestIdHex = requestIdHex, callerDid = callerDid)
 
     /**
      * Forces a terminal `Error{terminal:true}` chunk into an active
      * stream (§5.4.5 receiver-side revocation re-check,
      * `RevokedMidStream` / `SCP-TOOL-6110`).
      *
+     * `callerDid` MUST match the pinned invoker DID at stream open.
      * Called by the SDK framework's periodic UCAN re-check loop when
      * it observes the opening UCAN has been revoked since stream
      * open. The runtime emits a synthetic terminal Error chunk under
@@ -497,12 +519,14 @@ object OutletStreaming {
     @JvmStatic
     suspend fun terminate(
         requestIdHex: String,
+        callerDid: String,
         slug: String,
         code: String,
         message: String,
     ) {
         ffiOutletStreamTerminate(
             requestIdHex = requestIdHex,
+            callerDid = callerDid,
             slug = slug,
             code = code,
             message = message,
@@ -516,29 +540,49 @@ object OutletStreaming {
  * `Outlets.kt` (the `InvocationHandle.grantCredit` method) can call it
  * without importing from the generated `uniffi.scp` package.
  */
-internal suspend fun outletStreamGrantCredit(requestIdHex: String, grant: UInt): UInt =
-    ffiOutletStreamGrantCredit(requestIdHex = requestIdHex, grant = grant)
+internal suspend fun outletStreamGrantCredit(
+    requestIdHex: String,
+    callerDid: String,
+    grant: UInt,
+): UInt =
+    ffiOutletStreamGrantCredit(
+        requestIdHex = requestIdHex,
+        callerDid = callerDid,
+        grant = grant,
+    )
 
 /**
  * Module-internal alias for the UniFFI-generated `outletStreamCancel`.
+ *
+ * CRITICAL #3 — `next_seq` is no longer caller-supplied; the bridge
+ * derives the canonical next-emission cursor from runtime state.
  */
-internal suspend fun outletStreamCancel(requestIdHex: String, nextSeq: ULong? = null): ULong? =
-    ffiOutletStreamCancel(requestIdHex = requestIdHex, nextSeq = nextSeq)
+internal suspend fun outletStreamCancel(
+    requestIdHex: String,
+    callerDid: String,
+): ULong? =
+    ffiOutletStreamCancel(requestIdHex = requestIdHex, callerDid = callerDid)
 
 /**
  * Module-internal alias for the UniFFI-generated `outletStreamTerminate`
  * — exposed at the `works.limn.scp` package scope so SDK code can call
  * the §5.4.5 receiver-side revocation re-check terminate without
  * importing from the generated `uniffi.scp` package.
+ *
+ * CRITICAL #1 — `callerDid` MUST match the pinned invoker DID at
+ * stream open. The bridge rejects mismatched callers as
+ * `authorization.denied`.
  */
 internal suspend fun outletStreamTerminate(
     requestIdHex: String,
+    callerDid: String,
     slug: String,
     code: String,
     message: String,
 ) {
     ffiOutletStreamTerminate(
         requestIdHex = requestIdHex,
+        callerDid = callerDid,
         slug = slug,
         code = code,
         message = message,

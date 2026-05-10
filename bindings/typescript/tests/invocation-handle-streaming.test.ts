@@ -225,7 +225,7 @@ describe("Mid-stream control plane (OUT-038 AC15/AC16)", () => {
           sink.chunk(dataChunk(0, { x: 1 }));
         });
       },
-      { requestIdHex: "bb".repeat(16) },
+      { requestIdHex: "bb".repeat(16), invokerDid: "did:dht:z6MkInvoker" },
     );
     const it = handle[Symbol.asyncIterator]();
     const first = await it.next();
@@ -255,7 +255,7 @@ describe("Mid-stream control plane (OUT-038 AC15/AC16)", () => {
           sink.chunk(dataChunk(0, {}));
         });
       },
-      { requestIdHex: "cc".repeat(16) },
+      { requestIdHex: "cc".repeat(16), invokerDid: "did:dht:z6MkInvoker" },
     );
     const it = handle[Symbol.asyncIterator]();
     await it.next();
@@ -263,7 +263,10 @@ describe("Mid-stream control plane (OUT-038 AC15/AC16)", () => {
 
     let raised: unknown = null;
     try {
-      await handle.cancel(3);
+      // CRITICAL #3 — cancel no longer accepts caller-supplied next_seq;
+      // the bridge derives the canonical next-emission cursor from
+      // runtime state.
+      await handle.cancel();
     } catch (err) {
       raised = err;
     }
@@ -295,7 +298,7 @@ describe("Mid-stream control plane (OUT-038 AC15/AC16)", () => {
           sink.chunk(dataChunk(0, {}));
         }, 5);
       },
-      { requestIdPromise },
+      { requestIdPromise, invokerDid: "did:dht:z6MkInvoker" },
     );
     // Call grantCredit IMMEDIATELY — before the bridge open closure
     // has run. The fix: grantCredit awaits requestIdPromise rather

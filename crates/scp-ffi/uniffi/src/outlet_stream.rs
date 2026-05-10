@@ -103,6 +103,10 @@ pub(crate) struct StreamRegistryEntry {
     /// runtime tracker pins the corresponding verifying key at open;
     /// every grant signature must verify under that pinned key.
     pub invoker_signing_key: SigningKey,
+    /// Pinned invoker DID. The control-plane bridge functions
+    /// (`grant_credit`, `cancel`, `terminate`) verify `caller_did`
+    /// matches this before signing. CRITICAL #1 fix.
+    pub invoker_did: String,
     /// 16-byte `request_id` (the registry key in raw form) so the pump
     /// task and the close path can look up by either the hex string
     /// (registry key) or the typed wire form.
@@ -327,6 +331,11 @@ pub struct OutletStreamHandle {
     /// 16-byte `request_id` rendered as hex. Kept on the iterator so the
     /// SDK can surface it without re-decoding chunks.
     request_id_hex: String,
+    /// Pinned invoker DID at open. The convenience wrappers
+    /// ([`Self::cancel`], [`Self::terminate`]) thread this through to
+    /// the standalone control-plane functions as `caller_did` so the
+    /// CRITICAL #1 caller-authentication check has a value to match.
+    invoker_did: String,
     /// `true` after the pump observed a terminal chunk and the iterator
     /// must stop. Survives the receiver being dropped.
     terminated: Arc<std::sync::atomic::AtomicBool>,
@@ -418,9 +427,11 @@ impl OutletStreamHandle {
     /// or `None` when the stream had already reached a terminal chunk
     /// (the runtime ignores the cancel per §5.4.5 idempotency).
     ///
-    /// `next_seq` is the receiver's view of the next-to-emit chunk
-    /// sequence. Defaults to `0` when the SDK has not yet observed any
-    /// chunks.
+    /// The bridge derives the canonical `next_seq` from the runtime's
+    /// current emission cursor — never accepts caller input. CRITICAL
+    /// #3 fix: a caller-supplied `next_seq` lets the caller forge
+    /// `cancel_ack_seq` (zero to nullify billing of delivered chunks,
+    /// or `u64::MAX` to over-bill).
     ///
     /// # Errors
     ///
@@ -428,8 +439,8 @@ impl OutletStreamHandle {
     /// when the stream has already been evicted from the registry
     /// (terminal chunk observed by another caller, bridge shutdown,
     /// double-cancel after the first cancel completed).
-    pub async fn cancel(&self, next_seq: Option<u64>) -> Result<Option<u64>, ScpError> {
-        outlet_stream_cancel(self.request_id_hex.clone(), next_seq).await
+    pub async fn cancel(&self) -> Result<Option<u64>, ScpError> {
+        outlet_stream_cancel(self.request_id_hex.clone(), self.invoker_did.clone()).await
     }
 
     /// Forces a terminal `Error{terminal:true}` chunk into this stream
@@ -455,7 +466,14 @@ impl OutletStreamHandle {
         code: String,
         message: String,
     ) -> Result<(), ScpError> {
-        outlet_stream_terminate(self.request_id_hex.clone(), slug, code, message).await
+        outlet_stream_terminate(
+            self.request_id_hex.clone(),
+            self.invoker_did.clone(),
+            slug,
+            code,
+            message,
+        )
+        .await
     }
 }
 
@@ -774,9 +792,15 @@ async fn open_stream_internal(
         invoker_pk,
         Arc::clone(&signing_key_arc),
     );
-    let admission = Arc::new(std::sync::Mutex::new(
-        scp_runtime::context::outlets::stream::StreamAdmissionTracker::new(),
-    ));
+    // §5.4.5 admission tracker MUST persist across successive opens
+    // within a single context — fetch (or lazily create) the per-context
+    // tracker on the bridge instance so the caps actually trip.
+    let admission = runtime::default_bridge_instance_raw()
+        .ok_or_else(|| ScpError::Context {
+            msg: "bridge instance not initialised".to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        })?
+        .outlet_stream_admission_for_context(&handle.context_id);
 
     let invoker_did_typed: scp_primitives::DID = identity.did.clone().into();
     let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id);
@@ -822,12 +846,14 @@ async fn open_stream_internal(
         stream_epoch,
         caveats_binding,
         invoker_signing_key: signing_key,
+        invoker_did: identity.did.clone(),
         request_id,
     })?;
 
     Ok(OutletStreamHandle {
         rx: Arc::new(TokioMutex::new(Some(receiver))),
         request_id_hex: request_id_hex_str,
+        invoker_did: identity.did.clone(),
         terminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
@@ -920,6 +946,7 @@ fn register_stream_entry(entry: StreamRegistryEntry) -> Result<(), ScpError> {
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn outlet_stream_grant_credit(
     request_id_hex: String,
+    caller_did: String,
     grant: u32,
 ) -> Result<u32, ScpError> {
     if grant == 0 {
@@ -928,7 +955,8 @@ pub async fn outlet_stream_grant_credit(
             code: scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION.to_owned(),
         });
     }
-    let entry = lookup_entry(&request_id_hex)?;
+    scp_ffi_common::validate::validate_did(&caller_did).map_err(ScpError::from)?;
+    let entry = lookup_entry_authenticated(&request_id_hex, &caller_did)?;
 
     // Reserve the next monotonic_seq under a critical section so two
     // racing grant calls cannot collide. Bumping the counter BEFORE
@@ -1013,10 +1041,20 @@ fn sign_credit_grant(
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn outlet_stream_cancel(
     request_id_hex: String,
-    next_seq: Option<u64>,
+    caller_did: String,
 ) -> Result<Option<u64>, ScpError> {
-    let entry = lookup_entry(&request_id_hex)?;
-    let cancel = sign_cancel_for_entry(&entry, next_seq.unwrap_or(0));
+    scp_ffi_common::validate::validate_did(&caller_did).map_err(ScpError::from)?;
+    let entry = lookup_entry_authenticated(&request_id_hex, &caller_did)?;
+    // §5.4.5 next-emission cursor MUST come from runtime state, not
+    // caller input. CRITICAL #3 fix.
+    let next_seq_u64 = {
+        let handle_guard = entry
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handle_guard.current_next_emission_seq()
+    };
+    let cancel = sign_cancel_for_entry(&entry, next_seq_u64);
     let handle_guard = entry
         .handle
         .lock()
@@ -1092,11 +1130,13 @@ fn sign_cancel_for_entry(
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn outlet_stream_terminate(
     request_id_hex: String,
+    caller_did: String,
     slug: String,
     code: String,
     message: String,
 ) -> Result<(), ScpError> {
-    let entry = lookup_entry(&request_id_hex)?;
+    scp_ffi_common::validate::validate_did(&caller_did).map_err(ScpError::from)?;
+    let entry = lookup_entry_authenticated(&request_id_hex, &caller_did)?;
     let handle_guard = entry
         .handle
         .lock()
@@ -1280,6 +1320,28 @@ fn lookup_entry(request_id_hex: &str) -> Result<Arc<StreamRegistryEntry>, ScpErr
             ),
             code: scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION.to_owned(),
         })
+}
+
+/// Looks up the stream entry and verifies `caller_did` matches the
+/// pinned `invoker_did`. CRITICAL #1 fix — without this gate, any
+/// in-process code with a `request_id_hex` could drain credit, cancel,
+/// or terminate any concurrent stream because the bridge wields the
+/// invoker's signing key.
+fn lookup_entry_authenticated(
+    request_id_hex: &str,
+    caller_did: &str,
+) -> Result<Arc<StreamRegistryEntry>, ScpError> {
+    let entry = lookup_entry(request_id_hex)?;
+    if entry.invoker_did != caller_did {
+        return Err(ScpError::Context {
+            msg: format!(
+                "caller {caller_did} is not the pinned invoker for stream '{request_id_hex}' \
+                 (authorization.denied)"
+            ),
+            code: codes::PERM_3001.to_owned(),
+        });
+    }
+    Ok(entry)
 }
 
 /// Resolves the invoker's Ed25519 signing key from either the context
@@ -1624,7 +1686,8 @@ mod tests {
     /// rule.
     #[tokio::test]
     async fn grant_credit_rejects_zero_grant() {
-        let result = outlet_stream_grant_credit("00".repeat(16), 0).await;
+        let result =
+            outlet_stream_grant_credit("00".repeat(16), "did:dht:z6MkInvoker".to_owned(), 0).await;
         assert!(result.is_err(), "grant=0 must be rejected");
         let err_str = format!("{:?}", result.unwrap_err());
         assert!(
@@ -1640,7 +1703,7 @@ mod tests {
         // Use a fresh hex unlikely to match any other test's active
         // stream (registry is shared across tests in the default bridge
         // instance — see ADR-048).
-        let result = outlet_stream_cancel("ee".repeat(16), Some(0)).await;
+        let result = outlet_stream_cancel("ee".repeat(16), "did:dht:z6MkInvoker".to_owned()).await;
         assert!(result.is_err(), "missing request_id must be rejected");
         let err_str = format!("{:?}", result.unwrap_err());
         assert!(

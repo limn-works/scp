@@ -533,11 +533,16 @@ class InvocationHandle:
         chunks: asyncio.Queue[OutletStreamChunk | BaseException | None],
         *,
         request_id: str | None = None,
+        invoker_did: str | None = None,
         aggregate_schema: dict[str, Any] | None = None,
     ) -> None:
         self._chunks = chunks
         self._consumed: str | None = None
         self._request_id = request_id
+        # CRITICAL #1 fix — pinned invoker DID, threaded through to
+        # every control-plane bridge call as ``caller_did`` so the
+        # bridge can verify against its registry's pinned identity.
+        self._invoker_did = invoker_did
         self._aggregate_schema = aggregate_schema
         # Terminal-chunk observed: set once an End / Error{terminal:true}
         # chunk passes through the iterator or the aggregate await path.
@@ -701,24 +706,30 @@ class InvocationHandle:
                 "grant_credit rejected: handle was opened without a streaming session "
                 "(degenerate single-shot invoke; the End chunk arrived synchronously)",
             )
+        if self._invoker_did is None:
+            raise StreamAlreadyClosed(
+                "grant_credit rejected: handle has no pinned invoker DID "
+                "(degenerate single-shot invoke); cancel/grant requires the "
+                "streaming bridge to authenticate the caller",
+            )
         bridge = _require_bridge()
         try:
             return await asyncio.to_thread(
                 bridge.outlet_stream_grant_credit,
                 self._request_id,
+                self._invoker_did,
                 grant.raw,
             )
         except Exception as exc:
             raise _translate_bridge_error(exc) from exc
 
-    async def cancel(self, next_seq: int | None = None) -> int | None:
+    async def cancel(self) -> int | None:
         """Cancel an active stream (§5.4.5 cancellation + billing boundary).
 
-        ``next_seq`` is the receiver's view of the next-to-emit
-        sequence — passed verbatim to the runtime's
-        ``apply_outlet_cancel`` so the framework can record
-        ``cancel_ack_seq`` per §5.4.5. Defaults to ``None`` (the
-        runtime records its own current emission cursor).
+        The bridge derives the canonical ``next_seq`` from the runtime's
+        current emission cursor — never accepts caller input.
+        CRITICAL #3 fix: a caller-supplied ``next_seq`` lets the caller
+        forge ``cancel_ack_seq``.
 
         Raises :class:`StreamAlreadyClosed` (OUT-038 AC13) when the
         stream has already terminated.
@@ -737,12 +748,17 @@ class InvocationHandle:
                 "cancel rejected: handle was opened without a streaming session "
                 "(degenerate single-shot invoke; the End chunk arrived synchronously)",
             )
+        if self._invoker_did is None:
+            raise StreamAlreadyClosed(
+                "cancel rejected: handle has no pinned invoker DID — bridge "
+                "caller authentication unavailable",
+            )
         bridge = _require_bridge()
         try:
             return await asyncio.to_thread(
                 bridge.outlet_stream_cancel,
                 self._request_id,
-                next_seq,
+                self._invoker_did,
             )
         except Exception as exc:
             raise _translate_bridge_error(exc) from exc
@@ -1411,6 +1427,7 @@ class OutletNamespace:
         handle = InvocationHandle(
             q,
             request_id=request_id_hex,
+            invoker_did=invoker_did,
             aggregate_schema=aggregate_schema,
         )
         handle._pump_task = loop.create_task(_pump())  # type: ignore[attr-defined]
@@ -1467,6 +1484,7 @@ class OutletNamespace:
                             await asyncio.to_thread(
                                 bridge.outlet_stream_terminate,
                                 request_id_hex,
+                                invoker_did,
                                 "authorization.revoked-mid-stream",
                                 "SCP-TOOL-6110",
                                 str(exc),

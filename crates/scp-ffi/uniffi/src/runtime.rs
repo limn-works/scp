@@ -250,6 +250,15 @@ pub struct UniffiBridgeInstance {
     /// grant-credit paths cannot reach a stale handle past shutdown.
     pub(crate) outlet_stream_registry:
         Arc<DashMap<String, Arc<crate::outlet_stream::StreamRegistryEntry>>>,
+    /// SCP-OUT-037 — per-context streaming admission tracker. CRITICAL #4 fix:
+    /// the prior implementation constructed a fresh tracker per
+    /// `open_outlet_stream` call so the §5.4.5 caps never tripped.
+    pub(crate) outlet_stream_admission: Arc<
+        DashMap<
+            String,
+            Arc<std::sync::Mutex<scp_runtime::context::outlets::stream::StreamAdmissionTracker>>,
+        >,
+    >,
 }
 
 impl UniffiBridgeInstance {
@@ -274,6 +283,7 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_stream_admission: Arc::new(DashMap::new()),
         }
     }
 
@@ -301,6 +311,7 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_stream_admission: Arc::new(DashMap::new()),
         }
     }
 
@@ -406,6 +417,7 @@ impl UniffiBridgeInstance {
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             outlet_stream_registry: Arc::new(DashMap::new()),
+            outlet_stream_admission: Arc::new(DashMap::new()),
         }
     }
 
@@ -499,6 +511,23 @@ impl UniffiBridgeInstance {
     ) -> &Arc<DashMap<String, Arc<crate::outlet_stream::StreamRegistryEntry>>> {
         &self.outlet_stream_registry
     }
+
+    /// Returns the per-context `StreamAdmissionTracker`, creating it
+    /// lazily on first call. CRITICAL #4 fix.
+    pub(crate) fn outlet_stream_admission_for_context(
+        &self,
+        context_id: &str,
+    ) -> Arc<std::sync::Mutex<scp_runtime::context::outlets::stream::StreamAdmissionTracker>> {
+        let entry = self
+            .outlet_stream_admission
+            .entry(context_id.to_owned())
+            .or_insert_with(|| {
+                Arc::new(std::sync::Mutex::new(
+                    scp_runtime::context::outlets::stream::StreamAdmissionTracker::default(),
+                ))
+            });
+        Arc::clone(entry.value())
+    }
 }
 
 #[async_trait]
@@ -558,6 +587,8 @@ impl BridgeInstanceCore for UniffiBridgeInstance {
         // grant-credit paths cannot reach a stale handle past
         // shutdown. Mirrors the PyO3 / NAPI bridges (SCP-OUT-037).
         self.outlet_stream_registry.clear();
+        // Drop the per-context admission tracker registry.
+        self.outlet_stream_admission.clear();
     }
 }
 

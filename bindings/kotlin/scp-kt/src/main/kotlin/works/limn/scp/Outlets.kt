@@ -395,6 +395,12 @@ class InvocationHandle internal constructor(
     private val aggregateFn: suspend () -> Aggregate,
     private val flowFn: () -> Flow<OutletStreamChunk>,
     private val requestIdHex: String? = null,
+    /**
+     * Pinned invoker DID. Threaded through to every control-plane
+     * bridge call as `callerDid` so the bridge can verify against
+     * its registry's pinned identity. CRITICAL #1 fix.
+     */
+    private val invokerDid: String? = null,
     private val aggregateSchemaJson: String? = null,
 ) {
     private val terminatedFlag = java.util.concurrent.atomic.AtomicBoolean(false)
@@ -481,21 +487,15 @@ class InvocationHandle internal constructor(
      *   emitted a terminal chunk.
      */
     suspend fun grantCredit(grant: Credit): UInt {
-        if (terminatedFlag.get()) {
-            throw StreamAlreadyClosed(
-                "grantCredit rejected: stream has already emitted a terminal chunk",
-            )
-        }
-        val rid = requestIdHex
-            ?: throw StreamAlreadyClosed(
-                "grantCredit rejected: handle was opened without a streaming session " +
-                    "(degenerate single-shot invoke; the End chunk arrived synchronously)",
-            )
-        return outletStreamGrantCredit(requestIdHex = rid, grant = grant.raw)
+        val (rid, did) = preflightControlPlane("grantCredit")
+        return outletStreamGrantCredit(requestIdHex = rid, callerDid = did, grant = grant.raw)
     }
 
     /**
      * SCP-OUT-038 AC9 — cancels the active stream (§5.4.5 cancel-ack).
+     *
+     * CRITICAL #3 — `next_seq` is no longer accepted; the bridge
+     * derives the canonical next-emission cursor from runtime state.
      *
      * @return Recorded cancel-ack sequence, or `null` when the stream
      *   had already reached a terminal chunk at the moment the cancel
@@ -503,18 +503,41 @@ class InvocationHandle internal constructor(
      * @throws StreamAlreadyClosed (AC13) when the stream has already
      *   emitted a terminal chunk.
      */
-    suspend fun cancel(nextSeq: ULong? = null): ULong? {
+    suspend fun cancel(): ULong? {
+        val (rid, did) = preflightControlPlane("cancel")
+        return outletStreamCancel(requestIdHex = rid, callerDid = did)
+    }
+
+    /**
+     * Shared preflight for [grantCredit] and [cancel]. Verifies the
+     * stream is still active, the registry holds a `request_id` for
+     * this handle, and the pinned `invoker_did` is set; throws
+     * [StreamAlreadyClosed] otherwise. Returning a `(rid, did)` pair
+     * keeps each call site below the detekt `ThrowsCount` ceiling
+     * without sacrificing the three discrete guards.
+     */
+    @Suppress("ThrowsCount") // three discrete guards: terminated, request id present, invoker did present
+    private fun preflightControlPlane(verb: String): Pair<String, String> {
         if (terminatedFlag.get()) {
             throw StreamAlreadyClosed(
-                "cancel rejected: stream has already emitted a terminal chunk",
+                "$verb rejected: stream has already emitted a terminal chunk",
             )
         }
         val rid = requestIdHex
-            ?: throw StreamAlreadyClosed(
-                "cancel rejected: handle was opened without a streaming session " +
+        val did = invokerDid
+        if (rid == null) {
+            throw StreamAlreadyClosed(
+                "$verb rejected: handle was opened without a streaming session " +
                     "(degenerate single-shot invoke; the End chunk arrived synchronously)",
             )
-        return outletStreamCancel(requestIdHex = rid, nextSeq = nextSeq)
+        }
+        if (did == null) {
+            throw StreamAlreadyClosed(
+                "$verb rejected: handle has no pinned invoker DID — bridge " +
+                    "caller authentication unavailable",
+            )
+        }
+        return rid to did
     }
 
     /**

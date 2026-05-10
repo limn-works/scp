@@ -455,10 +455,15 @@ pub fn outlet_invoke_stream(
 /// * `SCP-TOOL-6101` — `request_id_hex` does not match any active
 ///   stream registry entry (`protocol.unknown-session`).
 #[wasm_bindgen(js_name = "outletStreamGrantCredit")]
-pub fn outlet_stream_grant_credit(request_id_hex: String, grant: u32) -> Promise {
+pub fn outlet_stream_grant_credit(
+    request_id_hex: String,
+    caller_did: String,
+    grant: u32,
+) -> Promise {
     future_to_promise(async move {
-        let total = with_manager(|mgr| mgr.outlet_stream_grant_credit(&request_id_hex, grant))
-            .map_err(ScpWasmError::into_js)?;
+        let total =
+            with_manager(|mgr| mgr.outlet_stream_grant_credit(&request_id_hex, &caller_did, grant))
+                .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::from_f64(f64::from(total)))
     })
 }
@@ -480,13 +485,9 @@ pub fn outlet_stream_grant_credit(request_id_hex: String, grant: u32) -> Promise
 /// * `SCP-TOOL-6101` — `request_id_hex` does not match any active
 ///   stream registry entry.
 #[wasm_bindgen(js_name = "outletStreamCancel")]
-pub fn outlet_stream_cancel(request_id_hex: String, next_seq: Option<f64>) -> Promise {
+pub fn outlet_stream_cancel(request_id_hex: String, caller_did: String) -> Promise {
     future_to_promise(async move {
-        let next_seq_u64 = match next_seq {
-            Some(v) => validate_stream_epoch(v)?,
-            None => 0u64,
-        };
-        let recorded = with_manager(|mgr| mgr.outlet_stream_cancel(&request_id_hex, next_seq_u64))
+        let recorded = with_manager(|mgr| mgr.outlet_stream_cancel(&request_id_hex, &caller_did))
             .map_err(ScpWasmError::into_js)?;
         Ok(recorded.map_or(JsValue::NULL, |seq| {
             #[allow(clippy::cast_precision_loss)]
@@ -525,13 +526,16 @@ pub fn outlet_stream_cancel(request_id_hex: String, next_seq: Option<f64>) -> Pr
 #[wasm_bindgen(js_name = "outletStreamTerminate")]
 pub fn outlet_stream_terminate(
     request_id_hex: String,
+    caller_did: String,
     slug: String,
     code: String,
     message: String,
 ) -> Promise {
     future_to_promise(async move {
-        with_manager(|mgr| mgr.outlet_stream_terminate(&request_id_hex, &slug, &code, &message))
-            .map_err(ScpWasmError::into_js)?;
+        with_manager(|mgr| {
+            mgr.outlet_stream_terminate(&request_id_hex, &caller_did, &slug, &code, &message)
+        })
+        .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::UNDEFINED)
     })
 }

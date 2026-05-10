@@ -837,6 +837,93 @@ pub(crate) struct WasmOutletStreamSession {
     /// running executor, so credit exhaustion closes the stream
     /// instead of stalling.
     pub remaining_credit: u32,
+    /// Pinned invoker DID. The control-plane bridge functions
+    /// (`outlet_stream_grant_credit`, `outlet_stream_cancel`,
+    /// `outlet_stream_terminate`) verify `caller_did` matches this
+    /// before any state mutation. CRITICAL #1 fix.
+    pub invoker_did: String,
+    /// Count of chunks already popped from `chunks` and delivered to the
+    /// JS side (the next-to-emit cursor). Bumped by `outlet_stream_next`
+    /// every time it pops the head and returns it. Used as the
+    /// runtime-derived `next_seq` value when the bridge constructs an
+    /// `OutletStreamCancel` — caller-supplied `next_seq` is rejected.
+    /// CRITICAL #3 fix.
+    pub emitted_count: u64,
+}
+
+/// WASM-local mirror of
+/// `scp_runtime::context::outlets::stream::StreamAdmissionTracker` —
+/// the runtime crate cannot compile to wasm32 (tokio multi-thread per
+/// ADR-034), so the tracker structure is re-implemented locally with
+/// the same three-cap shape per §5.4.5.
+///
+/// Caps the runtime exposes via `ContextParams`:
+/// - `max_concurrent_inbound_streams_per_invoker` (default 8)
+/// - `max_concurrent_inbound_streams_per_origin_invoker` (default 16)
+/// - `max_concurrent_inbound_streams_per_outlet` (default 128)
+#[derive(Debug, Default)]
+// All three counters share the `per_` prefix because the §5.4.5 spec
+// names them that way (per_invoker / per_origin_invoker / per_outlet);
+// renaming would diverge from `scp_runtime::context::outlets::stream::StreamAdmissionTracker`.
+#[allow(clippy::struct_field_names)]
+pub(crate) struct WasmStreamAdmissionTracker {
+    pub per_invoker: HashMap<String, u32>,
+    pub per_origin_invoker: HashMap<String, u32>,
+    pub per_outlet: HashMap<String, u32>,
+}
+
+impl WasmStreamAdmissionTracker {
+    /// Returns `Ok(())` if all three caps would allow one more open
+    /// for `(invoker_did, origin_invoker_did, outlet_id)`, otherwise
+    /// returns the §5.4.4 transport slug for the breaching cap.
+    /// On `Ok`, increments all three counters atomically.
+    pub fn try_admit(
+        &mut self,
+        invoker_did: &str,
+        origin_invoker_did: &str,
+        outlet_id: &str,
+        per_invoker_cap: u32,
+        per_origin_invoker_cap: u32,
+        per_outlet_cap: u32,
+    ) -> Result<(), &'static str> {
+        let invoker_count = *self.per_invoker.get(invoker_did).unwrap_or(&0);
+        if invoker_count >= per_invoker_cap {
+            return Err("transport.concurrent-streams-per-invoker");
+        }
+        let origin_count = *self
+            .per_origin_invoker
+            .get(origin_invoker_did)
+            .unwrap_or(&0);
+        if origin_count >= per_origin_invoker_cap {
+            return Err("transport.concurrent-streams-per-origin-invoker");
+        }
+        let outlet_count = *self.per_outlet.get(outlet_id).unwrap_or(&0);
+        if outlet_count >= per_outlet_cap {
+            return Err("transport.concurrent-streams-per-outlet");
+        }
+        *self.per_invoker.entry(invoker_did.to_owned()).or_insert(0) += 1;
+        *self
+            .per_origin_invoker
+            .entry(origin_invoker_did.to_owned())
+            .or_insert(0) += 1;
+        *self.per_outlet.entry(outlet_id.to_owned()).or_insert(0) += 1;
+        Ok(())
+    }
+
+    /// Releases one slot from each of the three counters.
+    /// Saturating-subtracts so a release that races a missing key is
+    /// idempotent.
+    pub fn release(&mut self, invoker_did: &str, origin_invoker_did: &str, outlet_id: &str) {
+        if let Some(c) = self.per_invoker.get_mut(invoker_did) {
+            *c = c.saturating_sub(1);
+        }
+        if let Some(c) = self.per_origin_invoker.get_mut(origin_invoker_did) {
+            *c = c.saturating_sub(1);
+        }
+        if let Some(c) = self.per_outlet.get_mut(outlet_id) {
+            *c = c.saturating_sub(1);
+        }
+    }
 }
 
 /// Parameters for [`WasmContextManager::open_outlet_stream`] (SCP-OUT-037
@@ -981,6 +1068,20 @@ pub struct WasmContextManager {
     /// `PyBridgeInstance` / `NapiBridgeInstance` /
     /// `UniffiBridgeInstance`.
     pub(crate) outlet_streams: HashMap<String, WasmOutletStreamSession>,
+    /// Per-context streaming admission tracker (§5.4.5 concurrent-stream
+    /// caps). CRITICAL #4 fix — without persisting this across opens,
+    /// the per-invoker / per-origin-invoker / per-outlet caps are
+    /// vacuous (every fresh tracker resets to zero). Keyed by
+    /// `context_id`. Lives on the manager because the
+    /// `WasmContextManager` is the bridge instance on the WASM target
+    /// (single-threaded, `thread_local!`).
+    ///
+    /// Re-implemented WASM-locally (ADR-034 — `scp-runtime` cannot
+    /// compile to wasm32). The shape mirrors
+    /// `scp_runtime::context::outlets::stream::StreamAdmissionTracker`:
+    /// three maps tracking concurrent counts per
+    /// (`invoker_did`, `origin_invoker_did`, `outlet_id`).
+    pub(crate) outlet_stream_admission: HashMap<String, WasmStreamAdmissionTracker>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1426,6 +1527,23 @@ impl WasmContextManager {
             contexts: HashMap::new(),
             pending_key_packages: HashMap::new(),
             outlet_streams: HashMap::new(),
+            outlet_stream_admission: HashMap::new(),
+        }
+    }
+
+    /// Releases one slot from the per-context admission tracker.
+    /// Called from every session-eviction site — `outlet_stream_next`
+    /// (queue drained or terminal observed), `outlet_stream_cancel`,
+    /// `outlet_stream_terminate`. Idempotent: a missing context entry
+    /// or zeroed counter is treated as a no-op.
+    pub(crate) fn release_admission_slot(
+        &mut self,
+        context_id: &str,
+        invoker_did: &str,
+        outlet_id: &str,
+    ) {
+        if let Some(tracker) = self.outlet_stream_admission.get_mut(context_id) {
+            tracker.release(invoker_did, invoker_did, outlet_id);
         }
     }
 
@@ -2441,6 +2559,7 @@ impl WasmContextManager {
     /// The session's 32-char lowercase hex `request_id` — the SDK uses
     /// this to address the stream from `outlet_stream_grant_credit`
     /// and `outlet_stream_cancel`.
+    #[allow(clippy::too_many_lines)] // CRITICAL #4 admission gate adds ~30 lines; refactoring out a helper would obscure the gate ordering relative to require_active_context_mut + handler dispatch.
     pub fn open_outlet_stream(
         &mut self,
         params: OpenOutletStreamParams<'_>,
@@ -2457,6 +2576,33 @@ impl WasmContextManager {
             invoker_signing_key,
             credit_window,
         } = params;
+
+        // CRITICAL #4: per-context admission gate. The tracker
+        // persists across opens within a single context so the §5.4.5
+        // caps actually trip. Pulling defaults that match
+        // `ContextParams` (8 / 16 / 128) — until ContextParams plumbs
+        // into the WASM context state, default to the §9.18.B
+        // baseline so the gate is at least active.
+        {
+            let admission = self
+                .outlet_stream_admission
+                .entry(context_id.to_owned())
+                .or_default();
+            if let Err(slug) = admission.try_admit(
+                identity_did,
+                identity_did, // origin = invoker on WASM single-hop
+                outlet_id,
+                8,
+                16,
+                128,
+            ) {
+                return Err(ScpWasmError::Context {
+                    message: format!("stream open rejected: {slug}"),
+                    code: scp_protocol::context::outlets::error_codes::CODE_TRANSPORT_FAULT
+                        .to_owned(),
+                });
+            }
+        }
 
         let ctx = self.require_active_context_mut(context_id)?;
 
@@ -2562,6 +2708,8 @@ impl WasmContextManager {
                 // chunks (Data + Progress). End/Error are terminal and
                 // do NOT consume credit.
                 remaining_credit: credit_window,
+                invoker_did: identity_did.to_owned(),
+                emitted_count: 0,
             },
             &request_id_hex,
         );
@@ -2605,7 +2753,16 @@ impl WasmContextManager {
             // Queue drained — flip terminated and evict so future
             // `next()` calls see `None` cleanly without a stale entry.
             session.terminated = true;
+            // Capture identity so we can release the admission slot
+            // after the session is removed (the borrow on
+            // `outlet_streams` is held by `session` until end of
+            // scope; cloning out the strings lets the post-eviction
+            // release run cleanly).
+            let ctx = session.context_id.clone();
+            let inv = session.invoker_did.clone();
+            let out = session.outlet_id.clone();
             self.outlet_streams.remove(request_id_hex);
+            self.release_admission_slot(&ctx, &inv, &out);
             return None;
         };
 
@@ -2654,6 +2811,7 @@ impl WasmContextManager {
                 // tail — credit-exhausted closure is a hard stop, no
                 // further Data/Progress passes through.
                 session.chunks.clear();
+                session.emitted_count = session.emitted_count.saturating_add(1);
                 return Some(scp_protocol::context::outlets::stream::OutletStreamChunk {
                     request_id: session.request_id,
                     sequence,
@@ -2667,6 +2825,12 @@ impl WasmContextManager {
         if is_terminal {
             session.terminated = true;
         }
+        // §5.4.5 next-emission cursor: bump after every chunk popped
+        // from the queue (the runtime-published "next-to-emit" sequence
+        // for the next call). Used by `outlet_stream_cancel` to derive
+        // the canonical `next_seq` written into the cancel preimage —
+        // CRITICAL #3 fix.
+        session.emitted_count = session.emitted_count.saturating_add(1);
         Some(chunk)
     }
 
@@ -2714,6 +2878,7 @@ impl WasmContextManager {
     pub fn outlet_stream_grant_credit(
         &mut self,
         request_id_hex: &str,
+        caller_did: &str,
         grant: u32,
     ) -> Result<u32, ScpWasmError> {
         use scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION;
@@ -2736,6 +2901,18 @@ impl WasmContextManager {
                     ),
                     code: CODE_PROTOCOL_SESSION.to_owned(),
                 })?;
+        // CRITICAL #1 fix: verify caller_did matches the session's
+        // pinned invoker_did before signing under the session's
+        // invoker key.
+        if session.invoker_did != caller_did {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "caller {caller_did} is not the pinned invoker for stream \
+                     '{request_id_hex}' (authorization.denied)"
+                ),
+                code: codes::PERM_3001.to_owned(),
+            });
+        }
 
         // Bump the counter BEFORE signing — matches the §5.4.5
         // strict-monotonicity invariant on the other bridges.
@@ -2813,16 +2990,34 @@ impl WasmContextManager {
     /// cancel arrived (matching the §5.4.5 idempotency rule used by
     /// the other bridges).
     ///
+    /// CRITICAL #1: requires `caller_did` to match the session's
+    /// pinned `invoker_did`. CRITICAL #2: builds and signs an
+    /// `OutletStreamCancel` under the session's pinned invoker key,
+    /// then verifies the signature against the same key — bringing
+    /// WASM cancel-auth to parity with the native bridges, where the
+    /// runtime's `apply_outlet_cancel` rejects an unsigned-or-tampered
+    /// cancel as `Authorization::AuthorizationFailed`. CRITICAL #3:
+    /// derives `next_seq` from `session.emitted_count` (the runtime
+    /// next-to-emit cursor) — never accepts caller input.
+    ///
     /// # Errors
     ///
     /// * `Context` (slug `protocol.unknown-session`) —
     ///   `request_id_hex` does not match any active session.
+    /// * `Context` (slug `authorization.denied`,
+    ///   `SCP-PERM-3001`) — `caller_did != session.invoker_did`.
+    /// * `Crypto` (`SCP-CRYPTO-4001`) — signature self-verification
+    ///   failed (preimage drift; cannot happen under normal
+    ///   operation).
     pub fn outlet_stream_cancel(
         &mut self,
         request_id_hex: &str,
-        next_seq: u64,
+        caller_did: &str,
     ) -> Result<Option<u64>, ScpWasmError> {
         use scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION;
+        use scp_protocol::context::outlets::stream::{
+            CancelSigningInputs, OutletStreamCancel, sign_cancel, verify_cancel_signature,
+        };
 
         let session =
             self.outlet_streams
@@ -2833,11 +3028,61 @@ impl WasmContextManager {
                     ),
                     code: CODE_PROTOCOL_SESSION.to_owned(),
                 })?;
+        // CRITICAL #1: caller authentication.
+        if session.invoker_did != caller_did {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "caller {caller_did} is not the pinned invoker for stream \
+                     '{request_id_hex}' (authorization.denied)"
+                ),
+                code: codes::PERM_3001.to_owned(),
+            });
+        }
 
         if session.terminated || session.cancelled {
             // Idempotent — already terminal at cancel receipt.
             return Ok(None);
         }
+
+        // CRITICAL #3: derive next_seq from runtime state, never from
+        // caller input. `emitted_count` is the count of chunks already
+        // popped from the queue and delivered to the JS side — that is
+        // the next-to-emit cursor at the moment the cancel arrives.
+        let next_seq = session.emitted_count;
+
+        // CRITICAL #2: build, sign, and verify the cancel. The
+        // signature roundtrip mirrors the native runtime's
+        // `apply_outlet_cancel` which rejects an unsigned-or-tampered
+        // cancel. Self-verification under the same key catches
+        // SCP-OUTLET-CANCEL-V1 preimage drift early.
+        let inputs = CancelSigningInputs {
+            context_id: session.context_id.as_str(),
+            outlet_id: session.outlet_id.as_str(),
+            request_id: &session.request_id,
+            next_seq,
+            caveats_binding: &session.caveats_binding,
+        };
+        let sig = sign_cancel(&session.invoker_signing_key, &inputs);
+        let cancel = OutletStreamCancel {
+            request_id: session.request_id,
+            next_seq,
+            sig,
+        };
+        if !verify_cancel_signature(
+            &cancel,
+            &session.invoker_signing_key.verifying_key(),
+            session.context_id.as_str(),
+            session.outlet_id.as_str(),
+            &session.caveats_binding,
+        ) {
+            return Err(ScpWasmError::Crypto {
+                message: "internal: freshly-signed cancel failed self-verification \
+                     — SCP-OUTLET-CANCEL-V1 preimage drift"
+                    .to_owned(),
+                code: codes::CRYPTO_4001.to_owned(),
+            });
+        }
+
         session.cancelled = true;
         // Drop any chunks past the sequence we have not yet emitted —
         // the cancel-ack semantics in §5.4.5 say the executor must
@@ -2879,6 +3124,7 @@ impl WasmContextManager {
     pub fn outlet_stream_terminate(
         &mut self,
         request_id_hex: &str,
+        caller_did: &str,
         slug: &str,
         code: &str,
         message: &str,
@@ -2895,6 +3141,16 @@ impl WasmContextManager {
                     ),
                     code: CODE_PROTOCOL_SESSION.to_owned(),
                 })?;
+        // CRITICAL #1 fix: caller authentication.
+        if session.invoker_did != caller_did {
+            return Err(ScpWasmError::Context {
+                message: format!(
+                    "caller {caller_did} is not the pinned invoker for stream \
+                     '{request_id_hex}' (authorization.denied)"
+                ),
+                code: codes::PERM_3001.to_owned(),
+            });
+        }
 
         if session.terminated || session.cancelled {
             // Idempotent — recoverable from the SDK's recheck loop
@@ -8787,6 +9043,8 @@ mod tests {
                 // Only one billable chunk fits in the window — the
                 // second Data chunk MUST hit the exhausted path.
                 remaining_credit: 1,
+                invoker_did: "did:dht:z6MkInvoker".to_owned(),
+                emitted_count: 0,
             },
         );
 
@@ -8863,11 +9121,13 @@ mod tests {
                 cancelled: false,
                 total_credit: 0,
                 remaining_credit: 0,
+                invoker_did: "did:dht:z6MkInvoker".to_owned(),
+                emitted_count: 0,
             },
         );
 
         let total = mgr
-            .outlet_stream_grant_credit(&request_id_hex, 5)
+            .outlet_stream_grant_credit(&request_id_hex, "did:dht:z6MkInvoker", 5)
             .expect("grant accepted");
         assert_eq!(total, 5, "total_credit reflects accepted grant");
 

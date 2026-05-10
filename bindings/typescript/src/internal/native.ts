@@ -948,21 +948,25 @@ export function createNativeBridge(): Bridge {
       );
     },
 
-    async outletStreamGrantCredit(requestIdHex: string, grant: number): Promise<number> {
-      return await (addon.outletStreamGrantCredit as (rid: string, g: number) => Promise<number>)(
-        requestIdHex,
-        grant,
-      );
+    async outletStreamGrantCredit(
+      requestIdHex: string,
+      callerDid: string,
+      grant: number,
+    ): Promise<number> {
+      return await (
+        addon.outletStreamGrantCredit as (rid: string, cd: string, g: number) => Promise<number>
+      )(requestIdHex, callerDid, grant);
     },
 
-    async outletStreamCancel(requestIdHex: string, nextSeq?: number): Promise<number | null> {
+    async outletStreamCancel(requestIdHex: string, callerDid: string): Promise<number | null> {
       return await (
-        addon.outletStreamCancel as (rid: string, ns: number | undefined) => Promise<number | null>
-      )(requestIdHex, nextSeq);
+        addon.outletStreamCancel as (rid: string, cd: string) => Promise<number | null>
+      )(requestIdHex, callerDid);
     },
 
     async outletStreamTerminate(
       requestIdHex: string,
+      callerDid: string,
       slug: string,
       code: string,
       message: string,
@@ -970,11 +974,12 @@ export function createNativeBridge(): Bridge {
       await (
         addon.outletStreamTerminate as (
           rid: string,
+          cd: string,
           s: string,
           c: string,
           m: string,
         ) => Promise<void>
-      )(requestIdHex, slug, code, message);
+      )(requestIdHex, callerDid, slug, code, message);
     },
 
     async verifyChunkSignature(

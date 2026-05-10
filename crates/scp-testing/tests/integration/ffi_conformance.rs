@@ -27,6 +27,7 @@
 const PYO3_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/src/identity.rs");
 const PYO3_CONTEXT: &str = include_str!("../../../../crates/scp-ffi/src/context.rs");
 const PYO3_OUTLETS: &str = include_str!("../../../../crates/scp-ffi/src/outlets.rs");
+const PYO3_OUTLET_STREAM: &str = include_str!("../../../../crates/scp-ffi/src/outlet_stream.rs");
 const PYO3_UCAN: &str = include_str!("../../../../crates/scp-ffi/src/ucan.rs");
 const PYO3_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/src/event_log.rs");
 const PYO3_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/src/transport.rs");
@@ -40,13 +41,19 @@ const PYO3_MCP: &str = include_str!("../../../../crates/scp-ffi/src/mcp.rs");
 const PYO3_ECONOMY: &str = include_str!("../../../../crates/scp-ffi/src/economy.rs");
 const PYO3_MEDIA: &str = include_str!("../../../../crates/scp-ffi/src/media.rs");
 
-// UniFFI bridge (single file)
+// UniFFI bridge — `bridge.rs` carries the bulk of exports, but the
+// streaming control plane lives in `outlet_stream.rs` per ADR-021.
+// SCP-OUT-037 AC13 requires the conformance matrix to walk both files.
 const UNIFFI_BRIDGE: &str = include_str!("../../../../crates/scp-ffi/uniffi/src/bridge.rs");
+const UNIFFI_OUTLET_STREAM: &str =
+    include_str!("../../../../crates/scp-ffi/uniffi/src/outlet_stream.rs");
 
 // NAPI bridge sources
 const NAPI_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/napi/src/identity.rs");
 const NAPI_CONTEXT: &str = include_str!("../../../../crates/scp-ffi/napi/src/context.rs");
 const NAPI_OUTLETS: &str = include_str!("../../../../crates/scp-ffi/napi/src/outlets.rs");
+const NAPI_OUTLET_STREAM: &str =
+    include_str!("../../../../crates/scp-ffi/napi/src/outlet_stream.rs");
 const NAPI_UCAN: &str = include_str!("../../../../crates/scp-ffi/napi/src/ucan.rs");
 const NAPI_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/napi/src/event_log.rs");
 const NAPI_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/napi/src/transport.rs");
@@ -64,6 +71,8 @@ const NAPI_MEDIA: &str = include_str!("../../../../crates/scp-ffi/napi/src/media
 const WASM_IDENTITY: &str = include_str!("../../../../crates/scp-ffi/wasm/src/identity.rs");
 const WASM_CONTEXT: &str = include_str!("../../../../crates/scp-ffi/wasm/src/context.rs");
 const WASM_OUTLETS: &str = include_str!("../../../../crates/scp-ffi/wasm/src/outlets.rs");
+const WASM_OUTLET_STREAM: &str =
+    include_str!("../../../../crates/scp-ffi/wasm/src/outlet_stream.rs");
 const WASM_UCAN: &str = include_str!("../../../../crates/scp-ffi/wasm/src/ucan.rs");
 const WASM_EVENT_LOG: &str = include_str!("../../../../crates/scp-ffi/wasm/src/event_log.rs");
 const WASM_TRANSPORT: &str = include_str!("../../../../crates/scp-ffi/wasm/src/transport.rs");
@@ -126,6 +135,14 @@ const PARITY_OPERATIONS: &[(&str, &str, bool)] = &[
     ("outlets", "outlet_interface_offer", false),
     ("outlets", "outlet_interface_accept", false),
     ("outlets", "outlet_interface_revoke", false),
+    // §5.4.5 streaming (SCP-OUT-037 AC13). All four bridges export the
+    // streaming control plane.
+    ("outlets", "context_outlet_invoke_stream", true),
+    ("outlets", "outlet_stream_grant_credit", true),
+    ("outlets", "outlet_stream_cancel", true),
+    ("outlets", "outlet_stream_terminate", true),
+    ("outlets", "verify_chunk_signature", true),
+    ("outlets", "compute_caveats_binding", true),
     // UCAN
     ("ucan", "ucan_validate", true),
     ("ucan", "ucan_mint", true),
@@ -242,6 +259,12 @@ fn any_source_has_fn(sources: &[&str], name: &str) -> bool {
 fn pyo3_names(canonical: &str) -> Vec<String> {
     let mut names = vec![format!("py_{canonical}")];
     match canonical {
+        // PyO3 uses py_outlet_invoke_stream (no `context_` prefix in
+        // function name, even though the public API surface is named
+        // `context_outlet_invoke_stream`).
+        "context_outlet_invoke_stream" => {
+            names.push("py_outlet_invoke_stream".to_string());
+        }
         // PyO3 uses "context_receive" for the subscribe/receive pattern
         "context_subscribe" => {
             names.push("py_context_receive".to_string());
@@ -287,6 +310,10 @@ fn uniffi_names(canonical: &str) -> Vec<String> {
         "context_add_checkpoint_cosignature" => {
             names.push("add_checkpoint_cosignature".to_string());
         }
+        // UniFFI uses outlet_invoke_stream (no `context_` prefix).
+        "context_outlet_invoke_stream" => {
+            names.push("outlet_invoke_stream".to_string());
+        }
         _ => {}
     }
     names
@@ -323,6 +350,11 @@ fn wasm_names(canonical: &str) -> Vec<String> {
         "broadcast_block_subscriber" => {
             names.push("broadcast_block".to_string());
         }
+        // WASM uses outlet_invoke_stream (no `context_` prefix in the
+        // exported function name).
+        "context_outlet_invoke_stream" => {
+            names.push("outlet_invoke_stream".to_string());
+        }
         _ => {}
     }
     names
@@ -339,9 +371,10 @@ fn pyo3_has_operation(sources: &[&str], canonical: &str) -> bool {
 }
 
 fn uniffi_has_operation(canonical: &str) -> bool {
+    let sources = [UNIFFI_BRIDGE, UNIFFI_OUTLET_STREAM];
     uniffi_names(canonical)
         .iter()
-        .any(|name| source_has_fn(UNIFFI_BRIDGE, name))
+        .any(|name| sources.iter().any(|s| source_has_fn(s, name)))
 }
 
 fn napi_has_operation(sources: &[&str], canonical: &str) -> bool {
@@ -365,6 +398,7 @@ fn pyo3_sources() -> Vec<&'static str> {
         PYO3_IDENTITY,
         PYO3_CONTEXT,
         PYO3_OUTLETS,
+        PYO3_OUTLET_STREAM,
         PYO3_UCAN,
         PYO3_EVENT_LOG,
         PYO3_TRANSPORT,
@@ -384,6 +418,7 @@ fn napi_sources() -> Vec<&'static str> {
         NAPI_IDENTITY,
         NAPI_CONTEXT,
         NAPI_OUTLETS,
+        NAPI_OUTLET_STREAM,
         NAPI_UCAN,
         NAPI_EVENT_LOG,
         NAPI_TRANSPORT,
@@ -403,6 +438,7 @@ fn wasm_sources() -> Vec<&'static str> {
         WASM_IDENTITY,
         WASM_CONTEXT,
         WASM_OUTLETS,
+        WASM_OUTLET_STREAM,
         WASM_UCAN,
         WASM_EVENT_LOG,
         WASM_TRANSPORT,
@@ -1055,7 +1091,14 @@ fn discovery_and_provenance_coverage() {
 // paths, so no new parity operation was added in its place. This is a
 // legitimate removal; the ratchet is reset to the new floor. See commit
 // 2291102.
-const MIN_PARITY_OPERATIONS: usize = 101;
+//
+// 2026-05: SCP-OUT-037 streaming control plane added 6 entries:
+// `context_outlet_invoke_stream`, `outlet_stream_grant_credit`,
+// `outlet_stream_cancel`, `outlet_stream_terminate`,
+// `verify_chunk_signature`, `compute_caveats_binding`. Floor moved to
+// 107 — additive ratchet entry per CLAUDE.md "Adding NEW assertions /
+// additive ratchet entries" exception.
+const MIN_PARITY_OPERATIONS: usize = 107;
 
 /// Named set of operations that must have `wasm_required=true`.
 /// This is a named set, not a count — swapping one operation for another is
@@ -1094,6 +1137,13 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "outlet_deregister",
     "outlet_list",
     "outlet_get",
+    // Streaming control plane (SCP-OUT-037 AC13)
+    "context_outlet_invoke_stream",
+    "outlet_stream_grant_credit",
+    "outlet_stream_cancel",
+    "outlet_stream_terminate",
+    "verify_chunk_signature",
+    "compute_caveats_binding",
     // UCAN
     "ucan_validate",
     "ucan_mint",

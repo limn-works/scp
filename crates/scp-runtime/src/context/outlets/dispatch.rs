@@ -257,6 +257,15 @@ pub(crate) struct SharedSessionState {
     /// Pinned at acceptance — the executor stops billing chunks above
     /// this `cancel_ack_seq` (§5.4.5 cancel-ack ceiling).
     pub cancel_ack_seq: Option<u64>,
+    /// Live cursor: the **next-to-emit** outer sequence the pump will
+    /// stamp onto the next forwarded chunk (§5.4.5 "current emission
+    /// cursor"). Initialised to `0` at session creation and bumped by
+    /// the pump after every accepted forward. Read by the bridge layer
+    /// to derive the canonical `cancel_ack_seq` written into the
+    /// `OutletStreamCancel` preimage — bridges MUST NOT accept this
+    /// value from caller input (a forged value enables zero-bill or
+    /// over-bill of delivered chunks).
+    pub next_emission_seq: u64,
     /// Operator signing key pinned at acceptance. The pump uses this
     /// to sign every chunk that crosses the outer wire boundary —
     /// executor-emitted chunks (re-signed under the pump's renumbered
@@ -435,6 +444,25 @@ impl StreamSessionHandle {
     #[must_use]
     pub const fn request_id(&self) -> &RequestId {
         &self.request_id
+    }
+
+    /// Reads the **runtime-derived** next-to-emit sequence cursor (the
+    /// §5.4.5 "current emission cursor"). Bridge cancel paths MUST use
+    /// this value as the `next_seq` field when constructing
+    /// [`OutletStreamCancel`] — never trust caller input. A caller-
+    /// supplied `next_seq` lets the caller forge `cancel_ack_seq` (zero
+    /// to nullify billing of delivered chunks, or `u64::MAX` to over-
+    /// bill); reading the cursor from runtime state closes that
+    /// surface.
+    ///
+    /// Returns `0` for a stream that has not yet emitted any chunk.
+    #[must_use]
+    pub fn current_next_emission_seq(&self) -> u64 {
+        let guard = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard.next_emission_seq
     }
 
     /// Applies an `OutletStreamCredit` grant.
@@ -717,6 +745,7 @@ fn build_shared_state(
         cancel_ack_armed: false,
         credit_stall_armed_at: None,
         cancel_ack_seq: None,
+        next_emission_seq: 0,
         operator_signing_key: params.operator_signing_key.clone(),
         pending_terminate: None,
     }))
@@ -1311,6 +1340,17 @@ async fn run_stream_pump_v2(
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let g = &mut *guard;
                     accrue_data_chunk_if_billable(&mut g.escrow, &g.cancel_ack, &final_chunk);
+                    // §5.4.5 next-emission-cursor publication — the
+                    // bridge layer reads this value to derive the
+                    // canonical `cancel_ack_seq` written into
+                    // `OutletStreamCancel` preimages (see
+                    // `StreamSessionHandle::current_next_emission_seq`).
+                    // Bump under the same lock as the gate decision so
+                    // a racing `apply_outlet_cancel` either observes
+                    // the cursor before this forward (cancel pins the
+                    // pre-forward cursor) or after (cancel pins the
+                    // post-forward cursor), never half-stamped.
+                    g.next_emission_seq = next_seq;
                 }
                 emitted_chunks.push(final_chunk.clone());
                 let terminal = final_chunk.payload.is_terminal();
@@ -1501,6 +1541,7 @@ mod tests {
             cancel_ack_armed: false,
             credit_stall_armed_at: None,
             cancel_ack_seq: None,
+            next_emission_seq: 0,
             operator_signing_key: Some(signing),
             pending_terminate: None,
         }))

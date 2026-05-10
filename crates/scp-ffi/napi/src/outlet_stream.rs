@@ -98,6 +98,10 @@ pub(crate) struct StreamRegistryEntry {
     /// runtime tracker pins the corresponding verifying key at open;
     /// every grant signature must verify under that pinned key.
     pub invoker_signing_key: SigningKey,
+    /// Pinned invoker DID. The control-plane bridge functions
+    /// (`grant_credit`, `cancel`, `terminate`) verify `caller_did`
+    /// matches this before signing. CRITICAL #1 fix.
+    pub invoker_did: String,
     /// 16-byte `request_id` (the registry key in raw form).
     pub request_id: [u8; 16],
 }
@@ -586,9 +590,18 @@ pub async fn context_outlet_invoke_stream(
         signing_key.verifying_key(),
         Arc::clone(&signing_key_arc),
     );
-    let admission = Arc::new(std::sync::Mutex::new(
-        scp_runtime::context::outlets::stream::StreamAdmissionTracker::new(),
-    ));
+    // §5.4.5 admission tracker MUST persist across successive opens
+    // within a single context — fetch (or lazily create) the per-context
+    // tracker on the bridge instance so the caps actually trip.
+    crate::runtime::ensure_bridge_instance();
+    let admission = crate::runtime::default_bridge_instance_raw()
+        .ok_or_else(|| {
+            napi::Error::from(ScpNapiError::Context {
+                message: "bridge instance not initialised".to_owned(),
+                code: codes::CTX_2000.to_owned(),
+            })
+        })?
+        .outlet_stream_admission_for_context(&context_id);
 
     let invoker_did_typed: scp_primitives::DID = identity_did.clone().into();
     let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id.as_str());
@@ -639,6 +652,7 @@ pub async fn context_outlet_invoke_stream(
         stream_epoch: stream_epoch_u64,
         caveats_binding,
         invoker_signing_key: signing_key,
+        invoker_did: identity_did.clone(),
         request_id,
     })?;
 
@@ -736,7 +750,11 @@ fn register_stream_entry(entry: StreamRegistryEntry) -> napi::Result<()> {
 ///   identity mismatch, escrow overflow, insufficient funds).
 #[napi(js_name = "outletStreamGrantCredit")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn outlet_stream_grant_credit(request_id_hex: String, grant: u32) -> napi::Result<u32> {
+pub fn outlet_stream_grant_credit(
+    request_id_hex: String,
+    caller_did: String,
+    grant: u32,
+) -> napi::Result<u32> {
     if grant == 0 {
         return Err(napi::Error::from(ScpNapiError::Validation {
             message: "invalid grant 0: must be in (0, 2^32 - 1] (protocol.invalid-grant)"
@@ -744,7 +762,9 @@ pub fn outlet_stream_grant_credit(request_id_hex: String, grant: u32) -> napi::R
             code: scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION.to_owned(),
         }));
     }
-    let entry = lookup_entry(&request_id_hex)?;
+    scp_ffi_common::validate::validate_did(&caller_did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    let entry = lookup_entry_authenticated(&request_id_hex, &caller_did)?;
 
     // Reserve the next monotonic_seq under a critical section so two
     // racing grant calls cannot collide. Bumping the counter BEFORE
@@ -835,16 +855,21 @@ fn sign_credit_grant(
 #[allow(clippy::needless_pass_by_value)]
 pub fn outlet_stream_cancel(
     request_id_hex: String,
-    next_seq: Option<f64>,
+    caller_did: String,
 ) -> napi::Result<Option<f64>> {
-    // Validate the optional next_seq the same way as `stream_epoch` —
-    // negative / fractional / non-finite floats are bridge-layer
-    // input errors, not runtime rejections.
-    let next_seq_u64 = match next_seq {
-        Some(v) => validate_stream_epoch(v)?,
-        None => 0u64,
+    scp_ffi_common::validate::validate_did(&caller_did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    let entry = lookup_entry_authenticated(&request_id_hex, &caller_did)?;
+    // §5.4.5 next-emission cursor MUST come from runtime state, not
+    // caller input. CRITICAL #3 fix — caller-supplied `next_seq`
+    // forges `cancel_ack_seq`.
+    let next_seq_u64 = {
+        let handle_guard = entry
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handle_guard.current_next_emission_seq()
     };
-    let entry = lookup_entry(&request_id_hex)?;
     let cancel = sign_cancel_for_entry(&entry, next_seq_u64);
     let handle_guard = entry
         .handle
@@ -898,11 +923,14 @@ pub fn outlet_stream_cancel(
 #[allow(clippy::needless_pass_by_value)]
 pub fn outlet_stream_terminate(
     request_id_hex: String,
+    caller_did: String,
     slug: String,
     code: String,
     message: String,
 ) -> napi::Result<()> {
-    let entry = lookup_entry(&request_id_hex)?;
+    scp_ffi_common::validate::validate_did(&caller_did)
+        .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    let entry = lookup_entry_authenticated(&request_id_hex, &caller_did)?;
     let handle_guard = entry
         .handle
         .lock()
@@ -1154,6 +1182,28 @@ fn lookup_entry(request_id_hex: &str) -> napi::Result<Arc<StreamRegistryEntry>> 
                 code: scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION.to_owned(),
             })
         })
+}
+
+/// Looks up the stream entry and verifies `caller_did` matches the
+/// pinned `invoker_did`. CRITICAL #1 fix — without this gate, any
+/// in-process code with a `request_id_hex` could drain credit, cancel,
+/// or terminate any concurrent stream because the bridge wields the
+/// invoker's signing key.
+fn lookup_entry_authenticated(
+    request_id_hex: &str,
+    caller_did: &str,
+) -> napi::Result<Arc<StreamRegistryEntry>> {
+    let entry = lookup_entry(request_id_hex)?;
+    if entry.invoker_did != caller_did {
+        return Err(napi::Error::from(ScpNapiError::Context {
+            message: format!(
+                "caller {caller_did} is not the pinned invoker for stream '{request_id_hex}' \
+                 (authorization.denied)"
+            ),
+            code: codes::PERM_3001.to_owned(),
+        }));
+    }
+    Ok(entry)
 }
 
 async fn resolve_invoker_signing_key(identity_did: &str) -> napi::Result<SigningKey> {
@@ -1443,7 +1493,8 @@ mod tests {
     /// `Validation` error per OUT-031 round-6 uniform `InvalidGrant` rule.
     #[test]
     fn grant_credit_rejects_zero_grant() {
-        let result = outlet_stream_grant_credit("00".repeat(16), 0);
+        let result =
+            outlet_stream_grant_credit("00".repeat(16), "did:dht:z6MkInvoker".to_owned(), 0);
         assert!(result.is_err(), "grant=0 must be rejected");
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -1459,7 +1510,7 @@ mod tests {
         // Use a fresh hex that is unlikely to match any other test's
         // active stream (registry is process-global per default
         // bridge instance — see ADR-048).
-        let result = outlet_stream_cancel("ee".repeat(16), Some(0.0));
+        let result = outlet_stream_cancel("ee".repeat(16), "did:dht:z6MkInvoker".to_owned());
         assert!(result.is_err(), "missing request_id must be rejected");
         let err_str = format!("{}", result.unwrap_err());
         assert!(

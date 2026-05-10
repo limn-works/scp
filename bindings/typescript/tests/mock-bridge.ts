@@ -649,13 +649,17 @@ export function createMockBridge(): Bridge & {
       );
     },
 
-    async outletStreamGrantCredit(_requestIdHex: string, _grant: number): Promise<number> {
+    async outletStreamGrantCredit(
+      _requestIdHex: string,
+      _callerDid: string,
+      _grant: number,
+    ): Promise<number> {
       throw new Error(
         "[SCP-TOOL-6020] streaming outlet invocation is not implemented in the mock bridge",
       );
     },
 
-    async outletStreamCancel(_requestIdHex: string, _nextSeq?: number): Promise<number | null> {
+    async outletStreamCancel(_requestIdHex: string, _callerDid: string): Promise<number | null> {
       throw new Error(
         "[SCP-TOOL-6020] streaming outlet invocation is not implemented in the mock bridge",
       );
@@ -663,6 +667,7 @@ export function createMockBridge(): Bridge & {
 
     async outletStreamTerminate(
       _requestIdHex: string,
+      _callerDid: string,
       _slug: string,
       _code: string,
       _message: string,

@@ -577,6 +577,11 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     /// stream — `nil` for handles backed by the non-streaming bridge.
     private let requestIdHex: String?
 
+    /// Pinned invoker DID; threaded through to every control-plane
+    /// bridge call as `callerDid` so the bridge can verify against
+    /// its registry's pinned identity. CRITICAL #1 fix.
+    private let invokerDid: String?
+
     /// Optional aggregate-schema (JSON Schema-shaped) for End-chunk
     /// validation per OUT-038 AC12.
     private let aggregateSchemaJson: String?
@@ -588,6 +593,7 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
 
     public init(
         requestIdHex: String? = nil,
+        invokerDid: String? = nil,
         aggregateSchemaJson: String? = nil,
         pump: @Sendable @escaping (
             @Sendable @escaping (OutletStreamChunk) -> Void,
@@ -596,6 +602,7 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
         ) -> Void
     ) {
         self.requestIdHex = requestIdHex
+        self.invokerDid = invokerDid
         self.aggregateSchemaJson = aggregateSchemaJson
         var chunkCont: AsyncThrowingStream<OutletStreamChunk, Error>.Continuation?
         let stream = AsyncThrowingStream<OutletStreamChunk, Error> { cont in
@@ -688,15 +695,28 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
                 message: "grantCredit rejected: handle was opened without a streaming session"
             )
         }
-        return try await outletStreamGrantCredit(requestIdHex: ridHex, grant: grant.raw)
+        guard let did = invokerDid else {
+            throw OutletError.makeStreamAlreadyClosed(
+                message: "grantCredit rejected: handle has no pinned invoker DID — bridge "
+                    + "caller authentication unavailable"
+            )
+        }
+        return try await outletStreamGrantCredit(
+            requestIdHex: ridHex,
+            callerDid: did,
+            grant: grant.raw
+        )
     }
 
     /// SCP-OUT-038 AC2/AC3 — cancels the active stream (§5.4.5).
     ///
+    /// CRITICAL #3 — `next_seq` is no longer accepted; the bridge
+    /// derives the canonical next-emission cursor from runtime state.
+    ///
     /// - Throws: `OutletError.streamAlreadyClosed` (AC13) when the
     ///   stream has already emitted a terminal chunk.
     @discardableResult
-    public func cancel(nextSeq: UInt64? = nil) async throws -> UInt64? {
+    public func cancel() async throws -> UInt64? {
         if terminatedFlag.isTerminated {
             throw OutletError.makeStreamAlreadyClosed()
         }
@@ -705,7 +725,13 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
                 message: "cancel rejected: handle was opened without a streaming session"
             )
         }
-        return try await outletStreamCancel(requestIdHex: ridHex, nextSeq: nextSeq)
+        guard let did = invokerDid else {
+            throw OutletError.makeStreamAlreadyClosed(
+                message: "cancel rejected: handle has no pinned invoker DID — bridge "
+                    + "caller authentication unavailable"
+            )
+        }
+        return try await outletStreamCancel(requestIdHex: ridHex, callerDid: did)
     }
 
     /// `true` once a terminal chunk has been observed (AC13). Exposed
@@ -1047,8 +1073,10 @@ public actor OutletNamespace {
     ) -> InvocationHandle {
         let handle = self.handle
         let identity = self.identity
+        let invokerDidValue = identity.did()
         return InvocationHandle(
             requestIdHex: nil,
+            invokerDid: invokerDidValue,
             aggregateSchemaJson: aggregateSchemaJson
         ) { yieldChunk, resolveAggregate, rejectAggregate in
             Task {
@@ -1071,7 +1099,8 @@ public actor OutletNamespace {
                         ucanToken: ucanToken,
                         proofTokens: proofTokens,
                         recheckSecs: ucanRecheckSecs,
-                        requestIdHex: raw.requestId()
+                        requestIdHex: raw.requestId(),
+                        invokerDid: invokerDidValue
                     )
                     defer { recheckTask.cancel() }
                     try await pumpStreamingChunks(
