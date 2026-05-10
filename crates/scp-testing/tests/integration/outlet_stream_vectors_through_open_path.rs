@@ -620,6 +620,13 @@ fn synthetic_invoker_signing_key(did: &str) -> SigningKey {
 fn build_open_stream_params(open: &OpenSpec) -> OpenStreamParams {
     let invoker_signing = synthetic_invoker_signing_key(&open.invoker_did);
     let operator_signing = synthetic_invoker_signing_key(&open.operator_did);
+    // §5.4.5 HIGH-wave-2 — these conformance vectors are legacy test
+    // fixtures (pre-binding-pinning); they ride the sentinel-binding
+    // path the runtime treats as "no UCAN context, skip recompute"
+    // (empty `ucan_cid` + `[0u8; 32]` binding). The forge-binding
+    // path is exercised by the runtime's `open_rejects_caveats_
+    // binding_mismatch` unit test, which presents a real `ucan_cid`
+    // alongside a forged binding.
     OpenStreamParams {
         identity: StreamIdentity {
             context_id: open.context_id.clone(),
@@ -645,6 +652,18 @@ fn build_open_stream_params(open: &OpenSpec) -> OpenStreamParams {
         // the framework's stall timer fires within the test runtime.
         stream_credit_stall_secs: open.stream_credit_stall_secs.min(2),
         stream_cancel_ack_secs: open.stream_cancel_ack_secs.min(2),
+        // §5.4.5 HIGH-wave-2 (Fix B) — runtime-authoritative
+        // revocation re-check. Vectors do not exercise mid-stream
+        // revocation; supply a never-revokes checker on a long cadence
+        // so the timer never trips during the bounded vector run.
+        stream_ucan_recheck_secs: 60,
+        // Legacy-fixture sentinel (see comment above): empty `ucan_cid`
+        // opts out of the §5.4.5 binding-pinning recompute.
+        ucan_cid: String::new(),
+        request_id: [0xEE; 16],
+        revocation_checker: std::sync::Arc::new(
+            scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
+        ),
     }
 }
 

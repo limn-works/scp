@@ -55,6 +55,44 @@ use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
 
 // ---------------------------------------------------------------------------
+// Per-stream revocation checker
+// ---------------------------------------------------------------------------
+
+/// Adapter that wires the bridge's per-context UCAN revocation list
+/// (owned by [`crate::runtime::UcanContextState::core::revocation_list`])
+/// into the runtime's streaming pump for §5.4.5 receiver-side
+/// revocation re-checks.
+///
+/// Mirrors `BridgeStreamRevocationChecker` in `crates/scp-ffi/src/outlet_stream.rs`.
+pub(crate) struct BridgeStreamRevocationChecker {
+    context_id: String,
+}
+
+impl BridgeStreamRevocationChecker {
+    /// Builds a revocation-checker adapter for `context_id`. Returns
+    /// `Err` if the context has not been registered in the UCAN-state
+    /// registry.
+    fn for_context(context_id: &str) -> Result<Self, ScpNapiError> {
+        crate::runtime::with_context(context_id, |_rt| Ok(()))?;
+        Ok(Self {
+            context_id: context_id.to_owned(),
+        })
+    }
+}
+
+impl scp_protocol::crypto::ucan::validate::RevocationChecker for BridgeStreamRevocationChecker {
+    fn is_revoked(&self, token_cid: &str) -> bool {
+        // Fail-CLOSED on lookup failure: a context whose UCAN state has
+        // been removed (e.g., closed mid-stream) is equivalent to "no
+        // longer valid" → treat as revoked → terminate the stream.
+        crate::runtime::with_context(&self.context_id, |rt| {
+            Ok(rt.core.revocation_list.is_revoked(token_cid))
+        })
+        .unwrap_or(true)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stream registry
 // ---------------------------------------------------------------------------
 
@@ -579,6 +617,29 @@ pub async fn context_outlet_invoke_stream(
     // sees a clean ValidationError instead of an opaque runtime
     // rejection.
     let stream_epoch_u64 = validate_stream_epoch(stream_epoch)?;
+
+    // §5.4.5 HIGH-wave-2 Fix A — supply the inputs the runtime needs
+    // to recompute the `caveats_binding`. The bridge has already
+    // validated the UCAN above; re-parse the encoded JWT to compute
+    // its CID for the binding preimage. The §5.4.5 spec commits to
+    // the CID + a runtime-pinned `request_id`; both must reach
+    // `OpenStreamParams`.
+    let ucan_token_parsed =
+        scp_protocol::crypto::ucan::validate::parse_ucan(&ucan_token).map_err(|e| {
+            napi::Error::from(ScpNapiError::Permission {
+                message: format!("failed to parse ucan_token for cid: {e}"),
+                code: codes::PERM_3001.to_owned(),
+            })
+        })?;
+    let ucan_cid_for_binding = scp_runtime::crypto::ucan::mint::compute_cid(&ucan_token_parsed);
+    let request_id: scp_protocol::context::outlets::stream::RequestId =
+        *uuid::Uuid::now_v7().as_bytes();
+    let revocation_checker: std::sync::Arc<
+        dyn scp_protocol::crypto::ucan::validate::RevocationChecker + Send + Sync,
+    > = std::sync::Arc::new(
+        BridgeStreamRevocationChecker::for_context(&context_id).map_err(napi::Error::from)?,
+    );
+
     let params = build_open_stream_params(
         context_id.clone(),
         outlet_id.clone(),
@@ -589,6 +650,9 @@ pub async fn context_outlet_invoke_stream(
         estimated_chunk_count,
         signing_key.verifying_key(),
         Arc::clone(&signing_key_arc),
+        ucan_cid_for_binding,
+        request_id,
+        revocation_checker,
     );
     // §5.4.5 admission tracker MUST persist across successive opens
     // within a single context — fetch (or lazily create) the per-context
@@ -682,6 +746,11 @@ fn build_open_stream_params(
     estimated_chunk_count: Option<u32>,
     invoker_pk: ed25519_dalek::VerifyingKey,
     operator_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    ucan_cid: String,
+    request_id: scp_protocol::context::outlets::stream::RequestId,
+    revocation_checker: std::sync::Arc<
+        dyn scp_protocol::crypto::ucan::validate::RevocationChecker + Send + Sync,
+    >,
 ) -> scp_runtime::context::outlets::dispatch::OpenStreamParams {
     let credit_window_value =
         credit_window.unwrap_or(scp_protocol::context::outlets::stream::DEFAULT_CREDIT_WINDOW);
@@ -713,6 +782,15 @@ fn build_open_stream_params(
         stream_credit_stall_secs:
             scp_protocol::context::outlets::stream::DEFAULT_STREAM_CREDIT_STALL_SECS,
         stream_cancel_ack_secs: 5,
+        // §5.4.5 HIGH-wave-2 — runtime-authoritative UCAN revocation
+        // re-check and binding-pinning. See PyO3 bridge for the field-
+        // by-field rationale; this bridge mirrors that wiring for the
+        // Node.js / Bun consumer.
+        stream_ucan_recheck_secs:
+            scp_protocol::context::outlets::stream::DEFAULT_STREAM_UCAN_RECHECK_SECS,
+        ucan_cid,
+        request_id,
+        revocation_checker,
     }
 }
 
