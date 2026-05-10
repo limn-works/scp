@@ -851,6 +851,23 @@ pub(crate) struct WasmOutletStreamSession {
     pub emitted_count: u64,
 }
 
+impl Drop for WasmOutletStreamSession {
+    /// §5.4.5 HIGH-wave-3 Fix A — defense-in-depth zeroization of the
+    /// non-secret-but-tidy `caveats_binding` hash on drop. The
+    /// `invoker_signing_key` field is an `ed25519_dalek::SigningKey`
+    /// which already implements `ZeroizeOnDrop`, so its bytes are
+    /// scrubbed when this struct drops. The `chunks` queue carries
+    /// publicly-signed protocol envelopes (no secrets) and the
+    /// remaining fields are public ids / counters. Per ADR-034 the
+    /// WASM bridge runs in the same security boundary as the JS host
+    /// — same in-process trust model as the native bridges — so this
+    /// is best-effort hygiene, not a load-bearing crypto control.
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.caveats_binding.zeroize();
+    }
+}
+
 /// WASM-local mirror of
 /// `scp_runtime::context::outlets::stream::StreamAdmissionTracker` —
 /// the runtime crate cannot compile to wasm32 (tokio multi-thread per

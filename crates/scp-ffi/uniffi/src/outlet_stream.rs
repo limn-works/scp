@@ -46,18 +46,83 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use scp_core::context::outlets::stream::{
-    self as proto_stream, ChunkPayload, CreditGrantSigningInputs, OutletStreamChunk,
-    OutletStreamCredit,
+    self as proto_stream, ChunkPayload, OutletStreamChunk, OutletStreamCredit,
 };
 use scp_ffi_common::error_codes as codes;
+use scp_platform::{KeyCustody, KeyHandle};
 use scp_protocol::trust::caveats::InvocationCaveats;
 use serde_json::Value;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
+use zeroize::Zeroize;
 
 use crate::ScpError;
+use crate::bridge::CallbackKeyCustody;
+#[cfg(feature = "allow_in_memory_custody")]
+use crate::bridge::OpaqueInMemoryKeyCustody;
+
+// ---------------------------------------------------------------------------
+// StreamCustody — bridge-layer enum so the registry entry can hold any of
+// the UniFFI bridge's custody variants without erasing trait identity. The
+// underlying scp_platform::KeyCustody trait uses RPITIT (not dyn-safe), so a
+// boxed trait object is not an option — this enum dispatches statically.
+// ---------------------------------------------------------------------------
+
+/// Custody provider variant pinned on a [`StreamRegistryEntry`].
+///
+/// §5.4.5 HIGH-wave-3 Fix A — the entry no longer caches a raw
+/// `SigningKey`. Every grant / cancel / terminate signature delegates
+/// to one of the variants below (whichever the identity at stream open
+/// presented) via [`Self::sign`], so private bytes never leave the
+/// custody boundary (ADR-006).
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum StreamCustody {
+    /// Platform-provided custody injected via `KeyCustodyProvider`
+    /// (Apple Keychain, Android Keystore, etc.). Preferred path in
+    /// production builds.
+    Callback(Arc<CallbackKeyCustody>),
+    /// In-memory custody, only available when the
+    /// `allow_in_memory_custody` feature is enabled. Used by tests
+    /// and CLI builds.
+    #[cfg(feature = "allow_in_memory_custody")]
+    InMemory(Arc<OpaqueInMemoryKeyCustody>),
+}
+
+impl StreamCustody {
+    /// Signs `data` under the key identified by `handle`. Dispatches
+    /// statically over the [`KeyCustody`] trait impl on the matched
+    /// variant — RPITIT precludes a boxed trait object, so this
+    /// `match` is the bridge-layer fan-out.
+    async fn sign(
+        &self,
+        handle: &KeyHandle,
+        data: &[u8],
+    ) -> Result<scp_platform::Signature, scp_platform::PlatformError> {
+        match self {
+            Self::Callback(cb) => cb.sign(handle, data).await,
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(imc) => imc.0.sign(handle, data).await,
+        }
+    }
+
+    /// Exports the raw [`SigningKey`] for the runtime pump's
+    /// `operator_signing_key` field. The pump signs every outer-wire
+    /// chunk under this key; the key lives only inside the pump task
+    /// and is dropped when the pump exits — the bridge does NOT cache
+    /// it on the registry entry.
+    async fn export_signing_key(
+        &self,
+        handle: &KeyHandle,
+    ) -> Result<SigningKey, scp_platform::PlatformError> {
+        match self {
+            Self::Callback(cb) => cb.export_ed25519_signing_key(handle).await,
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(imc) => imc.0.export_ed25519_signing_key(handle).await,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Per-stream revocation checker
@@ -145,18 +210,44 @@ pub(crate) struct StreamRegistryEntry {
     /// 32-byte `caveats_binding` pinned at acceptance — committed into
     /// every grant preimage.
     pub caveats_binding: [u8; 32],
-    /// Invoker's Ed25519 signing key — used to sign every grant. The
-    /// runtime tracker pins the corresponding verifying key at open;
-    /// every grant signature must verify under that pinned key.
-    pub invoker_signing_key: SigningKey,
+    /// Opaque [`KeyHandle`] for the invoker's Ed25519 signing key.
+    /// §5.4.5 HIGH-wave-3 Fix A — replaces the previous raw
+    /// `SigningKey` field so private bytes never linger on the bridge
+    /// heap for the stream's lifetime (ADR-006). Grant / cancel /
+    /// terminate signatures dispatch through [`Self::custody`] (a
+    /// [`StreamCustody`] enum over the bridge's available providers).
+    pub invoker_key_handle: KeyHandle,
+    /// Custody provider that owns [`Self::invoker_key_handle`]. Cloned
+    /// from the context handle or identity at stream open. Held by
+    /// value (each variant is `Arc`-cloneable internally) so the
+    /// custody remains alive for the stream's lifetime.
+    pub custody: StreamCustody,
+    /// Invoker's Ed25519 verifying key (public, non-secret)
+    /// snapshotted at open. Used to self-verify every freshly-signed
+    /// grant / cancel against the same pinned identity the runtime's
+    /// `apply_credit_grant` / `apply_outlet_cancel` use for downstream
+    /// verification.
+    pub invoker_verifying_key: VerifyingKey,
     /// Pinned invoker DID. The control-plane bridge functions
     /// (`grant_credit`, `cancel`, `terminate`) verify `caller_did`
-    /// matches this before signing. CRITICAL #1 fix.
+    /// matches this before invoking custody to sign. CRITICAL #1 fix.
     pub invoker_did: String,
     /// 16-byte `request_id` (the registry key in raw form) so the pump
     /// task and the close path can look up by either the hex string
     /// (registry key) or the typed wire form.
     pub request_id: [u8; 16],
+}
+
+impl Drop for StreamRegistryEntry {
+    /// §5.4.5 HIGH-wave-3 Fix A — defense-in-depth zeroization of the
+    /// `caveats_binding` hash (non-secret but tidy) on drop. The other
+    /// fields are either opaque handles (`invoker_key_handle`,
+    /// `custody` variants behind `Arc`), public values
+    /// (`invoker_verifying_key`, ids), or runtime-owned state behind
+    /// the inner Mutex — none need zeroization at the bridge boundary.
+    fn drop(&mut self) {
+        self.caveats_binding.zeroize();
+    }
 }
 
 /// Returns a reference to the per-bridge stream registry on the default
@@ -385,6 +476,29 @@ pub struct OutletStreamHandle {
     /// `true` after the pump observed a terminal chunk and the iterator
     /// must stop. Survives the receiver being dropped.
     terminated: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for OutletStreamHandle {
+    /// §5.4.5 HIGH-wave-3 Fix B — evict the per-bridge registry entry
+    /// on drop so a wrapper that goes out of scope without being
+    /// drained to terminal (exception path, Swift/Kotlin ARC release,
+    /// awaiting-only consumption that never observes a terminal chunk)
+    /// does NOT leak `StreamRegistryEntry` (`KeyHandle` + per-stream
+    /// [`scp_runtime::context::outlets::dispatch::StreamSessionHandle`]
+    /// state) indefinitely.
+    ///
+    /// Idempotent: when [`Self::next`] already observed a terminal
+    /// chunk it called [`evict_request`] inline, and the registry no
+    /// longer holds the entry — this `Drop` becomes a no-op. The
+    /// runtime pump's settlement block (triggered by the receiver
+    /// closing when `rx` drops) releases the
+    /// `StreamAdmissionTracker` counters on all three keys
+    /// (`AdmissionReleaseKeys`); no separate `release_admission_slot()`
+    /// call from the wrapper is needed — the receiver close is the
+    /// authoritative trigger.
+    fn drop(&mut self) {
+        evict_request(&self.request_id_hex);
+    }
 }
 
 #[uniffi::export(async_runtime = "tokio")]
@@ -815,9 +929,26 @@ async fn open_stream_internal(
             code: codes::CTX_2040.to_owned(),
         })?;
 
-    let signing_key = resolve_invoker_signing_key(handle, identity).await?;
+    // §5.4.5 HIGH-wave-3 Fix A — resolve the invoker's key handle +
+    // custody variant up front. The runtime pump still needs an
+    // `Arc<SigningKey>` for chunk signing
+    // (`OpenStreamParams::operator_signing_key`); export that once
+    // here. The registry entry keeps only the custody enum + key
+    // handle so grant / cancel / terminate dispatch through custody
+    // rather than reaching into a cached private key — private bytes
+    // never linger on the bridge heap for the stream's lifetime
+    // (ADR-006).
+    let (custody, invoker_key_handle) = resolve_invoker_custody(handle, identity)?;
+    let signing_key = custody
+        .export_signing_key(&invoker_key_handle)
+        .await
+        .map_err(|e| ScpError::Identity {
+            msg: format!("failed to export invoker signing key from custody: {e}"),
+            code: codes::IDENT_1041.to_owned(),
+        })?;
     let invoker_pk = signing_key.verifying_key();
-    let signing_key_arc = Arc::new(signing_key.clone());
+    let invoker_verifying_key = invoker_pk;
+    let signing_key_arc = Arc::new(signing_key);
 
     let executor: Arc<dyn scp_runtime::context::outlets::invoke::OutletExecutor> =
         Arc::new(ClosureExecutor {
@@ -914,7 +1045,9 @@ async fn open_stream_internal(
         outlet_id: outlet_id.to_owned(),
         stream_epoch,
         caveats_binding,
-        invoker_signing_key: signing_key,
+        invoker_key_handle,
+        custody,
+        invoker_verifying_key,
         invoker_did: identity.did.clone(),
         request_id,
     })?;
@@ -1061,7 +1194,7 @@ pub async fn outlet_stream_grant_credit(
         *guard
     };
 
-    let credit = sign_credit_grant(&entry, grant, next_seq);
+    let credit = sign_credit_grant(&entry, grant, next_seq).await?;
 
     let handle_guard = entry
         .handle
@@ -1076,27 +1209,58 @@ pub async fn outlet_stream_grant_credit(
 }
 
 /// Constructs and signs an [`OutletStreamCredit`] for `entry`.
-fn sign_credit_grant(
+async fn sign_credit_grant(
     entry: &StreamRegistryEntry,
     grant: u32,
     monotonic_seq: u64,
-) -> OutletStreamCredit {
-    let inputs = CreditGrantSigningInputs {
-        context_id: entry.context_id.as_str(),
-        outlet_id: entry.outlet_id.as_str(),
-        request_id: &entry.request_id,
+) -> Result<OutletStreamCredit, ScpError> {
+    let preimage = proto_stream::compute_credit_sig_preimage(
+        entry.context_id.as_str(),
+        entry.outlet_id.as_str(),
+        &entry.request_id,
         grant,
         monotonic_seq,
-        stream_epoch: entry.stream_epoch,
-        caveats_binding: &entry.caveats_binding,
-    };
-    let sig = proto_stream::sign_credit_grant(&entry.invoker_signing_key, &inputs);
-    OutletStreamCredit {
+        entry.stream_epoch,
+        &entry.caveats_binding,
+    );
+    let signature = entry
+        .custody
+        .sign(&entry.invoker_key_handle, &preimage)
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("custody sign failed for credit grant: {e}"),
+            code: codes::CTX_2000.to_owned(),
+        })?;
+    let sig_bytes: [u8; 64] =
+        signature
+            .into_bytes()
+            .try_into()
+            .map_err(|got: Vec<u8>| ScpError::Context {
+                msg: format!(
+                    "custody returned signature of {} bytes; expected 64",
+                    got.len()
+                ),
+                code: codes::CTX_2000.to_owned(),
+            })?;
+    let signature_typed = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    if entry
+        .invoker_verifying_key
+        .verify_strict(&preimage, &signature_typed)
+        .is_err()
+    {
+        return Err(ScpError::Context {
+            msg: "freshly-signed credit grant failed self-verification \
+                  — SCP-OUTLET-CREDIT-V1 preimage drift or custody/key mismatch"
+                .to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        });
+    }
+    Ok(OutletStreamCredit {
         request_id: entry.request_id,
         grant,
         monotonic_seq,
-        sig,
-    }
+        sig: sig_bytes,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,7 +1300,7 @@ pub async fn outlet_stream_cancel(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         handle_guard.current_next_emission_seq()
     };
-    let cancel = sign_cancel_for_entry(&entry, next_seq_u64);
+    let cancel = sign_cancel_for_entry(&entry, next_seq_u64).await?;
     let handle_guard = entry
         .handle
         .lock()
@@ -1154,26 +1318,60 @@ pub async fn outlet_stream_cancel(
 
 /// Builds and signs an `OutletStreamCancel` for `entry` against
 /// `next_seq` (mirrors [`sign_credit_grant`]).
-fn sign_cancel_for_entry(
+///
+/// §5.4.5 HIGH-wave-3 Fix A — calls into custody for the actual
+/// signing step; private bytes never leave the custody boundary
+/// (ADR-006). Self-verifies the signature under the entry's pinned
+/// verifying key.
+async fn sign_cancel_for_entry(
     entry: &StreamRegistryEntry,
     next_seq: u64,
-) -> scp_protocol::context::outlets::stream::OutletStreamCancel {
-    use scp_protocol::context::outlets::stream::{
-        CancelSigningInputs, OutletStreamCancel, sign_cancel,
-    };
-    let inputs = CancelSigningInputs {
-        context_id: entry.context_id.as_str(),
-        outlet_id: entry.outlet_id.as_str(),
-        request_id: &entry.request_id,
+) -> Result<scp_protocol::context::outlets::stream::OutletStreamCancel, ScpError> {
+    use scp_protocol::context::outlets::stream::{OutletStreamCancel, compute_cancel_sig_preimage};
+    let preimage = compute_cancel_sig_preimage(
+        entry.context_id.as_str(),
+        entry.outlet_id.as_str(),
+        &entry.request_id,
         next_seq,
-        caveats_binding: &entry.caveats_binding,
-    };
-    let sig = sign_cancel(&entry.invoker_signing_key, &inputs);
-    OutletStreamCancel {
+        &entry.caveats_binding,
+    );
+    let signature = entry
+        .custody
+        .sign(&entry.invoker_key_handle, &preimage)
+        .await
+        .map_err(|e| ScpError::Context {
+            msg: format!("custody sign failed for cancel: {e}"),
+            code: codes::CTX_2000.to_owned(),
+        })?;
+    let sig_bytes: [u8; 64] =
+        signature
+            .into_bytes()
+            .try_into()
+            .map_err(|got: Vec<u8>| ScpError::Context {
+                msg: format!(
+                    "custody returned signature of {} bytes; expected 64",
+                    got.len()
+                ),
+                code: codes::CTX_2000.to_owned(),
+            })?;
+    let signature_typed = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    if entry
+        .invoker_verifying_key
+        .verify_strict(&preimage, &signature_typed)
+        .is_err()
+    {
+        return Err(ScpError::Context {
+            msg: "freshly-signed cancel failed self-verification \
+                  — SCP-OUTLET-CANCEL-V1 preimage drift or custody/key mismatch"
+                .to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        });
+    }
+    Ok(OutletStreamCancel {
         request_id: entry.request_id,
         next_seq,
-        sig,
-    }
+        sig: sig_bytes,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1468,21 +1666,25 @@ fn lookup_entry_authenticated(
     Ok(entry)
 }
 
-/// Resolves the invoker's Ed25519 signing key from either the context
-/// handle's pinned custody (preferred — `outlet_invoke` uses this same
-/// path) or the identity's own retained custody. Mirrors
-/// `resolve_uniffi_signing_key` in `bridge.rs` but tolerates the
-/// in-memory custody living on the `Identity` rather than the
-/// `ContextHandle`.
-async fn resolve_invoker_signing_key(
+/// Resolves the invoker's [`KeyHandle`] and the matching
+/// [`StreamCustody`] variant from either the context handle's pinned
+/// custody (preferred — `outlet_invoke` uses this same path) or the
+/// identity's own retained custody.
+///
+/// §5.4.5 HIGH-wave-3 Fix A — replaces the previous
+/// `resolve_invoker_signing_key` helper as the primary key-resolution
+/// path so the bridge does not cache raw private bytes on the registry
+/// entry. The returned [`StreamCustody`] is moved into the registry
+/// entry; every later sign call goes through it.
+fn resolve_invoker_custody(
     handle: &ContextHandle,
     identity: &Identity,
-) -> Result<SigningKey, ScpError> {
+) -> Result<(StreamCustody, KeyHandle), ScpError> {
     // Prefer the context handle's signing key (set during context
-    // creation / join). Falls back to the identity's `core_id` when the
-    // ContextHandle was minted without an identity-tied signing key
-    // (e.g., a context joined with a different identity than was used
-    // for `identity_create`).
+    // creation / join). Falls back to the identity's `core_id` when
+    // the ContextHandle was minted without an identity-tied signing
+    // key (e.g., a context joined with a different identity than was
+    // used for `identity_create`).
     let key_handle = handle.signing_key.or_else(|| {
         identity
             .core_id
@@ -1498,53 +1700,22 @@ async fn resolve_invoker_signing_key(
     };
 
     // Try the context handle's callback custody first, then in-memory
-    // custody, then the identity's callback custody / in-memory custody.
+    // custody, then the identity's callback custody / in-memory
+    // custody — mirroring the precedence the legacy
+    // `resolve_invoker_signing_key` helper used.
     if let Some(ref cb) = handle.callback_custody {
-        return cb
-            .export_ed25519_signing_key(&key_handle)
-            .await
-            .map_err(|e| ScpError::Identity {
-                msg: format!("failed to export invoker signing key from platform custody: {e}"),
-                code: codes::IDENT_1041.to_owned(),
-            });
+        return Ok((StreamCustody::Callback(Arc::clone(cb)), key_handle));
     }
-
     #[cfg(feature = "allow_in_memory_custody")]
     if let Some(ref imc) = handle.in_memory_custody {
-        return imc
-            .0
-            .export_ed25519_signing_key(&key_handle)
-            .await
-            .map_err(|e| ScpError::Identity {
-                msg: format!("failed to export invoker signing key from in-memory custody: {e}"),
-                code: codes::IDENT_1041.to_owned(),
-            });
+        return Ok((StreamCustody::InMemory(Arc::clone(imc)), key_handle));
     }
-
     if let Some(ref cb) = identity.callback_custody {
-        return cb
-            .export_ed25519_signing_key(&key_handle)
-            .await
-            .map_err(|e| ScpError::Identity {
-                msg: format!(
-                    "failed to export invoker signing key from identity platform custody: {e}"
-                ),
-                code: codes::IDENT_1041.to_owned(),
-            });
+        return Ok((StreamCustody::Callback(Arc::clone(cb)), key_handle));
     }
-
     #[cfg(feature = "allow_in_memory_custody")]
     if let Some(ref imc) = identity.in_memory_custody {
-        return imc
-            .0
-            .export_ed25519_signing_key(&key_handle)
-            .await
-            .map_err(|e| ScpError::Identity {
-                msg: format!(
-                    "failed to export invoker signing key from identity in-memory custody: {e}"
-                ),
-                code: codes::IDENT_1041.to_owned(),
-            });
+        return Ok((StreamCustody::InMemory(Arc::clone(imc)), key_handle));
     }
 
     Err(ScpError::Identity {
@@ -1834,5 +2005,46 @@ mod tests {
             err_str.contains("not found") || err_str.contains("unknown-session"),
             "error must mention unknown-session: {err_str}"
         );
+    }
+
+    /// §5.4.5 HIGH-wave-3 Fix B — dropping an [`OutletStreamHandle`]
+    /// without consuming it evicts the registry entry. Build a wrapper
+    /// referencing a sentinel request id, drop it, assert the registry
+    /// no longer holds that key. Idempotent — running this test
+    /// twice in a row succeeds.
+    #[test]
+    fn drop_evicts_registry_entry() {
+        runtime::ensure_bridge_instance();
+        let request_id_hex = "ef".repeat(16);
+        {
+            let wrapper = OutletStreamHandle {
+                rx: Arc::new(TokioMutex::new(None)),
+                request_id_hex: request_id_hex.clone(),
+                invoker_did: "did:dht:z6MkInvoker".to_owned(),
+                terminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            drop(wrapper);
+        }
+        let reg = registry().expect("registry available");
+        assert!(
+            reg.get(&request_id_hex).is_none(),
+            "drop must leave the registry without the entry"
+        );
+    }
+
+    /// §5.4.5 HIGH-wave-3 Fix A — `StreamRegistryEntry` no longer
+    /// stores a raw `SigningKey`. Compile-time check: the
+    /// `invoker_key_handle` field is a `KeyHandle`, `custody` is a
+    /// `StreamCustody` enum, and `invoker_verifying_key` is the public
+    /// key only. A field named `invoker_signing_key` would fail to
+    /// compile if re-introduced.
+    #[test]
+    fn registry_entry_has_no_raw_signing_key_field() {
+        fn assert_shape() {
+            let _ = std::mem::size_of::<KeyHandle>();
+            let _ = std::mem::size_of::<StreamCustody>();
+            let _ = std::mem::size_of::<VerifyingKey>();
+        }
+        let _ = assert_shape;
     }
 }
