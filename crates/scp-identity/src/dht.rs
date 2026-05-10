@@ -1954,24 +1954,58 @@ fn bind_old_document_to_old_did(
 ///
 /// # Verification Steps
 ///
-/// 1. **Migration proof (MODERATE assurance):** Verifies that the old Identity
-///    Key signed `SHA-256(DOMAIN_MIGRATION_V1 || u32_be(len(old_did)) ||
-///    old_did || u32_be(len(new_did)) || new_did || u64_be(rotated_at))`.
-///    Length prefixes (u32 big-endian for the DID strings and the implicit
-///    u64 big-endian width of `rotated_at`) prevent concatenation ambiguity
+/// Always-checked invariants (run on every call; correspond to invariants
+/// 1-7 in ADR-003 §4c):
+///
+/// 0. **Document self-cert binding (Step 0 precondition).** [`bind_old_document_to_old_did`]
+///    verifies that the `#0` verification method of the supplied `old_document`
+///    z-base-32-decodes (under the `did:dht:z` prefix interpretation) to bytes
+///    equal to the public key derivable from `old_did`. Rejects mismatched
+///    documents before any downstream invariant — notably Step 1c
+///    (STRONG-when-committed enforcement) — consults
+///    `old_document.pre_rotation_service()`. (ADR-003 invariant 1.)
+/// 1. **Migration proof signature (MODERATE assurance, invariant 2).**
+///    Verifies via `verify_strict` that the old Identity Key signed
+///    `SHA-256(DOMAIN_MIGRATION_V1 || u32_be(len(old_did)) || old_did ||
+///    u32_be(len(new_did)) || new_did || u64_be(rotated_at))`. Length
+///    prefixes (u32 big-endian for the DID strings and the implicit u64
+///    big-endian width of `rotated_at`) prevent concatenation ambiguity
 ///    between variable-length DID strings.
-/// 2. **Pre-rotation proof (STRONG assurance, optional):** If present, verifies
-///    ALL OF:
-///    - `SHA-256(pre_rot.revealed_key) == pre_rot.commitment` — the
-///      cryptographic invariant.
-///    - `pre_rot.commitment` matches the `PreRotationCommitment` service
-///      published in the **old DID document** — prevents an attacker from
-///      replaying a valid `PreRotationProof` with a different `commitment`
-///      value than the one the victim DID actually committed to.
-///    - `pre_rot.revealed_key` derives the **`new_did`** via
+///    - Step 1b. **`old_public_key` self-certifies to `old_did`
+///      (invariant 3).** `migration_proof.old_public_key` MUST
+///      z-base-32-encode (with the `did:dht:z` prefix) to exactly the
+///      `old_did` argument. did:dht is self-certifying — without this
+///      check, an attacker could substitute their own pubkey and a valid
+///      signature and forge "MODERATE assurance" migrations.
+///    - Step 1c. **STRONG-when-committed enforcement (invariant 7).** If
+///      the OLD DID document publishes a `PreRotationCommitment` service
+///      entry, `pre_rotation_proof` MUST be `Some(_)`. Rejects the silent
+///      downgrade to MODERATE-only when STRONG was committed to at
+///      creation time. Passes vacuously when both
+///      `pre_rotation_proof.is_none()` AND
+///      `old_document.pre_rotation_service().is_none()`.
+///
+/// Also always-checked: invariants 4, 5, 6 — `rotated_at` future-skew
+/// bound (saturating, [`MAX_FUTURE_SKEW_SECS`]), past-window bound
+/// (saturating, [`MAX_PAST_WINDOW_SECS`]), and the hard epoch floor at
+/// [`MIGRATION_EPOCH_FLOOR_UNIX_SECS`]. See the `now` parameter
+/// documentation below for rationale.
+///
+/// Conditional invariants — applied only when `pre_rotation_proof` is
+/// `Some(_)` (STRONG assurance; correspond to invariants 8-10):
+///
+/// 2. **Pre-rotation proof.** Verifies ALL OF:
+///    - 2a. `SHA-256(pre_rot.revealed_key) == pre_rot.commitment` — the
+///      cryptographic invariant (invariant 8).
+///    - 2b. `pre_rot.commitment` matches the `PreRotationCommitment`
+///      service published in the **old DID document** — prevents an
+///      attacker from replaying a valid `PreRotationProof` with a different
+///      `commitment` value than the one the victim DID actually committed
+///      to (invariant 9).
+///    - 2c. `pre_rot.revealed_key` derives the **`new_did`** via
 ///      `did:dht:z<z-base-32(revealed_key)>` — prevents a valid proof for
 ///      one new DID from being substituted under a different `new_did`
-///      string.
+///      string (invariant 10).
 ///
 /// Returns `true` only if all provided proofs verify successfully.
 ///

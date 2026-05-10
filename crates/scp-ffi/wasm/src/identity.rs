@@ -3979,6 +3979,8 @@ pub(crate) mod test_helpers {
         IDENTITY_REGISTRY.with(|reg| reg.borrow_mut().clear());
         PRE_ROTATION_REGISTRY.with(|reg| reg.borrow_mut().clear());
         PRE_ROTATION_NEXT_ID.with(|next| *next.borrow_mut() = 0);
+        MIGRATION_LINKS.with(|links| links.borrow_mut().clear());
+        LINK_ATTESTATIONS.with(|reg| reg.borrow_mut().clear());
     }
 }
 

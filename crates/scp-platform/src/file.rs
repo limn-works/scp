@@ -697,9 +697,14 @@ impl KeyCustody for FileKeyCustody {
             // doesn't contain, refuse to write rather than emitting a
             // malformed file with a clamped count.
             if removed_index >= current_count as usize {
+                tracing::error!(
+                    key_id,
+                    removed_index,
+                    current_count,
+                    "FileKeyCustody::destroy_key detected handle map / on-disk file desync — refusing to write corrupt state"
+                );
                 return Err(PlatformError::CustodyError(format!(
-                    "handle map desynchronized with key file: entry index {removed_index} \
-                     out of bounds for on-disk entry count {current_count}"
+                    "destroy_key: handle map references entry_index {removed_index} but file has {current_count} entries — refusing to write corrupt state"
                 )));
             }
 
@@ -1157,7 +1162,7 @@ mod tests {
         match err {
             PlatformError::CustodyError(msg) => {
                 assert!(
-                    msg.contains("handle map desynchronized with key file"),
+                    msg.contains("refusing to write corrupt state"),
                     "expected desync error, got: {msg}"
                 );
                 assert!(
