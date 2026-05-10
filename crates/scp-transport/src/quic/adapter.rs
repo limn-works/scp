@@ -322,9 +322,10 @@ impl TransportAdapter for QuicAdapter {
             // authoritative gate; this pre-check is a fast-path
             // optimization that narrows the relay-side leak window when
             // the cap is hit. A residual TOCTOU between this check and
-            // `insert_or_replace` is acceptable. (Broader QUIC error-path
-            // leak classes -- e.g., not finishing the send stream on
-            // intermediate failures -- are tracked separately.)
+            // `insert_or_replace` is acceptable: if the insert nonetheless
+            // fails in that window, the error path below finishes the send
+            // stream so a conforming relay can release any subscription state
+            // gracefully (whether it does is relay-implementation-dependent).
             if !self
                 .subscriptions
                 .contains(&RoutingId::new(routing_id_bytes))
@@ -345,28 +346,43 @@ impl TransportAdapter for QuicAdapter {
                 TransportError::SubscriptionFailed(format!("failed to open stream: {e}"))
             })?;
 
-            Self::write_client_message(&mut send, &msg)
-                .await
-                .map_err(|e| {
-                    TransportError::SubscriptionFailed(format!("failed to send SUBSCRIBE: {e}"))
-                })?;
-            // Do NOT finish the send stream -- subscribe stream stays open.
+            // Error paths between open_bi() and successful registration in
+            // `self.subscriptions` must call `send.finish()` before returning
+            // so the relay sees a graceful FIN rather than a stream RESET.
+            // RESET is a hard close; a FIN lets a conforming relay release any
+            // subscription state it created. Whether a given relay keys cleanup
+            // off the per-stream FIN is relay-implementation-dependent (SCP's
+            // own relay cleans up on connection-level close).
+            if let Err(e) = Self::write_client_message(&mut send, &msg).await {
+                let _ = send.finish();
+                return Err(TransportError::SubscriptionFailed(format!(
+                    "failed to send SUBSCRIBE: {e}"
+                )));
+            }
+            // Do NOT finish the send stream on the success path -- subscribe
+            // stream stays open and is moved into the spawned read loop below.
 
             // Read the OK/ERR response from the relay.
-            let response = Self::read_relay_message(&mut recv).await.map_err(|e| {
-                TransportError::SubscriptionFailed(format!(
-                    "failed to read SUBSCRIBE response: {e}"
-                ))
-            })?;
+            let response = match Self::read_relay_message(&mut recv).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = send.finish();
+                    return Err(TransportError::SubscriptionFailed(format!(
+                        "failed to read SUBSCRIBE response: {e}"
+                    )));
+                }
+            };
 
             match &response {
                 RelayMessage::Ok { .. } => {}
                 RelayMessage::Err { code, msg, .. } => {
+                    let _ = send.finish();
                     return Err(TransportError::SubscriptionFailed(format!(
                         "relay rejected subscription: {code}: {msg}"
                     )));
                 }
                 _ => {
+                    let _ = send.finish();
                     return Err(TransportError::ProtocolError(
                         "unexpected response to SUBSCRIBE".to_string(),
                     ));
@@ -380,14 +396,23 @@ impl TransportAdapter for QuicAdapter {
             // Store the subscription handle, replacing any previous one for
             // this routing ID (and cancelling the old read loop).
             let new_handle = SubscriptionHandle { cancel };
-            if let Some(prev) = self
+            match self
                 .subscriptions
                 .insert_or_replace(RoutingId::new(routing_id_bytes), new_handle)
-                .map_err(|e| {
-                    TransportError::SubscriptionFailed(format!("subscription map full: {e}"))
-                })?
             {
-                prev.cancel.cancel();
+                Ok(Some(prev)) => prev.cancel.cancel(),
+                Ok(None) => {}
+                Err(e) => {
+                    // Registration failed after IO (TOCTOU vs the pre-IO cap
+                    // check above); finish the send stream so the relay sees a
+                    // graceful FIN rather than a RESET, allowing a conforming
+                    // relay to release any subscription state it just created
+                    // (whether it does is relay-implementation-dependent).
+                    let _ = send.finish();
+                    return Err(TransportError::SubscriptionFailed(format!(
+                        "subscription map full: {e}"
+                    )));
+                }
             }
 
             // Create a channel for the subscription stream.

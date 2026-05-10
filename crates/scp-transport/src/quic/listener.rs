@@ -690,7 +690,12 @@ async fn read_client_message(mut recv: RecvStream) -> Result<ClientMessage, Stre
         .await
         .map_err(|e| StreamError::Read(e.to_string()))?;
 
-    ClientMessage::from_bytes(&buf).map_err(|e| StreamError::Protocol(e.to_string()))
+    // Drop the deserializer's Display string: rmp_serde can embed excerpts of
+    // the attacker-controlled malformed MessagePack bytes, which would then be
+    // logged at the stream-handler error site (error = %e). Keep a static
+    // description so no input bytes reach the relay's logs.
+    ClientMessage::from_bytes(&buf)
+        .map_err(|_| StreamError::Protocol("failed to deserialize message".to_string()))
 }
 
 /// Writes a relay message to a QUIC send stream.
