@@ -66,8 +66,8 @@ use scp_primitives::DID;
 use scp_protocol::context::outlets::OutletId;
 use scp_protocol::context::outlets::error_codes;
 use scp_protocol::context::outlets::stream::{
-    ChunkPayload, OutletStreamCancel, OutletStreamChunk, OutletStreamCredit, RequestId, sign_chunk,
-    verify_cancel_signature, verify_chunk_signature,
+    ChunkPayload, OutletStreamCancel, OutletStreamChunk, OutletStreamCredit, RequestId,
+    TerminateReason, sign_chunk, verify_cancel_signature, verify_chunk_signature,
 };
 use scp_protocol::economy::types::Amount;
 use scp_protocol::trust::caveats::InvocationCaveats;
@@ -208,16 +208,19 @@ pub struct OpenStreamParams {
     /// sign every chunk that crosses the outer wire boundary — both
     /// executor-emitted chunks (renumbered under the pump's sequence)
     /// and framework-emitted terminal chunks (cancel-ack-timeout,
-    /// credit-stall). Pinned at acceptance.
+    /// credit-stall, revoked-mid-stream). Pinned at acceptance.
     ///
-    /// `None` is reserved for legacy / test callers that have no key
-    /// to sign with. When `None` the pump emits the all-zero signature
-    /// placeholder and logs a `tracing::error!` so the gap is visible
-    /// in production telemetry — preferred over silently corrupting
-    /// the wire form. Production native FFI bridges always pass
-    /// `Some`; WASM passes the invoker key (operator==invoker per
+    /// Non-optional: every accepted stream MUST have a signing key.
+    /// The §5.4.5 wire contract is that every chunk crossing the outer
+    /// boundary carries a verifiable `SCP-OUTLET-CHUNK-SIG-V1:`
+    /// signature; emitting an unsigned `[0u8; 64]` placeholder would
+    /// silently corrupt the wire and let a receiver bill chunks under
+    /// a sig that no operator ever signed. Production native FFI
+    /// bridges always supplied `Some(...)`; tests construct a
+    /// throwaway `SigningKey` via `SigningKey::from_bytes(&[0u8; 32])`
+    /// or similar. WASM uses the invoker key (operator==invoker per
     /// ADR-034, single-process bridge).
-    pub operator_signing_key: Option<Arc<SigningKey>>,
+    pub operator_signing_key: Arc<SigningKey>,
     /// `ContextParams::stream_credit_stall_secs`.
     pub stream_credit_stall_secs: u32,
     /// `ContextParams::stream_cancel_ack_secs`.
@@ -270,16 +273,16 @@ pub(crate) struct SharedSessionState {
     /// to sign every chunk that crosses the outer wire boundary —
     /// executor-emitted chunks (re-signed under the pump's renumbered
     /// sequence) and framework-emitted terminal chunks (cancel-ack-
-    /// timeout, credit-stall). `None` only for legacy / test callers
-    /// that do not supply a key — the pump emits the all-zero sig
-    /// placeholder and logs a `tracing::error!` so the gap is visible.
-    pub operator_signing_key: Option<Arc<SigningKey>>,
+    /// timeout, credit-stall, revoked-mid-stream). Non-optional: see
+    /// [`OpenStreamParams::operator_signing_key`] for rationale.
+    pub operator_signing_key: Arc<SigningKey>,
     /// Receiver-side termination request. When `Some`, the pump
     /// emits a synthetic `Error{terminal:true}` chunk under the
     /// pinned operator key on its next iteration and breaks the
     /// loop. Set by [`StreamSessionHandle::terminate_with_error`]
-    /// per §5.4.5 receiver-side revocation re-check (UCAN
-    /// `RevokedMidStream`, `SCP-TOOL-6110`). The pump consumes the
+    /// per §5.4.5 framework-initiated termination paths (receiver-
+    /// side UCAN revocation re-check `RevokedMidStream`, executor
+    /// cancel-ack-timeout, credit-stall). The pump consumes the
     /// `Option` (`take()`) so a duplicate notification is a no-op
     /// and the synthetic chunk is emitted exactly once.
     pub pending_terminate: Option<PendingTerminate>,
@@ -288,18 +291,24 @@ pub(crate) struct SharedSessionState {
 /// Terminal-injection payload supplied by
 /// [`StreamSessionHandle::terminate_with_error`].
 ///
-/// Wraps the `(slug, code, message)` triple the SDK framework chose for
-/// the §5.4.5 receiver-side revocation termination so the pump can
-/// build the `ChunkPayload::Error{terminal:true}` chunk under the
-/// pinned operator key without retaking external state.
+/// Carries a closed-set [`TerminateReason`] (which deterministically
+/// maps to the §5.4.4 slug + code) plus an optional caller-supplied
+/// message extension. The slug and code are NEVER caller-controlled —
+/// they are derived from the enum on the pump side so attacker-
+/// controlled strings cannot enter the provenance record through the
+/// termination path.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingTerminate {
-    /// `SCP-TOOL-NNNN` error code recorded into the chunk payload.
-    pub code: String,
-    /// Human-readable message recorded into the chunk payload —
-    /// typically `format!("{slug}: {operator_message}")` per
-    /// §5.4.4 wire shape.
-    pub message: String,
+    /// Closed-set termination cause. Determines the slug and code of
+    /// the synthetic terminal chunk via [`TerminateReason::slug`] and
+    /// [`TerminateReason::code`].
+    pub reason: TerminateReason,
+    /// Optional caller-supplied human-readable extension. When `Some`,
+    /// the chunk's `message` field becomes
+    /// `format!("{slug}: {override}")`; when `None`, it becomes
+    /// `format!("{slug}: {default_message}")` per §5.4.4 wire shape.
+    /// The slug prefix is always derived from the enum.
+    pub message_override: Option<String>,
 }
 
 /// The 3-tuple of strings the admission tracker keys on. Kept as a
@@ -588,25 +597,33 @@ impl StreamSessionHandle {
     }
 
     /// Forces a terminal `Error{terminal:true}` chunk into the stream
-    /// under the pinned operator key (§5.4.5 receiver-side
-    /// revocation re-check).
+    /// under the pinned operator key, identified by a closed-set
+    /// [`TerminateReason`] (§5.4.5 framework-initiated termination).
     ///
     /// Per §5.4.5 "Revocation re-check cadence (receiver-side)" the
     /// SDK framework MUST re-check the opening UCAN's revocation
     /// status every `ContextParams::stream_ucan_recheck_secs` and on
     /// observed revocation MUST terminate the stream with
-    /// `OutletErrorClass::Authorization::RevokedMidStream` (slug
-    /// `authorization.revoked-mid-stream`, code `SCP-TOOL-6110`). This
+    /// `OutletErrorClass::Authorization::RevokedMidStream`. This
     /// method is the runtime entry point that performs that
     /// termination: it arms `pending_terminate` on the shared session
-    /// state, notifies the pump via `terminate_wake`, and the pump
-    /// emits a synthetic terminal chunk on its next iteration. The
-    /// chunk is signed under the pinned operator key (the same path
-    /// the cancel-ack-timeout / credit-stall framework chunks use) and
-    /// flows through the pump's settlement block so admission release,
-    /// escrow refund, and `OutletInvokedEvent` emission run end-to-end
-    /// — the audit log records the receiver-driven termination
-    /// identically to any other framework-emitted close.
+    /// state with the supplied [`TerminateReason`], notifies the pump
+    /// via `terminate_wake`, and the pump emits a synthetic terminal
+    /// chunk on its next iteration. The chunk is signed under the
+    /// pinned operator key (the same path the cancel-ack-timeout /
+    /// credit-stall framework chunks use) and flows through the
+    /// pump's settlement block so admission release, escrow refund,
+    /// and `OutletInvokedEvent` emission run end-to-end — the audit
+    /// log records the receiver-driven termination identically to any
+    /// other framework-emitted close.
+    ///
+    /// The slug and code carried by the synthetic chunk are derived
+    /// deterministically from `reason` via [`TerminateReason::slug`]
+    /// and [`TerminateReason::code`] — callers MUST NOT supply
+    /// free-form slug or code strings, so attacker-controlled inputs
+    /// cannot enter the provenance record through this path.
+    /// `message_override` is the only caller-controllable string and
+    /// is treated as a non-canonical human-readable suffix.
     ///
     /// Idempotent: a second call while the first is still pending
     /// returns [`TerminateError::AlreadyPending`]; calls after the
@@ -626,9 +643,8 @@ impl StreamSessionHandle {
     /// this call.
     pub fn terminate_with_error(
         &self,
-        slug: &str,
-        code: &str,
-        message: &str,
+        reason: TerminateReason,
+        message_override: Option<String>,
     ) -> Result<(), TerminateError> {
         let mut guard = self
             .state
@@ -638,8 +654,8 @@ impl StreamSessionHandle {
             return Err(TerminateError::AlreadyPending);
         }
         guard.pending_terminate = Some(PendingTerminate {
-            code: code.to_owned(),
-            message: format!("{slug}: {message}"),
+            reason,
+            message_override,
         });
         drop(guard);
         self.terminate_wake.notify_waiters();
@@ -746,7 +762,7 @@ fn build_shared_state(
         credit_stall_armed_at: None,
         cancel_ack_seq: None,
         next_emission_seq: 0,
-        operator_signing_key: params.operator_signing_key.clone(),
+        operator_signing_key: Arc::clone(&params.operator_signing_key),
         pending_terminate: None,
     }))
 }
@@ -934,7 +950,13 @@ where
         misdeclaration_sink,
         handler_panic_sink,
         None,
-        params.operator_signing_key.clone(),
+        // `invoke_outlet` accepts `Option<Arc<SigningKey>>` for the
+        // inner pump's signing path (legacy test callers may pass
+        // `None`); the dispatch path always has a real key, so wrap
+        // it in `Some` here. The outer pump path re-signs every chunk
+        // under the renumbered outer sequence with the non-optional
+        // key in `SharedSessionState::operator_signing_key`.
+        Some(Arc::clone(&params.operator_signing_key)),
         params.identity.caveats_binding,
     )
     .await
@@ -1001,9 +1023,9 @@ where
 /// each emission.
 #[derive(Clone)]
 struct PumpSigningContext {
-    /// Operator signing key. `None` for legacy / test callers; see
-    /// [`OpenStreamParams::operator_signing_key`].
-    operator_signing_key: Option<Arc<SigningKey>>,
+    /// Operator signing key. Pinned at acceptance; the pump never
+    /// emits an unsigned chunk.
+    operator_signing_key: Arc<SigningKey>,
     /// Hosting context id (committed into every preimage).
     context_id: String,
     /// Outlet id (committed into every preimage).
@@ -1017,54 +1039,83 @@ impl PumpSigningContext {
     /// pinned `(context_id, outlet_id, caveats_binding)` and returns
     /// the 64-byte signature.
     ///
-    /// Returns the all-zero placeholder + logs `tracing::error!` when
-    /// the operator key is `None` — this preserves the wire shape but
-    /// makes the gap visible to operators (the receiver will reject
-    /// such a chunk under the §5.4.5 verifier; the placeholder is a
-    /// last-ditch fallback for legacy / test callers that never wired
-    /// the key, never the production path).
+    /// Returns `Err(jcs_error_string)` only when JCS canonicalization
+    /// of the payload fails — which is a structural invariant
+    /// violation for a `ChunkPayload` constructed by this pump
+    /// (statically-typed, no floats, no cycles). On `Err` the pump
+    /// MUST log + break its loop rather than emit an unsigned chunk;
+    /// the receiver-side §5.4.5 verifier rejects any chunk whose sig
+    /// doesn't match the preimage, so the wire never carries a
+    /// silently-corrupt all-zero placeholder.
     fn sign_outer_chunk(
         &self,
         request_id: &RequestId,
         sequence: u64,
         payload: &scp_protocol::context::outlets::stream::ChunkPayload,
-    ) -> [u8; 64] {
-        let Some(key) = self.operator_signing_key.as_ref() else {
-            tracing::error!(
-                request_id = %hex::encode(request_id),
-                outlet_id = %self.outlet_id,
-                context_id = %self.context_id,
-                sequence,
-                "dispatch pump: operator_signing_key is None — emitting unsigned chunk (legacy/test path)"
-            );
-            return [0u8; 64];
-        };
-        match sign_chunk(
-            key,
+    ) -> Result<[u8; 64], String> {
+        sign_chunk(
+            &self.operator_signing_key,
             &self.context_id,
             &self.outlet_id,
             request_id,
             sequence,
             &self.caveats_binding,
             payload,
-        ) {
-            Ok(sig) => sig,
+        )
+    }
+
+    /// Builds a fully-formed signed [`OutletStreamChunk`] for the
+    /// given `(sequence, payload)` pair.
+    ///
+    /// Returns `None` only when [`Self::sign_outer_chunk`] fails JCS
+    /// canonicalization — a structural invariant violation in the
+    /// pump. On `None` the caller logs the error and breaks the
+    /// pump loop without emitting; this guarantees the test
+    /// invariant "no chunk emitted by the pump ever has
+    /// `sig == [0u8; 64]`" because we never construct an unsigned
+    /// chunk on the failure path.
+    fn try_build_signed_chunk(
+        &self,
+        request_id: RequestId,
+        sequence: u64,
+        payload: ChunkPayload,
+    ) -> Option<OutletStreamChunk> {
+        match self.sign_outer_chunk(&request_id, sequence, &payload) {
+            Ok(sig) => Some(OutletStreamChunk {
+                request_id,
+                sequence,
+                payload,
+                sig,
+            }),
             Err(e) => {
-                // JCS canonicalization should never fail for a valid
-                // ChunkPayload; if it ever does, surface the error and
-                // fall back to the placeholder rather than panic the
-                // pump task.
                 tracing::error!(
                     request_id = %hex::encode(request_id),
                     outlet_id = %self.outlet_id,
                     context_id = %self.context_id,
                     sequence,
                     error = %e,
-                    "dispatch pump: failed to sign chunk — emitting unsigned placeholder"
+                    "dispatch pump: chunk signing failed (JCS canonicalization) — \
+                     pump will break without emitting; downstream receiver sees stream end"
                 );
-                [0u8; 64]
+                None
             }
         }
+    }
+}
+
+/// Builds the synthetic terminal `Error{terminal:true}` payload from a
+/// pending-terminate request. The slug is committed verbatim as the
+/// chunk message prefix so the receiver records the canonical §5.4.4
+/// slug regardless of what override the caller supplied.
+fn build_pending_terminate_payload(pt: &PendingTerminate) -> ChunkPayload {
+    let suffix = pt
+        .message_override
+        .as_deref()
+        .unwrap_or_else(|| pt.reason.default_message());
+    ChunkPayload::Error {
+        code: pt.reason.code().to_owned(),
+        message: format!("{slug}: {suffix}", slug = pt.reason.slug()),
+        terminal: true,
     }
 }
 
@@ -1096,7 +1147,7 @@ async fn run_stream_pump_v2(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let identity = guard.credit.identity().clone();
         PumpSigningContext {
-            operator_signing_key: guard.operator_signing_key.clone(),
+            operator_signing_key: Arc::clone(&guard.operator_signing_key),
             context_id: identity.context_id,
             outlet_id: identity.outlet_id,
             caveats_binding: identity.caveats_binding,
@@ -1122,17 +1173,12 @@ async fn run_stream_pump_v2(
             guard.pending_terminate.take()
         };
         if let Some(pt) = pending {
-            let payload = ChunkPayload::Error {
-                code: pt.code,
-                message: pt.message,
-                terminal: true,
-            };
-            let sig = signing_ctx.sign_outer_chunk(&request_id, next_seq, &payload);
-            let chunk = OutletStreamChunk {
-                request_id,
-                sequence: next_seq,
-                payload,
-                sig,
+            let payload = build_pending_terminate_payload(&pt);
+            let Some(chunk) = signing_ctx.try_build_signed_chunk(request_id, next_seq, payload)
+            else {
+                // Signing failed: pump breaks without emitting.
+                // `try_build_signed_chunk` already logged the cause.
+                break;
             };
             emitted_chunks.push(chunk.clone());
             let _ = outer_tx.send(chunk).await;
@@ -1180,12 +1226,10 @@ async fn run_stream_pump_v2(
                 biased;
                 () = cancel_timer_fut => {
                     let payload = CancelAckTracker::cancel_ack_timeout_payload();
-                    let sig = signing_ctx.sign_outer_chunk(&request_id, next_seq, &payload);
-                    let chunk = OutletStreamChunk {
-                        request_id,
-                        sequence: next_seq,
-                        payload,
-                        sig,
+                    let Some(chunk) =
+                        signing_ctx.try_build_signed_chunk(request_id, next_seq, payload)
+                    else {
+                        break;
                     };
                     emitted_chunks.push(chunk.clone());
                     let _ = outer_tx.send(chunk).await;
@@ -1193,12 +1237,10 @@ async fn run_stream_pump_v2(
                 }
                 () = credit_timer_fut => {
                     let payload = CancelAckTracker::credit_stall_payload();
-                    let sig = signing_ctx.sign_outer_chunk(&request_id, next_seq, &payload);
-                    let chunk = OutletStreamChunk {
-                        request_id,
-                        sequence: next_seq,
-                        payload,
-                        sig,
+                    let Some(chunk) =
+                        signing_ctx.try_build_signed_chunk(request_id, next_seq, payload)
+                    else {
+                        break;
                     };
                     emitted_chunks.push(chunk.clone());
                     let _ = outer_tx.send(chunk).await;
@@ -1224,12 +1266,10 @@ async fn run_stream_pump_v2(
                 biased;
                 () = cancel_timer_fut => {
                     let payload = CancelAckTracker::cancel_ack_timeout_payload();
-                    let sig = signing_ctx.sign_outer_chunk(&request_id, next_seq, &payload);
-                    let chunk = OutletStreamChunk {
-                        request_id,
-                        sequence: next_seq,
-                        payload,
-                        sig,
+                    let Some(chunk) =
+                        signing_ctx.try_build_signed_chunk(request_id, next_seq, payload)
+                    else {
+                        break;
                     };
                     emitted_chunks.push(chunk.clone());
                     let _ = outer_tx.send(chunk).await;
@@ -1237,12 +1277,10 @@ async fn run_stream_pump_v2(
                 }
                 () = credit_timer_fut => {
                     let payload = CancelAckTracker::credit_stall_payload();
-                    let sig = signing_ctx.sign_outer_chunk(&request_id, next_seq, &payload);
-                    let chunk = OutletStreamChunk {
-                        request_id,
-                        sequence: next_seq,
-                        payload,
-                        sig,
+                    let Some(chunk) =
+                        signing_ctx.try_build_signed_chunk(request_id, next_seq, payload)
+                    else {
+                        break;
                     };
                     emitted_chunks.push(chunk.clone());
                     let _ = outer_tx.send(chunk).await;
@@ -1300,7 +1338,6 @@ async fn run_stream_pump_v2(
         match outcome {
             StreamGateOutcome::Forward => {
                 let seq = next_seq;
-                next_seq = next_seq.saturating_add(1);
                 // §5.4.5 per-chunk operator signature MUST cover the
                 // outer (renumbered) sequence. The inner pump's chunk
                 // bears a sig under the inner-pump sequence which the
@@ -1309,28 +1346,31 @@ async fn run_stream_pump_v2(
                 // can verify each chunk against `chunk.sequence` as
                 // delivered. Without this, the inner sig is dead weight
                 // (verifies under a sequence the wire never carries).
-                let sig = signing_ctx.sign_outer_chunk(&request_id, seq, &chunk.payload);
-                let final_chunk = OutletStreamChunk {
-                    request_id,
-                    sequence: seq,
-                    payload: chunk.payload.clone(),
-                    sig,
+                let Some(final_chunk) =
+                    signing_ctx.try_build_signed_chunk(request_id, seq, chunk.payload.clone())
+                else {
+                    // Signing failed: do not advance `next_seq`, do not
+                    // emit, break out. Receiver sees stream end without
+                    // an unsigned chunk on the wire.
+                    break;
                 };
+                // Only advance the emission cursor AFTER signing
+                // succeeded — a failed-signature path must not burn a
+                // sequence number.
+                next_seq = next_seq.saturating_add(1);
                 // Crisp invariant: every chunk reaching a bridge consumer
                 // verifies under the pinned operator key. In debug
                 // builds we re-verify the sig we just produced, so a
                 // signing-vs-verifying preimage drift surfaces in tests
                 // before any production member observes a bad chunk.
                 debug_assert!(
-                    signing_ctx.operator_signing_key.as_ref().is_none_or(|key| {
-                        verify_chunk_signature(
-                            &final_chunk,
-                            &key.verifying_key(),
-                            &signing_ctx.context_id,
-                            &signing_ctx.outlet_id,
-                            &signing_ctx.caveats_binding,
-                        )
-                    }),
+                    verify_chunk_signature(
+                        &final_chunk,
+                        &signing_ctx.operator_signing_key.verifying_key(),
+                        &signing_ctx.context_id,
+                        &signing_ctx.outlet_id,
+                        &signing_ctx.caveats_binding,
+                    ),
                     "dispatch pump: just-signed chunk fails to verify under the pinned operator key — \
                      signing/verifying preimage drift",
                 );
@@ -1542,7 +1582,7 @@ mod tests {
             credit_stall_armed_at: None,
             cancel_ack_seq: None,
             next_emission_seq: 0,
-            operator_signing_key: Some(signing),
+            operator_signing_key: signing,
             pending_terminate: None,
         }))
     }
@@ -1604,9 +1644,8 @@ mod tests {
 
         handle
             .terminate_with_error(
-                "authorization.revoked-mid-stream",
-                "SCP-TOOL-6110",
-                "ucan revoked mid-stream",
+                TerminateReason::RevokedMidStream,
+                Some("ucan revoked mid-stream".to_owned()),
             )
             .expect("terminate accepted");
 
@@ -1616,6 +1655,22 @@ mod tests {
             .await
             .expect("pump emits synthetic terminal within 2s")
             .expect("chunk arrives");
+        // Crisp invariant for the [0u8;64] placeholder deletion: the
+        // synthetic terminal chunk MUST carry a real signature, never
+        // the all-zero placeholder. Regression-pin this so a future
+        // refactor that re-introduces an unsigned-fallback branch
+        // surfaces here rather than as a wire-level corruption.
+        assert_ne!(
+            chunk.sig, [0u8; 64],
+            "pump emitted synthetic terminal chunk with all-zero sig — \
+             placeholder fallback re-introduced"
+        );
+        // The slug + code MUST come from the closed-set
+        // `TerminateReason::RevokedMidStream`, not from any
+        // caller-supplied string. `message_override` is the only
+        // caller-controllable field and appears as a suffix only.
+        let expected_slug = TerminateReason::RevokedMidStream.slug();
+        let expected_code = TerminateReason::RevokedMidStream.code();
         let ChunkPayload::Error {
             code,
             message,
@@ -1626,10 +1681,10 @@ mod tests {
             // — anything else is a regression in the eager-check loop entry.
             unreachable!("expected terminal Error chunk");
         };
-        assert_eq!(code, "SCP-TOOL-6110");
+        assert_eq!(code, expected_code);
         assert!(
-            message.contains("authorization.revoked-mid-stream"),
-            "message must carry slug prefix: {message}"
+            message.starts_with(&format!("{expected_slug}: ")),
+            "message must start with the canonical slug prefix from the enum: {message}"
         );
         assert!(message.contains("ucan revoked mid-stream"));
         assert!(terminal, "terminate must emit `terminal: true`");
@@ -1643,6 +1698,15 @@ mod tests {
         let summary = summary_rx.await.expect("summary published");
         assert_eq!(summary.stream_chunk_count, 1);
         assert_eq!(summary.manifest.len(), 1);
+        // §test #6 invariant: every chunk in the manifest MUST have a
+        // non-placeholder signature. Closes the [0u8;64] deletion gap.
+        for (i, c) in summary.manifest.iter().enumerate() {
+            assert_ne!(
+                c.sig, [0u8; 64],
+                "manifest chunk[{i}] has all-zero sig — placeholder \
+                 emission path re-introduced"
+            );
+        }
     }
 
     /// `terminate_with_error` is idempotent: a second call while the
@@ -1667,12 +1731,116 @@ mod tests {
 
         // First call wins.
         handle
-            .terminate_with_error("a.b", "SCP-TOOL-6110", "first")
+            .terminate_with_error(TerminateReason::RevokedMidStream, Some("first".to_owned()))
             .expect("first terminate accepted");
         // Second call sees pending → AlreadyPending.
         let err = handle
-            .terminate_with_error("a.b", "SCP-TOOL-6110", "second")
+            .terminate_with_error(TerminateReason::RevokedMidStream, Some("second".to_owned()))
             .expect_err("second terminate rejected");
         assert!(matches!(err, TerminateError::AlreadyPending));
+    }
+
+    /// `terminate_with_error` derives the slug+code from the supplied
+    /// [`TerminateReason`] variant, NOT from caller input. Each
+    /// closed-set variant maps to its canonical slug+code; the
+    /// caller's optional `message_override` is only a human-readable
+    /// suffix and never reshapes the slug prefix.
+    #[tokio::test]
+    async fn terminate_with_error_slug_and_code_derived_from_reason_enum() {
+        for reason in [
+            TerminateReason::RevokedMidStream,
+            TerminateReason::CancelAckTimeout,
+            TerminateReason::CreditStall,
+        ] {
+            let state = build_test_state();
+            let grant_wake = Arc::new(Notify::new());
+            let cancel_wake = Arc::new(Notify::new());
+            let terminate_wake = Arc::new(Notify::new());
+            let (_inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(16);
+            let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
+            let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
+            let request_id: RequestId = [0x55; 16];
+
+            let pump_state = Arc::clone(&state);
+            let pump_grant = Arc::clone(&grant_wake);
+            let pump_cancel = Arc::clone(&cancel_wake);
+            let pump_terminate = Arc::clone(&terminate_wake);
+            let pump_handle = tokio::spawn(async move {
+                run_stream_pump_v2(
+                    pump_state,
+                    pump_grant,
+                    pump_cancel,
+                    pump_terminate,
+                    inner_rx,
+                    outer_tx,
+                    summary_tx,
+                    Duration::from_secs(30),
+                    Duration::from_secs(5),
+                    request_id,
+                    PumpEventEmissionInputs {
+                        sink: None,
+                        context_id: "ctx-test".to_owned(),
+                        outlet_id: "outlet-test".to_owned(),
+                        invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),
+                        input_hash: "0".repeat(64),
+                        start: Instant::now(),
+                    },
+                )
+                .await;
+            });
+
+            let handle = StreamSessionHandle {
+                receiver: None,
+                state: Arc::clone(&state),
+                grant_wake: Arc::clone(&grant_wake),
+                cancel_wake: Arc::clone(&cancel_wake),
+                terminate_wake: Arc::clone(&terminate_wake),
+                summary_rx: None,
+                request_id,
+            };
+
+            // Pass a deliberately-misleading message_override to prove
+            // the slug is NEVER caller-derived. The chunk message MUST
+            // be `{enum_slug}: {override}`; an attacker who supplies
+            // `"authorization.attacker-injected"` cannot reach the slug.
+            handle
+                .terminate_with_error(reason, Some("authorization.attacker-injected".to_owned()))
+                .expect("terminate accepted");
+
+            let chunk = tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
+                .await
+                .expect("pump emits synthetic terminal within 2s")
+                .expect("chunk arrives");
+            assert_ne!(
+                chunk.sig, [0u8; 64],
+                "sig MUST NOT be all-zero placeholder for reason {reason:?}"
+            );
+            let ChunkPayload::Error { code, message, .. } = chunk.payload else {
+                unreachable!("expected terminal Error chunk for reason {reason:?}");
+            };
+            // Canonical slug+code from the enum, not from the override.
+            assert_eq!(code, reason.code(), "reason {reason:?} must use enum code");
+            assert!(
+                message.starts_with(&format!("{}: ", reason.slug())),
+                "reason {reason:?} must prefix the message with its enum slug, got: {message}"
+            );
+            // Attacker-controlled string MUST NOT appear as the slug
+            // prefix. It is permitted to appear as the suffix (human
+            // text), but the canonical slug from the enum wins.
+            assert!(
+                !message.starts_with("authorization.attacker-injected"),
+                "attacker-supplied string leaked into slug position for reason {reason:?}: \
+                 {message}"
+            );
+
+            pump_handle.await.expect("pump settles");
+            let summary = summary_rx.await.expect("summary published");
+            for c in &summary.manifest {
+                assert_ne!(
+                    c.sig, [0u8; 64],
+                    "manifest chunk has all-zero sig for reason {reason:?}"
+                );
+            }
+        }
     }
 }

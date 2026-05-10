@@ -36,6 +36,31 @@ import type {
 } from "../types";
 
 // ---------------------------------------------------------------------------
+// TerminateReason — closed-set framework stream-termination causes (§5.4.5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Closed-set slug identifying a framework-initiated stream termination
+ * cause (§5.4.5). Mirrors the Rust protocol-layer
+ * `scp_protocol::context::outlets::stream::TerminateReason` enum. The
+ * bridge accepts only these three values; any other string is rejected
+ * with a Validation error so attacker-controlled slug strings cannot
+ * enter the provenance record.
+ *
+ * - `"authorization.revoked-mid-stream"` — periodic UCAN re-check
+ *   observed token revoked since stream open (`SCP-TOOL-6110`).
+ * - `"execution.cancel-ack-timeout"` — executor failed to emit a
+ *   terminal chunk within `stream_cancel_ack_secs` after
+ *   `OutletCancel` arrival (`SCP-TOOL-6135`).
+ * - `"execution.credit-stall"` — credit window remained at zero
+ *   past `stream_credit_stall_secs` (`SCP-TOOL-6133`).
+ */
+export type TerminateReasonSlug =
+  | "authorization.revoked-mid-stream"
+  | "execution.cancel-ack-timeout"
+  | "execution.credit-stall";
+
+// ---------------------------------------------------------------------------
 // Bridge interface — the contract both native and WASM bridges implement
 // ---------------------------------------------------------------------------
 
@@ -374,21 +399,30 @@ export interface Bridge {
 
   /**
    * Forces a terminal `Error{terminal:true}` chunk into the active
-   * stream (§5.4.5 receiver-side revocation re-check, `RevokedMidStream`
-   * / `SCP-TOOL-6110`). Called by the SDK framework's periodic UCAN
-   * re-check loop when it observes the opening UCAN has been revoked
-   * since stream open. The runtime emits a synthetic terminal Error
-   * chunk under the pinned operator key; the SDK's chunk consumer
-   * receives it as the next chunk and the stream closes naturally.
+   * stream (§5.4.5 framework-initiated stream termination). Called by
+   * the SDK framework's periodic UCAN re-check loop with `reason =
+   * "authorization.revoked-mid-stream"` when it observes the opening
+   * UCAN has been revoked since stream open. The runtime emits a
+   * synthetic terminal Error chunk under the pinned operator key;
+   * the SDK's chunk consumer receives it as the next chunk and the
+   * stream closes naturally.
+   *
+   * `reason` MUST be one of the closed-set §5.4.4 slugs registered
+   * in the protocol-layer `TerminateReason` enum (exported below as
+   * the `TerminateReasonSlug` union). The slug and §5.4.4 code of
+   * the synthetic chunk are derived from this value on the bridge —
+   * caller-supplied slug/code strings are no longer accepted.
+   * `messageOverride` is the only caller-controlled string; pass
+   * `null` / `undefined` to use the spec's canonical default
+   * message.
    *
    * `callerDid` MUST match the pinned invoker DID at stream open.
    */
   outletStreamTerminate(
     requestIdHex: string,
     callerDid: string,
-    slug: string,
-    code: string,
-    message: string,
+    reason: TerminateReasonSlug,
+    messageOverride: string | null,
   ): Promise<void>;
 
   /**

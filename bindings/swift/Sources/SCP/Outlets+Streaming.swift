@@ -261,9 +261,8 @@ func makeRevocationRecheckTask(
                 _ = try? await OutletStream.terminate(
                     requestIdHex: requestIdHex,
                     callerDid: invokerDid,
-                    slug: "authorization.revoked-mid-stream",
-                    code: "SCP-TOOL-6110",
-                    message: "ucan revoked or invalid mid-stream"
+                    reason: .revokedMidStream,
+                    messageOverride: "ucan revoked or invalid mid-stream"
                 )
                 return
             }
@@ -434,23 +433,27 @@ public enum OutletsStreaming {
     }
 
     /// Forces a terminal `Error{terminal:true}` chunk into an active
-    /// stream (§5.4.5 receiver-side revocation re-check,
-    /// `RevokedMidStream` / `SCP-TOOL-6110`).
+    /// stream (§5.4.5 framework-initiated stream termination).
+    ///
+    /// `reason` is a closed-set enum mirroring the Rust protocol-layer
+    /// `TerminateReason`. The bridge derives the canonical §5.4.4 slug
+    /// + code from this value — caller-supplied slug/code strings are
+    /// no longer accepted. `messageOverride` is the only caller-
+    /// controlled string; pass `nil` to use the spec's canonical
+    /// default message.
     ///
     /// `callerDid` MUST match the pinned invoker DID (CRITICAL #1).
     public static func terminate(
         requestIdHex: String,
         callerDid: String,
-        slug: String,
-        code: String,
-        message: String
+        reason: TerminateReason,
+        messageOverride: String?
     ) async throws {
         try await outletStreamTerminate(
             requestIdHex: requestIdHex,
             callerDid: callerDid,
-            slug: slug,
-            code: code,
-            message: message
+            reason: reason,
+            messageOverride: messageOverride
         )
     }
 }

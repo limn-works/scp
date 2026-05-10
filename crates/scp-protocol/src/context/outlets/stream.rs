@@ -72,9 +72,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::context::outlets::error_codes::{
-    CODE_AUTHORIZATION_DENIED, CODE_PROTOCOL_SESSION, CODE_PROTOCOL_VIOLATION,
-    SLUG_AUTHORIZATION_ATTENUATION_VIOLATION, SLUG_AUTHORIZATION_REVOKED_MID_STREAM,
-    SLUG_PROTOCOL_STREAM_ALREADY_OPEN, SLUG_PROTOCOL_UNKNOWN_SESSION,
+    CODE_AUTHORIZATION_DENIED, CODE_EXECUTION_CANCEL_ACK_TIMEOUT, CODE_EXECUTION_CREDIT_STALL,
+    CODE_PROTOCOL_SESSION, CODE_PROTOCOL_VIOLATION, SLUG_AUTHORIZATION_ATTENUATION_VIOLATION,
+    SLUG_AUTHORIZATION_REVOKED_MID_STREAM, SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
+    SLUG_EXECUTION_CREDIT_STALL, SLUG_PROTOCOL_STREAM_ALREADY_OPEN, SLUG_PROTOCOL_UNKNOWN_SESSION,
 };
 use crate::context::outlets::errors::OutletErrorClass;
 use crate::context::outlets::{OutletId, OutletKind};
@@ -865,6 +866,131 @@ pub enum StreamTerminalStatus {
     Error(String),
     /// Stream was cancelled (the cancel-ack chunk closed it).
     Cancelled,
+}
+
+// ---------------------------------------------------------------------------
+// TerminateReason — closed set of framework-side stream termination causes
+// ---------------------------------------------------------------------------
+
+/// Closed set of framework-emitted stream termination causes (§5.4.5).
+///
+/// This is the canonical enumeration of reasons the runtime / framework
+/// MAY force-close a stream with a synthetic terminal `Error{terminal:true}`
+/// chunk. Every variant maps deterministically to a §5.4.4 slug + code +
+/// canonical default message via [`Self::slug`], [`Self::code`], and
+/// [`Self::default_message`]. Callers MUST NOT supply free-form slug or
+/// code strings — those are derived from the enum so attacker-controlled
+/// strings cannot enter the provenance record through the termination path.
+///
+/// # Spec source
+///
+/// Spec §5.4.5 defines exactly three framework-side termination causes:
+///
+/// - "Revocation re-check cadence (receiver-side)" → [`RevokedMidStream`]
+///   (slug `authorization.revoked-mid-stream`, code `SCP-TOOL-6110`). The
+///   receiver-side SDK framework periodic UCAN re-check observes the
+///   opening token revoked since stream open and force-closes within
+///   `stream_ucan_recheck_secs`.
+/// - "Cancellation and billing boundary" → [`CancelAckTimeout`] (slug
+///   `execution.cancel-ack-timeout`, code `SCP-TOOL-6135`). The executor
+///   failed to emit a terminal chunk within `stream_cancel_ack_secs`
+///   after `OutletCancel` arrival.
+/// - Credit-stall timer → [`CreditStall`] (slug `execution.credit-stall`,
+///   code `SCP-TOOL-6133`). The credit window remained at zero past
+///   `stream_credit_stall_secs` and no fresh grant arrived.
+///
+/// Any termination cause not in this set is not a legitimate framework
+/// close — it is either an executor-emitted terminal (which the executor
+/// produces directly, never through this enum) or an architectural gap
+/// (which is a code bug, not a new variant). Adding a variant requires
+/// a corresponding slug allocation in [`super::error_codes`] and a spec
+/// change in §5.4.5.
+///
+/// [`RevokedMidStream`]: Self::RevokedMidStream
+/// [`CancelAckTimeout`]: Self::CancelAckTimeout
+/// [`CreditStall`]: Self::CreditStall
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TerminateReason {
+    /// `authorization.revoked-mid-stream` / `SCP-TOOL-6110` — UCAN
+    /// revocation re-check observed the opening token revoked since
+    /// stream open. The receiver-side SDK framework drives this path
+    /// via the periodic re-check loop.
+    RevokedMidStream,
+    /// `execution.cancel-ack-timeout` / `SCP-TOOL-6135` — executor failed
+    /// to emit a terminal chunk within `stream_cancel_ack_secs` after
+    /// `OutletCancel` arrival. The framework forces the stream closed
+    /// at the next-to-emit sequence (§5.4.5 cancel-ack timer).
+    CancelAckTimeout,
+    /// `execution.credit-stall` / `SCP-TOOL-6133` — credit window
+    /// remained at zero past `stream_credit_stall_secs` and no fresh
+    /// grant arrived. The framework forces the stream closed.
+    CreditStall,
+}
+
+impl TerminateReason {
+    /// Returns the §5.4.4 slug for this termination cause.
+    ///
+    /// Static, never derived from caller input. The slug uniquely
+    /// identifies the termination path in the §5.4.4 catalog and is
+    /// committed verbatim into the synthetic terminal chunk's message
+    /// (prefixed before any [`Self::default_message`] / caller-supplied
+    /// override).
+    #[must_use]
+    pub const fn slug(&self) -> &'static str {
+        match self {
+            Self::RevokedMidStream => SLUG_AUTHORIZATION_REVOKED_MID_STREAM,
+            Self::CancelAckTimeout => SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
+            Self::CreditStall => SLUG_EXECUTION_CREDIT_STALL,
+        }
+    }
+
+    /// Returns the §5.4.4 `SCP-TOOL-NNNN` code for this termination
+    /// cause. Static; never caller-derived.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::RevokedMidStream => CODE_AUTHORIZATION_DENIED,
+            Self::CancelAckTimeout => CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
+            Self::CreditStall => CODE_EXECUTION_CREDIT_STALL,
+        }
+    }
+
+    /// Returns the canonical default message string the framework
+    /// emits when no caller override is supplied.
+    ///
+    /// Matches the strings produced by
+    /// [`super::super::stream::CancelAckTracker::cancel_ack_timeout_payload`]
+    /// and `credit_stall_payload` in the runtime so a `TerminateReason`-
+    /// driven terminal chunk is byte-identical to a timer-driven one
+    /// (modulo the operator signature, which depends on `request_id` /
+    /// `sequence` and is necessarily distinct per stream).
+    #[must_use]
+    pub const fn default_message(&self) -> &'static str {
+        match self {
+            Self::RevokedMidStream => "ucan revoked mid-stream",
+            Self::CancelAckTimeout => {
+                "executor failed to emit terminal chunk within stream_cancel_ack_secs"
+            }
+            Self::CreditStall => "credit window remained at zero past stream_credit_stall_secs",
+        }
+    }
+
+    /// Parses a slug string back to a [`TerminateReason`] variant.
+    ///
+    /// Used by the `PyO3` / NAPI bridges that accept a slug `&str` /
+    /// `string` on the wire (per-language idiom — Python and JS
+    /// developers expect string identifiers, not opaque integers).
+    /// Returns `None` for unknown slugs; callers must surface a
+    /// `Validation` error to the SDK rather than silently defaulting.
+    #[must_use]
+    pub fn from_slug(slug: &str) -> Option<Self> {
+        match slug {
+            SLUG_AUTHORIZATION_REVOKED_MID_STREAM => Some(Self::RevokedMidStream),
+            SLUG_EXECUTION_CANCEL_ACK_TIMEOUT => Some(Self::CancelAckTimeout),
+            SLUG_EXECUTION_CREDIT_STALL => Some(Self::CreditStall),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2436,5 +2562,97 @@ mod tests {
         // module so future runtime wiring (SCP-OUT-033) can use the
         // existing typed alias rather than a re-declared `String`.
         let _: crate::context::outlets::interface::ContextId = "ctx".into();
+    }
+
+    // -----------------------------------------------------------------------
+    // TerminateReason — closed-set framework-termination cause mapping
+    // -----------------------------------------------------------------------
+
+    /// Each `TerminateReason` variant maps to the §5.4.4 catalog slug
+    /// it is documented to surface. Pinning the mapping in a test
+    /// guarantees a future variant rename / re-route surfaces here
+    /// rather than as a silent provenance corruption.
+    #[test]
+    fn terminate_reason_slug_matches_5_4_4_catalog() {
+        use crate::context::outlets::error_codes::{
+            SLUG_AUTHORIZATION_REVOKED_MID_STREAM, SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
+            SLUG_EXECUTION_CREDIT_STALL,
+        };
+        assert_eq!(
+            TerminateReason::RevokedMidStream.slug(),
+            SLUG_AUTHORIZATION_REVOKED_MID_STREAM
+        );
+        assert_eq!(
+            TerminateReason::CancelAckTimeout.slug(),
+            SLUG_EXECUTION_CANCEL_ACK_TIMEOUT
+        );
+        assert_eq!(
+            TerminateReason::CreditStall.slug(),
+            SLUG_EXECUTION_CREDIT_STALL
+        );
+    }
+
+    /// Each `TerminateReason` variant maps to the `SCP-TOOL-NNNN` code
+    /// allocated to its §5.4.4 class. Same regression-pinning rationale
+    /// as the slug test.
+    #[test]
+    fn terminate_reason_code_matches_5_4_4_allocation() {
+        use crate::context::outlets::error_codes::{
+            CODE_AUTHORIZATION_DENIED, CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
+            CODE_EXECUTION_CREDIT_STALL,
+        };
+        assert_eq!(
+            TerminateReason::RevokedMidStream.code(),
+            CODE_AUTHORIZATION_DENIED
+        );
+        assert_eq!(
+            TerminateReason::CancelAckTimeout.code(),
+            CODE_EXECUTION_CANCEL_ACK_TIMEOUT
+        );
+        assert_eq!(
+            TerminateReason::CreditStall.code(),
+            CODE_EXECUTION_CREDIT_STALL
+        );
+    }
+
+    /// `from_slug` round-trips every variant. Unknown slugs return
+    /// `None` so callers can surface a `Validation` error rather than
+    /// silently defaulting to a wrong cause.
+    #[test]
+    fn terminate_reason_from_slug_roundtrips_and_rejects_unknown() {
+        for r in [
+            TerminateReason::RevokedMidStream,
+            TerminateReason::CancelAckTimeout,
+            TerminateReason::CreditStall,
+        ] {
+            assert_eq!(TerminateReason::from_slug(r.slug()), Some(r));
+        }
+        assert_eq!(TerminateReason::from_slug(""), None);
+        assert_eq!(TerminateReason::from_slug("not-a-real-slug"), None);
+        // Attacker-controlled string that LOOKS like a slug but is not
+        // in the §5.4.4 catalog must fail closed.
+        assert_eq!(
+            TerminateReason::from_slug("authorization.attacker-injected"),
+            None
+        );
+    }
+
+    /// Default messages are non-empty and contain no slug colon prefix
+    /// (the caller is expected to prefix the slug; the default message
+    /// is the suffix only).
+    #[test]
+    fn terminate_reason_default_messages_are_non_empty_and_unprefixed() {
+        for r in [
+            TerminateReason::RevokedMidStream,
+            TerminateReason::CancelAckTimeout,
+            TerminateReason::CreditStall,
+        ] {
+            let msg = r.default_message();
+            assert!(!msg.is_empty(), "empty default message for {r:?}");
+            assert!(
+                !msg.contains(": "),
+                "default message must not carry its own slug prefix: {msg:?}"
+            );
+        }
     }
 }

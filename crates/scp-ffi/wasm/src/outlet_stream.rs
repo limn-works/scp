@@ -501,9 +501,42 @@ pub fn outlet_stream_cancel(request_id_hex: String, caller_did: String) -> Promi
 // outletStreamTerminate — receiver-side revocation re-check (§5.4.5)
 // ---------------------------------------------------------------------------
 
+/// Wire-stable integer code for the `RevokedMidStream` variant of
+/// [`scp_protocol::context::outlets::stream::TerminateReason`].
+///
+/// What the WASM bridge accepts on the `outletStreamTerminate` surface.
+/// The TypeScript SDK exports these constants so callers reference them
+/// by name (`TERMINATE_REASON_REVOKED_MID_STREAM`) rather than magic
+/// numbers. New variants MUST allocate a fresh monotonically-increasing
+/// code; reusing a retired code would silently re-route past stream-
+/// termination call sites.
+pub const TERMINATE_REASON_REVOKED_MID_STREAM: u32 = 0;
+/// `execution.cancel-ack-timeout` wire-stable code (§5.4.5).
+pub const TERMINATE_REASON_CANCEL_ACK_TIMEOUT: u32 = 1;
+/// `execution.credit-stall` wire-stable code (§5.4.5).
+pub const TERMINATE_REASON_CREDIT_STALL: u32 = 2;
+
+fn terminate_reason_from_u32(
+    code: u32,
+) -> Result<scp_protocol::context::outlets::stream::TerminateReason, ScpWasmError> {
+    use scp_protocol::context::outlets::stream::TerminateReason;
+    match code {
+        TERMINATE_REASON_REVOKED_MID_STREAM => Ok(TerminateReason::RevokedMidStream),
+        TERMINATE_REASON_CANCEL_ACK_TIMEOUT => Ok(TerminateReason::CancelAckTimeout),
+        TERMINATE_REASON_CREDIT_STALL => Ok(TerminateReason::CreditStall),
+        _ => Err(ScpWasmError::Validation {
+            message: format!(
+                "unknown TerminateReason code {code}; expected 0 (RevokedMidStream), \
+                 1 (CancelAckTimeout), or 2 (CreditStall) (§5.4.4 closed set)"
+            ),
+            code: codes::VALID_7000.to_owned(),
+        }),
+    }
+}
+
 /// Forces a terminal `Error{terminal:true}` chunk into the active stream
-/// identified by `request_id_hex` (§5.4.5 receiver-side revocation
-/// re-check, `RevokedMidStream` / `SCP-TOOL-6110`).
+/// identified by `request_id_hex` (§5.4.5 framework-initiated stream
+/// termination).
 ///
 /// Routes through
 /// [`crate::manager::WasmContextManager::outlet_stream_terminate`] —
@@ -513,27 +546,44 @@ pub fn outlet_stream_cancel(request_id_hex: String, caller_did: String) -> Promi
 /// terminal; the one after that resolves to `None` and evicts the
 /// session.
 ///
-/// The SDK framework's periodic UCAN re-check loop calls this whenever
-/// it observes the opening UCAN has been revoked since stream open.
+/// `reason` is a wire-stable `u32` code matching one of:
+/// - [`TERMINATE_REASON_REVOKED_MID_STREAM`] (0) — periodic UCAN
+///   re-check observed token revoked since stream open.
+/// - [`TERMINATE_REASON_CANCEL_ACK_TIMEOUT`] (1) — executor failed to
+///   emit a terminal chunk within `stream_cancel_ack_secs`.
+/// - [`TERMINATE_REASON_CREDIT_STALL`] (2) — credit window remained at
+///   zero past `stream_credit_stall_secs`.
 ///
-/// Returns a JS `Promise<void>` — resolves on success, rejects only when
-/// the `request_id_hex` does not match any active session.
+/// Unknown codes are rejected with a `Validation` error. The canonical
+/// §5.4.4 slug + code carried by the synthetic chunk are derived
+/// from the matched enum — never caller-supplied. `message_override`
+/// (the only caller-controlled string) is appended as a human suffix
+/// after the canonical slug prefix; passing `null` / `undefined`
+/// uses the spec's default message.
+///
+/// Returns a JS `Promise<void>` — resolves on success.
 ///
 /// # Errors
 ///
+/// * `VALID_7000` — `reason` is not in the closed `TerminateReason` set.
 /// * `SCP-TOOL-6101` — `request_id_hex` does not match any active
 ///   stream registry entry (`protocol.unknown-session`).
 #[wasm_bindgen(js_name = "outletStreamTerminate")]
 pub fn outlet_stream_terminate(
     request_id_hex: String,
     caller_did: String,
-    slug: String,
-    code: String,
-    message: String,
+    reason: u32,
+    message_override: Option<String>,
 ) -> Promise {
     future_to_promise(async move {
+        let reason_variant = terminate_reason_from_u32(reason).map_err(ScpWasmError::into_js)?;
         with_manager(|mgr| {
-            mgr.outlet_stream_terminate(&request_id_hex, &caller_did, &slug, &code, &message)
+            mgr.outlet_stream_terminate(
+                &request_id_hex,
+                &caller_did,
+                reason_variant,
+                message_override.as_deref(),
+            )
         })
         .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::UNDEFINED)

@@ -707,8 +707,9 @@ fn build_open_stream_params(
         invoker_pk,
         // Native FFI bridges: invoker == operator in the local
         // single-context streaming path. See PyO3 bridge for full
-        // rationale (§5.4.5 / §6.2.0.5).
-        operator_signing_key: Some(operator_signing_key),
+        // rationale (§5.4.5 / §6.2.0.5). The runtime now requires a
+        // non-optional key (all-zero-sig placeholder deleted).
+        operator_signing_key,
         stream_credit_stall_secs:
             scp_protocol::context::outlets::stream::DEFAULT_STREAM_CREDIT_STALL_SECS,
         stream_cancel_ack_secs: 5,
@@ -897,8 +898,8 @@ pub fn outlet_stream_cancel(
 // ---------------------------------------------------------------------------
 
 /// Forces a terminal `Error{terminal:true}` chunk into the active stream
-/// identified by `request_id_hex` (§5.4.5 receiver-side revocation
-/// re-check, `RevokedMidStream` / `SCP-TOOL-6110`).
+/// identified by `request_id_hex` (§5.4.5 framework-initiated stream
+/// termination).
 ///
 /// Routes through
 /// [`scp_runtime::context::outlets::dispatch::StreamSessionHandle::terminate_with_error`]
@@ -908,10 +909,23 @@ pub fn outlet_stream_cancel(
 /// closes.
 ///
 /// The SDK framework's periodic UCAN re-check loop calls this whenever
-/// it observes the opening UCAN has been revoked since stream open.
+/// it observes the opening UCAN has been revoked since stream open
+/// (`reason = "authorization.revoked-mid-stream"`).
+///
+/// `reason` MUST be one of the closed-set §5.4.4 slugs registered in
+/// [`scp_protocol::context::outlets::stream::TerminateReason`]:
+/// - `"authorization.revoked-mid-stream"` → `RevokedMidStream`
+/// - `"execution.cancel-ack-timeout"` → `CancelAckTimeout`
+/// - `"execution.credit-stall"` → `CreditStall`
+///
+/// Unknown slugs are rejected with a `Validation` error — attacker-
+/// controlled slug strings cannot enter the provenance record.
+/// `message` is an optional human-readable extension (empty string =
+/// use canonical default).
 ///
 /// # Errors
 ///
+/// * `Validation` — `reason` is not in the closed `TerminateReason` set.
 /// * `Context` (slug `protocol.unknown-session`) — `request_id_hex`
 ///   does not match any active stream.
 /// * `Context` — the runtime rejected the termination because the pump
@@ -924,23 +938,38 @@ pub fn outlet_stream_cancel(
 pub fn outlet_stream_terminate(
     request_id_hex: String,
     caller_did: String,
-    slug: String,
-    code: String,
+    reason: String,
     message: String,
 ) -> napi::Result<()> {
+    use scp_protocol::context::outlets::stream::TerminateReason;
     scp_ffi_common::validate::validate_did(&caller_did)
         .map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
+    let reason_variant = TerminateReason::from_slug(&reason).ok_or_else(|| {
+        napi::Error::from(ScpNapiError::Validation {
+            message: format!(
+                "unknown TerminateReason slug {reason:?}; expected one of \
+                 'authorization.revoked-mid-stream', 'execution.cancel-ack-timeout', \
+                 'execution.credit-stall' (§5.4.4 closed set)"
+            ),
+            code: scp_protocol::context::outlets::error_codes::CODE_INPUT_VIOLATION.to_owned(),
+        })
+    })?;
+    let message_override = if message.is_empty() {
+        None
+    } else {
+        Some(message)
+    };
     let entry = lookup_entry_authenticated(&request_id_hex, &caller_did)?;
     let handle_guard = entry
         .handle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     handle_guard
-        .terminate_with_error(&slug, &code, &message)
+        .terminate_with_error(reason_variant, message_override)
         .map_err(|err| {
             napi::Error::from(ScpNapiError::Context {
                 message: format!("terminate rejected: {err}"),
-                code: code.clone(),
+                code: reason_variant.code().to_owned(),
             })
         })?;
     Ok(())

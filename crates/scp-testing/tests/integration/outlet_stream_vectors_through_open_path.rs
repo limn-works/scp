@@ -640,7 +640,7 @@ fn build_open_stream_params(open: &OpenSpec) -> OpenStreamParams {
         credit_window: open.credit_window,
         caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
         invoker_pk: invoker_signing.verifying_key(),
-        operator_signing_key: Some(std::sync::Arc::new(operator_signing)),
+        operator_signing_key: std::sync::Arc::new(operator_signing),
         // Use a very short stall for the credit_exhaustion vector so
         // the framework's stall timer fires within the test runtime.
         stream_credit_stall_secs: open.stream_credit_stall_secs.min(2),

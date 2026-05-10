@@ -38,8 +38,8 @@
         "name": "outlet_stream_terminate",
         "story": "SCP-OUT-038",
         "kind": "function",
-        "signature": "outlet_stream_terminate(request_id_hex, slug, code, message) -> None",
-        "comment": "§5.4.5 receiver-side revocation re-check (RevokedMidStream / SCP-TOOL-6110). SDK framework calls this when its periodic UCAN re-check observes the opening UCAN has been revoked since stream open."
+        "signature": "outlet_stream_terminate(request_id_hex, caller_did, reason, message) -> None",
+        "comment": "§5.4.5 framework-initiated termination. `reason` is a closed-set §5.4.4 slug (TerminateReason::from_slug). Slug + code derived from the enum on the bridge; never caller-supplied."
       },
       {
         "name": "verify_chunk_signature",
@@ -96,8 +96,8 @@
         "name": "outletStreamTerminate",
         "story": "SCP-OUT-038",
         "kind": "function",
-        "signature": "outletStreamTerminate(requestIdHex, slug, code, message) -> void",
-        "comment": "§5.4.5 receiver-side revocation re-check (RevokedMidStream / SCP-TOOL-6110). SDK framework calls this when its periodic UCAN re-check observes the opening UCAN has been revoked since stream open."
+        "signature": "outletStreamTerminate(requestIdHex, callerDid, reason, message) -> void",
+        "comment": "§5.4.5 framework-initiated termination. `reason` is a closed-set §5.4.4 slug (TerminateReason::from_slug). Slug + code derived from the enum on the bridge; never caller-supplied."
       },
       {
         "name": "verifyChunkSignature",
@@ -160,8 +160,8 @@
         "name": "outlet_stream_terminate",
         "story": "SCP-OUT-038",
         "kind": "async_function",
-        "signature": "outlet_stream_terminate(request_id_hex: String, slug: String, code: String, message: String) -> Result<(), ScpError>",
-        "comment": "§5.4.5 receiver-side revocation re-check (RevokedMidStream / SCP-TOOL-6110). SDK framework calls this when its periodic UCAN re-check observes the opening UCAN has been revoked since stream open. Convenience wrapper also exposed on OutletStreamHandle.terminate(slug, code, message)."
+        "signature": "outlet_stream_terminate(request_id_hex: String, caller_did: String, reason: TerminateReason, message_override: Option<String>) -> Result<(), ScpError>",
+        "comment": "§5.4.5 framework-initiated termination. `reason` is a closed-set UniFFI enum mirroring the Rust protocol `TerminateReason`. Slug + code derived from the enum on the bridge. Convenience wrapper also exposed on OutletStreamHandle.terminate(reason, messageOverride)."
       },
       {
         "name": "verify_chunk_signature",
@@ -232,8 +232,8 @@
         "name": "outletStreamTerminate",
         "story": "SCP-OUT-038",
         "kind": "function",
-        "signature": "outletStreamTerminate(requestIdHex, slug, code, message) -> Promise<void>",
-        "comment": "§5.4.5 receiver-side revocation re-check (RevokedMidStream / SCP-TOOL-6110). WASM has no executor pump — the manager pushes a synthetic terminal Error chunk into the pre-materialised queue under the per-session signing key."
+        "signature": "outletStreamTerminate(requestIdHex, callerDid, reason: u32, messageOverride: Option<String>) -> Promise<void>",
+        "comment": "§5.4.5 framework-initiated termination. `reason` is a wire-stable u32 (TERMINATE_REASON_*); slug + code derived from the matched enum on the bridge. WASM has no executor pump — the manager pushes a synthetic terminal Error chunk into the pre-materialised queue under the per-session signing key."
       },
       {
         "name": "verifyChunkSignature",
