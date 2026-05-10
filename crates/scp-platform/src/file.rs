@@ -557,10 +557,16 @@ impl KeyCustody for FileKeyCustody {
                 KeyType::X25519 => StoredKeyType::X25519,
             };
 
-            let entry_index = self.append_entry(stored_type, &key_bytes)?;
-
-            let handle = self.next_handle();
+            // Hold `handle_map` across the entire append-and-insert
+            // path so a concurrent `destroy_key` cannot rewrite the
+            // file and shift `entry_index` between our `append_entry`
+            // and the map insert. `append_entry` takes only
+            // `file_write_lock`, never `handle_map`, so there is no
+            // lock-ordering inversion. Mirrors the pattern in
+            // `import_ed25519_signing_key`.
             let mut map = self.handle_map.lock().await;
+            let entry_index = self.append_entry(stored_type, &key_bytes)?;
+            let handle = self.next_handle();
             map.entries.insert(handle.id(), (stored_type, entry_index));
             drop(map);
 
@@ -1349,5 +1355,91 @@ mod tests {
             count, 1,
             "concurrent dedup must not append a parallel encrypted entry"
         );
+    }
+
+    /// Concurrent `generate_keypair` ↔ `destroy_key` MUST NOT corrupt
+    /// the handle map. Holding `handle_map` across the entire
+    /// append-and-insert path is what guarantees this: without it, a
+    /// concurrent `destroy_key` could rewrite the file and shift
+    /// `entry_index` values between our `append_entry` and the map
+    /// insert, leaving the new handle pointing at a stale slot. The
+    /// test pre-creates a victim key, then races a `generate_keypair`
+    /// against `destroy_key` on the victim and asserts that whatever
+    /// handle came back from `generate_keypair` decrypts cleanly (i.e.
+    /// the recorded `entry_index` still references its real ciphertext
+    /// in the file).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generate_keypair_concurrent_destroy_does_not_corrupt_handle_map() {
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let custody = Arc::new(make_custody(&dir, "concurrent-gen-destroy-passphrase"));
+
+        // Pre-populate the file with enough entries that the victim
+        // we destroy isn't always the trailing entry. The bug pattern
+        // (index shift after destroy) only manifests when there are
+        // entries *after* the destroyed one.
+        let mut handles: Vec<KeyHandle> = Vec::new();
+        for _ in 0..4 {
+            handles.push(custody.generate_keypair(KeyType::Ed25519).await.unwrap());
+        }
+        // Destroy the middle entry — index shift is most visible here.
+        let victim = handles.remove(1);
+
+        let custody_gen = Arc::clone(&custody);
+        let task_gen = tokio::spawn(async move {
+            custody_gen
+                .generate_keypair(KeyType::Ed25519)
+                .await
+                .unwrap()
+        });
+
+        let custody_destroy = Arc::clone(&custody);
+        let task_destroy = tokio::spawn(async move {
+            custody_destroy.destroy_key(&victim).await.unwrap();
+        });
+
+        let new_handle = task_gen.await.unwrap();
+        task_destroy.await.unwrap();
+
+        // The new handle MUST decrypt cleanly. If `generate_keypair`
+        // had captured a stale `entry_index` from before
+        // `destroy_key`'s shift, `public_key` would fail to decrypt
+        // (or recover a different key than the one we wrote).
+        let _public = custody
+            .public_key(&new_handle)
+            .await
+            .expect("new handle must decrypt cleanly after concurrent destroy");
+        // And `sign` MUST succeed — confirms the recovered key
+        // material is a valid Ed25519 signing key.
+        let _sig = custody
+            .sign(&new_handle, b"concurrent-test")
+            .await
+            .expect("new handle must sign after concurrent destroy");
+
+        // All other pre-existing handles MUST still decrypt cleanly
+        // (the destroy path is responsible for shifting their indices,
+        // and `generate_keypair` must not interleave a stale insert).
+        for h in &handles {
+            let _ = custody
+                .public_key(h)
+                .await
+                .expect("pre-existing handles must decrypt after concurrent generate/destroy");
+        }
+
+        // Handle map invariant: every entry's `entry_index` is in
+        // bounds for the current file. A stale insert would leave an
+        // out-of-bounds index that `decrypt_entry` would reject above.
+        let map = custody.handle_map.lock().await;
+        let bytes = std::fs::read(&custody.path).unwrap();
+        let count_offset = 1 + SALT_LEN;
+        let count =
+            u32::from_le_bytes(bytes[count_offset..count_offset + 4].try_into().unwrap()) as usize;
+        for (id, (_kt, idx)) in &map.entries {
+            assert!(
+                *idx < count,
+                "handle {id} has stale entry_index {idx} ≥ on-disk count {count}"
+            );
+        }
     }
 }

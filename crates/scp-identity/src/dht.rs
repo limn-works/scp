@@ -1571,10 +1571,19 @@ pub fn verify_self_certification(
 
 /// Decodes a multibase-encoded public key (z-prefix = base58btc).
 ///
+/// Beyond the encoding check, the decoded 32-byte payload is validated
+/// as an Ed25519 Edwards-curve point via
+/// `ed25519_dalek::VerifyingKey::from_bytes`. This rejects non-curve
+/// payloads only (ZIP-215 rules) — low-order / small-subgroup points
+/// are NOT rejected here; they are caught at signature verification
+/// time via `verify_strict`. Matches the WASM bridge's `from_did`
+/// curve-point gate so both decoding entry points behave consistently.
+///
 /// # Errors
 ///
 /// Returns [`IdentityError::InvalidDidFormat`] if the key is not properly
-/// base58btc encoded.
+/// base58btc encoded, not exactly 32 bytes, or does not decompress to a
+/// valid Ed25519 Edwards-curve point.
 pub fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], IdentityError> {
     let b58_str = encoded.strip_prefix('z').ok_or_else(|| {
         IdentityError::InvalidDidFormat("multibase key must start with 'z' (base58btc)".to_owned())
@@ -1583,9 +1592,23 @@ pub fn decode_multibase_key(encoded: &str) -> Result<[u8; 32], IdentityError> {
     let decoded = base58btc_decode(b58_str)
         .map_err(|e| IdentityError::InvalidDidFormat(format!("base58btc decode failed: {e}")))?;
 
-    decoded.try_into().map_err(|v: Vec<u8>| {
+    let decoded_array: [u8; 32] = decoded.try_into().map_err(|v: Vec<u8>| {
         IdentityError::InvalidDidFormat(format!("expected 32-byte key, got {} bytes", v.len()))
-    })
+    })?;
+
+    // Curve-point validation: `ed25519_dalek::VerifyingKey::from_bytes`
+    // rejects byte strings that don't decompress to an Edwards-curve
+    // point (ZIP-215 rules). Low-order / small-subgroup points are NOT
+    // rejected here — they are caught at signature verification time
+    // via `verify_strict`. Matches the WASM `from_did_inner` gate so
+    // both decoding entry points reject non-curve payloads early.
+    ed25519_dalek::VerifyingKey::from_bytes(&decoded_array).map_err(|e| {
+        IdentityError::InvalidDidFormat(format!(
+            "multibase key payload is not a valid Ed25519 public key: {e}"
+        ))
+    })?;
+
+    Ok(decoded_array)
 }
 
 /// Base58btc decoding (Bitcoin alphabet) via the `bs58` crate.
@@ -2730,6 +2753,49 @@ mod tests {
         let vm = encoded.verification_method_by_fragment("0").unwrap();
         let decoded = decode_multibase_key(&vm.public_key_multibase).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// `decode_multibase_key` MUST reject payloads that don't decompress
+    /// to a valid Ed25519 Edwards-curve point. ed25519-dalek's
+    /// `from_bytes` enforces ZIP-215 curve-point decompression. About
+    /// half of random 32-byte strings fail this check, so we search for
+    /// one rather than hardcoding a specific value. Matches the WASM
+    /// bridge's `from_did_rejects_non_ed25519_curve_point` guard so
+    /// both decoding entry points reject non-curve payloads early.
+    #[test]
+    fn decode_multibase_key_rejects_non_curve_point() {
+        use rand::RngCore;
+
+        // Search for a 32-byte payload that fails Ed25519 decompression.
+        let non_curve_bytes: [u8; 32] = {
+            let mut found: Option<[u8; 32]> = None;
+            for _ in 0..512 {
+                let mut candidate = [0u8; 32];
+                rand::rngs::OsRng.fill_bytes(&mut candidate);
+                if ed25519_dalek::VerifyingKey::from_bytes(&candidate).is_err() {
+                    found = Some(candidate);
+                    break;
+                }
+            }
+            found.expect(
+                "should find a non-curve 32-byte payload within 512 tries (~50% rejection rate)",
+            )
+        };
+
+        // base58btc-encode the non-curve payload and prefix with `z`
+        // (matches the on-the-wire multibase form).
+        let encoded = format!("z{}", bs58::encode(&non_curve_bytes).into_string());
+
+        let err = decode_multibase_key(&encoded).expect_err("non-curve payload must be rejected");
+        match err {
+            IdentityError::InvalidDidFormat(msg) => {
+                assert!(
+                    msg.contains("not a valid Ed25519 public key"),
+                    "expected curve-point error message; got: {msg}"
+                );
+            }
+            other => panic!("expected InvalidDidFormat, got: {other:?}"),
+        }
     }
 
     #[test]

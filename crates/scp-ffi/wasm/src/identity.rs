@@ -977,15 +977,32 @@ impl WasmIdentity {
     ///
     /// # Side effects
     ///
-    /// The DID is registered in the bridge-local `IDENTITY_REGISTRY` as
-    /// an [`IdentityRecord::Resolved`] entry. Subsequent signing or
-    /// rotation attempts therefore surface [`codes::IDENT_1028`] (no
-    /// retained key material) — the stable, documented contract —
-    /// rather than the cryptic [`codes::IDENT_1002`] (DID not
-    /// registered) callers would otherwise hit on these handles.
+    /// Registry behaviour depends on whether the DID is already known:
+    ///
+    /// - **Absent from the registry:** a fresh
+    ///   [`IdentityRecord::Resolved`] entry is registered with the
+    ///   decoded public key bytes and `custody_type = "js_custody"`.
+    ///   Subsequent signing or rotation attempts on the returned handle
+    ///   surface [`codes::IDENT_1028`] (no retained key material) — the
+    ///   stable, documented contract — rather than the cryptic
+    ///   [`codes::IDENT_1002`] (DID not registered) callers would
+    ///   otherwise hit.
+    /// - **Already registered as [`IdentityRecord::Local`]:** the
+    ///   existing record is preserved (no overwrite). The returned
+    ///   [`WasmIdentity`] mirrors the existing Local record's state —
+    ///   including `has_agent_key`, `agent_public_key_multibase`, and
+    ///   `custody_type` — so it may still carry signing capability.
+    ///
+    /// Callers who require a guaranteed non-signing handle MUST first
+    /// call [`cleanup`] (or operate on a DID known to be foreign to
+    /// this WASM instance) before invoking `from_did`. Otherwise the
+    /// returned handle may reflect a pre-existing Local record's
+    /// signing surface.
     ///
     /// The registry write respects [`WASM_IDENTITY_REGISTRY_CAP`] and
-    /// returns [`codes::VALID_7400`] if the cap is exceeded.
+    /// returns [`codes::VALID_7400`] if the cap is exceeded (only
+    /// applies to the insert-new path; preserving an existing entry
+    /// does not consume a new slot).
     ///
     /// The `verifyingKey` field on the returned handle is populated
     /// from the decoded payload (it's already public — these are
@@ -5415,6 +5432,77 @@ mod tests {
             }
             other => panic!("expected Validation error, got: {other:?}"),
         }
+
+        cleanup_registries();
+    }
+
+    /// `from_did` MUST preserve an existing `IdentityRecord::Local`
+    /// entry rather than overwriting it with a fresh `Resolved`
+    /// record. The returned `WasmIdentity` must mirror the existing
+    /// Local's state — including `custody_type` (not hardcoded
+    /// `js_custody`) and `has_agent_key` — so JS callers don't get a
+    /// handle that lies about its signing surface.
+    #[test]
+    fn from_did_preserves_existing_local_record() {
+        cleanup_registries();
+
+        // Set up a Local record with custody_type = "in_memory" and an
+        // agent key (matches what `identity_create_with_agent_key` writes).
+        let (did, _identity_pub, _active_pub, _agent_pub) = register_identity_with_agent();
+
+        // Sanity: registry contains a Local record with the agent key
+        // and "in_memory" custody (NOT "js_custody").
+        IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            match map.get(&did) {
+                Some(IdentityRecord::Local {
+                    agent_signing_key_bytes,
+                    custody_type,
+                    ..
+                }) => {
+                    assert_eq!(
+                        custody_type, "in_memory",
+                        "test fixture should register custody_type=in_memory"
+                    );
+                    assert!(
+                        agent_signing_key_bytes.is_some(),
+                        "test fixture should register an agent key"
+                    );
+                }
+                other => panic!("expected Local variant, got: {other:?}"),
+            }
+        });
+
+        // Call `from_did` on the existing Local DID. Per the documented
+        // contract, this preserves the Local record and returns a
+        // handle reflecting its state — NOT a fresh Resolved
+        // placeholder with hardcoded "js_custody".
+        let handle = from_did_inner(did.clone()).expect("valid did:dht must decode");
+
+        // The returned handle must mirror the Local record's state.
+        assert_eq!(
+            handle.custody_type, "in_memory",
+            "from_did on existing Local DID must preserve custody_type=in_memory, NOT overwrite to js_custody"
+        );
+        assert!(
+            handle.has_agent_key,
+            "from_did on existing Local DID with an agent key must surface has_agent_key=true"
+        );
+        assert!(
+            handle.agent_public_key_multibase.is_some(),
+            "from_did on existing Local DID with an agent key must surface agent_public_key_multibase"
+        );
+
+        // The registry record must still be Local (not overwritten to
+        // Resolved). This is the strongest behavioural assertion —
+        // overwrite would silently destroy retained key material.
+        IDENTITY_REGISTRY.with(|reg| {
+            let map = reg.borrow();
+            match map.get(&did) {
+                Some(IdentityRecord::Local { .. }) => {}
+                other => panic!("from_did MUST preserve existing Local record; got: {other:?}"),
+            }
+        });
 
         cleanup_registries();
     }

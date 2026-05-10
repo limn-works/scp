@@ -343,9 +343,23 @@ mod tests {
 
     const TEST_DID: &str = "did:dht:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK";
 
+    /// Helper: generate a valid Ed25519 public key. `decode_multibase_key`
+    /// enforces curve-point validity, so test fixtures cannot use
+    /// arbitrary `[Nu8; 32]` byte patterns — they must be real public
+    /// keys.
+    fn fresh_ed25519_pub() -> [u8; 32] {
+        ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+            .verifying_key()
+            .to_bytes()
+    }
+
     /// Helper: creates a DID document with `#active` and optionally `#agent` VMs.
     fn test_did_doc(active_key: &[u8; 32], agent_key: Option<&[u8; 32]>) -> DidDocument {
-        let identity_key = [0u8; 32];
+        // Identity key must also decompress to a valid Ed25519 point so
+        // any future caller that decodes #0 doesn't trip the curve-point
+        // check. `commitment` is just a SHA-256-shaped opaque value, no
+        // curve constraint.
+        let identity_key = fresh_ed25519_pub();
         let commitment = [0u8; 32];
         let mut doc = DidDocument::new(TEST_DID, &identity_key, active_key, &commitment);
 
@@ -365,7 +379,7 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn resolve_signing_key_active_returns_active_vm() {
-        let active_key = [2u8; 32];
+        let active_key = fresh_ed25519_pub();
         let doc = test_did_doc(&active_key, None);
 
         let cred = ScpCredential::new(TEST_DID.to_string(), None, SigningKeyId::Active).unwrap();
@@ -376,8 +390,8 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn resolve_signing_key_agent_returns_agent_vm() {
-        let active_key = [2u8; 32];
-        let agent_key = [3u8; 32];
+        let active_key = fresh_ed25519_pub();
+        let agent_key = fresh_ed25519_pub();
         let doc = test_did_doc(&active_key, Some(&agent_key));
 
         let cred = ScpCredential::new(TEST_DID.to_string(), None, SigningKeyId::Agent).unwrap();
@@ -388,7 +402,7 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn resolve_signing_key_agent_missing_vm_returns_error() {
-        let active_key = [2u8; 32];
+        let active_key = fresh_ed25519_pub();
         // No agent key in this document.
         let doc = test_did_doc(&active_key, None);
 
@@ -406,8 +420,8 @@ mod tests {
     #[test]
     #[allow(clippy::unwrap_used)]
     fn resolve_signing_key_active_with_agent_present_still_returns_active() {
-        let active_key = [2u8; 32];
-        let agent_key = [3u8; 32];
+        let active_key = fresh_ed25519_pub();
+        let agent_key = fresh_ed25519_pub();
         let doc = test_did_doc(&active_key, Some(&agent_key));
 
         // Credential uses Active — should get the active key, not the agent key.

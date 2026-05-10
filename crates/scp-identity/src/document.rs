@@ -890,12 +890,26 @@ impl DidDocument {
     pub fn retire_operational_keys_for_migration(&mut self) {
         // Remove `#active` and `#agent` verification methods.
         // Retired entries (`#retired-*`, `#retired-agent-*`) remain.
-        self.verification_method
-            .retain(|vm| !vm.id.ends_with("#active") && !vm.id.ends_with("#agent"));
-        self.authentication
-            .retain(|reference| !reference.ends_with("#active") && !reference.ends_with("#agent"));
-        self.assertion_method
-            .retain(|reference| !reference.ends_with("#active") && !reference.ends_with("#agent"));
+        //
+        // Exact-fragment match (not `ends_with`) so a hypothetical
+        // future fragment like `#secondary-active` or
+        // `#auxiliary-agent` is not silently swept along with the
+        // operational keys. Today the spec defines only `#0`,
+        // `#active`, `#agent`, `#retired-N`, and `#retired-agent-N`,
+        // so this is forward-compat hardening rather than a bug fix
+        // against current data.
+        self.verification_method.retain(|vm| {
+            let frag = vm.id.rsplit('#').next().unwrap_or("");
+            frag != "active" && frag != "agent"
+        });
+        self.authentication.retain(|reference| {
+            let frag = reference.rsplit('#').next().unwrap_or("");
+            frag != "active" && frag != "agent"
+        });
+        self.assertion_method.retain(|reference| {
+            let frag = reference.rsplit('#').next().unwrap_or("");
+            frag != "active" && frag != "agent"
+        });
     }
 
     // --- Agent key management (ADR-039) ---
@@ -2418,5 +2432,97 @@ mod tests {
         assert_eq!(entries[0].attestation_id, "abc123");
         assert_eq!(entries[1].platform, "x.com");
         assert_eq!(entries[1].attestation_id, "def456");
+    }
+
+    /// `retire_operational_keys_for_migration` MUST use exact-fragment
+    /// match so a hypothetical future fragment like `#secondary-active`
+    /// or `#auxiliary-agent` is not silently swept along with the
+    /// operational keys. Today the spec defines only `#0`, `#active`,
+    /// `#agent`, `#retired-N`, and `#retired-agent-N`; this test is
+    /// forward-compat hardening.
+    #[test]
+    fn retire_operational_keys_for_migration_preserves_unrelated_fragments() {
+        let did = "did:dht:zRetireExact";
+        let mut doc = DidDocument::new(did, &[7u8; 32], &[8u8; 32], &[9u8; 32]);
+
+        // Inject a synthetic `#secondary-active` VM (the suffix
+        // `active` would have matched the old `ends_with("#active")`
+        // filter even though the fragment is `secondary-active`).
+        doc.verification_method.push(VerificationMethod {
+            id: format!("{did}#secondary-active"),
+            method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+            controller: did.to_owned(),
+            public_key_multibase: format!("z{}", base58btc_encode(&[11u8; 32])),
+        });
+        // Also reference it from authentication so the per-array
+        // filter is exercised.
+        doc.authentication.push(format!("{did}#secondary-active"));
+        doc.assertion_method.push(format!("{did}#secondary-active"));
+
+        // Sanity: before retire, all four VMs and refs are present.
+        assert!(
+            doc.verification_method
+                .iter()
+                .any(|vm| vm.id == format!("{did}#0"))
+        );
+        assert!(
+            doc.verification_method
+                .iter()
+                .any(|vm| vm.id == format!("{did}#active"))
+        );
+        assert!(
+            doc.verification_method
+                .iter()
+                .any(|vm| vm.id == format!("{did}#secondary-active"))
+        );
+
+        doc.retire_operational_keys_for_migration();
+
+        // `#0` and `#secondary-active` MUST remain. `#active` MUST go.
+        let frags: Vec<String> = doc
+            .verification_method
+            .iter()
+            .map(|vm| vm.id.clone())
+            .collect();
+        assert!(
+            frags.contains(&format!("{did}#0")),
+            "#0 must be retained; got: {frags:?}"
+        );
+        assert!(
+            frags.contains(&format!("{did}#secondary-active")),
+            "#secondary-active must NOT be swept by exact-fragment retire; got: {frags:?}"
+        );
+        assert!(
+            !frags.contains(&format!("{did}#active")),
+            "#active must be removed; got: {frags:?}"
+        );
+        assert!(
+            !frags.contains(&format!("{did}#agent")),
+            "#agent (if present) must be removed; got: {frags:?}"
+        );
+
+        // Reference arrays: `#secondary-active` retained, `#active` removed.
+        assert!(
+            doc.authentication
+                .contains(&format!("{did}#secondary-active")),
+            "authentication must retain #secondary-active; got: {:?}",
+            doc.authentication
+        );
+        assert!(
+            !doc.authentication.contains(&format!("{did}#active")),
+            "authentication must drop #active; got: {:?}",
+            doc.authentication
+        );
+        assert!(
+            doc.assertion_method
+                .contains(&format!("{did}#secondary-active")),
+            "assertionMethod must retain #secondary-active; got: {:?}",
+            doc.assertion_method
+        );
+        assert!(
+            !doc.assertion_method.contains(&format!("{did}#active")),
+            "assertionMethod must drop #active; got: {:?}",
+            doc.assertion_method
+        );
     }
 }

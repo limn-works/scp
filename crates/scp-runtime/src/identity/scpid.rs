@@ -1249,11 +1249,21 @@ mod tests {
         let challenge = scpid_challenge("https://example.com", Duration::from_mins(2)).unwrap();
         let (response, _doc) = sign_and_build_doc(did, SigningKeyId::Active, &challenge).await;
 
-        // Build a DID document with a different key in the #active slot.
+        // Build a DID document with a DIFFERENT but VALID Ed25519
+        // public key in the #active slot. `decode_multibase_key`
+        // enforces curve-point validity, so the wrong key must still
+        // decompress — otherwise the test trips that gate instead of
+        // exercising the signature-mismatch path it's named for.
+        let wrong_identity_pk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+            .verifying_key()
+            .to_bytes();
+        let wrong_active_pk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng)
+            .verifying_key()
+            .to_bytes();
         let wrong_doc = scp_identity::document::DidDocument::new_with_agent_key(
             did,
-            &[0u8; 32],
-            &[99u8; 32], // different key — verification will fail
+            &wrong_identity_pk,
+            &wrong_active_pk,
             &[0u8; 32],
             None,
         );
