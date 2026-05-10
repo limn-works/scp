@@ -1439,8 +1439,11 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     }
 
     /// Builds a migration proof by signing
-    /// `SHA-256("SCP-MIGRATION-V1:" || old_did || new_did || rotated_at)`
-    /// with the old Identity Key.
+    /// `SHA-256(DOMAIN_MIGRATION_V1 || u32_be(len(old_did)) || old_did ||
+    /// u32_be(len(new_did)) || new_did || u64_be(rotated_at))` with the old
+    /// Identity Key. Length prefixes (u32 big-endian for the DID strings
+    /// and the implicit u64 big-endian width of `rotated_at`) prevent
+    /// concatenation ambiguity between variable-length DID strings.
     async fn build_migration_proof(
         identity: &ScpIdentity,
         new_did: &str,
@@ -1887,6 +1890,41 @@ async fn destroy_old_operational_keys<C: KeyCustody>(key_custody: &C, identity: 
     }
 }
 
+/// Defense-in-depth: binds a caller-supplied `old_document` to `old_did`
+/// by checking that the document's `#0` verification method derives the
+/// DID string. did:dht is self-certifying — the DID string is z-base-32
+/// of the `#0` identity-key public — so byte-comparing the DID-derived
+/// public key against the document's `#0` VM closes the gap.
+///
+/// Without this check, a forged document — e.g. one whose `id` field is
+/// `old_did` but whose VMs/services are attacker-controlled, notably one
+/// that omits the `PreRotationCommitment` service — would silently
+/// downgrade `verify_migration`'s STRONG-when-committed enforcement
+/// (which consults `old_document.pre_rotation_service()`) to
+/// MODERATE-only. The downgrade is precisely the scenario the
+/// pre-rotation chain is designed to defend against (briefly-captured
+/// OLD `#0` key).
+fn bind_old_document_to_old_did(
+    old_did: &str,
+    old_document: &DidDocument,
+) -> Result<(), IdentityError> {
+    let old_did_pubkey = extract_public_key(old_did)?;
+    let old_doc_vm0 = old_document
+        .verification_method_by_fragment("0")
+        .ok_or_else(|| {
+            IdentityError::MigrationVerificationFailed(
+                "old_document has no #0 verification method".to_owned(),
+            )
+        })?;
+    let old_doc_vm0_pubkey = decode_multibase_key(&old_doc_vm0.public_key_multibase)?;
+    if old_doc_vm0_pubkey != old_did_pubkey {
+        return Err(IdentityError::MigrationVerificationFailed(
+            "old_document does not derive old_did".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// Verifies a DID identity migration (Layer 3).
 ///
 /// Checks the cryptographic proofs that an identity migration from `old_did`
@@ -1895,7 +1933,11 @@ async fn destroy_old_operational_keys<C: KeyCustody>(key_custody: &C, identity: 
 /// # Verification Steps
 ///
 /// 1. **Migration proof (MODERATE assurance):** Verifies that the old Identity
-///    Key signed `SHA-256("SCP-MIGRATION-V1:" || old_did || new_did || rotated_at)`.
+///    Key signed `SHA-256(DOMAIN_MIGRATION_V1 || u32_be(len(old_did)) ||
+///    old_did || u32_be(len(new_did)) || new_did || u64_be(rotated_at))`.
+///    Length prefixes (u32 big-endian for the DID strings and the implicit
+///    u64 big-endian width of `rotated_at`) prevent concatenation ambiguity
+///    between variable-length DID strings.
 /// 2. **Pre-rotation proof (STRONG assurance, optional):** If present, verifies
 ///    ALL OF:
 ///    - `SHA-256(pre_rot.revealed_key) == pre_rot.commitment` — the
@@ -1937,6 +1979,13 @@ async fn destroy_old_operational_keys<C: KeyCustody>(key_custody: &C, identity: 
 /// # Errors
 ///
 /// Returns [`IdentityError::MigrationVerificationFailed`] if:
+/// - `old_document` does not derive `old_did` via self-certification
+///   (the document's `#0` verification method does not match the
+///   z-base-32 encoded public key in the `old_did` string). This
+///   defense-in-depth check binds the caller-supplied `old_document`
+///   to `old_did` so a forged document — e.g. one with no
+///   `PreRotationCommitment` service — cannot silently downgrade
+///   STRONG-assurance enforcement to MODERATE.
 /// - `rotated_at` is more than [`MAX_FUTURE_SKEW_SECS`] ahead of `now`,
 ///   strictly below [`MIGRATION_EPOCH_FLOOR_UNIX_SECS`], or more than
 ///   [`MAX_PAST_WINDOW_SECS`] behind `now`.
@@ -1961,6 +2010,13 @@ pub fn verify_migration(
     rotated_at: u64,
     now: u64,
 ) -> Result<bool, IdentityError> {
+    // Step 0: defense-in-depth binding of `old_document` to `old_did`.
+    // Run before any other invariant so a mismatched document is
+    // rejected before its `pre_rotation_service` can influence
+    // downstream decisions (notably step 1c's STRONG-when-committed
+    // enforcement). See `bind_old_document_to_old_did` for rationale.
+    bind_old_document_to_old_did(old_did, old_document)?;
+
     // Step 1: Verify the migration proof signature.
     // Reconstruct the signed digest:
     //   SHA-256(DOMAIN_MIGRATION_V1 || len(old_did) || old_did || len(new_did) || new_did || rotated_at)
@@ -3837,6 +3893,75 @@ mod tests {
                 assert!(
                     msg.contains("old_public_key derives DID"),
                     "expected step 1b error, got: {msg}"
+                );
+            }
+            other => panic!("expected MigrationVerificationFailed, got: {other:?}"),
+        }
+    }
+
+    /// `verify_migration` MUST reject a caller-supplied `old_document`
+    /// whose `#0` verification method does not derive `old_did`. The
+    /// step-0 binding is defense-in-depth against forged documents
+    /// (e.g. one with no `PreRotationCommitment` service) silently
+    /// downgrading STRONG-when-committed enforcement to MODERATE: the
+    /// verifier consults `old_document.pre_rotation_service()` to
+    /// decide whether a `PreRotationProof` is required, so a forged
+    /// document with the same `id` string but different VMs would
+    /// otherwise let an attacker who briefly captured the OLD `#0`
+    /// key bypass the pre-rotation chain entirely.
+    #[tokio::test]
+    async fn verify_migration_rejects_forged_old_document() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let dht = make_dht_with_custody(&custody);
+
+        // Identity A: legitimate, gets migrated.
+        let (identity_a, document_a, pre_rotation_handle_a, pre_rotation_custody_a) =
+            create_identity_with_pre_rotation_key(&custody, &dht).await;
+        dht.publish_document(&identity_a, &document_a)
+            .await
+            .unwrap();
+
+        let rotated_at = 1_700_000_000u64;
+
+        let (_new_identity_a, _new_doc_a, event, _new_pre_rotation_handle_a) = dht
+            .migrate_identity(
+                &identity_a,
+                &document_a,
+                &pre_rotation_handle_a,
+                &*pre_rotation_custody_a,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .unwrap();
+
+        // Identity B: an unrelated identity with its own `#0`. Its
+        // document derives identity_b.did (zB), NOT identity_a.did
+        // (zA) — passing document_b under old_did = identity_a.did
+        // is precisely the forgery step 0 must catch.
+        let pre_rotation_custody_b =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (_identity_b, document_b, _pre_rotation_handle_b) = dht
+            .create(&*custody, &*pre_rotation_custody_b)
+            .await
+            .unwrap();
+
+        let result = verify_migration(
+            &event.old_did,
+            &document_b,
+            &event.new_did,
+            &event.migration_proof,
+            event.pre_rotation_proof.as_ref(),
+            event.rotated_at,
+            event.rotated_at + 1,
+        );
+        let err = result
+            .expect_err("step 0 MUST reject an old_document whose #0 VM does not derive old_did");
+        match err {
+            IdentityError::MigrationVerificationFailed(msg) => {
+                assert!(
+                    msg.contains("old_document does not derive old_did"),
+                    "expected step 0 binding error, got: {msg}"
                 );
             }
             other => panic!("expected MigrationVerificationFailed, got: {other:?}"),
