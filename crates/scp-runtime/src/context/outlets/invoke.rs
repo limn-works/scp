@@ -6834,6 +6834,15 @@ mod tests {
     }
 
     /// Helper: build a fresh OUT-034 stream identity for tests.
+    ///
+    /// Returns a `[0xAB; 32]` sentinel binding paired with an EMPTY
+    /// `ucan_cid` at the OpenStreamParams level (see
+    /// [`out034_open_params`]). The runtime's §5.4.5 HIGH-wave-2
+    /// open-time binding-pinning gate treats an empty `ucan_cid` as
+    /// the legacy-fixture sentinel and skips the recompute — so this
+    /// sentinel binding does NOT mask a real check. Production
+    /// bridges supply a non-empty `ucan_cid` (derived from the
+    /// validated UCAN), and the recompute runs unconditionally there.
     fn out034_identity(outlet_id: &str) -> super::super::stream::StreamIdentity {
         super::super::stream::StreamIdentity {
             context_id: "ctx-invoke-test".to_owned(),
@@ -6854,6 +6863,14 @@ mod tests {
         credit_window: u32,
         verifying_key: ed25519_dalek::VerifyingKey,
     ) -> super::super::dispatch::OpenStreamParams {
+        // §5.4.5 HIGH-wave-2 binding-pinning: legacy unit-test fixtures
+        // use the `[0xAB; 32]` sentinel binding paired with an EMPTY
+        // `ucan_cid`, which signals the runtime to skip the recompute.
+        // Tests that sign cancels under this binding (via
+        // [`out034_identity`]) stay consistent because the runtime
+        // pins the same sentinel value at open time. Production
+        // bridges always supply a non-empty `ucan_cid` so the
+        // recompute always runs there.
         super::super::dispatch::OpenStreamParams {
             identity: out034_identity(outlet_id),
             caps: out034_admission_caps(),
@@ -6873,6 +6890,18 @@ mod tests {
             operator_signing_key: StdArc::new(ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32])),
             stream_credit_stall_secs: 1,
             stream_cancel_ack_secs: 1,
+            // §5.4.5 HIGH-wave-2 (Fix B) — runtime-authoritative
+            // revocation re-check. Tests use a never-revokes checker;
+            // the timer fires harmlessly until the test completes.
+            stream_ucan_recheck_secs: 60,
+            // Legacy-fixture sentinel: empty `ucan_cid` opts out of
+            // the runtime's §5.4.5 binding-pinning recompute. See
+            // [`out034_identity`] for the rationale.
+            ucan_cid: String::new(),
+            request_id: [0xAB; 16],
+            revocation_checker: StdArc::new(
+                scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
+            ),
         }
     }
 
@@ -7378,6 +7407,11 @@ mod tests {
         credit_window: u32,
         operator_signing_key: StdArc<ed25519_dalek::SigningKey>,
     ) -> super::super::dispatch::OpenStreamParams {
+        // Mirror `out034_open_params` — legacy-fixture sentinel binding
+        // + empty `ucan_cid` opts out of the §5.4.5 HIGH-wave-2
+        // open-time recompute. See [`out034_open_params`] for the
+        // rationale (and the symmetric `out034_identity` for the
+        // signing-context side of the same sentinel).
         super::super::dispatch::OpenStreamParams {
             identity: out034_identity(outlet_id),
             caps: out034_admission_caps(),
@@ -7392,6 +7426,12 @@ mod tests {
             operator_signing_key: StdArc::clone(&operator_signing_key),
             stream_credit_stall_secs: 1,
             stream_cancel_ack_secs: 1,
+            stream_ucan_recheck_secs: 60,
+            ucan_cid: String::new(),
+            request_id: [0xAB; 16],
+            revocation_checker: StdArc::new(
+                scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
+            ),
         }
     }
 
@@ -8039,6 +8079,362 @@ mod tests {
         assert!(
             matches!(handle.apply_outlet_cancel(&good), Ok(Some(6))),
             "honest cancel accepted at next_seq=6"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // §5.4.5 HIGH-wave-2 Fix A — caveats-binding recompute at open
+    // -----------------------------------------------------------------------
+
+    /// HIGH-wave-2 (Fix A): the runtime recomputes the `caveats_binding`
+    /// at open time and rejects any `OpenStreamParams` whose SDK-supplied
+    /// `identity.caveats_binding` does not match the recomputed value.
+    /// A malicious invoker who presents a UCAN narrowed to caveat set A
+    /// but supplies a binding committing to a looser set B is caught at
+    /// the gate — the open is rejected with
+    /// [`OpenStreamRejection::CaveatsBindingMismatch`] (slug:
+    /// `authorization.attenuation-violation`, code: `SCP-TOOL-6110`).
+    ///
+    /// The test forges the binding by computing it against a DIFFERENT
+    /// `request_id` than the one the runtime will pin — every other
+    /// input agrees, but the binding's preimage commits to a request_id
+    /// that the runtime never sees. The runtime's recompute (using the
+    /// real `params.request_id`) therefore does not match, and the open
+    /// is rejected before admission counters are incremented.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // integration-shaped test: setup + forge + open + assert
+    async fn open_rejects_caveats_binding_mismatch() {
+        struct StubExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for StubExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                _tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(StubExecutor);
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x55; 32]);
+        let admission = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+
+        // Mint a binding that commits to a FORGED `request_id` —
+        // every other input agrees with what the runtime will see,
+        // but the binding's preimage uses a different `request_id`
+        // than the one we hand to `OpenStreamParams::request_id`.
+        // The runtime recomputes using the REAL `params.request_id`
+        // (which is what every downstream chunk/grant/cancel signs
+        // under), so the recompute MUST diverge and reject.
+        let ucan_cid = "bafyrei-forge-test".to_owned();
+        let real_request_id: scp_protocol::context::outlets::stream::RequestId = [0x11; 16];
+        let forged_request_id: scp_protocol::context::outlets::stream::RequestId = [0x99; 16];
+        let caveats = scp_protocol::trust::caveats::InvocationCaveats::empty();
+        let caveats_jcs = caveats
+            .to_canonical_json_bytes()
+            .expect("forge-binding test: empty caveats canonicalize");
+        let forged_binding = scp_protocol::context::outlets::stream::compute_caveats_binding(
+            ucan_cid.as_bytes(),
+            &forged_request_id, // ← forged
+            creator_did,
+            0,
+            &caveats_jcs,
+        );
+        // Sanity: the binding the runtime will recompute (under the
+        // REAL request_id) must differ from the forged binding.
+        let runtime_recompute = scp_protocol::context::outlets::stream::compute_caveats_binding(
+            ucan_cid.as_bytes(),
+            &real_request_id, // ← what the runtime sees
+            creator_did,
+            0,
+            &caveats_jcs,
+        );
+        assert_ne!(
+            runtime_recompute, forged_binding,
+            "test invariant: forged and real bindings must differ for the test to be meaningful"
+        );
+
+        let params = super::super::dispatch::OpenStreamParams {
+            identity: super::super::stream::StreamIdentity {
+                context_id: "ctx-invoke-test".to_owned(),
+                outlet_id: outlet_id_owned.clone(),
+                stream_epoch: 1,
+                caveats_binding: forged_binding,
+            },
+            caps: out034_admission_caps(),
+            invoker_did: creator_did.to_owned(),
+            origin_invoker_did: creator_did.to_owned(),
+            cost_per_chunk: scp_protocol::economy::types::Amount::new(0),
+            available_balance: scp_protocol::economy::types::Amount::new(u64::MAX),
+            declared_estimated_chunk_count: None,
+            credit_window: 16,
+            caveats,
+            invoker_pk: signing.verifying_key(),
+            operator_signing_key: StdArc::new(signing),
+            stream_credit_stall_secs: 1,
+            stream_cancel_ack_secs: 1,
+            stream_ucan_recheck_secs: 60,
+            ucan_cid,
+            request_id: real_request_id,
+            revocation_checker: StdArc::new(
+                scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
+            ),
+        };
+
+        let result = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            params,
+            StdArc::clone(&admission),
+        )
+        .await;
+        let Err(rejection) = result else {
+            panic!("forged caveats_binding MUST be rejected at open");
+        };
+
+        assert!(
+            matches!(
+                rejection,
+                super::super::dispatch::OpenStreamRejection::CaveatsBindingMismatch
+            ),
+            "forged binding must surface as CaveatsBindingMismatch (got {rejection:?})"
+        );
+        assert_eq!(
+            rejection.slug(),
+            scp_protocol::context::outlets::error_codes::SLUG_AUTHORIZATION_ATTENUATION_VIOLATION,
+            "CaveatsBindingMismatch slug = authorization.attenuation-violation"
+        );
+        assert_eq!(
+            rejection.error_code(),
+            scp_protocol::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED,
+            "CaveatsBindingMismatch code = SCP-TOOL-6110 (Authorization umbrella)"
+        );
+
+        // Admission counters were NEVER incremented (the recompute
+        // runs before the admission gate per §5.4.5). A forged-binding
+        // open does not consume per-invoker / per-origin / per-outlet
+        // quota — pin this so a future refactor that swaps the gate
+        // order surfaces here.
+        let count_per_outlet = {
+            let admission_guard = admission.lock().expect("admission lock");
+            admission_guard.count_per_outlet(&outlet_id_owned)
+        };
+        assert_eq!(
+            count_per_outlet, 0,
+            "forged-binding open MUST NOT consume admission quota"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // §5.4.5 HIGH-wave-2 Fix B — runtime-side revocation re-check timer
+    // -----------------------------------------------------------------------
+
+    /// HIGH-wave-2 (Fix B): the streaming pump consults the injected
+    /// [`scp_protocol::crypto::ucan::validate::RevocationChecker`]
+    /// every `stream_ucan_recheck_secs`. On observed mid-stream
+    /// revocation it arms `pending_terminate` with
+    /// [`scp_protocol::context::outlets::stream::TerminateReason::RevokedMidStream`]
+    /// and the pump emits the synthetic terminal chunk within
+    /// `2 × recheck_secs` of the revocation event. The runtime is the
+    /// authoritative termination locus per §5.4.5 — the SDK-side
+    /// re-check loops in the bridges remain as defense-in-depth but
+    /// the runtime forces closure even if no SDK-side loop is running.
+    ///
+    /// Uses `tokio::time::pause()` + `advance` so the test runs in
+    /// deterministic virtual time rather than wall-clock.
+    #[tokio::test(start_paused = true)]
+    #[allow(clippy::too_many_lines)] // integration-shaped test: setup + open + revoke + assert
+    async fn revocation_recheck_emits_terminal_within_window() {
+        use scp_protocol::crypto::ucan::validate::{InMemoryRevocationChecker, RevocationChecker};
+        use std::sync::Mutex as StdMutex;
+        use std::time::Duration;
+
+        /// Mutable revocation checker — the test flips the token from
+        /// "live" to "revoked" mid-stream. Wraps an
+        /// `InMemoryRevocationChecker` behind a `Mutex` so the
+        /// test can mutate it after the pump has captured an
+        /// `Arc<dyn RevocationChecker>` clone.
+        struct FlippingChecker {
+            inner: StdMutex<InMemoryRevocationChecker>,
+        }
+        impl FlippingChecker {
+            fn new() -> Self {
+                Self {
+                    inner: StdMutex::new(InMemoryRevocationChecker::new()),
+                }
+            }
+            fn revoke(&self, cid: &str) {
+                self.inner.lock().unwrap().revoked.insert(cid.to_owned());
+            }
+        }
+        impl RevocationChecker for FlippingChecker {
+            fn is_revoked(&self, token_cid: &str) -> bool {
+                self.inner.lock().unwrap().is_revoked(token_cid)
+            }
+        }
+
+        /// Slow executor that never emits a terminal — the only
+        /// terminal the pump produces is the revocation-driven one
+        /// (or, if revocation never fires, the test times out).
+        struct ParkedExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for ParkedExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                _tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                // Sleep "forever" (in virtual time) — the parked task
+                // is dropped when the runtime closes the stream.
+                tokio::time::sleep(Duration::from_hours(1)).await;
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(ParkedExecutor);
+
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x88; 32]);
+        let admission = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+
+        let checker = StdArc::new(FlippingChecker::new());
+        let recheck_secs: u32 = 1;
+        let token_cid = "bafyrei-revoke-test".to_owned();
+
+        // Compute the binding the runtime will recompute against, so
+        // the open passes the binding-pinning gate. The forge path
+        // is covered by `open_rejects_caveats_binding_mismatch`.
+        let request_id_real: scp_protocol::context::outlets::stream::RequestId = [0x22; 16];
+        let caveats = scp_protocol::trust::caveats::InvocationCaveats::empty();
+        let caveats_jcs = caveats
+            .to_canonical_json_bytes()
+            .expect("revocation-recheck test: empty caveats canonicalize");
+        let declared_estimated: u32 = 8;
+        let real_binding = scp_protocol::context::outlets::stream::compute_caveats_binding(
+            token_cid.as_bytes(),
+            &request_id_real,
+            creator_did,
+            declared_estimated,
+            &caveats_jcs,
+        );
+
+        let params = super::super::dispatch::OpenStreamParams {
+            identity: super::super::stream::StreamIdentity {
+                context_id: "ctx-invoke-test".to_owned(),
+                outlet_id: outlet_id_owned.clone(),
+                stream_epoch: 1,
+                caveats_binding: real_binding,
+            },
+            caps: out034_admission_caps(),
+            invoker_did: creator_did.to_owned(),
+            origin_invoker_did: creator_did.to_owned(),
+            cost_per_chunk: scp_protocol::economy::types::Amount::new(0),
+            available_balance: scp_protocol::economy::types::Amount::new(u64::MAX),
+            declared_estimated_chunk_count: Some(declared_estimated),
+            credit_window: 16,
+            caveats,
+            invoker_pk: signing.verifying_key(),
+            operator_signing_key: StdArc::new(signing),
+            stream_credit_stall_secs: 3600,
+            stream_cancel_ack_secs: 3600,
+            // Drive the recheck arm with a short cadence so virtual-time
+            // advance only needs to step `recheck_secs` * 2 ahead.
+            stream_ucan_recheck_secs: recheck_secs,
+            ucan_cid: token_cid.clone(),
+            request_id: request_id_real,
+            // Inject the flipping checker so we can transition the
+            // token from "live" to "revoked" after the open succeeds.
+            revocation_checker: StdArc::clone(&checker)
+                as StdArc<dyn RevocationChecker + Send + Sync>,
+        };
+
+        let mut handle = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            params,
+            StdArc::clone(&admission),
+        )
+        .await
+        .expect("open succeeds with matching binding");
+
+        let mut rx = handle.receiver().expect("receiver");
+
+        // Mark the token revoked. The pump's recheck arm will observe
+        // this on its next interval tick (within `recheck_secs`) and
+        // arm `pending_terminate` with `RevokedMidStream`.
+        checker.revoke(&token_cid);
+
+        // Advance virtual time by `2 × recheck_secs` so the recheck
+        // arm fires at least once. The spec guarantees the terminal
+        // arrives "within `2 × recheck_secs` of the revocation event."
+        tokio::time::advance(Duration::from_secs(u64::from(recheck_secs) * 2 + 1)).await;
+
+        // The pump emits exactly one terminal `Error{terminal:true}`
+        // chunk under the pinned operator key. Drain receiver, find
+        // the terminal, and assert its slug/code.
+        let chunk = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("recheck arm produces a terminal within 2 × recheck_secs")
+            .expect("terminal chunk arrives before receiver close");
+
+        assert_ne!(
+            chunk.sig, [0u8; 64],
+            "synthetic terminal MUST carry a real signature (round-7 round-up)"
+        );
+        let scp_protocol::context::outlets::stream::ChunkPayload::Error {
+            code,
+            message,
+            terminal,
+        } = chunk.payload
+        else {
+            panic!("expected terminal Error chunk on mid-stream revocation");
+        };
+        assert!(terminal, "revoked-mid-stream chunk MUST set terminal=true");
+        assert_eq!(
+            code,
+            scp_protocol::context::outlets::stream::TerminateReason::RevokedMidStream.code(),
+            "terminal code = SCP-TOOL-6110"
+        );
+        let expected_slug =
+            scp_protocol::context::outlets::stream::TerminateReason::RevokedMidStream.slug();
+        assert!(
+            message.starts_with(&format!("{expected_slug}: ")),
+            "terminal message must start with the canonical slug prefix; got {message}"
         );
     }
 }

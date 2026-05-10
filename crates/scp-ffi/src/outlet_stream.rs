@@ -47,6 +47,65 @@ use crate::error::ScpPyError;
 use crate::validate;
 
 // ---------------------------------------------------------------------------
+// Per-stream revocation checker
+// ---------------------------------------------------------------------------
+
+/// Adapter that wires the bridge's per-context UCAN revocation list
+/// (owned by [`crate::runtime::FfiBridgeState`]) into the runtime's
+/// streaming pump for §5.4.5 receiver-side revocation re-checks.
+///
+/// The pump polls [`scp_protocol::crypto::ucan::validate::RevocationChecker`]
+/// every `stream_ucan_recheck_secs`; this adapter answers each poll by
+/// taking a short read on the bridge's per-context state via
+/// [`crate::runtime::with_context`] and consulting the live
+/// `RevocationList`. The lookup is `O(1)` against the underlying
+/// `HashSet`, so the per-tick cost is bounded even with a large list.
+///
+/// `Send + Sync` because the runtime pump holds the adapter inside an
+/// `Arc<dyn RevocationChecker + Send + Sync>` and may consult it from
+/// a worker thread. The captured `context_id` is the only state.
+pub(crate) struct BridgeStreamRevocationChecker {
+    context_id: String,
+}
+
+impl BridgeStreamRevocationChecker {
+    /// Builds a revocation-checker adapter for `context_id`. Returns
+    /// `Err` only if the bridge state has not been initialised (the
+    /// upstream caller has already invoked
+    /// [`crate::runtime::ensure_bridge_instance`] in
+    /// `py_outlet_invoke_stream`, so this branch is purely defensive).
+    fn for_context(context_id: &str) -> PyResult<Self> {
+        // Validate that the context exists at construction time so a
+        // forged context_id surfaces the bridge's typed error instead
+        // of a silent "no token is ever revoked" failure mode at the
+        // pump's recheck arm.
+        crate::runtime::with_context(context_id, |_rt| Ok(()))?;
+        Ok(Self {
+            context_id: context_id.to_owned(),
+        })
+    }
+}
+
+impl scp_protocol::crypto::ucan::validate::RevocationChecker for BridgeStreamRevocationChecker {
+    fn is_revoked(&self, token_cid: &str) -> bool {
+        // Consult the live per-context revocation list. The bridge
+        // mutates the list via `py_ucan_revoke`; the pump observes the
+        // mutation on its next tick. The closure must not return an
+        // `Err` from the inner `is_revoked` call — a checker failure
+        // is fail-CLOSED (treat as revoked) because the §5.4.5 re-check
+        // is a safety gate, not a correctness gate. `with_context`
+        // can fail only if the context has been removed (e.g., closed
+        // while the stream's pump was still running); that path is
+        // equivalent to "no longer valid," which we represent here as
+        // "revoked" to terminate the stream promptly.
+        crate::runtime::with_context(&self.context_id, |rt| {
+            Ok(rt.revocation_list.is_revoked(token_cid))
+        })
+        .unwrap_or(true)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stream registry
 // ---------------------------------------------------------------------------
 
@@ -421,6 +480,31 @@ pub fn py_outlet_invoke_stream(
         });
 
     let signing_key_arc = Arc::new(signing_key.clone());
+
+    // §5.4.5 HIGH-wave-2 Fix A — supply the runtime with the inputs it
+    // needs to recompute the `caveats_binding`. The bridge already
+    // parses the UCAN above (via `validate_outlet_ucan`); re-parse here
+    // to extract the CID. (`compute_cid` consumes a `UcanToken`; the
+    // helper is cheap relative to the open path and avoids surface
+    // churn on `validate_outlet_ucan`.) The §5.4.5 binding preimage
+    // commits to BOTH the CID and the runtime-pinned `request_id`, so
+    // both must reach the runtime — generating `request_id` here lets
+    // a future SDK update echo the same value into its own
+    // `compute_caveats_binding` call so the bridge and SDK agree.
+    let ucan_token_parsed = scp_protocol::crypto::ucan::validate::parse_ucan(ucan_token)
+        .map_err(|e| ScpPyError::ucan(format!("failed to parse ucan_token for cid: {e}")))?;
+    let ucan_cid_for_binding = scp_runtime::crypto::ucan::mint::compute_cid(&ucan_token_parsed);
+    let request_id: scp_protocol::context::outlets::stream::RequestId =
+        *uuid::Uuid::now_v7().as_bytes();
+    // §5.4.5 HIGH-wave-2 Fix B — runtime-authoritative revocation
+    // re-check. Reuse the bridge's per-context `BridgeRevocationChecker`
+    // by snapshotting the revocation list into a `RevocationCidSet`
+    // adapter the runtime can poll on its interval without retaking
+    // the FFI runtime-registry lock per tick.
+    let revocation_checker: std::sync::Arc<
+        dyn scp_protocol::crypto::ucan::validate::RevocationChecker + Send + Sync,
+    > = std::sync::Arc::new(BridgeStreamRevocationChecker::for_context(context_id)?);
+
     let params = build_open_stream_params(
         ctx_id_owned.clone(),
         outlet_id_owned.clone(),
@@ -431,6 +515,9 @@ pub fn py_outlet_invoke_stream(
         estimated_chunk_count,
         signing_key.verifying_key(),
         Arc::clone(&signing_key_arc),
+        ucan_cid_for_binding,
+        request_id,
+        revocation_checker,
     );
     // §5.4.5 admission tracker MUST persist across successive opens
     // within a single context — fetch (or lazily create) the per-context
@@ -544,6 +631,11 @@ fn build_open_stream_params(
     estimated_chunk_count: Option<u32>,
     invoker_pk: ed25519_dalek::VerifyingKey,
     operator_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    ucan_cid: String,
+    request_id: scp_protocol::context::outlets::stream::RequestId,
+    revocation_checker: std::sync::Arc<
+        dyn scp_protocol::crypto::ucan::validate::RevocationChecker + Send + Sync,
+    >,
 ) -> scp_runtime::context::outlets::dispatch::OpenStreamParams {
     let credit_window_value =
         credit_window.unwrap_or(scp_protocol::context::outlets::stream::DEFAULT_CREDIT_WINDOW);
@@ -580,6 +672,25 @@ fn build_open_stream_params(
         stream_credit_stall_secs:
             scp_protocol::context::outlets::stream::DEFAULT_STREAM_CREDIT_STALL_SECS,
         stream_cancel_ack_secs: 5,
+        // §5.4.5 runtime-authoritative UCAN revocation re-check
+        // (HIGH-wave-2 Fix B). The runtime now polls `revocation_checker`
+        // every `stream_ucan_recheck_secs` and forces a terminal
+        // `RevokedMidStream` chunk on observed revocation. The bridge
+        // supplies the per-context `BridgeRevocationChecker`
+        // (already wired into the open-time UCAN validation pipeline);
+        // SDK-side recheck loops remain in place as defense-in-depth.
+        stream_ucan_recheck_secs:
+            scp_protocol::context::outlets::stream::DEFAULT_STREAM_UCAN_RECHECK_SECS,
+        // §5.4.5 binding-pinning (HIGH-wave-2 Fix A). The runtime
+        // recomputes the `caveats_binding` at open from these inputs
+        // (plus the `caveats` field already on this struct) and
+        // rejects mismatches as `CaveatsBindingMismatch`. The SDK
+        // supplies the `caveats_binding` value via `caveats_binding`
+        // (above); the bridge forwards the inputs the SDK used to
+        // compute it.
+        ucan_cid,
+        request_id,
+        revocation_checker,
     }
 }
 

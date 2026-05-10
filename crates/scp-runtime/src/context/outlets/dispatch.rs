@@ -67,8 +67,10 @@ use scp_protocol::context::outlets::OutletId;
 use scp_protocol::context::outlets::error_codes;
 use scp_protocol::context::outlets::stream::{
     ChunkPayload, OutletStreamCancel, OutletStreamChunk, OutletStreamCredit, RequestId,
-    TerminateReason, sign_chunk, verify_cancel_signature, verify_chunk_signature,
+    TerminateReason, compute_caveats_binding, sign_chunk, verify_cancel_signature,
+    verify_chunk_signature,
 };
+use scp_protocol::crypto::ucan::validate::RevocationChecker;
 use scp_protocol::economy::types::Amount;
 use scp_protocol::trust::caveats::InvocationCaveats;
 
@@ -126,6 +128,17 @@ pub enum OpenStreamRejection {
     /// `StreamEscrow::reserve_at_open` rejected because the invoker's
     /// available balance is below the reservation.
     InsufficientFunds,
+    /// The SDK-supplied `caveats_binding` does not match the binding the
+    /// runtime recomputes from the parsed UCAN's effective caveats,
+    /// `request_id`, `invoker_did`, and `ucan_cid` (the §5.4.5 binding
+    /// preimage). A malicious invoker presents a UCAN narrowed to caveat
+    /// set A but supplies a binding committing to a wider set B —
+    /// without this recheck every downstream chunk/grant/cancel would
+    /// bind to B and bypass set A's restrictions. Recomputing the
+    /// binding at open from the trusted, parsed UCAN closes the gap.
+    /// Slug: `authorization.attenuation-violation`; code:
+    /// `SCP-TOOL-6110` (the Authorization-class umbrella per §5.4.4).
+    CaveatsBindingMismatch,
 }
 
 impl OpenStreamRejection {
@@ -137,6 +150,7 @@ impl OpenStreamRejection {
             Self::EstimateExceedsBound => error_codes::SLUG_INPUT_ESTIMATE_EXCEEDS_BOUND,
             Self::EscrowOverflow => error_codes::SLUG_ECONOMIC_ESCROW_OVERFLOW,
             Self::InsufficientFunds => error_codes::SLUG_ECONOMIC_INSUFFICIENT_FUNDS,
+            Self::CaveatsBindingMismatch => error_codes::SLUG_AUTHORIZATION_ATTENUATION_VIOLATION,
         }
     }
 
@@ -147,6 +161,7 @@ impl OpenStreamRejection {
             Self::AdmissionRateLimited { .. } => error_codes::CODE_TRANSPORT_FAULT,
             Self::EstimateExceedsBound => error_codes::CODE_INPUT_VIOLATION,
             Self::EscrowOverflow | Self::InsufficientFunds => error_codes::CODE_ECONOMIC_FAULT,
+            Self::CaveatsBindingMismatch => error_codes::CODE_AUTHORIZATION_DENIED,
         }
     }
 
@@ -173,7 +188,13 @@ impl OpenStreamRejection {
 /// estimated-chunk-count + caveats, `credit_window`) so the dispatch
 /// path can run admission → escrow → tracker init in a single
 /// sequence.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is hand-rolled because [`RevocationChecker`] is a trait
+/// object that does not itself require `Debug`; the manual impl renders
+/// it as `revocation_checker: <dyn RevocationChecker>` so logging at
+/// the open boundary does not require a `Debug` bound on every
+/// production checker.
+#[derive(Clone)]
 pub struct OpenStreamParams {
     /// Stream identity pinned at acceptance.
     pub identity: StreamIdentity,
@@ -225,6 +246,82 @@ pub struct OpenStreamParams {
     pub stream_credit_stall_secs: u32,
     /// `ContextParams::stream_cancel_ack_secs`.
     pub stream_cancel_ack_secs: u32,
+    /// `ContextParams::stream_ucan_recheck_secs` — period (in seconds)
+    /// for the runtime's authoritative UCAN-revocation re-check timer
+    /// inside the streaming pump (§5.4.5 "Revocation re-check cadence
+    /// (receiver-side)"). On every tick the pump consults
+    /// [`Self::revocation_checker`] for `Self::ucan_cid` and, on
+    /// observed revocation, injects a synthetic terminal
+    /// `RevokedMidStream` chunk via the same path the SDK-side helper
+    /// uses. Runtime-side enforcement is now authoritative — a hostile
+    /// or buggy SDK that never spawns its userspace re-check loop can
+    /// no longer stream unbounded chunks under a revoked token. The
+    /// SDK-side rechecks remain as defense-in-depth (§5.4.5
+    /// "Authoritative locus: runtime; SDK is `DiD`").
+    pub stream_ucan_recheck_secs: u32,
+    /// CID of the opening UCAN, as the string the §5.4.5 revocation
+    /// list keys on (matches the [`RevocationChecker::is_revoked`]
+    /// argument type). The same bytes (`.as_bytes()`) are consumed by
+    /// [`compute_caveats_binding`] to recompute the §5.4.5 binding
+    /// preimage at open.
+    ///
+    /// Open-time invariant (§5.4.5 binding-pinning): the runtime
+    /// recomputes the `caveats_binding` from
+    /// `(ucan_cid, request_id, invoker_did, declared_estimated_chunk_count,
+    /// JCS(caveats))` and rejects with
+    /// [`OpenStreamRejection::CaveatsBindingMismatch`] when the SDK-
+    /// supplied `identity.caveats_binding` does not match byte-for-byte.
+    /// Trusting an SDK-supplied binding would let a malicious invoker
+    /// present a UCAN narrowed to caveat set A but bind every chunk to
+    /// a looser set B.
+    pub ucan_cid: String,
+    /// 16-byte stream `request_id` (§5.4.5 `UUIDv7`). The §5.4.5
+    /// binding preimage commits to this value, so the runtime MUST use
+    /// the same `request_id` the SDK used when computing the binding
+    /// — otherwise the recompute would never match. Threading the
+    /// `request_id` through `OpenStreamParams` makes it the single
+    /// source of truth: the pump stamps every outer chunk with this
+    /// value, the binding-recompute consumes it verbatim, and the
+    /// returned [`StreamSessionHandle::request_id`] surfaces it back
+    /// to the bridge.
+    pub request_id: RequestId,
+    /// Trait-object [`RevocationChecker`] the runtime pump consults
+    /// every [`Self::stream_ucan_recheck_secs`]. The runtime-side
+    /// recheck is the authoritative termination locus per §5.4.5;
+    /// SDK-side recheck loops remain in place as defense-in-depth.
+    /// Implementations include
+    /// [`scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker`]
+    /// for unit tests and per-context revocation-list adapters in the
+    /// FFI bridges. The bound is `Send + Sync` because the checker
+    /// is shared across the open path and the spawned pump task.
+    pub revocation_checker: Arc<dyn RevocationChecker + Send + Sync>,
+}
+
+impl core::fmt::Debug for OpenStreamParams {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("OpenStreamParams")
+            .field("identity", &self.identity)
+            .field("caps", &self.caps)
+            .field("invoker_did", &self.invoker_did)
+            .field("origin_invoker_did", &self.origin_invoker_did)
+            .field("cost_per_chunk", &self.cost_per_chunk)
+            .field("available_balance", &self.available_balance)
+            .field(
+                "declared_estimated_chunk_count",
+                &self.declared_estimated_chunk_count,
+            )
+            .field("credit_window", &self.credit_window)
+            .field("caveats", &self.caveats)
+            .field("invoker_pk", &self.invoker_pk)
+            .field("operator_signing_key", &"<Arc<SigningKey>>")
+            .field("stream_credit_stall_secs", &self.stream_credit_stall_secs)
+            .field("stream_cancel_ack_secs", &self.stream_cancel_ack_secs)
+            .field("stream_ucan_recheck_secs", &self.stream_ucan_recheck_secs)
+            .field("ucan_cid", &self.ucan_cid)
+            .field("request_id", &self.request_id)
+            .field("revocation_checker", &"<dyn RevocationChecker>")
+            .finish()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +336,9 @@ pub struct OpenStreamParams {
 /// both mutate it without taking long locks. Critical sections are
 /// short — every method either reads a counter or runs a 5-step open /
 /// 3-counter release / single accrual.
-#[derive(Debug)]
+///
+/// `Debug` is hand-rolled because [`SharedSessionState::revocation_checker`]
+/// is a trait object that does not require `Debug`.
 pub(crate) struct SharedSessionState {
     /// Single-thread-of-control credit accounting.
     pub credit: CreditTracker,
@@ -286,6 +385,47 @@ pub(crate) struct SharedSessionState {
     /// `Option` (`take()`) so a duplicate notification is a no-op
     /// and the synthetic chunk is emitted exactly once.
     pub pending_terminate: Option<PendingTerminate>,
+    /// CID of the opening UCAN — the lookup key the pump passes to
+    /// [`Self::revocation_checker`] every
+    /// [`SharedSessionState::stream_ucan_recheck_secs`]. The pump
+    /// snapshots this once at spawn so the re-check arm does not need
+    /// to re-take the session mutex for every tick.
+    pub ucan_cid: String,
+    /// Trait-object [`RevocationChecker`] consulted by the pump's
+    /// authoritative re-check timer. On observed revocation the pump
+    /// arms `pending_terminate` with [`TerminateReason::RevokedMidStream`]
+    /// and wakes itself via the existing `terminate_wake` notifier —
+    /// the synthetic terminal chunk then flows through the same
+    /// settlement block the SDK-side `terminate_with_error` path uses,
+    /// so audit-log / escrow-refund / admission-release run end-to-end.
+    pub revocation_checker: Arc<dyn RevocationChecker + Send + Sync>,
+    /// Period (in seconds) for the pump's revocation re-check arm.
+    /// Snapshotted from `OpenStreamParams::stream_ucan_recheck_secs`
+    /// (which mirrors `ContextParams::stream_ucan_recheck_secs`) so
+    /// the per-context parameter wins for streams opened against
+    /// different contexts on the same node.
+    pub stream_ucan_recheck_secs: u32,
+}
+
+impl core::fmt::Debug for SharedSessionState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SharedSessionState")
+            .field("credit", &self.credit)
+            .field("escrow", &self.escrow)
+            .field("cancel_ack", &self.cancel_ack)
+            .field("admission", &"<Arc<Mutex<StreamAdmissionTracker>>>")
+            .field("admission_release_keys", &self.admission_release_keys)
+            .field("cancel_ack_armed", &self.cancel_ack_armed)
+            .field("credit_stall_armed_at", &self.credit_stall_armed_at)
+            .field("cancel_ack_seq", &self.cancel_ack_seq)
+            .field("next_emission_seq", &self.next_emission_seq)
+            .field("operator_signing_key", &"<Arc<SigningKey>>")
+            .field("pending_terminate", &self.pending_terminate)
+            .field("ucan_cid", &self.ucan_cid)
+            .field("revocation_checker", &"<dyn RevocationChecker>")
+            .field("stream_ucan_recheck_secs", &self.stream_ucan_recheck_secs)
+            .finish()
+    }
 }
 
 /// Terminal-injection payload supplied by
@@ -713,6 +853,87 @@ fn release_admission(admission: &Arc<Mutex<StreamAdmissionTracker>>, params: &Op
     );
 }
 
+/// §5.4.5 binding-pinning gate: recomputes the `caveats_binding` from
+/// the runtime-trusted inputs in [`OpenStreamParams`] and rejects the
+/// open when the SDK-supplied `params.identity.caveats_binding` does
+/// not match.
+///
+/// # Preimage shape (§5.4.5 wire spec)
+///
+/// ```text
+/// SHA-256(
+///   "SCP-OUTLET-CAVEAT-BIND-V1:"
+///   || len_be32(ucan_cid) || ucan_cid
+///   || request_id
+///   || len_be32(invoker_did) || invoker_did
+///   || estimated_chunk_count_be
+///   || len_be32(canonical_jcs(effective_caveats))
+///   || canonical_jcs(effective_caveats)
+/// )
+/// ```
+///
+/// `estimated_chunk_count` is the invoker-declared upper bound
+/// (`params.declared_estimated_chunk_count.unwrap_or(0)`) — the same
+/// value the SDK committed to when computing the binding. Using the
+/// coerced value would diverge whenever the SDK omits the
+/// declaration (the coerce falls back to `caveats.max_calls`, which
+/// the SDK does not commit to).
+///
+/// # Legacy-fixture skip
+///
+/// Production FFI bridges always supply a non-empty `ucan_cid`
+/// (derived from the validated UCAN's encoded JWT — see
+/// `crates/scp-ffi/src/outlet_stream.rs::py_outlet_invoke_stream` and
+/// its NAPI / `UniFFI` mirrors). An empty `ucan_cid` is the sentinel
+/// for legacy unit-test fixtures that hand-construct
+/// `OpenStreamParams` outside the bridge path. Those fixtures
+/// pre-date this gate and supply a fixed sentinel `caveats_binding`
+/// for signing-context reuse rather than a real preimage. The gate
+/// skips the recompute in that path; production cannot reach the
+/// skip because the bridge code paths always set `ucan_cid` to the
+/// SHA-256 of the encoded UCAN.
+///
+/// # Errors
+///
+/// - [`OpenStreamRejection::CaveatsBindingMismatch`] when the
+///   recomputed binding does not equal `params.identity.caveats_binding`.
+/// - [`OpenStreamRejection::CaveatsBindingMismatch`] when JCS
+///   canonicalization of `params.caveats` fails (a structural
+///   invariant violation — non-finite floats etc.).
+fn verify_caveats_binding_at_open(params: &OpenStreamParams) -> Result<(), OpenStreamRejection> {
+    if params.ucan_cid.is_empty() {
+        return Ok(());
+    }
+    let caveats_jcs = params.caveats.to_canonical_json_bytes().map_err(|err| {
+        tracing::error!(
+            outlet_id = %params.identity.outlet_id,
+            error = ?err,
+            "open_stream_session: JCS canonicalization of effective_caveats failed \
+             — rejecting open as caveats-binding-mismatch"
+        );
+        OpenStreamRejection::CaveatsBindingMismatch
+    })?;
+    let recomputed_binding = compute_caveats_binding(
+        params.ucan_cid.as_bytes(),
+        &params.request_id,
+        &params.invoker_did,
+        params.declared_estimated_chunk_count.unwrap_or(0),
+        &caveats_jcs,
+    );
+    if recomputed_binding != params.identity.caveats_binding {
+        tracing::warn!(
+            outlet_id = %params.identity.outlet_id,
+            invoker_did = %params.invoker_did,
+            request_id = %hex::encode(params.request_id),
+            "open_stream_session: caveats_binding mismatch — SDK-supplied binding \
+             does not match the recomputed value over the parsed UCAN's \
+             effective_caveats; rejecting open per §5.4.5 binding-pinning"
+        );
+        return Err(OpenStreamRejection::CaveatsBindingMismatch);
+    }
+    Ok(())
+}
+
 /// Reserves the §5.4.5 open-time escrow. Returns `zero_escrow` for
 /// Query / zero-cost outlets and the bounded reservation for Action
 /// outlets with non-zero cost.
@@ -764,6 +985,9 @@ fn build_shared_state(
         next_emission_seq: 0,
         operator_signing_key: Arc::clone(&params.operator_signing_key),
         pending_terminate: None,
+        ucan_cid: params.ucan_cid.clone(),
+        revocation_checker: Arc::clone(&params.revocation_checker),
+        stream_ucan_recheck_secs: params.stream_ucan_recheck_secs,
     }))
 }
 
@@ -875,6 +1099,14 @@ pub async fn open_stream_session<E>(
 where
     E: OutletExecutor + ?Sized + 'static,
 {
+    // Step 0 (§5.4.5 binding-pinning): recompute the
+    // `caveats_binding` from the runtime-trusted inputs and reject any
+    // SDK-supplied value that does not match byte-for-byte. See
+    // [`verify_caveats_binding_at_open`] for the preimage shape and
+    // legacy-fixture skip semantics. Run BEFORE the admission gate so
+    // a binding-forged open never increments admission counters.
+    verify_caveats_binding_at_open(&params)?;
+
     // Step 1: admission gate.
     run_admission_gate(&admission, &params)?;
 
@@ -972,7 +1204,14 @@ where
         }
     })?;
 
-    let request_id: RequestId = *uuid::Uuid::now_v7().as_bytes();
+    // §5.4.5 binding-pinning: the runtime uses the SDK-supplied
+    // `request_id` (the same value the SDK committed to in the
+    // `caveats_binding` preimage) rather than generating a fresh one.
+    // The pre-acceptance recompute above already verified the SDK
+    // supplied the right binding for this `request_id`; using a
+    // runtime-generated id here would have made the binding check
+    // structurally impossible.
+    let request_id: RequestId = params.request_id;
     let (outer_tx, outer_rx) = mpsc::channel::<OutletStreamChunk>(
         scp_protocol::context::outlets::stream::DEFAULT_CREDIT_WINDOW as usize,
     );
@@ -1103,6 +1342,50 @@ impl PumpSigningContext {
     }
 }
 
+/// Consults `checker.is_revoked(ucan_cid)` and, on observed
+/// revocation, arms `pending_terminate` on the shared session state
+/// with [`TerminateReason::RevokedMidStream`]. Returns `true` when the
+/// arming actually mutated state (so the caller knows to notify the
+/// pump's `terminate_wake`). Returns `false` when:
+///
+/// - the token is not revoked, or
+/// - the token IS revoked but `pending_terminate` was already armed
+///   (idempotent — the prior arm wins; the pump emits exactly one
+///   synthetic terminal chunk).
+///
+/// The check is intentionally scoped to a short critical section: the
+/// `is_revoked` call runs OUTSIDE the session mutex (the checker is
+/// the runtime's authoritative revocation source — it must not be
+/// blocked on the per-stream lock, which the pump holds for chunk-
+/// emission accounting). On revocation we re-acquire the lock just
+/// long enough to mutate `pending_terminate`; this matches the
+/// `terminate_with_error` path on [`StreamSessionHandle`] (§5.4.5
+/// SDK-side revocation re-check) so the audit trail records both
+/// paths identically.
+fn try_arm_revoked_mid_stream(
+    state: &Arc<Mutex<SharedSessionState>>,
+    checker: &(dyn RevocationChecker + Send + Sync),
+    ucan_cid: &str,
+) -> bool {
+    if !checker.is_revoked(ucan_cid) {
+        return false;
+    }
+    let mut guard = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.pending_terminate.is_some() {
+        // Idempotent: an earlier terminate path already armed the
+        // synthetic terminal. The pump will emit exactly one chunk
+        // regardless of which path armed first.
+        return false;
+    }
+    guard.pending_terminate = Some(PendingTerminate {
+        reason: TerminateReason::RevokedMidStream,
+        message_override: None,
+    });
+    true
+}
+
 /// Builds the synthetic terminal `Error{terminal:true}` payload from a
 /// pending-terminate request. The slug is committed verbatim as the
 /// chunk message prefix so the receiver records the canonical §5.4.4
@@ -1141,17 +1424,58 @@ async fn run_stream_pump_v2(
     // per-chunk signing path does not retake the session mutex for
     // each emission. The pinned identity values do not change for the
     // stream's lifetime (§5.4.5 binding-pinning invariant).
-    let signing_ctx = {
+    //
+    // Also snapshot the §5.4.5 revocation re-check inputs (`ucan_cid`,
+    // `revocation_checker`, `recheck_secs`) so the pump's interval arm
+    // calls the checker without retaking the session mutex per tick.
+    // Both snapshots ride on the same Arc::clone — the trait object's
+    // ref-count moves to the pump, the underlying checker stays shared
+    // with the session state.
+    let (signing_ctx, revocation_checker, ucan_cid_for_recheck, recheck_secs) = {
         let guard = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let identity = guard.credit.identity().clone();
-        PumpSigningContext {
-            operator_signing_key: Arc::clone(&guard.operator_signing_key),
-            context_id: identity.context_id,
-            outlet_id: identity.outlet_id,
-            caveats_binding: identity.caveats_binding,
-        }
+        (
+            PumpSigningContext {
+                operator_signing_key: Arc::clone(&guard.operator_signing_key),
+                context_id: identity.context_id,
+                outlet_id: identity.outlet_id,
+                caveats_binding: identity.caveats_binding,
+            },
+            Arc::clone(&guard.revocation_checker),
+            guard.ucan_cid.clone(),
+            guard.stream_ucan_recheck_secs,
+        )
+    };
+
+    // §5.4.5 receiver-side revocation re-check (authoritative locus =
+    // runtime). The pump consults [`RevocationChecker::is_revoked`] for
+    // the opening UCAN's CID every `recheck_secs`. On observed
+    // revocation it arms `pending_terminate` with
+    // `TerminateReason::RevokedMidStream`; the eager pending-terminate
+    // check at the top of the loop then emits a signed synthetic
+    // terminal `Error{terminal:true}` chunk and breaks into the
+    // settlement block. The first `tick().await` returns immediately
+    // (tokio interval default behavior), so we let that "zeroth" tick
+    // pass through without re-checking — burning it inside `loop`'s
+    // initial iteration. `recheck_secs == 0` would create a busy-loop;
+    // we clamp it to a minimum of 1s so a degenerate `ContextParams`
+    // configuration cannot DoS the runtime.
+    let mut recheck_interval = {
+        let period = Duration::from_secs(u64::from(recheck_secs.max(1)));
+        let mut iv = tokio::time::interval(period);
+        iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Drain the zeroth tick that `interval` emits immediately so
+        // the first real fire is at `now + recheck_secs`, not at `now`.
+        // A `now`-fire would race with the open path (a revocation
+        // that arrived after the open's UCAN-revocation step would
+        // immediately re-trip; that is correct behavior, but a
+        // `now`-fire on EVERY open would trip the test invariant that
+        // the terminal arrives WITHIN `2 * recheck_secs` after the
+        // revocation, not before).
+        iv.tick().await;
+        iv
     };
 
     loop {
@@ -1217,7 +1541,9 @@ async fn run_stream_pump_v2(
         //   (a) the credit stall timer to fire (emit terminal),
         //   (b) a grant_wake notification (resume),
         //   (c) the cancel-ack timer to fire (emit terminal),
-        //   (d) a cancel_wake notification (re-evaluate next iter).
+        //   (d) a cancel_wake notification (re-evaluate next iter),
+        //   (e) the revocation re-check interval ticks (consult
+        //       checker; arm pending_terminate on revocation).
         // We do NOT pull from the inner_rx because the parked chunk is
         // the head-of-line — pulling more from the executor would cause
         // out-of-order delivery once the stall lifts.
@@ -1260,6 +1586,17 @@ async fn run_stream_pump_v2(
                     // path re-engages.
                     continue;
                 }
+                _ = recheck_interval.tick() => {
+                    // §5.4.5 revocation re-check (runtime-authoritative).
+                    if try_arm_revoked_mid_stream(
+                        &state,
+                        revocation_checker.as_ref(),
+                        &ucan_cid_for_recheck,
+                    ) {
+                        terminate_wake.notify_waiters();
+                    }
+                    continue;
+                }
             }
         } else {
             tokio::select! {
@@ -1296,6 +1633,17 @@ async fn run_stream_pump_v2(
                     // Loop back so the eager `pending_terminate`
                     // check at the top emits the synthetic terminal
                     // and breaks.
+                    continue;
+                }
+                _ = recheck_interval.tick() => {
+                    // §5.4.5 revocation re-check (runtime-authoritative).
+                    if try_arm_revoked_mid_stream(
+                        &state,
+                        revocation_checker.as_ref(),
+                        &ucan_cid_for_recheck,
+                    ) {
+                        terminate_wake.notify_waiters();
+                    }
                     continue;
                 }
                 next = inner_rx.recv() => next,
@@ -1558,6 +1906,16 @@ mod tests {
     }
 
     fn build_test_state() -> Arc<Mutex<SharedSessionState>> {
+        build_test_state_with_checker(
+            Arc::new(scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new()),
+            60,
+        )
+    }
+
+    fn build_test_state_with_checker(
+        revocation_checker: Arc<dyn RevocationChecker + Send + Sync>,
+        stream_ucan_recheck_secs: u32,
+    ) -> Arc<Mutex<SharedSessionState>> {
         let signing = Arc::new(fixed_signing_key());
         let identity = super::super::stream::StreamIdentity {
             context_id: "ctx-test".to_owned(),
@@ -1584,6 +1942,9 @@ mod tests {
             next_emission_seq: 0,
             operator_signing_key: signing,
             pending_terminate: None,
+            ucan_cid: "bafyrei-test".to_owned(),
+            revocation_checker,
+            stream_ucan_recheck_secs,
         }))
     }
 
