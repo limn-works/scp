@@ -88,6 +88,49 @@ pub struct WasmOutletInvocationStream {
     request_id_hex: String,
 }
 
+impl Drop for WasmOutletInvocationStream {
+    /// §5.4.5 HIGH-wave-3 Fix B — evict the per-bridge session entry
+    /// on drop so a wrapper GC'd by the JS host without being drained
+    /// to terminal (exception path, V8 GC, awaiting-only consumption
+    /// that never observes a terminal chunk) does NOT leak the
+    /// [`crate::manager::WasmOutletStreamSession`] (which holds the
+    /// invoker's `SigningKey`, the pre-materialised chunk queue, and
+    /// the admission slot held on the per-context
+    /// `WasmStreamAdmissionTracker`).
+    ///
+    /// Performs eviction + admission release atomically under the
+    /// thread-local manager borrow:
+    /// 1. Reads the session's `(context_id, invoker_did, outlet_id)`
+    ///    while it is still in the map, so the admission release uses
+    ///    the same identity triple the open path admitted under.
+    /// 2. Removes the session from the manager's `outlet_streams` map.
+    /// 3. Calls `release_admission_slot()` (which
+    ///    saturating-subtracts so a release that races with the
+    ///    terminal-chunk-evict path is idempotent).
+    ///
+    /// Idempotent: when [`Self::next`] already drained the queue or
+    /// observed a terminal chunk the manager already removed the
+    /// session and released the slot — this `Drop` becomes a no-op
+    /// (the `get` returns `None`, the `release_admission_slot` short-
+    /// circuits on missing tracker entries).
+    fn drop(&mut self) {
+        let request_id_hex = self.request_id_hex.clone();
+        let _ = with_manager(|mgr| {
+            if let Some(session) = mgr.outlet_streams.remove(&request_id_hex) {
+                let ctx = session.context_id.clone();
+                let inv = session.invoker_did.clone();
+                let out = session.outlet_id.clone();
+                // Explicitly drop the session here so its zeroizing
+                // Drop runs before we release admission — keeps the
+                // critical-section ordering stable.
+                drop(session);
+                mgr.release_admission_slot(&ctx, &inv, &out);
+            }
+            Ok(())
+        });
+    }
+}
+
 #[wasm_bindgen]
 impl WasmOutletInvocationStream {
     /// Returns the §5.4.5 16-byte `request_id` of the open stream as a

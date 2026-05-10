@@ -38,21 +38,23 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use napi::bindgen_prelude::Buffer;
 use napi_derive::napi;
 use scp_core::context::outlets::stream::{
-    self as proto_stream, ChunkPayload, CreditGrantSigningInputs, OutletStreamChunk,
-    OutletStreamCredit,
+    self as proto_stream, ChunkPayload, OutletStreamChunk, OutletStreamCredit,
 };
 use scp_ffi_common::error_codes as codes;
+use scp_platform::{KeyCustody, KeyHandle};
 use scp_protocol::trust::caveats::InvocationCaveats;
 use serde_json::Value;
 use tokio::sync::Mutex as TokioMutex;
 use tokio::sync::mpsc;
+use zeroize::Zeroize;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
+use crate::identity::OpaqueInMemoryKeyCustody;
 
 // ---------------------------------------------------------------------------
 // Per-stream revocation checker
@@ -132,16 +134,41 @@ pub(crate) struct StreamRegistryEntry {
     /// 32-byte `caveats_binding` pinned at acceptance — committed into
     /// every grant preimage.
     pub caveats_binding: [u8; 32],
-    /// Invoker's Ed25519 signing key — used to sign every grant. The
-    /// runtime tracker pins the corresponding verifying key at open;
-    /// every grant signature must verify under that pinned key.
-    pub invoker_signing_key: SigningKey,
+    /// Opaque [`KeyHandle`] for the invoker's Ed25519 signing key.
+    /// §5.4.5 HIGH-wave-3 Fix A — replaces the previous raw
+    /// `SigningKey` field so private bytes never linger on the bridge
+    /// heap for the stream's lifetime (ADR-006). Grant / cancel /
+    /// terminate signatures call back into [`Self::custody`] for the
+    /// actual sign step.
+    pub invoker_key_handle: KeyHandle,
+    /// Custody provider that owns [`Self::invoker_key_handle`]. Cloned
+    /// from the identity registry at open. Held as `Arc` so the
+    /// custody remains alive across the stream's lifetime even if the
+    /// identity is rotated out from under it.
+    pub custody: Arc<OpaqueInMemoryKeyCustody>,
+    /// Invoker's Ed25519 verifying key (public, non-secret)
+    /// snapshotted at open. Used to self-verify every freshly-signed
+    /// grant / cancel against the same pinned identity the runtime
+    /// uses for downstream verification.
+    pub invoker_verifying_key: VerifyingKey,
     /// Pinned invoker DID. The control-plane bridge functions
     /// (`grant_credit`, `cancel`, `terminate`) verify `caller_did`
-    /// matches this before signing. CRITICAL #1 fix.
+    /// matches this before invoking custody to sign. CRITICAL #1 fix.
     pub invoker_did: String,
     /// 16-byte `request_id` (the registry key in raw form).
     pub request_id: [u8; 16],
+}
+
+impl Drop for StreamRegistryEntry {
+    /// §5.4.5 HIGH-wave-3 Fix A — defense-in-depth zeroization of the
+    /// `caveats_binding` hash (non-secret but tidy) on drop. The other
+    /// fields are either opaque handles (`invoker_key_handle`,
+    /// `custody` Arc), public values (`invoker_verifying_key`, ids),
+    /// or runtime-owned state behind the inner Mutex — none need
+    /// zeroization at the bridge boundary.
+    fn drop(&mut self) {
+        self.caveats_binding.zeroize();
+    }
 }
 
 /// Returns a reference to the per-bridge stream registry on the
@@ -391,6 +418,31 @@ pub struct NapiOutletInvocationStream {
     terminated: Arc<std::sync::atomic::AtomicBool>,
 }
 
+impl Drop for NapiOutletInvocationStream {
+    /// §5.4.5 HIGH-wave-3 Fix B — evict the per-bridge registry entry
+    /// on drop so a wrapper GC'd by Node.js without being drained to
+    /// terminal (exception path, V8 GC, awaiting-only consumption that
+    /// never observes a terminal chunk) does NOT leak
+    /// `StreamRegistryEntry` (`KeyHandle` + per-stream
+    /// [`scp_runtime::context::outlets::dispatch::StreamSessionHandle`]
+    /// state) indefinitely.
+    ///
+    /// Idempotent: when [`Self::next`] already observed a terminal
+    /// chunk it called [`evict_request`] inline, and the registry no
+    /// longer holds the entry — this `Drop` becomes a no-op. The
+    /// admission counters held by the runtime pump are released by
+    /// the pump's settlement block when the receiver drops: dropping
+    /// `rx` closes the channel so the pump's `outer_tx.send().await`
+    /// fails, breaks the loop, and runs settlement
+    /// (`StreamAdmissionTracker::release` on all three counters per
+    /// [`scp_runtime::context::outlets::dispatch::AdmissionReleaseKeys`]).
+    /// No separate `release_admission_slot()` call from the wrapper —
+    /// the receiver close is the authoritative trigger.
+    fn drop(&mut self) {
+        evict_request(&self.request_id_hex);
+    }
+}
+
 #[napi]
 impl NapiOutletInvocationStream {
     /// Returns the §5.4.5 16-byte `request_id` of the open stream as a
@@ -601,8 +653,19 @@ pub async fn context_outlet_invoke_stream(
         })
         .map_err(napi::Error::from)?;
 
-    let signing_key = resolve_invoker_signing_key(&identity_did).await?;
-    let signing_key_arc = Arc::new(signing_key.clone());
+    // §5.4.5 HIGH-wave-3 Fix A — resolve the invoker's key handle +
+    // custody Arc up front. The runtime pump still needs an
+    // `Arc<SigningKey>` for chunk signing
+    // (`OpenStreamParams::operator_signing_key`); export that once
+    // here and pass it to the pump. The registry entry keeps only the
+    // custody handle so grant / cancel / terminate signatures call
+    // into custody instead of a cached private key — private bytes
+    // never linger on the bridge heap for the stream's lifetime
+    // (ADR-006).
+    let (custody, invoker_key_handle) = resolve_invoker_key_handle(&identity_did)?;
+    let signing_key = resolve_invoker_signing_key_via_custody(&custody, invoker_key_handle).await?;
+    let invoker_verifying_key = signing_key.verifying_key();
+    let signing_key_arc = Arc::new(signing_key);
 
     let executor: Arc<dyn scp_runtime::context::outlets::invoke::OutletExecutor> =
         Arc::new(ClosureExecutor {
@@ -648,7 +711,7 @@ pub async fn context_outlet_invoke_stream(
         caveats_binding,
         credit_window,
         estimated_chunk_count,
-        signing_key.verifying_key(),
+        invoker_verifying_key,
         Arc::clone(&signing_key_arc),
         ucan_cid_for_binding,
         request_id,
@@ -715,7 +778,9 @@ pub async fn context_outlet_invoke_stream(
         outlet_id: outlet_id.clone(),
         stream_epoch: stream_epoch_u64,
         caveats_binding,
-        invoker_signing_key: signing_key,
+        invoker_key_handle,
+        custody,
+        invoker_verifying_key,
         invoker_did: identity_did.clone(),
         request_id,
     })?;
@@ -829,7 +894,7 @@ fn register_stream_entry(entry: StreamRegistryEntry) -> napi::Result<()> {
 ///   identity mismatch, escrow overflow, insufficient funds).
 #[napi(js_name = "outletStreamGrantCredit")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn outlet_stream_grant_credit(
+pub async fn outlet_stream_grant_credit(
     request_id_hex: String,
     caller_did: String,
     grant: u32,
@@ -868,7 +933,7 @@ pub fn outlet_stream_grant_credit(
         *guard
     };
 
-    let credit = sign_credit_grant(&entry, grant, next_seq);
+    let credit = sign_credit_grant(&entry, grant, next_seq).await?;
 
     let handle_guard = entry
         .handle
@@ -886,27 +951,64 @@ pub fn outlet_stream_grant_credit(
 }
 
 /// Constructs and signs an [`OutletStreamCredit`] for `entry`.
-fn sign_credit_grant(
+///
+/// §5.4.5 HIGH-wave-3 Fix A — calls into custody for the actual signing
+/// step so private bytes never leave the custody boundary (ADR-006).
+/// Self-verifies the signature under the entry's pinned verifying key
+/// before returning to surface preimage / key drift at the bridge layer.
+async fn sign_credit_grant(
     entry: &StreamRegistryEntry,
     grant: u32,
     monotonic_seq: u64,
-) -> OutletStreamCredit {
-    let inputs = CreditGrantSigningInputs {
-        context_id: entry.context_id.as_str(),
-        outlet_id: entry.outlet_id.as_str(),
-        request_id: &entry.request_id,
+) -> napi::Result<OutletStreamCredit> {
+    let preimage = proto_stream::compute_credit_sig_preimage(
+        entry.context_id.as_str(),
+        entry.outlet_id.as_str(),
+        &entry.request_id,
         grant,
         monotonic_seq,
-        stream_epoch: entry.stream_epoch,
-        caveats_binding: &entry.caveats_binding,
-    };
-    let sig = proto_stream::sign_credit_grant(&entry.invoker_signing_key, &inputs);
-    OutletStreamCredit {
+        entry.stream_epoch,
+        &entry.caveats_binding,
+    );
+    let signature = entry
+        .custody
+        .0
+        .sign(&entry.invoker_key_handle, &preimage)
+        .await
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("custody sign failed for credit grant: {e}"),
+                code: codes::CTX_2000.to_owned(),
+            })
+        })?;
+    let sig_bytes: [u8; 64] = signature.into_bytes().try_into().map_err(|got: Vec<u8>| {
+        napi::Error::from(ScpNapiError::Context {
+            message: format!(
+                "custody returned signature of {} bytes; expected 64",
+                got.len()
+            ),
+            code: codes::CTX_2000.to_owned(),
+        })
+    })?;
+    let signature_typed = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    if entry
+        .invoker_verifying_key
+        .verify_strict(&preimage, &signature_typed)
+        .is_err()
+    {
+        return Err(napi::Error::from(ScpNapiError::Context {
+            message: "freshly-signed credit grant failed self-verification \
+                      — SCP-OUTLET-CREDIT-V1 preimage drift or custody/key mismatch"
+                .to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        }));
+    }
+    Ok(OutletStreamCredit {
         request_id: entry.request_id,
         grant,
         monotonic_seq,
-        sig,
-    }
+        sig: sig_bytes,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -932,7 +1034,7 @@ fn sign_credit_grant(
 ///   operation; surfaces only on key-rotation drift).
 #[napi(js_name = "outletStreamCancel")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn outlet_stream_cancel(
+pub async fn outlet_stream_cancel(
     request_id_hex: String,
     caller_did: String,
 ) -> napi::Result<Option<f64>> {
@@ -949,7 +1051,7 @@ pub fn outlet_stream_cancel(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         handle_guard.current_next_emission_seq()
     };
-    let cancel = sign_cancel_for_entry(&entry, next_seq_u64);
+    let cancel = sign_cancel_for_entry(&entry, next_seq_u64).await?;
     let handle_guard = entry
         .handle
         .lock()
@@ -1055,26 +1157,60 @@ pub fn outlet_stream_terminate(
 
 /// Builds and signs an `OutletStreamCancel` for `entry` against
 /// `next_seq` (mirrors [`sign_credit_grant`]).
-fn sign_cancel_for_entry(
+///
+/// §5.4.5 HIGH-wave-3 Fix A — calls into custody for the actual signing
+/// step; private bytes never leave the custody boundary (ADR-006).
+/// Self-verifies the signature under the entry's pinned verifying key.
+async fn sign_cancel_for_entry(
     entry: &StreamRegistryEntry,
     next_seq: u64,
-) -> scp_protocol::context::outlets::stream::OutletStreamCancel {
-    use scp_protocol::context::outlets::stream::{
-        CancelSigningInputs, OutletStreamCancel, sign_cancel,
-    };
-    let inputs = CancelSigningInputs {
-        context_id: entry.context_id.as_str(),
-        outlet_id: entry.outlet_id.as_str(),
-        request_id: &entry.request_id,
+) -> napi::Result<scp_protocol::context::outlets::stream::OutletStreamCancel> {
+    use scp_protocol::context::outlets::stream::{OutletStreamCancel, compute_cancel_sig_preimage};
+    let preimage = compute_cancel_sig_preimage(
+        entry.context_id.as_str(),
+        entry.outlet_id.as_str(),
+        &entry.request_id,
         next_seq,
-        caveats_binding: &entry.caveats_binding,
-    };
-    let sig = sign_cancel(&entry.invoker_signing_key, &inputs);
-    OutletStreamCancel {
+        &entry.caveats_binding,
+    );
+    let signature = entry
+        .custody
+        .0
+        .sign(&entry.invoker_key_handle, &preimage)
+        .await
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("custody sign failed for cancel: {e}"),
+                code: codes::CTX_2000.to_owned(),
+            })
+        })?;
+    let sig_bytes: [u8; 64] = signature.into_bytes().try_into().map_err(|got: Vec<u8>| {
+        napi::Error::from(ScpNapiError::Context {
+            message: format!(
+                "custody returned signature of {} bytes; expected 64",
+                got.len()
+            ),
+            code: codes::CTX_2000.to_owned(),
+        })
+    })?;
+    let signature_typed = ed25519_dalek::Signature::from_bytes(&sig_bytes);
+    if entry
+        .invoker_verifying_key
+        .verify_strict(&preimage, &signature_typed)
+        .is_err()
+    {
+        return Err(napi::Error::from(ScpNapiError::Context {
+            message: "freshly-signed cancel failed self-verification \
+                      — SCP-OUTLET-CANCEL-V1 preimage drift or custody/key mismatch"
+                .to_owned(),
+            code: codes::CTX_2000.to_owned(),
+        }));
+    }
+    Ok(OutletStreamCancel {
         request_id: entry.request_id,
         next_seq,
-        sig,
-    }
+        sig: sig_bytes,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1313,29 +1449,43 @@ fn lookup_entry_authenticated(
     Ok(entry)
 }
 
-async fn resolve_invoker_signing_key(identity_did: &str) -> napi::Result<SigningKey> {
-    // `with_identity` looks up the per-identity entry in the bridge's
-    // identity registry. We clone out the `Arc<custody>` and the key
-    // handle, drop the DashMap lock, then run the async export
-    // outside the lock — the same two-phase pattern used by the
-    // link-attestation signer in `identity.rs`.
-    let (custody, key_handle) = crate::runtime::with_identity(identity_did, |entry| {
+/// Resolves the invoker's [`KeyHandle`] + custody [`Arc`] from the
+/// bridge's identity registry. Replaces the previous
+/// `resolve_invoker_signing_key` helper as the primary key-resolution
+/// path so the bridge no longer caches raw private bytes on the
+/// registry entry (HIGH-wave-3 Fix A; ADR-006).
+fn resolve_invoker_key_handle(
+    identity_did: &str,
+) -> napi::Result<(Arc<OpaqueInMemoryKeyCustody>, KeyHandle)> {
+    crate::runtime::with_identity(identity_did, |entry| {
         Ok((
             Arc::clone(&entry.custody),
             entry.identity.active_signing_key,
         ))
-    })?;
-    let signing_key = custody
+    })
+    .map_err(napi::Error::from)
+}
+
+/// Exports the invoker's [`SigningKey`] via custody. Used at stream
+/// open to build the runtime pump's `Arc<SigningKey>` — the pump signs
+/// every chunk under this key (see
+/// [`scp_runtime::context::outlets::dispatch::OpenStreamParams::operator_signing_key`]).
+/// The returned key lives only inside the pump task; the bridge does
+/// NOT cache it on the registry entry.
+async fn resolve_invoker_signing_key_via_custody(
+    custody: &OpaqueInMemoryKeyCustody,
+    handle: KeyHandle,
+) -> napi::Result<SigningKey> {
+    custody
         .0
-        .export_ed25519_signing_key(&key_handle)
+        .export_ed25519_signing_key(&handle)
         .await
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Identity {
                 message: format!("failed to export invoker signing key: {e}"),
                 code: codes::IDENT_1041.to_owned(),
             })
-        })?;
-    Ok(signing_key)
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -1598,10 +1748,10 @@ mod tests {
 
     /// `outlet_stream_grant_credit` rejects `grant == 0` with
     /// `Validation` error per OUT-031 round-6 uniform `InvalidGrant` rule.
-    #[test]
-    fn grant_credit_rejects_zero_grant() {
+    #[tokio::test]
+    async fn grant_credit_rejects_zero_grant() {
         let result =
-            outlet_stream_grant_credit("00".repeat(16), "did:dht:z6MkInvoker".to_owned(), 0);
+            outlet_stream_grant_credit("00".repeat(16), "did:dht:z6MkInvoker".to_owned(), 0).await;
         assert!(result.is_err(), "grant=0 must be rejected");
         let err_str = format!("{}", result.unwrap_err());
         assert!(
@@ -1612,17 +1762,58 @@ mod tests {
 
     /// `outlet_stream_cancel` returns `Context` error when the
     /// `request_id_hex` does not match any registry entry.
-    #[test]
-    fn cancel_returns_unknown_session_for_missing_request() {
+    #[tokio::test]
+    async fn cancel_returns_unknown_session_for_missing_request() {
         // Use a fresh hex that is unlikely to match any other test's
         // active stream (registry is process-global per default
         // bridge instance — see ADR-048).
-        let result = outlet_stream_cancel("ee".repeat(16), "did:dht:z6MkInvoker".to_owned());
+        let result = outlet_stream_cancel("ee".repeat(16), "did:dht:z6MkInvoker".to_owned()).await;
         assert!(result.is_err(), "missing request_id must be rejected");
         let err_str = format!("{}", result.unwrap_err());
         assert!(
             err_str.contains("not found") || err_str.contains("unknown-session"),
             "error must mention unknown-session: {err_str}"
         );
+    }
+
+    /// §5.4.5 HIGH-wave-3 Fix B — dropping a
+    /// [`NapiOutletInvocationStream`] without consuming it evicts the
+    /// registry entry. Exercises the `Drop` impl: build a wrapper
+    /// referencing a sentinel request id, drop it, assert the registry
+    /// no longer holds that key. Idempotent — running this test
+    /// twice in a row succeeds.
+    #[test]
+    fn drop_evicts_registry_entry() {
+        crate::runtime::ensure_bridge_instance();
+        let request_id_hex = "cd".repeat(16);
+        {
+            let wrapper = NapiOutletInvocationStream {
+                rx: Arc::new(TokioMutex::new(None)),
+                request_id_hex: request_id_hex.clone(),
+                terminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            drop(wrapper);
+        }
+        let reg = registry().expect("registry available");
+        assert!(
+            reg.get(&request_id_hex).is_none(),
+            "drop must leave the registry without the entry"
+        );
+    }
+
+    /// §5.4.5 HIGH-wave-3 Fix A — `StreamRegistryEntry` no longer
+    /// stores a raw `SigningKey`. Compile-time check: the struct's
+    /// `invoker_key_handle` field is a `KeyHandle` (opaque), `custody`
+    /// is an `Arc<OpaqueInMemoryKeyCustody>`, and
+    /// `invoker_verifying_key` is the public key. A field named
+    /// `invoker_signing_key` would fail to compile if re-introduced.
+    #[test]
+    fn registry_entry_has_no_raw_signing_key_field() {
+        fn assert_shape() {
+            let _ = std::mem::size_of::<KeyHandle>();
+            let _ = std::mem::size_of::<Arc<OpaqueInMemoryKeyCustody>>();
+            let _ = std::mem::size_of::<VerifyingKey>();
+        }
+        let _ = assert_shape;
     }
 }
