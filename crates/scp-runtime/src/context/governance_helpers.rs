@@ -3860,3 +3860,170 @@ pub fn try_broadcast_commit_or_enqueue(
         }
     }
 }
+
+// ===========================================================================
+// Supervisor-iterating sweep entry points (Phase 2A finalization)
+// ===========================================================================
+//
+// These are the non-legacy replacements for the `_legacy` sweep helpers
+// in `governance_helpers_legacy.rs`. Each iterates
+// [`Supervisor::actor_ids`](crate::context::supervisor::Supervisor::actor_ids)
+// (the actor registry — NOT the legacy `Supervisor::contexts` DashMap)
+// and dispatches one typed sweep command per actor via the per-actor
+// mailbox.
+//
+// Per-actor sweep bodies live in
+// [`crate::context::actor::handlers::governance`] as
+// `handle_*_actor` functions, dispatched from the actor's
+// `dispatch_state` arm for the matching `GovernanceCommand` variant.
+//
+// Sweep commands carry no `context_id` field — the routing target is
+// decided at the iteration site (one command per known actor). They
+// are NOT routable via `Supervisor::dispatch_governance_command`
+// because `governance_command_context_id` returns `None`; callers MUST
+// go through these entry points.
+
+/// Sweep entry point: evaluate consequence rules for every registered
+/// actor.
+///
+/// Relocates the legacy
+/// [`governance_helpers_legacy::evaluate_periodic_consequences_legacy`](crate::context::governance_helpers_legacy::evaluate_periodic_consequences_legacy)
+/// off the `Supervisor::contexts` DashMap. Iterates the actor registry
+/// and dispatches one
+/// [`GovernanceCommand::EvaluatePeriodicConsequences`](crate::context::actor::commands::GovernanceCommand::EvaluatePeriodicConsequences)
+/// per actor.
+///
+/// Best-effort: if an actor's mailbox is closed mid-sweep (actor has
+/// shut down) the iteration silently skips it. Per-actor replies are
+/// awaited in turn — the sweep returns when every actor has either
+/// replied or its mailbox is gone.
+pub async fn evaluate_periodic_consequences(
+    supervisor: &crate::context::supervisor::Supervisor,
+) {
+    use crate::context::actor::commands::{ContextCommand, GovernanceCommand};
+
+    for ctx_id in supervisor.actor_ids() {
+        let Some(actor) = supervisor.lookup(&ctx_id) else {
+            continue;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::Governance(GovernanceCommand::EvaluatePeriodicConsequences {
+            reply: tx,
+        });
+        if actor
+            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+            .await
+            .is_err()
+        {
+            // Mailbox closed — actor shut down between snapshot and
+            // dispatch. Skip silently (legacy did the same on
+            // DashMap::get returning None mid-iteration).
+            continue;
+        }
+        let _ = rx.await;
+    }
+}
+
+/// Sweep entry point: process the MLS commit retry queue for every
+/// registered actor (PR #1606 C6).
+///
+/// Relocates the legacy
+/// [`governance_helpers_legacy::process_pending_commits_legacy`](crate::context::governance_helpers_legacy::process_pending_commits_legacy)
+/// off the `Supervisor::contexts` DashMap. Iterates the actor registry
+/// and dispatches one
+/// [`GovernanceCommand::ProcessPendingCommits`](crate::context::actor::commands::GovernanceCommand::ProcessPendingCommits)
+/// per actor.
+pub async fn process_pending_commits(supervisor: &crate::context::supervisor::Supervisor) {
+    use crate::context::actor::commands::{ContextCommand, GovernanceCommand};
+
+    for ctx_id in supervisor.actor_ids() {
+        let Some(actor) = supervisor.lookup(&ctx_id) else {
+            continue;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd =
+            ContextCommand::Governance(GovernanceCommand::ProcessPendingCommits { reply: tx });
+        if actor
+            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let _ = rx.await;
+    }
+}
+
+/// Sweep entry point: run one tick of the governance timeout pipeline
+/// for a single context (target supplied by the caller — the
+/// supervisor's spawn-time per-context timer task).
+///
+/// This is the per-tick body that the spawn-time governance-timeout
+/// task invokes. Unlike the bulk sweeps above, this entry point
+/// targets a single named context (the timer's own); the
+/// supervisor-iterating shape is reserved for the bulk consequence /
+/// commit sweeps.
+///
+/// Dispatches
+/// [`GovernanceCommand::EvaluateTimeouts`](crate::context::actor::commands::GovernanceCommand::EvaluateTimeouts)
+/// to the named actor and returns whether the timer loop should
+/// continue (`true`) or stop (`false`). Matches the legacy timer
+/// closure's `bool` return.
+///
+/// Returns `false` if the actor cannot be reached (mailbox closed or
+/// no actor registered for `context_id`) — the timer loop stops in
+/// that case, matching the legacy `contexts.get(ctx_id) = None ->
+/// return false` semantics.
+pub async fn tick_governance_timeout(
+    supervisor: &crate::context::supervisor::Supervisor,
+    context_id: &str,
+) -> bool {
+    use crate::context::actor::commands::{ContextCommand, GovernanceCommand};
+
+    let Some(actor) = supervisor.lookup(context_id) else {
+        return false;
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = ContextCommand::Governance(GovernanceCommand::EvaluateTimeouts { reply: tx });
+    if actor
+        .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+        .await
+        .is_err()
+    {
+        return false;
+    }
+    rx.await.map(|r| r.unwrap_or(false)).unwrap_or(false)
+}
+
+/// Sweep entry point: spawn the supervisor-driven governance timeout
+/// task for a context.
+///
+/// Per ADR-049 Phase 2A finalization §sweep-helper-relocation, the
+/// per-context governance-timeout actor lands in Phase 2B; for now the
+/// spawn-time setup stays supervisor-driven but the per-tick body is
+/// rerouted through the actor mailbox via
+/// [`tick_governance_timeout`]. The spawn dance (task_set + per-context
+/// `start_in`) remains in
+/// [`governance_helpers_legacy::start_governance_timeout_task_legacy`]
+/// because it deeply touches the legacy `Supervisor::contexts`
+/// generation tracking; full migration lands when the legacy `contexts`
+/// DashMap is removed.
+///
+/// This wrapper is provided so callers can address the migration via
+/// the non-legacy module surface. It currently delegates to the legacy
+/// helper byte-identically — the only observable behavior change is
+/// that the spawned task's PHASE 4/5 (consequences + commit retry)
+/// bodies now dispatch through this module's
+/// [`evaluate_periodic_consequences`] and
+/// [`process_pending_commits`] when they migrate in a follow-up
+/// commit of the same ladder.
+pub async fn start_governance_timeout_task(
+    supervisor: &crate::context::supervisor::Supervisor,
+    context_id: &str,
+) {
+    crate::context::governance_helpers_legacy::start_governance_timeout_task_legacy(
+        supervisor,
+        context_id,
+    )
+    .await;
+}

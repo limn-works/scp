@@ -1189,7 +1189,7 @@ pub async fn finalize_create(
     // Designated-legacy supervisor-scoped iteration helper — see module
     // doc comment.
     let supervisor = deps.supervisor.shim_supervisor();
-    crate::context::governance_helpers_legacy::start_governance_timeout_task_legacy(
+    crate::context::governance_helpers::start_governance_timeout_task(
         supervisor.as_ref(),
         context_id,
     )
@@ -1602,7 +1602,7 @@ pub async fn import_context(
 
     // Start governance timeout task (ADR-031 §5).
     let supervisor = deps.supervisor.shim_supervisor();
-    crate::context::governance_helpers_legacy::start_governance_timeout_task_legacy(
+    crate::context::governance_helpers::start_governance_timeout_task(
         supervisor.as_ref(),
         &context_id,
     )
@@ -1945,7 +1945,7 @@ pub async fn restore_context(
     // Start governance timeout task (ADR-031 §5). Designated-legacy
     // supervisor-scoped iteration helper — see module doc comment.
     let supervisor = deps.supervisor.shim_supervisor();
-    crate::context::governance_helpers_legacy::start_governance_timeout_task_legacy(
+    crate::context::governance_helpers::start_governance_timeout_task(
         supervisor.as_ref(),
         context_id,
     )
@@ -1964,4 +1964,268 @@ pub async fn restore_context(
     }
 
     Ok(())
+}
+
+// ===========================================================================
+// Supervisor-iterating sweep entry points (Phase 2A finalization)
+// ===========================================================================
+//
+// These are the non-legacy replacements for the `_legacy` lifecycle
+// sweep helpers in `lifecycle_helpers_legacy.rs`. Each iterates
+// [`Supervisor::actor_ids`](crate::context::supervisor::Supervisor::actor_ids)
+// (the actor registry — NOT the legacy `Supervisor::contexts` DashMap)
+// and dispatches one typed sweep command per actor via the per-actor
+// mailbox.
+//
+// `restore_all_contexts` is the exception — it iterates PERSISTENCE
+// (snapshots from the configured persistence provider) because no
+// actors exist before restore. The body builds each context's
+// payload from snapshot and calls `Supervisor::restore_context`,
+// which routes the bootstrap variant through
+// `dispatch_lifecycle_direct` (the only legitimate caller of the
+// bootstrap-shape legacy helpers per ADR-049 §7 allowlist).
+//
+// Per-actor sweep bodies live in
+// [`crate::context::actor::handlers::lifecycle`] as `handle_*_actor`
+// functions, dispatched from the actor's `dispatch_actor_inner` arm
+// for the matching `LifecycleCommand` variant.
+
+/// Sweep entry point: restore every persisted context from the
+/// configured persistence provider.
+///
+/// Returns the list of restored context IDs. Contexts in `Closing` /
+/// `Closed` / `Expired` states are skipped (only `Active` contexts are
+/// resurrected after a restart).
+///
+/// Relocates the legacy
+/// [`lifecycle_helpers_legacy::restore_all_contexts_legacy`](crate::context::lifecycle_helpers_legacy::restore_all_contexts_legacy)
+/// off direct `Supervisor::contexts` DashMap insertion. The body
+/// iterates persistence snapshots and dispatches one
+/// `Supervisor::restore_context` call per snapshot — that ergonomic
+/// method routes through the actor mailbox (after the bootstrap
+/// `dispatch_lifecycle_direct` arm spawns the actor) so the resulting
+/// actor registry is populated correctly.
+///
+/// # Errors
+///
+/// - [`ContextError::PersistenceFailed`] if the persistence provider
+///   is unconfigured or `list_persisted_contexts` fails.
+pub async fn restore_all_contexts(
+    supervisor: &crate::context::supervisor::Supervisor,
+) -> Result<Vec<String>, ContextError> {
+    let Some(persistence) = supervisor.persistence_ref() else {
+        return Err(ContextError::PersistenceFailed(
+            "no persistence provider configured".into(),
+        ));
+    };
+    let context_ids = persistence.list_persisted_contexts().map_err(|e| {
+        ContextError::PersistenceFailed(format!("failed to list persisted contexts: {e}"))
+    })?;
+
+    let mut restored = Vec::new();
+    for ctx_id in &context_ids {
+        let ctx_snapshot = match persistence.load_context(ctx_id) {
+            Ok(Some(snap)) => snap,
+            Ok(None) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    context_id = %ctx_id,
+                    error = %e,
+                    "failed to load context snapshot during restore"
+                );
+                continue;
+            }
+        };
+
+        if ctx_snapshot.state != scp_protocol::context::ContextState::Active {
+            continue;
+        }
+
+        let handle = crate::context::ContextHandle::new(
+            ctx_id.clone(),
+            ctx_snapshot.context_params.clone(),
+        );
+
+        match supervisor.restore_context(ctx_id, &handle).await {
+            Ok(()) => restored.push(ctx_id.clone()),
+            Err(e) => {
+                tracing::warn!(
+                    context_id = %ctx_id,
+                    error = %e,
+                    "failed to restore context"
+                );
+            }
+        }
+    }
+    Ok(restored)
+}
+
+/// Sweep entry point: best-effort flush of every actor's snapshot to
+/// the configured persistence provider.
+///
+/// Relocates the legacy
+/// [`lifecycle_helpers_legacy::flush_all_contexts_legacy`](crate::context::lifecycle_helpers_legacy::flush_all_contexts_legacy)
+/// off the `Supervisor::contexts` DashMap. Iterates the actor registry
+/// and dispatches one
+/// [`LifecycleCommand::FlushSnapshot`](crate::context::actor::commands::LifecycleCommand::FlushSnapshot)
+/// per actor.
+///
+/// Best-effort: per-actor flush failures log via `tracing::warn!`
+/// inside the handler. No-op if no persistence provider is configured.
+pub async fn flush_all_contexts(supervisor: &crate::context::supervisor::Supervisor) {
+    use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
+
+    if !crate::context::manager_methods::has_persistence(supervisor) {
+        return;
+    }
+
+    let mut flushed = 0usize;
+    for ctx_id in supervisor.actor_ids() {
+        let Some(actor) = supervisor.lookup(&ctx_id) else {
+            continue;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::Lifecycle(LifecycleCommand::FlushSnapshot { reply: tx });
+        if actor
+            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        if rx.await.is_ok() {
+            flushed += 1;
+        }
+    }
+    tracing::debug!(
+        flushed,
+        "flush_all_contexts: flushed {} context(s) via actor mailbox",
+        flushed,
+    );
+}
+
+/// Sync wrapper for [`flush_all_contexts`].
+///
+/// Required by `Drop` and other terminal sync callers that cannot
+/// `.await`. Uses [`tokio::runtime::Handle::try_current`] +
+/// [`tokio::task::block_in_place`] to bridge sync → async; **callers
+/// MUST be inside a multi-thread tokio runtime** (per ADR-049 §7
+/// allowlist for the FFI shutdown path). No-op if no persistence
+/// provider is configured or if called outside a runtime.
+pub fn flush_all_contexts_sync(supervisor: &crate::context::supervisor::Supervisor) {
+    if !crate::context::manager_methods::has_persistence(supervisor) {
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| {
+                handle.block_on(flush_all_contexts(supervisor));
+            });
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "flush_all_contexts_sync called outside tokio runtime; \
+                 skipping flush — context state may not be persisted"
+            );
+        }
+    }
+}
+
+/// Sweep entry point: shut down every actor (best-effort, local
+/// cleanup only).
+///
+/// Destroys per-context sender keys + MLS groups + event logs in that
+/// order (zeroize secrets before tearing down structure) by dispatching
+/// [`LifecycleCommand::ShutdownSelf`](crate::context::actor::commands::LifecycleCommand::ShutdownSelf)
+/// to each actor; then removes each context from the legacy
+/// `Supervisor::contexts` DashMap (kept in lock-step with the actor
+/// registry by the bootstrap dual-write) and clears supervisor-level
+/// state (standing contexts, local DIDs, wrapping keys, task set).
+///
+/// Relocates the legacy
+/// [`lifecycle_helpers_legacy::shutdown_all_contexts_legacy`](crate::context::lifecycle_helpers_legacy::shutdown_all_contexts_legacy)
+/// off the `Supervisor::contexts` DashMap iteration. Used by
+/// [`Supervisor::shutdown_all_contexts`](crate::context::supervisor::Supervisor::shutdown_all_contexts)
+/// (and its sync wrapper) for process exit / test teardown. Does NOT
+/// send leave messages or notify remote peers.
+pub async fn shutdown_all_contexts(supervisor: &crate::context::supervisor::Supervisor) {
+    use std::collections::{HashMap, HashSet};
+
+    use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
+
+    let context_ids = supervisor.actor_ids();
+    for ctx_id in &context_ids {
+        let Some(actor) = supervisor.lookup(ctx_id) else {
+            continue;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::Lifecycle(LifecycleCommand::ShutdownSelf { reply: tx });
+        if actor
+            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        let _ = rx.await;
+        // Remove from the legacy contexts DashMap to keep it in
+        // lock-step with the actor registry. The bootstrap dual-write
+        // inserts in both; the shutdown sweep removes from both. The
+        // DashMap dissolves entirely in a subsequent finalization
+        // session.
+        supervisor.contexts_ref().remove(ctx_id);
+    }
+
+    // Supervisor-level state clear. Acquired under the write_lock once
+    // for the standing_contexts + local_dids stores so a concurrent
+    // reader observes a coherent shutdown rather than a partially-
+    // cleared registry.
+    {
+        let _guard = supervisor.write_lock.lock().await;
+        supervisor
+            .standing_contexts_ref()
+            .store(std::sync::Arc::new(HashMap::new()));
+        supervisor
+            .local_dids_ref()
+            .store(std::sync::Arc::new(HashSet::new()));
+    }
+
+    supervisor.clear_wrapping_keys();
+
+    if let Some(task_set) = supervisor.task_set_ref() {
+        let mut tasks = task_set.lock().await;
+        tasks.abort_all();
+    }
+
+    tracing::info!(
+        removed_count = context_ids.len(),
+        "shutdown: removed all contexts via actor mailbox, cleared identity registries, \
+         and aborted background tasks"
+    );
+}
+
+/// Sync wrapper for [`shutdown_all_contexts`].
+///
+/// Required by destructor / atexit-style sync callers (the FFI bridge
+/// instance's blocking-shutdown path) that cannot `.await`. Per
+/// ADR-049 §7 allowlist for the FFI shutdown path — uses
+/// [`tokio::runtime::Handle::try_current`] +
+/// [`tokio::task::block_in_place`] to bridge sync → async; no-op
+/// (with warning) when called outside a runtime.
+pub fn shutdown_all_contexts_sync(supervisor: &crate::context::supervisor::Supervisor) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| {
+                handle.block_on(shutdown_all_contexts(supervisor));
+            });
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "shutdown_all_contexts_sync called outside tokio runtime; \
+                 skipping shutdown — per-actor resources will leak"
+            );
+        }
+    }
 }

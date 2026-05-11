@@ -2024,13 +2024,33 @@ impl Supervisor {
     /// `dead_code` allow: the first production call site is commit 7's
     /// query-path migration, which routes FFI-bridge lookups through
     /// `Supervisor::lookup(ctx).send(QueriesCommand::...)`.
+    ///
+    /// Visibility widened to `pub(in crate::context)` at Phase 2A
+    /// finalization (sweep helper relocation) so the sweep entry
+    /// points in `governance_helpers` / `lifecycle_helpers` can route
+    /// per-actor sweep commands through the mailbox.
     #[must_use]
     #[allow(dead_code)]
-    pub(in crate::context::supervisor) fn lookup(
-        &self,
-        ctx_id: &str,
-    ) -> Option<ContextActorHandle> {
+    pub(in crate::context) fn lookup(&self, ctx_id: &str) -> Option<ContextActorHandle> {
         self.actors.get(ctx_id).map(|r| r.value().clone())
+    }
+
+    /// Returns a snapshot of every currently-registered actor's
+    /// `context_id`.
+    ///
+    /// The returned `Vec<String>` is independent of the underlying
+    /// `DashMap` — callers can iterate it freely without holding any
+    /// shard locks. Each call rebuilds the snapshot; the sweep
+    /// iterators in `governance_helpers` / `lifecycle_helpers` call
+    /// this once per sweep and dispatch one command per `context_id`.
+    ///
+    /// Added at Phase 2A finalization (sweep helper relocation) so the
+    /// sweep entry points have a way to enumerate the actor registry
+    /// without reaching for the legacy `contexts` DashMap (which is
+    /// scheduled for deletion in a subsequent session).
+    #[must_use]
+    pub(in crate::context) fn actor_ids(&self) -> Vec<String> {
+        self.actors.iter().map(|e| e.key().clone()).collect()
     }
 
     /// Spawn a new `ContextActor` task, register its handle, and return
@@ -3008,7 +3028,7 @@ impl Supervisor {
     /// - [`ContextError::PersistenceFailed`] if the persistence
     ///   provider is unconfigured or `list_persisted_contexts` fails.
     pub async fn restore_all_contexts(&self) -> Result<Vec<String>, ContextError> {
-        crate::context::lifecycle_helpers_legacy::restore_all_contexts_legacy(self).await
+        crate::context::lifecycle_helpers::restore_all_contexts(self).await
     }
 
     /// Restore a single previously-persisted context from storage via
@@ -3066,7 +3086,7 @@ impl Supervisor {
     /// `?`. Per-context flush failures are logged via `tracing::warn!`
     /// inside the helper.
     pub async fn flush_all_contexts(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers_legacy::flush_all_contexts_legacy(self).await;
+        crate::context::lifecycle_helpers::flush_all_contexts(self).await;
         Ok(())
     }
 
@@ -3082,7 +3102,7 @@ impl Supervisor {
     /// Currently always returns `Ok(())`. Per-context flush failures
     /// are logged via `tracing::warn!` inside the helper.
     pub fn flush_all_contexts_sync(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers_legacy::flush_all_contexts_sync_legacy(self);
+        crate::context::lifecycle_helpers::flush_all_contexts_sync(self);
         Ok(())
     }
 
@@ -3108,7 +3128,7 @@ impl Supervisor {
     /// Currently always returns `Ok(())`. Best-effort cleanup logs
     /// per-context failures via `tracing::warn!` inside the helper.
     pub async fn shutdown_all_contexts(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers_legacy::shutdown_all_contexts_legacy(self).await;
+        crate::context::lifecycle_helpers::shutdown_all_contexts(self).await;
         Ok(())
     }
 
@@ -3127,7 +3147,7 @@ impl Supervisor {
     /// Currently always returns `Ok(())`. Per-context cleanup failures
     /// are logged via `tracing` inside the helper.
     pub fn shutdown_all_contexts_sync(&self) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers_legacy::shutdown_all_contexts_sync_legacy(self);
+        crate::context::lifecycle_helpers::shutdown_all_contexts_sync(self);
         Ok(())
     }
 
