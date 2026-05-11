@@ -275,6 +275,39 @@ pub enum MessagingCommand {
         /// legacy method's no-error contract).
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
+
+    /// Record that a received envelope triggered degraded-mode (spec
+    /// §13.6) for a context. Emits a `DegradedMode` event into the
+    /// per-context receive buffer (and the supervisor's optional event
+    /// broadcast channel).
+    ///
+    /// Mirrors the legacy
+    /// [`ContextManager::report_degraded_mode`](crate::context::supervisor::Supervisor::report_degraded_mode)
+    /// signature: a fire-and-forget side-effect on the messaging path's
+    /// receive-buffer state. The reply channel carries `Ok(())` once the
+    /// emit completes (or no-ops on `Match` / `IncompatibleMajor`
+    /// envelopes); the handler never errors.
+    ///
+    /// Routing it through the messaging dispatch keeps every receive-
+    /// buffer mutation in one place alongside `DeliverIncoming` and
+    /// `DrainEvents`.
+    ReportDegradedMode {
+        /// Context identifier.
+        context_id: String,
+        /// Envelope-level version compatibility classification carried by
+        /// the inbound message (spec §13.6). Only the
+        /// [`VersionCompatibility::DegradedMode`](scp_protocol::envelope::VersionCompatibility)
+        /// case triggers an event — the others are silent no-ops.
+        compat: scp_protocol::envelope::VersionCompatibility,
+        /// Sender-advertised feature flags the local peer cannot
+        /// interpret. Surfaced verbatim on the emitted `DegradedMode`
+        /// event so the application layer can decide whether to warn /
+        /// abort.
+        unsupported_features: Vec<String>,
+        /// Oneshot reply channel. Always replies `Ok(())` — the legacy
+        /// method has no error path.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
 }
 
 /// Payload for [`MessagingCommand::SendPseudonymAnnouncement`]. Boxed

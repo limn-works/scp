@@ -105,6 +105,12 @@ pub async fn dispatch(
             )
             .await
         }
+        MessagingCommand::ReportDegradedMode {
+            context_id,
+            compat,
+            unsupported_features,
+            reply,
+        } => handle_report_degraded_mode(state, deps, &context_id, compat, unsupported_features, reply),
     }
 }
 
@@ -153,6 +159,21 @@ pub(crate) async fn dispatch_from_shim(
                 p.params,
                 &p.sender_did,
                 &p.signing_key,
+                reply,
+            )
+            .await
+        }
+        MessagingCommand::ReportDegradedMode {
+            context_id,
+            compat,
+            unsupported_features,
+            reply,
+        } => {
+            shim_handle_report_degraded_mode(
+                supervisor,
+                &context_id,
+                compat,
+                unsupported_features,
                 reply,
             )
             .await
@@ -366,6 +387,37 @@ async fn handle_send_pseudonym_announcement(
     outcome
 }
 
+/// Handle [`MessagingCommand::ReportDegradedMode`] (actor-shape).
+///
+/// Synchronous pure-emit handler: delegates to the actor-shape
+/// [`queries_helpers::report_degraded_mode`](crate::context::queries_helpers::report_degraded_mode)
+/// which writes a `DegradedMode` event into `state.receive_buffer` (and
+/// the optional broadcast channel on `deps.event_tx`) only when the
+/// supplied `compat` is the `DegradedMode` variant. All other
+/// `VersionCompatibility` cases are silent no-ops. The handler never
+/// awaits transport / storage so no `tokio::time::timeout` wrapper is
+/// required. Always replies `Ok(())` and reports
+/// [`Outcome::ok_mutated`] because the receive buffer may have grown by
+/// one event.
+fn handle_report_degraded_mode(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    compat: scp_protocol::envelope::VersionCompatibility,
+    unsupported_features: Vec<String>,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    crate::context::queries_helpers::report_degraded_mode(
+        state,
+        deps,
+        context_id,
+        compat,
+        unsupported_features,
+    );
+    let _ = reply.send(Ok(()));
+    Outcome::ok_mutated(())
+}
+
 // ---------------------------------------------------------------------------
 // Shim handlers (legacy `&Supervisor` lock-and-call path)
 // ---------------------------------------------------------------------------
@@ -524,6 +576,33 @@ async fn shim_handle_send_pseudonym_announcement(
 
     let _ = reply.send(reply_result);
     outcome
+}
+
+/// Handle [`MessagingCommand::ReportDegradedMode`] via the legacy
+/// `&Supervisor` shim. Drives
+/// [`queries_helpers_legacy::report_degraded_mode_legacy`](crate::context::queries_helpers_legacy::report_degraded_mode_legacy).
+///
+/// The legacy method writes a `DegradedMode` event into the per-context
+/// receive buffer (and the supervisor's optional event broadcast
+/// channel) only when the supplied `compat` is the `DegradedMode`
+/// variant. The reply is `Ok(())` regardless of inner outcomes — the
+/// legacy method has no error path.
+async fn shim_handle_report_degraded_mode(
+    supervisor: &Supervisor,
+    context_id: &str,
+    compat: scp_protocol::envelope::VersionCompatibility,
+    unsupported_features: Vec<String>,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    crate::context::queries_helpers_legacy::report_degraded_mode_legacy(
+        supervisor,
+        context_id,
+        compat,
+        unsupported_features,
+    )
+    .await;
+    let _ = reply.send(Ok(()));
+    Outcome::ok_mutated(())
 }
 
 // ---------------------------------------------------------------------------

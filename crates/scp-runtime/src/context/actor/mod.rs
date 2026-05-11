@@ -756,6 +756,12 @@ impl ContextActor {
                     "messaging::send_pseudonym_announcement (use Supervisor::dispatch_command during commits 8-11)",
                 );
             }
+            ContextCommand::Messaging(MessagingCommand::ReportDegradedMode { reply, .. }) => {
+                ack_not_impl(
+                    reply,
+                    "messaging::report_degraded_mode (use Supervisor::dispatch_command during commits 8-11)",
+                );
+            }
             ContextCommand::Lifecycle(sub) => Self::skeleton_dispatch_lifecycle(sub),
             ContextCommand::Governance(sub) => Self::skeleton_dispatch_governance(sub),
             ContextCommand::Broadcast(sub) => Self::skeleton_dispatch_broadcast(sub),

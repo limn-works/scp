@@ -2433,12 +2433,26 @@ impl Supervisor {
         crate::context::queries_helpers_legacy::get_role_state_legacy(self, context_id).await
     }
 
-    /// Passthrough to
-    /// [`crate::context::queries_helpers::drain_events`] — drains and
-    /// returns every event currently buffered for `context_id`.
+    /// Drains and returns every event currently buffered for
+    /// `context_id` via the actor mailbox.
+    ///
+    /// Matches the legacy soft-default contract: returns an empty
+    /// `Vec` if the context is unknown, if the mailbox enqueue fails,
+    /// or if the reply channel is dropped before the handler responds.
     #[must_use]
     pub async fn drain_events(&self, context_id: &str) -> Vec<ContextEvent> {
-        crate::context::queries_helpers_legacy::drain_events_legacy(self, context_id).await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::DrainEvents {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_command(context_id, cmd).await.is_err() {
+            return Vec::new();
+        }
+        match rx.await {
+            Ok(Ok(events)) => events,
+            Ok(Err(_)) | Err(_) => Vec::new(),
+        }
     }
 
     /// Passthrough to
@@ -2609,25 +2623,28 @@ impl Supervisor {
         .await
     }
 
-    /// Passthrough to
-    /// [`crate::context::messaging_helpers_legacy::send_message_legacy`]
-    /// — encrypts and broadcasts a payload through the context's MLS
-    /// group via the lock-and-call legacy path.
+    /// Encrypts and broadcasts a payload through the context's MLS
+    /// group via the actor mailbox.
     ///
-    /// Phase 2A.7 — the actor-shape `messaging_helpers::send_message`
-    /// takes `(&mut PerContextState, &ActorDeps, ...)` directly; this
-    /// passthrough still uses the legacy `&Supervisor` shape because
-    /// callers without an attached actor (test fixtures, integration
-    /// suites that bypass the mailbox) need the lock-and-call dance to
-    /// land per-context state mutations. Removed in Phase 2A
-    /// finalization with the rest of the supervisor shim.
+    /// Phase 2A finalization — every per-context method on `Supervisor`
+    /// builds a typed `ContextCommand` carrying an embedded reply
+    /// oneshot, enqueues it via [`Self::dispatch_command`], and awaits
+    /// the actor's typed reply. The dispatch helper routes through the
+    /// per-context actor mailbox when one is registered, falling back
+    /// to the legacy lock-and-call shim during the migration window
+    /// when no actor has been spawned yet (a state that disappears once
+    /// the legacy `*_helpers_legacy::*_legacy` bodies are deleted in
+    /// the next session).
     ///
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if the supervisor's provider
     ///   slots are empty (the supervisor was constructed via
     ///   [`Self::for_query_shim`]).
-    /// - Other [`ContextError`] variants propagated from the helper.
+    /// - Other [`ContextError`] variants propagated from the handler.
+    /// - [`ContextError::TransportFailed`] if the mailbox reply channel
+    ///   is dropped before the handler completes (handler crash /
+    ///   actor shutdown).
     pub async fn send_message(
         &self,
         handle: &crate::context::ContextHandle,
@@ -2637,16 +2654,27 @@ impl Supervisor {
         source_provenance: Option<&scp_protocol::provenance::attach::SourceContextInfo>,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
     ) -> Result<(), ContextError> {
-        crate::context::messaging_helpers_legacy::send_message_legacy(
-            self,
-            handle,
-            sender_did,
-            payload,
-            signing_key,
-            source_provenance,
-            spending_ucan,
-        )
-        .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let payload_box = Box::new(crate::context::actor::commands::SendMessagePayload {
+            context_id: handle.context_id().to_owned(),
+            params: handle.params().clone(),
+            sender_did: sender_did.clone(),
+            payload: payload.to_vec(),
+            signing_key: signing_key
+                .map(crate::context::actor::commands::SigningKeyBytes::from_signing_key),
+            source_provenance: source_provenance.cloned(),
+            spending_ucan: spending_ucan.cloned(),
+        });
+        let cmd = MessagingCommand::SendMessage {
+            payload: payload_box,
+            reply: tx,
+        };
+        self.dispatch_command(handle.context_id(), cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::send_message — actor reply channel closed".to_owned(),
+            )
+        })?
     }
 
     /// Passthrough to
@@ -2848,24 +2876,34 @@ impl Supervisor {
         crate::context::queries_helpers_legacy::commit_fault_legacy(self, context_id).await
     }
 
-    /// Passthrough to
-    /// [`crate::context::queries_helpers::report_degraded_mode`] —
-    /// emits a `DegradedMode` event when an envelope's
+    /// Emits a `DegradedMode` event when an envelope's
     /// [`scp_protocol::envelope::VersionCompatibility`] indicates the
     /// remote peer's minor version is unknown to us.
+    ///
+    /// Routes through the per-context actor mailbox via
+    /// [`Self::dispatch_command`]. Silent best-effort: mailbox enqueue
+    /// failures and reply-channel drops are swallowed to match the
+    /// legacy "no-error path" contract — the event is a hint to the
+    /// application layer and missing one event on a contended actor is
+    /// preferable to surfacing a `ContextError` on what callers treat
+    /// as a fire-and-forget signal.
     pub async fn report_degraded_mode(
         &self,
         context_id: &str,
         compat: scp_protocol::envelope::VersionCompatibility,
         unsupported_features: Vec<String>,
     ) {
-        crate::context::queries_helpers_legacy::report_degraded_mode_legacy(
-            self,
-            context_id,
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = MessagingCommand::ReportDegradedMode {
+            context_id: context_id.to_owned(),
             compat,
             unsupported_features,
-        )
-        .await;
+            reply: tx,
+        };
+        if self.dispatch_command(context_id, cmd).await.is_err() {
+            return;
+        }
+        let _ = rx.await;
     }
 
     // -----------------------------------------------------------------
