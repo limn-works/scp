@@ -205,31 +205,7 @@ pub fn get_context_arc(
 }
 
 // ---------------------------------------------------------------------------
-// 4. get_context_arc_pub
-// ---------------------------------------------------------------------------
-
-/// `pub(crate)` variant of [`get_context_arc`]. Used by the commit-7
-/// query shim on `Supervisor::dispatch_query` to resolve the
-/// per-context Arc outside the `manager/` submodule without exposing the
-/// inner `Mutex` contents.
-///
-/// Hoisted body of the legacy
-/// [`ContextManager::get_context_arc_pub`](crate::context::supervisor::Supervisor::get_context_arc_pub)
-/// (ADR-049 commit 12). Byte-identical behavior.
-///
-/// # Errors
-///
-/// Returns [`ContextError::ContextNotRegistered`] if the context is
-/// unknown.
-pub fn get_context_arc_pub(
-    supervisor: &Supervisor,
-    context_id: &str,
-) -> Result<Arc<Mutex<PerContextState>>, ContextError> {
-    get_context_arc(supervisor, context_id)
-}
-
-// ---------------------------------------------------------------------------
-// 5. insert_context
+// 4. insert_context
 // ---------------------------------------------------------------------------
 
 /// Insert a new context, stamping a fresh generation ID.

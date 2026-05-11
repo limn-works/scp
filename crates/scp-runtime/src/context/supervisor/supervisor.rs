@@ -872,105 +872,77 @@ impl Supervisor {
         })
     }
 
-    /// Dispatch a pure-read [`QueriesCommand`] through the migration
-    /// shim.
+    /// Dispatch a pure-read [`QueriesCommand`].
     ///
-    /// Behaviour (byte-identical to the legacy `ContextManager::foo()`
-    /// it replaces):
+    /// Behaviour:
     ///
-    /// - Takes the per-context mutex via the manager's `get_context_arc_pub`.
-    /// - Calls [`handlers::queries::dispatch_from_shim`] with the
-    ///   locked `&PerContextState` and the manager's shared event-log
-    ///   provider. The handler matches on the command variant, sends
-    ///   the typed oneshot reply, and returns `Outcome::ok(())` with
-    ///   `mutated: false`.
-    /// - On missing context, the shim emits the variant's legacy
+    /// - Mailbox-first for variants that carry a per-context
+    ///   `context_id`: the actor's `run()` loop pulls the command,
+    ///   dispatches through `handlers::queries::dispatch` (actor-shape,
+    ///   takes `&mut PerContextState`), and writes the typed result to
+    ///   the embedded reply oneshot.
+    /// - `EventLogEntries` carries a 32-byte hash rather than a string
+    ///   context-id and delegates directly to the event-log provider —
+    ///   no per-context state is involved.
+    /// - When no actor is registered for the variant's `context_id`,
+    ///   [`Self::dispatch_queries_direct`] emits the variant's legacy
     ///   default (e.g. `MemberCount::Ok(None)`, `IsMember::Ok(false)`)
-    ///   without entering the handler — this preserves the
-    ///   "context unknown = soft fallback" behaviour of the pre-shim
-    ///   path.
+    ///   or surfaces `ContextError::ContextNotRegistered` directly on
+    ///   the variant's oneshot, preserving the "context unknown = soft
+    ///   default / typed error" contract of the legacy method shape.
     ///
     /// Outcome: `Outcome::ok(())` on every success. The variant's reply
     /// channel carries the typed result. The returned `Outcome` is
     /// dropped by FFI callers — it is retained so the wiring is
-    /// symmetric with the mutating-handler paths that land in
-    /// commits 8-11.
+    /// symmetric with the mutating-handler paths.
     ///
     /// # Errors
     ///
-    /// - [`ContextError::NotInitialized`] if no `ContextManager` has
-    ///   been attached yet — the caller must call
-    ///   [`Self::with_providers`] first.
+    /// - [`ContextError::NotInitialized`] if no providers have been
+    ///   attached — the caller must call [`Self::with_providers`]
+    ///   first.
     pub async fn dispatch_query(&self, cmd: QueriesCommand) -> Result<Outcome<()>, ContextError> {
         // ADR-049 Phase 2A finalization — try the actor mailbox first
         // for variants that carry a per-context `context_id`. The
         // actor's `run()` loop pulls the command, dispatches it through
         // `handlers::queries::dispatch` (actor-shape, takes `&mut
-        // ActorPerContextState`), and writes the typed result to the
+        // PerContextState`), and writes the typed result to the
         // embedded reply oneshot.
         //
         // `EventLogEntries` is a 32-byte hash with no per-context lock
         // — it stays on the inline event-log path below. Unknown-
-        // context cases continue to surface the legacy soft / hard
-        // defaults via `dispatch_with_view`.
+        // context cases surface the legacy soft / hard defaults via
+        // `dispatch_queries_direct`.
         if let Some(ctx_id) = Self::queries_command_context_id(&cmd) {
             let ctx_id_owned = ctx_id.to_owned();
             if let Some(actor) = self.lookup(&ctx_id_owned) {
                 return Self::dispatch_via_mailbox(&actor, ContextCommand::Queries(cmd)).await;
             }
         }
-        // Pre-lookup: variants that require a per-context lock all carry
-        // a `context_id` field. We route by command variant to preserve
-        // the legacy "context unknown = soft default" contract.
-        match cmd {
-            // Variants whose legacy method returns a `ContextError` on
-            // unknown context — propagate the error directly.
-            QueriesCommand::LocalPseudonym { ref context_id, .. }
-            | QueriesCommand::GetBroadcastKeyForLocalAuthor { ref context_id, .. } => {
-                let ctx_id = context_id.clone();
-                Self::dispatch_with_view(self, &ctx_id, cmd, /*soft_fallback=*/ false).await
-            }
 
-            // Variants whose legacy method returns a default value on
-            // unknown context — route through the soft fallback path.
-            QueriesCommand::MemberCount { ref context_id, .. }
-            | QueriesCommand::IsMember { ref context_id, .. }
-            | QueriesCommand::MemberDids { ref context_id, .. }
-            | QueriesCommand::MemberRole { ref context_id, .. }
-            | QueriesCommand::ContextParams { ref context_id, .. }
-            | QueriesCommand::GetRoleState { ref context_id, .. }
-            | QueriesCommand::PendingCommits { ref context_id, .. }
-            | QueriesCommand::CommitFault { ref context_id, .. } => {
-                let ctx_id = context_id.clone();
-                Self::dispatch_with_view(self, &ctx_id, cmd, /*soft_fallback=*/ true).await
-            }
-
-            // `EventLogEntries` takes a 32-byte hash rather than a
-            // context-id string and delegates straight to the event-log
-            // provider — no per-context lock involved.
-            QueriesCommand::EventLogEntries {
-                context_id_bytes,
-                reply,
-            } => {
-                let elp = self.event_log_ref().ok_or_else(|| {
-                    ContextError::NotInitialized(
-                        "Supervisor::dispatch_query — event_log provider not configured".to_owned(),
-                    )
-                })?;
-                let answer = elp.event_log_entries(&context_id_bytes);
-                let _ = reply.send(answer);
-                Ok(Outcome::ok(()))
-            }
-
-            #[cfg(feature = "testing")]
-            QueriesCommand::GetAccessKey { ref context_id, .. }
-            | QueriesCommand::GetAllAccessKeys { ref context_id, .. }
-            | QueriesCommand::RemainingBudgetForTest { ref context_id, .. }
-            | QueriesCommand::VelocityForTest { ref context_id, .. } => {
-                let ctx_id = context_id.clone();
-                Self::dispatch_with_view(self, &ctx_id, cmd, /*soft_fallback=*/ true).await
-            }
+        // `EventLogEntries` delegates straight to the supervisor's
+        // shared event-log provider — no per-context lock involved.
+        if let QueriesCommand::EventLogEntries {
+            context_id_bytes,
+            reply,
+        } = cmd
+        {
+            let elp = self.event_log_ref().ok_or_else(|| {
+                ContextError::NotInitialized(
+                    "Supervisor::dispatch_query — event_log provider not configured".to_owned(),
+                )
+            })?;
+            let answer = elp.event_log_entries(&context_id_bytes);
+            let _ = reply.send(answer);
+            return Ok(Outcome::ok(()));
         }
+
+        // No actor registered for the variant's `context_id`. Direct
+        // dispatch surfaces the variant's legacy unknown-context
+        // contract (hard error vs soft default) without entering a
+        // shim handler — the legacy DashMap fallback was deleted in
+        // this session.
+        Ok(Self::dispatch_queries_direct(cmd))
     }
 
     /// Dispatch a mutating [`MessagingCommand`] through the migration
@@ -1307,48 +1279,74 @@ impl Supervisor {
         }
     }
 
-    /// Helper: acquire the per-context lock, run the query handler
-    /// inline (sync — the handler awaits nothing) against the locked
-    /// state borrow + shared event-log provider, and send the typed
-    /// reply. On soft-fallback + missing context, synthesize the
-    /// variant's legacy default via the view-less fallback.
-    async fn dispatch_with_view(
-        supervisor: &Self,
-        context_id: &str,
-        cmd: QueriesCommand,
-        soft_fallback: bool,
-    ) -> Result<Outcome<()>, ContextError> {
-        // Resolve the per-context Arc via the supervisor's own
-        // `manager_methods::get_context_arc_pub` (lifted in 12c.9g.1).
-        let elp = if let Some(p) = supervisor.event_log_ref() {
-            Arc::clone(p)
-        } else {
-            let err = ContextError::NotInitialized(
-                "Supervisor::dispatch_with_view — event_log provider not configured".to_owned(),
-            );
-            if soft_fallback {
-                reply_with_soft_default(cmd);
-            } else {
+    /// Direct supervisor-scoped dispatch for [`QueriesCommand`] variants
+    /// whose target context has no registered actor.
+    ///
+    /// Mirrors the standing-direct precedent: when the mailbox-first
+    /// lookup in [`Self::dispatch_query`] returns `None`, this method
+    /// surfaces the variant's legacy unknown-context contract on the
+    /// embedded reply oneshot without entering an actor or a locked
+    /// legacy `PerContextState` view. Two contracts apply per variant:
+    ///
+    /// - **Hard-error variants** (`LocalPseudonym`,
+    ///   `GetBroadcastKeyForLocalAuthor`): emit
+    ///   `ContextError::ContextNotRegistered` on the reply.
+    /// - **Soft-default variants** (`MemberCount`, `IsMember`,
+    ///   `MemberDids`, `MemberRole`, `ContextParams`, `GetRoleState`,
+    ///   `PendingCommits`, `CommitFault`, plus the `testing`-only
+    ///   access-key / budget / velocity variants): emit the legacy
+    ///   default (`Ok(None)`, `Ok(false)`, `Ok(Vec::new())`, etc.).
+    ///
+    /// `EventLogEntries` is handled inline in
+    /// [`Self::dispatch_query`] and never reaches this method.
+    ///
+    /// Returns `Outcome::ok(())` on every arm — the typed result lives
+    /// on the variant's oneshot, not the method-level outcome.
+    fn dispatch_queries_direct(cmd: QueriesCommand) -> Outcome<()> {
+        match cmd {
+            // Hard-error variants — legacy `local_pseudonym` /
+            // `get_broadcast_key_for_local_author` return
+            // `ContextError::ContextNotRegistered` on unknown context.
+            QueriesCommand::LocalPseudonym { ref context_id, .. }
+            | QueriesCommand::GetBroadcastKeyForLocalAuthor { ref context_id, .. } => {
+                let err = ContextError::ContextNotRegistered(format!(
+                    "context not registered: {context_id}"
+                ));
                 reply_with_error(cmd, err);
             }
-            return Ok(Outcome::ok(()));
-        };
-        match crate::context::manager_methods::get_context_arc_pub(supervisor, context_id) {
-            Ok(arc) => {
-                let guard = arc.lock().await;
-                handlers::queries::dispatch_from_shim(&guard, &elp, cmd);
-                drop(guard);
-                Ok(Outcome::ok(()))
+            // Soft-default variants — legacy methods return the
+            // variant-specific default on unknown context.
+            QueriesCommand::MemberCount { .. }
+            | QueriesCommand::IsMember { .. }
+            | QueriesCommand::MemberDids { .. }
+            | QueriesCommand::MemberRole { .. }
+            | QueriesCommand::ContextParams { .. }
+            | QueriesCommand::GetRoleState { .. }
+            | QueriesCommand::PendingCommits { .. }
+            | QueriesCommand::CommitFault { .. } => {
+                reply_with_soft_default(cmd);
             }
-            Err(err) => {
-                if soft_fallback {
-                    reply_with_soft_default(cmd);
-                } else {
-                    reply_with_error(cmd, err);
-                }
-                Ok(Outcome::ok(()))
+            // EventLogEntries never reaches this method — `dispatch_query`
+            // handles it inline against the supervisor's shared
+            // event-log provider before falling through to direct
+            // dispatch. Left as a defensive arm so a future
+            // classification change trips the debug assert.
+            QueriesCommand::EventLogEntries { reply, .. } => {
+                debug_assert!(
+                    false,
+                    "EventLogEntries routed through dispatch_queries_direct"
+                );
+                let _ = reply.send(Ok(None));
+            }
+            #[cfg(feature = "testing")]
+            QueriesCommand::GetAccessKey { .. }
+            | QueriesCommand::GetAllAccessKeys { .. }
+            | QueriesCommand::RemainingBudgetForTest { .. }
+            | QueriesCommand::VelocityForTest { .. } => {
+                reply_with_soft_default(cmd);
             }
         }
+        Outcome::ok(())
     }
 
     /// Look up the actor handle for a context ID. Lock-free

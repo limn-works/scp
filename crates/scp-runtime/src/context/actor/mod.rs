@@ -627,12 +627,12 @@ impl ContextActor {
             // handler. The actor's owned `state` + `deps.event_log` +
             // `deps.local_dids` are sufficient for every read variant;
             // no supervisor shim is needed on the actor path. The
-            // supervisor's `dispatch_query` is preserved for the FFI /
-            // shim-fallback path during the Phase 2A migration window
-            // (callers without an attached actor) and routes through
-            // `handlers::queries::dispatch_from_shim` against the
-            // legacy locked state. `_supervisor` is unused on this arm
-            // because the actor owns everything the read needs.
+            // supervisor's `dispatch_query` continues to route callers
+            // through this mailbox when an actor is registered, and
+            // surfaces the variant's legacy unknown-context default via
+            // [`Supervisor::dispatch_queries_direct`] when no actor
+            // exists (the prior locked-DashMap shim was deleted in the
+            // Phase 2A finalization queries+lifecycle session).
             ContextCommand::Queries(sub) => handlers::queries::dispatch(state, deps, sub).await,
             // SagaPhase + LifecycleControl already migrated to the
             // state-owning signature.
