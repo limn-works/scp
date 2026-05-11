@@ -66,6 +66,19 @@ pub const IDENT_1013: &str = "SCP-IDENT-1013";
 /// length wrong for the declared key type, or decoded bytes that fail
 /// curve-point validation.
 pub const IDENT_1014: &str = "SCP-IDENT-1014";
+/// Device attestation feature unavailable.
+///
+/// Surfaced by the Python SDK shim when the `PyO3` extension was built
+/// without the `allow_in_memory_custody` feature: the `identity_attest_device`
+/// method is not exposed on the native bridge.
+pub const IDENT_1015: &str = "SCP-IDENT-1015";
+/// Device attestation verification feature unavailable.
+///
+/// Surfaced by the Python SDK shim when the `PyO3` extension was built
+/// without the `allow_in_memory_custody` feature: the
+/// `identity_verify_device_attestation` method is not exposed on the
+/// native bridge.
+pub const IDENT_1016: &str = "SCP-IDENT-1016";
 /// Identity agent key creation.
 pub const IDENT_1020: &str = "SCP-IDENT-1020";
 /// Identity DID document error.

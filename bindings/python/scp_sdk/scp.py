@@ -427,7 +427,7 @@ class SCP:
         if not hasattr(self._native, "identity_attest_device"):
             raise IdentityError(
                 "Device attestation requires the 'allow_in_memory_custody' feature",
-                "SCP-IDENT-1050",
+                "SCP-IDENT-1015",
             )
         return await asyncio.to_thread(self._native.identity_attest_device, identity_did)
 
@@ -619,7 +619,7 @@ class SCP:
         if not hasattr(self._native, "identity_verify_device_attestation"):
             raise IdentityError(
                 "Device attestation verification requires the 'allow_in_memory_custody' feature",
-                "SCP-IDENT-1051",
+                "SCP-IDENT-1016",
             )
         return await asyncio.to_thread(
             self._native.identity_verify_device_attestation, did, token_base64
