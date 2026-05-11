@@ -67,9 +67,7 @@
       "uniffi": [
         "identity_migrate"
       ],
-      "napi": [
-        "identity_migrate"
-      ],
+      "napi": [],
       "wasm": [
         "identity_migrate"
       ]
@@ -2321,9 +2319,7 @@
       "napi": [
         "scpid_verify"
       ],
-      "wasm": [
-        "scpid_verify"
-      ]
+      "wasm": []
     },
     {
       "canonical": "enable_site_projection",
@@ -2338,9 +2334,7 @@
       "napi": [
         "enable_site_projection"
       ],
-      "wasm": [
-        "enable_site_projection"
-      ]
+      "wasm": []
     },
     {
       "canonical": "disable_site_projection",
@@ -2355,9 +2349,7 @@
       "napi": [
         "disable_site_projection"
       ],
-      "wasm": [
-        "disable_site_projection"
-      ]
+      "wasm": []
     },
     {
       "canonical": "context_tombstone_migrated",
@@ -2372,9 +2364,7 @@
       "napi": [
         "context_tombstone_migrated"
       ],
-      "wasm": [
-        "context_tombstone_migrated"
-      ]
+      "wasm": []
     },
     {
       "canonical": "access_key_generate",
@@ -2389,9 +2379,7 @@
       "napi": [
         "access_key_generate"
       ],
-      "wasm": [
-        "access_key_generate"
-      ]
+      "wasm": []
     },
     {
       "canonical": "access_key_revoke",
@@ -2406,9 +2394,7 @@
       "napi": [
         "access_key_revoke"
       ],
-      "wasm": [
-        "access_key_revoke"
-      ]
+      "wasm": []
     },
     {
       "canonical": "access_key_restore",
@@ -2423,9 +2409,7 @@
       "napi": [
         "access_key_restore"
       ],
-      "wasm": [
-        "access_key_restore"
-      ]
+      "wasm": []
     },
     {
       "canonical": "context_governance_get_proposal",
@@ -2593,9 +2577,7 @@
       "napi": [
         "mcp_server_create"
       ],
-      "wasm": [
-        "mcp_server_create"
-      ]
+      "wasm": []
     },
     {
       "canonical": "mcp_server_stop",
@@ -2610,9 +2592,7 @@
       "napi": [
         "mcp_server_stop"
       ],
-      "wasm": [
-        "mcp_server_stop"
-      ]
+      "wasm": []
     },
     {
       "canonical": "mcp_client_connect_stdio",
@@ -2627,9 +2607,7 @@
       "napi": [
         "mcp_client_connect_stdio"
       ],
-      "wasm": [
-        "mcp_client_connect_stdio"
-      ]
+      "wasm": []
     },
     {
       "canonical": "mcp_client_connect_sse",
@@ -2644,9 +2622,7 @@
       "napi": [
         "mcp_client_connect_sse"
       ],
-      "wasm": [
-        "mcp_client_connect_sse"
-      ]
+      "wasm": []
     },
     {
       "canonical": "mcp_client_disconnect",
@@ -2661,9 +2637,7 @@
       "napi": [
         "mcp_client_disconnect"
       ],
-      "wasm": [
-        "mcp_client_disconnect"
-      ]
+      "wasm": []
     },
     {
       "canonical": "mcp_client_list_tools",
@@ -2678,9 +2652,7 @@
       "napi": [
         "mcp_client_list_tools"
       ],
-      "wasm": [
-        "mcp_client_list_tools"
-      ]
+      "wasm": []
     },
     {
       "canonical": "mcp_client_invoke",
@@ -2695,9 +2667,7 @@
       "napi": [
         "mcp_client_invoke"
       ],
-      "wasm": [
-        "mcp_client_invoke"
-      ]
+      "wasm": []
     },
     {
       "canonical": "mcp_configure_stdio_allowlist",
@@ -2712,9 +2682,7 @@
       "napi": [
         "mcp_configure_stdio_allowlist"
       ],
-      "wasm": [
-        "mcp_configure_stdio_allowlist"
-      ]
+      "wasm": []
     },
     {
       "canonical": "mcp_disable_stdio_allowlist",
@@ -2729,9 +2697,7 @@
       "napi": [
         "mcp_disable_stdio_allowlist"
       ],
-      "wasm": [
-        "mcp_disable_stdio_allowlist"
-      ]
+      "wasm": []
     },
     {
       "canonical": "mcp_reset_stdio_allowlist",
@@ -2746,9 +2712,7 @@
       "napi": [
         "mcp_reset_stdio_allowlist"
       ],
-      "wasm": [
-        "mcp_reset_stdio_allowlist"
-      ]
+      "wasm": []
     },
     {
       "canonical": "mcp_get_stdio_allowlist",
@@ -2763,9 +2727,7 @@
       "napi": [
         "mcp_get_stdio_allowlist"
       ],
-      "wasm": [
-        "mcp_get_stdio_allowlist"
-      ]
+      "wasm": []
     },
     {
       "canonical": "tool_interface_expose",
@@ -2900,9 +2862,7 @@
       "napi": [
         "node_start_in_memory"
       ],
-      "wasm": [
-        "node_start_in_memory"
-      ]
+      "wasm": []
     },
     {
       "canonical": "node_start_local",
@@ -2917,9 +2877,7 @@
       "napi": [
         "node_start_local"
       ],
-      "wasm": [
-        "node_start_local"
-      ]
+      "wasm": []
     },
     {
       "canonical": "relay_start_in_memory",
@@ -2934,9 +2892,7 @@
       "napi": [
         "relay_start_in_memory"
       ],
-      "wasm": [
-        "relay_start_in_memory"
-      ]
+      "wasm": []
     },
     {
       "canonical": "relay_start_local",
@@ -2951,9 +2907,7 @@
       "napi": [
         "relay_start_local"
       ],
-      "wasm": [
-        "relay_start_local"
-      ]
+      "wasm": []
     },
     {
       "canonical": "with_storage",
@@ -2968,9 +2922,7 @@
       "napi": [
         "with_storage"
       ],
-      "wasm": [
-        "with_storage"
-      ]
+      "wasm": []
     },
     {
       "canonical": "sandbox_check_capability",
@@ -3019,9 +2971,7 @@
       "napi": [
         "configure_relay_transport"
       ],
-      "wasm": [
-        "configure_relay_transport"
-      ]
+      "wasm": []
     },
     {
       "canonical": "identity_verify_link_attestation",
@@ -3142,7 +3092,7 @@
       },
       {
         "canonical": "with_storage",
-        "reason": "WASM bridge has no scp-platform per ADR-034 — no persistent on-disk storage primitives. Storage attachment is a no-op on WASM; consumers either use the in-memory default or wire persistence via the host JS runtime."
+        "reason": "WASM bridge has no scp-platform per ADR-034 \u2014 no persistent on-disk storage primitives. Storage attachment is a no-op on WASM; consumers either use the in-memory default or wire persistence via the host JS runtime."
       },
       {
         "canonical": "configure_relay_transport",

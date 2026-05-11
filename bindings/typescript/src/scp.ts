@@ -61,6 +61,7 @@ type NativeAddon = RawNativeAddon & {
   templateGetParams?: unknown;
   validateAgainstTemplate?: unknown;
   validateContextParams?: unknown;
+  checkScopedCapability?: unknown;
 };
 
 /**
@@ -1120,10 +1121,10 @@ export class SCP {
     grantedCapabilities: readonly string[],
     requiredCapability: string,
   ): boolean {
-    return (this.#native.checkScopedCapability as (g: readonly string[], r: string) => boolean)(
-      grantedCapabilities,
-      requiredCapability,
-    );
+    // ADR-048 §1: pure helper, routed to the addon's module-level free fn
+    // (the `SCP::check_scoped_capability` method was deleted in PR-E #28).
+    const fn = nativeFreeFn<(g: string[], r: string) => boolean>("checkScopedCapability");
+    return fn([...grantedCapabilities], requiredCapability);
   }
 
   evaluateInvitation(

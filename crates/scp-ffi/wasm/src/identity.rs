@@ -3562,6 +3562,13 @@ pub fn identity_create_link_attestation(
         // the issuer's #active or #agent key") and §3.5.2 wire format
         // ("using issuer's #active or #agent key"). Only `Local` records
         // carry it; `Resolved` handles refuse structurally.
+        //
+        // SEMANTIC DIVERGENCE: see ADR-048 §7b cross-bridge semantic
+        // divergence registry. WASM previously signed with the identity
+        // key (#0) and was aligned to the spec-mandated #active in the
+        // 2026-04-26 fix; consumers that cached signatures created by
+        // older WASM builds may need to re-verify with the migrated key.
+        // Note retained for one release cycle.
         let signature_bytes = IDENTITY_REGISTRY.with(|reg| {
             let map = reg.borrow();
             let entry = map.get(&did).ok_or_else(|| -> JsValue {

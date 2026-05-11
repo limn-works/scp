@@ -2552,19 +2552,12 @@ impl Scp {
         )
     }
 
-    /// Per-instance equivalent of the free-function `check_scoped_capability`.
-    ///
-    /// This operation is pure — it does not touch any bridge-instance state —
-    /// so the method forwards to a shared inner helper with no `bi` argument.
-    #[napi(js_name = "checkScopedCapability")]
-    #[must_use]
-    pub fn check_scoped_capability(
-        &self,
-        granted_capabilities: Vec<String>,
-        required_capability: String,
-    ) -> bool {
-        crate::context::check_scoped_capability_inner(granted_capabilities, required_capability)
-    }
+    // `check_scoped_capability` is exposed as a module-level free fn at
+    // `crates/scp-ffi/napi/src/context.rs::check_scoped_capability` per
+    // ADR-048 §1 — the operation reads no `Scp` state, so binding it to
+    // the receiver is pure ceremony. The TypeScript SDK's
+    // `SCP.checkScopedCapability` routes through `nativeFreeFn(...)` to
+    // reach the module-level export.
 
     /// Per-instance equivalent of the free-function `evaluate_invitation`.
     #[napi(js_name = "evaluateInvitation")]

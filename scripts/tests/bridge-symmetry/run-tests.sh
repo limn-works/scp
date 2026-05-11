@@ -31,6 +31,7 @@ FIXTURES=(
     "good-exempt-missing"
     "bad-alias-in-test-module-only"
     "bad-alias-in-test-impl"
+    "bad-alias-undecorated-fn"
 )
 EXPECTED_EXITS=(
     "0"
@@ -38,11 +39,13 @@ EXPECTED_EXITS=(
     "0"
     "1"
     "1"
+    "1"
 )
 EXPECTED_SUBSTRINGS=(
     "0 finding(s)"
     "bridge=napi missing operation widget_create"
     "0 finding(s)"
+    "bridge=napi missing operation widget_create"
     "bridge=napi missing operation widget_create"
     "bridge=napi missing operation widget_create"
 )
