@@ -1563,20 +1563,21 @@ impl Supervisor {
         // actor mailbox when every receipt in the batch agrees on a
         // single `Some(context_id)` and an actor is registered for it.
         // Mixed-context batches and relay-level (`None`) receipts have
-        // no single owning actor and fall through to the shim, which
-        // resolves the payment adapter from the supervisor's lifted
-        // provider slot. The actor-shape and shim-shape helpers both
-        // delegate to the same `economy_helpers::verify_payment_receipts`
-        // body (the read uses only `deps.payment_adapter`), so the two
-        // paths are observably equivalent — routing chooses the
-        // serialization point, not the work.
+        // no single owning actor and fall through to
+        // `dispatch_economy_direct`, which resolves the payment adapter
+        // from the supervisor's lifted provider slot. The actor-shape
+        // and direct-shape helpers both delegate to the same
+        // `economy_helpers::verify_payment_receipts` body (the read
+        // uses only `deps.payment_adapter`), so the two paths are
+        // observably equivalent — routing chooses the serialization
+        // point, not the work.
         if let Some(ctx_id) = Self::economy_command_context_id(&cmd) {
             let ctx_id_owned = ctx_id.to_owned();
             if let Some(actor) = self.lookup(&ctx_id_owned) {
                 return Self::dispatch_via_mailbox(&actor, ContextCommand::Economy(cmd)).await;
             }
         }
-        Ok(handlers::economy::dispatch_from_shim(self, cmd).await)
+        Ok(self.dispatch_economy_direct(cmd).await)
     }
 
     /// Extract the target context_id from an [`EconomyCommand`] when one
@@ -1605,6 +1606,61 @@ impl Supervisor {
                     }
                 }
                 Some(first_str)
+            }
+        }
+    }
+
+    /// Direct supervisor-scoped dispatch for [`EconomyCommand`] variants
+    /// whose target context cannot be unambiguously derived from the
+    /// command (mixed-context batches, empty batches, relay-level
+    /// receipts) or for which no per-context actor is registered.
+    ///
+    /// Mirrors the standing-/lifecycle-direct precedents: each arm wraps
+    /// the supervisor-scoped body in a 30s timeout matching the actor-
+    /// handler shape (plan §"Transport timeouts inside actor handlers")
+    /// and relays the typed reply on the variant's oneshot.
+    ///
+    /// `VerifyPaymentReceipts` delegates to
+    /// [`economy_helpers_legacy::verify_payment_receipts_legacy`](crate::context::economy_helpers_legacy::verify_payment_receipts_legacy)
+    /// which iterates over the batch and dispatches to the configured
+    /// payment adapter from the supervisor's lifted provider slot. The
+    /// legacy body already handles mixed-context batches correctly
+    /// (verification depends only on `adapter_id`, not `context_id`); a
+    /// per-context fan-out would yield identical results because the
+    /// payment adapter lookup is supervisor-scoped, not actor-scoped.
+    /// The direct method therefore stays a thin wrapper around the
+    /// legacy body until Phase 2B refines the economy actor surface.
+    async fn dispatch_economy_direct(&self, cmd: EconomyCommand) -> Outcome<()> {
+        use crate::context::economy_helpers_legacy;
+        use crate::economy::receipt::ReceiptVerificationError;
+        const ECONOMY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        match cmd {
+            EconomyCommand::Placeholder { reply } => {
+                const MSG: &str =
+                    "EconomyCommand::Placeholder — mailbox-pipe smoke target; no production work";
+                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
+                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
+            }
+            EconomyCommand::VerifyPaymentReceipts { receipts, reply } => {
+                let receipts = *receipts;
+                let verify_fut =
+                    economy_helpers_legacy::verify_payment_receipts_legacy(self, &receipts);
+                let results = match tokio::time::timeout(ECONOMY_TIMEOUT, verify_fut).await {
+                    Ok(vec) => vec,
+                    Err(_elapsed) => receipts
+                        .iter()
+                        .map(|r| {
+                            Err(ReceiptVerificationError::NoVerifierForAdapter {
+                                receipt_id: r.receipt_id,
+                                adapter_id: r.adapter_id.clone(),
+                            })
+                        })
+                        .collect(),
+                };
+                let _ = reply.send(results);
+                // Verify payment receipts is a pure read — mutated=false.
+                Outcome::ok(())
             }
         }
     }
