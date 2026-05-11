@@ -2754,24 +2754,32 @@ impl Supervisor {
         })?
     }
 
-    /// Passthrough to
-    /// [`crate::context::governance_helpers::list_proposals`] — lists
-    /// every governance proposal currently tracked by the context's
-    /// engine.
+    /// Lists every governance proposal currently tracked by the
+    /// context's engine via the actor mailbox.
     ///
     /// # Errors
     ///
     /// - [`ContextError::ContextNotRegistered`] if the context is unknown.
+    /// - [`ContextError::TransportFailed`] if the actor reply channel
+    ///   is closed before the handler responds.
     pub async fn list_proposals(
         &self,
         context_id: &str,
     ) -> Result<Vec<scp_protocol::context::governance::GovernanceProposal>, ContextError> {
-        crate::context::governance_helpers_legacy::list_proposals_legacy(self, context_id).await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::ListProposals {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_governance_command(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::list_proposals — actor reply channel closed".to_owned(),
+            )
+        })?
     }
 
-    /// Passthrough to
-    /// [`crate::context::governance_helpers::get_proposal`] — fetches a
-    /// single proposal by ID.
+    /// Fetches a single proposal by ID via the actor mailbox.
     ///
     /// # Errors
     ///
@@ -2782,27 +2790,32 @@ impl Supervisor {
         context_id: &str,
         proposal_id: &scp_protocol::context::governance::ProposalId,
     ) -> Result<scp_protocol::context::governance::GovernanceProposal, ContextError> {
-        crate::context::governance_helpers_legacy::get_proposal_legacy(
-            self,
-            context_id,
-            proposal_id,
-        )
-        .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::GetProposal {
+            context_id: context_id.to_owned(),
+            proposal_id: *proposal_id,
+            reply: tx,
+        };
+        self.dispatch_governance_command(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::get_proposal — actor reply channel closed".to_owned(),
+            )
+        })?
     }
 
-    /// Passthrough to
-    /// [`crate::context::governance_helpers::propose_governance_action`].
+    /// Submits a governance proposal via the actor mailbox — unchecked
+    /// variant.
     ///
     /// Gated behind the `testing` feature — the unchecked propose path
     /// is not part of the production FFI surface (every bridge calls
     /// [`Self::propose_governance_action_checked`] instead). Crate-
     /// internal callers that bypass the capability check are limited
-    /// to integration tests under `crates/scp-runtime/tests/`. Phase 1
-    /// fix-up of ADR-049 (post-review-round-1).
+    /// to integration tests under `crates/scp-runtime/tests/`.
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] from the helper.
+    /// Propagates [`ContextError`] from the handler.
     #[cfg(any(test, feature = "testing"))]
     pub async fn propose_governance_action(
         &self,
@@ -2818,22 +2831,33 @@ impl Supervisor {
         ),
         ContextError,
     > {
-        crate::context::governance_helpers_legacy::propose_governance_action_legacy(
-            self,
-            context_id,
-            proposer_did,
-            action,
-            signing_key,
-        )
-        .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let payload = Box::new(
+            crate::context::actor::commands::ProposeGovernanceActionPayload {
+                context_id: context_id.to_owned(),
+                proposer_did: proposer_did.clone(),
+                action,
+                signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
+                    signing_key,
+                ),
+            },
+        );
+        let cmd = GovernanceCommand::ProposeGovernanceAction { payload, reply: tx };
+        self.dispatch_governance_command(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::propose_governance_action — actor reply channel closed".to_owned(),
+            )
+        })?
     }
 
-    /// Passthrough to
-    /// [`crate::context::governance_helpers::propose_governance_action_checked`].
+    /// Submits a governance proposal via the actor mailbox — checked
+    /// variant. Validates the proposer's `GovernancePropose` capability
+    /// inside the same lock as the proposal submission (no TOCTOU).
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] from the helper.
+    /// Propagates [`ContextError`] from the handler.
     pub async fn propose_governance_action_checked(
         &self,
         context_id: &str,
@@ -2841,29 +2865,37 @@ impl Supervisor {
         action: scp_protocol::context::governance::GovernanceAction,
         signing_key: &ed25519_dalek::SigningKey,
     ) -> Result<crate::context::state::ProposalOutcome, ContextError> {
-        crate::context::governance_helpers_legacy::propose_governance_action_checked_legacy(
-            self,
-            context_id,
-            proposer_did,
-            action,
-            signing_key,
-        )
-        .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let payload = Box::new(
+            crate::context::actor::commands::ProposeGovernanceActionPayload {
+                context_id: context_id.to_owned(),
+                proposer_did: proposer_did.clone(),
+                action,
+                signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
+                    signing_key,
+                ),
+            },
+        );
+        let cmd = GovernanceCommand::ProposeGovernanceActionChecked { payload, reply: tx };
+        self.dispatch_governance_command(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::propose_governance_action_checked — actor reply channel closed"
+                    .to_owned(),
+            )
+        })?
     }
 
-    /// Passthrough to
-    /// [`crate::context::governance_helpers::vote_on_proposal`].
+    /// Casts a vote on a pending proposal via the actor mailbox.
+    /// `approve == true` is an approval vote; `false` is rejection.
     ///
-    /// Gated behind the `testing` feature — the unchecked vote path
-    /// is not part of the production FFI surface (every bridge calls
-    /// the suspension-aware
-    /// [`vote_on_proposal_inner`](crate::context::governance_helpers::vote_on_proposal_inner)
-    /// helper with `check_vote_capability=true`).
-    /// Phase 1 fix-up of ADR-049 (post-review-round-1).
+    /// Gated behind the `testing` feature — the unchecked vote path is
+    /// not part of the production FFI surface (every bridge calls the
+    /// suspension-aware helper with `check_vote_capability=true`).
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] from the helper.
+    /// Propagates [`ContextError`] from the handler.
     #[cfg(any(test, feature = "testing"))]
     pub async fn vote_on_proposal(
         &self,
@@ -2879,36 +2911,52 @@ impl Supervisor {
         ),
         ContextError,
     > {
-        crate::context::governance_helpers_legacy::vote_on_proposal_legacy(
-            self,
-            context_id,
-            proposal_id,
-            voter_did,
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let payload = Box::new(crate::context::actor::commands::VoteOnProposalPayload {
+            context_id: context_id.to_owned(),
+            proposal_id: *proposal_id,
+            voter_did: voter_did.clone(),
+            signing_key: crate::context::actor::commands::SigningKeyBytes::from_signing_key(
+                signing_key,
+            ),
+        });
+        let cmd = GovernanceCommand::VoteOnProposal {
+            payload,
             approve,
-            signing_key,
-        )
-        .await
+            reply: tx,
+        };
+        self.dispatch_governance_command(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::vote_on_proposal — actor reply channel closed".to_owned(),
+            )
+        })?
     }
 
-    /// Passthrough to
-    /// [`crate::context::governance_helpers::withdraw_governance_vote`].
+    /// Withdraws a previously cast vote via the actor mailbox.
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] from the helper.
+    /// Propagates [`ContextError`] from the handler.
     pub async fn withdraw_governance_vote(
         &self,
         context_id: &str,
         proposal_id: &scp_protocol::context::governance::ProposalId,
         voter_did: &DID,
     ) -> Result<scp_protocol::context::governance::ProposalStatus, ContextError> {
-        crate::context::governance_helpers_legacy::withdraw_governance_vote_legacy(
-            self,
-            context_id,
-            proposal_id,
-            voter_did,
-        )
-        .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = GovernanceCommand::WithdrawGovernanceVote {
+            context_id: context_id.to_owned(),
+            proposal_id: *proposal_id,
+            voter_did: voter_did.clone(),
+            reply: tx,
+        };
+        self.dispatch_governance_command(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::withdraw_governance_vote — actor reply channel closed".to_owned(),
+            )
+        })?
     }
 
     // -------------------------------------------------------------------
@@ -3109,10 +3157,13 @@ impl Supervisor {
     }
 
     /// Extract the target context_id from a [`GovernanceCommand`].
-    /// Most variants have a `context_id` string field; a few carry it
-    /// in opaque boxed payloads (those return `None` and route via
-    /// the direct-shim path).
-    const fn governance_command_context_id(cmd: &GovernanceCommand) -> Option<&str> {
+    ///
+    /// Every per-context variant — including the boxed-payload propose
+    /// / vote / execute variants — surfaces its `context_id` so the
+    /// dispatch helper can route through the per-context actor's
+    /// mailbox. Only [`GovernanceCommand::Placeholder`] returns `None`
+    /// (no target).
+    fn governance_command_context_id(cmd: &GovernanceCommand) -> Option<&str> {
         match cmd {
             GovernanceCommand::GetProposal { context_id, .. }
             | GovernanceCommand::ListProposals { context_id, .. }
@@ -3120,16 +3171,23 @@ impl Supervisor {
             | GovernanceCommand::ApplyPendingEconomicPolicyChange { context_id, .. }
             | GovernanceCommand::TombstoneMigratedContext { context_id, .. }
             | GovernanceCommand::MigrationState { context_id, .. }
-            | GovernanceCommand::AcknowledgeCommitFault { context_id, .. } => {
+            | GovernanceCommand::AcknowledgeCommitFault { context_id, .. }
+            | GovernanceCommand::WithdrawGovernanceVote { context_id, .. } => {
                 Some(context_id.as_str())
             }
-            // VoteOnProposal / ApproveGovernanceProposal /
-            // RejectGovernanceProposal / WithdrawGovernanceVote /
-            // ExecuteGovernanceAction / ProposeGovernanceAction /
-            // ProposeGovernanceActionChecked carry context_id inside a
-            // boxed payload; not routed via mailbox until that payload
-            // is destructured in a follow-on Phase 2 chunk.
-            _ => None,
+            GovernanceCommand::ProposeGovernanceAction { payload, .. }
+            | GovernanceCommand::ProposeGovernanceActionChecked { payload, .. } => {
+                Some(payload.context_id.as_str())
+            }
+            GovernanceCommand::VoteOnProposal { payload, .. }
+            | GovernanceCommand::ApproveGovernanceProposal { payload, .. }
+            | GovernanceCommand::RejectGovernanceProposal { payload, .. } => {
+                Some(payload.context_id.as_str())
+            }
+            GovernanceCommand::ExecuteGovernanceAction { payload, .. } => {
+                Some(payload.context_id.as_str())
+            }
+            GovernanceCommand::Placeholder { .. } => None,
         }
     }
 

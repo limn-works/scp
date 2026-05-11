@@ -910,6 +910,13 @@ pub fn build_governance_context_legacy(
 /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
 /// - [`ContextError::GovernanceFailed`] if the proposer lacks authority or
 ///   the action is invalid.
+/// Dead-code as of phase-2A finalization commit-12 (the supervisor
+/// passthrough that called this now builds a `GovernanceCommand` and
+/// routes through the actor mailbox; the actor-side handler delegates
+/// to `propose_governance_action_inner_legacy` directly under a lock).
+/// Retained until the next session deletes the entire
+/// `governance_helpers_legacy` module.
+#[allow(dead_code)]
 #[instrument(skip_all, fields(context_id))]
 pub async fn propose_governance_action_legacy(
     supervisor: &Supervisor,
@@ -1197,6 +1204,14 @@ pub async fn propose_governance_action_inner_legacy(
 /// - [`ContextError::ContextNotActive`] if the context is not `Active`.
 /// - [`ContextError::GovernanceFailed`] if the voter is not eligible,
 ///   already voted, or the proposal is not pending.
+///
+/// Dead-code as of phase-2A finalization commit-12 (the supervisor
+/// passthrough that called this now builds a `GovernanceCommand` and
+/// routes through the actor mailbox; the actor-side handler delegates
+/// to `vote_on_proposal_inner_legacy` directly under a lock).
+/// Retained until the next session deletes the entire
+/// `governance_helpers_legacy` module.
+#[allow(dead_code)]
 #[instrument(skip_all, fields(context_id))]
 pub async fn vote_on_proposal_legacy(
     supervisor: &Supervisor,
