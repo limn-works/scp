@@ -1609,7 +1609,12 @@ export function createNativeBridge(scp: SCP): Bridge {
       grantedCapabilities: readonly string[],
       requiredCapability: string,
     ): boolean {
-      return (native.checkScopedCapability as (g: string[], r: string) => boolean)(
+      // Module-level free function (per ADR-048 §1) — route through
+      // `addon`, not `native`. The previous routing through the per-
+      // instance handle was incorrect after PR-E #28 deleted the
+      // `Scp::check_scoped_capability` method on the napi side; the
+      // dispatcher-invariant test catches this exactly.
+      return (addon.checkScopedCapability as unknown as (g: string[], r: string) => boolean)(
         [...grantedCapabilities],
         requiredCapability,
       );
