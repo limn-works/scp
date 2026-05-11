@@ -2749,14 +2749,13 @@ impl Supervisor {
                 )),
             );
         }
-        match rx.await {
-            Ok(result) => result,
-            Err(_) => Err(
+        rx.await.unwrap_or_else(|_| {
+            Err(
                 scp_protocol::context::builder::ContextCreationError::CreationFailed(
                     "Supervisor::create_context — actor reply channel closed".to_owned(),
                 ),
-            ),
-        }
+            )
+        })
     }
 
     /// Adds a new member to an existing context via the actor mailbox.
@@ -3378,7 +3377,7 @@ impl Supervisor {
     /// [`QueriesCommand::EventLogEntries`] takes a 32-byte hash with no
     /// per-context lock and returns `None` so it stays on the
     /// supervisor's inline event-log path.
-    fn queries_command_context_id(cmd: &QueriesCommand) -> Option<&str> {
+    const fn queries_command_context_id(cmd: &QueriesCommand) -> Option<&str> {
         match cmd {
             QueriesCommand::LocalPseudonym { context_id, .. }
             | QueriesCommand::GetBroadcastKeyForLocalAuthor { context_id, .. }

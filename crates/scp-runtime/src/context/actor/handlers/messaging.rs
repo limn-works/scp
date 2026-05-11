@@ -110,7 +110,14 @@ pub async fn dispatch(
             compat,
             unsupported_features,
             reply,
-        } => handle_report_degraded_mode(state, deps, &context_id, compat, unsupported_features, reply),
+        } => handle_report_degraded_mode(
+            state,
+            deps,
+            &context_id,
+            compat,
+            unsupported_features,
+            reply,
+        ),
     }
 }
 
