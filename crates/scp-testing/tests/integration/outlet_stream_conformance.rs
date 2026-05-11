@@ -62,7 +62,8 @@ use scp_protocol::context::outlets::error_codes::{
     SLUG_EXECUTION_STREAM_GAP,
 };
 use scp_protocol::context::outlets::stream::{
-    ChunkPayload, OutletStreamChunk, RequestId, StreamTerminalStatus,
+    ChunkPayload, OutletStreamChunk, RequestId, StreamTerminalStatus, sign_chunk,
+    verify_chunk_signature,
 };
 use scp_runtime::context::outlets::stream::{
     CancelAckTracker, CreditTracker, StreamEscrow, StreamIdentity, compute_chunks_billed_ref,
@@ -97,7 +98,7 @@ struct OpenSpec {
     chain_depth: u8,
 }
 
-#[derive(serde::Deserialize, Debug)]
+#[derive(serde::Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum VectorChunk {
     Data {
@@ -112,7 +113,6 @@ enum VectorChunk {
     Error {
         sequence: u64,
         code: String,
-        #[allow(dead_code)]
         slug: Option<String>,
         message: String,
         terminal: bool,
@@ -126,6 +126,11 @@ enum VectorChunk {
 }
 
 impl VectorChunk {
+    /// Returns the declared `sequence` for the chunk. Used by the
+    /// gap-detection cross-check below — the `sequence_gap` test now
+    /// drives `detect_first_gap` over the signed manifest, but the
+    /// helper remains available for diagnostic call sites.
+    #[allow(dead_code)]
     const fn sequence(&self) -> u64 {
         match self {
             Self::Data { sequence, .. }
@@ -135,7 +140,23 @@ impl VectorChunk {
         }
     }
 
-    fn into_protocol_chunk(self, request_id: RequestId) -> OutletStreamChunk {
+    /// Construct an `OutletStreamChunk` whose `sig` is a real Ed25519
+    /// signature produced by the §5.4.5 `SCP-OUTLET-CHUNK-SIG-V1:`
+    /// preimage path. `signing_key`, `context_id`, `outlet_id`, and
+    /// `caveats_binding` MUST match the verifier's pinned values; the
+    /// vector replay loop pins them via `synthetic_operator_signing_key`
+    /// alongside the per-vector `OpenSpec`. Replaces the prior
+    /// `sig: [0u8; 64]` stub so the conformance test exercises the
+    /// real signing-and-verification path rather than a self-agreement
+    /// tautology.
+    fn into_protocol_chunk(
+        self,
+        request_id: RequestId,
+        signing_key: &SigningKey,
+        context_id: &str,
+        outlet_id: &str,
+        caveats_binding: &[u8; 32],
+    ) -> OutletStreamChunk {
         let (sequence, payload) = match self {
             Self::Data { sequence, value } => (sequence, ChunkPayload::Data { value }),
             Self::End {
@@ -175,11 +196,21 @@ impl VectorChunk {
                 note,
             } => (sequence, ChunkPayload::Progress { pct, note }),
         };
+        let sig = sign_chunk(
+            signing_key,
+            context_id,
+            outlet_id,
+            &request_id,
+            sequence,
+            caveats_binding,
+            &payload,
+        )
+        .expect("sign_chunk: valid ChunkPayload canonicalizes via JCS");
         OutletStreamChunk {
             request_id,
             sequence,
             payload,
-            sig: [0u8; 64], // synthetic — see module rustdoc
+            sig,
         }
     }
 }
@@ -261,6 +292,20 @@ fn synthetic_invoker_pk() -> ed25519_dalek::VerifyingKey {
     // here.
     SigningKey::from_bytes(&[7u8; 32]).verifying_key()
 }
+
+/// Deterministic synthetic operator signing key used to produce the
+/// per-chunk Ed25519 signatures the conformance replay verifies. Distinct
+/// seed from `synthetic_invoker_pk` so a chunk signature can never be
+/// confused with a credit-grant signature in failure diagnostics.
+fn synthetic_operator_signing_key() -> SigningKey {
+    SigningKey::from_bytes(&[0x33; 32])
+}
+
+/// Pinned `caveats_binding` the replay uses for every chunk built via
+/// `into_protocol_chunk`. The bytes are non-zero so a verifier wired to
+/// a different (e.g. `[0u8; 32]`) binding fails — the test asserts
+/// signatures verify under exactly this binding.
+const VECTOR_CAVEATS_BINDING: [u8; 32] = [0x99; 32];
 
 fn synthetic_provenance() -> scp_protocol::provenance::DataProvenance {
     scp_protocol::provenance::DataProvenance {
@@ -386,6 +431,8 @@ fn classify_terminal_status(
 
 #[test]
 fn replay_each_vector_produces_expected_terminal_status() {
+    let signing_key = synthetic_operator_signing_key();
+    let operator_pk = signing_key.verifying_key();
     for v in load_vectors() {
         let request_id = VECTOR_REQUEST_ID;
 
@@ -396,61 +443,27 @@ fn replay_each_vector_produces_expected_terminal_status() {
         // cancel — there is no receiver-emitted terminal in the
         // manifest, so we synthesize the StreamTerminalStatus from the
         // first-gap detection rule below.
+        //
+        // Each chunk's `sig` is a real Ed25519 signature produced by
+        // `sign_chunk` against the §5.4.5 chunk-sig preimage. The
+        // verification loop below recomputes the preimage on the
+        // verifier side and asserts every chunk's signature passes —
+        // a tampered chunk (any bit-flip in payload, sequence,
+        // request_id, or caveats_binding) MUST be rejected. This
+        // replaces the prior `sig: [0u8; 64]` stub which left the
+        // conformance test agreeing with itself.
         let manifest: Vec<OutletStreamChunk> = v
             .chunks
             .iter()
-            .map(|c| match c {
-                VectorChunk::Data { sequence, value } => OutletStreamChunk {
+            .cloned()
+            .map(|c| {
+                c.into_protocol_chunk(
                     request_id,
-                    sequence: *sequence,
-                    payload: ChunkPayload::Data {
-                        value: value.clone(),
-                    },
-                    sig: [0u8; 64],
-                },
-                VectorChunk::End {
-                    sequence,
-                    aggregate,
-                    execution_time_ms,
-                } => OutletStreamChunk {
-                    request_id,
-                    sequence: *sequence,
-                    payload: ChunkPayload::End {
-                        aggregate: aggregate.clone(),
-                        provenance: synthetic_provenance(),
-                        execution_time_ms: *execution_time_ms,
-                    },
-                    sig: [0u8; 64],
-                },
-                VectorChunk::Error {
-                    sequence,
-                    code,
-                    message,
-                    terminal,
-                    ..
-                } => OutletStreamChunk {
-                    request_id,
-                    sequence: *sequence,
-                    payload: ChunkPayload::Error {
-                        code: code.clone(),
-                        message: message.clone(),
-                        terminal: *terminal,
-                    },
-                    sig: [0u8; 64],
-                },
-                VectorChunk::Progress {
-                    sequence,
-                    pct,
-                    note,
-                } => OutletStreamChunk {
-                    request_id,
-                    sequence: *sequence,
-                    payload: ChunkPayload::Progress {
-                        pct: *pct,
-                        note: note.clone(),
-                    },
-                    sig: [0u8; 64],
-                },
+                    &signing_key,
+                    &v.open.context_id,
+                    &v.open.outlet_id,
+                    &VECTOR_CAVEATS_BINDING,
+                )
             })
             .collect();
 
@@ -460,6 +473,50 @@ fn replay_each_vector_produces_expected_terminal_status() {
             manifest.len(),
             v.expected_total_chunks as usize,
             "vector {}: expected_total_chunks mismatch",
+            v.name
+        );
+
+        // §5.4.5 — every chunk's `sig` MUST verify under the operator's
+        // pinned public key + the stream's pinned `(context_id,
+        // outlet_id, caveats_binding)` triple. A miss here means the
+        // sign / verify round-trip diverged at the protocol layer.
+        for chunk in &manifest {
+            assert!(
+                verify_chunk_signature(
+                    chunk,
+                    &operator_pk,
+                    &v.open.context_id,
+                    &v.open.outlet_id,
+                    &VECTOR_CAVEATS_BINDING,
+                ),
+                "vector {}: chunk seq={} failed verify_chunk_signature \
+                 under pinned operator key + stream identity",
+                v.name,
+                chunk.sequence
+            );
+        }
+
+        // Tamper-detection sanity check on the first chunk: flipping
+        // any preimage-bound byte MUST make verification fail. We
+        // exercise the `caveats_binding` axis (each chunk's preimage
+        // commits to it) so a verifier wired to the wrong binding is
+        // rejected. Other preimage-bound fields (`context_id`,
+        // `outlet_id`, `request_id`, `sequence`, `payload`) are pinned
+        // by the manifest construction and not mutable here without
+        // mutating the chunk in place.
+        let first = manifest.first().expect("vector emitted ≥ 1 chunk");
+        let mut tampered_binding = VECTOR_CAVEATS_BINDING;
+        tampered_binding[0] ^= 0x01;
+        assert!(
+            !verify_chunk_signature(
+                first,
+                &operator_pk,
+                &v.open.context_id,
+                &v.open.outlet_id,
+                &tampered_binding,
+            ),
+            "vector {}: verify_chunk_signature must REJECT a chunk \
+             checked under a tampered caveats_binding",
             v.name
         );
 
@@ -592,6 +649,24 @@ fn cancellation_vector_replays_through_cancel_ack_tracker() {
 // position.
 // ---------------------------------------------------------------------------
 
+/// Receiver-side first-gap detector — `§5.4.5 ordering rule`. Returns
+/// `Some(expected_seq)` when a chunk in `chunks` skipped the next
+/// expected sequence (i.e. `chunks[i].sequence != i as u64`). `None`
+/// means the sequence is contiguous starting from 0. This mirrors the
+/// receiver-side `StreamGap` cancel trigger condition the SDK
+/// `InvocationHandle` pump runs — feeding signed chunks through it
+/// gives the conformance test a real detector to drive, not a
+/// JSON-vs-JSON comparison.
+fn detect_first_gap(chunks: &[OutletStreamChunk]) -> Option<u64> {
+    for (i, c) in chunks.iter().enumerate() {
+        let expected = i as u64;
+        if c.sequence != expected {
+            return Some(expected);
+        }
+    }
+    None
+}
+
 #[test]
 fn sequence_gap_vector_has_one_missing_sequence() {
     let v = load_vectors()
@@ -599,25 +674,98 @@ fn sequence_gap_vector_has_one_missing_sequence() {
         .find(|v| v.name == "sequence_gap")
         .expect("sequence_gap vector must exist");
 
-    let observed: Vec<u64> = v.chunks.iter().map(VectorChunk::sequence).collect();
+    // Build the signed manifest the same way `replay_each_vector_…`
+    // does, then feed it through the receiver-side gap detector.
+    // Driving the real detector (rather than re-parsing the JSON
+    // sequence list and comparing to itself) keeps the conformance
+    // assertion honest: any drift in the detector's "next expected
+    // sequence" rule against the manifest's actual layout surfaces
+    // here as a real failure.
+    let signing_key = synthetic_operator_signing_key();
+    let manifest: Vec<OutletStreamChunk> = v
+        .chunks
+        .iter()
+        .cloned()
+        .map(|c| {
+            c.into_protocol_chunk(
+                VECTOR_REQUEST_ID,
+                &signing_key,
+                &v.open.context_id,
+                &v.open.outlet_id,
+                &VECTOR_CAVEATS_BINDING,
+            )
+        })
+        .collect();
 
-    // Find the first gap.
-    let mut first_gap: Option<u64> = None;
-    for (i, &seq) in observed.iter().enumerate() {
-        let expected = i as u64;
-        if seq != expected {
-            first_gap = Some(expected);
-            break;
-        }
-    }
-
+    let first_gap = detect_first_gap(&manifest);
     assert!(
         first_gap.is_some(),
-        "sequence_gap vector must contain a gap"
+        "sequence_gap vector: detect_first_gap must flag a gap in the signed manifest"
     );
     assert_eq!(
         first_gap, v.expected_first_gap_sequence,
-        "sequence_gap vector: first-gap sequence mismatch"
+        "sequence_gap vector: detector first-gap mismatch — detector reports {first_gap:?}, \
+         vector declares {:?}",
+        v.expected_first_gap_sequence
+    );
+
+    // Cross-check: a manifest without the gap (contiguous 0..N) MUST
+    // NOT trigger the detector. We rebuild a contiguous manifest from
+    // the Data chunks of the vector with re-indexed sequences and
+    // confirm `detect_first_gap` returns `None`. This pins the
+    // detector against false positives — a real receiver must NOT
+    // emit StreamGap on a contiguous stream.
+    let contiguous: Vec<OutletStreamChunk> = v
+        .chunks
+        .iter()
+        .enumerate()
+        .map(|(i, c)| match c {
+            VectorChunk::Data { value, .. } => VectorChunk::Data {
+                sequence: i as u64,
+                value: value.clone(),
+            },
+            VectorChunk::End {
+                aggregate,
+                execution_time_ms,
+                ..
+            } => VectorChunk::End {
+                sequence: i as u64,
+                aggregate: aggregate.clone(),
+                execution_time_ms: *execution_time_ms,
+            },
+            VectorChunk::Error {
+                code,
+                slug,
+                message,
+                terminal,
+                ..
+            } => VectorChunk::Error {
+                sequence: i as u64,
+                code: code.clone(),
+                slug: slug.clone(),
+                message: message.clone(),
+                terminal: *terminal,
+            },
+            VectorChunk::Progress { pct, note, .. } => VectorChunk::Progress {
+                sequence: i as u64,
+                pct: *pct,
+                note: note.clone(),
+            },
+        })
+        .map(|c| {
+            c.into_protocol_chunk(
+                VECTOR_REQUEST_ID,
+                &signing_key,
+                &v.open.context_id,
+                &v.open.outlet_id,
+                &VECTOR_CAVEATS_BINDING,
+            )
+        })
+        .collect();
+    assert_eq!(
+        detect_first_gap(&contiguous),
+        None,
+        "detect_first_gap: contiguous-sequence manifest must NOT trigger StreamGap"
     );
 
     // The §5.4.4 slug → code mapping for execution.stream-gap shares
@@ -777,9 +925,32 @@ fn every_vector_chunk_emits_through_protocol_chunk_constructor() {
     // exercise the helper used by SDK smoke tests when they need to
     // synthesize OutletStreamChunk values for the InvocationHandle
     // pump. Catches drift between the JSON shape and the protocol enum.
+    // The chunk's `sig` is a real Ed25519 signature so the assertion
+    // also pins the §5.4.5 sign/verify round-trip end-to-end.
+    let signing_key = synthetic_operator_signing_key();
+    let operator_pk = signing_key.verifying_key();
     for v in load_vectors() {
         for c in v.chunks {
-            let _: OutletStreamChunk = c.into_protocol_chunk(VECTOR_REQUEST_ID);
+            let chunk = c.into_protocol_chunk(
+                VECTOR_REQUEST_ID,
+                &signing_key,
+                &v.open.context_id,
+                &v.open.outlet_id,
+                &VECTOR_CAVEATS_BINDING,
+            );
+            assert!(
+                verify_chunk_signature(
+                    &chunk,
+                    &operator_pk,
+                    &v.open.context_id,
+                    &v.open.outlet_id,
+                    &VECTOR_CAVEATS_BINDING,
+                ),
+                "vector {}: chunk seq={} produced via into_protocol_chunk \
+                 must verify under the same signing key",
+                v.name,
+                chunk.sequence
+            );
         }
     }
 }

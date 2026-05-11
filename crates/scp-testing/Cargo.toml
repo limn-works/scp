@@ -222,5 +222,9 @@ path = "tests/integration/outlet_economy_wiring.rs"
 name = "outlet_stream_vectors_through_open_path"
 path = "tests/integration/outlet_stream_vectors_through_open_path.rs"
 
+[[test]]
+name = "outlet_stream_credit_signing_funnel"
+path = "tests/integration/outlet_stream_credit_signing_funnel.rs"
+
 [lints]
 workspace = true

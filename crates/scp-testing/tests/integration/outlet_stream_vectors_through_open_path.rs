@@ -1048,22 +1048,16 @@ async fn vector_credit_exhaustion_through_open_path() {
 // Cross-vector invariants
 // ---------------------------------------------------------------------------
 
-#[test]
-fn open_path_funnel_is_a_single_method() {
-    // SCP-OUT-039 AC4: bridge open paths funnel through
-    // `ContextManager::open_outlet_stream`. The bridge layer between
-    // FFI signature and this method is validation + state-snapshotting
-    // + parameter marshalling; it does not interact with the per-stream
-    // pump.
-    //
-    // This assertion is a textual reminder for future maintainers — the
-    // mechanical enforcement is in
-    // `crates/scp-testing/tests/integration/pipeline_wiring.rs`
-    // (`bridge_outlet_invoke_stream_calls_manager_open_outlet_stream`-
-    // shaped assertions on each bridge file).
-    let canonical_method_name = "open_outlet_stream";
-    assert_eq!(canonical_method_name, "open_outlet_stream");
-}
+// Cross-vector textual invariant — removed. The prior
+// `open_path_funnel_is_a_single_method` test asserted
+// `assert_eq!("open_outlet_stream", "open_outlet_stream")`, which the
+// compiler optimises into nothing and which never observed bridge code.
+// The actual mechanical enforcement that every FFI bridge funnels
+// through `ContextManager::open_outlet_stream` lives in
+// `crates/scp-testing/tests/integration/pipeline_wiring.rs` (the
+// bridge-source string-search assertions) — that is the single source
+// of truth for SCP-OUT-039 AC4 and the only place this invariant
+// should be enforced.
 
 #[test]
 fn vector_set_loads_and_has_seven_named_vectors() {
