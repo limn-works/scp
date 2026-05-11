@@ -1997,9 +1997,9 @@ pub async fn restore_context(
 /// `Closed` / `Expired` states are skipped (only `Active` contexts are
 /// resurrected after a restart).
 ///
-/// Relocates the legacy
-/// [`lifecycle_helpers_legacy::restore_all_contexts_legacy`](crate::context::lifecycle_helpers_legacy::restore_all_contexts_legacy)
-/// off direct `Supervisor::contexts` `DashMap` insertion. The body
+/// Relocates the legacy `restore_all_contexts_legacy` off direct
+/// `Supervisor::contexts` `DashMap` insertion (the legacy body is now
+/// deleted). The body
 /// iterates persistence snapshots and dispatches one
 /// `Supervisor::restore_context` call per snapshot — that ergonomic
 /// method routes through the actor mailbox (after the bootstrap
@@ -2140,9 +2140,9 @@ pub fn flush_all_contexts_sync(supervisor: &crate::context::supervisor::Supervis
 /// registry by the bootstrap dual-write) and clears supervisor-level
 /// state (standing contexts, local DIDs, wrapping keys, task set).
 ///
-/// Relocates the legacy
-/// [`lifecycle_helpers_legacy::shutdown_all_contexts_legacy`](crate::context::lifecycle_helpers_legacy::shutdown_all_contexts_legacy)
-/// off the `Supervisor::contexts` `DashMap` iteration. Used by
+/// Relocates the legacy `shutdown_all_contexts_legacy` off the
+/// `Supervisor::contexts` `DashMap` iteration (the legacy body is now
+/// deleted). Used by
 /// [`Supervisor::shutdown_all_contexts`](crate::context::supervisor::Supervisor::shutdown_all_contexts)
 /// (and its sync wrapper) for process exit / test teardown. Does NOT
 /// send leave messages or notify remote peers.
