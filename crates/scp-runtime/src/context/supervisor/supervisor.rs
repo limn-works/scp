@@ -1764,23 +1764,21 @@ impl Supervisor {
                     )
                     .await
                 };
-                let (outcome, reply_result) =
-                    match tokio::time::timeout(TRUST_RECOVERY_TIMEOUT, notify_fut).await {
-                        Ok(Ok(())) => (Outcome::ok(()), Ok(())),
-                        Ok(Err(e)) => (
-                            Outcome::err(standing_outcome_error_sketch(&e)),
-                            Err(e),
-                        ),
-                        Err(_elapsed) => {
-                            let err = ContextError::TransportTimeout(format!(
-                                "recovery_notify_contact exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for recovering_did {recovering_did}"
-                            ));
-                            (
-                                Outcome::err(standing_outcome_error_sketch(&err)),
-                                Err(err),
-                            )
-                        }
-                    };
+                let (outcome, reply_result) = match tokio::time::timeout(
+                    TRUST_RECOVERY_TIMEOUT,
+                    notify_fut,
+                )
+                .await
+                {
+                    Ok(Ok(())) => (Outcome::ok(()), Ok(())),
+                    Ok(Err(e)) => (Outcome::err(standing_outcome_error_sketch(&e)), Err(e)),
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "recovery_notify_contact exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for recovering_did {recovering_did}"
+                        ));
+                        (Outcome::err(standing_outcome_error_sketch(&err)), Err(err))
+                    }
+                };
                 let _ = reply.send(reply_result);
                 outcome
             }
@@ -1798,23 +1796,27 @@ impl Supervisor {
                     &p.creator_did,
                     p.creator_signature,
                 );
-                let (outcome, reply_result) =
-                    match tokio::time::timeout(TRUST_RECOVERY_TIMEOUT, create_fut).await {
-                        Ok(Ok(checkpoint)) => (Outcome::ok_mutated(()), Ok(checkpoint)),
-                        Ok(Err(e)) => (
-                            Outcome::err_mutated(standing_outcome_error_sketch(&e)),
-                            Err(e),
-                        ),
-                        Err(_elapsed) => {
-                            let err = ContextError::TransportTimeout(format!(
-                                "create_governance_checkpoint exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for context {context_id}"
-                            ));
-                            (
-                                Outcome::err_mutated(standing_outcome_error_sketch(&err)),
-                                Err(err),
-                            )
-                        }
-                    };
+                let (outcome, reply_result) = match tokio::time::timeout(
+                    TRUST_RECOVERY_TIMEOUT,
+                    create_fut,
+                )
+                .await
+                {
+                    Ok(Ok(checkpoint)) => (Outcome::ok_mutated(()), Ok(checkpoint)),
+                    Ok(Err(e)) => (
+                        Outcome::err_mutated(standing_outcome_error_sketch(&e)),
+                        Err(e),
+                    ),
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "create_governance_checkpoint exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        (
+                            Outcome::err_mutated(standing_outcome_error_sketch(&err)),
+                            Err(err),
+                        )
+                    }
+                };
                 let _ = reply.send(reply_result);
                 outcome
             }
@@ -1831,45 +1833,47 @@ impl Supervisor {
                     &mut checkpoint,
                     *cosignature,
                 );
-                let (outcome, reply_result) =
-                    match tokio::time::timeout(TRUST_RECOVERY_TIMEOUT, add_fut).await {
-                        Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok((checkpoint, status))),
-                        Ok(Err(e)) => (
-                            Outcome::err(standing_outcome_error_sketch(&e)),
-                            Err(e),
-                        ),
-                        Err(_elapsed) => {
-                            let err = ContextError::TransportTimeout(format!(
-                                "add_checkpoint_cosignature exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for context {context_id}"
-                            ));
-                            (
-                                Outcome::err(standing_outcome_error_sketch(&err)),
-                                Err(err),
-                            )
-                        }
-                    };
+                let (outcome, reply_result) = match tokio::time::timeout(
+                    TRUST_RECOVERY_TIMEOUT,
+                    add_fut,
+                )
+                .await
+                {
+                    Ok(Ok(status)) => (Outcome::ok_mutated(()), Ok((checkpoint, status))),
+                    Ok(Err(e)) => (Outcome::err(standing_outcome_error_sketch(&e)), Err(e)),
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "add_checkpoint_cosignature exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        (Outcome::err(standing_outcome_error_sketch(&err)), Err(err))
+                    }
+                };
                 let _ = reply.send(reply_result);
                 outcome
             }
             TrustRecoveryCommand::RecoveryAdvanceEpoch { context_id, reply } => {
                 let advance_fut = helpers::recovery_advance_epoch_legacy(self, &context_id);
-                let (outcome, reply_result) =
-                    match tokio::time::timeout(TRUST_RECOVERY_TIMEOUT, advance_fut).await {
-                        Ok(Ok(epoch)) => (Outcome::ok_mutated(()), Ok(epoch)),
-                        Ok(Err(e)) => (
-                            Outcome::err_mutated(standing_outcome_error_sketch(&e)),
-                            Err(e),
-                        ),
-                        Err(_elapsed) => {
-                            let err = ContextError::TransportTimeout(format!(
-                                "recovery_advance_epoch exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for context {context_id}"
-                            ));
-                            (
-                                Outcome::err_mutated(standing_outcome_error_sketch(&err)),
-                                Err(err),
-                            )
-                        }
-                    };
+                let (outcome, reply_result) = match tokio::time::timeout(
+                    TRUST_RECOVERY_TIMEOUT,
+                    advance_fut,
+                )
+                .await
+                {
+                    Ok(Ok(epoch)) => (Outcome::ok_mutated(()), Ok(epoch)),
+                    Ok(Err(e)) => (
+                        Outcome::err_mutated(standing_outcome_error_sketch(&e)),
+                        Err(e),
+                    ),
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "recovery_advance_epoch exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        (
+                            Outcome::err_mutated(standing_outcome_error_sketch(&err)),
+                            Err(err),
+                        )
+                    }
+                };
                 let _ = reply.send(reply_result);
                 outcome
             }
@@ -1888,23 +1892,21 @@ impl Supervisor {
                     )
                     .await
                 };
-                let (outcome, reply_result) =
-                    match tokio::time::timeout(TRUST_RECOVERY_TIMEOUT, send_fut).await {
-                        Ok(Ok(())) => (Outcome::ok(()), Ok(())),
-                        Ok(Err(e)) => (
-                            Outcome::err(standing_outcome_error_sketch(&e)),
-                            Err(e),
-                        ),
-                        Err(_elapsed) => {
-                            let err = ContextError::TransportTimeout(format!(
-                                "recovery_send_notification exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for context {context_id}"
-                            ));
-                            (
-                                Outcome::err(standing_outcome_error_sketch(&err)),
-                                Err(err),
-                            )
-                        }
-                    };
+                let (outcome, reply_result) = match tokio::time::timeout(
+                    TRUST_RECOVERY_TIMEOUT,
+                    send_fut,
+                )
+                .await
+                {
+                    Ok(Ok(())) => (Outcome::ok(()), Ok(())),
+                    Ok(Err(e)) => (Outcome::err(standing_outcome_error_sketch(&e)), Err(e)),
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "recovery_send_notification exceeded {TRUST_RECOVERY_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        (Outcome::err(standing_outcome_error_sketch(&err)), Err(err))
+                    }
+                };
                 let _ = reply.send(reply_result);
                 outcome
             }
