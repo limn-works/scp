@@ -469,7 +469,7 @@ fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Ou
 /// increment `crate::metrics::record_persistence_failure()`; the
 /// reply oneshot always carries `Ok(())`.
 fn handle_flush_snapshot_actor(
-    state: &mut PerContextState,
+    state: &PerContextState,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
@@ -537,7 +537,7 @@ fn handle_flush_snapshot_actor(
 /// keys, task set) is the iterating entry point's responsibility —
 /// each actor only owns its own per-context resources.
 fn handle_shutdown_self_actor(
-    state: &mut PerContextState,
+    state: &PerContextState,
     deps: &ActorDeps,
     reply: oneshot::Sender<Result<(), ContextError>>,
 ) -> Outcome<()> {
@@ -575,5 +575,8 @@ fn handle_shutdown_self_actor(
     state.ttl.timer.cancel();
     state.governance.timeout_task.cancel();
     let _ = reply.send(Ok(()));
-    Outcome::ok_mutated(())
+    // Shutdown mutates external resources (crypto, event log, task
+    // handles) but does NOT mutate `state` itself — `cancel()` takes
+    // `&self`. Mark non-mutated for the actor's dirty tracking.
+    Outcome::ok(())
 }

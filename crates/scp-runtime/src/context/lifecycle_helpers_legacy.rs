@@ -2072,4 +2072,3 @@ pub async fn restore_context_legacy(
     let _ = event_log; // silence unused on this branch
     Ok(())
 }
-

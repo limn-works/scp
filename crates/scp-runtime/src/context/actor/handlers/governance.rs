@@ -799,79 +799,47 @@ fn handle_evaluate_periodic_consequences_actor(
     Outcome::ok_mutated(())
 }
 
-/// Handle [`GovernanceCommand::ProcessPendingCommits`] (actor-shape).
+/// Outcome of attempting to retry a single pending MLS commit
+/// (PR #1606 C6). Phase A of [`handle_process_pending_commits_actor`]
+/// produces one of these per pending entry whose backoff has elapsed;
+/// Phase B applies the outcomes to the actor's pending-commits queue.
+enum CommitRetryOutcomeKind {
+    Success {
+        attempts: u32,
+        operation: crate::context::state::CommitOperation,
+    },
+    Retry {
+        error: String,
+        next_attempt_at: u64,
+        new_retry_count: u32,
+        operation: crate::context::state::CommitOperation,
+    },
+    Failed {
+        reason: String,
+        attempts: u32,
+        operation: crate::context::state::CommitOperation,
+    },
+}
+struct CommitRetryOutcome {
+    index: usize,
+    kind: CommitRetryOutcomeKind,
+}
+
+/// Phase A of [`handle_process_pending_commits_actor`]. Classifies each
+/// pending commit whose backoff has elapsed as `Success`, `Retry`, or
+/// `Failed`. Returns one outcome per processed entry (entries whose
+/// `next_attempt_at` is still in the future are skipped).
 ///
-/// Per-actor body of the relocated sweep (PR #1606 C6). Walks
-/// `state.pending_commits`, retries any commits whose `next_attempt_at
-/// <= now`, and either dequeues on success, updates retry count on
-/// transient failure, or marks the context fail-closed once the retry
-/// budget is exhausted.
-///
-/// Mirrors the per-context body of `process_pending_commits_legacy`.
-/// The legacy body executed transport sends with the contexts lock
-/// RELEASED; the actor-shape body keeps the same property by snapshotting
-/// the queue, releasing the borrow on `state` for the transport phase
-/// (the transport adapter takes no `&state`), then re-acquiring `&mut
-/// state` for the result-application phase. The actor's own dispatch
-/// loop owns the `&mut state` borrow exclusively, so other commands
-/// cannot interleave between phases — this preserves the legacy "queue
-/// is only mutated by this task between phases" invariant.
-async fn handle_process_pending_commits_actor(
-    state: &mut crate::context::actor::state::PerContextState,
-    deps: &ActorDeps,
-    reply: oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
-    use scp_protocol::context::membership::ContextEvent;
-
-    use crate::context::state::{
-        CommitFaultMarker, CommitOperation, MAX_COMMIT_AGE_SECS, MAX_COMMIT_RETRIES, PendingCommit,
-        commit_retry_backoff, context_id_to_bytes,
-    };
-
-    if state.commit_fault.is_some() {
-        let _ = reply.send(Ok(()));
-        return Outcome::ok(());
-    }
-    let snapshot: Vec<PendingCommit> = state.pending_commits.iter().cloned().collect();
-    if snapshot.is_empty() {
-        let _ = reply.send(Ok(()));
-        return Outcome::ok(());
-    }
-    let now = deps.clock.now_secs();
-    let context_id = state.handle.context_id().to_owned();
-    let context_id_bytes = context_id_to_bytes(&context_id);
-
-    // Phase A: classify outcomes with no `&mut state` mutations.
-    //
-    // The legacy body executed `transport.send_message` with the
-    // contexts DashMap lock RELEASED to avoid holding the per-context
-    // mutex across network I/O. The actor-shape body achieves the same
-    // observable property: the transport adapter is `Arc<dyn ...>` and
-    // takes no `&state`, so the send sites here do not borrow `state`
-    // even though the surrounding function holds `&mut state`. The
-    // actor's `dispatch_state` arm owns the borrow exclusively for the
-    // command's lifetime, so other commands cannot interleave.
-    enum CommitRetryOutcomeKind {
-        Success {
-            attempts: u32,
-            operation: CommitOperation,
-        },
-        Retry {
-            error: String,
-            next_attempt_at: u64,
-            new_retry_count: u32,
-            operation: CommitOperation,
-        },
-        Failed {
-            reason: String,
-            attempts: u32,
-            operation: CommitOperation,
-        },
-    }
-    struct CommitRetryOutcome {
-        index: usize,
-        kind: CommitRetryOutcomeKind,
-    }
+/// Operates on a snapshot, not `&state`, so the transport sends happen
+/// with no `&state` borrow held. The actor's `dispatch_state` arm owns
+/// the `&mut state` borrow exclusively for the command's lifetime so
+/// no other command can interleave between Phase A and Phase B.
+fn compute_commit_retry_outcomes(
+    snapshot: &[crate::context::state::PendingCommit],
+    now: u64,
+    transport: &dyn crate::context::builder::ContextTransportProvider,
+) -> Vec<CommitRetryOutcome> {
+    use crate::context::state::{MAX_COMMIT_AGE_SECS, MAX_COMMIT_RETRIES, commit_retry_backoff};
 
     let mut outcomes: Vec<CommitRetryOutcome> = Vec::new();
     for (idx, pending) in snapshot.iter().enumerate() {
@@ -890,10 +858,7 @@ async fn handle_process_pending_commits_actor(
             });
             continue;
         }
-        match deps
-            .transport
-            .send_message(&pending.routing_id, &pending.commit_bytes)
-        {
+        match transport.send_message(&pending.routing_id, &pending.commit_bytes) {
             Ok(()) => {
                 outcomes.push(CommitRetryOutcome {
                     index: idx,
@@ -929,12 +894,23 @@ async fn handle_process_pending_commits_actor(
             }
         }
     }
-    if outcomes.is_empty() {
-        let _ = reply.send(Ok(()));
-        return Outcome::ok(());
-    }
+    outcomes
+}
 
-    // Phase B: apply outcomes to `state.pending_commits`.
+/// Phase B of [`handle_process_pending_commits_actor`]. Applies the
+/// outcomes to `state.pending_commits` under the actor's exclusive
+/// `&mut state` borrow. Pushes receive-buffer events and returns the
+/// labels that should be appended to the durable event log (Phase C).
+fn apply_commit_retry_outcomes(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    outcomes: Vec<CommitRetryOutcome>,
+) -> Vec<&'static str> {
+    use scp_protocol::context::membership::ContextEvent;
+
+    use crate::context::state::CommitFaultMarker;
+
     let mut event_log_writes: Vec<&'static str> = Vec::new();
     let queue_len = state.pending_commits.len();
     let mut to_remove: Vec<usize> = Vec::new();
@@ -952,7 +928,7 @@ async fn handle_process_pending_commits_actor(
                         operation: operation.label(),
                         attempts,
                     },
-                    &context_id,
+                    context_id,
                     deps.event_tx.as_ref(),
                 );
                 event_log_writes.push("CommitBroadcastSucceeded");
@@ -975,7 +951,7 @@ async fn handle_process_pending_commits_actor(
                         error,
                         attempt: new_retry_count,
                     },
-                    &context_id,
+                    context_id,
                     deps.event_tx.as_ref(),
                 );
                 event_log_writes.push("CommitBroadcastPending");
@@ -998,7 +974,7 @@ async fn handle_process_pending_commits_actor(
                         reason,
                         attempts,
                     },
-                    &context_id,
+                    context_id,
                     deps.event_tx.as_ref(),
                 );
                 event_log_writes.push("CommitBroadcastFailed");
@@ -1010,9 +986,57 @@ async fn handle_process_pending_commits_actor(
     for idx in to_remove {
         state.pending_commits.remove(idx);
     }
+    event_log_writes
+}
 
-    // Phase C: append durable event log entries with no lock concern
-    // (event_log adapter is `Arc<dyn ...>`, takes no `&state`).
+/// Handle [`GovernanceCommand::ProcessPendingCommits`] (actor-shape).
+///
+/// Per-actor body of the relocated sweep (PR #1606 C6). Walks
+/// `state.pending_commits`, retries any commits whose `next_attempt_at
+/// <= now`, and either dequeues on success, updates retry count on
+/// transient failure, or marks the context fail-closed once the retry
+/// budget is exhausted.
+///
+/// Mirrors the per-context body of `process_pending_commits_legacy`.
+/// The legacy body executed transport sends with the contexts lock
+/// RELEASED; the actor-shape body keeps the same property by
+/// snapshotting the queue, performing Phase A with no `&state`
+/// borrow on the transport call, then re-using the actor's exclusive
+/// `&mut state` borrow for Phase B. The actor's own dispatch loop
+/// owns the borrow exclusively, so other commands cannot interleave
+/// between phases — this preserves the legacy "queue is only mutated
+/// by this task between phases" invariant.
+async fn handle_process_pending_commits_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    use crate::context::state::{PendingCommit, context_id_to_bytes};
+
+    if state.commit_fault.is_some() {
+        let _ = reply.send(Ok(()));
+        return Outcome::ok(());
+    }
+    let snapshot: Vec<PendingCommit> = state.pending_commits.iter().cloned().collect();
+    if snapshot.is_empty() {
+        let _ = reply.send(Ok(()));
+        return Outcome::ok(());
+    }
+    let now = deps.clock.now_secs();
+    let context_id = state.handle.context_id().to_owned();
+    let context_id_bytes = context_id_to_bytes(&context_id);
+
+    let outcomes = compute_commit_retry_outcomes(&snapshot, now, deps.transport.as_ref());
+    if outcomes.is_empty() {
+        let _ = reply.send(Ok(()));
+        return Outcome::ok(());
+    }
+
+    let event_log_writes = apply_commit_retry_outcomes(state, deps, &context_id, outcomes);
+
+    // Phase C: append durable event log entries (event_log adapter is
+    // `Arc<dyn ...>`, takes no `&state` so the actor's borrow is not
+    // contended).
     let mut retry_event_count: u64 = 0;
     for label in event_log_writes {
         if let Err(e) = deps
@@ -1078,8 +1102,7 @@ async fn handle_evaluate_timeouts_actor(
 
     let gov_ctx = build_governance_context(state, deps.clock.as_ref());
 
-    let current_members: HashSet<DID> =
-        state.membership.members().map(|m| m.did.clone()).collect();
+    let current_members: HashSet<DID> = state.membership.members().map(|m| m.did.clone()).collect();
     let departed: Vec<DID> = state
         .governance
         .last_known_members
@@ -1088,9 +1111,7 @@ async fn handle_evaluate_timeouts_actor(
         .collect();
     state.governance.last_known_members = current_members;
 
-    state
-        .governance
-        .evict_stale_entries(deps.clock.now_secs());
+    state.governance.evict_stale_entries(deps.clock.now_secs());
 
     let epoch_resets: Vec<DID> = std::mem::take(&mut state.governance.pending_epoch_resets);
 

@@ -51,8 +51,7 @@ use scp_protocol::economy::types::EconomicPolicy;
 use tracing::instrument;
 
 use crate::context::governance_logic::{
-    EnforceConsequencesCtx, check_proposer_eligibility, dispatch_consequences,
-    enforce_triggered_consequences, event_log_entries_for_consequences,
+    check_proposer_eligibility, dispatch_consequences, event_log_entries_for_consequences,
 };
 use crate::context::supervisor::Supervisor;
 
@@ -65,12 +64,11 @@ use crate::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
     ContentKeysRotatedResult, ContextGeneration, ECONOMIC_POLICY_NOTIFICATION_PERIOD_SECS,
     EXECUTED_PROPOSALS_TTL_SECS, GovernanceActionResult, GovernanceReconfiguredResult,
-    MAX_COMMIT_AGE_SECS, MAX_COMMIT_RETRIES, MAX_PENDING_COMMITS, MAX_REGISTERED_TOOLS,
-    MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES, MigrationProposedResult, MigrationState,
-    PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange, PerContextState,
-    RestoreAccessResult, RevokeResult, SuspendMemberResult, commit_retry_backoff,
-    context_id_to_bytes, push_welcome_event, require_active, require_migrating_out,
-    strip_event_payload,
+    MAX_PENDING_COMMITS, MAX_REGISTERED_TOOLS, MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES,
+    MigrationProposedResult, MigrationState, PendingCeilingModification, PendingCommit,
+    PendingEconomicPolicyChange, PerContextState, RestoreAccessResult, RevokeResult,
+    SuspendMemberResult, commit_retry_backoff, context_id_to_bytes, push_welcome_event,
+    require_active, require_migrating_out, strip_event_payload,
 };
 
 // The governance-domain free functions below are mechanically hoisted from the
@@ -4800,20 +4798,33 @@ pub async fn start_governance_timeout_task_legacy(supervisor: &Supervisor, conte
     // (post-review-round-1).
     let spawn_generation = ctx.generation;
 
+    // Capture the per-context actor handle at spawn time. Phase 4 +
+    // Phase 5 of the tick body dispatch through this handle to drive
+    // the relocated sweep bodies in `handlers::governance` — when the
+    // handle is `Some`, the legacy `_legacy` per-context bodies are
+    // bypassed in favor of `GovernanceCommand::{EvaluatePeriodicConsequences,
+    // ProcessPendingCommits}` against the actor's owned `&mut state`.
+    // When the handle is `None` (bootstrap raced ahead of actor spawn,
+    // or actor despawned mid-spawn), Phases 4 and 5 are no-ops; the
+    // legacy `_legacy` bodies are not called because the contexts
+    // DashMap path is scheduled for deletion. Phase 1-3 still touch
+    // the DashMap directly because the governance-timeout actor lands
+    // in Phase 2B of ADR-049.
+    let actor_handle_opt: Option<crate::context::actor::ContextActorHandle> =
+        supervisor.lookup(&ctx_id);
+
     ctx.governance.timeout_task.start_in(&mut task_set, {
         let ctx_id = ctx_id.clone();
         let clock = Arc::clone(&clock_arc);
         let event_log = Arc::clone(&event_log_arc);
-        let transport = Arc::clone(&transport_arc);
+        let _transport = Arc::clone(&transport_arc);
         let event_tx = event_tx_owned.clone();
         move || {
             let contexts = Arc::clone(&contexts_arc);
             let clock = Arc::clone(&clock);
             let event_log = Arc::clone(&event_log);
             let event_tx = event_tx.clone();
-            let transport_for_retry = Arc::clone(&transport);
-            let event_log_for_retry = Arc::clone(&event_log);
-            let clock_for_retry = Arc::clone(&clock);
+            let actor_handle_opt = actor_handle_opt.clone();
             let ctx_id = ctx_id.clone();
             async move {
                 // Phase 1: Acquire lock, snapshot data, process proposals,
@@ -4943,29 +4954,52 @@ pub async fn start_governance_timeout_task_legacy(supervisor: &Supervisor, conte
                 }
 
                 // Phase 4: Periodic consequence evaluation (#1531).
-                evaluate_periodic_consequences_legacy(
-                    &contexts,
-                    &ctx_id,
-                    &*clock,
-                    &*event_log,
-                    event_tx.as_ref(),
-                )
-                .await;
-
                 // Phase 5 (PR #1606 C6): drain the persistent MLS
-                // commit retry queue. Retries any pending commits
-                // whose backoff timer has elapsed and either dequeues
-                // them on success or marks the context fail-closed
-                // when the retry budget is exhausted.
-                process_pending_commits_legacy(
-                    &contexts,
-                    &ctx_id,
-                    Arc::clone(&transport_for_retry),
-                    Arc::clone(&event_log_for_retry),
-                    Arc::clone(&clock_for_retry),
-                    event_tx.clone(),
-                )
-                .await;
+                // commit retry queue.
+                //
+                // Both are now dispatched through the per-context
+                // actor mailbox — the relocated sweep bodies live in
+                // `handlers::governance` and operate on the actor's
+                // owned `&mut state`. The legacy `_legacy` per-context
+                // bodies are bypassed. When the actor handle is `None`
+                // (bootstrap raced ahead of actor spawn, or actor
+                // despawned), both phases no-op silently.
+                if let Some(actor) = actor_handle_opt.as_ref() {
+                    // Phase 4
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let cmd = crate::context::actor::commands::ContextCommand::Governance(
+                        crate::context::actor::commands::GovernanceCommand::EvaluatePeriodicConsequences {
+                            reply: tx,
+                        },
+                    );
+                    if actor
+                        .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+                        .await
+                        .is_ok()
+                    {
+                        let _ = rx.await;
+                    }
+                    // Phase 5
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let cmd = crate::context::actor::commands::ContextCommand::Governance(
+                        crate::context::actor::commands::GovernanceCommand::ProcessPendingCommits {
+                            reply: tx,
+                        },
+                    );
+                    if actor
+                        .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+                        .await
+                        .is_ok()
+                    {
+                        let _ = rx.await;
+                    }
+                }
+                // Silence unused-binding lints on the per-tick locals
+                // that are no longer threaded into Phase 4/5 (the
+                // mailbox dispatch above carries `deps.transport` /
+                // `deps.event_log` / `deps.clock` from the actor's
+                // own `ActorDeps`).
+                let _ = (&contexts, &clock, &event_log, &event_tx);
 
                 true // Continue the loop.
             }
@@ -5125,374 +5159,4 @@ pub fn translate_timeout_events_legacy(
     }
 
     ctx_events
-}
-
-// ---------------------------------------------------------------------------
-// evaluate_periodic_consequences_legacy (transitive helper)
-// ---------------------------------------------------------------------------
-
-/// Phase 4 of the governance timeout task: evaluates consequence rules for
-/// all members (#1531).
-///
-/// Hoisted body of the legacy
-/// [`ContextManager::evaluate_periodic_consequences_legacy`](crate::context::supervisor::Supervisor::evaluate_periodic_consequences_legacy)
-/// (ADR-049 commit 12). Byte-identical behavior.
-///
-/// Time-based rules (e.g., "if no messages in 1 hour, downgrade role") must
-/// fire even when no user action occurs. Evaluates all members on every
-/// tick. Early return when no rules are configured (the common case).
-pub async fn evaluate_periodic_consequences_legacy(
-    contexts: &Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<PerContextState>>>>,
-    ctx_id: &str,
-    clock: &dyn Clock,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
-    event_tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
-) {
-    use scp_protocol::trust::consequence::{TriggeredConsequence, evaluate_consequence_rules};
-
-    // M9: Clone data under lock, drop lock for evaluation, reacquire
-    // for enforcement. This prevents holding the contexts lock for
-    // the entire evaluation duration (which includes event log I/O).
-    let now = clock.now_secs();
-    let (rules, member_dids, events) = {
-        let Some(ctx_entry) = contexts.get(ctx_id) else {
-            return;
-        };
-        let ctx_arc = Arc::clone(ctx_entry.value());
-        drop(ctx_entry);
-        let guard = ctx_arc.lock().await;
-        let ctx = &*guard;
-        let rules = ctx.governance.consequence_rules.clone();
-        if rules.is_empty() {
-            return;
-        }
-        let member_dids: Vec<DID> = ctx.membership.members().map(|m| m.did.clone()).collect();
-        let events =
-            event_log_entries_for_consequences(&ctx.receive_buffer, ctx_id, now, event_log);
-        (rules, member_dids, events)
-    };
-    // Lock dropped — pure evaluation with no lock held.
-    let mut results: Vec<(DID, Vec<TriggeredConsequence>)> = Vec::new();
-    for member_did in member_dids {
-        let triggered = evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
-        if !triggered.is_empty() {
-            results.push((member_did, triggered));
-        }
-    }
-    if results.is_empty() {
-        return;
-    }
-    // Reacquire lock for enforcement.
-    let Some(ctx_entry) = contexts.get(ctx_id) else {
-        return;
-    };
-    let ctx_arc = Arc::clone(ctx_entry.value());
-    drop(ctx_entry);
-    let mut guard = ctx_arc.lock().await;
-    let ctx = &mut *guard;
-    let ctx = &mut *ctx;
-    let mut split = crate::context::governance_logic::ConsequenceStateSplit::from_state(ctx);
-    for (member_did, triggered) in &results {
-        enforce_triggered_consequences(
-            &mut split,
-            &EnforceConsequencesCtx {
-                context_id: ctx_id,
-                member_did,
-                now,
-                triggered,
-                rules: &rules,
-                clock,
-                event_log,
-                event_tx,
-            },
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// process_pending_commits_legacy (transitive helper, formerly _static)
-// ---------------------------------------------------------------------------
-
-// PR #1606 C6 helper types — outcome of attempting to retry a single
-// pending commit. Lifted out of `process_pending_commits_legacy` to satisfy
-// `clippy::items_after_statements`.
-struct CommitRetryOutcome {
-    index: usize,
-    kind: CommitRetryOutcomeKind,
-}
-
-enum CommitRetryOutcomeKind {
-    Success {
-        attempts: u32,
-        operation: CommitOperation,
-    },
-    Retry {
-        error: String,
-        next_attempt_at: u64,
-        new_retry_count: u32,
-        operation: CommitOperation,
-    },
-    Failed {
-        reason: String,
-        attempts: u32,
-        operation: CommitOperation,
-    },
-}
-
-/// Processes the per-context MLS Commit retry queue (PR #1606 C6).
-///
-/// Hoisted body of the legacy
-/// [`ContextManager::process_pending_commits_static`](crate::context::supervisor::Supervisor::process_pending_commits_static)
-/// (ADR-049 commit 12). The legacy `_static` suffix is dropped
-/// because the free function form has no `&self` ambiguity.
-/// Byte-identical behavior.
-///
-/// Called periodically from
-/// [`start_governance_timeout_task_legacy`].
-/// Walks `ctx.pending_commits`, retries any commits whose
-/// `next_attempt_at <= now`, and either:
-/// 1. Dequeues on success (emits `CommitBroadcastSucceeded`).
-/// 2. Updates retry count + next attempt on failure (emits
-///    `CommitBroadcastPending` with the new attempt count).
-/// 3. Marks the context fail-closed and emits `CommitBroadcastFailed`
-///    when `retry_count >= MAX_COMMIT_RETRIES` or
-///    `now - first_attempt_at >= MAX_COMMIT_AGE_SECS`.
-///
-/// All transport sends happen with the contexts lock RELEASED to
-/// avoid holding the lock across I/O.
-pub async fn process_pending_commits_legacy(
-    contexts: &Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<PerContextState>>>>,
-    context_id: &str,
-    transport: Arc<dyn crate::context::builder::ContextTransportProvider>,
-    event_log: Arc<dyn crate::context::builder::ContextEventLogProvider>,
-    clock: Arc<dyn Clock>,
-    event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
-) {
-    // Snapshot the queue under lock.
-    let snapshot: Vec<PendingCommit> = {
-        let Some(ctx_entry) = contexts.get(context_id) else {
-            return;
-        };
-        let ctx_arc = Arc::clone(ctx_entry.value());
-        drop(ctx_entry);
-        let guard = ctx_arc.lock().await;
-        let ctx = &*guard;
-        // If a fault marker is already set, do not retry — the queue
-        // is frozen until an operator acknowledges.
-        if ctx.commit_fault.is_some() {
-            return;
-        }
-        ctx.pending_commits.iter().cloned().collect()
-    };
-    if snapshot.is_empty() {
-        return;
-    }
-    let now = clock.now_secs();
-    // Phase A (no lock held): retry each pending entry whose backoff has
-    // elapsed and classify the outcome.
-    let outcomes = compute_commit_retry_outcomes_legacy(&snapshot, now, transport.as_ref());
-    if outcomes.is_empty() {
-        return;
-    }
-    // Phase B (lock held): apply the outcomes to the queue.
-    let context_id_bytes = context_id_to_bytes(context_id);
-    let event_log_writes = apply_commit_retry_outcomes_legacy(
-        contexts,
-        context_id,
-        outcomes,
-        &*clock,
-        event_tx.as_ref(),
-    )
-    .await;
-    // Phase C (no lock held): append durable event log entries.
-    let mut retry_event_count: u64 = 0;
-    for label in event_log_writes {
-        if let Err(e) = event_log.append_context_event(&context_id_bytes, label, "system") {
-            tracing::warn!(
-                context_id = %context_id,
-                error = %e,
-                "failed to append commit retry event to durable log"
-            );
-        }
-        retry_event_count += 1;
-    }
-    if retry_event_count > 0
-        && let Some(ctx_entry) = contexts.get(context_id)
-    {
-        let ctx_arc = Arc::clone(ctx_entry.value());
-        drop(ctx_entry);
-        let mut guard = ctx_arc.lock().await;
-        let ctx = &mut *guard;
-        ctx.checkpoint_events_since += retry_event_count;
-    }
-}
-
-/// Phase A of [`process_pending_commits_legacy`]: classifies each
-/// pending commit whose backoff has elapsed as `Success`, `Retry`,
-/// or `Failed`. Returns one outcome per processed entry (entries whose
-/// `next_attempt_at` is still in the future are skipped).
-fn compute_commit_retry_outcomes_legacy(
-    snapshot: &[PendingCommit],
-    now: u64,
-    transport: &dyn crate::context::builder::ContextTransportProvider,
-) -> Vec<CommitRetryOutcome> {
-    let mut outcomes: Vec<CommitRetryOutcome> = Vec::new();
-    for (idx, pending) in snapshot.iter().enumerate() {
-        if now < pending.next_attempt_at {
-            continue;
-        }
-        // Age budget check. If we're past MAX_COMMIT_AGE_SECS, force-fail
-        // without making another network call.
-        let age = now.saturating_sub(pending.first_attempt_at);
-        if age >= MAX_COMMIT_AGE_SECS {
-            outcomes.push(CommitRetryOutcome {
-                index: idx,
-                kind: CommitRetryOutcomeKind::Failed {
-                    reason: format!("max age exceeded ({age}s >= {MAX_COMMIT_AGE_SECS}s)"),
-                    attempts: pending.retry_count,
-                    operation: pending.operation.clone(),
-                },
-            });
-            continue;
-        }
-        // Attempt the send.
-        match transport.send_message(&pending.routing_id, &pending.commit_bytes) {
-            Ok(()) => {
-                outcomes.push(CommitRetryOutcome {
-                    index: idx,
-                    kind: CommitRetryOutcomeKind::Success {
-                        attempts: pending.retry_count,
-                        operation: pending.operation.clone(),
-                    },
-                });
-            }
-            Err(e) => {
-                let new_retry_count = pending.retry_count.saturating_add(1);
-                if new_retry_count > MAX_COMMIT_RETRIES {
-                    outcomes.push(CommitRetryOutcome {
-                        index: idx,
-                        kind: CommitRetryOutcomeKind::Failed {
-                            reason: e.to_string(),
-                            attempts: new_retry_count,
-                            operation: pending.operation.clone(),
-                        },
-                    });
-                } else {
-                    let backoff = commit_retry_backoff(new_retry_count);
-                    outcomes.push(CommitRetryOutcome {
-                        index: idx,
-                        kind: CommitRetryOutcomeKind::Retry {
-                            error: e.to_string(),
-                            next_attempt_at: now.saturating_add(backoff),
-                            new_retry_count,
-                            operation: pending.operation.clone(),
-                        },
-                    });
-                }
-            }
-        }
-    }
-    outcomes
-}
-
-/// Phase B of [`process_pending_commits_legacy`]: applies the outcomes
-/// to `PerContextState::pending_commits` under lock. Pushes receive
-/// buffer events and returns the labels that should be appended to
-/// the durable event log.
-async fn apply_commit_retry_outcomes_legacy(
-    contexts: &Arc<dashmap::DashMap<String, Arc<tokio::sync::Mutex<PerContextState>>>>,
-    context_id: &str,
-    outcomes: Vec<CommitRetryOutcome>,
-    clock: &dyn Clock,
-    event_tx: Option<&tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
-) -> Vec<&'static str> {
-    let mut event_log_writes: Vec<&'static str> = Vec::new();
-    let Some(ctx_entry) = contexts.get(context_id) else {
-        return event_log_writes;
-    };
-    let ctx_arc = Arc::clone(ctx_entry.value());
-    drop(ctx_entry);
-    let mut guard = ctx_arc.lock().await;
-    let ctx = &mut *guard;
-    let queue_len = ctx.pending_commits.len();
-    // Apply outcomes by their snapshot index. The queue is only mutated
-    // by this task (success/failed removals) and by new enqueue calls
-    // (which append to the end), so prefix indices remain stable
-    // between Phase A and Phase B.
-    let mut to_remove: Vec<usize> = Vec::new();
-    for outcome in outcomes {
-        if outcome.index >= queue_len {
-            continue;
-        }
-        match outcome.kind {
-            CommitRetryOutcomeKind::Success {
-                attempts,
-                operation,
-            } => {
-                ctx.emit_event(
-                    ContextEvent::CommitBroadcastSucceeded {
-                        operation: operation.label(),
-                        attempts,
-                    },
-                    context_id,
-                    event_tx,
-                );
-                event_log_writes.push("CommitBroadcastSucceeded");
-                to_remove.push(outcome.index);
-            }
-            CommitRetryOutcomeKind::Retry {
-                error,
-                next_attempt_at,
-                new_retry_count,
-                operation,
-            } => {
-                if let Some(entry) = ctx.pending_commits.get_mut(outcome.index) {
-                    entry.retry_count = new_retry_count;
-                    entry.next_attempt_at = next_attempt_at;
-                    entry.last_error = Some(error.clone());
-                }
-                ctx.emit_event(
-                    ContextEvent::CommitBroadcastPending {
-                        operation: operation.label(),
-                        error,
-                        attempt: new_retry_count,
-                    },
-                    context_id,
-                    event_tx,
-                );
-                event_log_writes.push("CommitBroadcastPending");
-            }
-            CommitRetryOutcomeKind::Failed {
-                reason,
-                attempts,
-                operation,
-            } => {
-                let now_failed = clock.now_secs();
-                ctx.commit_fault = Some(CommitFaultMarker {
-                    operation: operation.clone(),
-                    reason: reason.clone(),
-                    failed_at: now_failed,
-                    retry_count: attempts,
-                });
-                ctx.emit_event(
-                    ContextEvent::CommitBroadcastFailed {
-                        operation: operation.label(),
-                        reason,
-                        attempts,
-                    },
-                    context_id,
-                    event_tx,
-                );
-                event_log_writes.push("CommitBroadcastFailed");
-                to_remove.push(outcome.index);
-            }
-        }
-    }
-    // Remove successful/failed entries in reverse-index order so earlier
-    // indices stay valid.
-    to_remove.sort_unstable_by(|a, b| b.cmp(a));
-    for idx in to_remove {
-        ctx.pending_commits.remove(idx);
-    }
-    event_log_writes
 }

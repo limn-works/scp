@@ -1999,7 +1999,7 @@ pub async fn restore_context(
 ///
 /// Relocates the legacy
 /// [`lifecycle_helpers_legacy::restore_all_contexts_legacy`](crate::context::lifecycle_helpers_legacy::restore_all_contexts_legacy)
-/// off direct `Supervisor::contexts` DashMap insertion. The body
+/// off direct `Supervisor::contexts` `DashMap` insertion. The body
 /// iterates persistence snapshots and dispatches one
 /// `Supervisor::restore_context` call per snapshot — that ergonomic
 /// method routes through the actor mailbox (after the bootstrap
@@ -2041,10 +2041,8 @@ pub async fn restore_all_contexts(
             continue;
         }
 
-        let handle = crate::context::ContextHandle::new(
-            ctx_id.clone(),
-            ctx_snapshot.context_params.clone(),
-        );
+        let handle =
+            crate::context::ContextHandle::new(ctx_id.clone(), ctx_snapshot.context_params.clone());
 
         match supervisor.restore_context(ctx_id, &handle).await {
             Ok(()) => restored.push(ctx_id.clone()),
@@ -2063,10 +2061,9 @@ pub async fn restore_all_contexts(
 /// Sweep entry point: best-effort flush of every actor's snapshot to
 /// the configured persistence provider.
 ///
-/// Relocates the legacy
-/// [`lifecycle_helpers_legacy::flush_all_contexts_legacy`](crate::context::lifecycle_helpers_legacy::flush_all_contexts_legacy)
-/// off the `Supervisor::contexts` DashMap. Iterates the actor registry
-/// and dispatches one
+/// Relocates the legacy `flush_all_contexts_legacy` off the
+/// `Supervisor::contexts` `DashMap` (now deleted). Iterates the actor
+/// registry and dispatches one
 /// [`LifecycleCommand::FlushSnapshot`](crate::context::actor::commands::LifecycleCommand::FlushSnapshot)
 /// per actor.
 ///
@@ -2139,13 +2136,13 @@ pub fn flush_all_contexts_sync(supervisor: &crate::context::supervisor::Supervis
 /// order (zeroize secrets before tearing down structure) by dispatching
 /// [`LifecycleCommand::ShutdownSelf`](crate::context::actor::commands::LifecycleCommand::ShutdownSelf)
 /// to each actor; then removes each context from the legacy
-/// `Supervisor::contexts` DashMap (kept in lock-step with the actor
+/// `Supervisor::contexts` `DashMap` (kept in lock-step with the actor
 /// registry by the bootstrap dual-write) and clears supervisor-level
 /// state (standing contexts, local DIDs, wrapping keys, task set).
 ///
 /// Relocates the legacy
 /// [`lifecycle_helpers_legacy::shutdown_all_contexts_legacy`](crate::context::lifecycle_helpers_legacy::shutdown_all_contexts_legacy)
-/// off the `Supervisor::contexts` DashMap iteration. Used by
+/// off the `Supervisor::contexts` `DashMap` iteration. Used by
 /// [`Supervisor::shutdown_all_contexts`](crate::context::supervisor::Supervisor::shutdown_all_contexts)
 /// (and its sync wrapper) for process exit / test teardown. Does NOT
 /// send leave messages or notify remote peers.

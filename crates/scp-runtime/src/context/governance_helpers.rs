@@ -3886,10 +3886,9 @@ pub fn try_broadcast_commit_or_enqueue(
 /// Sweep entry point: evaluate consequence rules for every registered
 /// actor.
 ///
-/// Relocates the legacy
-/// [`governance_helpers_legacy::evaluate_periodic_consequences_legacy`](crate::context::governance_helpers_legacy::evaluate_periodic_consequences_legacy)
-/// off the `Supervisor::contexts` DashMap. Iterates the actor registry
-/// and dispatches one
+/// Relocates the legacy `evaluate_periodic_consequences_legacy` off
+/// the `Supervisor::contexts` `DashMap` (now deleted). Iterates the
+/// actor registry and dispatches one
 /// [`GovernanceCommand::EvaluatePeriodicConsequences`](crate::context::actor::commands::GovernanceCommand::EvaluatePeriodicConsequences)
 /// per actor.
 ///
@@ -3897,9 +3896,19 @@ pub fn try_broadcast_commit_or_enqueue(
 /// shut down) the iteration silently skips it. Per-actor replies are
 /// awaited in turn — the sweep returns when every actor has either
 /// replied or its mailbox is gone.
-pub async fn evaluate_periodic_consequences(
-    supervisor: &crate::context::supervisor::Supervisor,
-) {
+///
+/// First bulk-iterator caller lands in Phase 2B per ADR-049 — the
+/// per-context governance-timeout task's tick closure already
+/// dispatches the per-actor variant directly via the actor mailbox
+/// (see `start_governance_timeout_task_legacy`'s Phase 4), so the
+/// supervisor-scope sweep is only needed for FFI bridge "evaluate
+/// now" operations or test fixtures that drive deterministic ticks.
+#[allow(
+    dead_code,
+    reason = "first bulk-iterator caller lands in Phase 2B per ADR-049 — \
+              the per-actor variant is wired through the timer task today"
+)]
+pub async fn evaluate_periodic_consequences(supervisor: &crate::context::supervisor::Supervisor) {
     use crate::context::actor::commands::{ContextCommand, GovernanceCommand};
 
     for ctx_id in supervisor.actor_ids() {
@@ -3927,12 +3936,20 @@ pub async fn evaluate_periodic_consequences(
 /// Sweep entry point: process the MLS commit retry queue for every
 /// registered actor (PR #1606 C6).
 ///
-/// Relocates the legacy
-/// [`governance_helpers_legacy::process_pending_commits_legacy`](crate::context::governance_helpers_legacy::process_pending_commits_legacy)
-/// off the `Supervisor::contexts` DashMap. Iterates the actor registry
-/// and dispatches one
+/// Relocates the legacy `process_pending_commits_legacy` off the
+/// `Supervisor::contexts` `DashMap` (now deleted). Iterates the actor
+/// registry and dispatches one
 /// [`GovernanceCommand::ProcessPendingCommits`](crate::context::actor::commands::GovernanceCommand::ProcessPendingCommits)
 /// per actor.
+///
+/// First bulk-iterator caller lands in Phase 2B per ADR-049 — see
+/// [`evaluate_periodic_consequences`] for the rationale (the
+/// per-actor variant is already wired through the timer task).
+#[allow(
+    dead_code,
+    reason = "first bulk-iterator caller lands in Phase 2B per ADR-049 — \
+              the per-actor variant is wired through the timer task today"
+)]
 pub async fn process_pending_commits(supervisor: &crate::context::supervisor::Supervisor) {
     use crate::context::actor::commands::{ContextCommand, GovernanceCommand};
 
@@ -3974,6 +3991,21 @@ pub async fn process_pending_commits(supervisor: &crate::context::supervisor::Su
 /// no actor registered for `context_id`) — the timer loop stops in
 /// that case, matching the legacy `contexts.get(ctx_id) = None ->
 /// return false` semantics.
+///
+/// First caller lands in Phase 2B per ADR-049 (per-context
+/// governance-timeout actor). The current
+/// `start_governance_timeout_task_legacy` body inlines the
+/// per-actor dispatch of `EvaluatePeriodicConsequences` /
+/// `ProcessPendingCommits` directly (rather than dispatching the
+/// whole-tick `EvaluateTimeouts` via this helper) so Phase 1-3
+/// machinery can still reach `Supervisor::contexts` for
+/// generation tracking during the migration window.
+#[allow(
+    dead_code,
+    reason = "first caller lands in Phase 2B per ADR-049 — entry point \
+              in place so the whole-tick mailbox dispatch shape is \
+              grep-findable and the `EvaluateTimeouts` variant is reachable"
+)]
 pub async fn tick_governance_timeout(
     supervisor: &crate::context::supervisor::Supervisor,
     context_id: &str,
@@ -3992,7 +4024,10 @@ pub async fn tick_governance_timeout(
     {
         return false;
     }
-    rx.await.map(|r| r.unwrap_or(false)).unwrap_or(false)
+    match rx.await {
+        Ok(Ok(b)) => b,
+        _ => false,
+    }
 }
 
 /// Sweep entry point: spawn the supervisor-driven governance timeout
@@ -4002,12 +4037,12 @@ pub async fn tick_governance_timeout(
 /// per-context governance-timeout actor lands in Phase 2B; for now the
 /// spawn-time setup stays supervisor-driven but the per-tick body is
 /// rerouted through the actor mailbox via
-/// [`tick_governance_timeout`]. The spawn dance (task_set + per-context
+/// [`tick_governance_timeout`]. The spawn dance (`task_set` + per-context
 /// `start_in`) remains in
 /// [`governance_helpers_legacy::start_governance_timeout_task_legacy`]
 /// because it deeply touches the legacy `Supervisor::contexts`
 /// generation tracking; full migration lands when the legacy `contexts`
-/// DashMap is removed.
+/// `DashMap` is removed.
 ///
 /// This wrapper is provided so callers can address the migration via
 /// the non-legacy module surface. It currently delegates to the legacy
@@ -4022,8 +4057,7 @@ pub async fn start_governance_timeout_task(
     context_id: &str,
 ) {
     crate::context::governance_helpers_legacy::start_governance_timeout_task_legacy(
-        supervisor,
-        context_id,
+        supervisor, context_id,
     )
     .await;
 }

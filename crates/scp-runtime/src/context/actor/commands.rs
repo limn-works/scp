@@ -692,8 +692,8 @@ pub enum LifecycleCommand {
     /// `supervisor.actors` and sends one of these commands per actor.
     ///
     /// Mirrors the per-context body of the legacy
-    /// `shutdown_all_contexts_legacy`. Destroys per-context sender keys
-    /// + MLS groups + event logs in that order (zeroize secrets before
+    /// `shutdown_all_contexts_legacy`. Destroys per-context sender keys,
+    /// MLS groups, and event logs in that order (zeroize secrets before
     /// tearing down structure). Does NOT send leave messages or notify
     /// remote peers — used by `scp_ffi_common::BridgeInstance::shutdown`
     /// for process exit / test teardown.
