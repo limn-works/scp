@@ -44,7 +44,7 @@ use scp_protocol::context::governance::{
 };
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::params::ToolRegistration;
-use scp_protocol::context::roles::{self, Capability, CapabilityCeiling};
+use scp_protocol::context::roles::{self, Capability};
 use scp_protocol::context::tools::interface::ToolInterface;
 use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::types::EconomicPolicy;
@@ -68,7 +68,7 @@ use crate::context::state::{
     MAX_COMMIT_AGE_SECS, MAX_COMMIT_RETRIES, MAX_PENDING_COMMITS, MAX_REGISTERED_TOOLS,
     MAX_THRESHOLD_SIGNERS, MAX_TOOL_INTERFACES, MigrationProposedResult, MigrationState,
     PendingCeilingModification, PendingCommit, PendingEconomicPolicyChange, PerContextState,
-    ProposalOutcome, RestoreAccessResult, RevokeResult, SuspendMemberResult, commit_retry_backoff,
+    RestoreAccessResult, RevokeResult, SuspendMemberResult, commit_retry_backoff,
     context_id_to_bytes, push_welcome_event, require_active, require_migrating_out,
     strip_event_payload,
 };
@@ -1416,275 +1416,25 @@ pub async fn vote_on_proposal_inner_legacy(
 // get_proposal_legacy
 // ---------------------------------------------------------------------------
 
-/// Retrieves a governance proposal by ID.
-///
-/// # Errors
-///
-/// - [`ContextError::ContextNotRegistered`] if the context is not registered.
-/// - [`ContextError::GovernanceFailed`] if the proposal is not found.
-#[instrument(skip_all, fields(context_id))]
-pub async fn get_proposal_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-    proposal_id: &ProposalId,
-) -> Result<GovernanceProposal, ContextError> {
-    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
-        .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-    let guard = ctx_arc.lock().await;
-    let ctx = &*guard;
-
-    ctx.governance
-        .engine
-        .get_proposal(proposal_id)
-        .cloned()
-        .ok_or_else(|| {
-            ContextError::GovernanceFailed(format!(
-                "proposal not found: {}",
-                hex::encode(proposal_id)
-            ))
-        })
-}
-
 // ---------------------------------------------------------------------------
 // list_proposals_legacy
 // ---------------------------------------------------------------------------
-
-/// Lists all governance proposals for a context.
-///
-/// Returns both pending and resolved proposals tracked by the governance
-/// engine. Note that engines only retain proposals in memory; for durable
-/// access, proposals should be queried from the event log.
-///
-/// # Errors
-///
-/// - [`ContextError::ContextNotRegistered`] if the context is not registered.
-#[instrument(skip_all, fields(context_id))]
-pub async fn list_proposals_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-) -> Result<Vec<GovernanceProposal>, ContextError> {
-    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
-        .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-    let guard = ctx_arc.lock().await;
-    let ctx = &*guard;
-
-    Ok(ctx.governance.engine.list_proposals())
-}
 
 // ---------------------------------------------------------------------------
 // propose_governance_action_checked_legacy
 // ---------------------------------------------------------------------------
 
-/// Submits a new governance proposal with capability validation.
-///
-/// Validates that the proposer holds the `GovernancePropose` capability
-/// (UCAN) before delegating to the governance engine. The
-/// suspension-aware `member_has_capability` check rejects both members
-/// whose role does not grant the capability AND members whose
-/// capability is currently suspended (e.g., presence-only members per
-/// spec §05-contexts and ADR-038). Returns a [`ProposalOutcome`]
-/// containing the proposal, its status, and an optional execution result.
-///
-/// For `SingleAdmin`, the proposal is simultaneously created and approved
-/// (ADR-031 section 4a). The action is auto-executed and the result is
-/// returned in `ProposalOutcome::execution_result`. For multi-admin
-/// models, the proposal enters `Pending` status and `execution_result`
-/// is `None` until the proposal is approved via votes.
-///
-/// # Errors
-///
-/// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-/// - [`ContextError::ContextNotRegistered`] if the context is not registered.
-/// - [`ContextError::PermissionDenied`] if the proposer lacks
-///   `GovernancePropose` capability.
-#[instrument(skip_all, fields(context_id))]
-pub async fn propose_governance_action_checked_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-    proposer_did: &DID,
-    action: GovernanceAction,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> Result<ProposalOutcome, ContextError> {
-    // GovernancePropose capability check is performed INSIDE
-    // propose_governance_action_inner_legacy (check_propose_capability=true)
-    // under the same lock as the proposal submission. This eliminates
-    // the TOCTOU race where a separate check-then-act pattern allowed
-    // capability revocation between the check and the propose.
-    let (proposal, _events, execution_result) = propose_governance_action_inner_legacy(
-        supervisor,
-        context_id,
-        proposer_did,
-        action,
-        signing_key,
-        true,
-    )
-    .await?;
-
-    let status = proposal.status.clone();
-    Ok(ProposalOutcome {
-        proposal,
-        status,
-        execution_result,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // approve_governance_proposal_legacy
 // ---------------------------------------------------------------------------
-
-/// Casts an approval vote on a pending governance proposal.
-///
-/// Validates that the voter holds the `GovernanceVote` capability (UCAN)
-/// before delegating to the governance engine. Events are recorded in the
-/// context event log and the action is auto-executed if quorum is reached.
-///
-/// # Errors
-///
-/// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-/// - [`ContextError::ContextNotRegistered`] if the context is not registered.
-/// - [`ContextError::PermissionDenied`] if the voter lacks `GovernanceVote`
-///   capability or the engine rejects the vote.
-#[instrument(skip_all, fields(context_id))]
-pub async fn approve_governance_proposal_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-    proposal_id: &ProposalId,
-    voter_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> Result<ProposalStatus, ContextError> {
-    // Capability check is atomic inside vote_on_proposal_inner_legacy (under
-    // the same lock as the vote) — eliminates the TOCTOU window from
-    // the previous separate lock block.
-    let (status, _events) = vote_on_proposal_inner_legacy(
-        supervisor,
-        context_id,
-        proposal_id,
-        voter_did,
-        true,
-        signing_key,
-        true,
-    )
-    .await?;
-
-    Ok(status)
-}
 
 // ---------------------------------------------------------------------------
 // reject_governance_proposal_legacy
 // ---------------------------------------------------------------------------
 
-/// Casts a rejection vote on a pending governance proposal.
-///
-/// Validates that the voter holds the `GovernanceVote` capability (UCAN)
-/// before delegating to the governance engine. Events are recorded in the
-/// context event log.
-///
-/// # Errors
-///
-/// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-/// - [`ContextError::ContextNotRegistered`] if the context is not registered.
-/// - [`ContextError::PermissionDenied`] if the voter lacks `GovernanceVote`
-///   capability or the engine rejects the vote.
-#[instrument(skip_all, fields(context_id))]
-pub async fn reject_governance_proposal_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-    proposal_id: &ProposalId,
-    voter_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> Result<ProposalStatus, ContextError> {
-    // Capability check is atomic inside vote_on_proposal_inner_legacy (under
-    // the same lock as the vote) — eliminates the TOCTOU window from
-    // the previous separate lock block.
-    let (status, _events) = vote_on_proposal_inner_legacy(
-        supervisor,
-        context_id,
-        proposal_id,
-        voter_did,
-        false,
-        signing_key,
-        true,
-    )
-    .await?;
-
-    Ok(status)
-}
-
 // ---------------------------------------------------------------------------
 // withdraw_governance_vote_legacy
 // ---------------------------------------------------------------------------
-
-/// Withdraws a previously cast vote on a pending governance proposal.
-///
-/// The voter must have already voted on this proposal. No signing key
-/// is required -- withdrawal is the voter's privileged operation on
-/// their own vote (per the `GovernanceEngine::withdraw_vote` trait).
-///
-/// # Errors
-///
-/// - [`ContextError::ContextNotActive`] if the context is not `Active`.
-/// - [`ContextError::ContextNotRegistered`] if the context is not registered.
-/// - [`ContextError::PermissionDenied`] if the engine rejects the
-///   withdrawal (proposal not found, voter hasn't voted, etc.).
-#[instrument(skip_all, fields(context_id))]
-pub async fn withdraw_governance_vote_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-    proposal_id: &ProposalId,
-    voter_did: &DID,
-) -> Result<ProposalStatus, ContextError> {
-    let (status, events) = {
-        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
-            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut guard = ctx_arc.lock().await;
-        let ctx = &mut *guard;
-        require_active(&ctx.handle)?;
-
-        let gov_ctx = build_governance_context_legacy(
-            ctx,
-            &**supervisor
-                .clock_ref()
-                .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?,
-        );
-        ctx.governance
-            .engine
-            .withdraw_vote(proposal_id, voter_did, &gov_ctx)
-            .map_err(|e| ContextError::PermissionDenied(e.to_string()))?
-    };
-
-    let context_id_bytes = context_id_to_bytes(context_id);
-    let mut event_count: u64 = 0;
-    for event in &events {
-        supervisor
-            .event_log_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-            .append_context_event(
-                &context_id_bytes,
-                governance_event_label_legacy(event),
-                voter_did.as_ref(),
-            )?;
-        event_count += 1;
-    }
-    if event_count > 0
-        && let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id)
-    {
-        let mut guard = ctx_arc.lock().await;
-        let ctx = &mut *guard;
-        ctx.checkpoint_events_since += event_count;
-    }
-
-    // Persist context state after withdrawal.
-    if manager_methods::has_persistence(supervisor)
-        && let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id)
-    {
-        let guard = ctx_arc.lock().await;
-        let ctx = &*guard;
-        let snapshot = manager_methods::snapshot_context(ctx);
-        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
-    }
-
-    Ok(status)
-}
 
 // ---------------------------------------------------------------------------
 // execute_suspend_member_legacy
@@ -2645,69 +2395,6 @@ pub async fn execute_modify_ceiling_legacy(
 // ---------------------------------------------------------------------------
 // apply_pending_ceiling_modification_legacy
 // ---------------------------------------------------------------------------
-
-/// Applies a pending ceiling modification after the notification period.
-///
-/// Called periodically or on demand to check if the notification period
-/// has expired and apply the pending ceiling change (M7, §5.3.2).
-///
-/// Returns `true` if a pending modification was applied, `false` if there
-/// was no pending modification or the notification period has not yet expired.
-///
-/// # Errors
-///
-/// Returns `ContextError` if the context is not found or is not active.
-#[instrument(skip_all, fields(context_id))]
-pub async fn apply_pending_ceiling_modification_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-    current_timestamp: u64,
-) -> Result<bool, ContextError> {
-    let context_id_bytes = context_id_to_bytes(context_id);
-
-    let (applied, snapshot) = {
-        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
-            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut guard = ctx_arc.lock().await;
-        let ctx = &mut *guard;
-        require_active(&ctx.handle)?;
-
-        let pending = match &ctx.governance.pending_ceiling_modification {
-            Some(p) if p.is_effective(current_timestamp) => p.clone(),
-            _ => return Ok(false),
-        };
-
-        // Apply the pending ceiling.
-        ctx.role_state.ceiling = CapabilityCeiling::new(pending.new_capabilities.iter().cloned());
-        ctx.governance.pending_ceiling_modification = None;
-
-        let snap = if manager_methods::has_persistence(supervisor) {
-            Some(manager_methods::snapshot_context(ctx))
-        } else {
-            None
-        };
-        (true, snap)
-    };
-
-    if applied {
-        if let Some(snapshot) = snapshot {
-            manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
-        }
-        supervisor
-            .event_log_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-            .append_context_event(&context_id_bytes, "CeilingModified", "")?;
-        {
-            if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
-                let mut guard = ctx_arc.lock().await;
-                let ctx = &mut *guard;
-                ctx.checkpoint_events_since += 1;
-            }
-        }
-    }
-
-    Ok(applied)
-}
 
 // ---------------------------------------------------------------------------
 // execute_close_context_legacy
@@ -4154,67 +3841,6 @@ pub async fn execute_set_economic_policy_legacy(
 // apply_pending_economic_policy_change_legacy
 // ---------------------------------------------------------------------------
 
-/// Applies a pending economic policy change if its notification period
-/// has expired (§19.3).
-///
-/// Returns `true` if the pending change was applied, `false` if there
-/// was no pending change or the notification period has not yet expired.
-///
-/// # Errors
-///
-/// Returns `ContextError` if the context is not found or is not active.
-#[instrument(skip_all, fields(context_id))]
-pub async fn apply_pending_economic_policy_change_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-    current_timestamp: u64,
-) -> Result<bool, ContextError> {
-    let context_id_bytes = context_id_to_bytes(context_id);
-
-    let (applied, snapshot) = {
-        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
-            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut guard = ctx_arc.lock().await;
-        let ctx = &mut *guard;
-        require_active(&ctx.handle)?;
-
-        let pending = match &ctx.governance.pending_economic_policy_change {
-            Some(p) if p.is_effective(current_timestamp) => p.clone(),
-            _ => return Ok(false),
-        };
-
-        // Apply the pending policy.
-        ctx.governance.economic_policy = Some(pending.new_policy);
-        ctx.governance.pending_economic_policy_change = None;
-
-        let snap = if manager_methods::has_persistence(supervisor) {
-            Some(manager_methods::snapshot_context(ctx))
-        } else {
-            None
-        };
-        (true, snap)
-    };
-
-    if applied {
-        if let Some(snapshot) = snapshot {
-            manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
-        }
-        supervisor
-            .event_log_ref()
-            .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-            .append_context_event(&context_id_bytes, "EconomicPolicyApplied", "")?;
-        {
-            if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
-                let mut guard = ctx_arc.lock().await;
-                let ctx = &mut *guard;
-                ctx.checkpoint_events_since += 1;
-            }
-        }
-    }
-
-    Ok(applied)
-}
-
 // ---------------------------------------------------------------------------
 // execute_approve_spend_legacy
 // ---------------------------------------------------------------------------
@@ -4737,144 +4363,9 @@ pub async fn execute_cancel_context_migration_legacy(
 // tombstone_migrated_context_legacy
 // ---------------------------------------------------------------------------
 
-/// Tombstones a context after migration grace period expiry (§5.11A.5).
-///
-/// Transitions the context from `MigratingOut` to `Tombstoned`,
-/// cancels timers, drops broadcast state, and emits the tombstone event.
-/// This is called by the application layer when it detects the grace
-/// period has expired.
-///
-/// # Errors
-///
-/// - [`ContextError::ContextNotRegistered`] if the context is not registered.
-/// - [`ContextError::PermissionDenied`] if the context is not migrating
-///   or the grace period has not expired.
-#[instrument(skip_all, fields(context_id))]
-pub async fn tombstone_migrated_context_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-) -> Result<(), ContextError> {
-    let context_id_bytes = context_id_to_bytes(context_id);
-
-    let now = supervisor
-        .clock_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-        .now_secs();
-
-    // State transition and mutation happen under the same lock to prevent
-    // a race where migration_state_legacy is cleared but the transition to
-    // Tombstoned fails.
-    let (destination_id, migration_pid, snapshot) = {
-        let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
-            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let mut guard = ctx_arc.lock().await;
-        let ctx = &mut *guard;
-
-        let state = ctx
-            .handle
-            .try_read_state()
-            .ok_or(ContextError::ContextNotActive)?;
-        if state != ContextState::MigratingOut {
-            return Err(ContextError::PermissionDenied(
-                "context is not in MigratingOut state — cannot tombstone".to_owned(),
-            ));
-        }
-
-        let migration = ctx.migration_state.as_ref().ok_or_else(|| {
-            ContextError::PermissionDenied(
-                "no migration state found despite MigratingOut state".to_owned(),
-            )
-        })?;
-
-        // Check grace period has expired.
-        if now < migration.grace_period_end {
-            return Err(ContextError::PermissionDenied(format!(
-                "migration grace period has not expired (ends at {}, now {})",
-                migration.grace_period_end, now
-            )));
-        }
-
-        let dest_id = migration.destination_context_id.clone();
-        let m_pid = migration.proposal_id;
-
-        // Transition to Tombstoned inside the lock.
-        ctx.handle
-            .transition_to(&ContextState::Tombstoned)
-            .await
-            .map_err(|_| {
-                ContextError::PermissionDenied(
-                    "cannot transition from MigratingOut to Tombstoned".to_owned(),
-                )
-            })?;
-
-        // Emit tombstone event.
-        let tombstone_event = ContextEvent::ContextTombstoned {
-            destination_context_id: dest_id.clone(),
-            migration_proposal_id: m_pid,
-        };
-        ctx.emit_event(tombstone_event, context_id, supervisor.event_tx_ref());
-
-        // Cancel TTL timer and governance timeout task.
-        ctx.ttl.timer.cancel();
-        ctx.governance.timeout_task.cancel();
-        // Drop broadcast context state.
-        ctx.broadcast_context = None;
-        // Clear migration state.
-        ctx.migration_state = None;
-        // M7: Participation decay on tombstone (#1530).
-        ctx.governance.decay_participation();
-
-        let snapshot = if manager_methods::has_persistence(supervisor) {
-            Some(manager_methods::snapshot_context(ctx))
-        } else {
-            None
-        };
-        (dest_id, m_pid, snapshot)
-    };
-
-    if let Some(snapshot) = snapshot {
-        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
-    }
-    supervisor
-        .event_log_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?
-        .append_context_event(
-            &context_id_bytes,
-            &format!(
-                "ContextTombstoned:{}:{}",
-                destination_id,
-                hex::encode(migration_pid)
-            ),
-            "",
-        )?;
-    {
-        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
-            let mut guard = ctx_arc.lock().await;
-            let ctx = &mut *guard;
-            ctx.checkpoint_events_since += 1;
-        }
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // migration_state_legacy
 // ---------------------------------------------------------------------------
-
-/// Returns the migration state for a context, if any.
-///
-/// Returns `None` if the context is not registered or not migrating.
-#[instrument(skip_all, fields(context_id))]
-pub async fn migration_state_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-) -> Option<MigrationState> {
-    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id).ok()?;
-
-    let guard = ctx_arc.lock().await;
-    let ctx = &*guard;
-    ctx.migration_state.clone()
-}
 
 // ---------------------------------------------------------------------------
 // detect_and_handle_conflicts_legacy
@@ -5245,38 +4736,6 @@ pub async fn try_broadcast_commit_or_enqueue_legacy(
 // ---------------------------------------------------------------------------
 // acknowledge_commit_fault_legacy
 // ---------------------------------------------------------------------------
-
-/// Acknowledges a commit broadcast fault and clears the fail-close
-/// marker so the context can accept further mutations (PR #1606 C6).
-///
-/// This is the operator-driven recovery path. It does NOT re-attempt
-/// the failed commit — that data is already lost (or unrecoverable
-/// from the local node's perspective). Callers SHOULD reach out to
-/// remaining members through an out-of-band channel to verify whether
-/// the failed commit's effect (member removal, key rotation) needs to
-/// be re-applied.
-///
-/// # Errors
-///
-/// Returns [`ContextError::ContextNotRegistered`] if the context is not
-/// registered. Returns [`ContextError::InvalidState`] if no fault
-/// marker is set.
-#[instrument(skip_all, fields(context_id))]
-pub async fn acknowledge_commit_fault_legacy(
-    supervisor: &Supervisor,
-    context_id: &str,
-) -> Result<CommitFaultMarker, ContextError> {
-    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
-        .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-    let mut guard = ctx_arc.lock().await;
-    let ctx = &mut *guard;
-    let marker = ctx.commit_fault.take().ok_or_else(|| {
-        ContextError::InvalidState(format!(
-            "context {context_id} has no commit fault to acknowledge"
-        ))
-    })?;
-    Ok(marker)
-}
 
 // ---------------------------------------------------------------------------
 // start_governance_timeout_task_legacy (transitive of lifecycle/governance paths)

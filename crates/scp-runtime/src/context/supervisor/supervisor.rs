@@ -1236,43 +1236,52 @@ impl Supervisor {
     /// [`Supervisor`](crate::context::supervisor::Supervisor)
     /// governance methods it replaces):
     ///
-    /// Step 1 invokes
-    /// [`handlers::governance::dispatch_from_shim`](crate::context::actor::handlers::governance::dispatch_from_shim)
-    /// with a reference to the attached manager. Governance handlers
-    /// never read or mutate `send_tracker` (only the messaging path
-    /// touches it), so no per-context take-and-swap or scratch tracker
-    /// is required — same shape as the lifecycle shim.
-    ///
-    /// Each variant wraps the delegated
-    /// [`Supervisor`](crate::context::supervisor::Supervisor) method
-    /// in `tokio::time::timeout` with a 30s budget, maps a timeout to
-    /// [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout),
-    /// and relays the typed reply on the variant's oneshot.
+    /// Routes every per-context variant through the per-context actor's
+    /// mailbox via [`Self::dispatch_via_mailbox`]. The actor's `run()`
+    /// loop pulls the command, dispatches it through the actor-shape
+    /// `dispatch(state, deps, cmd)` entry point, and writes the typed
+    /// reply on the command's embedded oneshot. The `Placeholder`
+    /// variant (mailbox handshake target — no `context_id`) returns
+    /// [`ContextError::ContextNotRegistered`] from this method when no
+    /// per-context routing target exists; the no-op reply is otherwise
+    /// produced by the actor-side `dispatch_state` arm.
     ///
     /// # Errors
     ///
     /// - [`ContextError::NotInitialized`] if no
     ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet.
-    /// - Any typed error from the delegated manager method is surfaced
-    ///   through the variant's oneshot reply; the method-level result
-    ///   here is `Ok(Outcome { .. })`.
+    /// - [`ContextError::ContextNotRegistered`] if no actor has been
+    ///   spawned for the command's target context_id. Every production
+    ///   context creation path (create / join / restore / import)
+    ///   spawns an actor before the supervisor returns control to FFI,
+    ///   so this error indicates a sequencing or test-setup bug.
+    /// - Any typed error from the delegated handler is surfaced through
+    ///   the variant's oneshot reply; the method-level result here is
+    ///   `Ok(Outcome { .. })`.
     /// - [`ContextError::TransportTimeout`] is surfaced through the
     ///   oneshot reply, not the method result.
     pub async fn dispatch_governance_command(
         &self,
         cmd: GovernanceCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 Phase 2A item 5 — try the actor mailbox first.
-        if let Some(ctx_id) = Self::governance_command_context_id(&cmd)
-            && let Some(actor) = self.lookup(ctx_id)
-        {
-            return Self::dispatch_via_mailbox(&actor, ContextCommand::Governance(cmd)).await;
-        }
-        // Direct-shim fallback. `Box::pin` — see the matching comment
-        // on `handlers::governance::dispatch` for the 16-KB stack-
-        // future rationale.
-        Ok(Box::pin(handlers::governance::dispatch_from_shim(self, cmd)).await)
+        // ADR-049 Phase 2A finalization — mailbox-only. The
+        // handler-side `dispatch_from_shim` and its `_legacy` body have
+        // been deleted; every command's target actor must be spawned
+        // before dispatch reaches this method.
+        let Some(ctx_id) = Self::governance_command_context_id(&cmd) else {
+            return Err(ContextError::ContextNotRegistered(
+                "dispatch_governance_command — variant has no per-context routing target \
+                 (Placeholder / cross-context); mailbox-only after Phase 2A finalization"
+                    .to_owned(),
+            ));
+        };
+        let actor = self.lookup(ctx_id).ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "dispatch_governance_command — no actor registered for context_id `{ctx_id}`"
+            ))
+        })?;
+        Self::dispatch_via_mailbox(&actor, ContextCommand::Governance(cmd)).await
     }
 
     /// Dispatch an [`EconomyCommand`] through the migration shim
