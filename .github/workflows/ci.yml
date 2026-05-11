@@ -625,12 +625,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly
+      # Pin nightly to the last known-good date for the fuzz crate.
+      # Nightlies after 2026-05-03 tightened pub(crate) re-export rules
+      # (E0365) and break openmls 0.8.1's
+      # `pub use crate::ciphersuite::signature::*` at prelude.rs:16.
+      # Unpin once openmls publishes a fix or we upgrade to a version
+      # that re-exports under the new compiler rules.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-03
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "fuzz -> target"
       - name: Check fuzz crate compiles
-        run: cargo +nightly check --manifest-path fuzz/Cargo.toml
+        run: cargo +nightly-2026-05-03 check --manifest-path fuzz/Cargo.toml
 
   # ── Bridge parity (ADR-046) ────────────────────────────────────────
   # Cross-bridge runtime parity harness: drives PyO3 (in-process) and
