@@ -225,10 +225,9 @@ public extension SCP {
         try await inner.applyPendingCeilingModification(handle: handle, currentTimestamp: currentTimestamp)
     }
 
-    /// Forwards to ``Scp/bridgeEvaluateTrust`` on ``inner``.
-    func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadowStatus: String) throws -> UInt8 {
-        try inner.bridgeEvaluateTrust(isBridged: isBridged, isNativeTransport: isNativeTransport, shadowStatus: shadowStatus)
-    }
+    // `bridgeEvaluateTrust` moved to a UniFFI-generated free top-level
+    // function under ADR-048 §1 + §7 Swift bullet. Call it directly:
+    // `try bridgeEvaluateTrust(isBridged:isNativeTransport:shadowStatus:)`.
 
     /// Forwards to ``Scp/broadcastAdmission`` on ``inner``.
     func broadcastAdmission(handle: ContextHandle) async -> String? {
@@ -547,20 +546,13 @@ public extension SCP {
         inner.identityRemoveLinkAttestation(did: did, attestationId: attestationId)
     }
 
-    /// Forwards to ``Scp/identityResolve`` on ``inner``.
-    func identityResolve(did: String) async throws -> DidDocument {
-        try await inner.identityResolve(did: did)
-    }
-
-    /// Forwards to ``Scp/identityVerifyDeviceAttestation`` on ``inner``.
-    func identityVerifyDeviceAttestation(did: String, tokenBase64: String) async throws -> Bool {
-        try await inner.identityVerifyDeviceAttestation(did: did, tokenBase64: tokenBase64)
-    }
-
-    /// Forwards to ``Scp/identityVerifyLinkAttestation`` on ``inner``.
-    func identityVerifyLinkAttestation(attestationJson: String, issuerPublicKeyHex: String) async throws -> Bool {
-        try await inner.identityVerifyLinkAttestation(attestationJson: attestationJson, issuerPublicKeyHex: issuerPublicKeyHex)
-    }
+    // `identityResolve`, `identityVerifyDeviceAttestation`, and
+    // `identityVerifyLinkAttestation` moved to UniFFI-generated free
+    // top-level functions under ADR-048 §1 + §7 Swift bullet. Call them
+    // directly:
+    //   `try await identityResolve(did:)`
+    //   `try await identityVerifyDeviceAttestation(did:tokenBase64:)`
+    //   `try identityVerifyLinkAttestation(attestationJson:issuerPublicKeyHex:)`
 
     /// Forwards to ``Scp/isLocalDid`` on ``inner``.
     func isLocalDid(did: String) async -> Bool {
@@ -760,20 +752,12 @@ public extension SCP {
         try inner.setEconomicPolicy(handle: handle, policyJson: policyJson)
     }
 
-    /// Forwards to ``Scp/syncClassifyOffline`` on ``inner``.
-    func syncClassifyOffline(lastRelayContact: UInt64, now: UInt64) -> String {
-        inner.syncClassifyOffline(lastRelayContact: lastRelayContact, now: now)
-    }
-
-    /// Forwards to ``Scp/syncClassifyOfflineCustom`` on ``inner``.
-    func syncClassifyOfflineCustom(lastRelayContact: UInt64, now: UInt64, tier1ThresholdSecs: UInt64, tier2ThresholdSecs: UInt64) -> String {
-        inner.syncClassifyOfflineCustom(lastRelayContact: lastRelayContact, now: now, tier1ThresholdSecs: tier1ThresholdSecs, tier2ThresholdSecs: tier2ThresholdSecs)
-    }
-
-    /// Forwards to ``Scp/syncGetPolicy`` on ``inner``.
-    func syncGetPolicy() -> SyncPolicyResult {
-        inner.syncGetPolicy()
-    }
+    // `syncClassifyOffline`, `syncClassifyOfflineCustom`, and `syncGetPolicy`
+    // moved to UniFFI-generated free top-level functions under
+    // ADR-048 §1 + §7 Swift bullet. Call them directly:
+    //   `syncClassifyOffline(lastRelayContact:now:)`
+    //   `syncClassifyOfflineCustom(lastRelayContact:now:tier1ThresholdSecs:tier2ThresholdSecs:)`
+    //   `syncGetPolicy()`
 
     /// Forwards to ``Scp/tombstoneMigratedContext`` on ``inner``.
     func tombstoneMigratedContext(handle: ContextHandle) async throws {
@@ -850,15 +834,11 @@ public extension SCP {
         try inner.trustCreateChallenge(targetDid: targetDid)
     }
 
-    /// Forwards to ``Scp/trustQueryScore`` on ``inner``.
-    func trustQueryScore(did: String, contextId: String) throws -> TrustScoreResult {
-        try inner.trustQueryScore(did: did, contextId: contextId)
-    }
-
-    /// Forwards to ``Scp/trustVerifyAttestation`` on ``inner``.
-    func trustVerifyAttestation(attestationJson: String) throws -> AttestationVerificationResult {
-        try inner.trustVerifyAttestation(attestationJson: attestationJson)
-    }
+    // `trustQueryScore` and `trustVerifyAttestation` moved to UniFFI-generated
+    // free top-level functions under ADR-048 §1 + §7 Swift bullet. Call
+    // them directly:
+    //   `try trustQueryScore(did:contextId:)`
+    //   `try trustVerifyAttestation(attestationJson:)`
 
     /// Forwards to ``Scp/trustVerifyResponse`` on ``inner``.
     func trustVerifyResponse(challengeJson: String, responseJson: String) throws -> Bool {
@@ -885,8 +865,8 @@ public extension SCP {
         try await inner.ucanValidate(handle: handle, token: token, capability: capability, presentingAgentDid: presentingAgentDid, proofTokens: proofTokens)
     }
 
-    /// Forwards to ``Scp/verifyParticipationRequirements`` on ``inner``.
-    func verifyParticipationRequirements(profileJson: String, requirementsJson: String) throws -> Bool {
-        try inner.verifyParticipationRequirements(profileJson: profileJson, requirementsJson: requirementsJson)
-    }
+    // `verifyParticipationRequirements` moved to a UniFFI-generated free
+    // top-level function under ADR-048 §1 + §7 Swift bullet. Call it
+    // directly:
+    //   `try verifyParticipationRequirements(profileJson:requirementsJson:)`
 }

@@ -2944,15 +2944,60 @@ async fn identity_create_link_attestation_impl(
     })
 }
 
-/// Removes an identity link attestation by its ID.
+/// Resolves a DID to its document.
 ///
-/// Returns `true` if the attestation was found and removed, `false` if the
-/// DID is not in the identity custody registry or the attestation was not found.
+/// DID resolution uses a fresh `DidDht::new()` and reads zero per-instance
+/// state — it is a pure helper per ADR-048 §1.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn identity_resolve(did: String) -> Result<DIDDocument, ScpError> {
+    runtime()
+        .spawn(async move {
+            let did_method = DidDht::new();
+            let document = did_method.resolve(&did).await.map_err(ScpError::from)?;
+
+            Ok(DIDDocument {
+                id: document.id.clone(),
+                authentication: document.authentication.clone(),
+                assertion_methods: document.assertion_method.clone(),
+                also_known_as: document.also_known_as.clone(),
+                service_endpoints: document
+                    .service
+                    .iter()
+                    .map(|s| s.service_endpoint.clone())
+                    .collect(),
+            })
+        })
+        .await
+        .map_err(|e| ScpError::Identity {
+            msg: format!("tokio task join error during DID resolution: {e}"),
+            code: codes::IDENT_1006.to_owned(),
+        })?
+}
+
+/// Verifies a device attestation token.
+///
+/// Uses `InMemoryDeviceAttestation` to check the token format. ADR-048 §1:
+/// pure helper, no per-instance state.
+///
+/// See §9.3.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn identity_verify_device_attestation(
+    did: String,
+    token_base64: String,
+) -> Result<bool, ScpError> {
+    identity_verify_device_attestation_impl(did, token_base64).await
+}
+
+/// Verifies the Ed25519 signature on an identity link attestation.
+///
+/// Signature verification is a pure function and does not require
+/// in-memory custody — only the issuer's Ed25519 public key. ADR-048 §1:
+/// pure helper, no per-instance state.
 ///
 /// See spec §3.5.1.
-#[cfg(feature = "allow_in_memory_custody")]
-#[allow(clippy::unused_async)]
-async fn identity_verify_link_attestation_impl(
+#[uniffi::export]
+#[allow(clippy::needless_pass_by_value)]
+pub fn identity_verify_link_attestation(
     attestation_json: String,
     issuer_public_key_hex: String,
 ) -> Result<bool, ScpError> {
@@ -4858,6 +4903,43 @@ pub struct ChallengeResult {
     pub challenge_id: String,
     /// The serialized challenge request (JSON).
     pub challenge_json: String,
+}
+
+/// Queries a trust score for the given DID in the given context.
+///
+/// Trust event counts are queried from the module-level helper (a
+/// stateless `(0, 0)` stub today — see
+/// `runtime::query_trust_event_counts`). The composite score is
+/// `min(1.0, log10(1 + message_count + governance_count))`.
+///
+/// ADR-048 §1: pure helper, no per-instance state.
+#[uniffi::export]
+pub fn trust_query_score(did: String, context_id: String) -> Result<TrustScoreResult, ScpError> {
+    if did.is_empty() {
+        return Err(ScpError::Validation {
+            msg: "DID must not be empty".to_owned(),
+            code: codes::VALID_7010.to_owned(),
+        });
+    }
+    if context_id.is_empty() {
+        return Err(ScpError::Validation {
+            msg: "context_id must not be empty".to_owned(),
+            code: codes::VALID_7011.to_owned(),
+        });
+    }
+
+    let (message_count, governance_count) =
+        crate::runtime::query_trust_event_counts(&context_id, &did);
+
+    let total = message_count + governance_count;
+    #[allow(clippy::cast_precision_loss)]
+    let composite_score = (1.0 + total as f64).log10().min(1.0);
+
+    Ok(TrustScoreResult {
+        message_count,
+        governance_count,
+        composite_score,
+    })
 }
 
 /// Verifies an attestation's Ed25519 signature, evidence, expiry, and
@@ -7273,40 +7355,6 @@ impl Scp {
             })?
     }
 
-    /// Per-instance equivalent of the free-function `identity_resolve`.
-    ///
-    /// Resolves a DID to its document. DID resolution itself doesn't touch
-    /// the instance — the method variant exists for API symmetry with the
-    /// other `identity_*` operations.
-    pub async fn identity_resolve(&self, did: String) -> Result<DIDDocument, ScpError> {
-        // Body is identical to the free function — DID resolution uses a
-        // fresh `DidDht::new()` and doesn't touch instance state. Taking
-        // `&self` keeps the method-surface uniform across all
-        // `Scp::identity_*` operations.
-        runtime()
-            .spawn(async move {
-                let did_method = DidDht::new();
-                let document = did_method.resolve(&did).await.map_err(ScpError::from)?;
-
-                Ok(DIDDocument {
-                    id: document.id.clone(),
-                    authentication: document.authentication.clone(),
-                    assertion_methods: document.assertion_method.clone(),
-                    also_known_as: document.also_known_as.clone(),
-                    service_endpoints: document
-                        .service
-                        .iter()
-                        .map(|s| s.service_endpoint.clone())
-                        .collect(),
-                })
-            })
-            .await
-            .map_err(|e| ScpError::Identity {
-                msg: format!("tokio task join error during DID resolution: {e}"),
-                code: codes::IDENT_1006.to_owned(),
-            })?
-    }
-
     /// Per-instance equivalent of the free-function
     /// `identity_attest_device`.
     ///
@@ -7322,22 +7370,6 @@ impl Scp {
             .check_handle(identity.instance_id())
             .map_err(ScpError::from)?;
         identity_attest_device_impl(identity).await
-    }
-
-    /// Per-instance equivalent of the free-function
-    /// `identity_verify_device_attestation`.
-    ///
-    /// Verification itself is a pure function — taking `&self` keeps the
-    /// method surface uniform.
-    pub async fn identity_verify_device_attestation(
-        &self,
-        did: String,
-        token_base64: String,
-    ) -> Result<bool, ScpError> {
-        // Verification is a pure function; `&self` is retained for API
-        // symmetry across the `Scp::identity_*` surface but does not need
-        // to flow into the implementation.
-        identity_verify_device_attestation_impl(did, token_base64).await
     }
 
     /// Per-instance equivalent of the free-function
@@ -7415,24 +7447,6 @@ impl Scp {
         let before = entry.len();
         entry.retain(|a| a.id != attestation_id);
         entry.len() < before
-    }
-
-    /// Per-instance equivalent of the free-function
-    /// `identity_verify_link_attestation`.
-    ///
-    /// Signature verification is a pure function — taking `&self` keeps
-    /// the method surface uniform.
-    ///
-    /// See spec §3.5.1.
-    pub async fn identity_verify_link_attestation(
-        &self,
-        attestation_json: String,
-        issuer_public_key_hex: String,
-    ) -> Result<bool, ScpError> {
-        // Signature verification is a pure function; `&self` is retained
-        // for API symmetry across the `Scp::identity_*` surface but does
-        // not need to flow into the implementation.
-        identity_verify_link_attestation_impl(attestation_json, issuer_public_key_hex).await
     }
 
     // ===== Context lifecycle — per-instance methods on `Scp` =====
@@ -12355,74 +12369,6 @@ impl Scp {
         crate::server::node_start_local_on(&self.inner, data_dir, identity, passphrase).await
     }
 
-    /// Per-instance equivalent of the free-function `trust_query_score`.
-    ///
-    /// Trust event counts are queried from the module-level helper (a
-    /// stateless `(0, 0)` stub today — see `runtime::query_trust_event_counts`).
-    /// The method exists for SDK API uniformity.
-    pub fn trust_query_score(
-        &self,
-        did: String,
-        context_id: String,
-    ) -> Result<TrustScoreResult, ScpError> {
-        if did.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "DID must not be empty".to_owned(),
-                code: codes::VALID_7010.to_owned(),
-            });
-        }
-        if context_id.is_empty() {
-            return Err(ScpError::Validation {
-                msg: "context_id must not be empty".to_owned(),
-                code: codes::VALID_7011.to_owned(),
-            });
-        }
-
-        let (message_count, governance_count) =
-            crate::runtime::query_trust_event_counts(&context_id, &did);
-
-        let total = message_count + governance_count;
-        #[allow(clippy::cast_precision_loss)]
-        let composite_score = (1.0 + total as f64).log10().min(1.0);
-
-        Ok(TrustScoreResult {
-            message_count,
-            governance_count,
-            composite_score,
-        })
-    }
-
-    /// Per-instance equivalent of the free-function [`trust_verify_attestation`].
-    ///
-    /// The underlying attestation verification is stateless — this method
-    /// is a thin delegate for SDK API uniformity.
-    pub fn trust_verify_attestation(
-        &self,
-        attestation_json: String,
-    ) -> Result<AttestationVerificationResult, ScpError> {
-        let attestation: scp_core::trust::Attestation = serde_json::from_str(&attestation_json)
-            .map_err(|e| ScpError::Validation {
-                msg: format!("failed to parse attestation JSON: {e}"),
-                code: codes::VALID_7012.to_owned(),
-            })?;
-
-        let resolver = scp_core::trust::IdentityDidPublicKeyResolver;
-        let clock = scp_identity::cache::SystemClock;
-
-        match scp_core::trust::verify_attestation(&attestation, &resolver, &clock) {
-            Ok(()) => Ok(AttestationVerificationResult {
-                valid: true,
-                chain_depth: 1,
-                error_message: String::new(),
-            }),
-            Err(e) => Ok(AttestationVerificationResult {
-                valid: false,
-                chain_depth: 0,
-                error_message: format!("{e}"),
-            }),
-        }
-    }
-
     /// Per-instance equivalent of the free-function [`trust_create_challenge`].
     ///
     /// Stateless helper — uses an ephemeral signing key per call.
@@ -12515,40 +12461,6 @@ impl Scp {
             None,
         )
         .is_ok())
-    }
-
-    /// Per-instance equivalent of the free-function [`verify_participation_requirements`].
-    ///
-    /// Stateless helper that parses both JSON inputs and delegates to the
-    /// scp-core verifier using the current system time.
-    pub fn verify_participation_requirements(
-        &self,
-        profile_json: String,
-        requirements_json: String,
-    ) -> Result<bool, ScpError> {
-        let profiles: Vec<scp_core::trust::ParticipationProfile> =
-            serde_json::from_str(&profile_json).map_err(|e| ScpError::Validation {
-                msg: format!("failed to parse participation profiles JSON: {e}"),
-                code: codes::VALID_7030.to_owned(),
-            })?;
-
-        let requirements: Vec<scp_core::trust::RequireParticipation> =
-            serde_json::from_str(&requirements_json).map_err(|e| ScpError::Validation {
-                msg: format!("failed to parse participation requirements JSON: {e}"),
-                code: codes::VALID_7031.to_owned(),
-            })?;
-
-        let current_time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs());
-
-        scp_core::trust::verify_participation_requirements(current_time, &requirements, &profiles)
-            .map_err(|e| ScpError::Validation {
-                msg: format!("participation admission verification failed: {e}"),
-                code: codes::VALID_7032.to_owned(),
-            })?;
-
-        Ok(true)
     }
 
     /// Per-instance equivalent of the free-function `aggregate_trust_input`.
@@ -12688,127 +12600,6 @@ impl Scp {
                     code: codes::VALID_7052.to_owned(),
                 })
             }
-        }
-    }
-
-    /// Per-instance equivalent of the free-function [`bridge_evaluate_trust`].
-    ///
-    /// Pure function — no per-instance state required. Exists for SDK
-    /// API uniformity.
-    pub fn bridge_evaluate_trust(
-        &self,
-        is_bridged: bool,
-        is_native_transport: bool,
-        shadow_status: String,
-    ) -> Result<u8, ScpError> {
-        if !is_bridged {
-            let level =
-                scp_core::bridge::provenance::evaluate_trust_level(None, is_native_transport);
-            return Ok(level as u8);
-        }
-
-        let status = match shadow_status.as_str() {
-            "shadow" => scp_core::bridge::ShadowProvenanceStatus::Shadow,
-            "claimed" => scp_core::bridge::ShadowProvenanceStatus::Claimed,
-            other => {
-                return Err(ScpError::Validation {
-                    msg: format!("invalid shadow_status '{other}': expected 'shadow' or 'claimed'"),
-                    code: codes::VALID_7051.to_owned(),
-                });
-            }
-        };
-
-        let base = scp_core::provenance::DataProvenance {
-            source_context: String::new(),
-            source_type: scp_core::provenance::SourceType::Persistent,
-            counterparties: vec![],
-            purpose: None,
-            discovery_method: scp_core::provenance::DiscoveryMethod::OutOfBand,
-            age: std::time::Duration::from_secs(0),
-            memory_scope: scp_core::context::MemoryScope::Full,
-            chain_depth: 0,
-            chain_path: None,
-            payment_amount: None,
-            payment_adapter: None,
-            payment_receipt_id: None,
-        };
-
-        let connector = scp_core::bridge::BridgeConnector {
-            bridge_id: String::new(),
-            operator_did: "did:key:unused".into(),
-            platform: String::new(),
-            mode: scp_core::bridge::BridgeMode::Relay,
-            status: scp_core::bridge::BridgeStatus::Active,
-            registration_context: String::new(),
-            registered_at: 0,
-        };
-
-        let shadow = scp_core::bridge::ShadowIdentity {
-            shadow_id: String::new(),
-            platform_handle: String::new(),
-            bridge_id: String::new(),
-            attributed_role: "observer".to_string(),
-            provenance_status: status,
-            created_at: 0,
-        };
-
-        let bp = scp_core::bridge::provenance::mark_bridge_provenance(base, &connector, &shadow);
-        let level =
-            scp_core::bridge::provenance::evaluate_trust_level(Some(&bp), is_native_transport);
-        Ok(level as u8)
-    }
-
-    /// Per-instance equivalent of the free-function [`sync_classify_offline`].
-    ///
-    /// Pure function — no per-instance state required.
-    #[must_use]
-    pub fn sync_classify_offline(&self, last_relay_contact: u64, now: u64) -> String {
-        match scp_core::sync::classify_offline_duration(last_relay_contact, now) {
-            scp_core::sync::OfflineTier::Short => "short".to_string(),
-            scp_core::sync::OfflineTier::Extended => "extended".to_string(),
-            scp_core::sync::OfflineTier::Long => "long".to_string(),
-        }
-    }
-
-    /// Per-instance equivalent of the free-function [`sync_classify_offline_custom`].
-    ///
-    /// Pure function — no per-instance state required.
-    #[must_use]
-    pub fn sync_classify_offline_custom(
-        &self,
-        last_relay_contact: u64,
-        now: u64,
-        tier_1_threshold_secs: u64,
-        tier_2_threshold_secs: u64,
-    ) -> String {
-        let policy = scp_core::sync::SyncPolicy::default()
-            .with_tier_1_threshold_secs(tier_1_threshold_secs)
-            .with_tier_2_threshold_secs(tier_2_threshold_secs);
-
-        match policy.classify_offline_duration(last_relay_contact, now) {
-            scp_core::sync::OfflineTier::Short => "short".to_string(),
-            scp_core::sync::OfflineTier::Extended => "extended".to_string(),
-            scp_core::sync::OfflineTier::Long => "long".to_string(),
-        }
-    }
-
-    /// Per-instance equivalent of the free-function [`sync_get_policy`].
-    ///
-    /// Pure function — returns the default sync policy parameters.
-    #[must_use]
-    pub fn sync_get_policy(&self) -> SyncPolicyResult {
-        let policy = scp_core::sync::SyncPolicy::default();
-
-        #[allow(clippy::cast_possible_truncation)]
-        SyncPolicyResult {
-            tier_1_threshold_secs: policy.tier_1_threshold_secs,
-            tier_2_threshold_secs: policy.tier_2_threshold_secs,
-            gap_timeout_secs: policy.gap_timeout.as_secs(),
-            reorder_buffer_capacity: policy.reorder_buffer_capacity as u32,
-            max_sequential_commits: policy.max_sequential_commits,
-            commit_process_timeout_secs: policy.commit_process_timeout.as_secs(),
-            sender_key_timeout_secs: policy.sender_key_timeout.as_secs(),
-            reconnection_dedup_window_secs: policy.reconnection_dedup_window.as_secs(),
         }
     }
 

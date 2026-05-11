@@ -2052,14 +2052,6 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMode: String, contextId: String) throws  -> ShadowIdentityResult
     
     /**
-     * Per-instance equivalent of the free-function [`bridge_evaluate_trust`].
-     *
-     * Pure function — no per-instance state required. Exists for SDK
-     * API uniformity.
-     */
-    func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadowStatus: String) throws  -> UInt8
-    
-    /**
      * Per-instance equivalent of the free-function `broadcast_admission`.
      *
      * Routes through `&*self.inner`. Returns `None` when the handle's
@@ -2577,35 +2569,6 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func identityRemoveLinkAttestation(did: String, attestationId: String)  -> Bool
     
     /**
-     * Per-instance equivalent of the free-function `identity_resolve`.
-     *
-     * Resolves a DID to its document. DID resolution itself doesn't touch
-     * the instance — the method variant exists for API symmetry with the
-     * other `identity_*` operations.
-     */
-    func identityResolve(did: String) async throws  -> DidDocument
-    
-    /**
-     * Per-instance equivalent of the free-function
-     * `identity_verify_device_attestation`.
-     *
-     * Verification itself is a pure function — taking `&self` keeps the
-     * method surface uniform.
-     */
-    func identityVerifyDeviceAttestation(did: String, tokenBase64: String) async throws  -> Bool
-    
-    /**
-     * Per-instance equivalent of the free-function
-     * `identity_verify_link_attestation`.
-     *
-     * Signature verification is a pure function — taking `&self` keeps
-     * the method surface uniform.
-     *
-     * See spec §3.5.1.
-     */
-    func identityVerifyLinkAttestation(attestationJson: String, issuerPublicKeyHex: String) async throws  -> Bool
-    
-    /**
      * Returns the monotonic identifier for this instance.
      */
     func instanceId()  -> UInt64
@@ -2908,27 +2871,6 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func suspend() throws 
     
     /**
-     * Per-instance equivalent of the free-function [`sync_classify_offline`].
-     *
-     * Pure function — no per-instance state required.
-     */
-    func syncClassifyOffline(lastRelayContact: UInt64, now: UInt64)  -> String
-    
-    /**
-     * Per-instance equivalent of the free-function [`sync_classify_offline_custom`].
-     *
-     * Pure function — no per-instance state required.
-     */
-    func syncClassifyOfflineCustom(lastRelayContact: UInt64, now: UInt64, tier1ThresholdSecs: UInt64, tier2ThresholdSecs: UInt64)  -> String
-    
-    /**
-     * Per-instance equivalent of the free-function [`sync_get_policy`].
-     *
-     * Pure function — returns the default sync policy parameters.
-     */
-    func syncGetPolicy()  -> SyncPolicyResult
-    
-    /**
      * Per-instance equivalent of the free-function
      * `tombstone_migrated_context`.
      *
@@ -3079,23 +3021,6 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func trustCreateChallenge(targetDid: String) throws  -> ChallengeResult
     
     /**
-     * Per-instance equivalent of the free-function `trust_query_score`.
-     *
-     * Trust event counts are queried from the module-level helper (a
-     * stateless `(0, 0)` stub today — see `runtime::query_trust_event_counts`).
-     * The method exists for SDK API uniformity.
-     */
-    func trustQueryScore(did: String, contextId: String) throws  -> TrustScoreResult
-    
-    /**
-     * Per-instance equivalent of the free-function [`trust_verify_attestation`].
-     *
-     * The underlying attestation verification is stateless — this method
-     * is a thin delegate for SDK API uniformity.
-     */
-    func trustVerifyAttestation(attestationJson: String) throws  -> AttestationVerificationResult
-    
-    /**
      * Per-instance equivalent of the free-function [`trust_verify_response`].
      *
      * Stateless helper — uses an ephemeral verification signer per call.
@@ -3133,14 +3058,6 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * `instance_id` does not match this `SCP`'s.
      */
     func ucanValidate(handle: ContextHandle, token: String, capability: String, presentingAgentDid: String?, proofTokens: [String]?) async throws 
-    
-    /**
-     * Per-instance equivalent of the free-function [`verify_participation_requirements`].
-     *
-     * Stateless helper that parses both JSON inputs and delegates to the
-     * scp-core verifier using the current system time.
-     */
-    func verifyParticipationRequirements(profileJson: String, requirementsJson: String) throws  -> Bool
     
 }
 /**
@@ -3444,22 +3361,6 @@ open func bridgeCreateShadow(bridgeId: String, platformHandle: String, bridgeMod
         FfiConverterString.lower(platformHandle),
         FfiConverterString.lower(bridgeMode),
         FfiConverterString.lower(contextId),$0
-    )
-})
-}
-    
-    /**
-     * Per-instance equivalent of the free-function [`bridge_evaluate_trust`].
-     *
-     * Pure function — no per-instance state required. Exists for SDK
-     * API uniformity.
-     */
-open func bridgeEvaluateTrust(isBridged: Bool, isNativeTransport: Bool, shadowStatus: String)throws  -> UInt8  {
-    return try  FfiConverterUInt8.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_bridge_evaluate_trust(self.uniffiClonePointer(),
-        FfiConverterBool.lower(isBridged),
-        FfiConverterBool.lower(isNativeTransport),
-        FfiConverterString.lower(shadowStatus),$0
     )
 })
 }
@@ -4817,80 +4718,6 @@ open func identityRemoveLinkAttestation(did: String, attestationId: String) -> B
 }
     
     /**
-     * Per-instance equivalent of the free-function `identity_resolve`.
-     *
-     * Resolves a DID to its document. DID resolution itself doesn't touch
-     * the instance — the method variant exists for API symmetry with the
-     * other `identity_*` operations.
-     */
-open func identityResolve(did: String)async throws  -> DidDocument  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_identity_resolve(
-                    self.uniffiClonePointer(),
-                    FfiConverterString.lower(did)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
-            liftFunc: FfiConverterTypeDIDDocument_lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function
-     * `identity_verify_device_attestation`.
-     *
-     * Verification itself is a pure function — taking `&self` keeps the
-     * method surface uniform.
-     */
-open func identityVerifyDeviceAttestation(did: String, tokenBase64: String)async throws  -> Bool  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_identity_verify_device_attestation(
-                    self.uniffiClonePointer(),
-                    FfiConverterString.lower(did),FfiConverterString.lower(tokenBase64)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
-            liftFunc: FfiConverterBool.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function
-     * `identity_verify_link_attestation`.
-     *
-     * Signature verification is a pure function — taking `&self` keeps
-     * the method surface uniform.
-     *
-     * See spec §3.5.1.
-     */
-open func identityVerifyLinkAttestation(attestationJson: String, issuerPublicKeyHex: String)async throws  -> Bool  {
-    return
-        try  await uniffiRustCallAsync(
-            rustFutureFunc: {
-                uniffi_scp_ffi_uniffi_fn_method_scp_identity_verify_link_attestation(
-                    self.uniffiClonePointer(),
-                    FfiConverterString.lower(attestationJson),FfiConverterString.lower(issuerPublicKeyHex)
-                )
-            },
-            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
-            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
-            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
-            liftFunc: FfiConverterBool.lift,
-            errorHandler: FfiConverterTypeScpError_lift
-        )
-}
-    
-    /**
      * Returns the monotonic identifier for this instance.
      */
 open func instanceId() -> UInt64  {
@@ -5606,48 +5433,6 @@ open func suspend()throws   {try rustCallWithError(FfiConverterTypeScpError_lift
 }
     
     /**
-     * Per-instance equivalent of the free-function [`sync_classify_offline`].
-     *
-     * Pure function — no per-instance state required.
-     */
-open func syncClassifyOffline(lastRelayContact: UInt64, now: UInt64) -> String  {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_method_scp_sync_classify_offline(self.uniffiClonePointer(),
-        FfiConverterUInt64.lower(lastRelayContact),
-        FfiConverterUInt64.lower(now),$0
-    )
-})
-}
-    
-    /**
-     * Per-instance equivalent of the free-function [`sync_classify_offline_custom`].
-     *
-     * Pure function — no per-instance state required.
-     */
-open func syncClassifyOfflineCustom(lastRelayContact: UInt64, now: UInt64, tier1ThresholdSecs: UInt64, tier2ThresholdSecs: UInt64) -> String  {
-    return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_method_scp_sync_classify_offline_custom(self.uniffiClonePointer(),
-        FfiConverterUInt64.lower(lastRelayContact),
-        FfiConverterUInt64.lower(now),
-        FfiConverterUInt64.lower(tier1ThresholdSecs),
-        FfiConverterUInt64.lower(tier2ThresholdSecs),$0
-    )
-})
-}
-    
-    /**
-     * Per-instance equivalent of the free-function [`sync_get_policy`].
-     *
-     * Pure function — returns the default sync policy parameters.
-     */
-open func syncGetPolicy() -> SyncPolicyResult  {
-    return try!  FfiConverterTypeSyncPolicyResult_lift(try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_method_scp_sync_get_policy(self.uniffiClonePointer(),$0
-    )
-})
-}
-    
-    /**
      * Per-instance equivalent of the free-function
      * `tombstone_migrated_context`.
      *
@@ -6029,36 +5814,6 @@ open func trustCreateChallenge(targetDid: String)throws  -> ChallengeResult  {
 }
     
     /**
-     * Per-instance equivalent of the free-function `trust_query_score`.
-     *
-     * Trust event counts are queried from the module-level helper (a
-     * stateless `(0, 0)` stub today — see `runtime::query_trust_event_counts`).
-     * The method exists for SDK API uniformity.
-     */
-open func trustQueryScore(did: String, contextId: String)throws  -> TrustScoreResult  {
-    return try  FfiConverterTypeTrustScoreResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_trust_query_score(self.uniffiClonePointer(),
-        FfiConverterString.lower(did),
-        FfiConverterString.lower(contextId),$0
-    )
-})
-}
-    
-    /**
-     * Per-instance equivalent of the free-function [`trust_verify_attestation`].
-     *
-     * The underlying attestation verification is stateless — this method
-     * is a thin delegate for SDK API uniformity.
-     */
-open func trustVerifyAttestation(attestationJson: String)throws  -> AttestationVerificationResult  {
-    return try  FfiConverterTypeAttestationVerificationResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_trust_verify_attestation(self.uniffiClonePointer(),
-        FfiConverterString.lower(attestationJson),$0
-    )
-})
-}
-    
-    /**
      * Per-instance equivalent of the free-function [`trust_verify_response`].
      *
      * Stateless helper — uses an ephemeral verification signer per call.
@@ -6162,21 +5917,6 @@ open func ucanValidate(handle: ContextHandle, token: String, capability: String,
             liftFunc: { $0 },
             errorHandler: FfiConverterTypeScpError_lift
         )
-}
-    
-    /**
-     * Per-instance equivalent of the free-function [`verify_participation_requirements`].
-     *
-     * Stateless helper that parses both JSON inputs and delegates to the
-     * scp-core verifier using the current system time.
-     */
-open func verifyParticipationRequirements(profileJson: String, requirementsJson: String)throws  -> Bool  {
-    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
-    uniffi_scp_ffi_uniffi_fn_method_scp_verify_participation_requirements(self.uniffiClonePointer(),
-        FfiConverterString.lower(profileJson),
-        FfiConverterString.lower(requirementsJson),$0
-    )
-})
 }
     
 
@@ -13796,6 +13536,65 @@ public func evaluateProvenanceQuality(sourceContext: String?, sourceType: String
 })
 }
 /**
+ * Resolves a DID to its document.
+ *
+ * DID resolution uses a fresh `DidDht::new()` and reads zero per-instance
+ * state — it is a pure helper per ADR-048 §1.
+ */
+public func identityResolve(did: String)async throws  -> DidDocument  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_identity_resolve(FfiConverterString.lower(did)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterTypeDIDDocument_lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Verifies a device attestation token.
+ *
+ * Uses `InMemoryDeviceAttestation` to check the token format. ADR-048 §1:
+ * pure helper, no per-instance state.
+ *
+ * See §9.3.
+ */
+public func identityVerifyDeviceAttestation(did: String, tokenBase64: String)async throws  -> Bool  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_scp_ffi_uniffi_fn_func_identity_verify_device_attestation(FfiConverterString.lower(did),FfiConverterString.lower(tokenBase64)
+                )
+            },
+            pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_i8,
+            completeFunc: ffi_scp_ffi_uniffi_rust_future_complete_i8,
+            freeFunc: ffi_scp_ffi_uniffi_rust_future_free_i8,
+            liftFunc: FfiConverterBool.lift,
+            errorHandler: FfiConverterTypeScpError_lift
+        )
+}
+/**
+ * Verifies the Ed25519 signature on an identity link attestation.
+ *
+ * Signature verification is a pure function and does not require
+ * in-memory custody — only the issuer's Ed25519 public key. ADR-048 §1:
+ * pure helper, no per-instance state.
+ *
+ * See spec §3.5.1.
+ */
+public func identityVerifyLinkAttestation(attestationJson: String, issuerPublicKeyHex: String)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_identity_verify_link_attestation(
+        FfiConverterString.lower(attestationJson),
+        FfiConverterString.lower(issuerPublicKeyHex),$0
+    )
+})
+}
+/**
  * Activates a media session (transitions from Initiating to Active).
  *
  * Takes a JSON string representing the session and returns the updated session.
@@ -14168,6 +13967,24 @@ public func trustCreateChallenge(targetDid: String)throws  -> ChallengeResult  {
 })
 }
 /**
+ * Queries a trust score for the given DID in the given context.
+ *
+ * Trust event counts are queried from the module-level helper (a
+ * stateless `(0, 0)` stub today — see
+ * `runtime::query_trust_event_counts`). The composite score is
+ * `min(1.0, log10(1 + message_count + governance_count))`.
+ *
+ * ADR-048 §1: pure helper, no per-instance state.
+ */
+public func trustQueryScore(did: String, contextId: String)throws  -> TrustScoreResult  {
+    return try  FfiConverterTypeTrustScoreResult_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
+    uniffi_scp_ffi_uniffi_fn_func_trust_query_score(
+        FfiConverterString.lower(did),
+        FfiConverterString.lower(contextId),$0
+    )
+})
+}
+/**
  * Verifies an attestation's Ed25519 signature, evidence, expiry, and
  * revocation status.
  *
@@ -14293,6 +14110,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_evaluate_provenance_quality() != 60373) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_resolve() != 39653) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_verify_device_attestation() != 44196) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_identity_verify_link_attestation() != 14133) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_scp_ffi_uniffi_checksum_func_media_activate_session() != 44695) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14366,6 +14192,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_create_challenge() != 37813) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_func_trust_query_score() != 58685) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_trust_verify_attestation() != 50772) {
@@ -14501,9 +14330,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_create_shadow() != 8590) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_bridge_evaluate_trust() != 11772) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_broadcast_admission() != 47745) {
@@ -14692,15 +14518,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_link_attestation() != 51771) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_resolve() != 31124) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_verify_device_attestation() != 26963) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_verify_link_attestation() != 21755) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_instance_id() != 43175) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14818,15 +14635,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_suspend() != 57088) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_sync_classify_offline() != 16755) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_sync_classify_offline_custom() != 29264) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_sync_get_policy() != 7910) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_tombstone_migrated_context() != 15228) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14875,12 +14683,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_create_challenge() != 25481) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_query_score() != 20746) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_attestation() != 36949) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_trust_verify_response() != 16753) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14894,9 +14696,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_ucan_validate() != 38327) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_verify_participation_requirements() != 3735) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_adapter_count() != 31835) {
