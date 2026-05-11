@@ -2,16 +2,16 @@
 //! [`TtlCloseCommand`](crate::context::actor::commands::TtlCloseCommand)
 //! and spec §5.8.
 //!
-//! # Phase 2A.6 — actor-shape dispatch
+//! # Phase 2A — actor-shape dispatch
 //!
-//! The handler's primary entry point [`dispatch`] takes
+//! The handler's entry point [`dispatch`] takes
 //! `(&mut PerContextState, &ActorDeps, TtlCloseCommand)` and routes
 //! every variant through [`crate::context::ttl_close_helpers`] (the
-//! actor-shape TTL-domain helpers). The shim entry point
-//! [`dispatch_from_shim`] remains during Phase 2A and routes through
-//! [`crate::context::ttl_close_helpers_legacy`] for callers that arrive
-//! via the supervisor mailbox-fallback path before a per-context actor
-//! exists.
+//! actor-shape TTL-domain helpers). Phase 2A finalization deleted the
+//! supervisor-receiver shim — every command's target actor must be
+//! spawned before
+//! [`Supervisor::dispatch_ttl_close_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_ttl_close_command)
+//! routes it here.
 //!
 //! # Timer ownership
 //!
@@ -22,11 +22,11 @@
 //! [`crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy`]
 //! through
 //! [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-//! during Phase 2A.6 — see the
-//! [`crate::context::ttl_close_helpers`] module-level doc for the full
-//! rationale (Option B of the Phase 2A.6 plan). Phase 2A.9 (lifecycle
-//! migration) revisits timer ownership so the TTL timer becomes a
-//! `select!` arm in [`ContextActor::run`](crate::context::actor::ContextActor).
+//! — see the [`crate::context::ttl_close_helpers`] module-level doc for
+//! the full rationale (Option B of the Phase 2A.6 plan). Phase 2A.9
+//! (lifecycle migration) revisits timer ownership so the TTL timer
+//! becomes a `select!` arm in
+//! [`ContextActor::run`](crate::context::actor::ContextActor).
 //!
 //! # Transport-timeout budget
 //!
@@ -46,7 +46,6 @@ use crate::context::actor::commands::TtlCloseCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
 use crate::context::actor::state::PerContextState;
-use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for TTL-close handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -97,46 +96,6 @@ pub async fn dispatch(
         TtlCloseCommand::FinalizeClose { payload, reply } => {
             let p = *payload;
             handle_finalize_close(state, deps, p.context_id, p.params, reply).await
-        }
-    }
-}
-
-/// Shim-callable dispatch. Used by
-/// [`Supervisor::dispatch_ttl_close_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_ttl_close_command)
-/// during the Phase 2A migration window when no per-context actor
-/// exists for the target context — every variant routes through
-/// [`crate::context::ttl_close_helpers_legacy`]. Removed in Phase 2A
-/// finalization with the rest of the supervisor shim.
-pub(crate) async fn dispatch_from_shim(
-    supervisor: &Supervisor,
-    cmd: TtlCloseCommand,
-) -> Outcome<()> {
-    match cmd {
-        TtlCloseCommand::Placeholder { reply } => reply_not_implemented(reply),
-        TtlCloseCommand::StartTtlTimer { payload, reply } => {
-            let p = *payload;
-            shim_handle_start_ttl_timer(supervisor, p.context_id, p.params, p.duration, reply).await
-        }
-        TtlCloseCommand::ExtendTtl {
-            context_id,
-            member_did,
-            proposed_duration,
-            reply,
-        } => {
-            shim_handle_extend_ttl(supervisor, context_id, member_did, proposed_duration, reply)
-                .await
-        }
-        TtlCloseCommand::ResetTtlTimer { payload, reply } => {
-            let p = *payload;
-            shim_handle_reset_ttl_timer(supervisor, p.context_id, p.params, p.duration, reply).await
-        }
-        TtlCloseCommand::ExecuteTtlClose { payload, reply } => {
-            let p = *payload;
-            shim_handle_execute_ttl_close(supervisor, p.context_id, p.params, reply).await
-        }
-        TtlCloseCommand::FinalizeClose { payload, reply } => {
-            let p = *payload;
-            shim_handle_finalize_close(supervisor, p.context_id, p.params, reply).await
         }
     }
 }
@@ -336,198 +295,6 @@ async fn handle_finalize_close(
     }
 
     let finalize_fut = crate::context::ttl_close_helpers::finalize_close(state, deps, &handle);
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, finalize_fut).await {
-        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "finalize_close exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-// ---------------------------------------------------------------------------
-// Shim-fallback handlers — route through `ttl_close_helpers_legacy`
-// (Supervisor lock-and-call). Used when no per-context actor exists.
-// ---------------------------------------------------------------------------
-
-async fn shim_handle_start_ttl_timer(
-    supervisor: &Supervisor,
-    context_id: String,
-    params: scp_protocol::context::params::ContextParams,
-    duration: std::time::Duration,
-    reply: oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
-    let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle
-        .transition_to(&scp_protocol::context::ContextState::Active)
-        .await
-    {
-        let sketch = outcome_error_sketch(&e);
-        let _ = reply.send(Err(e));
-        return Outcome::err(sketch);
-    }
-
-    let spawn_fut = crate::context::ttl_close_helpers_legacy::start_ttl_timer(
-        supervisor,
-        &context_id,
-        duration,
-        handle,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, spawn_fut).await {
-        Ok(()) => (Outcome::ok_mutated(()), Ok(())),
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "start_ttl_timer exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_extend_ttl(
-    supervisor: &Supervisor,
-    context_id: String,
-    member_did: scp_identity::DID,
-    proposed_duration: std::time::Duration,
-    reply: oneshot::Sender<Result<bool, ContextError>>,
-) -> Outcome<()> {
-    let extend_fut = crate::context::ttl_close_helpers_legacy::propose_ttl_extension(
-        supervisor,
-        &context_id,
-        &member_did,
-        proposed_duration,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, extend_fut).await {
-        Ok(Ok(unanimous)) => (Outcome::ok_mutated(()), Ok(unanimous)),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "propose_ttl_extension exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_reset_ttl_timer(
-    supervisor: &Supervisor,
-    context_id: String,
-    params: scp_protocol::context::params::ContextParams,
-    new_duration: std::time::Duration,
-    reply: oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
-    let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle
-        .transition_to(&scp_protocol::context::ContextState::Active)
-        .await
-    {
-        let sketch = outcome_error_sketch(&e);
-        let _ = reply.send(Err(e));
-        return Outcome::err(sketch);
-    }
-
-    let reset_fut = crate::context::ttl_close_helpers_legacy::reset_ttl_timer(
-        supervisor,
-        &context_id,
-        new_duration,
-        handle,
-    );
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reset_fut).await {
-        Ok(()) => (Outcome::ok_mutated(()), Ok(())),
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "reset_ttl_timer exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_execute_ttl_close(
-    supervisor: &Supervisor,
-    context_id: String,
-    params: scp_protocol::context::params::ContextParams,
-    reply: oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
-    let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle
-        .transition_to(&scp_protocol::context::ContextState::Active)
-        .await
-    {
-        let sketch = outcome_error_sketch(&e);
-        let _ = reply.send(Err(e));
-        return Outcome::err(sketch);
-    }
-
-    let expiry_fut =
-        crate::context::ttl_close_helpers_legacy::handle_ttl_expiry(supervisor, &handle);
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, expiry_fut).await {
-        Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "handle_ttl_expiry exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_finalize_close(
-    supervisor: &Supervisor,
-    context_id: String,
-    params: scp_protocol::context::params::ContextParams,
-    reply: oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
-    let handle = ContextHandle::new(context_id.clone(), params);
-    if let Err(e) = handle
-        .transition_to(&scp_protocol::context::ContextState::Closing)
-        .await
-    {
-        let sketch = outcome_error_sketch(&e);
-        let _ = reply.send(Err(e));
-        return Outcome::err(sketch);
-    }
-
-    let finalize_fut =
-        crate::context::ttl_close_helpers_legacy::finalize_close(supervisor, &handle);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, finalize_fut).await {
         Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),

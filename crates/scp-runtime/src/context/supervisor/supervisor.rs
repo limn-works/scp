@@ -1105,14 +1105,23 @@ impl Supervisor {
         &self,
         cmd: TtlCloseCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 Phase 2A item 5 — try the actor mailbox first.
-        if let Some(ctx_id) = Self::ttl_close_command_context_id(&cmd)
-            && let Some(actor) = self.lookup(ctx_id)
-        {
-            return Self::dispatch_via_mailbox(&actor, ContextCommand::TtlClose(cmd)).await;
-        }
-        // Direct-shim fallback.
-        Ok(handlers::ttl_close::dispatch_from_shim(self, cmd).await)
+        // ADR-049 Phase 2A finalization — mailbox-only. The
+        // handler-side `dispatch_from_shim` and the dead `_legacy`
+        // bodies have been deleted; every command's target actor must
+        // be spawned before dispatch reaches this method.
+        let Some(ctx_id) = Self::ttl_close_command_context_id(&cmd) else {
+            return Err(ContextError::ContextNotRegistered(
+                "dispatch_ttl_close_command — variant has no per-context routing target \
+                 (Placeholder); mailbox-only after Phase 2A finalization"
+                    .to_owned(),
+            ));
+        };
+        let actor = self.lookup(ctx_id).ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "dispatch_ttl_close_command — no actor registered for context_id `{ctx_id}`"
+            ))
+        })?;
+        Self::dispatch_via_mailbox(&actor, ContextCommand::TtlClose(cmd)).await
     }
 
     /// Dispatch a [`GovernanceCommand`] through the migration shim

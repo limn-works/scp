@@ -7,310 +7,55 @@
 // byte-identical to the legacy behavior.
 #![allow(clippy::significant_drop_tightening)]
 
-//! Legacy TTL-close helpers
-//! (ADR-049 Phase 2A.6, TTL-domain shim-fallback path).
+//! Legacy TTL-close timer-spawn entry point
+//! (ADR-049 Phase 2A.6, post-finalization residual).
 //!
 //! # Purpose
 //!
-//! This module preserves the pre-migration `&Supervisor` lock-and-call
-//! TTL-close helper bodies for the Phase 2A shim fallback. The live
-//! actor path now calls [`crate::context::ttl_close_helpers`], which
-//! owns per-context state directly; the shim path keeps these legacy
-//! twins until Phase 2A finalization removes all `*_helpers_legacy.rs`
-//! modules.
+//! Phase 2A finalization eliminated the supervisor-receiver shim for
+//! TTL-close commands — every [`TtlCloseCommand`] now routes through the
+//! per-context actor mailbox via
+//! [`Supervisor::dispatch_ttl_close_command`].
+//! The bulk of the legacy `&Supervisor` lock-and-call TTL helpers
+//! (`finalize_close`, `handle_ttl_expiry`, `propose_ttl_extension`,
+//! `reset_ttl_timer`, `start_ttl_timer`) were deleted with that shim.
 //!
-//! # Behavior preservation
+//! [`spawn_ttl_timer_legacy`] survives because non-domain callers
+//! (lifecycle restore / finalize-create / import paths in
+//! `lifecycle_helpers`, the governance TTL-extension proposal handler in
+//! `governance_helpers`, and the actor-shape
+//! `ttl_close_helpers::{start_ttl_timer,reset_ttl_timer}` escape) still
+//! need a single shared spawn-timer entry point that owns the supervisor's
+//! `task_set` and contexts map. Phase 2A.9 (lifecycle migration) revisits
+//! timer ownership end-to-end and removes this last residual.
 //!
-//! Every hoisted free function is **behavior-preserving by construction**.
-//! The bodies are verbatim copies of the legacy `lifecycle_helpers`
-//! TTL-close functions (commits 12c.2 and earlier); the only delta vs
-//! the original is the [`spawn_ttl_timer_legacy`] rename to disambiguate
-//! the legacy entry point from the actor-shape
-//! [`crate::context::ttl_close_helpers::start_ttl_timer`] /
-//! [`crate::context::ttl_close_helpers::reset_ttl_timer`] helpers and
-//! to make the shim-fallback intent legible at the call site.
+//! # `_legacy` suffix
 //!
-//! # Legacy twins
-//!
-//! [`finalize_close`], [`handle_ttl_expiry`], [`propose_ttl_extension`],
-//! [`reset_ttl_timer`], [`start_ttl_timer`], [`spawn_ttl_timer_legacy`].
-//!
-//! # `spawn_ttl_timer_legacy` — out-of-domain callers
-//!
-//! `spawn_ttl_timer_legacy` is also reached by lifecycle restore /
-//! finalize-create / import paths (`lifecycle_helpers::restore_context`,
-//! `lifecycle_helpers::finalize_create`,
-//! `lifecycle_helpers::import_context`) and by the governance TTL
-//! extension proposal handler
-//! (`governance_helpers::handle_ttl_extension_proposal`). Those callers
-//! continue to spawn through the legacy path until Phase 2A.9 (lifecycle
-//! migration) revisits timer ownership end-to-end.
+//! The `_legacy` suffix is retained to make the shim-fallback intent
+//! legible at every call site and to avoid future namespace clashes with
+//! any actor-shape `spawn_ttl_timer` that might land in
+//! [`crate::context::ttl_close_helpers`] during Phase 2A.9.
 
 use std::sync::Arc;
 
-use scp_identity::DID;
-use scp_protocol::context::ContextError;
 use scp_protocol::context::membership::ContextEvent;
 
 use crate::context::ContextHandle;
 use crate::context::manager_methods;
 use crate::context::supervisor::Supervisor;
-use crate::context::ttl::{self, TtlExtension};
-
-// Phase 1 fix-up of ADR-049 (post-review-round-1): per-helper
-// `ATTACHED_EXPECT` constants consolidated to the single
-// `PROVIDER_NOT_INITIALIZED` definition in `manager_methods`.
-use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT;
+use crate::context::ttl;
 
 // ---------------------------------------------------------------------------
-// 1. finalize_close (top-level)
-// ---------------------------------------------------------------------------
-
-/// Completes context closure (hoisted body of the legacy
-/// `ContextManager::finalize_close`).
-///
-/// Destroys MLS group state and sender keys, issues relay deletion
-/// requests for ephemeral/summary scopes, transitions from `Closing`
-/// to `Closed`, and appends the final `ContextClosed` event.
-pub async fn finalize_close(
-    supervisor: &Supervisor,
-    handle: &ContextHandle,
-) -> Result<(), ContextError> {
-    let crypto = supervisor
-        .crypto_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let transport = supervisor
-        .transport_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let event_log = supervisor
-        .event_log_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let context_id = handle.context_id().to_owned();
-
-    ttl::finalize_close(
-        handle,
-        crypto.as_ref(),
-        transport.as_ref(),
-        event_log.as_ref(),
-    )
-    .await?;
-
-    // Delete persisted state after finalize (best-effort).
-    if let Some(persistence) = supervisor.persistence_ref() {
-        let _ = persistence.delete_context(&context_id);
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// 2. handle_ttl_expiry (top-level)
-// ---------------------------------------------------------------------------
-
-/// Handles automatic TTL expiry (hoisted body of the legacy
-/// `ContextManager::handle_ttl_expiry`).
-///
-/// Transitions from `Active` to `Expired`, destroys keys per memory
-/// scope, issues relay deletion requests for ephemeral/summary scopes,
-/// and appends `ContextExpired` to the event log.
-pub async fn handle_ttl_expiry(
-    supervisor: &Supervisor,
-    handle: &ContextHandle,
-) -> Result<(), ContextError> {
-    let crypto = supervisor
-        .crypto_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let transport = supervisor
-        .transport_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let event_log = supervisor
-        .event_log_ref()
-        .ok_or_else(|| ContextError::NotInitialized(ATTACHED_EXPECT.to_owned()))?;
-    let context_id = handle.context_id().to_owned();
-
-    // Capture generation before async expiry work for confused-deputy
-    // detection on reacquire.
-    let ctx_gen = {
-        let (_guard, generation) = manager_methods::lock_context(supervisor, &context_id)
-            .await
-            .map_err(|_| ContextError::ContextNotRegistered(context_id.clone()))?;
-        generation
-    };
-
-    // Async TTL expiry logic -- no lock held. Pass transport for
-    // best-effort relay ciphertext deletion (§5.11).
-    let result = ttl::try_ttl_expiry_cleanup(
-        handle,
-        crypto.as_ref(),
-        Some(transport.as_ref()),
-        event_log.as_ref(),
-        0,
-    )
-    .await;
-
-    // Cancel governance timeout task, decay participation, and emit
-    // appropriate event (lock acquired, then dropped, with generation check).
-    {
-        if let Ok(mut guard) = manager_methods::relock_context(supervisor, &ctx_gen).await {
-            let ctx = &mut *guard;
-            ctx.governance.timeout_task.cancel();
-            // Participation decay on TTL expiry (#1530): clear
-            // participation cache and cooldown state so stale data does
-            // not carry over if the context is later restored.
-            ctx.governance.decay_participation();
-            if result.is_complete() {
-                let event = ContextEvent::Expired;
-                ctx.emit_event(event, &context_id, supervisor.event_tx_ref());
-            } else {
-                let event = ContextEvent::ExpiryFailed {
-                    reason: result.to_string(),
-                    state_transitioned: result.state_transitioned(),
-                    mls_destroyed: result.mls_destroyed(),
-                    sender_key_destroyed: result.sender_key_destroyed(),
-                    event_logged: result.event_logged(),
-                };
-                ctx.emit_event(event, &context_id, supervisor.event_tx_ref());
-            }
-        } else {
-            tracing::warn!(
-                context_id = %context_id,
-                "handle_ttl_expiry: generation mismatch — skipping state mutation"
-            );
-        }
-    }
-
-    // Persist context state after TTL expiry (best-effort).
-    if manager_methods::has_persistence(supervisor)
-        && let Ok(guard) = manager_methods::relock_context(supervisor, &ctx_gen).await
-    {
-        let ctx = &*guard;
-        let snapshot = manager_methods::snapshot_context(ctx);
-        manager_methods::persist_context_snapshot(supervisor, &context_id, snapshot);
-    }
-
-    if result.has_failures() {
-        let msg = result.errors().join("; ");
-        return Err(
-            if !result.mls_destroyed() || !result.sender_key_destroyed() {
-                ContextError::CryptoFailed(msg)
-            } else {
-                ContextError::EventLogFailed(msg)
-            },
-        );
-    }
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// 3. propose_ttl_extension (top-level)
-// ---------------------------------------------------------------------------
-
-/// Proposes a TTL extension (hoisted body of the legacy
-/// `ContextManager::propose_ttl_extension`).
-///
-/// Records consent from the given member. Returns `true` iff every
-/// member has now consented (unanimous); the caller should then call
-/// [`reset_ttl_timer`] with the new duration.
-pub async fn propose_ttl_extension(
-    supervisor: &Supervisor,
-    context_id: &str,
-    member_did: &DID,
-    proposed_duration: std::time::Duration,
-) -> Result<bool, ContextError> {
-    // All checks and mutation within a single lock acquisition.
-    let ctx_arc = manager_methods::get_context_arc(supervisor, context_id)
-        .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-    let mut guard = ctx_arc.lock().await;
-    let ctx = &mut *guard;
-
-    if !ctx.membership.contains(member_did) {
-        return Err(ContextError::MemberNotFound(member_did.to_string()));
-    }
-
-    let member_count = ctx.membership.count();
-
-    // Initialize extension proposal if not already in progress.
-    let extension = ctx
-        .ttl
-        .extension
-        .get_or_insert_with(|| TtlExtension::new(proposed_duration, member_count));
-
-    extension.add_consent(member_did.clone());
-    let unanimous = extension.is_unanimous();
-
-    // Persist context state after proposal consent (best-effort).
-    if manager_methods::has_persistence(supervisor) {
-        let ctx_snapshot = manager_methods::snapshot_context(ctx);
-        manager_methods::persist_context_snapshot(supervisor, context_id, ctx_snapshot);
-    }
-
-    Ok(unanimous)
-}
-
-// ---------------------------------------------------------------------------
-// 4. reset_ttl_timer (top-level)
-// ---------------------------------------------------------------------------
-
-/// Resets the TTL timer after a successful unanimous extension (hoisted
-/// body of the legacy `ContextManager::reset_ttl_timer`).
-///
-/// Cancels the old timer and spawns a new one with the given duration.
-/// Clears the extension proposal state.
-pub async fn reset_ttl_timer(
-    supervisor: &Supervisor,
-    context_id: &str,
-    new_duration: std::time::Duration,
-    handle: ContextHandle,
-) {
-    // Cancel old timer and clear extension state (lock, then drop).
-    {
-        if let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id) {
-            let mut guard = ctx_arc.lock().await;
-            let ctx = &mut *guard;
-            ctx.ttl.timer.cancel();
-            ctx.ttl.extension = None;
-        }
-    }
-
-    spawn_ttl_timer_legacy(supervisor, context_id, new_duration, handle).await;
-
-    // Persist context state after TTL reset (best-effort).
-    if manager_methods::has_persistence(supervisor)
-        && let Ok(ctx_arc) = manager_methods::get_context_arc(supervisor, context_id)
-    {
-        let guard = ctx_arc.lock().await;
-        let ctx = &*guard;
-        let snapshot = manager_methods::snapshot_context(ctx);
-        manager_methods::persist_context_snapshot(supervisor, context_id, snapshot);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 5. start_ttl_timer (top-level shim, forwarder into spawn_ttl_timer_legacy)
-// ---------------------------------------------------------------------------
-
-/// Installs a TTL timer for the given context (hoisted body of the
-/// legacy `ContextManager::start_ttl_timer`).
-///
-/// Thin shim that delegates to [`spawn_ttl_timer_legacy`] — the
-/// shim-callable
-/// [`TtlCloseCommand::StartTtlTimer`](crate::context::actor::commands::TtlCloseCommand::StartTtlTimer)
-/// fallback uses this wrapper so it doesn't need to depend on the
-/// supervisor-internal spawn helper directly.
-pub async fn start_ttl_timer(
-    supervisor: &Supervisor,
-    context_id: &str,
-    duration: std::time::Duration,
-    handle: ContextHandle,
-) {
-    spawn_ttl_timer_legacy(supervisor, context_id, duration, handle).await;
-}
-
-// ---------------------------------------------------------------------------
-// 6. spawn_ttl_timer_legacy (transitive — shared by reset_ttl_timer,
-//    start_ttl_timer, import_context, finalize_create, restore_context,
-//    governance_helpers::handle_ttl_extension_proposal)
+// spawn_ttl_timer_legacy (sole survivor of Phase 2A finalization)
+//
+// Called from production lifecycle paths
+// (`lifecycle_helpers::{restore_context,finalize_create,import_context}`,
+// `governance_helpers::handle_ttl_extension_proposal`) and the actor-shape
+// `ttl_close_helpers::{start_ttl_timer,reset_ttl_timer}` escape until
+// Phase 2A.9 (lifecycle migration) revisits timer ownership end-to-end.
+// All other legacy helpers (`finalize_close`, `handle_ttl_expiry`,
+// `propose_ttl_extension`, `reset_ttl_timer`, `start_ttl_timer`) were
+// deleted with the supervisor-receiver shim in Phase 2A finalization.
 // ---------------------------------------------------------------------------
 
 /// Spawns a TTL timer for the given context (hoisted body of the legacy
