@@ -990,45 +990,39 @@ impl Supervisor {
         Self::dispatch_via_mailbox(&actor, ContextCommand::Messaging(cmd)).await
     }
 
-    /// Dispatch a mutating [`LifecycleCommand`] through the migration
-    /// shim (ADR-049 commit 9 / plan row 9).
+    /// Dispatch a mutating [`LifecycleCommand`].
     ///
-    /// Contract (byte-identical to the legacy
-    /// [`Supervisor`](crate::context::supervisor::Supervisor)
-    /// lifecycle methods it replaces):
+    /// Routing (ADR-049 Phase 2A finalization):
     ///
-    /// Step 1 invokes
-    /// [`handlers::lifecycle::dispatch_from_shim`](crate::context::actor::handlers::lifecycle::dispatch_from_shim)
-    /// with a reference to the attached manager. Lifecycle handlers
-    /// never read or mutate `send_tracker` (only the messaging path
-    /// touches it), so no per-context take-and-swap or scratch tracker
-    /// is required.
+    /// - **Bootstrap variants** (`CreateContext`, `ImportContext`,
+    ///   `RestoreContext`) always route through
+    ///   [`Self::dispatch_lifecycle_direct`], which delegates to the
+    ///   designated-legacy `&Supervisor`-shape helpers in
+    ///   [`crate::context::lifecycle_helpers_legacy`]. These helpers
+    ///   construct fresh `PerContextState` and (on dual-write) spawn
+    ///   the per-context actor as part of the bootstrap handshake.
+    /// - **Per-context variants** (`JoinContext`, `LeaveContext`,
+    ///   `CloseContext`, `ExportContext`,
+    ///   `GenerateContextAccessKey`, `RevokeContextAccessKey`,
+    ///   `RestoreContextAccessKey`) carry a `context_id` and route
+    ///   through the per-context actor's mailbox into the actor-shape
+    ///   `handlers::lifecycle::dispatch`. If no actor is registered for
+    ///   the target context, the call falls through to
+    ///   [`Self::dispatch_lifecycle_direct`] which surfaces
+    ///   `ContextError::ContextNotRegistered` on the reply oneshot.
     ///
-    /// Each variant wraps the delegated
-    /// [`Supervisor`](crate::context::supervisor::Supervisor) method
-    /// in `tokio::time::timeout` with a 30s budget, maps a timeout to
+    /// Each variant wraps its delegated body in `tokio::time::timeout`
+    /// with a 30s budget, maps a timeout to
     /// [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout),
     /// and relays the typed reply on the variant's oneshot.
     ///
-    /// # Why no per-context Arc lookup
-    ///
-    /// `CreateContext` / `ImportContext` operate on a context that does
-    /// not yet exist; `CloseContext` / `LeaveContext` /
-    /// `ExportContext` / `JoinContext` delegate to the legacy method
-    /// which resolves the per-context Arc internally. Routing through
-    /// `get_context_arc_pub` here would duplicate that resolution, and
-    /// for the create/import variants would fail pre-emptively with
-    /// `ContextNotRegistered`.
-    ///
     /// # Errors
     ///
-    /// - [`ContextError::NotInitialized`] if no
-    ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
-    ///   been attached yet — the caller must call
-    ///   [`Self::with_providers`] first.
-    /// - Any typed error returned by the delegated
-    ///   `ContextManager::{create,join,leave,close,export,import}_context`
-    ///   call is surfaced through the variant's oneshot reply; the
+    /// - [`ContextError::NotInitialized`] if no providers have been
+    ///   attached — the caller must call [`Self::with_providers`]
+    ///   first.
+    /// - Any typed error returned by the delegated bootstrap / actor
+    ///   handler is surfaced through the variant's oneshot reply; the
     ///   method-level result here is `Ok(Outcome { .. })`.
     /// - [`ContextError::TransportTimeout`] is surfaced through the
     ///   oneshot reply, not the method result.
@@ -1036,18 +1030,412 @@ impl Supervisor {
         &self,
         cmd: LifecycleCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 Phase 2A item 5 — try the actor mailbox first for
-        // variants whose context_id is visible without unboxing.
+        // ADR-049 Phase 2A finalization — bootstrap variants always
+        // route through `dispatch_lifecycle_direct`. They construct
+        // fresh state (and, on dual-write, spawn the actor); the
+        // mailbox-first check would either no-op for a fresh context
+        // (no actor yet) or recurse against the existing actor on a
+        // re-create attempt — neither produces correct semantics. The
+        // direct path inlines the supervisor-scoped bootstrap body and
+        // surfaces the typed reply on the variant's oneshot.
+        if matches!(
+            cmd,
+            LifecycleCommand::CreateContext { .. }
+                | LifecycleCommand::ImportContext { .. }
+                | LifecycleCommand::RestoreContext { .. }
+        ) {
+            return Ok(Box::pin(self.dispatch_lifecycle_direct(cmd)).await);
+        }
+        // Per-context variants (Join / Leave / Close / Export +
+        // access-key generate / revoke / restore + Placeholder) all
+        // carry a `context_id` and have a registered actor after
+        // bootstrap dual-write. Mailbox-first routes to the actor's
+        // `dispatch_state` loop which executes the actor-shape handler.
         if let Some(ctx_id) = Self::lifecycle_command_context_id(&cmd)
             && let Some(actor) = self.lookup(ctx_id)
         {
             return Self::dispatch_via_mailbox(&actor, ContextCommand::Lifecycle(cmd)).await;
         }
-        // Direct-shim fallback: lifecycle handler takes `&Supervisor`.
-        // `Box::pin` — the combined size of the rebuilt handle,
-        // context params, and the per-variant 30s-timeout future
-        // crosses clippy's 16-KB stack budget for async futures.
-        Ok(Box::pin(handlers::lifecycle::dispatch_from_shim(self, cmd)).await)
+        // Per-context variant for which no actor is registered — the
+        // `Supervisor::contexts` DashMap fallback (and its handler-side
+        // `dispatch_from_shim`) were deleted in this session. Surface
+        // the typed error on the reply oneshot via the direct path's
+        // unreachable-arm sketch so the caller gets a defined response.
+        Ok(Box::pin(self.dispatch_lifecycle_direct(cmd)).await)
+    }
+
+    /// Direct supervisor-scoped dispatch for bootstrap-shaped
+    /// [`LifecycleCommand`] variants (Create / Import / Restore) and
+    /// the no-actor fallback for per-context variants.
+    ///
+    /// Mirrors [`Self::dispatch_standing_direct`]: each arm wraps the
+    /// supervisor-scoped body in a 30s timeout matching the actor-
+    /// handler shape (plan §"Transport timeouts inside actor handlers")
+    /// and relays the typed reply on the variant's oneshot. The
+    /// bootstrap arms delegate to the legacy `&Supervisor`-shape helpers
+    /// in [`crate::context::lifecycle_helpers_legacy`] (designated
+    /// survivors — the supervisor cannot synthesize the full
+    /// `ActorDeps` bundle that the actor-shape helpers require because
+    /// `OpenMlsStorageAdapter` and per-identity `KeyPackageStoreHandle`
+    /// are caller-supplied at FFI boundary, not stored on the
+    /// supervisor). Per-context variants surface
+    /// `ContextError::ContextNotRegistered` when they reach this method
+    /// — they should never get here once bootstrap dual-write is in
+    /// place.
+    #[allow(clippy::too_many_lines)] // flat match over every lifecycle variant
+    async fn dispatch_lifecycle_direct(&self, cmd: LifecycleCommand) -> Outcome<()> {
+        use crate::context::lifecycle_helpers_legacy;
+        const LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        match cmd {
+            LifecycleCommand::Placeholder { reply } => {
+                const MSG: &str =
+                    "LifecycleCommand::Placeholder — handshake target; no production work";
+                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
+                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
+            }
+            LifecycleCommand::CreateContext { payload, reply } => {
+                let p = *payload;
+                let context_id = p.context_id.clone();
+                let fut = lifecycle_helpers_legacy::create_context_legacy(
+                    self,
+                    p.context_id,
+                    p.params,
+                    p.creator_did,
+                    p.local_pseudonym,
+                );
+                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
+                    .await
+                {
+                    Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),
+                    Ok(Err(e)) => {
+                        let sketch = ContextError::CryptoFailed(format!("create_context: {e}"));
+                        (Outcome::err_mutated(sketch), Err(e))
+                    }
+                    Err(_elapsed) => {
+                        let err =
+                            scp_protocol::context::builder::ContextCreationError::CreationFailed(
+                                format!(
+                                    "create_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
+                                ),
+                            );
+                        let sketch = ContextError::TransportTimeout(format!(
+                            "create_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        (Outcome::err_mutated(sketch), Err(err))
+                    }
+                };
+                let _ = reply.send(reply_result);
+                outcome
+            }
+            LifecycleCommand::ImportContext { export, reply } => {
+                let context_id = export.snapshot.context_id.clone();
+                // Box::pin — the per-variant import future crosses
+                // clippy's 16 KB stack budget (ContextExport ~2 KB +
+                // the full PerContextState-construction locals inside
+                // the legacy `import_context` body).
+                let fut = Box::pin(lifecycle_helpers_legacy::import_context_legacy(
+                    self, *export,
+                ));
+                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
+                    .await
+                {
+                    Ok(Ok(handle)) => (Outcome::ok_mutated(()), Ok(handle)),
+                    Ok(Err(e)) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        (Outcome::err_mutated(sketch), Err(e))
+                    }
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "import_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        let sketch = standing_outcome_error_sketch(&err);
+                        (Outcome::err_mutated(sketch), Err(err))
+                    }
+                };
+                let _ = reply.send(reply_result);
+                outcome
+            }
+            LifecycleCommand::RestoreContext { payload, reply } => {
+                let p = *payload;
+                let context_id = p.context_id.clone();
+                let handle = crate::context::ContextHandle::new(p.context_id.clone(), p.params);
+                if let Err(e) = handle
+                    .transition_to(&scp_protocol::context::ContextState::Active)
+                    .await
+                {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    let _ = reply.send(Err(e));
+                    return Outcome::err(sketch);
+                }
+                let fut = Box::pin(lifecycle_helpers_legacy::restore_context_legacy(
+                    self,
+                    &p.context_id,
+                    &handle,
+                ));
+                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
+                    .await
+                {
+                    Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+                    Ok(Err(e)) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        (Outcome::err_mutated(sketch), Err(e))
+                    }
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "restore_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        let sketch = standing_outcome_error_sketch(&err);
+                        (Outcome::err_mutated(sketch), Err(err))
+                    }
+                };
+                let _ = reply.send(reply_result);
+                outcome
+            }
+            // Per-context variants reach this arm only when no actor
+            // is registered for the target context. The legacy
+            // bootstrap callers (`standing_helpers_legacy::standing_context_legacy`,
+            // `governance_helpers_legacy::execute_create_child_context_legacy`)
+            // create contexts via `create_context_legacy` which inserts
+            // into the supervisor's contexts `DashMap` but does NOT
+            // spawn an actor — those callers will be migrated to the
+            // actor-shape bootstrap in a subsequent finalization
+            // session. Until then, this arm uses the designated-legacy
+            // per-context helpers to operate on the DashMap-borrowed
+            // state directly. Each variant carries the same 30s
+            // timeout as the actor path.
+            LifecycleCommand::JoinContext { payload, reply } => {
+                let p = *payload;
+                let context_id = p.context_id.clone();
+                let handle = crate::context::ContextHandle::new(p.context_id, p.params);
+                if let Err(e) = handle
+                    .transition_to(&scp_protocol::context::ContextState::Active)
+                    .await
+                {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    let _ = reply.send(Err(e));
+                    return Outcome::err(sketch);
+                }
+                let fut = lifecycle_helpers_legacy::join_context_legacy(
+                    self,
+                    &handle,
+                    p.key_package,
+                    p.spending_ucan.as_ref(),
+                    p.local_pseudonym,
+                );
+                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
+                    .await
+                {
+                    Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+                    Ok(Err(e)) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        (Outcome::err_mutated(sketch), Err(e))
+                    }
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "join_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        let sketch = standing_outcome_error_sketch(&err);
+                        (Outcome::err_mutated(sketch), Err(err))
+                    }
+                };
+                let _ = reply.send(reply_result);
+                outcome
+            }
+            LifecycleCommand::LeaveContext { payload, reply } => {
+                let p = *payload;
+                let context_id = p.context_id.clone();
+                let handle = crate::context::ContextHandle::new(p.context_id, p.params);
+                if let Err(e) = handle
+                    .transition_to(&scp_protocol::context::ContextState::Active)
+                    .await
+                {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    let _ = reply.send(Err(e));
+                    return Outcome::err(sketch);
+                }
+                let fut = lifecycle_helpers_legacy::leave_context_legacy(
+                    self,
+                    &handle,
+                    &p.caller_did,
+                    &p.member_did,
+                );
+                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
+                    .await
+                {
+                    Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+                    Ok(Err(e)) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        (Outcome::err_mutated(sketch), Err(e))
+                    }
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "leave_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        let sketch = standing_outcome_error_sketch(&err);
+                        (Outcome::err_mutated(sketch), Err(err))
+                    }
+                };
+                let _ = reply.send(reply_result);
+                outcome
+            }
+            LifecycleCommand::CloseContext { payload, reply } => {
+                let p = *payload;
+                let context_id = p.context_id.clone();
+                let handle = crate::context::ContextHandle::new(p.context_id, p.params);
+                if let Err(e) = handle
+                    .transition_to(&scp_protocol::context::ContextState::Active)
+                    .await
+                {
+                    let sketch = standing_outcome_error_sketch(&e);
+                    let _ = reply.send(Err(e));
+                    return Outcome::err(sketch);
+                }
+                let fut =
+                    lifecycle_helpers_legacy::close_context_legacy(self, &handle, &p.initiator_did);
+                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
+                    .await
+                {
+                    Ok(Ok(result)) => (Outcome::ok_mutated(()), Ok(result)),
+                    Ok(Err(e)) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        (Outcome::err_mutated(sketch), Err(e))
+                    }
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "close_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        let sketch = standing_outcome_error_sketch(&err);
+                        (Outcome::err_mutated(sketch), Err(err))
+                    }
+                };
+                let _ = reply.send(reply_result);
+                outcome
+            }
+            LifecycleCommand::ExportContext {
+                context_id,
+                exporter_did,
+                reply,
+            } => {
+                let fut = lifecycle_helpers_legacy::export_context_legacy(
+                    self,
+                    &context_id,
+                    exporter_did,
+                );
+                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
+                    .await
+                {
+                    Ok(Ok(export)) => (Outcome::ok(()), Ok(export)),
+                    Ok(Err(e)) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        (Outcome::err(sketch), Err(e))
+                    }
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "export_context exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        let sketch = standing_outcome_error_sketch(&err);
+                        (Outcome::err(sketch), Err(err))
+                    }
+                };
+                let _ = reply.send(reply_result);
+                outcome
+            }
+            LifecycleCommand::GenerateContextAccessKey {
+                context_id,
+                member_did,
+                caller_did,
+                reply,
+            } => {
+                let fut =
+                    crate::context::queries_helpers_legacy::generate_context_access_key_legacy(
+                        self,
+                        &context_id,
+                        &member_did,
+                        &caller_did,
+                    );
+                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
+                    .await
+                {
+                    Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+                    Ok(Err(e)) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        (Outcome::err_mutated(sketch), Err(e))
+                    }
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "generate_context_access_key exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        let sketch = standing_outcome_error_sketch(&err);
+                        (Outcome::err_mutated(sketch), Err(err))
+                    }
+                };
+                let _ = reply.send(reply_result);
+                outcome
+            }
+            LifecycleCommand::RevokeContextAccessKey {
+                context_id,
+                member_did,
+                caller_did,
+                reply,
+            } => {
+                let fut = crate::context::queries_helpers_legacy::revoke_context_access_key_legacy(
+                    self,
+                    &context_id,
+                    &member_did,
+                    &caller_did,
+                );
+                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
+                    .await
+                {
+                    Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+                    Ok(Err(e)) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        (Outcome::err_mutated(sketch), Err(e))
+                    }
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "revoke_context_access_key exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        let sketch = standing_outcome_error_sketch(&err);
+                        (Outcome::err_mutated(sketch), Err(err))
+                    }
+                };
+                let _ = reply.send(reply_result);
+                outcome
+            }
+            LifecycleCommand::RestoreContextAccessKey {
+                context_id,
+                member_did,
+                caller_did,
+                reply,
+            } => {
+                let fut = crate::context::queries_helpers_legacy::restore_context_access_key_legacy(
+                    self,
+                    &context_id,
+                    &member_did,
+                    &caller_did,
+                );
+                let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
+                    .await
+                {
+                    Ok(Ok(())) => (Outcome::ok_mutated(()), Ok(())),
+                    Ok(Err(e)) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        (Outcome::err_mutated(sketch), Err(e))
+                    }
+                    Err(_elapsed) => {
+                        let err = ContextError::TransportTimeout(format!(
+                            "restore_context_access_key exceeded {LIFECYCLE_TIMEOUT:?} budget for context {context_id}"
+                        ));
+                        let sketch = standing_outcome_error_sketch(&err);
+                        (Outcome::err_mutated(sketch), Err(err))
+                    }
+                };
+                let _ = reply.send(reply_result);
+                outcome
+            }
+        }
     }
 
     /// Dispatch a mutating [`TtlCloseCommand`] through the migration
