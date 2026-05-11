@@ -5,6 +5,59 @@ All notable changes to SCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-05-10
+
+### Enforcement infra hardening — PR-E (PR #1735)
+
+Four enforcement-infra improvements that close gaps surfaced in the #1543
+review series, plus the §1 cleanup the new gate identified. No protocol
+behaviour change; all changes are mechanical hardening of the bridge
+surface tests and refactoring of pure helpers per ADR-048 §1.
+
+**Internal changes only — no external SDK behaviour change** other than
+the SDK class methods listed below routing to module-level FFI exports
+internally (the SDK class shape is unchanged for TypeScript / Swift /
+Kotlin; Python continues to expose module-level functions per
+`scp_sdk.{auth,identity,provenance}` per ADR-048 §7).
+
+- **Phantom-alias scanner hardening (#26).** Bridge-symmetry alias
+  resolution now requires the candidate fn to be exported through the
+  bridge binding tooling, not merely defined in source. Both
+  `scripts/check-bridge-symmetry.sh` and the syn-based
+  `every_alias_resolves_to_a_real_fn_or_exemption` test in
+  `crates/scp-testing/tests/integration/ffi_conformance.rs` were
+  tightened. New fixture `bad-alias-undecorated-fn/`.
+- **Empty arrays for exempt bridges (#27).** 25 placeholder cells in
+  `scripts/bridge-aliases.json` (24 wasm + 1 napi) replaced with `[]`.
+  New invariant `every_bridge_alias_array_is_non_empty_or_exempt`.
+- **ADR-048 §1 pure-helpers mechanization (#28).** New syn-based gate
+  `pure_helpers_stay_free_fns_at_ffi_layer` flags methods with a `self`
+  receiver that never use it inside FFI-decorated impl blocks. Macro
+  bodies are walked via `proc-macro2` so `format!("{}", self.field)` is
+  correctly recognized as bound. 22 pre-existing violations cleaned up:
+  - 1 NAPI: `NapiScp::check_scoped_capability` → module-level free fn.
+  - 8 PyO3: `scpid_challenge`, `identity_verify_device_attestation`,
+    `verify_identity_link_attestation`, and 5 provenance helpers moved
+    from `#[pymethods] impl PyScp { ... }` to `#[pyfunction]` free fns
+    registered in the appropriate `register_*` hook.
+  - 10 UniFFI: `bridge_evaluate_trust`, `identity_resolve`,
+    `identity_verify_{device_attestation,link_attestation}`,
+    `sync_classify_offline{,_custom}`, `sync_get_policy`,
+    `trust_query_score`, `trust_verify_attestation`,
+    `verify_participation_requirements` moved from
+    `#[uniffi::export] impl Scp { ... }` to free fns.
+- **ADR-048 §7b cross-bridge semantic divergence registry (#29).**
+  Documents canonical operations where bridges diverge in semantics
+  despite sharing the same name (`identity_rotate_key` — WASM DID
+  migration vs native active-key rotation; `identity_create_link_attestation` —
+  resolved 2026-04-26 by PR #1719). Inline `// SEMANTIC DIVERGENCE`
+  comments at the WASM call sites.
+
+**Side fix:** `scripts/hooks/pretooluse-enforcement-files.sh` switched
+from suffix to exact-canonical-path matching anchored at the worktree
+root. Fixture copies of `bridge-aliases.json` no longer trigger
+false-positive blocks; symlink-bypass protection preserved.
+
 ## [Unreleased] - 2026-04-18
 
 ### Per-instance MCP stdio allowlist (PR #1725)
