@@ -3274,15 +3274,21 @@ impl Supervisor {
     }
 
     /// Extract the target context_id from a [`TtlCloseCommand`].
-    /// Only `ExtendTtl` has a literal `context_id` field; the others
-    /// (StartTtlTimer / ResetTtlTimer / ExecuteTtlClose / FinalizeClose)
-    /// carry it inside boxed payloads. Boxed-payload variants route via
-    /// the direct-shim path until a follow-on Phase 2 chunk destructures
-    /// them.
+    ///
+    /// Every per-context variant surfaces its `context_id` so the dispatch
+    /// helper can route through the per-context actor's mailbox. The
+    /// boxed-payload variants (`StartTtlTimer` / `ResetTtlTimer` /
+    /// `ExecuteTtlClose` / `FinalizeClose`) destructure their payloads to
+    /// expose the embedded `context_id`. Only [`TtlCloseCommand::Placeholder`]
+    /// returns `None` (no target).
     const fn ttl_close_command_context_id(cmd: &TtlCloseCommand) -> Option<&str> {
         match cmd {
             TtlCloseCommand::ExtendTtl { context_id, .. } => Some(context_id.as_str()),
-            _ => None,
+            TtlCloseCommand::StartTtlTimer { payload, .. }
+            | TtlCloseCommand::ResetTtlTimer { payload, .. } => Some(payload.context_id.as_str()),
+            TtlCloseCommand::ExecuteTtlClose { payload, .. }
+            | TtlCloseCommand::FinalizeClose { payload, .. } => Some(payload.context_id.as_str()),
+            TtlCloseCommand::Placeholder { .. } => None,
         }
     }
 
