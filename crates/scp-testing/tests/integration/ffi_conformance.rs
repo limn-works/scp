@@ -2482,6 +2482,23 @@ fn scan_pure_helpers() -> Vec<PureHelperViolation> {
                     if item_impl.trait_.is_some() {
                         continue;
                     }
+                    // §1 only applies to impl blocks that the FFI binding
+                    // tooling actually exports. An undecorated `impl Foo {
+                    // ... }` block (no `#[pymethods]` / `#[napi]` /
+                    // `#[uniffi::export]` / `#[wasm_bindgen]`) is internal
+                    // Rust — its methods never cross the FFI boundary, so
+                    // "should this be a free fn?" is a coding-style choice,
+                    // not an enforcement matter. Real instance:
+                    // `impl WasmContextManager { ... }` (no decoration)
+                    // hosts the WASM manager's internal helpers; those are
+                    // called from `#[wasm_bindgen] pub fn context_*` free
+                    // functions in `context.rs`, NOT exposed as methods on
+                    // a JS class. Mirroring the strict alias scanner in
+                    // #26: an impl that is not FFI-decorated produces no
+                    // exports.
+                    if !attrs_have_impl_block_ffi_export(&item_impl.attrs) {
+                        continue;
+                    }
                     for impl_item in &item_impl.items {
                         let syn::ImplItem::Fn(method) = impl_item else {
                             continue;
