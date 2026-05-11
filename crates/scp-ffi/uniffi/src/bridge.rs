@@ -16183,4 +16183,84 @@ mod tests {
         );
         assert!(weak_observer.upgrade().is_none());
     }
+
+    // -----------------------------------------------------------------------
+    // PreRotationCustodyError typed-code mapping
+    //
+    // Regression tests pinning each `PreRotationCustodyError` variant to
+    // its typed error code on the UniFFI bridge. Mirrors the PyO3 tests in
+    // `crates/scp-ffi/src/error.rs` (same function names, same semantics)
+    // so any future re-ordering or accidental swap of match arms in the
+    // `From<scp_identity::IdentityError>` impl breaks here, not at the
+    // Swift/Kotlin SDK boundary where it would be harder to diagnose.
+    // -----------------------------------------------------------------------
+
+    fn pre_rotation_code_of(e: ScpError) -> String {
+        match e {
+            ScpError::Identity { code, .. } => code,
+            other => panic!("expected ScpError::Identity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_rotation_handle_not_found_surfaces_typed_code() {
+        let err: ScpError = scp_identity::IdentityError::PreRotation(
+            scp_platform::PreRotationCustodyError::HandleNotFound,
+        )
+        .into();
+        assert_eq!(pre_rotation_code_of(err), codes::IDENT_1047);
+    }
+
+    #[test]
+    fn pre_rotation_unavailable_surfaces_typed_code() {
+        let err: ScpError = scp_identity::IdentityError::PreRotation(
+            scp_platform::PreRotationCustodyError::Unavailable("hardware key not connected".into()),
+        )
+        .into();
+        assert_eq!(pre_rotation_code_of(err), codes::IDENT_1048);
+    }
+
+    #[test]
+    fn pre_rotation_user_declined_surfaces_typed_code() {
+        let err: ScpError = scp_identity::IdentityError::PreRotation(
+            scp_platform::PreRotationCustodyError::UserDeclined,
+        )
+        .into();
+        assert_eq!(pre_rotation_code_of(err), codes::IDENT_1049);
+    }
+
+    #[test]
+    fn pre_rotation_storage_surfaces_typed_code() {
+        let err: ScpError = scp_identity::IdentityError::PreRotation(
+            scp_platform::PreRotationCustodyError::Storage("disk full".into()),
+        )
+        .into();
+        assert_eq!(pre_rotation_code_of(err), codes::IDENT_1050);
+    }
+
+    #[test]
+    fn pre_rotation_invalid_callback_response_surfaces_typed_code() {
+        let err: ScpError = scp_identity::IdentityError::PreRotation(
+            scp_platform::PreRotationCustodyError::InvalidCallbackResponse(
+                "handle is empty".into(),
+            ),
+        )
+        .into();
+        assert_eq!(pre_rotation_code_of(err), codes::IDENT_1051);
+    }
+
+    #[test]
+    fn pre_rotation_commitment_mismatch_surfaces_typed_code() {
+        let err: ScpError = scp_identity::IdentityError::PreRotation(
+            scp_platform::PreRotationCustodyError::CommitmentMismatch,
+        )
+        .into();
+        assert_eq!(pre_rotation_code_of(err), codes::IDENT_1052);
+    }
+
+    #[test]
+    fn non_pre_rotation_identity_errors_keep_generic_envelope() {
+        let err: ScpError = scp_identity::IdentityError::InvalidDidFormat("bad".into()).into();
+        assert_eq!(pre_rotation_code_of(err), codes::IDENT_1001);
+    }
 }

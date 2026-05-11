@@ -557,6 +557,11 @@ pub enum PreRotationCustodyError {
     HandleNotFound,
     /// The custody backend (FIDO2 device, callback, paper backup, etc.) is
     /// unavailable. Carries a human-readable description for diagnostics.
+    ///
+    /// IMPLEMENTERS: do NOT embed key material, handle bytes, path
+    /// information, or other sensitive data in the diagnostic string —
+    /// it flows verbatim to SDK consumers via the typed error envelope.
+    /// Use opaque error categories with non-sensitive context only.
     #[error("pre-rotation custody unavailable: {0}")]
     Unavailable(String),
     /// The user declined an interactive prompt (e.g., FIDO2 touch
@@ -564,10 +569,23 @@ pub enum PreRotationCustodyError {
     #[error("pre-rotation custody operation declined by user")]
     UserDeclined,
     /// Persistence backend I/O failure. Carries a human-readable description.
+    ///
+    /// IMPLEMENTERS: do NOT embed key material, handle bytes, file-system
+    /// paths, database connection strings, or other sensitive data in the
+    /// diagnostic string — it flows verbatim to SDK consumers via the
+    /// typed error envelope. Use opaque error categories with
+    /// non-sensitive context only (e.g., "disk full", "permission
+    /// denied", "transient I/O failure").
     #[error("pre-rotation custody storage error: {0}")]
     Storage(String),
     /// A callback returned malformed bytes (wrong length, non-canonical
     /// encoding, etc.).
+    ///
+    /// IMPLEMENTERS: do NOT embed the raw callback bytes, derived key
+    /// material, or other sensitive data in the diagnostic string — it
+    /// flows verbatim to SDK consumers via the typed error envelope.
+    /// Describe the structural defect (e.g., "wrong length", "non-UTF-8
+    /// in expected text field") without echoing the offending input.
     #[error("pre-rotation custody callback returned invalid data: {0}")]
     InvalidCallbackResponse(String),
     /// The committed public key does not match what the custody returns —
