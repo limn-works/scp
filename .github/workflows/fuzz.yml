@@ -83,7 +83,16 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@nightly
+      # TEMPORARY: pinned nightly. Recent nightlies (post-2026-05-03) tightened
+      # E0365 enforcement on glob re-exports, which fires on openmls 0.8.1's
+      # prelude — its trailing `pub use crate::ciphersuite::*` picks up the
+      # earlier `pub(crate) use signature::*` shadow and re-exports
+      # `Signature` / `SignContent` / `SignaturePublicKey` /
+      # `OpenMlsSignaturePublicKey` at insufficient visibility.
+      #
+      # Unpin to `@nightly` once openmls publishes a fixed prelude (likely
+      # 0.8.2 or 0.9) and `crates/scp-runtime` updates its dependency.
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-03
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
@@ -173,7 +182,16 @@ jobs:
 
       - uses: actions/checkout@v5
 
-      - uses: dtolnay/rust-toolchain@nightly
+      # TEMPORARY: pinned nightly. Recent nightlies (post-2026-05-03) tightened
+      # E0365 enforcement on glob re-exports, which fires on openmls 0.8.1's
+      # prelude — its trailing `pub use crate::ciphersuite::*` picks up the
+      # earlier `pub(crate) use signature::*` shadow and re-exports
+      # `Signature` / `SignContent` / `SignaturePublicKey` /
+      # `OpenMlsSignaturePublicKey` at insufficient visibility.
+      #
+      # Unpin to `@nightly` once openmls publishes a fixed prelude (likely
+      # 0.8.2 or 0.9) and `crates/scp-runtime` updates its dependency.
+      - uses: dtolnay/rust-toolchain@nightly-2026-05-03
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
