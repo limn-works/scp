@@ -3628,7 +3628,7 @@ mod tests {
     /// Insert a per-context entry through the legacy manager-methods
     /// path so `spawn_actor_dashmap_backed` has something to look up.
     /// Returns the supervisor's stringified context-id key.
-    async fn seed_dashmap_context(supervisor: &Arc<Supervisor>, ctx_id_bytes: [u8; 32]) -> String {
+    fn seed_dashmap_context(supervisor: &Arc<Supervisor>, ctx_id_bytes: [u8; 32]) -> String {
         let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
             ctx_id_bytes,
             1_700_000_000,
@@ -3646,7 +3646,7 @@ mod tests {
     async fn spawn_actor_dashmap_backed_registers_handle_for_inserted_context() {
         let supervisor_arc = supervisor_with_providers();
         let ctx_id_bytes = [0x5Au8; 32];
-        let key = seed_dashmap_context(&supervisor_arc, ctx_id_bytes).await;
+        let key = seed_dashmap_context(&supervisor_arc, ctx_id_bytes);
 
         let deps = test_actor_deps(&supervisor_arc).await;
         let handle = supervisor_arc
