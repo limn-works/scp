@@ -775,6 +775,135 @@ fn empty_role_state_for_test() -> ContextRoleState {
 }
 
 impl PerContextState {
+    // -------------------------------------------------------------------
+    // Legacy accessor surface (ADR-049 Phase 2A finalization keystone)
+    //
+    // The legacy `state::PerContextState` exposed these accessors so the
+    // transitional query-handler shim and supervisor's messaging
+    // dispatch could borrow into the locked state. After the type
+    // unification (commit 12 phase 2A finalization — type unification,
+    // single PerContextState), the actor type carries the same fields
+    // directly; these inherent methods are preserved to keep the
+    // accessor surface stable while subsequent finalization commits
+    // delete the shim and supervisor's contexts DashMap. Every
+    // accessor returns a `&` borrow — mutating paths touch fields
+    // directly.
+    // -------------------------------------------------------------------
+
+    /// Membership state — live `MembershipState` tracking members,
+    /// pseudonyms, and per-member sequence numbers. Mirrors the legacy
+    /// `state::PerContextState::membership()` accessor.
+    #[must_use]
+    pub(crate) const fn membership(&self) -> &MembershipState {
+        &self.membership
+    }
+
+    /// Role / ceiling / assignment state.
+    #[must_use]
+    pub(crate) const fn role_state(&self) -> &ContextRoleState {
+        &self.role_state
+    }
+
+    /// Optional pseudonym routing ID (§9.10.4). `None` for legacy callers
+    /// and broadcast contexts.
+    #[must_use]
+    pub(crate) const fn local_pseudonym(&self) -> Option<&[u8; 32]> {
+        self.local_pseudonym.as_ref()
+    }
+
+    /// Broadcast-mode roster + admission policy state. `None` for
+    /// encrypted contexts.
+    #[must_use]
+    pub(crate) const fn broadcast_context(&self) -> Option<&ProtocolBroadcastContext> {
+        self.broadcast_context.as_ref()
+    }
+
+    /// Context handle — `ContextParams` (session cap, nesting depth,
+    /// chain depth, etc.) + protocol-level state machine.
+    #[must_use]
+    pub(crate) const fn handle(&self) -> &ContextHandle {
+        &self.handle
+    }
+
+    /// Pending MLS Commit retry queue (PR #1606 C6 surface). Read-only
+    /// view; mutation happens in the governance-timeout task.
+    #[must_use]
+    pub(crate) const fn pending_commits(&self) -> &VecDeque<PendingCommit> {
+        &self.pending_commits
+    }
+
+    /// Active commit fault marker. `Some` iff the most recent Commit
+    /// broadcast exhausted its retry budget.
+    #[must_use]
+    pub(crate) const fn commit_fault(&self) -> Option<&CommitFaultMarker> {
+        self.commit_fault.as_ref()
+    }
+
+    /// Per-member access-key store.
+    #[must_use]
+    pub(crate) const fn access_key_store(&self) -> &AccessKeyStore {
+        &self.access.access_key_store
+    }
+
+    /// Per-member budget tracker. Exposed for `#[cfg(feature = "testing")]`
+    /// assertions that verify the governance-economy bridge consumed
+    /// budget for a tool invocation.
+    #[must_use]
+    pub(crate) const fn budget_tracker(
+        &self,
+    ) -> &scp_protocol::economy::budget::MemberBudgetTracker {
+        &self.governance.budget_tracker
+    }
+
+    /// Per-member velocity tracker. Same scope and rationale as
+    /// [`Self::budget_tracker`].
+    #[must_use]
+    pub(crate) const fn velocity_tracker(
+        &self,
+    ) -> &scp_protocol::economy::antispam::SenderVelocityTracker {
+        &self.governance.velocity_tracker
+    }
+
+    /// Mutable send-sequence tracker (ADR-049 commit 8). Caller passes
+    /// this to [`crate::context::actor::SequenceReservation::reserve`]
+    /// to reserve the next send-sequence number with RAII rollback.
+    #[must_use]
+    pub(crate) const fn send_tracker_mut(&mut self) -> &mut SendSequenceTracker {
+        &mut self.send_tracker
+    }
+
+    /// Last-issued send sequence (read-only). Convenience for the shim
+    /// integration test to assert the reservation advanced / rolled
+    /// back as expected without constructing a full tracker borrow.
+    /// Gated on the `testing` feature so the accessor is never part of
+    /// production call graphs.
+    #[must_use]
+    #[cfg(feature = "testing")]
+    pub(crate) const fn send_tracker_last_issued(&self) -> u64 {
+        self.send_tracker.last_issued()
+    }
+
+    /// Pushes an event to the receive buffer and, if a broadcast channel
+    /// is provided, sends a sanitized copy there too. Mirrors the
+    /// security invariants of the standalone
+    /// [`crate::context::state::emit_event_into`] helper:
+    ///
+    /// - `WelcomeGenerated` events carry MLS key material and are NEVER
+    ///   sent on the broadcast channel (receive buffer only).
+    /// - `MessageReceived` / `MessageSent` payloads contain decrypted
+    ///   plaintext and are stripped (replaced with empty `Vec`) before
+    ///   broadcast to preserve encryption-as-access-control.
+    pub(crate) fn emit_event(
+        &mut self,
+        event: scp_protocol::context::membership::ContextEvent,
+        context_id: &str,
+        tx: Option<
+            &tokio::sync::broadcast::Sender<(String, scp_protocol::context::membership::ContextEvent)>,
+        >,
+    ) {
+        crate::context::state::emit_event_into(&mut self.receive_buffer, event, context_id, tx);
+    }
+
     /// Construct a fresh encrypted-mode actor state for test use. Populates
     /// every field with a sensible default (empty collections, zero
     /// counters, `None` optionals). The production construction path for
