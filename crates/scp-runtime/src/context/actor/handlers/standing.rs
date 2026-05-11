@@ -4,12 +4,14 @@
 //!
 //! # Phase 2A.2 — actor-shape dispatch
 //!
-//! The handler's primary entry point [`dispatch`] takes
+//! The handler's entry point [`dispatch`] takes
 //! `(&ActorDeps, StandingCommand)` and routes variants to migrated
-//! actor-shape helpers in
-//! [`crate::context::standing_helpers`]. The shim entry point is
-//! retained during Phase 2A and routes through
-//! [`crate::context::standing_helpers_legacy`].
+//! actor-shape helpers in [`crate::context::standing_helpers`]. Phase
+//! 2A finalization deleted the supervisor-receiver shim
+//! (`dispatch_from_shim`); supervisor-scoped variants (count / has /
+//! register / reconnect-all) now route directly through
+//! `Supervisor::dispatch_standing_direct` in
+//! [`crate::context::supervisor::supervisor`].
 //!
 //! # SAGA WIRING DEFERRED — see
 //! `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`.
@@ -40,7 +42,6 @@ use tokio::sync::oneshot;
 use crate::context::actor::commands::StandingCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
-use crate::context::supervisor::Supervisor;
 
 /// Per-call transport budget for standing handlers. Plan §"Transport
 /// timeouts inside actor handlers": 30 seconds.
@@ -50,18 +51,6 @@ pub const HANDLER_TIMEOUT: Duration = Duration::from_secs(30);
 /// capability-reduced dependencies.
 pub async fn dispatch(deps: &ActorDeps, cmd: StandingCommand) -> Outcome<()> {
     Box::pin(dispatch_inner(deps, cmd)).await
-}
-
-/// Shim-callable dispatch. Used by
-/// [`Supervisor::dispatch_standing_command`](crate::context::supervisor::supervisor::Supervisor::dispatch_standing_command)
-/// during the commits-11-to-11.5 migration window.
-///
-/// # Supervisor receiver (ADR-049 commit 12)
-pub(crate) async fn dispatch_from_shim(
-    supervisor: &Supervisor,
-    cmd: StandingCommand,
-) -> Outcome<()> {
-    Box::pin(dispatch_from_shim_inner(supervisor, cmd)).await
 }
 
 async fn dispatch_inner(deps: &ActorDeps, cmd: StandingCommand) -> Outcome<()> {
@@ -83,30 +72,6 @@ async fn dispatch_inner(deps: &ActorDeps, cmd: StandingCommand) -> Outcome<()> {
         }
         StandingCommand::ReconnectAllStanding { reply } => {
             handle_reconnect_all_standing(deps, reply).await
-        }
-        StandingCommand::InitiateStandingPairCreate { reply, .. } => reply_saga_deferred(reply),
-    }
-}
-
-async fn dispatch_from_shim_inner(supervisor: &Supervisor, cmd: StandingCommand) -> Outcome<()> {
-    match cmd {
-        StandingCommand::Placeholder { reply } => reply_not_implemented(reply),
-        StandingCommand::StandingContext {
-            local_did,
-            peer_did,
-            reply,
-        } => shim_handle_standing_context(supervisor, local_did, peer_did, reply).await,
-        StandingCommand::StandingContextCount { reply } => {
-            shim_handle_standing_context_count(supervisor, reply).await
-        }
-        StandingCommand::HasStandingContext { peer_did, reply } => {
-            shim_handle_has_standing_context(supervisor, peer_did, reply).await
-        }
-        StandingCommand::RegisterStandingContext { peer_did, reply } => {
-            shim_handle_register_standing_context(supervisor, peer_did, reply).await
-        }
-        StandingCommand::ReconnectAllStanding { reply } => {
-            shim_handle_reconnect_all_standing(supervisor, reply).await
         }
         StandingCommand::InitiateStandingPairCreate { reply, .. } => reply_saga_deferred(reply),
     }
@@ -227,138 +192,6 @@ async fn handle_reconnect_all_standing(
     reply: oneshot::Sender<Result<usize, ContextError>>,
 ) -> Outcome<()> {
     let reconnect_fut = crate::context::standing_helpers::reconnect_all_standing(deps);
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reconnect_fut).await {
-        Ok(Ok(count)) => (Outcome::ok_mutated(()), Ok(count)),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "reconnect_all_standing exceeded {HANDLER_TIMEOUT:?} budget"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_standing_context(
-    supervisor: &Supervisor,
-    local_did: scp_identity::DID,
-    peer_did: scp_identity::DID,
-    reply: oneshot::Sender<Result<String, ContextError>>,
-) -> Outcome<()> {
-    let standing_fut = async {
-        crate::context::standing_helpers_legacy::standing_context_legacy(
-            supervisor, &local_did, &peer_did,
-        )
-        .await
-    };
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, standing_fut).await {
-        Ok(Ok(ctx_id)) => (Outcome::ok_mutated(()), Ok(ctx_id)),
-        Ok(Err(e)) => {
-            let sketch = outcome_error_sketch(&e);
-            (Outcome::err_mutated(sketch), Err(e))
-        }
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "standing_context exceeded {HANDLER_TIMEOUT:?} budget"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_standing_context_count(
-    supervisor: &Supervisor,
-    reply: oneshot::Sender<Result<usize, ContextError>>,
-) -> Outcome<()> {
-    let count_fut =
-        crate::context::standing_helpers_legacy::standing_context_count_legacy(supervisor);
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, count_fut).await {
-        Ok(count) => (Outcome::ok(()), Ok(count)),
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "standing_context_count exceeded {HANDLER_TIMEOUT:?} budget"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_has_standing_context(
-    supervisor: &Supervisor,
-    peer_did: scp_identity::DID,
-    reply: oneshot::Sender<Result<bool, ContextError>>,
-) -> Outcome<()> {
-    let has_fut = async {
-        crate::context::standing_helpers_legacy::has_standing_context_legacy(supervisor, &peer_did)
-            .await
-    };
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, has_fut).await {
-        Ok(has) => (Outcome::ok(()), Ok(has)),
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "has_standing_context exceeded {HANDLER_TIMEOUT:?} budget"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_register_standing_context(
-    supervisor: &Supervisor,
-    peer_did: scp_identity::DID,
-    reply: oneshot::Sender<Result<(), ContextError>>,
-) -> Outcome<()> {
-    let register_fut = async {
-        crate::context::standing_helpers_legacy::register_standing_context_legacy(
-            supervisor, peer_did,
-        )
-        .await;
-    };
-
-    let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, register_fut).await {
-        Ok(()) => (Outcome::ok_mutated(()), Ok(())),
-        Err(_elapsed) => {
-            let err = ContextError::TransportTimeout(format!(
-                "register_standing_context exceeded {HANDLER_TIMEOUT:?} budget"
-            ));
-            let sketch = outcome_error_sketch(&err);
-            (Outcome::err_mutated(sketch), Err(err))
-        }
-    };
-
-    let _ = reply.send(reply_result);
-    outcome
-}
-
-async fn shim_handle_reconnect_all_standing(
-    supervisor: &Supervisor,
-    reply: oneshot::Sender<Result<usize, ContextError>>,
-) -> Outcome<()> {
-    let reconnect_fut =
-        crate::context::standing_helpers_legacy::reconnect_all_standing_legacy(supervisor);
 
     let (outcome, reply_result) = match tokio::time::timeout(HANDLER_TIMEOUT, reconnect_fut).await {
         Ok(Ok(count)) => (Outcome::ok_mutated(()), Ok(count)),

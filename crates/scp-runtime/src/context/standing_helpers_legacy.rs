@@ -5,61 +5,38 @@
 // the lint crate-locally keeps the hoist byte-identical to the legacy behavior.
 #![allow(clippy::significant_drop_tightening)]
 
-//! Standing-context helpers with explicit-collaborator signatures
-//! (ADR-049 commit 12).
+//! Standing-context legacy survivors
+//! (ADR-049 Phase 2A finalization).
 //!
 //! # Purpose
 //!
-//! This module hoists the standing-domain methods that the actor handler
-//! in [`crate::context::actor::handlers::standing`] currently reaches via
-//! `view.manager().X(...)`. After ADR-049 commit 12 (`ContextManager`
-//! deletion) every helper takes `&Supervisor`; Phase 2 of the
-//! post-review-round-1 plan will retarget the handler-side helpers to
-//! `&mut PerContextState + &ActorDeps`.
+//! Phase 2A finalization eliminated the supervisor-receiver shim for
+//! standing commands — every [`StandingCommand`] now routes through the
+//! per-context actor mailbox (variants carrying `(local_did, peer_did)`)
+//! or directly through `Supervisor::dispatch_standing_direct` (the
+//! supervisor-scoped variants). The bulk of the legacy `&Supervisor`
+//! lock-and-call standing helpers (`standing_context_count_legacy`,
+//! `has_standing_context_legacy`, `register_standing_context_legacy`)
+//! were deleted with that shim.
 //!
-//! This file is the standing counterpart to
-//! [`crate::context::messaging_helpers`] (12b.1, 12c.1, 12c.1b),
-//! [`crate::context::lifecycle_helpers`] (12c.2),
-//! [`crate::context::governance_helpers`] (12c.3b),
-//! [`crate::context::economy_helpers`] (12c.3a), and
-//! [`crate::context::trust_recovery_helpers`] (12c.3a).
+//! Two functions survive:
 //!
-//! # Behavior preservation
-//!
-//! Every hoisted free function is **behavior-preserving by construction**.
-//! Its body is a verbatim copy of the legacy inherent method's body with
-//! `self.X` replaced by either:
-//!
-//! - `manager_methods::X(supervisor, ...)` /
-//!   `<domain>_helpers::X(supervisor, ...)` for the cross-domain and
-//!   per-domain free-function helpers hoisted from `ContextManager` in
-//!   ADR-049 commit 12c.9g.1 (helper bodies migrated to direct calls in
-//!   commit 12c.9g.2; no `mgr` derivation), or
-//! - `supervisor.X_ref().ok_or(NotInitialized)?` for provider slots
-//!   lifted to the supervisor in ADR-049 commit 12c.9a-9b.
-//!
-//! The legacy inherent methods on
-//! [`Supervisor`](crate::context::supervisor::Supervisor) remain as
-//! one-line forwarders; they are deleted alongside the outer shim in a
-//! later ADR-049 commit when the actor handler body owns the standing
-//! path directly.
-//!
-//! # Top-level methods hoisted (actor-handler entry points)
-//!
-//! [`standing_context`], [`standing_context_count`],
-//! [`has_standing_context`], [`register_standing_context`],
-//! [`reconnect_all_standing`].
-//!
-//! # Pure helpers (no `mgr` parameter)
-//!
-//! [`generate_standing_context_id`] is a pure function. It is re-exported
-//! from `manager/standing.rs` as well to preserve the legacy public path
-//! for test code that imports it directly.
+//! - [`standing_context_legacy`] — get-or-create standing context, called
+//!   from [`crate::context::supervisor::handle::SupervisorHandle::standing_context`]
+//!   (which is what the actor-shape `standing_helpers::standing_context`
+//!   delegates to) and from `Supervisor::dispatch_standing_direct`. The
+//!   creation path still routes through
+//!   [`crate::context::lifecycle_helpers_legacy::create_context_legacy`]
+//!   until standing-pair sagas land (deferred per
+//!   `.docs/adrs/DEFERRED-commit-11-saga-use-cases.md`).
+//! - [`reconnect_all_standing_legacy`] — fan-out reconnect across the
+//!   supervisor's standing index, called from
+//!   [`crate::context::supervisor::handle::SupervisorHandle::reconnect_all_standing`]
+//!   and from `Supervisor::dispatch_standing_direct`.
 
 use scp_identity::DID;
 use scp_protocol::context::templates::template_params;
 use scp_protocol::context::{ContextError, ContextState, TemplateId};
-use sha2::{Digest, Sha256};
 
 use crate::context::ContextHandle;
 use crate::context::supervisor::Supervisor;
@@ -71,43 +48,7 @@ use crate::context::{lifecycle_helpers_legacy, manager_methods};
 use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT;
 
 // ---------------------------------------------------------------------------
-// generate_standing_context_id (pure helper, no mgr parameter)
-// ---------------------------------------------------------------------------
-
-/// Generates a deterministic context ID for a standing context between two DIDs.
-///
-/// The ID is derived from both DIDs sorted lexicographically, ensuring the same
-/// context ID is generated regardless of which peer initiates. Uses a
-/// `standing:` prefix for namespace isolation and a truncated SHA-256 hash of
-/// the sorted DID pair for the unique portion.
-///
-/// Hoisted body of the legacy
-/// [`crate::context::standing_helpers::generate_standing_context_id`]
-/// free function (ADR-049 commit 12). The legacy free function remains
-/// as a thin re-export so test code importing the legacy path keeps
-/// working through the shim window.
-pub fn generate_standing_context_id(local_did: &DID, peer_did: &DID) -> String {
-    // Sort to ensure determinism regardless of direction.
-    let (a, b) = if local_did.as_ref() <= peer_did.as_ref() {
-        (local_did.as_ref(), peer_did.as_ref())
-    } else {
-        (peer_did.as_ref(), local_did.as_ref())
-    };
-    // Hash the sorted DIDs with the standing prefix for a stable, deterministic ID.
-    let mut hasher = Sha256::new();
-    hasher.update(b"standing:");
-    hasher.update(a.as_bytes());
-    hasher.update(b":");
-    hasher.update(b.as_bytes());
-    let hash = hasher.finalize();
-    // Use the full 32-byte hash to avoid birthday-bound collisions.
-    // Truncating to 8 bytes (64 bits) has a ~50% collision probability
-    // at ~5 billion standing contexts (birthday paradox).
-    format!("standing-{}", hex::encode(hash))
-}
-
-// ---------------------------------------------------------------------------
-// 1. standing_context (top-level, actor-handler entry point)
+// standing_context_legacy (top-level, production survivor)
 // ---------------------------------------------------------------------------
 
 /// Returns an existing standing context or creates a new one (contact graph).
@@ -125,7 +66,8 @@ pub async fn standing_context_legacy(
     local_did: &DID,
     peer_did: &DID,
 ) -> Result<String, ContextError> {
-    let context_id = generate_standing_context_id(local_did, peer_did);
+    let context_id =
+        crate::context::standing_helpers::generate_standing_context_id(local_did, peer_did);
 
     // Step 1: Check if the context exists and is Active/Creating.
     //
@@ -232,65 +174,7 @@ pub async fn standing_context_legacy(
 }
 
 // ---------------------------------------------------------------------------
-// 2. standing_context_count (top-level, actor-handler entry point)
-// ---------------------------------------------------------------------------
-
-/// Returns the number of tracked standing contexts.
-///
-/// Hoisted body of the legacy `ContextManager::standing_context_count`
-/// method. `async` is preserved (despite no `await` after the lock-free
-/// migration) to keep the signature symmetric with the rest of the
-/// standing-domain helpers and the legacy actor-handler entry point.
-#[allow(clippy::unused_async)]
-pub async fn standing_context_count_legacy(supervisor: &Supervisor) -> usize {
-    // Lock-free read (ADR-049 §Decision 12).
-    supervisor.standing_contexts_ref().load().len()
-}
-
-// ---------------------------------------------------------------------------
-// 3. has_standing_context (top-level, actor-handler entry point)
-// ---------------------------------------------------------------------------
-
-/// Returns `true` if a standing context exists for the given peer DID.
-///
-/// Hoisted body of the legacy `ContextManager::has_standing_context`
-/// method. `async` is preserved (despite no `await` after the
-/// lock-free migration) to match the rest of the standing-domain
-/// helper signatures.
-#[allow(clippy::unused_async)]
-pub async fn has_standing_context_legacy(supervisor: &Supervisor, peer_did: &DID) -> bool {
-    // Lock-free read (ADR-049 §Decision 12).
-    supervisor
-        .standing_contexts_ref()
-        .load()
-        .contains_key(peer_did.as_ref())
-}
-
-// ---------------------------------------------------------------------------
-// 4. register_standing_context (top-level, actor-handler entry point)
-// ---------------------------------------------------------------------------
-
-/// Registers an existing context as a standing context.
-///
-/// Used during startup to restore standing contexts from persisted state.
-/// The context must be a `bilateral-persistent` context already registered
-/// in the manager's `contexts` map.
-///
-/// Hoisted body of the legacy
-/// [`ContextManager::register_standing_context`](crate::context::standing_helpers::register_standing_context).
-pub async fn register_standing_context_legacy(supervisor: &Supervisor, peer_did: DID) {
-    // ArcSwap+write_lock pattern (ADR-049 §Decision 12).
-    let _guard = supervisor.write_lock.lock().await;
-    let snapshot = supervisor.standing_contexts_ref().load_full();
-    let mut updated: std::collections::HashMap<String, DID> = (*snapshot).clone();
-    updated.insert(peer_did.to_string(), peer_did);
-    supervisor
-        .standing_contexts_ref()
-        .store(std::sync::Arc::new(updated));
-}
-
-// ---------------------------------------------------------------------------
-// 5. reconnect_all_standing (top-level, actor-handler entry point)
+// reconnect_all_standing (top-level, production survivor)
 // ---------------------------------------------------------------------------
 
 /// Reconnects transport for all active standing contexts.
@@ -336,7 +220,8 @@ pub async fn reconnect_all_standing_legacy(supervisor: &Supervisor) -> Result<us
     let mut handles: Vec<(String, ContextHandle)> = Vec::new();
     for (_key, peer_did) in &standing_entries {
         for local_did in &local_did_list {
-            let context_id = generate_standing_context_id(local_did, peer_did);
+            let context_id =
+                crate::context::standing_helpers::generate_standing_context_id(local_did, peer_did);
             if let Ok(arc) = manager_methods::get_context_arc(supervisor, &context_id) {
                 let ctx = arc.lock().await;
                 handles.push((context_id, ctx.handle.clone()));
@@ -392,7 +277,9 @@ pub async fn reconnect_all_standing_legacy(supervisor: &Supervisor) -> Result<us
             .iter()
             .filter(|(_key, peer_did)| {
                 local_did_set.iter().any(|local_did| {
-                    let cid = generate_standing_context_id(local_did, peer_did);
+                    let cid = crate::context::standing_helpers::generate_standing_context_id(
+                        local_did, peer_did,
+                    );
                     terminal_context_ids.contains(&cid)
                 })
             })
