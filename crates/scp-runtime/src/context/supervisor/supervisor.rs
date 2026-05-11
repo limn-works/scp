@@ -3620,4 +3620,63 @@ mod tests {
         let _ = h1.send_shutdown().await;
         let _ = h2.send_shutdown().await;
     }
+
+    // -----------------------------------------------------------------
+    // ADR-049 Phase 2A finalization — `spawn_actor_dashmap_backed` tests
+    // -----------------------------------------------------------------
+
+    /// Insert a per-context entry through the legacy manager-methods
+    /// path so `spawn_actor_dashmap_backed` has something to look up.
+    /// Returns the supervisor's stringified context-id key.
+    async fn seed_dashmap_context(supervisor: &Arc<Supervisor>, ctx_id_bytes: [u8; 32]) -> String {
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        // `insert_context` produces the canonical String key by taking
+        // the caller's argument verbatim; we mirror that here.
+        let key = hex::encode(ctx_id_bytes);
+        crate::context::manager_methods::insert_context(supervisor, key.clone(), state)
+            .expect("seed insert must succeed");
+        key
+    }
+
+    #[tokio::test]
+    async fn spawn_actor_dashmap_backed_registers_handle_for_inserted_context() {
+        let supervisor_arc = supervisor_with_providers();
+        let ctx_id_bytes = [0x5Au8; 32];
+        let key = seed_dashmap_context(&supervisor_arc, ctx_id_bytes).await;
+
+        let deps = test_actor_deps(&supervisor_arc).await;
+        let handle = supervisor_arc
+            .spawn_actor_dashmap_backed(key.clone(), deps, None)
+            .await
+            .expect("dashmap-backed spawn must succeed for an inserted context");
+
+        assert!(
+            supervisor_arc.lookup(&key).is_some(),
+            "actor registry must contain a handle for the dashmap-backed actor"
+        );
+
+        let _ = handle.send_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn spawn_actor_dashmap_backed_rejects_unknown_context() {
+        let supervisor_arc = supervisor_with_providers();
+        let deps = test_actor_deps(&supervisor_arc).await;
+
+        // `ContextActorHandle` does not implement `Debug`, so we
+        // pattern-match on the `Result` rather than calling
+        // `expect_err` (which requires `Debug` on the `Ok` variant).
+        let result = supervisor_arc
+            .spawn_actor_dashmap_backed("ctx-does-not-exist".to_owned(), deps, None)
+            .await;
+        match result {
+            Err(ContextError::ContextNotRegistered(ref s)) if s == "ctx-does-not-exist" => {}
+            Err(other) => panic!("expected ContextNotRegistered, got {other:?}"),
+            Ok(_) => panic!("expected error, got Ok"),
+        }
+    }
 }
