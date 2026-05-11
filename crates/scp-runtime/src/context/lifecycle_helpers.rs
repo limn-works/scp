@@ -1141,6 +1141,24 @@ pub async fn create_context(
     // contains_key and insert. Stamps a fresh generation atomically.
     deps.supervisor
         .insert_context(context_id.clone(), per_context)?;
+
+    // ADR-049 Phase 2A finalization bootstrap dual-write: every
+    // production context construction now populates BOTH the legacy
+    // contexts DashMap (above) AND the actor registry. The actor
+    // proxies its state through the same `Arc<Mutex<PerContextState>>`
+    // the DashMap holds (`new_dashmap_backed` semantics — see
+    // `Supervisor::spawn_actor_dashmap_backed`), so there is no
+    // divergence during the transition window. Subsequent finalization
+    // sessions delete the DashMap once every legacy consumer is
+    // ported. Bootstrap keeps its `&ActorDeps` borrow alive for
+    // `finalize_create` below; `clone_for_spawn` hands the actor task
+    // an owned bundle without disturbing that borrow.
+    let owned_deps = deps.clone_for_spawn();
+    deps.supervisor
+        .spawn_actor_for_context(context_id.clone(), owned_deps)
+        .await
+        .map_err(|e| ContextCreationError::CreationFailed(e.to_string()))?;
+
     finalize_create(deps, &context_id, params.ttl, &handle).await;
     Ok(handle)
 }

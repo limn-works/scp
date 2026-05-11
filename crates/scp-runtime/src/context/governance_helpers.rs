@@ -2313,125 +2313,164 @@ pub fn execute_modify_hard_rate_limit(
 // execute_propose_context_migration (per-action leaf helper)
 // ---------------------------------------------------------------------------
 
+/// Execute the `ProposeContextMigration` governance action.
+///
+/// Returns a hand-boxed `Pin<Box<dyn Future + Send>>` rather than the
+/// usual `async fn` opaque-type future. This signature is mechanical
+/// (ADR-049 Phase 2A finalization bootstrap dual-write): the function
+/// is reachable from `ContextActor::run()` via the migrated governance
+/// dispatch, AND it transitively calls
+/// `lifecycle_helpers::create_context` which now spawns a
+/// `ContextActor::run()` task through
+/// `Supervisor::spawn_actor_dashmap_backed`. The recursive Send-inference
+/// cycle through opaque async-fn types fails to converge; a named
+/// `dyn Future + Send` return type erases the opaque chain and lets the
+/// spawned actor's `.run()` future be provably `Send`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-pub async fn execute_propose_context_migration(
-    state: &mut PerContextState,
-    deps: &ActorDeps,
-    context_id: &str,
-    new_context_params: &scp_protocol::context::params::ContextParams,
-    reason: &str,
+pub fn execute_propose_context_migration<'a>(
+    state: &'a mut PerContextState,
+    deps: &'a ActorDeps,
+    context_id: &'a str,
+    new_context_params: &'a scp_protocol::context::params::ContextParams,
+    reason: &'a str,
     grace_period_secs: u64,
     auto_invite: bool,
     proposal_id: ProposalId,
-    actor_did: &str,
-) -> Result<MigrationProposedResult, ContextError> {
-    let context_id_bytes = context_id_to_bytes(context_id);
+    actor_did: &'a str,
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<MigrationProposedResult, ContextError>> + Send + 'a,
+    >,
+> {
+    Box::pin(async move {
+        let context_id_bytes = context_id_to_bytes(context_id);
 
-    let destination_context_id = {
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(b"SCP-MIGRATION-DEST:");
-        hasher.update(context_id.as_bytes());
-        hasher.update(proposal_id);
-        hex::encode(hasher.finalize())
-    };
+        let destination_context_id = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(b"SCP-MIGRATION-DEST:");
+            hasher.update(context_id.as_bytes());
+            hasher.update(proposal_id);
+            hex::encode(hasher.finalize())
+        };
 
-    let now = deps.clock.now_secs();
-    let grace_period_end = now.saturating_add(grace_period_secs);
+        let now = deps.clock.now_secs();
+        let grace_period_end = now.saturating_add(grace_period_secs);
 
-    let mut dest_params = new_context_params.clone();
-    dest_params.migration_source = Some(scp_protocol::context::params::MigrationSource {
-        source_context_id: context_id.to_owned(),
-        proposal_id,
-    });
+        let mut dest_params = new_context_params.clone();
+        dest_params.migration_source = Some(scp_protocol::context::params::MigrationSource {
+            source_context_id: context_id.to_owned(),
+            proposal_id,
+        });
 
-    require_active(&state.handle)?;
+        require_active(&state.handle)?;
 
-    if state.migration_state.is_some() {
-        return Err(ContextError::PermissionDenied(
-            "context migration is already in progress".to_owned(),
+        if state.migration_state.is_some() {
+            return Err(ContextError::PermissionDenied(
+                "context migration is already in progress".to_owned(),
+            ));
+        }
+
+        let creator = state
+            .membership
+            .members()
+            .find(|m| m.role_name == "admin")
+            .map(|m| m.did.clone())
+            .ok_or_else(|| {
+                ContextError::PermissionDenied(
+                    "no admin found in source context for destination creation".to_owned(),
+                )
+            })?;
+
+        state
+            .handle
+            .transition_to(&ContextState::MigratingOut)
+            .await
+            .map_err(|_| {
+                ContextError::PermissionDenied("cannot transition to MigratingOut".to_owned())
+            })?;
+
+        state.migration_state = Some(MigrationState {
+            destination_context_id: destination_context_id.clone(),
+            reason: reason.to_owned(),
+            grace_period_end,
+            auto_invite,
+            proposal_id,
+        });
+
+        let buffer_len_before_migration = state.receive_buffer.len();
+
+        // Buffer migration events WITHOUT broadcasting (rollback-able block).
+        let proposed_event = ContextEvent::ContextMigrationProposed {
+            destination_context_id: destination_context_id.clone(),
+            reason: reason.to_owned(),
+            grace_period_secs,
+            auto_invite,
+            proposal_id,
+        };
+        let started_event = ContextEvent::ContextMigrationStarted {
+            destination_context_id: destination_context_id.clone(),
+            grace_period_end,
+        };
+        state.receive_buffer.push(proposed_event.clone());
+        state.receive_buffer.push(started_event.clone());
+
+        // Phase 2A.9: lifecycle_helpers::create_context is now actor-shape
+        // (bootstrap form — constructs fresh PerContextState, registers
+        // through SupervisorHandle).
+        //
+        // Type-erased `Pin<Box<dyn Future + Send>>` breaks the
+        // Send-inference auto-trait cycle: this helper is reachable from
+        // `ContextActor::run()` via the migrated governance dispatch, AND
+        // `create_context` (Phase 2A finalization bootstrap dual-write)
+        // spawns a `ContextActor::run()` task through
+        // `Supervisor::spawn_actor_dashmap_backed`. Erasing the inner
+        // future type here shields auto-trait propagation from chasing the
+        // cycle.
+        let create_fut: std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::context::ContextHandle,
+                            scp_protocol::context::builder::ContextCreationError,
+                        >,
+                    > + Send,
+            >,
+        > = Box::pin(crate::context::lifecycle_helpers::create_context(
+            deps,
+            destination_context_id.clone(),
+            dest_params,
+            creator,
+            None,
         ));
-    }
+        if let Err(e) = create_fut.await {
+            // Roll back: revert source to Active and clear migration state.
+            let _ = state.handle.transition_to(&ContextState::Active).await;
+            state.migration_state = None;
+            state.receive_buffer.truncate(buffer_len_before_migration);
+            return Err(ContextError::PermissionDenied(format!(
+                "failed to create destination context: {e}"
+            )));
+        }
 
-    let creator = state
-        .membership
-        .members()
-        .find(|m| m.role_name == "admin")
-        .map(|m| m.did.clone())
-        .ok_or_else(|| {
-            ContextError::PermissionDenied(
-                "no admin found in source context for destination creation".to_owned(),
-            )
-        })?;
+        // Broadcast the migration events that were buffered above.
+        if let Some(tx) = deps.event_tx.as_ref() {
+            let _ = tx.send((context_id.to_owned(), strip_event_payload(&proposed_event)));
+            let _ = tx.send((context_id.to_owned(), strip_event_payload(&started_event)));
+        }
 
-    state
-        .handle
-        .transition_to(&ContextState::MigratingOut)
-        .await
-        .map_err(|_| {
-            ContextError::PermissionDenied("cannot transition to MigratingOut".to_owned())
-        })?;
+        crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
+        deps.event_log.append_context_event(
+            &context_id_bytes,
+            "ContextMigrationStarted",
+            actor_did,
+        )?;
+        state.checkpoint_events_since += 1;
 
-    state.migration_state = Some(MigrationState {
-        destination_context_id: destination_context_id.clone(),
-        reason: reason.to_owned(),
-        grace_period_end,
-        auto_invite,
-        proposal_id,
-    });
-
-    let buffer_len_before_migration = state.receive_buffer.len();
-
-    // Buffer migration events WITHOUT broadcasting (rollback-able block).
-    let proposed_event = ContextEvent::ContextMigrationProposed {
-        destination_context_id: destination_context_id.clone(),
-        reason: reason.to_owned(),
-        grace_period_secs,
-        auto_invite,
-        proposal_id,
-    };
-    let started_event = ContextEvent::ContextMigrationStarted {
-        destination_context_id: destination_context_id.clone(),
-        grace_period_end,
-    };
-    state.receive_buffer.push(proposed_event.clone());
-    state.receive_buffer.push(started_event.clone());
-
-    // Phase 2A.9: lifecycle_helpers::create_context is now actor-shape
-    // (bootstrap form — constructs fresh PerContextState, registers
-    // through SupervisorHandle).
-    if let Err(e) = crate::context::lifecycle_helpers::create_context(
-        deps,
-        destination_context_id.clone(),
-        dest_params,
-        creator,
-        None,
-    )
-    .await
-    {
-        // Roll back: revert source to Active and clear migration state.
-        let _ = state.handle.transition_to(&ContextState::Active).await;
-        state.migration_state = None;
-        state.receive_buffer.truncate(buffer_len_before_migration);
-        return Err(ContextError::PermissionDenied(format!(
-            "failed to create destination context: {e}"
-        )));
-    }
-
-    // Broadcast the migration events that were buffered above.
-    if let Some(tx) = deps.event_tx.as_ref() {
-        let _ = tx.send((context_id.to_owned(), strip_event_payload(&proposed_event)));
-        let _ = tx.send((context_id.to_owned(), strip_event_payload(&started_event)));
-    }
-
-    crate::context::messaging_helpers::persist_state_best_effort(state, deps, context_id);
-    deps.event_log
-        .append_context_event(&context_id_bytes, "ContextMigrationStarted", actor_did)?;
-    state.checkpoint_events_since += 1;
-
-    Ok(MigrationProposedResult {
-        destination_context_id,
-        grace_period_end,
+        Ok(MigrationProposedResult {
+            destination_context_id,
+            grace_period_end,
+        })
     })
 }
 
@@ -3221,6 +3260,11 @@ pub async fn dispatch_context_governance_action(
             grace_period_secs,
             auto_invite,
         } => {
+            // `execute_propose_context_migration` returns a hand-boxed
+            // `Pin<Box<dyn Future + Send>>` (rather than the usual
+            // `async fn` opaque-type future) so that this caller's own
+            // future remains provably `Send` — see the function-level
+            // doc for ADR-049 Phase 2A finalization rationale.
             let result = execute_propose_context_migration(
                 state,
                 deps,
