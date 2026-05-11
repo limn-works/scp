@@ -903,6 +903,23 @@ impl Supervisor {
     ///   been attached yet — the caller must call
     ///   [`Self::with_providers`] first.
     pub async fn dispatch_query(&self, cmd: QueriesCommand) -> Result<Outcome<()>, ContextError> {
+        // ADR-049 Phase 2A finalization — try the actor mailbox first
+        // for variants that carry a per-context `context_id`. The
+        // actor's `run()` loop pulls the command, dispatches it through
+        // `handlers::queries::dispatch` (actor-shape, takes `&mut
+        // ActorPerContextState`), and writes the typed result to the
+        // embedded reply oneshot.
+        //
+        // `EventLogEntries` is a 32-byte hash with no per-context lock
+        // — it stays on the inline event-log path below. Unknown-
+        // context cases continue to surface the legacy soft / hard
+        // defaults via `dispatch_with_view`.
+        if let Some(ctx_id) = Self::queries_command_context_id(&cmd) {
+            let ctx_id_owned = ctx_id.to_owned();
+            if let Some(actor) = self.lookup(&ctx_id_owned) {
+                return Self::dispatch_via_mailbox(&actor, ContextCommand::Queries(cmd)).await;
+            }
+        }
         // Pre-lookup: variants that require a per-context lock all carry
         // a `context_id` field. We route by command variant to preserve
         // the legacy "context unknown = soft default" contract.
@@ -2398,66 +2415,129 @@ impl Supervisor {
     // calls.
     // -------------------------------------------------------------------
 
-    /// Passthrough to
-    /// [`crate::context::queries_helpers::member_count`] — returns the
-    /// current member count for `context_id`, or `None` if the context
-    /// is not registered.
+    /// Returns the current member count for `context_id`, or `None` if
+    /// the context is not registered. Routes through the actor mailbox
+    /// via [`Self::dispatch_query`].
     #[must_use]
     pub async fn member_count(&self, context_id: &str) -> Option<usize> {
-        crate::context::queries_helpers_legacy::member_count_legacy(self, context_id).await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::MemberCount {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return None;
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => None,
+        }
     }
 
-    /// Passthrough to [`crate::context::queries_helpers::is_member`] —
-    /// returns `true` iff `did` is a member of `context_id`.
+    /// Returns `true` iff `did` is a member of `context_id`. Routes
+    /// through the actor mailbox via [`Self::dispatch_query`].
     #[must_use]
     pub async fn is_member(&self, context_id: &str, did: &str) -> bool {
-        crate::context::queries_helpers_legacy::is_member_legacy(self, context_id, did).await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::IsMember {
+            context_id: context_id.to_owned(),
+            did: did.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return false;
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => false,
+        }
     }
 
-    /// Passthrough to
-    /// [`crate::context::queries_helpers::member_dids`] — returns every
-    /// member DID currently associated with `context_id` (empty if the
-    /// context is unknown).
+    /// Returns every member DID currently associated with `context_id`
+    /// (empty if the context is unknown). Routes through the actor
+    /// mailbox via [`Self::dispatch_query`].
     #[must_use]
     pub async fn member_dids(&self, context_id: &str) -> Vec<String> {
-        crate::context::queries_helpers_legacy::member_dids_legacy(self, context_id).await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::MemberDids {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return Vec::new();
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => Vec::new(),
+        }
     }
 
-    /// Passthrough to
-    /// [`crate::context::queries_helpers::member_role`] — returns the
-    /// role assignment for `did` in `context_id`, or `None` if the
-    /// member has no role.
+    /// Returns the role assignment for `did` in `context_id`, or `None`
+    /// if the member has no role. Routes through the actor mailbox via
+    /// [`Self::dispatch_query`].
     #[must_use]
     pub async fn member_role(
         &self,
         context_id: &str,
         did: &str,
     ) -> Option<scp_protocol::context::roles::RoleAssignment> {
-        crate::context::queries_helpers_legacy::member_role_legacy(self, context_id, did).await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::MemberRole {
+            context_id: context_id.to_owned(),
+            did: did.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return None;
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => None,
+        }
     }
 
-    /// Passthrough to
-    /// [`crate::context::queries_helpers::context_params`] — returns a
-    /// clone of the context's creation parameters, or `None` if the
-    /// context is unknown.
+    /// Returns a clone of the context's creation parameters, or `None`
+    /// if the context is unknown. Routes through the actor mailbox via
+    /// [`Self::dispatch_query`].
     #[must_use]
     pub async fn context_params(
         &self,
         context_id: &str,
     ) -> Option<scp_protocol::context::ContextParams> {
-        crate::context::queries_helpers_legacy::context_params_legacy(self, context_id).await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::ContextParams {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return None;
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => None,
+        }
     }
 
-    /// Passthrough to
-    /// [`crate::context::queries_helpers::get_role_state`] — returns a
-    /// clone of the context's role state, or `None` if the context is
-    /// unknown.
+    /// Returns a clone of the context's role state, or `None` if the
+    /// context is unknown. Routes through the actor mailbox via
+    /// [`Self::dispatch_query`].
     #[must_use]
     pub async fn get_role_state(
         &self,
         context_id: &str,
     ) -> Option<scp_protocol::context::roles::ContextRoleState> {
-        crate::context::queries_helpers_legacy::get_role_state_legacy(self, context_id).await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::GetRoleState {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return None;
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => None,
+        }
     }
 
     /// Drains and returns every event currently buffered for
@@ -2482,10 +2562,16 @@ impl Supervisor {
         }
     }
 
-    /// Passthrough to
-    /// [`crate::context::queries_helpers::event_log_entries`] —
-    /// returns the Merkle-log entries for the routing-id-hashed
-    /// `context_id_bytes`.
+    /// Returns the Merkle-log entries for the routing-id-hashed
+    /// `context_id_bytes`. Synchronous — reads the supervisor's shared
+    /// event-log provider directly without acquiring a per-context
+    /// lock or routing through any actor mailbox (the operation is
+    /// stateless w.r.t. per-context state).
+    ///
+    /// This is the lone read-only query that cannot ride the actor
+    /// mailbox because the signature is `fn`, not `async fn`: the FFI
+    /// sync paths that call it (Python `gil-bound` event-log probes,
+    /// notably) cannot `.await`.
     ///
     /// # Errors
     ///
@@ -2496,13 +2582,16 @@ impl Supervisor {
         context_id_bytes: &[u8; 32],
     ) -> Result<Option<Vec<crate::context::providers::event_log::EventLogEntry>>, ContextError>
     {
-        crate::context::queries_helpers_legacy::event_log_entries_legacy(self, context_id_bytes)
+        let event_log = self.event_log_ref().ok_or_else(|| {
+            ContextError::NotInitialized(
+                "Supervisor::event_log_entries — event_log provider not configured".to_owned(),
+            )
+        })?;
+        event_log.event_log_entries(context_id_bytes)
     }
 
-    /// Passthrough to
-    /// [`crate::context::queries_helpers::get_broadcast_key_for_local_author`]
-    /// — returns the broadcast sender key + epoch for `author_did` in
-    /// `context_id`.
+    /// Returns the broadcast sender key + epoch for `author_did` in
+    /// `context_id` via the actor mailbox.
     ///
     /// # Errors
     ///
@@ -2513,10 +2602,19 @@ impl Supervisor {
         context_id: &str,
         author_did: &str,
     ) -> Result<(Zeroizing<[u8; 32]>, u64), ContextError> {
-        crate::context::queries_helpers_legacy::get_broadcast_key_for_local_author_legacy(
-            self, context_id, author_did,
-        )
-        .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::GetBroadcastKeyForLocalAuthor {
+            context_id: context_id.to_owned(),
+            author_did: author_did.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_query(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::get_broadcast_key_for_local_author — actor reply channel closed"
+                    .to_owned(),
+            )
+        })?
     }
 
     /// Runtime-agnostic hard-rate-limit consumption used by FFI
@@ -2967,38 +3065,73 @@ impl Supervisor {
     // already imports them.
     // -------------------------------------------------------------------
 
-    /// Passthrough to [`crate::context::queries_helpers::local_pseudonym`].
+    /// Returns the local member's pseudonym routing ID (§9.10.4) for
+    /// `context_id`. Routes through the actor mailbox via
+    /// [`Self::dispatch_query`].
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] from the helper.
+    /// Propagates [`ContextError`] from the handler.
     pub async fn local_pseudonym(
         &self,
         context_id: &str,
     ) -> Result<Option<[u8; 32]>, ContextError> {
-        crate::context::queries_helpers_legacy::local_pseudonym_legacy(self, context_id).await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::LocalPseudonym {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        self.dispatch_query(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::local_pseudonym — actor reply channel closed".to_owned(),
+            )
+        })?
     }
 
-    /// Passthrough to
-    /// [`crate::context::queries_helpers::pending_commits`] — returns
-    /// every commit currently in the per-context retry queue.
+    /// Returns every commit currently in the per-context retry queue.
+    /// Soft-default contract: empty `Vec` on unknown context or
+    /// mailbox failure. Routes through the actor mailbox via
+    /// [`Self::dispatch_query`].
     #[must_use]
     pub async fn pending_commits(
         &self,
         context_id: &str,
     ) -> Vec<crate::context::state::PendingCommit> {
-        crate::context::queries_helpers_legacy::pending_commits_legacy(self, context_id).await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::PendingCommits {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return Vec::new();
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => Vec::new(),
+        }
     }
 
-    /// Passthrough to
-    /// [`crate::context::queries_helpers::commit_fault`] — returns the
-    /// active fail-close marker, if any.
+    /// Returns the active fail-close marker, if any. Soft-default
+    /// contract: `None` on unknown context or mailbox failure. Routes
+    /// through the actor mailbox via [`Self::dispatch_query`].
     #[must_use]
     pub async fn commit_fault(
         &self,
         context_id: &str,
     ) -> Option<crate::context::state::CommitFaultMarker> {
-        crate::context::queries_helpers_legacy::commit_fault_legacy(self, context_id).await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = QueriesCommand::CommitFault {
+            context_id: context_id.to_owned(),
+            reply: tx,
+        };
+        if self.dispatch_query(cmd).await.is_err() {
+            return None;
+        }
+        match rx.await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) | Err(_) => None,
+        }
     }
 
     /// Emits a `DegradedMode` event when an envelope's
@@ -3207,6 +3340,33 @@ impl Supervisor {
             ToolsCommand::TryConsumeHardRateLimit { context_id, .. }
             | ToolsCommand::RefundHardRateLimit { context_id, .. } => Some(context_id.as_str()),
             _ => None,
+        }
+    }
+
+    /// Extract the target context_id from a [`QueriesCommand`].
+    ///
+    /// Every per-context variant surfaces a `context_id` string;
+    /// [`QueriesCommand::EventLogEntries`] takes a 32-byte hash with no
+    /// per-context lock and returns `None` so it stays on the
+    /// supervisor's inline event-log path.
+    fn queries_command_context_id(cmd: &QueriesCommand) -> Option<&str> {
+        match cmd {
+            QueriesCommand::LocalPseudonym { context_id, .. }
+            | QueriesCommand::GetBroadcastKeyForLocalAuthor { context_id, .. }
+            | QueriesCommand::MemberCount { context_id, .. }
+            | QueriesCommand::IsMember { context_id, .. }
+            | QueriesCommand::MemberDids { context_id, .. }
+            | QueriesCommand::MemberRole { context_id, .. }
+            | QueriesCommand::ContextParams { context_id, .. }
+            | QueriesCommand::GetRoleState { context_id, .. }
+            | QueriesCommand::PendingCommits { context_id, .. }
+            | QueriesCommand::CommitFault { context_id, .. } => Some(context_id.as_str()),
+            QueriesCommand::EventLogEntries { .. } => None,
+            #[cfg(feature = "testing")]
+            QueriesCommand::GetAccessKey { context_id, .. }
+            | QueriesCommand::GetAllAccessKeys { context_id, .. }
+            | QueriesCommand::RemainingBudgetForTest { context_id, .. }
+            | QueriesCommand::VelocityForTest { context_id, .. } => Some(context_id.as_str()),
         }
     }
 }
