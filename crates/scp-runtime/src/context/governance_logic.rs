@@ -58,7 +58,7 @@ pub fn dispatch_consequences(
     let rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
 
     // Collect event log entries for consequence evaluation (ADR-017).
-    let events = event_log_entries_for_consequences(ctx, context_id, now, event_log);
+    let events = event_log_entries_for_consequences(&ctx.receive_buffer, context_id, now, event_log);
 
     // Evaluate which consequences are triggered.
     let triggered: Vec<TriggeredConsequence> =
@@ -66,8 +66,9 @@ pub fn dispatch_consequences(
 
     // Enforce the triggered consequences, passing the already-cloned rules
     // to avoid cloning again inside enforce_triggered_consequences.
+    let mut split = ConsequenceStateSplit::from_state(ctx);
     enforce_triggered_consequences(
-        ctx,
+        &mut split,
         &EnforceConsequencesCtx {
             context_id,
             member_did,
@@ -196,8 +197,9 @@ pub struct ConsequenceStateSplit<'a> {
 }
 
 impl<'a> ConsequenceStateSplit<'a> {
-    /// Build a split-borrow from the legacy [`PerContextState`].
-    pub const fn from_legacy(ctx: &'a mut PerContextState) -> Self {
+    /// Build a split-borrow from the unified [`PerContextState`]
+    /// (ADR-049 §Decision 1 — single PerContextState).
+    pub const fn from_state(ctx: &'a mut PerContextState) -> Self {
         Self {
             governance: &mut ctx.governance,
             role_state: &mut ctx.role_state,
@@ -251,23 +253,6 @@ pub struct EnforceConsequencesCtx<'a> {
 /// receive buffer pushes remain because they are still useful for
 /// in-session SDK observation.
 pub fn enforce_triggered_consequences(
-    ctx: &mut PerContextState,
-    args: &EnforceConsequencesCtx<'_>,
-) {
-    let mut split = ConsequenceStateSplit::from_legacy(ctx);
-    enforce_triggered_consequences_split(&mut split, args);
-}
-
-/// Actor-shape entry point for the consequence-enforcement chain. Drives
-/// the same body as [`enforce_triggered_consequences`] but accepts a
-/// pre-built [`ConsequenceStateSplit`] so the actor can construct the
-/// split-borrow directly from
-/// [`crate::context::actor::state::PerContextState`] without going
-/// through the legacy [`PerContextState`].
-///
-/// ADR-049 Phase 2A.7 — added so the actor-shape `messaging_helpers`
-/// can call the same enforcement pipeline.
-pub fn enforce_triggered_consequences_split(
     state: &mut ConsequenceStateSplit<'_>,
     args: &EnforceConsequencesCtx<'_>,
 ) {
@@ -729,25 +714,13 @@ const MAX_BUFFER_EVENTS_FOR_EVAL: usize = 100;
 /// `ContextEventLogProvider::event_log_entries()` returns `EventLogEntry`,
 /// not the raw `scp_event_log::Event` that consequence rules consume. The
 /// conversion is done here, bridging the gap between the two formats.
-pub fn event_log_entries_for_consequences(
-    ctx: &PerContextState,
-    context_id: &str,
-    now: u64,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
-) -> Vec<scp_event_log::Event> {
-    event_log_entries_for_consequences_split(&ctx.receive_buffer, context_id, now, event_log)
-}
-
-/// Actor-shape entry point for the event-log + receive-buffer merge used
-/// by consequence enforcement. Drives the same body as
-/// [`event_log_entries_for_consequences`] but accepts a borrowed
-/// [`ReceiveBuffer`] directly so the actor can call without going through
-/// the legacy [`PerContextState`].
-///
-/// ADR-049 Phase 2A.7 — added so the actor-shape `messaging_helpers`
-/// can run consequence evaluation against actor-owned buffers.
+/// Event-log + receive-buffer merge used by consequence enforcement
+/// (ADR-017, #1531). Takes a borrowed [`ReceiveBuffer`] directly so the
+/// caller may build it from sub-borrows of the unified
+/// [`PerContextState`] (ADR-049 §Decision 1) without holding the whole
+/// state across the merge.
 #[allow(clippy::too_many_lines)]
-pub fn event_log_entries_for_consequences_split(
+pub fn event_log_entries_for_consequences(
     receive_buffer: &ReceiveBuffer,
     context_id: &str,
     now: u64,
@@ -952,7 +925,7 @@ pub fn check_proposer_eligibility(
         let merkle_root = event_log
             .event_log_merkle_root(&context_id_bytes)
             .unwrap_or([0u8; 32]);
-        let events = event_log_entries_for_consequences(ctx, &context_id, now, event_log);
+        let events = event_log_entries_for_consequences(&ctx.receive_buffer, &context_id, now, event_log);
         if !events.is_empty() {
             match scp_protocol::trust::participation::compute_participation_record(
                 &events,

@@ -520,7 +520,7 @@ where
         let message_pricing = ctx.governance.message_pricing.clone();
 
         let events_snapshot = crate::context::governance_logic::event_log_entries_for_consequences(
-            ctx,
+            &ctx.receive_buffer,
             context_id,
             now_secs,
             event_log.as_ref(),
@@ -722,7 +722,7 @@ where
         let now = clock.now_secs();
         let events_for_consequences =
             crate::context::governance_logic::event_log_entries_for_consequences(
-                ctx,
+                &ctx.receive_buffer,
                 context_id,
                 now,
                 event_log.as_ref(),
@@ -738,8 +738,9 @@ where
             &consequence_rules,
         );
 
+        let mut split = crate::context::governance_logic::ConsequenceStateSplit::from_state(ctx);
         crate::context::governance_logic::enforce_triggered_consequences(
-            ctx,
+            &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {
                 context_id,
                 member_did: invoker_did,

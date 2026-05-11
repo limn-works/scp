@@ -410,7 +410,7 @@ pub fn run_buffered_post_delivery(
 
     let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
     if !consequence_rules.is_empty() {
-        let events = crate::context::governance_logic::event_log_entries_for_consequences_split(
+        let events = crate::context::governance_logic::event_log_entries_for_consequences(
             &state.receive_buffer,
             context_id,
             now,
@@ -425,7 +425,7 @@ pub fn run_buffered_post_delivery(
             receive_buffer: &mut state.receive_buffer,
             checkpoint_events_since: &mut state.checkpoint_events_since,
         };
-        crate::context::governance_logic::enforce_triggered_consequences_split(
+        crate::context::governance_logic::enforce_triggered_consequences(
             &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {
                 context_id,
@@ -1009,7 +1009,7 @@ pub fn finalize_send(
     );
 
     // Consequence enforcement.
-    let send_events = crate::context::governance_logic::event_log_entries_for_consequences_split(
+    let send_events = crate::context::governance_logic::event_log_entries_for_consequences(
         &state.receive_buffer,
         context_id,
         now,
@@ -1026,7 +1026,7 @@ pub fn finalize_send(
             receive_buffer: &mut state.receive_buffer,
             checkpoint_events_since: &mut state.checkpoint_events_since,
         };
-        crate::context::governance_logic::enforce_triggered_consequences_split(
+        crate::context::governance_logic::enforce_triggered_consequences(
             &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {
                 context_id,
@@ -1517,7 +1517,7 @@ pub fn deliver_message_and_drain_buffered(
         let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
         if !consequence_rules.is_empty() {
             let recv_events =
-                crate::context::governance_logic::event_log_entries_for_consequences_split(
+                crate::context::governance_logic::event_log_entries_for_consequences(
                     &state.receive_buffer,
                     context_id,
                     now,
@@ -1533,7 +1533,7 @@ pub fn deliver_message_and_drain_buffered(
                 receive_buffer: &mut state.receive_buffer,
                 checkpoint_events_since: &mut state.checkpoint_events_since,
             };
-            crate::context::governance_logic::enforce_triggered_consequences_split(
+            crate::context::governance_logic::enforce_triggered_consequences(
                 &mut split,
                 &crate::context::governance_logic::EnforceConsequencesCtx {
                     context_id,
@@ -1629,7 +1629,7 @@ pub fn deliver_message_and_drain_buffered(
     let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
     if !consequence_rules.is_empty() {
         let recv_events =
-            crate::context::governance_logic::event_log_entries_for_consequences_split(
+            crate::context::governance_logic::event_log_entries_for_consequences(
                 &state.receive_buffer,
                 context_id,
                 now,
@@ -1645,7 +1645,7 @@ pub fn deliver_message_and_drain_buffered(
             receive_buffer: &mut state.receive_buffer,
             checkpoint_events_since: &mut state.checkpoint_events_since,
         };
-        crate::context::governance_logic::enforce_triggered_consequences_split(
+        crate::context::governance_logic::enforce_triggered_consequences(
             &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {
                 context_id,

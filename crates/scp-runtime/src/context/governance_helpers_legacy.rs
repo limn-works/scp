@@ -382,7 +382,7 @@ pub async fn finalize_governance_action_legacy(
             // Update participation record after governance action (#1530).
             // Reuse the same event log entries for participation (finding #46).
             let gov_events = event_log_entries_for_consequences(
-                ctx,
+                &ctx.receive_buffer,
                 context_id,
                 supervisor
                     .clock_ref()
@@ -5693,7 +5693,7 @@ pub async fn evaluate_periodic_consequences_legacy(
             return;
         }
         let member_dids: Vec<DID> = ctx.membership.members().map(|m| m.did.clone()).collect();
-        let events = event_log_entries_for_consequences(ctx, ctx_id, now, event_log);
+        let events = event_log_entries_for_consequences(&ctx.receive_buffer, ctx_id, now, event_log);
         (rules, member_dids, events)
     };
     // Lock dropped — pure evaluation with no lock held.
@@ -5716,9 +5716,10 @@ pub async fn evaluate_periodic_consequences_legacy(
     let mut guard = ctx_arc.lock().await;
     let ctx = &mut *guard;
     let ctx = &mut *ctx;
+    let mut split = crate::context::governance_logic::ConsequenceStateSplit::from_state(ctx);
     for (member_did, triggered) in &results {
         enforce_triggered_consequences(
-            ctx,
+            &mut split,
             &EnforceConsequencesCtx {
                 context_id: ctx_id,
                 member_did,

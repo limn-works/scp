@@ -51,8 +51,8 @@ use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::governance_logic::ConsequenceStateSplit;
 use crate::context::governance_logic::{
-    EnforceConsequencesCtx, enforce_triggered_consequences_split,
-    event_log_entries_for_consequences_split,
+    EnforceConsequencesCtx, enforce_triggered_consequences,
+    event_log_entries_for_consequences,
 };
 use crate::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
@@ -2724,7 +2724,7 @@ fn actor_check_proposer_eligibility(
         let merkle_root = event_log
             .event_log_merkle_root(&context_id_bytes)
             .unwrap_or([0u8; 32]);
-        let events = event_log_entries_for_consequences_split(
+        let events = event_log_entries_for_consequences(
             &state.receive_buffer,
             &context_id,
             now,
@@ -3530,7 +3530,7 @@ pub fn finalize_governance_action(
         let now = deps.clock.now_secs();
         let rules = state.governance.consequence_rules.clone();
         if !rules.is_empty() {
-            let buf_events = event_log_entries_for_consequences_split(
+            let buf_events = event_log_entries_for_consequences(
                 &state.receive_buffer,
                 context_id,
                 now,
@@ -3565,7 +3565,7 @@ pub fn finalize_governance_action(
                 receive_buffer: &mut state.receive_buffer,
                 checkpoint_events_since: &mut state.checkpoint_events_since,
             };
-            enforce_triggered_consequences_split(
+            enforce_triggered_consequences(
                 &mut split,
                 &EnforceConsequencesCtx {
                     context_id,
@@ -3586,7 +3586,7 @@ pub fn finalize_governance_action(
                     receive_buffer: &mut state.receive_buffer,
                     checkpoint_events_since: &mut state.checkpoint_events_since,
                 };
-                enforce_triggered_consequences_split(
+                enforce_triggered_consequences(
                     &mut split,
                     &EnforceConsequencesCtx {
                         context_id,
@@ -3606,7 +3606,7 @@ pub fn finalize_governance_action(
     // Update participation record after governance action (#1530).
     {
         let now = deps.clock.now_secs();
-        let gov_events = event_log_entries_for_consequences_split(
+        let gov_events = event_log_entries_for_consequences(
             &state.receive_buffer,
             context_id,
             now,

@@ -533,12 +533,16 @@ pub fn run_buffered_post_delivery_legacy(
     let consequence_rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
     if !consequence_rules.is_empty() {
         let events = crate::context::governance_logic::event_log_entries_for_consequences(
-            ctx, context_id, now, event_log,
+            &ctx.receive_buffer,
+            context_id,
+            now,
+            event_log,
         );
         let triggered = evaluate_consequence_rules(&consequence_rules, &events, sender_did, now);
         let member_did = DID(sender_did.to_owned());
+        let mut split = crate::context::governance_logic::ConsequenceStateSplit::from_state(ctx);
         crate::context::governance_logic::enforce_triggered_consequences(
-            ctx,
+            &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {
                 context_id,
                 member_did: &member_did,
@@ -1367,7 +1371,7 @@ pub async fn finalize_send_legacy(
             // The same event snapshot is reused for both consequence evaluation
             // and participation record computation (finding #46 dedup).
             let send_events = crate::context::governance_logic::event_log_entries_for_consequences(
-                ctx,
+                &ctx.receive_buffer,
                 context_id,
                 now,
                 &**supervisor
@@ -1383,8 +1387,9 @@ pub async fn finalize_send_legacy(
                 sender_did.as_ref(),
                 now,
             );
+            let mut split = crate::context::governance_logic::ConsequenceStateSplit::from_state(ctx);
             crate::context::governance_logic::enforce_triggered_consequences(
-                ctx,
+                &mut split,
                 &crate::context::governance_logic::EnforceConsequencesCtx {
                     context_id,
                     member_did: sender_did,
@@ -1894,7 +1899,7 @@ pub async fn deliver_message_and_drain_buffered_legacy(
         let consequence_rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
         if !consequence_rules.is_empty() {
             let recv_events = crate::context::governance_logic::event_log_entries_for_consequences(
-                ctx,
+                &ctx.receive_buffer,
                 context_id,
                 now,
                 &**supervisor
@@ -1904,8 +1909,10 @@ pub async fn deliver_message_and_drain_buffered_legacy(
             let recv_triggered =
                 evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
             let recv_member_did = DID(sender_did.to_owned());
+            let mut split =
+                crate::context::governance_logic::ConsequenceStateSplit::from_state(ctx);
             crate::context::governance_logic::enforce_triggered_consequences(
-                ctx,
+                &mut split,
                 &crate::context::governance_logic::EnforceConsequencesCtx {
                     context_id,
                     member_did: &recv_member_did,
@@ -2041,7 +2048,7 @@ pub async fn deliver_message_and_drain_buffered_legacy(
     let consequence_rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
     if !consequence_rules.is_empty() {
         let recv_events = crate::context::governance_logic::event_log_entries_for_consequences(
-            ctx,
+            &ctx.receive_buffer,
             context_id,
             now,
             &**supervisor
@@ -2051,8 +2058,9 @@ pub async fn deliver_message_and_drain_buffered_legacy(
         let recv_triggered =
             evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
         let recv_member_did = DID(sender_did.to_owned());
+        let mut split = crate::context::governance_logic::ConsequenceStateSplit::from_state(ctx);
         crate::context::governance_logic::enforce_triggered_consequences(
-            ctx,
+            &mut split,
             &crate::context::governance_logic::EnforceConsequencesCtx {
                 context_id,
                 member_did: &recv_member_did,

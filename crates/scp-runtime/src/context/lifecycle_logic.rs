@@ -211,7 +211,10 @@ pub fn post_join_bookkeeping(
         .event_log_merkle_root(&context_id_bytes)
         .unwrap_or([0u8; 32]);
     let join_events = super::governance_logic::event_log_entries_for_consequences(
-        ctx, context_id, now, event_log,
+        &ctx.receive_buffer,
+        context_id,
+        now,
+        event_log,
     );
     if !join_events.is_empty()
         && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
@@ -353,7 +356,7 @@ pub fn post_join_bookkeeping_split(
     let merkle_root = event_log
         .event_log_merkle_root(&context_id_bytes)
         .unwrap_or([0u8; 32]);
-    let join_events = super::governance_logic::event_log_entries_for_consequences_split(
+    let join_events = super::governance_logic::event_log_entries_for_consequences(
         receive_buffer,
         context_id,
         now,
