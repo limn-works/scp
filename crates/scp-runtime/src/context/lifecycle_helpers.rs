@@ -1571,8 +1571,30 @@ pub async fn import_context(
     };
 
     // 7. Register the context atomically (replace-if-exists).
+    //
+    // Before swapping the legacy DashMap entry, despawn any per-
+    // context actor that was attached to the prior entry. The prior
+    // actor's `state_arc` field references the about-to-be-removed
+    // `Arc<Mutex<PerContextState>>`; once `replace_context` swaps in a
+    // fresh `Arc<Mutex<...>>`, the stale actor would silently keep
+    // serving the old state until its mailbox drains. Despawning
+    // first closes that window (the handle's drop closes the mpsc
+    // sender, which causes the actor's run-loop to exit on the next
+    // inbox-empty poll).
+    let _despawned = deps.supervisor.despawn_actor(&context_id).await;
     deps.supervisor
         .replace_context(context_id.clone(), per_context)
+        .await
+        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+    // ADR-049 Phase 2A finalization bootstrap dual-write: import path
+    // mirrors create/restore — populate the actor registry alongside
+    // the legacy contexts DashMap. The new dashmap-backed actor
+    // proxies the fresh `Arc<Mutex<PerContextState>>` registered by
+    // `replace_context` above.
+    let owned_deps = deps.clone_for_spawn();
+    deps.supervisor
+        .spawn_actor_for_context(context_id.clone(), owned_deps)
         .await
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
@@ -1907,6 +1929,17 @@ pub async fn restore_context(
 
     deps.supervisor
         .insert_context(context_id.to_owned(), per_context)
+        .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
+
+    // ADR-049 Phase 2A finalization bootstrap dual-write: restore
+    // path mirrors create — populate the actor registry alongside the
+    // legacy contexts DashMap. The dashmap-backed actor proxies its
+    // state through the same `Arc<Mutex<PerContextState>>` the
+    // DashMap insert above produced.
+    let owned_deps = deps.clone_for_spawn();
+    deps.supervisor
+        .spawn_actor_for_context(context_id.to_owned(), owned_deps)
+        .await
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
     // Start governance timeout task (ADR-031 §5). Designated-legacy
