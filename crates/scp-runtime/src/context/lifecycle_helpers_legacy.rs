@@ -89,6 +89,10 @@ use scp_protocol::context::{ContextError, ContextParams, ContextState};
 use scp_protocol::economy::budget::MemberBudgetTracker;
 
 use crate::context::ContextHandle;
+use crate::context::actor::sequence::SendSequenceTracker;
+use crate::context::actor::state::{
+    ContextCryptoState, ContextLifecycleState, ContextModeState, RecvSequenceTracker,
+};
 use crate::context::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
 use crate::context::governance_helpers_legacy;
 use crate::context::manager_methods;
@@ -393,10 +397,23 @@ pub async fn import_context_legacy(
         "import",
     );
 
+    // ADR-049 Phase 2A finalization keystone: legacy import path is
+    // encrypted-only; derive the actor's `members` from the imported
+    // membership snapshot.
+    let context_id_bytes = state::context_id_to_bytes(&context_id);
+    let actor_members: HashSet<DID> = export
+        .snapshot
+        .membership
+        .members()
+        .map(|m| m.did.clone())
+        .collect();
     let per_context = PerContextState {
+        context_id: context_id_bytes,
+        created_at: clock.now_secs(),
         generation: next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         handle: handle.clone(),
         membership: export.snapshot.membership,
+        members: actor_members,
         role_state: export.snapshot.role_state,
         receive_buffer: ReceiveBuffer::new(),
         broadcast_context: None,
@@ -526,7 +543,15 @@ pub async fn import_context_legacy(
         local_pseudonym: None,
         pseudonym_registry: HashMap::new(),
         // ADR-049 commit 8: fresh actor-shape tracker on import.
-        send_tracker: crate::context::actor::SendSequenceTracker::new(),
+        send_tracker: SendSequenceTracker::new(),
+        // ADR-049 Phase 2A finalization keystone: legacy import is
+        // encrypted-only; start fresh actor-shape collections.
+        recv_tracker: RecvSequenceTracker::new(),
+        saga_pending: HashMap::new(),
+        welcome_scratchpad: None,
+        lifecycle_state: ContextLifecycleState::Open,
+        event_log: None,
+        mode: ContextModeState::Encrypted(Box::<ContextCryptoState>::default()),
     };
 
     // 7. Register the context.
@@ -682,10 +707,23 @@ pub async fn create_context_legacy(
     let initial_access_key_store =
         generate_initial_access_key_store_legacy(&context_id, &creator_did);
     let initial_members: HashSet<DID> = membership.members().map(|m| m.did.clone()).collect();
+    // ADR-049 Phase 2A finalization keystone: branch the actor's
+    // discriminated mode union on whether the supervisor returned a
+    // broadcast roster (legacy create path mirrors the new-style create).
+    let context_id_bytes = state::context_id_to_bytes(&context_id);
+    let actor_members: HashSet<DID> = initial_members.clone();
+    let mode = if broadcast_context.is_some() {
+        ContextModeState::Broadcast(Box::<crate::context::actor::state::BroadcastState>::default())
+    } else {
+        ContextModeState::Encrypted(Box::<ContextCryptoState>::default())
+    };
     let per_context = PerContextState {
+        context_id: context_id_bytes,
+        created_at: clock.now_secs(),
         generation: next_generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         handle: handle.clone(),
         membership,
+        members: actor_members,
         governance: GovernanceState {
             engine: governance_engine,
             executed_proposals: HashMap::new(),
@@ -757,7 +795,15 @@ pub async fn create_context_legacy(
         local_pseudonym,
         pseudonym_registry: HashMap::new(),
         // ADR-049 commit 8: fresh actor-shape tracker at creation.
-        send_tracker: crate::context::actor::SendSequenceTracker::new(),
+        send_tracker: SendSequenceTracker::new(),
+        // ADR-049 Phase 2A finalization keystone: actor-shape collections
+        // start empty at creation; lifecycle is Open.
+        recv_tracker: RecvSequenceTracker::new(),
+        saga_pending: HashMap::new(),
+        welcome_scratchpad: None,
+        lifecycle_state: ContextLifecycleState::Open,
+        event_log: None,
+        mode,
     };
 
     // Atomic check-and-insert — eliminates TOCTOU race between
@@ -1883,7 +1929,22 @@ pub async fn restore_context_legacy(
     }
 
     let next_gen_ref = supervisor.next_generation_ref();
+    // ADR-049 Phase 2A finalization keystone: legacy restore branches the
+    // actor's mode on whether the snapshot rehydrated a broadcast roster.
+    let context_id_bytes = state::context_id_to_bytes(context_id);
+    let actor_members: HashSet<DID> = ctx_snapshot
+        .membership
+        .members()
+        .map(|m| m.did.clone())
+        .collect();
+    let mode = if broadcast_ctx.is_some() {
+        ContextModeState::Broadcast(Box::<crate::context::actor::state::BroadcastState>::default())
+    } else {
+        ContextModeState::Encrypted(Box::<ContextCryptoState>::default())
+    };
     let per_context = PerContextState {
+        context_id: context_id_bytes,
+        created_at: clock.now_secs(),
         generation: if ctx_snapshot.generation == 0 {
             next_gen_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         } else {
@@ -1891,6 +1952,7 @@ pub async fn restore_context_legacy(
         },
         handle: handle.clone(),
         membership: ctx_snapshot.membership,
+        members: actor_members,
         governance: GovernanceState {
             engine: governance_engine,
             executed_proposals: {
@@ -1970,7 +2032,16 @@ pub async fn restore_context_legacy(
             .into_iter()
             .map(|(did_str, p)| (scp_identity::DID(did_str), p))
             .collect(),
-        send_tracker: crate::context::actor::SendSequenceTracker::new(),
+        send_tracker: SendSequenceTracker::new(),
+        // ADR-049 Phase 2A finalization keystone: restore rehydrates
+        // pending sagas / Welcome scratchpads as fresh — legacy snapshot
+        // format does not carry them.
+        recv_tracker: RecvSequenceTracker::new(),
+        saga_pending: HashMap::new(),
+        welcome_scratchpad: None,
+        lifecycle_state: ContextLifecycleState::Open,
+        event_log: None,
+        mode,
     };
 
     manager_methods::insert_context(supervisor, context_id.to_owned(), per_context)

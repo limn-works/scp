@@ -23,7 +23,7 @@ use super::governance::timeout::{DeadlockDetectionState, GovernanceTimeoutTask};
 use super::ttl::{TtlExtension, TtlTimer};
 use scp_identity::DID;
 use scp_primitives::Clock;
-use scp_protocol::context::broadcast::{BroadcastContext, GovernanceBanResult};
+use scp_protocol::context::broadcast::GovernanceBanResult;
 use scp_protocol::context::builder::ContextCreationError;
 use scp_protocol::context::governance::{
     AccessScope, GovernanceEngine, GovernanceModelConfig, GovernanceProposal, KeyResolver,

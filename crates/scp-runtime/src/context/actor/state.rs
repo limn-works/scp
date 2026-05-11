@@ -872,17 +872,6 @@ impl PerContextState {
         &mut self.send_tracker
     }
 
-    /// Last-issued send sequence (read-only). Convenience for the shim
-    /// integration test to assert the reservation advanced / rolled
-    /// back as expected without constructing a full tracker borrow.
-    /// Gated on the `testing` feature so the accessor is never part of
-    /// production call graphs.
-    #[must_use]
-    #[cfg(feature = "testing")]
-    pub(crate) const fn send_tracker_last_issued(&self) -> u64 {
-        self.send_tracker.last_issued()
-    }
-
     /// Pushes an event to the receive buffer and, if a broadcast channel
     /// is provided, sends a sanitized copy there too. Mirrors the
     /// security invariants of the standalone
