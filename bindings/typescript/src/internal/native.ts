@@ -1564,9 +1564,13 @@ export function createNativeBridge(scp: SCP): Bridge {
       attestationJson: string,
       issuerPublicKeyHex: string,
     ): Promise<boolean> {
-      return await (
-        native.identityVerifyLinkAttestation as (j: string, k: string) => Promise<boolean>
-      )(attestationJson, issuerPublicKeyHex);
+      // Module-level NAPI free fn (per ADR-048 §1) — route through `addon`.
+      // The previous `Scp::identity_verify_link_attestation` method (with its
+      // `let _ = &self.inner;` gate-defang) was deleted in PR-E #28.
+      return (addon.identityVerifyLinkAttestation as (j: string, k: string) => boolean)(
+        attestationJson,
+        issuerPublicKeyHex,
+      );
     },
 
     // Recovery and custody migration (#632, spec §9.12, §3.2.1)

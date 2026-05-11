@@ -1109,6 +1109,48 @@ pub struct NapiDIDDocument {
 // compromise recovery free-function façade exports were deleted. Their
 // `Scp` methods in `scp.rs` are now the only entry points — bridge state
 // flows through `&self.inner` rather than the process-global default.
+//
+// PR-E #28 (ADR-048 §1): `identity_verify_link_attestation` is restored
+// as a module-level free fn. The operation is pure Ed25519 signature
+// verification — no bridge-instance state is required — so the per-
+// instance method on `Scp` was Gaming-the-Gate fraud (`let _ = &self.inner;`
+// to satisfy the pure-helpers scanner). The TypeScript SDK's
+// `SCP.identityVerifyLinkAttestation` routes through the addon's module-
+// level export per ADR-048 §7 (TS keeps the method shape as a TS-local
+// ergonomic choice; the body routes via `nativeFreeFn`).
+
+/// Verifies an identity link attestation signature using a provided issuer
+/// public key.
+///
+/// Pure Ed25519 signature verification — touches no bridge-instance state
+/// and is exposed at module scope per ADR-048 §1.
+///
+/// # Errors
+///
+/// Returns `SCP-IDENT-1044` on JSON parse failure or invalid hex.
+#[napi(js_name = "identityVerifyLinkAttestation")]
+pub fn identity_verify_link_attestation(
+    attestation_json: String,
+    issuer_public_key_hex: String,
+) -> napi::Result<bool> {
+    use scp_core::identity::attestation::IdentityLinkAttestation;
+
+    let attestation: IdentityLinkAttestation =
+        serde_json::from_str(&attestation_json).map_err(|e| {
+            NapiError::from(ScpNapiError::Identity {
+                message: format!("failed to parse attestation JSON: {e}"),
+                code: codes::IDENT_1044.to_owned(),
+            })
+        })?;
+
+    let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| {
+        NapiError::from(ScpNapiError::Identity {
+            message: format!("invalid issuer_public_key_hex: {e}"),
+            code: codes::IDENT_1044.to_owned(),
+        })
+    })?;
+    Ok(attestation.verify_signature(&pub_bytes).is_ok())
+}
 
 // ---------------------------------------------------------------------------
 // Tests

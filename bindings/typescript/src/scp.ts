@@ -62,6 +62,7 @@ type NativeAddon = RawNativeAddon & {
   validateAgainstTemplate?: unknown;
   validateContextParams?: unknown;
   checkScopedCapability?: unknown;
+  identityVerifyLinkAttestation?: unknown;
 };
 
 /**
@@ -471,9 +472,13 @@ export class SCP {
     attestationJson: string,
     issuerPublicKeyHex: string,
   ): Promise<boolean> {
-    return await (
-      this.#native.identityVerifyLinkAttestation as (j: string, k: string) => Promise<boolean>
-    )(attestationJson, issuerPublicKeyHex);
+    // ADR-048 §1: pure Ed25519 signature verification, routed through the
+    // addon's module-level free fn (the `Scp::identity_verify_link_attestation`
+    // method was deleted in PR-E #28 along with its `let _ = &self.inner;`
+    // gate-defang). Surface stays async for SDK ABI stability; the underlying
+    // call is sync.
+    const fn = nativeFreeFn<(j: string, k: string) => boolean>("identityVerifyLinkAttestation");
+    return fn(attestationJson, issuerPublicKeyHex);
   }
 
   identityExecuteRecovery(did: string, tier: string, contextIds: readonly string[]): string {
