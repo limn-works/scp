@@ -19,8 +19,20 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { Credit, InvalidGrant, type OutletProtocolError, StreamAlreadyClosed } from "../src/errors";
-import { type Aggregate, InvocationHandle, type OutletStreamChunk } from "../src/outlets";
+import {
+  Credit,
+  InvalidGrant,
+  OutletExecutionError,
+  type OutletProtocolError,
+  StreamAlreadyClosed,
+} from "../src/errors";
+import {
+  type __InternalInvocationHandleSink,
+  __internalPumpStreamingBridge,
+  type Aggregate,
+  InvocationHandle,
+  type OutletStreamChunk,
+} from "../src/outlets";
 
 // ---------------------------------------------------------------------------
 // Synthetic chunk helpers — drive the InvocationHandle pump directly.
@@ -506,6 +518,161 @@ function _tscRejectsRawNumberForGrantCredit(handle: InvocationHandle): void {
   // Suppress unused-parameter lint.
   void handle;
 }
+
+// ---------------------------------------------------------------------------
+// Abnormal closure — `BridgeOutletInvocationStream.next()` returns `null`
+// BEFORE the executor emits a terminal chunk. The SDK must surface this
+// as an `OutletExecutionError` (SCP-TOOL-6131 / `execution.stream-gap`)
+// per §5.4.4 — NEVER synthesize a degenerate `End{value: null}` that
+// would let callers mistake a transport drop / executor crash / bridge
+// fault for a successful aggregate-null outcome.
+// ---------------------------------------------------------------------------
+
+// Build a fake `BridgeOutletInvocationStream` that yields a fixed
+// sequence of chunks (or `null` for an end-of-receiver signal).
+function makeFakeBridgeStream(
+  chunks: ReadonlyArray<{
+    payloadType: "data" | "progress" | "end" | "error";
+    seq: number;
+    valueJson?: string;
+    aggregateJson?: string;
+    code?: string;
+    message?: string;
+    terminal?: boolean;
+  } | null>,
+): {
+  readonly requestId: string;
+  next: () => Promise<unknown>;
+} {
+  let i = 0;
+  return {
+    requestId: "ab".repeat(16),
+    next: async () => {
+      if (i >= chunks.length) return null;
+      const c = chunks[i++];
+      // Under `noUncheckedIndexedAccess` the indexed access returns
+      // `T | undefined`. Either undefined (out-of-bounds — guarded
+      // above) or `null` (explicit end-of-stream sentinel) collapses
+      // to `null` for the bridge contract.
+      if (c === null || c === undefined) return null;
+      return {
+        requestId: new Uint8Array(16),
+        sequence: c.seq,
+        sig: new Uint8Array(64),
+        payloadType: c.payloadType,
+        valueJson: c.valueJson,
+        aggregateJson: c.aggregateJson,
+        code: c.code,
+        message: c.message,
+        terminal: c.terminal,
+      };
+    },
+  };
+}
+
+describe("Abnormal closure (HIGH wave 4)", () => {
+  test("pumpStreamingBridge calls sink.error(OutletExecutionError) when bridge closes without terminal", async () => {
+    // Bridge yields one Data chunk then closes — no End / Error{terminal:true}.
+    const fakeStream = makeFakeBridgeStream([
+      { payloadType: "data", seq: 0, valueJson: '{"i":0}' },
+      null,
+    ]);
+    const calls: { type: "chunk" | "end" | "error"; payload: unknown }[] = [];
+    const sink: __InternalInvocationHandleSink = {
+      chunk: (c) => calls.push({ type: "chunk", payload: c }),
+      end: (a) => calls.push({ type: "end", payload: a }),
+      error: (e) => calls.push({ type: "error", payload: e }),
+    };
+    // biome-ignore lint/suspicious/noExplicitAny: test-only synthetic bridge.
+    await __internalPumpStreamingBridge(fakeStream as any, sink);
+
+    // Sink saw exactly one Data chunk, then an OutletExecutionError —
+    // NOT a degenerate sink.end({value: null}).
+    expect(calls.length).toBe(2);
+    expect(calls[0]?.type).toBe("chunk");
+    expect(calls[1]?.type).toBe("error");
+    const err = calls[1]?.payload as Error;
+    expect(err).toBeInstanceOf(OutletExecutionError);
+    expect((err as OutletExecutionError).code).toBe("SCP-TOOL-6131");
+    expect(err.message).toContain("stream closed without terminal chunk");
+  });
+
+  test("pumpStreamingBridge calls sink.end normally when terminal observed before null", async () => {
+    // Regression guard — happy path still resolves cleanly.
+    const fakeStream = makeFakeBridgeStream([
+      { payloadType: "data", seq: 0, valueJson: '{"x":1}' },
+      { payloadType: "end", seq: 1, aggregateJson: '{"sum":1}' },
+      null,
+    ]);
+    const calls: { type: "chunk" | "end" | "error"; payload: unknown }[] = [];
+    const sink: __InternalInvocationHandleSink = {
+      chunk: (c) => calls.push({ type: "chunk", payload: c }),
+      end: (a) => calls.push({ type: "end", payload: a }),
+      error: (e) => calls.push({ type: "error", payload: e }),
+    };
+    // biome-ignore lint/suspicious/noExplicitAny: test-only synthetic bridge.
+    await __internalPumpStreamingBridge(fakeStream as any, sink);
+
+    // Data, End-chunk, then end({value: {sum:1}}); no error sink call.
+    expect(calls.filter((c) => c.type === "error").length).toBe(0);
+    const endCalls = calls.filter((c) => c.type === "end");
+    expect(endCalls.length).toBe(1);
+    const agg = endCalls[0]?.payload as Aggregate;
+    expect(agg.value).toEqual({ sum: 1 });
+  });
+
+  test("InvocationHandle await rejects with OutletExecutionError on abnormal closure", async () => {
+    // Drive an InvocationHandle whose pump runs the production
+    // `pumpStreamingBridge` against an abnormally-closed bridge.
+    const fakeStream = makeFakeBridgeStream([
+      { payloadType: "data", seq: 0, valueJson: "{}" },
+      null,
+    ]);
+    const handle = new InvocationHandle((sink) => {
+      // biome-ignore lint/suspicious/noExplicitAny: test-only synthetic bridge.
+      void __internalPumpStreamingBridge(fakeStream as any, sink);
+    });
+    let caught: unknown;
+    try {
+      await handle;
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(OutletExecutionError);
+    expect((caught as OutletExecutionError).code).toBe("SCP-TOOL-6131");
+    expect((caught as Error).message).toContain("stream closed without terminal chunk");
+    // Lifecycle guard fires — handle is terminated, post-terminal
+    // control plane calls raise StreamAlreadyClosed.
+    expect(handle.isTerminated).toBe(true);
+  });
+
+  test("InvocationHandle iterator emits error after partial Data then abnormal close", async () => {
+    const fakeStream = makeFakeBridgeStream([
+      { payloadType: "data", seq: 0, valueJson: "{}" },
+      { payloadType: "data", seq: 1, valueJson: "{}" },
+      null,
+    ]);
+    const handle = new InvocationHandle((sink) => {
+      // biome-ignore lint/suspicious/noExplicitAny: test-only synthetic bridge.
+      void __internalPumpStreamingBridge(fakeStream as any, sink);
+    });
+    const observed: OutletStreamChunk[] = [];
+    let caught: unknown;
+    try {
+      for await (const chunk of handle) {
+        observed.push(chunk);
+      }
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(OutletExecutionError);
+    expect((caught as OutletExecutionError).code).toBe("SCP-TOOL-6131");
+    // Two Data chunks were forwarded before the abnormal close — they
+    // are not retroactively invalidated.
+    expect(observed.length).toBe(2);
+    expect(observed.every((c) => c.payloadType === "data")).toBe(true);
+  });
+});
 
 // Reference the helper so biome doesn't warn about an unused function.
 // `void` is at expression position; the function itself is type-only

@@ -128,6 +128,11 @@ public struct OutletStreamSequence: AsyncSequence, Sendable {
 /// `AsyncIterator` for `OutletStreamSequence`.
 public struct OutletStreamIterator: AsyncIteratorProtocol, Sendable {
     let handle: OutletStreamHandle
+    /// Tracks whether a terminal chunk (End / Error{terminal:true}) has
+    /// been yielded by `next()`. Mutated on each call so the next-after-
+    /// terminal `nil` is recognised as a normal end-of-iteration vs. an
+    /// abnormal closure that warrants surfacing as `execution.stream-gap`.
+    private var terminalObserved: Bool = false
 
     public init(handle: OutletStreamHandle) {
         self.handle = handle
@@ -135,9 +140,35 @@ public struct OutletStreamIterator: AsyncIteratorProtocol, Sendable {
 
     public mutating func next() async throws -> OutletStreamChunkRecordSwift? {
         guard let raw = try await handle.next() else {
-            return nil
+            // Abnormal closure — handle.next() returned nil before the
+            // executor emitted a terminal chunk. Surface as
+            // `execution.stream-gap` (`SCP-TOOL-6131`) per §5.4.4 so
+            // callers cannot mistake a stream gap for a clean end of
+            // iteration. If a terminal chunk WAS observed in a prior
+            // call, this `nil` is the normal end-of-receiver marker and
+            // we signal end-of-iteration per `AsyncIteratorProtocol`.
+            if terminalObserved {
+                return nil
+            }
+            let env = OutletEnvelope(
+                classWire: .execution,
+                code: "SCP-TOOL-6131",
+                slug: "execution.stream-gap",
+                message: "stream closed without terminal chunk",
+                retry: .never,
+                detail: nil,
+                sourceChain: [],
+                padNonce: nil,
+                registrationEventId: nil
+            )
+            throw OutletError.execution(env)
         }
-        return OutletStreamChunkRecordSwift(from: raw)
+        let record = OutletStreamChunkRecordSwift(from: raw)
+        if record.payloadType == "end" ||
+            (record.payloadType == "error" && record.terminal == true) {
+            terminalObserved = true
+        }
+        return record
     }
 }
 
@@ -281,46 +312,104 @@ func makeRevocationRecheckTask(
 /// terminal-state transition. End resolves the aggregate with the
 /// chunk's `aggregate` field; terminal Error{terminal:true} rejects
 /// with an `OutletError.execution(...)` envelope.
+///
+/// Abnormal-closure handling: if `raw.next()` returns `nil` BEFORE a
+/// terminal chunk (`End` / `Error{terminal:true}`) was observed, the
+/// pump surfaces an `execution.stream-gap` (`SCP-TOOL-6131`) error via
+/// `rejectAggregate` — a transport drop, executor crash, or bridge
+/// fault MUST NOT be reported as a successful aggregate-null outcome.
 func pumpStreamingChunks(
     from raw: OutletStreamHandle,
     yieldChunk: @Sendable (OutletStreamChunk) -> Void,
     resolveAggregate: @Sendable (Aggregate) -> Void,
     rejectAggregate: @Sendable (Error) -> Void
 ) async throws {
+    try await pumpStreamingChunksWithNext(
+        next: { try await raw.next() },
+        yieldChunk: yieldChunk,
+        resolveAggregate: resolveAggregate,
+        rejectAggregate: rejectAggregate
+    )
+}
+
+/// Injectable test-seam variant of `pumpStreamingChunks` — accepts a
+/// `next` closure so tests can drive the pump against a synthetic
+/// chunk source without constructing a UniFFI `OutletStreamHandle`
+/// (the latter requires the XCFramework binary). The production
+/// `pumpStreamingChunks` is a thin wrapper that pins `next` to
+/// `raw.next()`.
+///
+/// `internal` so the SCPTests target can reach it without exposing
+/// the helper publicly.
+func pumpStreamingChunksWithNext(
+    next: @Sendable () async throws -> OutletStreamChunkRecord?,
+    yieldChunk: @Sendable (OutletStreamChunk) -> Void,
+    resolveAggregate: @Sendable (Aggregate) -> Void,
+    rejectAggregate: @Sendable (Error) -> Void
+) async throws {
+    var terminalObserved = false
     while true {
-        guard let bridgeChunk = try await raw.next() else {
-            resolveAggregate(Aggregate(valueJson: "null"))
+        guard let bridgeChunk = try await next() else {
+            // Abnormal closure — `next()` returned `nil` before the
+            // executor emitted a terminal chunk. Surface as
+            // `execution.stream-gap` (`SCP-TOOL-6131`) per §5.4.4. A
+            // prior terminal observation means this `nil` is the
+            // normal end-of-receiver marker.
+            if terminalObserved {
+                return
+            }
+            rejectAggregate(OutletError.execution(streamGapEnvelope()))
             return
         }
         let sdkChunk = bridgeChunkToSdk(bridgeChunk)
         yieldChunk(sdkChunk)
         switch sdkChunk.payload {
         case let .end(aggregate, executionTimeMs):
-            resolveAggregate(Aggregate(
-                valueJson: aggregate,
-                executionTimeMs: executionTimeMs
-            ))
+            terminalObserved = true
+            resolveAggregate(Aggregate(valueJson: aggregate, executionTimeMs: executionTimeMs))
             return
         case let .error(code, message, terminal):
             if terminal {
-                let env = OutletEnvelope(
-                    classWire: .execution,
-                    code: code,
-                    slug: code,
-                    message: message,
-                    retry: .never,
-                    detail: nil,
-                    sourceChain: [],
-                    padNonce: nil,
-                    registrationEventId: nil
-                )
-                rejectAggregate(OutletError.execution(env))
+                terminalObserved = true
+                rejectAggregate(OutletError.execution(terminalErrorEnvelope(code: code, message: message)))
                 return
             }
         default:
             break
         }
     }
+}
+
+/// `execution.stream-gap` envelope for the abnormal-closure path
+/// (bridge receiver returned `nil` before any terminal chunk).
+private func streamGapEnvelope() -> OutletEnvelope {
+    OutletEnvelope(
+        classWire: .execution,
+        code: "SCP-TOOL-6131",
+        slug: "execution.stream-gap",
+        message: "stream closed without terminal chunk",
+        retry: .never,
+        detail: nil,
+        sourceChain: [],
+        padNonce: nil,
+        registrationEventId: nil
+    )
+}
+
+/// Envelope for a terminal `Error{terminal: true}` chunk observed
+/// mid-stream — the chunk's own code+message become the envelope's.
+private func terminalErrorEnvelope(code: String, message: String) -> OutletEnvelope {
+    OutletEnvelope(
+        classWire: .execution,
+        code: code,
+        slug: code,
+        message: message,
+        retry: .never,
+        detail: nil,
+        sourceChain: [],
+        padNonce: nil,
+        registrationEventId: nil
+    )
 }
 
 /// Convert a UniFFI-generated `OutletStreamChunkRecord` to the SDK-

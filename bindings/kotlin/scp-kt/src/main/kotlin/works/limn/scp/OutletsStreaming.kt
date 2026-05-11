@@ -229,13 +229,21 @@ class OutletStreamFlow internal constructor(
     /**
      * Returns a cold [Flow] that emits one chunk per
      * `OutletStreamHandle.next()` call. Emission ends on receiver close
-     * or after a terminal chunk (`End` / `Error{terminal:true}`).
+     * AFTER a terminal chunk (`End` / `Error{terminal:true}`) has been
+     * observed.
+     *
+     * Abnormal-closure handling: if `handle.next()` returns `null`
+     * BEFORE a terminal chunk has been emitted, the flow throws
+     * [ExecutionError] with code `SCP-TOOL-6131` (slug
+     * `execution.stream-gap`) per §5.4.4. Synthesising a silent
+     * end-of-flow on receiver close would let callers mistake a
+     * transport drop, executor crash, or bridge fault for a clean
+     * stream completion.
      */
-    fun asFlow(): Flow<OutletStreamChunkData> = flow {
-        while (true) {
-            val raw = handle.next() ?: break
-            emit(
-                OutletStreamChunkData.fromFfi(
+    fun asFlow(): Flow<OutletStreamChunkData> =
+        outletStreamFlowFromNext {
+            handle.next()?.let { raw ->
+                StreamChunkSource(
                     requestId = raw.requestId,
                     sequence = raw.sequence,
                     sig = raw.sig,
@@ -249,10 +257,9 @@ class OutletStreamFlow internal constructor(
                     code = raw.code,
                     message = raw.message,
                     terminal = raw.terminal,
-                ),
-            )
+                )
+            }
         }
-    }
 
     /**
      * Signs and applies an `OutletStreamCredit` grant for this stream.
@@ -282,7 +289,7 @@ class OutletStreamFlow internal constructor(
      *   stream had already reached a terminal chunk (idempotent per
      *   §5.4.5).
      */
-    suspend fun cancel(): ULong? = handle.cancel(callerDid = invokerDid)
+    suspend fun cancel(): ULong? = handle.cancel()
 
     /**
      * Forces a terminal `Error{terminal:true}` chunk into this stream
@@ -305,6 +312,117 @@ class OutletStreamFlow internal constructor(
             reason = reason,
             messageOverride = messageOverride,
         )
+    }
+}
+
+/**
+ * Internal test-seam variant of [OutletStreamFlow.asFlow] — accepts a
+ * `next` suspend lambda so tests can drive the flow against synthetic
+ * chunk sources without constructing a UniFFI `OutletStreamHandle`
+ * (which would require the regenerated `uniffi.scp` bindings and the
+ * compiled cdylib). Production callers go through the
+ * [OutletStreamFlow.asFlow] method which pins `next` to `handle.next()`.
+ *
+ * Surfaced via an internal helper so unit tests in the same package can
+ * reach it without exposing it on the public API.
+ */
+internal fun outletStreamFlowFromNext(
+    next: suspend () -> StreamChunkSource?,
+): Flow<OutletStreamChunkData> = flow {
+    var terminalObserved = false
+    while (true) {
+        val raw = next()
+        if (raw == null) {
+            if (terminalObserved) {
+                return@flow
+            }
+            throw ExecutionError(
+                message = "stream closed without terminal chunk",
+                code = "SCP-TOOL-6131",
+                slug = "execution.stream-gap",
+            )
+        }
+        if (raw.payloadType == "end" || (raw.payloadType == "error" && raw.terminal == true)) {
+            terminalObserved = true
+        }
+        emit(
+            OutletStreamChunkData.fromFfi(
+                requestId = raw.requestId,
+                sequence = raw.sequence,
+                sig = raw.sig,
+                payloadType = raw.payloadType,
+                valueJson = raw.valueJson,
+                pct = raw.pct,
+                note = raw.note,
+                aggregateJson = raw.aggregateJson,
+                provenanceJson = raw.provenanceJson,
+                executionTimeMs = raw.executionTimeMs,
+                code = raw.code,
+                message = raw.message,
+                terminal = raw.terminal,
+            ),
+        )
+    }
+}
+
+/**
+ * Minimal shape that [outletStreamFlowFromNext] needs from each chunk —
+ * mirrors the field set of the UniFFI-generated `OutletStreamChunkRecord`
+ * so the production adapter (`{ handle.next()?.toSource() }`) can pass
+ * straight through. Tests construct synthetic instances of this type.
+ *
+ * Internal: this shape is an implementation detail of the abnormal-
+ * closure test seam, not part of the public API.
+ */
+internal data class StreamChunkSource(
+    val requestId: ByteArray,
+    val sequence: ULong,
+    val sig: ByteArray,
+    val payloadType: String,
+    val valueJson: String?,
+    val pct: UShort?,
+    val note: String?,
+    val aggregateJson: String?,
+    val provenanceJson: String?,
+    val executionTimeMs: ULong?,
+    val code: String?,
+    val message: String?,
+    val terminal: Boolean?,
+) {
+    @Suppress("CyclomaticComplexMethod", "ComplexCondition")
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is StreamChunkSource) return false
+        return requestId.contentEquals(other.requestId) &&
+            sequence == other.sequence &&
+            sig.contentEquals(other.sig) &&
+            payloadType == other.payloadType &&
+            valueJson == other.valueJson &&
+            pct == other.pct &&
+            note == other.note &&
+            aggregateJson == other.aggregateJson &&
+            provenanceJson == other.provenanceJson &&
+            executionTimeMs == other.executionTimeMs &&
+            code == other.code &&
+            message == other.message &&
+            terminal == other.terminal
+    }
+
+    override fun hashCode(): Int {
+        var result = requestId.contentHashCode()
+        result = 31 * result + sequence.hashCode()
+        result = 31 * result + sig.contentHashCode()
+        result = 31 * result + payloadType.hashCode()
+        result = 31 * result + (valueJson?.hashCode() ?: 0)
+        result = 31 * result + (pct?.hashCode() ?: 0)
+        result = 31 * result + (note?.hashCode() ?: 0)
+        result = 31 * result + (aggregateJson?.hashCode() ?: 0)
+        result = 31 * result + (provenanceJson?.hashCode() ?: 0)
+        result = 31 * result + (executionTimeMs?.hashCode() ?: 0)
+        result = 31 * result + (code?.hashCode() ?: 0)
+        result = 31 * result + (message?.hashCode() ?: 0)
+        result = 31 * result + (terminal?.hashCode() ?: 0)
+        return result
     }
 }
 

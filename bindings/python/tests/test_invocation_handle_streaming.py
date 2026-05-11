@@ -258,8 +258,12 @@ class TestPostTerminalLifecycleGuard:
 
         async for _ in handle:
             pass
+        # CRITICAL #3 — cancel no longer accepts a caller-supplied
+        # next_seq; the bridge derives it from the runtime's emission
+        # cursor. The post-terminal lifecycle guard fires BEFORE the
+        # cancel ever reaches the bridge, so the call is parameterless.
         with pytest.raises(StreamAlreadyClosed):
-            await handle.cancel(next_seq=0)
+            await handle.cancel()
 
     @pytest.mark.asyncio
     async def test_grant_credit_after_terminal_error_raises_stream_already_closed(self) -> None:
@@ -398,3 +402,92 @@ class TestAggregateAwaitWithErrorTerminal:
 
         with pytest.raises(OutletExecutionError):
             await handle
+
+
+# ---------------------------------------------------------------------------
+# Abnormal closure — bridge `None` arrives BEFORE any terminal chunk.
+# ---------------------------------------------------------------------------
+
+
+class TestAbnormalClosure:
+    """The bridge pump emits `None` to signal end-of-receiver. When the
+    `None` arrives WITHOUT a prior terminal chunk (transport drop,
+    executor crash, bridge fault) the SDK MUST surface this as an
+    :class:`OutletExecutionError` (`SCP-TOOL-6131` /
+    `execution.stream-gap`) on both the await and iterator paths —
+    NEVER as a degenerate ``Aggregate(value=None)`` or a silent
+    ``StopAsyncIteration``."""
+
+    @pytest.mark.asyncio
+    async def test_await_path_raises_execution_error_when_pump_closes_without_terminal(
+        self,
+    ) -> None:
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        # Push only `None` — no Data chunks, no End/Error{terminal:true}.
+        # This simulates the bridge receiver returning `None` without
+        # the executor ever emitting a terminal chunk.
+        await q.put(None)
+        handle = InvocationHandle(q, request_id="ab" * 16)
+
+        with pytest.raises(OutletExecutionError) as excinfo:
+            await handle
+        assert excinfo.value.code == "SCP-TOOL-6131"
+        assert "stream closed without terminal chunk" in str(excinfo.value)
+        # After abnormal closure the handle marks terminated so
+        # subsequent control-plane calls fail-fast per AC13.
+        assert handle.is_terminated is True
+
+    @pytest.mark.asyncio
+    async def test_await_path_raises_after_some_data_then_abnormal_close(self) -> None:
+        # Producer delivered some Data chunks then closed without a
+        # terminal — the abnormal-closure path STILL fires (the
+        # consumer never saw End / Error{terminal:true}).
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        await q.put(_data_chunk(seq=0, value={"x": 1}))
+        await q.put(_data_chunk(seq=1, value={"x": 2}))
+        await q.put(None)
+        handle = InvocationHandle(q, request_id="ac" * 16)
+
+        with pytest.raises(OutletExecutionError) as excinfo:
+            await handle
+        assert excinfo.value.code == "SCP-TOOL-6131"
+
+    @pytest.mark.asyncio
+    async def test_iterator_raises_execution_error_when_pump_closes_without_terminal(
+        self,
+    ) -> None:
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        await q.put(_data_chunk(seq=0, value={"i": 0}))
+        await q.put(None)  # abnormal close — no terminal yielded
+        handle = InvocationHandle(q, request_id="ad" * 16)
+
+        observed: list[OutletStreamChunk] = []
+        with pytest.raises(OutletExecutionError) as excinfo:
+            async for chunk in handle:
+                observed.append(chunk)
+        assert excinfo.value.code == "SCP-TOOL-6131"
+        # The Data chunk was successfully yielded before the abnormal
+        # close raised; the abnormal closure does not retroactively
+        # invalidate already-delivered chunks.
+        assert len(observed) == 1
+        assert observed[0].payload_type == "data"
+        assert handle.is_terminated is True
+
+    @pytest.mark.asyncio
+    async def test_iterator_clean_end_with_terminal_then_none_does_not_raise(self) -> None:
+        # Regression guard: when the iterator HAS observed a terminal
+        # chunk (End / Error{terminal:true}), the trailing `None`
+        # produced by the pump MUST resolve as a normal end-of-
+        # iteration (`StopAsyncIteration`) — NOT an abnormal-closure
+        # error. The terminal-then-none path is the happy path.
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        await q.put(_end_chunk(seq=0, aggregate={"ok": True}))
+        await q.put(None)
+        handle = InvocationHandle(q, request_id="ae" * 16)
+
+        observed: list[OutletStreamChunk] = []
+        async for chunk in handle:
+            observed.append(chunk)
+        assert len(observed) == 1
+        assert observed[0].payload_type == "end"
+        # No OutletExecutionError raised — iteration ended cleanly.

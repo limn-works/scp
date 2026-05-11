@@ -28,13 +28,10 @@ public struct DID: Sendable, Hashable {
     }
 }
 
-/// Distinct `OutletId` type — see `DID`.
-public struct OutletId: Sendable, Hashable {
-    public let raw: String
-    public init(_ raw: String) {
-        self.raw = raw
-    }
-}
+// `OutletId` itself is declared in `Errors.swift` as a throwing
+// newtype (validates non-empty). The previous duplicate declaration
+// here caused `invalid redeclaration of 'OutletId'`. Removed in HIGH
+// wave 4 — the throwing constructor is the canonical brand.
 
 /// UUIDv7 session identifier — distinct from `OutletId` / `DID`.
 public struct SessionId: Sendable, Hashable {
@@ -795,7 +792,13 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
         if value is NSNull { return "null" }
         if let num = value as? NSNumber {
             if CFGetTypeID(num) == CFBooleanGetTypeID() { return "boolean" }
-            if num.intValue == num.doubleValue, num.doubleValue.truncatingRemainder(dividingBy: 1) == 0 {
+            // Bridge `intValue` (Int) to Double for the equality compare —
+            // Swift 6 strict typing rejects `Int == Double`. The Double-
+            // domain comparison preserves the existing semantics (an
+            // integer-valued NSNumber is reported as "integer", anything
+            // else as "number").
+            let asDouble = num.doubleValue
+            if Double(num.intValue) == asDouble, asDouble.truncatingRemainder(dividingBy: 1) == 0 {
                 return "integer"
             }
             return "number"
@@ -1121,7 +1124,15 @@ public actor OutletNamespace {
         definition: OutletDefinition,
         updaterDid: String? = nil
     ) async throws -> String {
-        let actor = try updaterDid ?? (await identityDid())
+        // `??` evaluates its right-hand side in a non-async autoclosure;
+        // `await` is not legal inside the autoclosure under Swift 6
+        // strict concurrency. Hoist the await out before the coalesce.
+        let actor: String
+        if let updaterDid {
+            actor = updaterDid
+        } else {
+            actor = try await identityDid()
+        }
         return try await outletUpdate(
             handle: handle,
             outletId: id,
@@ -1143,7 +1154,14 @@ public actor OutletNamespace {
     }
 
     public func deregister(id: String, actorDid: String? = nil) async throws {
-        let actor = try actorDid ?? (await identityDid())
+        // Hoist the await out of the `??` autoclosure (Swift 6 strict
+        // concurrency rejects async calls inside non-async autoclosures).
+        let actor: String
+        if let actorDid {
+            actor = actorDid
+        } else {
+            actor = try await identityDid()
+        }
         try await outletDeregister(
             handle: handle,
             outletId: id,
