@@ -2761,11 +2761,60 @@ impl WasmContextManager {
         request_id_hex: &str,
     ) -> Option<scp_protocol::context::outlets::stream::OutletStreamChunk> {
         use scp_protocol::context::outlets::error_codes::{
-            CODE_EXECUTION_CREDIT, SLUG_EXECUTION_CREDIT_EXHAUSTED,
+            CODE_EXECUTION_CANCEL_ACK_TIMEOUT, CODE_EXECUTION_CREDIT,
+            SLUG_EXECUTION_CANCEL_ACK_TIMEOUT, SLUG_EXECUTION_CREDIT_EXHAUSTED,
         };
         use scp_protocol::context::outlets::stream::{ChunkPayload, sign_chunk};
 
         let session = self.outlet_streams.get_mut(request_id_hex)?;
+
+        // §5.4.5 cancellation point — checked BEFORE popping the next
+        // queued chunk so a cancel observed between two consumer pulls
+        // truncates the stream and surfaces as a signed synthetic
+        // terminal `Error` chunk. WASM's pre-materialised pipeline has
+        // no executor pump to suspend; this is the equivalent of the
+        // runtime path's `CancelAckTracker::should_force_close` —
+        // chunks beyond the cancel point MUST NOT be emitted, and the
+        // SDK consumer MUST observe a terminal closure (not a silent
+        // `None`).
+        if session.cancelled && !session.terminated {
+            let sequence = u64::try_from(session.chunks.len())
+                .map_or(session.emitted_count, |tail| {
+                    session.emitted_count.saturating_add(tail)
+                });
+            let error_payload = ChunkPayload::Error {
+                code: CODE_EXECUTION_CANCEL_ACK_TIMEOUT.to_owned(),
+                message: format!(
+                    "{SLUG_EXECUTION_CANCEL_ACK_TIMEOUT}: stream cancelled by invoker"
+                ),
+                terminal: true,
+            };
+            let sig = sign_chunk(
+                &session.invoker_signing_key,
+                session.context_id.as_str(),
+                session.outlet_id.as_str(),
+                &session.request_id,
+                sequence,
+                &session.caveats_binding,
+                &error_payload,
+            )
+            .ok()?;
+            session.terminated = true;
+            // Cancel truncates: drop any chunks queued past the cancel
+            // point — the spec says "Already-emitted chunks remain
+            // authorized; the stream closes regardless of executor
+            // behavior." Anything not yet popped is, by definition,
+            // not yet emitted.
+            session.chunks.clear();
+            session.emitted_count = session.emitted_count.saturating_add(1);
+            return Some(scp_protocol::context::outlets::stream::OutletStreamChunk {
+                request_id: session.request_id,
+                sequence,
+                payload: error_payload,
+                sig,
+            });
+        }
+
         let Some(chunk) = session.chunks.pop_front() else {
             // Queue drained — flip terminated and evict so future
             // `next()` calls see `None` cleanly without a stale entry.
@@ -3101,15 +3150,22 @@ impl WasmContextManager {
         }
 
         session.cancelled = true;
-        // Drop any chunks past the sequence we have not yet emitted —
-        // the cancel-ack semantics in §5.4.5 say the executor must
-        // stop emitting after a cancel, and we model that by clearing
-        // the queue and pushing nothing more. The session entry is
-        // retained until `next()` returns `None` so the
-        // `requestId`-keyed lookup remains valid for the close
-        // handshake.
-        session.chunks.clear();
-        session.terminated = true;
+        // §5.4.5 cancel-ack semantics: the executor must stop emitting
+        // after a cancel. WASM has no async executor to suspend; the
+        // chunk vector is pre-materialised at open time. To make
+        // cancellation an *observable cancellation point* on the
+        // consumer (matching the runtime path's
+        // `CancelAckTracker::should_force_close` flow), DO NOT clear
+        // chunks here and DO NOT flip `terminated` synchronously.
+        // Instead, `outlet_stream_next` consults `cancelled` BEFORE
+        // popping the next chunk and, on `cancelled = true`, builds a
+        // signed synthetic terminal `Error` chunk (code
+        // `SCP-TOOL-6135`, slug `execution.cancel-ack-timeout` — the
+        // canonical §5.4.5 closure for executor-initiated stream
+        // ends after a cancel signal) and stops producing real
+        // chunks. That moves the cancellation observation from the
+        // synchronous cancel call to the consumer's pull, which is
+        // the behaviour the runtime path delivers via `should_force_close`.
         Ok(Some(next_seq))
     }
 
@@ -9120,6 +9176,176 @@ mod tests {
         // and evicts the entry.
         assert!(mgr.outlet_stream_next(&request_id_hex).is_none());
         assert!(!mgr.outlet_streams.contains_key(&request_id_hex));
+    }
+
+    /// Helper for `wasm_outlet_stream_next_emits_synthetic_terminal_after_cancel`:
+    /// seed the manager with a 5-chunk Data stream and return the
+    /// `request_id_hex` plus the caveats binding (so the test can
+    /// verify signatures later).
+    fn seed_cancel_test_session(
+        mgr: &mut WasmContextManager,
+        signing: &ed25519_dalek::SigningKey,
+        invoker_did: &str,
+    ) -> (String, [u8; 16], [u8; 32]) {
+        use scp_protocol::context::outlets::stream::{ChunkPayload, sign_chunk};
+        let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+        let request_id_hex = hex::encode(request_id);
+        let caveats_binding = [0xC4u8; 32];
+        let mut chunks: VecDeque<scp_protocol::context::outlets::stream::OutletStreamChunk> =
+            VecDeque::new();
+        for seq in 0..5_u64 {
+            let payload = ChunkPayload::Data {
+                value: serde_json::json!({"seq": seq}),
+            };
+            let sig = sign_chunk(
+                signing,
+                "ctx",
+                "outlet",
+                &request_id,
+                seq,
+                &caveats_binding,
+                &payload,
+            )
+            .expect("sign chunk");
+            chunks.push_back(scp_protocol::context::outlets::stream::OutletStreamChunk {
+                request_id,
+                sequence: seq,
+                payload,
+                sig,
+            });
+        }
+        mgr.outlet_streams.insert(
+            request_id_hex.clone(),
+            super::WasmOutletStreamSession {
+                request_id,
+                context_id: "ctx".to_owned(),
+                outlet_id: "outlet".to_owned(),
+                stream_epoch: 0,
+                caveats_binding,
+                monotonic_seq: 0,
+                invoker_signing_key: signing.clone(),
+                chunks,
+                terminated: false,
+                cancelled: false,
+                total_credit: 0,
+                remaining_credit: 100,
+                invoker_did: invoker_did.to_owned(),
+                emitted_count: 0,
+            },
+        );
+        (request_id_hex, request_id, caveats_binding)
+    }
+
+    /// Cancel-mid-stream test: after `outlet_stream_cancel` lands while
+    /// chunks remain queued, the next `outlet_stream_next` call MUST
+    /// return a signed synthetic terminal `Error` chunk
+    /// (`SCP-TOOL-6135` / `execution.cancel-ack-timeout`) and the
+    /// remaining queued chunks MUST be dropped — the consumer NEVER
+    /// observes the 4th chunk after cancelling on chunk 3.
+    #[test]
+    fn wasm_outlet_stream_next_emits_synthetic_terminal_after_cancel() {
+        use scp_protocol::context::outlets::stream::ChunkPayload;
+
+        let mut mgr = WasmContextManager::new();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x5C; 32]);
+        let invoker_did = "did:dht:z6MkInvoker";
+        let (request_id_hex, _request_id, caveats_binding) =
+            seed_cancel_test_session(&mut mgr, &signing, invoker_did);
+
+        // Pull 3 chunks (sequences 0, 1, 2) — these are real Data chunks.
+        for expected_seq in 0..3 {
+            let c = mgr
+                .outlet_stream_next(&request_id_hex)
+                .expect("real chunk before cancel");
+            assert!(
+                matches!(c.payload, ChunkPayload::Data { .. }),
+                "chunk {expected_seq} should be Data, got {:?}",
+                c.payload
+            );
+            assert_eq!(c.sequence, expected_seq);
+        }
+
+        // Apply cancel — session.cancelled = true, queue NOT cleared
+        // synchronously, terminated NOT set synchronously.
+        let cancel_ack = mgr
+            .outlet_stream_cancel(&request_id_hex, invoker_did)
+            .expect("cancel accepted");
+        assert_eq!(
+            cancel_ack,
+            Some(3),
+            "cancel-ack-seq is the runtime next-to-emit cursor (emitted_count) at cancel time",
+        );
+        {
+            let s = mgr.outlet_streams.get(&request_id_hex).expect("present");
+            assert!(s.cancelled, "cancel must flip cancelled flag");
+            assert!(
+                !s.terminated,
+                "cancel must NOT flip terminated — the consumer pull surfaces the synthetic terminal"
+            );
+            assert_eq!(s.chunks.len(), 2, "remaining queued chunks NOT cleared yet");
+        }
+
+        // Next pull MUST return a signed synthetic terminal Error chunk
+        // — NOT the 4th queued Data chunk.
+        let terminal = mgr
+            .outlet_stream_next(&request_id_hex)
+            .expect("synthetic terminal after cancel");
+        match &terminal.payload {
+            ChunkPayload::Error {
+                code,
+                terminal: is_terminal,
+                message,
+            } => {
+                assert!(*is_terminal, "synthetic chunk MUST be terminal");
+                assert_eq!(
+                    code,
+                    scp_protocol::context::outlets::error_codes::CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
+                    "cancel-initiated synthetic terminal uses cancel-ack-timeout code"
+                );
+                assert!(
+                    message.contains(
+                        scp_protocol::context::outlets::error_codes::SLUG_EXECUTION_CANCEL_ACK_TIMEOUT
+                    ),
+                    "synthetic message includes the canonical slug, got: {message}"
+                );
+            }
+            other => panic!("expected synthetic terminal Error, got {other:?}"),
+        }
+
+        // The synthetic chunk MUST verify under the per-session key so
+        // SDK-side `verify_chunk_signature` round-trips.
+        assert!(
+            scp_protocol::context::outlets::stream::verify_chunk_signature(
+                &terminal,
+                &signing.verifying_key(),
+                "ctx",
+                "outlet",
+                &caveats_binding,
+            ),
+            "synthetic cancel-ack terminal chunk signature must verify"
+        );
+
+        // After the synthetic terminal: session terminated, remaining
+        // queued chunks dropped, next pull returns None and evicts.
+        {
+            let s = mgr
+                .outlet_streams
+                .get(&request_id_hex)
+                .expect("still present until None");
+            assert!(s.terminated, "synthetic terminal must flip terminated");
+            assert!(
+                s.chunks.is_empty(),
+                "queued tail dropped after synthetic terminal"
+            );
+        }
+        assert!(
+            mgr.outlet_stream_next(&request_id_hex).is_none(),
+            "post-terminal pull returns None and evicts the session"
+        );
+        assert!(
+            !mgr.outlet_streams.contains_key(&request_id_hex),
+            "session evicted after terminal observation"
+        );
     }
 
     /// Test (SCP-OUT-037 critical fix #5) — `outlet_stream_grant_credit`

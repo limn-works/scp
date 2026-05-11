@@ -94,6 +94,36 @@ Real MLS encryption using OpenMLS 0.8 with `features = ["js"]`. **Not a reimplem
 
 **Ciphersuite:** `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (same as scp-core).
 
+## Outlet Streaming — Lazy Cancellation Point
+
+WASM is single-threaded with no async executor pump; the §5.4.5 outlet
+streaming pipeline materialises chunks at `open_outlet_stream` time
+into `WasmOutletStreamSession::chunks: VecDeque<OutletStreamChunk>`.
+`outlet_stream_next` pops the front of the queue on each consumer pull.
+
+`outlet_stream_cancel` does NOT clear the queue or flip `terminated`
+synchronously. It only sets `cancelled = true`. The cancellation
+*observation* happens on the next consumer pull: `outlet_stream_next`
+consults `session.cancelled && !session.terminated` BEFORE popping and,
+on `true`, builds and returns a signed synthetic terminal `Error` chunk
+(`SCP-TOOL-6135` / `execution.cancel-ack-timeout`) and drops any queued
+tail. This is the WASM equivalent of the runtime path's
+`CancelAckTracker::should_force_close` — the consumer always observes a
+terminal chunk after cancel, never a silent end-of-stream. Without this,
+a mid-stream cancel after the SDK had already pulled N chunks would
+result in `next()` returning `None` immediately, leaving the SDK to
+think the stream completed cleanly with no terminal observation.
+
+The model is documented as a "lazy generator" pattern: between consumer
+pulls, the session yields control; on each pull, the generator checks
+`cancelled` first, then dequeues a real chunk if not cancelled.
+Credit-exhaustion (`SCP-TOOL-6131`) follows the same lazy pattern —
+checked when popping a billable chunk under zero `remaining_credit`.
+`outlet_stream_terminate` (framework-initiated termination, e.g.
+`RevokedMidStream`) takes a different path: it eagerly pushes a
+synthetic terminal Error chunk into the queue so the next pull
+delivers it.
+
 ## UCAN — Shared Validation Pipeline
 
 `ucan_validate` delegates to `scp_protocol::crypto::ucan::validate::validate_ucan` using an extract-validate-writeback pattern:

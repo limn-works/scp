@@ -747,18 +747,36 @@ interface InvocationHandleSink {
  * Used by `OutletNamespace.invoke()` when streaming-mode is engaged
  * (a `caveatsBinding` + `streamEpoch` pair was supplied). Internal —
  * not part of the public surface (SCP-OUT-038 AC1: ONE public verb).
+ *
+ * Abnormal-closure handling: if the bridge receiver returns `null`
+ * BEFORE a terminal chunk (`End` / `Error{terminal: true}`) was
+ * observed, the SDK surfaces an `execution.stream-gap` error
+ * (`SCP-TOOL-6131`) per §5.4.4 — synthesising a degenerate
+ * `End{value: null}` would mask a transport drop, executor crash, or
+ * bridge fault as a successful aggregate-null outcome. The runtime
+ * emits `execution.stream-gap` for the analogous mid-stream-gap
+ * condition, so the SDK uses the same slug + code on the consumer side.
  */
 async function pumpStreamingBridge(
   stream: BridgeOutletInvocationStream,
   sink: InvocationHandleSink,
 ): Promise<void> {
+  let terminalObserved = false;
   try {
     while (true) {
       const chunk: BridgeOutletStreamChunk | null = await stream.next();
       if (chunk === null) {
-        // End of receiver — synthesize a degenerate End if the bridge
-        // closed without one.
-        sink.end({ value: null });
+        if (!terminalObserved) {
+          // Abnormal closure — the bridge receiver closed without the
+          // executor emitting a terminal chunk. Surface as an
+          // `execution.stream-gap` (SCP-TOOL-6131) instead of
+          // synthesising an aggregate-null End so callers cannot
+          // mistake a transport drop / executor crash for a successful
+          // run that simply returned `null`.
+          sink.error(
+            new OutletExecutionError("stream closed without terminal chunk", "SCP-TOOL-6131"),
+          );
+        }
         return;
       }
       const sdkChunk = bridgeChunkToSdk(chunk);
@@ -767,6 +785,7 @@ async function pumpStreamingBridge(
         sdkChunk.payloadType === "end" ||
         (sdkChunk.payloadType === "error" && sdkChunk.terminal === true)
       ) {
+        terminalObserved = true;
         if (sdkChunk.payloadType === "end") {
           sink.end({
             value: sdkChunk.aggregate ?? null,
@@ -1420,7 +1439,16 @@ export class OutletNamespace {
 // ---------------------------------------------------------------------------
 
 export type { TestVector };
-export { OutletError, OutletExecutionError };
+// Internal test surface — exported under an underscore-prefixed name so the
+// abnormal-closure test in `tests/invocation-handle-streaming.test.ts` can
+// drive `pumpStreamingBridge` against a synthetic `BridgeOutletInvocationStream`.
+// Not part of the public SDK API.
+export {
+  type InvocationHandleSink as __InternalInvocationHandleSink,
+  OutletError,
+  OutletExecutionError,
+  pumpStreamingBridge as __internalPumpStreamingBridge,
+};
 
 /**
  * Constructor helper — matches the pre-rename `defineToolDefinition` API,

@@ -590,8 +590,20 @@ class InvocationHandle:
                 self._terminated = True
                 raise item
             if item is None:
+                # Abnormal closure — the pump pushed `None` (end-of-
+                # queue sentinel) BEFORE any terminal chunk was observed.
+                # The bridge receiver closed without the executor
+                # emitting `End` / `Error{terminal:true}` (transport
+                # drop, executor crash, bridge fault). Surface as
+                # `execution.stream-gap` (`SCP-TOOL-6131`) per §5.4.4
+                # instead of returning a degenerate `Aggregate(None)`
+                # that would let a caller mistake a stream gap for a
+                # successful aggregate-null outcome.
                 self._terminated = True
-                return Aggregate(value=None)
+                raise OutletExecutionError(
+                    "stream closed without terminal chunk",
+                    code="SCP-TOOL-6131",
+                )
             if item.payload_type == "end":
                 self._terminated = True
                 self._validate_aggregate_against_schema(item.aggregate)
@@ -650,8 +662,22 @@ class InvocationHandle:
             self._terminated = True
             raise item
         if item is None:
+            # Clean end-of-iteration vs. abnormal closure:
+            # - If a terminal chunk (End / Error{terminal:true}) was
+            #   already yielded, `self._terminated` is True and this
+            #   `None` is the normal end-of-queue marker — raise
+            #   `StopAsyncIteration` per the iterator protocol.
+            # - Otherwise the bridge receiver closed without the
+            #   executor ever emitting a terminal chunk; surface as
+            #   `execution.stream-gap` (`SCP-TOOL-6131`) per §5.4.4 so
+            #   the caller sees a real error, not silent completion.
+            if self._terminated:
+                raise StopAsyncIteration
             self._terminated = True
-            raise StopAsyncIteration
+            raise OutletExecutionError(
+                "stream closed without terminal chunk",
+                code="SCP-TOOL-6131",
+            )
         if item.payload_type == "end":
             # AC2 / AC14: End is observable as a chunk in the iterator
             # (yielded as part of the 11-chunk count for 10 Data + End).
