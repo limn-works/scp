@@ -2621,6 +2621,17 @@ impl Supervisor {
     /// callers that may run inside or outside a tokio runtime.
     ///
     /// Returns `false` if the bucket is empty.
+    ///
+    /// # Sync-shape exception
+    ///
+    /// Stays on the legacy `tools_helpers_legacy::*` path because the
+    /// method signature is `fn`, not `async fn` — FFI callers that
+    /// invoke it from outside a tokio runtime (Python's
+    /// gil-bound bridge in particular) cannot `.await`. Migrating it to
+    /// the actor mailbox would require an `async` signature change
+    /// that ripples through every bridge's sync rate-limit path. Phase
+    /// 2A leaves this on the legacy direct-call path as the lone sync
+    /// exception.
     #[must_use]
     pub fn try_consume_hard_rate_limit_from_any_context(
         self: &Arc<Self>,
@@ -2635,6 +2646,12 @@ impl Supervisor {
 
     /// Refund a hard-rate-limit token from any context (no-op on
     /// missing context).
+    ///
+    /// # Sync-shape exception
+    ///
+    /// See the doc on
+    /// [`Self::try_consume_hard_rate_limit_from_any_context`] — the
+    /// sync FFI path constraint applies here too.
     pub fn refund_hard_rate_limit_from_any_context(self: &Arc<Self>, context_id: &str, did: &DID) {
         crate::context::tools_helpers_legacy::refund_hard_rate_limit_from_any_context(
             self, context_id, did,
@@ -2642,6 +2659,18 @@ impl Supervisor {
     }
 
     /// Invoke a tool under the full economy pipeline.
+    ///
+    /// # Closure-shape exception
+    ///
+    /// Stays on the legacy `tools_helpers_legacy::*` path because the
+    /// `executor` parameter is a non-`Send`-bound generic `FnOnce`
+    /// closure (and its returned `Future`) that cannot cross an actor
+    /// mailbox. Migrating would require either erasing the closure to
+    /// a `Box<dyn FnOnce + Send>` (incompatible with several existing
+    /// FFI bridges that supply non-Send executor closures) or
+    /// reshaping the API so the executor runs on the supervisor side
+    /// before the mailbox handoff. Phase 2A leaves this on the legacy
+    /// direct-call path as the lone closure-shape exception.
     ///
     /// # Errors
     ///
