@@ -53,7 +53,12 @@ async-trait = { workspace = true }
 
 [dev-dependencies]
 scp-ffi-common = { path = "../common", features = ["testing"] }
+serde = { workspace = true, features = ["derive"] }
 tempfile = "3"
+
+[[test]]
+name = "outlet_stream_vectors_real"
+path = "tests/outlet_stream_vectors_real.rs"
 
 [build-dependencies]
 napi-build = "2"

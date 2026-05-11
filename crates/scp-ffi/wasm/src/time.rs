@@ -27,9 +27,37 @@ extern "C" {
 ///
 /// Uses the captured `Date.now` reference (see module docs). All WASM bridge
 /// code should use this instead of `js_sys::Date::now()`.
+///
+/// On non-wasm32 targets (native test runners), falls back to
+/// `SystemTime::now()`. The WASM bridge crate compiles natively (default
+/// `cdylib` crate-type) so that in-source `#[cfg(test)]` modules can
+/// exercise bridge functions end-to-end without requiring a wasm-bindgen
+/// JS runtime. The fallback matches the module's documented native-target
+/// contract and is gated behind `cfg(not(target_arch = "wasm32"))` so
+/// production wasm32 builds always use the hardened captured `Date.now`
+/// path.
 #[must_use]
 pub fn now_ms() -> f64 {
-    captured_date_now()
+    #[cfg(target_arch = "wasm32")]
+    {
+        captured_date_now()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        // Native test fallback per the module-level contract — keeps
+        // in-source `#[cfg(test)]` modules in the WASM bridge crate
+        // runnable on native targets (`cargo test -p scp-ffi-wasm`).
+        // Production wasm32 builds never take this branch.
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0.0, |d| {
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    d.as_millis() as f64
+                }
+            })
+    }
 }
 
 /// Returns the current time in milliseconds since Unix epoch as `u64`.
