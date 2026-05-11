@@ -572,7 +572,7 @@ pub fn create_checkpoint_if_due_legacy(
     let clock = supervisor.clock_ref()?;
     let event_log = supervisor.event_log_ref()?;
     let now = clock.now_secs();
-    crate::context::queries_helpers::create_checkpoint_if_due_split(
+    crate::context::queries_helpers::create_checkpoint_if_due(
         context_id,
         ctx.broadcast_context.is_none(),
         ctx.epoch.mls_epoch,

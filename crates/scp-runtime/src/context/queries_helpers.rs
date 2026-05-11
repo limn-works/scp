@@ -64,11 +64,10 @@
 //!
 //! - [`event_log_entries`] — passthrough on `deps.event_log` (no per-
 //!   context state).
-//! - [`create_checkpoint_if_due_split`],
-//!   [`force_create_checkpoint_split`],
-//!   [`force_create_checkpoint_fields`] — split signatures used by
-//!   `messaging_helpers` / `lifecycle_helpers` actor paths to drive
-//!   §9.9.3 checkpointing without going through `&Supervisor`.
+//! - [`create_checkpoint_if_due`],
+//!   [`force_create_checkpoint_fields`] — field-disjoint signatures
+//!   used by `messaging_helpers` / `lifecycle_helpers` actor paths to
+//!   drive §9.9.3 checkpointing.
 //!
 //! Pure helpers (no state, no deps):
 //!
@@ -478,43 +477,18 @@ pub fn velocity_for_test(state: &PerContextState, member_did: &DID, now_secs: u6
 // Checkpoint operations (§9.9.3, ADR-011 AC-8) — actor-shape entries
 // ===========================================================================
 
-/// Creates a consistency checkpoint if one is due based on event count
-/// or time interval thresholds.
+/// Creates a consistency checkpoint when due (§9.9.3 thresholds).
 ///
-/// Actor-shape — operates on the actor's owned `state` directly. The
-/// `now` value is supplied by the caller (typically
-/// `deps.clock.now_secs()`) so the body remains pure.
+/// Takes per-field references so callers may pass disjoint sub-borrows
+/// of the unified [`PerContextState`] (ADR-049 §Decision 1). The `now`
+/// value is supplied by the caller (typically `deps.clock.now_secs()`)
+/// so the body remains pure.
 ///
 /// A checkpoint is due when either:
 /// - 50 events have been appended since the last checkpoint, or
 /// - 10 minutes have elapsed since the last checkpoint.
-pub fn create_checkpoint_if_due(
-    state: &mut PerContextState,
-    deps: &ActorDeps,
-    context_id: &str,
-    sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> Option<scp_event_log::checkpoint::ConsistencyCheckpoint> {
-    let now = deps.clock.now_secs();
-    create_checkpoint_if_due_split(
-        context_id,
-        state.broadcast_context.is_none(),
-        state.epoch.mls_epoch,
-        &mut state.checkpoints,
-        &mut state.checkpoint_events_since,
-        &mut state.checkpoint_last_time_secs,
-        sender_did,
-        signing_key,
-        now,
-        deps.event_log.as_ref(),
-    )
-}
-
-/// Field-disjoint variant of [`create_checkpoint_if_due`] used by
-/// callers that drive checkpointing without holding `state` and `deps`
-/// together (legacy path, messaging actor path).
 #[allow(clippy::too_many_arguments)] // Required to avoid a per-call wrapper struct allocation.
-pub fn create_checkpoint_if_due_split(
+pub fn create_checkpoint_if_due(
     context_id: &str,
     broadcast_context_is_none: bool,
     mls_epoch: u64,
@@ -537,7 +511,7 @@ pub fn create_checkpoint_if_due_split(
         return None;
     }
 
-    let cp = build_checkpoint_split(
+    let cp = build_checkpoint(
         context_id,
         broadcast_context_is_none,
         mls_epoch,
@@ -565,67 +539,9 @@ pub fn create_checkpoint_if_due_split(
 }
 
 /// Unconditionally creates a consistency checkpoint regardless of
-/// whether the event/time thresholds have been reached.
-///
-/// Actor-shape entry — operates on the actor's owned `state` directly.
-pub fn force_create_checkpoint(
-    state: &mut PerContextState,
-    deps: &ActorDeps,
-    context_id: &str,
-    sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
-) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
-    let now = deps.clock.now_secs();
-    force_create_checkpoint_fields(
-        context_id,
-        state.broadcast_context.is_none(),
-        state.epoch.mls_epoch,
-        &mut state.checkpoint_events_since,
-        &mut state.checkpoint_last_time_secs,
-        &mut state.checkpoints,
-        sender_did,
-        signing_key,
-        now,
-        deps.event_log.as_ref(),
-    )
-}
-
-/// Field-disjoint variant of [`force_create_checkpoint`] taking the
-/// supervisor's legacy `&mut state::PerContextState` field slice
-/// indirectly. Kept for the legacy path's `force_create_checkpoint_legacy`
-/// entry point, which already dereferenced clock + `event_log`.
-pub fn force_create_checkpoint_split(
-    context_id: &str,
-    ctx: &mut crate::context::state::PerContextState,
-    sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
-    now: u64,
-    event_log: &dyn ContextEventLogProvider,
-) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
-    let cp = build_checkpoint(context_id, ctx, sender_did, signing_key, now, event_log);
-
-    ctx.checkpoint_events_since = 0;
-    ctx.checkpoint_last_time_secs = now;
-    ctx.checkpoints.push(cp.clone());
-
-    if ctx.checkpoints.len() > MAX_RETAINED_CHECKPOINTS {
-        ctx.checkpoints
-            .drain(..ctx.checkpoints.len() - MAX_RETAINED_CHECKPOINTS);
-    }
-
-    tracing::info!(
-        context_id,
-        event_count = cp.event_count,
-        "forced final checkpoint on context close (§9.9.3)"
-    );
-
-    cp
-}
-
-/// Field-disjoint variant of [`force_create_checkpoint_split`] that
-/// takes per-field references so callers can pass either the legacy
-/// `state::PerContextState` or the actor-shape
-/// `actor::state::PerContextState` without an adapter.
+/// whether the event/time thresholds have been reached. Takes per-field
+/// references so callers may pass disjoint sub-borrows of the unified
+/// [`PerContextState`] (ADR-049 §Decision 1).
 #[allow(clippy::too_many_arguments)]
 pub fn force_create_checkpoint_fields(
     context_id: &str,
@@ -639,7 +555,7 @@ pub fn force_create_checkpoint_fields(
     now: u64,
     event_log: &dyn ContextEventLogProvider,
 ) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
-    let cp = build_checkpoint_split(
+    let cp = build_checkpoint(
         context_id,
         broadcast_context_is_none,
         mls_epoch,
@@ -666,31 +582,9 @@ pub fn force_create_checkpoint_fields(
     cp
 }
 
-/// Builds a signed checkpoint from the current event log against the
-/// legacy [`crate::context::state::PerContextState`] shape used by the
-/// legacy `force_create_checkpoint_split` entry point.
+/// Builds a signed checkpoint from the current event log. Pure function
+/// over the field slice the §9.9.3 canonical-hash inputs require.
 fn build_checkpoint(
-    context_id: &str,
-    ctx: &crate::context::state::PerContextState,
-    sender_did: &DID,
-    signing_key: &ed25519_dalek::SigningKey,
-    now: u64,
-    event_log: &dyn ContextEventLogProvider,
-) -> scp_event_log::checkpoint::ConsistencyCheckpoint {
-    build_checkpoint_split(
-        context_id,
-        ctx.broadcast_context.is_none(),
-        ctx.epoch.mls_epoch,
-        sender_did,
-        signing_key,
-        now,
-        event_log,
-    )
-}
-
-/// Field-disjoint variant of [`build_checkpoint`]. Pure function over
-/// the field slice the §9.9.3 canonical-hash inputs require.
-fn build_checkpoint_split(
     context_id: &str,
     broadcast_context_is_none: bool,
     mls_epoch: u64,

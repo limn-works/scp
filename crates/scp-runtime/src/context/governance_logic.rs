@@ -198,7 +198,7 @@ pub struct ConsequenceStateSplit<'a> {
 
 impl<'a> ConsequenceStateSplit<'a> {
     /// Build a split-borrow from the unified [`PerContextState`]
-    /// (ADR-049 §Decision 1 — single PerContextState).
+    /// (ADR-049 §Decision 1 — single `PerContextState`).
     pub const fn from_state(ctx: &'a mut PerContextState) -> Self {
         Self {
             governance: &mut ctx.governance,

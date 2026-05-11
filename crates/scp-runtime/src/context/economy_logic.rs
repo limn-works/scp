@@ -537,29 +537,19 @@ pub fn commit_economy_ticket(
     ticket.deducted_cost
 }
 
-/// Rolls back every piece of state the ticket represents directly on
-/// an already-locked `PerContextState`. Use this when the caller already
-/// holds the per-context Mutex (Phase 1 error paths under lock).
+/// Rolls back every piece of state the ticket represents: the budget
+/// deduction, the velocity entry (via its rollback token, so we do not
+/// race concurrent senders), and the hard-rate-limit token (when the
+/// Phase 1 path consumed one).
+///
+/// Takes a `&mut GovernanceState` directly so callers may build it from
+/// a sub-borrow of the unified [`super::state::PerContextState`]
+/// (ADR-049 §Decision 1) — actor-shape callers that hold disjoint
+/// borrows on other fields, and the lock-shaped helpers that already
+/// drove the legacy wrapper, both reach this entry point.
 ///
 /// Consumes the ticket so the `Drop` guard does not fire.
 pub fn rollback_economy_ticket_inline(
-    ctx: &mut super::state::PerContextState,
-    ticket: EconomyTicket,
-) {
-    rollback_economy_ticket_inline_split(&mut ctx.governance, ticket);
-}
-
-/// Actor-shape entry point for in-lock rollback. Drives the same body
-/// as [`rollback_economy_ticket_inline`] but accepts a borrowed
-/// [`super::state::GovernanceState`] directly so the actor can call
-/// without going through the legacy [`super::state::PerContextState`].
-///
-/// ADR-049 Phase 2A.7 — added so the actor-shape `messaging_helpers`
-/// can drain `EconomyTicket`s on Phase 1 error paths without the
-/// supervisor lock.
-///
-/// Consumes the ticket so the `Drop` guard does not fire.
-pub fn rollback_economy_ticket_inline_split(
     governance: &mut super::state::GovernanceState,
     mut ticket: EconomyTicket,
 ) {

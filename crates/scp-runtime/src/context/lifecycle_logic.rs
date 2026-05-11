@@ -8,7 +8,6 @@ use std::collections::HashMap;
 use scp_protocol::context::ContextError;
 use scp_protocol::context::builder::ContextCreationError;
 
-use super::state::PerContextState;
 use scp_identity::DID;
 
 /// Builds an [`IdentityDepthAssessment`] for a member in a context.
@@ -166,70 +165,16 @@ pub fn validate_consequence_rules_for_import(
     Ok(())
 }
 
-/// Performs sybil resistance evaluation for a join candidate (#1530).
-///
-/// Reads the `sybil_policy` from `ContextParams`. When `None`, passes
-/// unconditionally (backward compatible). When `Some`, constructs an
-/// [`IdentityDepthAssessment`] from the member's available trust signals
-/// and delegates to [`scp_protocol::trust::sybil::evaluate_sybil_resistance`].
-///
-/// Currently, the `ContextManager` layer does not have access to external
-/// trust signals (social attestations, device attestations, etc.), so the
-/// assessment is constructed with an empty signal set. Contexts that set a
-/// sybil policy with non-trivial requirements will reject members until
-/// signal providers are wired in at a higher layer.
-pub fn evaluate_sybil_resistance(
-    ctx: &PerContextState,
-    member_did: &DID,
-    now: u64,
-) -> Result<(), ContextError> {
-    let Some(policy) = &ctx.handle.params().sybil_policy else {
-        tracing::trace!(
-            member = %member_did,
-            "sybil resistance check: no policy configured, passing"
-        );
-        return Ok(());
-    };
-
-    let assessment = build_identity_assessment(member_did, &ctx.governance, now);
-
-    scp_protocol::trust::sybil::evaluate_sybil_resistance(&assessment, policy, now, None)
-        .map_err(|e| ContextError::PermissionDenied(format!("sybil resistance check failed: {e}")))
-}
-
-/// Initializes participation record and records budget spend for a new member (#1530, #1537).
-pub fn post_join_bookkeeping(
-    ctx: &mut PerContextState,
-    context_id: &str,
-    member_did: &DID,
-    now: u64,
-    event_log: &dyn crate::context::builder::ContextEventLogProvider,
-) {
-    // Participation record initialization for the new member.
-    let context_id_bytes = super::state::context_id_to_bytes(context_id);
-    let merkle_root = event_log
-        .event_log_merkle_root(&context_id_bytes)
-        .unwrap_or([0u8; 32]);
-    let join_events = super::governance_logic::event_log_entries_for_consequences(
-        &ctx.receive_buffer,
-        context_id,
-        now,
-        event_log,
-    );
-    if !join_events.is_empty()
-        && let Ok(record) = scp_protocol::trust::participation::compute_participation_record(
-            &join_events,
-            member_did.as_ref(),
-            context_id,
-            merkle_root,
-            now,
-        )
-    {
-        ctx.governance
-            .participation_cache
-            .insert(member_did.to_string(), record);
-    }
-}
+// ADR-049 Phase 2A finalization keystone — type unification (commit 12):
+// the legacy `evaluate_sybil_resistance(&PerContextState, ...)` /
+// `post_join_bookkeeping(&mut PerContextState, ...)` /
+// `enforce_join_economy(&mut PerContextState, ...)` wrappers were carried
+// alongside their `_split` counterparts only because the legacy and actor
+// struct types diverged. With the unified struct (single
+// `PerContextState`), each public entry point now takes the field
+// sub-borrows directly — callers build them from the unified struct at
+// the call site. The `_split` suffix is dropped below; the legacy
+// `&PerContextState` wrappers are gone.
 
 /// Returns the spec §19.7 default per-DID message pricing configuration.
 ///
@@ -248,77 +193,20 @@ pub fn derive_message_pricing(
     Some(scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default())
 }
 
-/// Enforces economic policy for context joins (#1537, #1593).
+/// Performs sybil resistance evaluation for a join candidate (#1530).
 ///
-/// Checks auto-accept guard, then delegates to the unified `enforce_economy`
-/// which evaluates join cost, checks spending UCAN AND-composition (spec
-/// §19.5), and records spend against the joiner's budget. No auto-grant —
-/// budget must be explicitly approved via `ApproveSpend` governance action.
-///
-/// Returns the deducted cost (if any) so the caller can carry it in an
-/// `EconomyTicket` and drain all refundable economic state together via
-/// `rollback_economy_ticket` on subsequent failure (F4 escrow pattern).
-pub fn enforce_join_economy(
-    ctx: &mut PerContextState,
-    joiner_did: &DID,
-    now: u64,
-    spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
-    context_id: &str,
-    clock: &dyn scp_primitives::Clock,
-    key_resolver: &scp_protocol::context::governance::KeyResolver,
-) -> Result<Option<scp_protocol::economy::types::Amount>, ContextError> {
-    if scp_protocol::economy::policy::auto_accept_blocked_by_economics(
-        ctx.governance.economic_policy.as_ref(),
-    ) {
-        return Err(ContextError::PermissionDenied(
-            "SCP-ECON-12030: paid context requires explicit acceptance".into(),
-        ));
-    }
-    let pricing_default =
-        scp_protocol::economy::antispam::ContextMessagePricingConfig::spec_default();
-    // C1 (PR #1606): mirror messaging.rs split-borrow pattern so the new
-    // immutable `revoked_spending_ucan_cids` borrow coexists with the
-    // mutable budget/nonce borrows on disjoint fields of `governance`.
-    let member_count = ctx.membership.count();
-    let governance = &mut ctx.governance;
-    let pricing = governance
-        .message_pricing
-        .as_ref()
-        .unwrap_or(&pricing_default);
-    super::economy_logic::enforce_economy(super::economy_logic::EnforceEconomyRequest {
-        economic_policy: governance.economic_policy.as_ref(),
-        budget_tracker: &mut governance.budget_tracker,
-        velocity_tracker: &governance.velocity_tracker,
-        member_count,
-        action_type: scp_protocol::economy::types::PaidActionType::ContextJoin,
-        actor_did: joiner_did,
-        now,
-        spending_ucan,
-        action_label: "context:join",
-        context_id,
-        clock,
-        pricing,
-        nonce_tracker: &mut governance.spending_nonce_tracker,
-        revoked_spending_ucan_cids: &governance.revoked_spending_ucan_cids,
-        key_resolver,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Actor-shape `_split` variants (Phase 2A.9 — `lifecycle_helpers` migration)
-// ---------------------------------------------------------------------------
-
-/// Actor-shape variant of [`evaluate_sybil_resistance`].
-///
-/// Drives the same body but takes the underlying fields directly so the
-/// actor-shape per-context state can call without going through the
-/// legacy [`PerContextState`].
+/// Reads the `sybil_policy` directly so callers may pass
+/// `state.handle.params().sybil_policy.as_ref()` from the unified
+/// [`PerContextState`] (ADR-049 §Decision 1). When `None`, passes
+/// unconditionally. When `Some`, constructs an
+/// [`IdentityDepthAssessment`] from the member's available trust signals
+/// and delegates to [`scp_protocol::trust::sybil::evaluate_sybil_resistance`].
 ///
 /// # Errors
 ///
 /// Returns [`ContextError::PermissionDenied`] if the sybil policy is
 /// configured and the assessment fails.
-pub fn evaluate_sybil_resistance_split(
+pub fn evaluate_sybil_resistance(
     sybil_policy: Option<&scp_protocol::trust::sybil::ContextSybilPolicy>,
     governance: &super::state::GovernanceState,
     member_did: &DID,
@@ -338,13 +226,11 @@ pub fn evaluate_sybil_resistance_split(
         .map_err(|e| ContextError::PermissionDenied(format!("sybil resistance check failed: {e}")))
 }
 
-/// Actor-shape variant of [`post_join_bookkeeping`].
-///
-/// Drives the same participation-record initialization as the legacy
-/// helper, but takes a `&mut GovernanceState` and a `&ReceiveBuffer`
-/// directly so the actor-shape state can call without going through the
-/// legacy [`PerContextState`].
-pub fn post_join_bookkeeping_split(
+/// Initializes participation record and records budget spend for a new
+/// member (#1530, #1537). Takes a `&mut GovernanceState` and a
+/// `&ReceiveBuffer` directly so callers may pass disjoint sub-borrows of
+/// the unified [`PerContextState`] (ADR-049 §Decision 1).
+pub fn post_join_bookkeeping(
     governance: &mut super::state::GovernanceState,
     receive_buffer: &scp_protocol::context::membership::ReceiveBuffer,
     context_id: &str,
@@ -377,18 +263,21 @@ pub fn post_join_bookkeeping_split(
     }
 }
 
-/// Actor-shape variant of [`enforce_join_economy`].
+/// Enforces economic policy for context joins (#1537, #1593).
 ///
-/// Drives the same body as the legacy helper but takes the
-/// `GovernanceState` and `member_count` directly. The actor passes
-/// `state.governance` and `state.membership.count()`; the legacy path
-/// continues to call [`enforce_join_economy`].
+/// Checks auto-accept guard, then delegates to the unified
+/// `enforce_economy` which evaluates join cost, checks spending UCAN
+/// AND-composition (spec §19.5), and records spend against the joiner's
+/// budget. Takes a `&mut GovernanceState` and `member_count` directly so
+/// callers may pass disjoint sub-borrows of the unified
+/// [`PerContextState`] (ADR-049 §Decision 1).
 ///
 /// # Errors
 ///
-/// See [`enforce_join_economy`].
+/// Returns [`ContextError::PermissionDenied`] if the auto-accept guard
+/// rejects, or any error surfaced by `enforce_economy`.
 #[allow(clippy::too_many_arguments)]
-pub fn enforce_join_economy_split(
+pub fn enforce_join_economy(
     governance: &mut super::state::GovernanceState,
     member_count: usize,
     joiner_did: &DID,

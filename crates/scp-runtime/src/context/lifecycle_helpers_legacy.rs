@@ -945,7 +945,8 @@ pub async fn join_context_legacy(
         // M13: Sybil resistance check BEFORE economy enforcement so that
         // a rejected sybil attacker doesn't consume budget. Fail-closed.
         crate::context::lifecycle_logic::evaluate_sybil_resistance(
-            ctx,
+            ctx.handle.params().sybil_policy.as_ref(),
+            &ctx.governance,
             &member_did,
             clock.now_secs(),
         )?;
@@ -972,8 +973,10 @@ pub async fn join_context_legacy(
             .velocity_tracker
             .record_message(&member_did, now_secs);
 
+        let member_count = ctx.membership.count();
         let deducted_cost = match crate::context::lifecycle_logic::enforce_join_economy(
-            ctx,
+            &mut ctx.governance,
+            member_count,
             &member_did,
             now_secs,
             spending_ucan,
@@ -1220,7 +1223,8 @@ pub async fn join_context_membership_legacy(
     state::require_active(&ctx.handle)?;
 
     crate::context::lifecycle_logic::post_join_bookkeeping(
-        ctx,
+        &mut ctx.governance,
+        &ctx.receive_buffer,
         context_id,
         member_did,
         clock.now_secs(),

@@ -549,7 +549,7 @@ pub async fn send_message(
     let (broadcast_envelope, recipients_data, sequence, is_broadcast, send_routing_ids) =
         if let Some(ref mut bc) = state.broadcast_context {
             let Some(sk) = signing_key else {
-                crate::context::economy_logic::rollback_economy_ticket_inline_split(
+                crate::context::economy_logic::rollback_economy_ticket_inline(
                     &mut state.governance,
                     ticket,
                 );
@@ -560,7 +560,7 @@ pub async fn send_message(
             let env = match build_broadcast_envelope(&*deps.clock, bc, sender_did, payload, sk) {
                 Ok(env) => env,
                 Err(e) => {
-                    crate::context::economy_logic::rollback_economy_ticket_inline_split(
+                    crate::context::economy_logic::rollback_economy_ticket_inline(
                         &mut state.governance,
                         ticket,
                     );
@@ -579,7 +579,7 @@ pub async fn send_message(
         } else {
             // Encrypted: assign sequence under actor-owned tracker.
             let Some(seq) = state.membership.next_sequence_number(sender_did) else {
-                crate::context::economy_logic::rollback_economy_ticket_inline_split(
+                crate::context::economy_logic::rollback_economy_ticket_inline(
                     &mut state.governance,
                     ticket,
                 );
@@ -605,7 +605,7 @@ pub async fn send_message(
     let auth = match authorize_send_payment(state, deps, &context_id, sender_did).await {
         Ok(auth) => auth,
         Err(e) => {
-            crate::context::economy_logic::rollback_economy_ticket_inline_split(
+            crate::context::economy_logic::rollback_economy_ticket_inline(
                 &mut state.governance,
                 ticket,
             );
@@ -634,7 +634,7 @@ pub async fn send_message(
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
         }
-        crate::context::economy_logic::rollback_economy_ticket_inline_split(
+        crate::context::economy_logic::rollback_economy_ticket_inline(
             &mut state.governance,
             ticket,
         );
@@ -1067,7 +1067,7 @@ pub fn finalize_send(
     if let Some(sk) = signing_key {
         let broadcast_context_is_none = state.broadcast_context.is_none();
         let mls_epoch = state.epoch.mls_epoch;
-        crate::context::queries_helpers::create_checkpoint_if_due_split(
+        crate::context::queries_helpers::create_checkpoint_if_due(
             context_id,
             broadcast_context_is_none,
             mls_epoch,

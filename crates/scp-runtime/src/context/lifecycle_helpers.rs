@@ -581,7 +581,7 @@ pub async fn join_context(
 
     // M13: Sybil resistance check BEFORE economy enforcement so that
     // a rejected sybil attacker doesn't consume budget. Fail-closed.
-    crate::context::lifecycle_logic::evaluate_sybil_resistance_split(
+    crate::context::lifecycle_logic::evaluate_sybil_resistance(
         state.handle.params().sybil_policy.as_ref(),
         &state.governance,
         &member_did,
@@ -611,7 +611,7 @@ pub async fn join_context(
         .record_message(&member_did, now_secs);
 
     let member_count = state.membership.count();
-    let deducted_cost = match crate::context::lifecycle_logic::enforce_join_economy_split(
+    let deducted_cost = match crate::context::lifecycle_logic::enforce_join_economy(
         &mut state.governance,
         member_count,
         &member_did,
@@ -658,7 +658,7 @@ pub async fn join_context(
     {
         Ok(auth) => auth,
         Err(payment_err) => {
-            crate::context::economy_logic::rollback_economy_ticket_inline_split(
+            crate::context::economy_logic::rollback_economy_ticket_inline(
                 &mut state.governance,
                 ticket,
             );
@@ -679,7 +679,7 @@ pub async fn join_context(
                 crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id)
                     .await;
             }
-            crate::context::economy_logic::rollback_economy_ticket_inline_split(
+            crate::context::economy_logic::rollback_economy_ticket_inline(
                 &mut state.governance,
                 ticket,
             );
@@ -699,7 +699,7 @@ pub async fn join_context(
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
         }
-        crate::context::economy_logic::rollback_economy_ticket_inline_split(
+        crate::context::economy_logic::rollback_economy_ticket_inline(
             &mut state.governance,
             ticket,
         );
@@ -719,7 +719,7 @@ pub async fn join_context(
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
         }
-        crate::context::economy_logic::rollback_economy_ticket_inline_split(
+        crate::context::economy_logic::rollback_economy_ticket_inline(
             &mut state.governance,
             ticket,
         );
@@ -736,7 +736,7 @@ pub async fn join_context(
         if let Some(a) = auth {
             crate::context::economy_helpers::void_paid_action(state, deps, a, &context_id).await;
         }
-        crate::context::economy_logic::rollback_economy_ticket_inline_split(
+        crate::context::economy_logic::rollback_economy_ticket_inline(
             &mut state.governance,
             ticket,
         );
@@ -787,7 +787,7 @@ pub fn join_context_membership(
 ) -> Result<(), ContextError> {
     state::require_active(&state.handle)?;
 
-    crate::context::lifecycle_logic::post_join_bookkeeping_split(
+    crate::context::lifecycle_logic::post_join_bookkeeping(
         &mut state.governance,
         &state.receive_buffer,
         context_id,
