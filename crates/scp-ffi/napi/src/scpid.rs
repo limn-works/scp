@@ -388,6 +388,8 @@ mod tests {
 
         let dht_client = Arc::new(InMemoryDhtClient::new());
         let custody = Arc::new(scp_platform::testing::InMemoryKeyCustody::new());
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
 
         // Create a DidDht with a signer so we can publish the DID document.
         let sign_fn = scp_identity::DidDht::<InMemoryDhtClient, scp_identity::cache::SystemClock>::make_sign_fn(Arc::clone(&custody));
@@ -396,7 +398,10 @@ mod tests {
             Arc::new(DidCache::new()),
             sign_fn,
         );
-        let (identity, doc) = dht.create(custody.as_ref()).await.unwrap();
+        let (identity, doc, _pre_rotation_handle) = dht
+            .create(custody.as_ref(), pre_rotation_custody.as_ref())
+            .await
+            .unwrap();
 
         // Publish the document to the shared DHT so the resolver can find it.
         dht.publish(&identity, &doc).await.unwrap();

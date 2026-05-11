@@ -1269,6 +1269,7 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "identity_add_agent_key",
     "identity_remove_agent_key",
     "identity_rotate_agent_key",
+    "identity_rotate_key",
     // Stateless utility ops (4)
     "address_resolve",
     "aggregate_trust_input",

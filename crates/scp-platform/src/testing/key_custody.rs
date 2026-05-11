@@ -486,6 +486,48 @@ impl KeyCustody for InMemoryKeyCustody {
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::InMemory
     }
+
+    fn import_ed25519_signing_key(
+        &self,
+        seed: &Zeroizing<[u8; 32]>,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        // Wrap the local copy in `Zeroizing` immediately so the bytes
+        // are wiped when this function returns. `[u8; 32]` is `Copy`,
+        // so dereferencing the borrow performs a stack copy; capturing
+        // it directly into a `Zeroizing` ensures the wrapper owns the
+        // only stack residue (the original `seed` is owned by the
+        // caller and stays in their `Zeroizing`).
+        let seed_copy: Zeroizing<[u8; 32]> = Zeroizing::new(**seed);
+        async move {
+            let handle = self.next_handle();
+            let signing_key = SigningKey::from_bytes(&seed_copy);
+
+            let mut store = self.store.lock().await;
+            store.ed25519_keys.insert(handle.id(), signing_key);
+            store.key_types.insert(handle.id(), StoredKeyType::Ed25519);
+            drop(store);
+
+            // `seed_copy: Zeroizing<[u8; 32]>` drops here → bytes wiped.
+            Ok(handle)
+        }
+    }
+
+    fn generate_ephemeral_ed25519_seed(
+        &self,
+    ) -> impl Future<Output = Result<Zeroizing<[u8; 32]>, PlatformError>> + Send {
+        async move {
+            // Draw 32 bytes from the SAME RNG used by `generate_keypair`. This
+            // preserves the ADR-046 byte-parity invariant: the seeded
+            // bridge-parity tests expect `seed[0..32]` → identity_key,
+            // `seed[32..64]` → active_signing_key, `seed[64..96]` →
+            // pre-rotation key. Calling this method between identity and
+            // active generations would break parity; the dht::create flow
+            // is responsible for the correct ordering.
+            let mut seed = Zeroizing::new([0u8; 32]);
+            self.rng.lock().await.fill_bytes(seed.as_mut());
+            Ok(seed)
+        }
+    }
 }
 
 #[cfg(test)]

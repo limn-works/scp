@@ -141,8 +141,14 @@ COLLISION_COUNT=0
 # Scan only production FFI bridge source files (not tests).
 while IFS=: read -r file line_num content; do
     # Skip test files entirely.
+    # Path patterns:
+    #   - `*/tests/*` covers `crates/.../tests/`, `bindings/python/tests/`, etc.
+    #   - `*/src/test/*` covers Kotlin/Gradle layout
+    #     (`bindings/kotlin/scp-kt/src/test/kotlin/...`).
+    #   - `*Test.kt`, `*Tests.swift` cover JUnit / XCTest naming convention.
+    # File suffixes: `_test.rs`, `_test.ts`, `_test.py`, `.test.ts`, `.test.js`.
     case "$file" in
-        */tests/*|*_test.rs|*_test.ts|*_test.py|*.test.ts|*.test.js) continue ;;
+        */tests/*|*/src/test/*|*Test.kt|*Tests.swift|*_test.rs|*_test.ts|*_test.py|*.test.ts|*.test.js) continue ;;
     esac
 
     # Skip lines inside #[cfg(test)] modules (Rust inline tests).
@@ -158,6 +164,16 @@ while IFS=: read -r file line_num content; do
     esac
 
     # Only process lines that define an error (contain message/Error patterns).
+    #
+    # KNOWN LIMITATION: the matcher is Rust-shaped. SDK-wrapper literals
+    # in Python/TS/Swift/Kotlin that construct typed errors with ad-hoc
+    # `SCP-...` strings (e.g., `raise IdentityError(msg, "SCP-IDENT-1050")`)
+    # are NOT inspected by this Phase-2 detector. The current fingerprint
+    # comparator cannot reliably distinguish "same purpose, different
+    # syntax" (TS `throw new ValidationError(...)` vs Swift
+    # `ScpError.Validation(msg:...)`) from "different purpose, same code".
+    # SDK literals must be reviewed manually against `error_codes.rs`
+    # to prevent collisions.
     case "$content" in
         *message:*|*message*format*|*JsError::new*|*Error*message*) ;;
         *) continue ;;

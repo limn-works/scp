@@ -141,6 +141,27 @@ impl KeyCustody for FfiKeyCustody {
             Self::File(kc) => kc.custody_type(key),
         }
     }
+
+    async fn generate_ephemeral_ed25519_seed(
+        &self,
+    ) -> Result<zeroize::Zeroizing<[u8; 32]>, PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => kc.generate_ephemeral_ed25519_seed().await,
+            Self::File(kc) => kc.generate_ephemeral_ed25519_seed().await,
+        }
+    }
+
+    async fn import_ed25519_signing_key(
+        &self,
+        seed: &zeroize::Zeroizing<[u8; 32]>,
+    ) -> Result<KeyHandle, PlatformError> {
+        match self {
+            #[cfg(feature = "allow_in_memory_custody")]
+            Self::InMemory(kc) => kc.import_ed25519_signing_key(seed).await,
+            Self::File(kc) => kc.import_ed25519_signing_key(seed).await,
+        }
+    }
 }
 
 impl FfiKeyCustody {

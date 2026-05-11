@@ -55,6 +55,8 @@ class StubIdentityAdvancedBindings : IdentityAdvancedBindings {
     var rotateAgentKeyResult = 102L
     var removeAgentKeyResult = 103L
     var migrateResult = 104L
+    var rotationEventJsonResult: String? =
+        """{"old_did":"did:dht:zOld","new_did":"did:dht:zNew","rotated_at":1700000000}"""
     var attestDeviceResult = "dGVzdC1hdHRlc3RhdGlvbg=="
     var verifyDeviceAttestationResult = true
     var executeRecoveryResult = """{"key_rotation_completed":true}"""
@@ -94,6 +96,11 @@ class StubIdentityAdvancedBindings : IdentityAdvancedBindings {
         migrateCalled = true
         lastIdentityHandle = identityHandle
         return migrateResult
+    }
+
+    override fun identityRotationEventJson(identityHandle: Long): String? {
+        lastIdentityHandle = identityHandle
+        return rotationEventJsonResult
     }
 
     override fun identityAttestDevice(identityHandle: Long): String {
@@ -243,6 +250,14 @@ class IdentityAdvancedBridgeTest {
 
     @Nested
     inner class Migrate {
+        // The simpler `migrate` overload is deprecated at ERROR level
+        // because it drops the rotation event required by spec §3.2.1
+        // step 4b. We still test that the underlying binding plumbing
+        // works for any legacy in-tree caller until the overload is
+        // removed. `DEPRECATION_ERROR` is the Kotlin-specific suppress
+        // key for `DeprecationLevel.ERROR` (plain `DEPRECATION` only
+        // covers `DeprecationLevel.WARNING`).
+        @Suppress("DEPRECATION_ERROR")
         @Test
         fun `migrate delegates handle to bindings`() =
             runTest(testDispatcher) {
@@ -250,6 +265,27 @@ class IdentityAdvancedBridgeTest {
                 assertTrue(stubAdvanced.migrateCalled)
                 assertEquals(42L, stubAdvanced.lastIdentityHandle)
                 assertEquals(104L, result)
+            }
+
+        @Test
+        fun `migrateWithRotationEvent returns handle and rotation event JSON`() =
+            runTest(testDispatcher) {
+                val expectedJson =
+                    """{"old_did":"did:dht:zOld","new_did":"did:dht:zNew","rotated_at":1700000000}"""
+                stubAdvanced.rotationEventJsonResult = expectedJson
+                val result = advancedBridge.migrateWithRotationEvent(42L)
+                assertTrue(stubAdvanced.migrateCalled)
+                assertEquals(104L, result.handle)
+                assertEquals(expectedJson, result.rotationEventJson)
+            }
+
+        @Test
+        fun `migrateWithRotationEvent surfaces null rotation event JSON`() =
+            runTest(testDispatcher) {
+                stubAdvanced.rotationEventJsonResult = null
+                val result = advancedBridge.migrateWithRotationEvent(42L)
+                assertEquals(104L, result.handle)
+                assertEquals(null, result.rotationEventJson)
             }
     }
 

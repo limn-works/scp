@@ -125,6 +125,24 @@ impl From<ScpNapiError> for napi::Error {
 
 impl From<scp_identity::IdentityError> for ScpNapiError {
     fn from(e: scp_identity::IdentityError) -> Self {
+        use scp_identity::IdentityError as IE;
+        use scp_platform::PreRotationCustodyError as PE;
+
+        if let IE::PreRotation(pre_err) = &e {
+            let code = match pre_err {
+                PE::HandleNotFound => codes::IDENT_1047,
+                PE::Unavailable(_) => codes::IDENT_1048,
+                PE::UserDeclined => codes::IDENT_1049,
+                PE::Storage(_) => codes::IDENT_1050,
+                PE::InvalidCallbackResponse(_) => codes::IDENT_1051,
+                PE::CommitmentMismatch => codes::IDENT_1052,
+            };
+            return Self::Identity {
+                message: format!("{e}"),
+                code: code.to_owned(),
+            };
+        }
+
         Self::Identity {
             message: format!(
                 "{e} — check DID format, key custody configuration, or DHT connectivity"
@@ -489,5 +507,86 @@ pub(crate) fn validate_custody_type(custody: &str) -> Result<&str, ScpNapiError>
             ),
             code: codes::VALID_7005.to_owned(),
         }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+//
+// Regression tests pinning each `PreRotationCustodyError` variant to its
+// typed error code on the NAPI bridge. Mirrors the PyO3 tests in
+// `crates/scp-ffi/src/error.rs` (same function names, same semantics) so
+// any future re-ordering or accidental swap of match arms in the
+// `From<scp_identity::IdentityError>` impl above breaks here, not at the
+// TypeScript SDK boundary where it would be harder to diagnose.
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use scp_platform::PreRotationCustodyError;
+
+    fn code_of(e: ScpNapiError) -> String {
+        match e {
+            ScpNapiError::Identity { code, .. } => code,
+            other => panic!("expected ScpNapiError::Identity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_rotation_handle_not_found_surfaces_typed_code() {
+        let err: ScpNapiError =
+            scp_identity::IdentityError::PreRotation(PreRotationCustodyError::HandleNotFound)
+                .into();
+        assert_eq!(code_of(err), codes::IDENT_1047);
+    }
+
+    #[test]
+    fn pre_rotation_unavailable_surfaces_typed_code() {
+        let err: ScpNapiError = scp_identity::IdentityError::PreRotation(
+            PreRotationCustodyError::Unavailable("hardware key not connected".into()),
+        )
+        .into();
+        assert_eq!(code_of(err), codes::IDENT_1048);
+    }
+
+    #[test]
+    fn pre_rotation_user_declined_surfaces_typed_code() {
+        let err: ScpNapiError =
+            scp_identity::IdentityError::PreRotation(PreRotationCustodyError::UserDeclined).into();
+        assert_eq!(code_of(err), codes::IDENT_1049);
+    }
+
+    #[test]
+    fn pre_rotation_storage_surfaces_typed_code() {
+        let err: ScpNapiError = scp_identity::IdentityError::PreRotation(
+            PreRotationCustodyError::Storage("disk full".into()),
+        )
+        .into();
+        assert_eq!(code_of(err), codes::IDENT_1050);
+    }
+
+    #[test]
+    fn pre_rotation_invalid_callback_response_surfaces_typed_code() {
+        let err: ScpNapiError = scp_identity::IdentityError::PreRotation(
+            PreRotationCustodyError::InvalidCallbackResponse("handle is empty".into()),
+        )
+        .into();
+        assert_eq!(code_of(err), codes::IDENT_1051);
+    }
+
+    #[test]
+    fn pre_rotation_commitment_mismatch_surfaces_typed_code() {
+        let err: ScpNapiError =
+            scp_identity::IdentityError::PreRotation(PreRotationCustodyError::CommitmentMismatch)
+                .into();
+        assert_eq!(code_of(err), codes::IDENT_1052);
+    }
+
+    #[test]
+    fn non_pre_rotation_identity_errors_keep_generic_envelope() {
+        let err: ScpNapiError = scp_identity::IdentityError::InvalidDidFormat("bad".into()).into();
+        assert_eq!(code_of(err), codes::IDENT_1001);
     }
 }

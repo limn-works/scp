@@ -38,30 +38,62 @@ use super::IdentityError;
 use super::attestation::{IdentityLinkServiceEntry, ScpKeyCustodyAttestation};
 use serde::{Deserialize, Serialize};
 
-/// Custom serde module for `[u8; 64]` fields.
+/// Custom serde helpers for hex-encoded fixed-size byte arrays.
 ///
-/// Serde does not natively support arrays larger than 32 elements. This module
-/// serializes `[u8; 64]` via `Vec<u8>` (leveraging `serde_bytes` for compact
-/// binary representation) and validates the exact length on deserialization,
-/// rejecting anything other than exactly 64 bytes.
-mod serde_signature_64 {
-    use serde::{self, Deserializer, Serializer};
+/// Wire format is a lowercase hex string. Hex is the project-wide
+/// convention for cryptographic byte material (signatures, public keys,
+/// hashes): ~50% smaller on the wire than the `serde_bytes` JSON-array
+/// form, human-readable in logs, trivially copy-pasteable, and decodes
+/// in one call. Deserialization validates the exact byte count.
+///
+/// `serde`'s `with = "..."` attribute resolves a *module path* and
+/// cannot pass type parameters, so the const-generic core lives here
+/// and thin per-size submodules (`array64`, `array32`) instantiate it.
+/// Apply via `#[serde(with = "serde_hex_array::array64")]` etc.
+mod serde_hex_array {
+    use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S>(bytes: &[u8; 64], serializer: S) -> Result<S::Ok, S::Error>
+    fn serialize_impl<const N: usize, S>(bytes: &[u8; N], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        serde_bytes::serialize(bytes.as_slice(), serializer)
+        serializer.serialize_str(&hex::encode(bytes))
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<[u8; 64], D::Error>
+    fn deserialize_impl<'de, const N: usize, D>(deserializer: D) -> Result<[u8; N], D::Error>
     where
         D: Deserializer<'de>,
     {
-        let v: Vec<u8> = serde_bytes::deserialize(deserializer)?;
+        let s = String::deserialize(deserializer)?;
+        let v =
+            hex::decode(&s).map_err(|e| serde::de::Error::custom(format!("invalid hex: {e}")))?;
         v.try_into().map_err(|v: Vec<u8>| {
-            serde::de::Error::custom(format!("expected 64-byte signature, got {} bytes", v.len()))
+            serde::de::Error::custom(format!("expected {N}-byte field, got {} bytes", v.len()))
         })
+    }
+
+    pub mod array64 {
+        use super::{deserialize_impl, serialize_impl};
+        use serde::{Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(bytes: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
+            serialize_impl::<64, S>(bytes, s)
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
+            deserialize_impl::<64, D>(d)
+        }
+    }
+
+    pub mod array32 {
+        use super::{deserialize_impl, serialize_impl};
+        use serde::{Deserializer, Serializer};
+
+        pub fn serialize<S: Serializer>(bytes: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+            serialize_impl::<32, S>(bytes, s)
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+            deserialize_impl::<32, D>(d)
+        }
     }
 }
 
@@ -837,6 +869,49 @@ impl DidDocument {
         self.also_known_as = vec![new_did.to_owned()];
     }
 
+    /// Retires the `#active` and `#agent` operational keys for a
+    /// migrated identity (spec §9.12, "compromise recovery").
+    ///
+    /// Removes both verification methods from `verification_method`
+    /// and from the `authentication` / `assertion_method` arrays.
+    /// `#0` (Identity Key) and any `#retired-*` / `#retired-agent-*`
+    /// entries from prior Layer-1 rotations are preserved — `#0`
+    /// continues to authorize `alsoKnownAs` republishes, and the
+    /// retired-key history remains auditable.
+    ///
+    /// Used by [`DidDht::migrate_identity`] when republishing the
+    /// OLD DID document with `alsoKnownAs` pointing at the new
+    /// identity. After migration the OLD document's purpose is
+    /// forwarding only; leaving `#active` / `#agent` listed as
+    /// current verification methods would let a verifier resolving
+    /// the OLD doc still treat those keys as authoritative even
+    /// though their private bytes have been destroyed in custody
+    /// (step 7b).
+    pub fn retire_operational_keys_for_migration(&mut self) {
+        // Remove `#active` and `#agent` verification methods.
+        // Retired entries (`#retired-*`, `#retired-agent-*`) remain.
+        //
+        // Exact-fragment match (not `ends_with`) so a hypothetical
+        // future fragment like `#secondary-active` or
+        // `#auxiliary-agent` is not silently swept along with the
+        // operational keys. Today the spec defines only `#0`,
+        // `#active`, `#agent`, `#retired-N`, and `#retired-agent-N`,
+        // so this is forward-compat hardening rather than a bug fix
+        // against current data.
+        self.verification_method.retain(|vm| {
+            let frag = vm.id.rsplit('#').next().unwrap_or("");
+            frag != "active" && frag != "agent"
+        });
+        self.authentication.retain(|reference| {
+            let frag = reference.rsplit('#').next().unwrap_or("");
+            frag != "active" && frag != "agent"
+        });
+        self.assertion_method.retain(|reference| {
+            let frag = reference.rsplit('#').next().unwrap_or("");
+            frag != "active" && frag != "agent"
+        });
+    }
+
     // --- Agent key management (ADR-039) ---
 
     /// Returns `true` if this document contains an `#agent` verification method.
@@ -1077,22 +1152,29 @@ pub struct DidRotationEvent {
 
 /// Proof that the old Identity Key authorized a migration to a new DID.
 ///
-/// The signature covers `SHA-256("SCP-MIGRATION-V1:" || old_did || new_did
-/// || rotated_at)` and is signed by the old Identity Key. This provides
-/// MODERATE assurance that the migration was authorized by the DID owner.
-/// The `SCP-MIGRATION-V1:` domain separator prevents cross-protocol
-/// signature confusion.
+/// The signature covers
+/// `SHA-256(DOMAIN_MIGRATION_V1 || u32_be(len(old_did)) || old_did ||
+/// u32_be(len(new_did)) || new_did || u64_be(rotated_at))` and is signed
+/// by the old Identity Key. Length prefixes (u32 big-endian for the
+/// variable-length DID strings and the implicit u64 big-endian width of
+/// `rotated_at`) prevent concatenation ambiguity between adjacent
+/// variable-length fields. This provides MODERATE assurance that the
+/// migration was authorized by the DID owner. The `DOMAIN_MIGRATION_V1`
+/// domain separator prevents cross-protocol signature confusion.
 ///
 /// See ADR-003 acceptance criterion 4c.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MigrationProof {
-    /// Ed25519 signature of `SHA-256("SCP-MIGRATION-V1:" || old_did
-    /// || new_did || rotated_at)` signed by the old Identity Key. Must be
-    /// exactly 64 bytes (Ed25519).
-    #[serde(with = "serde_signature_64")]
+    /// Ed25519 signature of
+    /// `SHA-256(DOMAIN_MIGRATION_V1 || u32_be(len(old_did)) || old_did ||
+    /// u32_be(len(new_did)) || new_did || u64_be(rotated_at))` signed by
+    /// the old Identity Key. Must be exactly 64 bytes (Ed25519). Wire
+    /// format: lowercase hex string.
+    #[serde(with = "serde_hex_array::array64")]
     pub signature: [u8; 64],
     /// The old Identity Key's public bytes, for verification without resolving
-    /// the old DID document.
+    /// the old DID document. Wire format: lowercase hex string.
+    #[serde(with = "serde_hex_array::array32")]
     pub old_public_key: [u8; 32],
 }
 
@@ -1106,10 +1188,13 @@ pub struct MigrationProof {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PreRotationProof {
     /// The commitment published in the old DID document's
-    /// `PreRotationCommitment` service (`sha256:<hex>`).
+    /// `PreRotationCommitment` service (`sha256:<hex>`). Wire format:
+    /// lowercase hex string.
+    #[serde(with = "serde_hex_array::array32")]
     pub commitment: [u8; 32],
     /// The new Identity Key public bytes. `SHA-256(this)` must equal
-    /// `commitment`.
+    /// `commitment`. Wire format: lowercase hex string.
+    #[serde(with = "serde_hex_array::array32")]
     pub revealed_key: [u8; 32],
 }
 
@@ -1485,17 +1570,18 @@ mod tests {
         assert_eq!(urls[0], "wss://existing.example.com/scp/v1");
     }
 
-    // --- MigrationProof.signature [u8; 64] tests (SCP-202) ---
+    // --- MigrationProof.signature [u8; 64] hex-string tests ---
 
-    /// Helper: build a JSON object for `MigrationProof` with a signature of
-    /// the given length. The `old_public_key` is always a valid 32-byte array.
-    fn migration_proof_json_with_sig_len(len: usize) -> String {
-        let sig_array: Vec<String> = (0..len).map(|i| ((i % 256) as u8).to_string()).collect();
-        let pk_array: Vec<String> = (0..32).map(|_| "1".to_owned()).collect();
+    /// Helper: build a JSON object for `MigrationProof` with a signature
+    /// of the given byte length, hex-encoded. The `old_public_key` is
+    /// always a valid 32-byte array (hex-encoded).
+    fn migration_proof_json_with_sig_len(byte_len: usize) -> String {
+        let sig_bytes: Vec<u8> = (0..byte_len).map(|i| (i % 256) as u8).collect();
+        let pk_bytes: Vec<u8> = (0..32).map(|_| 1u8).collect();
         format!(
-            r#"{{"signature":[{}],"old_public_key":[{}]}}"#,
-            sig_array.join(","),
-            pk_array.join(",")
+            r#"{{"signature":"{}","old_public_key":"{}"}}"#,
+            hex::encode(&sig_bytes),
+            hex::encode(&pk_bytes)
         )
     }
 
@@ -1504,7 +1590,6 @@ mod tests {
         let json = migration_proof_json_with_sig_len(64);
         let proof: MigrationProof = serde_json::from_str(&json).unwrap();
         assert_eq!(proof.signature.len(), 64);
-        // Verify the bytes are correct.
         for (i, &b) in proof.signature.iter().enumerate() {
             assert_eq!(b, (i % 256) as u8);
         }
@@ -1535,13 +1620,44 @@ mod tests {
     }
 
     #[test]
+    fn migration_proof_invalid_hex_rejected() {
+        // Non-hex character in signature.
+        let json = r#"{"signature":"zzzz","old_public_key":"01010101010101010101010101010101010101010101010101010101010101"}"#;
+        let result = serde_json::from_str::<MigrationProof>(json);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("invalid hex"),
+            "error should mention invalid hex, got: {err_msg}"
+        );
+    }
+
+    #[test]
     fn migration_proof_signature_json_roundtrip() {
         let proof = MigrationProof {
             signature: [0xAA; 64],
             old_public_key: [0xBB; 32],
         };
         let json = serde_json::to_string(&proof).unwrap();
+        // Wire format must be hex strings, not byte arrays.
+        assert!(json.contains("\"aaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(json.contains("\"bbbbbbbbbbbbbbbb"));
+        assert!(!json.contains('['));
         let parsed: MigrationProof = serde_json::from_str(&json).unwrap();
+        assert_eq!(proof, parsed);
+    }
+
+    #[test]
+    fn pre_rotation_proof_json_roundtrip() {
+        let proof = PreRotationProof {
+            commitment: [0xCC; 32],
+            revealed_key: [0xDD; 32],
+        };
+        let json = serde_json::to_string(&proof).unwrap();
+        // Wire format must be hex strings.
+        assert!(json.contains("\"cccccccccccccccc"));
+        assert!(json.contains("\"dddddddddddddddd"));
+        let parsed: PreRotationProof = serde_json::from_str(&json).unwrap();
         assert_eq!(proof, parsed);
     }
 
@@ -2322,5 +2438,97 @@ mod tests {
         assert_eq!(entries[0].attestation_id, "abc123");
         assert_eq!(entries[1].platform, "x.com");
         assert_eq!(entries[1].attestation_id, "def456");
+    }
+
+    /// `retire_operational_keys_for_migration` MUST use exact-fragment
+    /// match so a hypothetical future fragment like `#secondary-active`
+    /// or `#auxiliary-agent` is not silently swept along with the
+    /// operational keys. Today the spec defines only `#0`, `#active`,
+    /// `#agent`, `#retired-N`, and `#retired-agent-N`; this test is
+    /// forward-compat hardening.
+    #[test]
+    fn retire_operational_keys_for_migration_preserves_unrelated_fragments() {
+        let did = "did:dht:zRetireExact";
+        let mut doc = DidDocument::new(did, &[7u8; 32], &[8u8; 32], &[9u8; 32]);
+
+        // Inject a synthetic `#secondary-active` VM (the suffix
+        // `active` would have matched the old `ends_with("#active")`
+        // filter even though the fragment is `secondary-active`).
+        doc.verification_method.push(VerificationMethod {
+            id: format!("{did}#secondary-active"),
+            method_type: ED25519_VERIFICATION_KEY_TYPE.to_owned(),
+            controller: did.to_owned(),
+            public_key_multibase: format!("z{}", base58btc_encode(&[11u8; 32])),
+        });
+        // Also reference it from authentication so the per-array
+        // filter is exercised.
+        doc.authentication.push(format!("{did}#secondary-active"));
+        doc.assertion_method.push(format!("{did}#secondary-active"));
+
+        // Sanity: before retire, all four VMs and refs are present.
+        assert!(
+            doc.verification_method
+                .iter()
+                .any(|vm| vm.id == format!("{did}#0"))
+        );
+        assert!(
+            doc.verification_method
+                .iter()
+                .any(|vm| vm.id == format!("{did}#active"))
+        );
+        assert!(
+            doc.verification_method
+                .iter()
+                .any(|vm| vm.id == format!("{did}#secondary-active"))
+        );
+
+        doc.retire_operational_keys_for_migration();
+
+        // `#0` and `#secondary-active` MUST remain. `#active` MUST go.
+        let frags: Vec<String> = doc
+            .verification_method
+            .iter()
+            .map(|vm| vm.id.clone())
+            .collect();
+        assert!(
+            frags.contains(&format!("{did}#0")),
+            "#0 must be retained; got: {frags:?}"
+        );
+        assert!(
+            frags.contains(&format!("{did}#secondary-active")),
+            "#secondary-active must NOT be swept by exact-fragment retire; got: {frags:?}"
+        );
+        assert!(
+            !frags.contains(&format!("{did}#active")),
+            "#active must be removed; got: {frags:?}"
+        );
+        assert!(
+            !frags.contains(&format!("{did}#agent")),
+            "#agent (if present) must be removed; got: {frags:?}"
+        );
+
+        // Reference arrays: `#secondary-active` retained, `#active` removed.
+        assert!(
+            doc.authentication
+                .contains(&format!("{did}#secondary-active")),
+            "authentication must retain #secondary-active; got: {:?}",
+            doc.authentication
+        );
+        assert!(
+            !doc.authentication.contains(&format!("{did}#active")),
+            "authentication must drop #active; got: {:?}",
+            doc.authentication
+        );
+        assert!(
+            doc.assertion_method
+                .contains(&format!("{did}#secondary-active")),
+            "assertionMethod must retain #secondary-active; got: {:?}",
+            doc.assertion_method
+        );
+        assert!(
+            !doc.assertion_method.contains(&format!("{did}#active")),
+            "assertionMethod must drop #active; got: {:?}",
+            doc.assertion_method
+        );
     }
 }

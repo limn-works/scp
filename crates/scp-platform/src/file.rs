@@ -557,10 +557,16 @@ impl KeyCustody for FileKeyCustody {
                 KeyType::X25519 => StoredKeyType::X25519,
             };
 
-            let entry_index = self.append_entry(stored_type, &key_bytes)?;
-
-            let handle = self.next_handle();
+            // Hold `handle_map` across the entire append-and-insert
+            // path so a concurrent `destroy_key` cannot rewrite the
+            // file and shift `entry_index` between our `append_entry`
+            // and the map insert. `append_entry` takes only
+            // `file_write_lock`, never `handle_map`, so there is no
+            // lock-ordering inversion. Mirrors the pattern in
+            // `import_ed25519_signing_key`.
             let mut map = self.handle_map.lock().await;
+            let entry_index = self.append_entry(stored_type, &key_bytes)?;
+            let handle = self.next_handle();
             map.entries.insert(handle.id(), (stored_type, entry_index));
             drop(map);
 
@@ -641,8 +647,16 @@ impl KeyCustody for FileKeyCustody {
     ) -> impl Future<Output = Result<(), PlatformError>> + Send {
         let key_id = key.id();
         async move {
-            // Remove from pseudonym keys if present.
+            // Standardized lock order: `handle_map` first, then
+            // `pseudonym_keys`. Other call sites that touch both
+            // (`sign`, `public_key`) release `pseudonym_keys` before
+            // acquiring `handle_map`, so they do not hold the locks
+            // concurrently and remain compatible with this ordering.
+            let mut map = self.handle_map.lock().await;
+
             // Pseudonym keys are in-memory only — no disk rewrite needed.
+            // Check them under the held `handle_map` lock so destroy_key
+            // is atomic with concurrent map readers.
             {
                 let mut pseudonyms = self.pseudonym_keys.lock().await;
                 if pseudonyms.remove(&key_id).is_some() {
@@ -650,12 +664,16 @@ impl KeyCustody for FileKeyCustody {
                 }
             }
 
-            let mut map = self.handle_map.lock().await;
-            let Some((_, removed_index)) = map.entries.remove(&key_id) else {
+            // Look up — do NOT mutate the map yet. Map mutation is
+            // deferred until after the file rewrite succeeds, so a
+            // failed `read_file` or `atomic_write` cannot orphan
+            // encrypted material on disk (the in-memory map would
+            // otherwise have lost the only handle pointing at it).
+            let Some(&(_, removed_index)) = map.entries.get(&key_id) else {
                 return Err(PlatformError::KeyNotFound);
             };
 
-            // Rewrite the key file without the destroyed entry (#1469).
+            // Rewrite the key file without the destroyed entry.
             // This ensures key material is removed from disk, not just from
             // the in-memory handle map.
             let _lock = self
@@ -674,7 +692,23 @@ impl KeyCustody for FileKeyCustody {
                     .map_err(|_| PlatformError::CustodyError("invalid entry count".into()))?,
             );
 
-            let new_count = current_count.saturating_sub(1);
+            // Defend against in-memory/on-disk desynchronization: if the
+            // handle map says the entry lives at an index the file
+            // doesn't contain, refuse to write rather than emitting a
+            // malformed file with a clamped count.
+            if removed_index >= current_count as usize {
+                tracing::error!(
+                    key_id,
+                    removed_index,
+                    current_count,
+                    "FileKeyCustody::destroy_key detected handle map / on-disk file desync — refusing to write corrupt state"
+                );
+                return Err(PlatformError::CustodyError(format!(
+                    "destroy_key: handle map references entry_index {removed_index} but file has {current_count} entries — refusing to write corrupt state"
+                )));
+            }
+
+            let new_count = current_count - 1;
             let mut new_data = Vec::with_capacity(HEADER_SIZE + (new_count as usize) * ENTRY_SIZE);
 
             // Copy header (version + salt).
@@ -691,10 +725,15 @@ impl KeyCustody for FileKeyCustody {
                 new_data.extend_from_slice(&data[entry_offset..entry_offset + ENTRY_SIZE]);
             }
 
+            // Commit to disk BEFORE mutating the in-memory map. If
+            // `atomic_write` fails, the map still references the
+            // (unmodified) on-disk entry — no orphaned ciphertext.
             atomic_write(&self.path, &new_data)?;
 
-            // Update indices in handle_map: entries after the removed index
-            // shift down by one.
+            // Now that disk state is updated, mutate the in-memory
+            // map: drop the destroyed entry and shift indices for
+            // entries that lived after it.
+            map.entries.remove(&key_id);
             for (_key_type, entry_index) in map.entries.values_mut() {
                 if *entry_index > removed_index {
                     *entry_index -= 1;
@@ -838,6 +877,88 @@ impl KeyCustody for FileKeyCustody {
 
     fn custody_type(&self, _key: &KeyHandle) -> CustodyType {
         CustodyType::Software
+    }
+
+    fn generate_ephemeral_ed25519_seed(
+        &self,
+    ) -> impl Future<Output = Result<Zeroizing<[u8; 32]>, PlatformError>> + Send {
+        async move {
+            // Software custody: draw 32 bytes from OsRng. The bytes are
+            // returned to the caller in a Zeroizing wrapper and never
+            // persisted in the file-encrypted custody — the caller hands
+            // them to a `PreRotationCustody` per spec §9.7.4.1 §1, §5(f).
+            let mut seed = Zeroizing::new([0u8; 32]);
+            rand::rngs::OsRng.fill_bytes(seed.as_mut());
+            Ok(seed)
+        }
+    }
+
+    fn import_ed25519_signing_key(
+        &self,
+        seed: &Zeroizing<[u8; 32]>,
+    ) -> impl Future<Output = Result<KeyHandle, PlatformError>> + Send {
+        async move {
+            // Dedup by content: if the seed's verifying key already
+            // matches an existing Ed25519 entry, return that handle
+            // instead of appending a duplicate. Without this guard a
+            // retry of import (e.g. on transient failure higher up the
+            // stack) would create a parallel encrypted entry holding the
+            // same private key — wasting space and producing a phantom
+            // handle on reopen that the registry can no longer reach.
+            let signing_key = SigningKey::from_bytes(seed);
+            let target_pub = signing_key.verifying_key().to_bytes();
+
+            // Hold `handle_map.lock()` across the entire scan-and-insert
+            // path so that two concurrent imports of the same seed
+            // cannot both observe a non-matching snapshot and both
+            // append. We do NOT call `self.decrypt_ed25519_key` from
+            // here (that method re-acquires `handle_map` and would
+            // deadlock). Instead, read the file once and decrypt
+            // candidate Ed25519 entries directly via `decrypt_entry`.
+            // `append_entry` takes the separate `file_write_lock`,
+            // never `handle_map`, so there is no inversion.
+            let mut map = self.handle_map.lock().await;
+
+            let data = self.read_file()?;
+            for (id, (kt, idx)) in &map.entries {
+                if *kt != StoredKeyType::Ed25519 {
+                    continue;
+                }
+                // Surface decrypt failure rather than silently skipping
+                // the entry. A failed decrypt at this point indicates
+                // file corruption (mismatched MAC, truncated ciphertext,
+                // or wrong passphrase-derived key) — not a "this entry
+                // doesn't match"; treating it as the latter would
+                // permit a corrupted file to silently re-grow with
+                // duplicate entries on every retry.
+                let existing_bytes = self.decrypt_entry(&data, *idx).map_err(|e| {
+                    PlatformError::CustodyError(format!(
+                        "import dedup scan: failed to decrypt entry {idx} \
+                         (handle {id}) — file may be corrupted: {e}"
+                    ))
+                })?;
+                let existing = SigningKey::from_bytes(&existing_bytes);
+                if existing.verifying_key().to_bytes() == target_pub {
+                    return Ok(KeyHandle::new(*id));
+                }
+            }
+            drop(data);
+
+            // Persist the seed bytes via the same encrypted append-only
+            // log used by `generate_keypair`. After this call the bytes
+            // are encrypted-at-rest under the same passphrase-derived key.
+            // `append_entry` takes only `file_write_lock` — safe to call
+            // while holding `handle_map`.
+            let key_bytes = Zeroizing::new(**seed);
+            let entry_index = self.append_entry(StoredKeyType::Ed25519, &key_bytes)?;
+
+            let handle = self.next_handle();
+            map.entries
+                .insert(handle.id(), (StoredKeyType::Ed25519, entry_index));
+            drop(map);
+
+            Ok(handle)
+        }
     }
 }
 
@@ -1006,6 +1127,75 @@ mod tests {
         assert!(custody.destroy_key(&handle).await.is_err());
     }
 
+    /// `destroy_key` MUST refuse to rewrite the file when the in-memory
+    /// handle map is desynchronized with the on-disk entry count
+    /// (i.e. the map points at an entry index that the file does not
+    /// contain). Silently clamping with `saturating_sub` would emit a
+    /// malformed file whose header count is smaller than the entry
+    /// payload — corrupting the custody store. The handle map must be
+    /// preserved on this error so the failed call does not orphan
+    /// material.
+    #[tokio::test]
+    async fn destroy_key_rejects_out_of_bounds_entry_index() {
+        let dir = TempDir::new().unwrap();
+        let custody = make_custody(&dir, "out-of-bounds-passphrase");
+
+        // Populate two real entries so the file is non-empty and the
+        // bounds check is the only thing that can fail.
+        let real_a = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+        let real_b = custody.generate_keypair(KeyType::Ed25519).await.unwrap();
+
+        // Inject a desynchronized entry: a handle the map claims lives
+        // at an out-of-bounds index relative to the on-disk count (2).
+        let desync_id = custody.next_handle().id();
+        {
+            let mut map = custody.handle_map.lock().await;
+            map.entries
+                .insert(desync_id, (StoredKeyType::Ed25519, 9_999));
+        }
+        let desync_handle = KeyHandle::new(desync_id);
+
+        let err = custody
+            .destroy_key(&desync_handle)
+            .await
+            .expect_err("destroy_key MUST refuse desynchronized entry index");
+        match err {
+            PlatformError::CustodyError(msg) => {
+                assert!(
+                    msg.contains("refusing to write corrupt state"),
+                    "expected desync error, got: {msg}"
+                );
+                assert!(
+                    msg.contains("9999"),
+                    "error message must surface the offending index, got: {msg}"
+                );
+            }
+            other => panic!("expected CustodyError, got: {other:?}"),
+        }
+
+        // The real entries MUST still be usable — the failed call must
+        // not have corrupted the on-disk file or shifted any indices.
+        custody
+            .public_key(&real_a)
+            .await
+            .expect("real_a must still decrypt after failed destroy");
+        custody
+            .public_key(&real_b)
+            .await
+            .expect("real_b must still decrypt after failed destroy");
+
+        // And the desynchronized map entry must still be present
+        // (destroy_key returned Err before any map mutation).
+        let preserved = {
+            let map = custody.handle_map.lock().await;
+            map.entries.contains_key(&desync_id)
+        };
+        assert!(
+            preserved,
+            "handle map MUST be preserved when destroy_key fails"
+        );
+    }
+
     #[tokio::test]
     async fn sign_with_x25519_key_fails() {
         let dir = TempDir::new().unwrap();
@@ -1129,5 +1319,229 @@ mod tests {
             custody2.public_key(&rh3).await.unwrap().as_bytes(),
             pk3.as_bytes()
         );
+    }
+
+    /// Importing the same Ed25519 seed twice must return the existing
+    /// handle rather than appending a duplicate encrypted entry. Without
+    /// this guard a retry of import would create an orphan entry that
+    /// the registry can no longer reach but reload would resurrect as a
+    /// phantom handle.
+    #[tokio::test]
+    async fn import_ed25519_signing_key_dedups_by_content() {
+        let dir = TempDir::new().unwrap();
+        let custody = make_custody(&dir, "dedup-passphrase");
+
+        let seed = Zeroizing::new([0x42u8; 32]);
+
+        let first = custody.import_ed25519_signing_key(&seed).await.unwrap();
+        let second = custody.import_ed25519_signing_key(&seed).await.unwrap();
+
+        // Same content -> same handle.
+        assert_eq!(
+            first.id(),
+            second.id(),
+            "second import of identical seed must return the existing handle"
+        );
+
+        // Handle map must hold exactly one entry for this seed.
+        let map = custody.handle_map.lock().await;
+        assert_eq!(
+            map.entries.len(),
+            1,
+            "duplicate import must not add a new handle map entry"
+        );
+        drop(map);
+
+        // The encrypted file must contain exactly one entry — the
+        // header records `entry_count` at offset `1 + SALT_LEN`.
+        let bytes = std::fs::read(&custody.path).unwrap();
+        let count_offset = 1 + SALT_LEN;
+        let count = u32::from_le_bytes(bytes[count_offset..count_offset + 4].try_into().unwrap());
+        assert_eq!(count, 1, "duplicate import must not append a file entry");
+
+        // Sanity: the public key must match what the seed derives to.
+        let derived = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+        let pk = custody.public_key(&first).await.unwrap();
+        assert_eq!(pk.as_bytes(), &derived);
+    }
+
+    /// Importing a *different* Ed25519 seed after the first one must
+    /// allocate a fresh handle and append a new entry — dedup is
+    /// content-keyed, not blanket suppression.
+    #[tokio::test]
+    async fn import_ed25519_signing_key_distinct_seeds_allocate_distinct_handles() {
+        let dir = TempDir::new().unwrap();
+        let custody = make_custody(&dir, "distinct-passphrase");
+
+        let seed_a = Zeroizing::new([0x11u8; 32]);
+        let seed_b = Zeroizing::new([0x22u8; 32]);
+
+        let h_a = custody.import_ed25519_signing_key(&seed_a).await.unwrap();
+        let h_b = custody.import_ed25519_signing_key(&seed_b).await.unwrap();
+
+        assert_ne!(
+            h_a.id(),
+            h_b.id(),
+            "distinct seeds must produce distinct handles"
+        );
+
+        let map = custody.handle_map.lock().await;
+        assert_eq!(
+            map.entries.len(),
+            2,
+            "distinct seeds must produce two handle map entries"
+        );
+        drop(map);
+    }
+
+    /// Two concurrent imports of the same seed must dedup correctly:
+    /// both calls return the same handle and the handle map ends up
+    /// with exactly one entry. Without holding `handle_map` across the
+    /// scan-and-insert path, both tasks could observe a non-matching
+    /// snapshot and both append, yielding two parallel encrypted
+    /// entries pointing at the same private key.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn import_ed25519_signing_key_concurrent_dedups_correctly() {
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let custody = Arc::new(make_custody(&dir, "concurrent-dedup-passphrase"));
+
+        // A fixed all-zero seed is used purely to deterministically
+        // exercise the concurrent same-content code path of
+        // `import_ed25519_signing_key`'s dedup logic — two tasks
+        // import IDENTICAL bytes simultaneously and must collapse to
+        // a single content-keyed entry. This test does NOT mirror
+        // `migrate_identity`'s probe behaviour: that probe draws
+        // OS-CSPRNG bytes precisely so it cannot alias any
+        // pre-existing entry. The fixed seed here is a test
+        // affordance, not a representation of any production caller.
+        let seed = Zeroizing::new([0u8; 32]);
+
+        let custody_a = Arc::clone(&custody);
+        let seed_a = seed.clone();
+        let task_a =
+            tokio::spawn(
+                async move { custody_a.import_ed25519_signing_key(&seed_a).await.unwrap() },
+            );
+
+        let custody_b = Arc::clone(&custody);
+        let seed_b = seed.clone();
+        let task_b =
+            tokio::spawn(
+                async move { custody_b.import_ed25519_signing_key(&seed_b).await.unwrap() },
+            );
+
+        let h_a = task_a.await.unwrap();
+        let h_b = task_b.await.unwrap();
+
+        assert_eq!(
+            h_a.id(),
+            h_b.id(),
+            "concurrent imports of the same seed must return the same handle"
+        );
+
+        let map = custody.handle_map.lock().await;
+        assert_eq!(
+            map.entries.len(),
+            1,
+            "concurrent dedup must not produce parallel handle map entries"
+        );
+        drop(map);
+
+        // File-level check: exactly one entry persisted.
+        let bytes = std::fs::read(&custody.path).unwrap();
+        let count_offset = 1 + SALT_LEN;
+        let count = u32::from_le_bytes(bytes[count_offset..count_offset + 4].try_into().unwrap());
+        assert_eq!(
+            count, 1,
+            "concurrent dedup must not append a parallel encrypted entry"
+        );
+    }
+
+    /// Concurrent `generate_keypair` ↔ `destroy_key` MUST NOT corrupt
+    /// the handle map. Holding `handle_map` across the entire
+    /// append-and-insert path is what guarantees this: without it, a
+    /// concurrent `destroy_key` could rewrite the file and shift
+    /// `entry_index` values between our `append_entry` and the map
+    /// insert, leaving the new handle pointing at a stale slot. The
+    /// test pre-creates a victim key, then races a `generate_keypair`
+    /// against `destroy_key` on the victim and asserts that whatever
+    /// handle came back from `generate_keypair` decrypts cleanly (i.e.
+    /// the recorded `entry_index` still references its real ciphertext
+    /// in the file).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn generate_keypair_concurrent_destroy_does_not_corrupt_handle_map() {
+        use std::sync::Arc;
+
+        let dir = TempDir::new().unwrap();
+        let custody = Arc::new(make_custody(&dir, "concurrent-gen-destroy-passphrase"));
+
+        // Pre-populate the file with enough entries that the victim
+        // we destroy isn't always the trailing entry. The bug pattern
+        // (index shift after destroy) only manifests when there are
+        // entries *after* the destroyed one.
+        let mut handles: Vec<KeyHandle> = Vec::new();
+        for _ in 0..4 {
+            handles.push(custody.generate_keypair(KeyType::Ed25519).await.unwrap());
+        }
+        // Destroy the middle entry — index shift is most visible here.
+        let victim = handles.remove(1);
+
+        let custody_gen = Arc::clone(&custody);
+        let task_gen = tokio::spawn(async move {
+            custody_gen
+                .generate_keypair(KeyType::Ed25519)
+                .await
+                .unwrap()
+        });
+
+        let custody_destroy = Arc::clone(&custody);
+        let task_destroy = tokio::spawn(async move {
+            custody_destroy.destroy_key(&victim).await.unwrap();
+        });
+
+        let new_handle = task_gen.await.unwrap();
+        task_destroy.await.unwrap();
+
+        // The new handle MUST decrypt cleanly. If `generate_keypair`
+        // had captured a stale `entry_index` from before
+        // `destroy_key`'s shift, `public_key` would fail to decrypt
+        // (or recover a different key than the one we wrote).
+        let _public = custody
+            .public_key(&new_handle)
+            .await
+            .expect("new handle must decrypt cleanly after concurrent destroy");
+        // And `sign` MUST succeed — confirms the recovered key
+        // material is a valid Ed25519 signing key.
+        let _sig = custody
+            .sign(&new_handle, b"concurrent-test")
+            .await
+            .expect("new handle must sign after concurrent destroy");
+
+        // All other pre-existing handles MUST still decrypt cleanly
+        // (the destroy path is responsible for shifting their indices,
+        // and `generate_keypair` must not interleave a stale insert).
+        for h in &handles {
+            let _ = custody
+                .public_key(h)
+                .await
+                .expect("pre-existing handles must decrypt after concurrent generate/destroy");
+        }
+
+        // Handle map invariant: every entry's `entry_index` is in
+        // bounds for the current file. A stale insert would leave an
+        // out-of-bounds index that `decrypt_entry` would reject above.
+        let map = custody.handle_map.lock().await;
+        let bytes = std::fs::read(&custody.path).unwrap();
+        let count_offset = 1 + SALT_LEN;
+        let count =
+            u32::from_le_bytes(bytes[count_offset..count_offset + 4].try_into().unwrap()) as usize;
+        for (id, (_kt, idx)) in &map.entries {
+            assert!(
+                *idx < count,
+                "handle {id} has stale entry_index {idx} ≥ on-disk count {count}"
+            );
+        }
     }
 }

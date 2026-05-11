@@ -1506,6 +1506,15 @@ export function createNativeBridge(scp: SCP): Bridge {
     },
 
     async identityMigrate(handle: BridgeIdentityHandle): Promise<BridgeIdentityHandle> {
+      // The NAPI bridge returns a `NapiIdentity` class instance whose
+      // `rotationEventJson` getter exposes the JSON-serialized
+      // `DidRotationEvent` (spec §9.12, ADR-003 §4b/4c). Returning the
+      // live class instance preserves the handle for downstream
+      // operations (rotateKey, addAgentKey, etc.) AND satisfies the
+      // `BridgeIdentityHandle.rotationEventJson` field via the NAPI
+      // getter — no own-property mutation needed (NAPI class
+      // properties are readonly, so `Object.assign` would throw
+      // `TypeError: Attempted to assign to readonly property.`).
       return await (handle as unknown as { migrate(): Promise<BridgeIdentityHandle> }).migrate();
     },
 

@@ -12,6 +12,7 @@ package works.limn.scp
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -79,6 +80,25 @@ interface IdentityAdvancedBindings {
      * @throws BridgeException if migration fails.
      */
     fun identityMigrate(identityHandle: Long): Long
+
+    /**
+     * Returns the JSON-serialized `DidRotationEvent` produced when the
+     * given handle was minted by [identityMigrate]. SDK callers MUST
+     * distribute the event to active context members per spec
+     * §3.2.1 step 4b. Returns `null` for handles that did not change
+     * the DID (e.g., create, rotate-key, agent-key ops, load).
+     *
+     * Mirrors the UniFFI-generated `Identity.rotationEventJson()`
+     * accessor on the auto-generated Kotlin binding (and the
+     * equivalent Swift `Identity.rotationEventJson()` /
+     * Python `Identity.rotation_event_json` /
+     * TypeScript `BridgeIdentityHandle.rotationEventJson`).
+     *
+     * @param identityHandle Handle from a migration operation.
+     * @return JSON-serialized `DidRotationEvent` or `null`.
+     * @throws BridgeException if the handle is invalid.
+     */
+    fun identityRotationEventJson(identityHandle: Long): String?
 
     /**
      * Generates a device attestation token for an identity.
@@ -206,6 +226,7 @@ interface IdentityAdvancedBindings {
  *
  * See §3.2 (Key Custody), §3.4 (Linking Identities), ADR-039.
  */
+@Suppress("TooManyFunctions")
 class IdentityAdvancedBridge internal constructor(
     private val bindings: IdentityAdvancedBindings,
     private val bridge: CoroutineBridge,
@@ -260,10 +281,57 @@ class IdentityAdvancedBridge internal constructor(
     /**
      * Migrates an identity to a new DID.
      *
+     * **Deprecated.** This overload silently drops the
+     * `DidRotationEvent` that spec §3.2.1 step 4b requires the caller
+     * to distribute to every active context where the OLD DID is a
+     * member. Without distribution, peers will reject subsequent
+     * messages signed by the new DID's `#active` key as unauthorized,
+     * and the migration is protocol-incomplete.
+     *
+     * Use [migrateWithRotationEvent] instead and forward the returned
+     * [IdentityMigrateResult.rotationEventJson] to every active
+     * context. Pre-context callers (no active contexts) may discard
+     * the rotation event explicitly.
+     *
      * @param identityHandle Handle from identity create or load.
      * @return Updated opaque identity handle with new DID.
      */
+    @Deprecated(
+        message =
+            "Drops the DidRotationEvent required by spec §3.2.1 step 4b. " +
+                "Use migrateWithRotationEvent and distribute the rotation event to " +
+                "all active contexts where the OLD DID is a member; pre-context callers " +
+                "may discard the event explicitly.",
+        replaceWith = ReplaceWith("migrateWithRotationEvent(identityHandle)"),
+        level = DeprecationLevel.ERROR,
+    )
     suspend fun migrate(identityHandle: Long): Long = bridge.ffiCall { bindings.identityMigrate(identityHandle) }
+
+    /**
+     * Migrates an identity to a new DID and returns both the new
+     * handle and the JSON-serialized `DidRotationEvent`.
+     *
+     * SDK callers MUST distribute
+     * [IdentityMigrateResult.rotationEventJson] to all active
+     * contexts where the OLD DID is a member (spec §3.2.1 step 4b).
+     * Without distribution, peers will reject subsequent messages
+     * signed by the new DID's `#active` key as unauthorized.
+     *
+     * Mirrors the rotation-event accessor exposed on the other
+     * SDKs: Python `Identity.rotation_event_json`, TypeScript
+     * `BridgeIdentityHandle.rotationEventJson`, Swift
+     * `Identity.rotationEventJson()`.
+     *
+     * @param identityHandle Handle from identity create or load.
+     * @return The new identity handle paired with the rotation
+     *   event JSON.
+     */
+    suspend fun migrateWithRotationEvent(identityHandle: Long): IdentityMigrateResult =
+        bridge.ffiCall {
+            val newHandle = bindings.identityMigrate(identityHandle)
+            val eventJson = bindings.identityRotationEventJson(newHandle)
+            IdentityMigrateResult(handle = newHandle, rotationEventJson = eventJson)
+        }
 
     /**
      * Generates a device attestation token for an identity.
@@ -401,6 +469,34 @@ class IdentityAdvancedBridge internal constructor(
 }
 
 // ---------------------------------------------------------------------------
+// Identity migration result (§3.2.1, ADR-003 §4b)
+// ---------------------------------------------------------------------------
+
+/**
+ * Result of [IdentityAdvancedBridge.migrateWithRotationEvent].
+ *
+ * The new opaque identity handle PLUS the JSON-serialized
+ * `DidRotationEvent` that SDK callers MUST distribute to active
+ * context members (spec §3.2.1 step 4b).
+ *
+ * Mirrors the rotation-event accessor on the other SDKs:
+ * Python `Identity.rotation_event_json`, TypeScript
+ * `BridgeIdentityHandle.rotationEventJson`, Swift
+ * `Identity.rotationEventJson()`.
+ *
+ * @property handle Opaque handle for the migrated identity (new DID).
+ * @property rotationEventJson JSON-serialized `DidRotationEvent`,
+ *   or `null` if the underlying handle did not change the DID
+ *   (which is unusual for `migrate` and indicates an upstream FFI
+ *   issue — production callers should treat `null` here as a
+ *   distribution-skipped warning, not a normal case).
+ */
+data class IdentityMigrateResult(
+    val handle: Long,
+    val rotationEventJson: String?,
+)
+
+// ---------------------------------------------------------------------------
 // Identity Link Attestation (§3.5)
 // ---------------------------------------------------------------------------
 
@@ -466,11 +562,22 @@ data class IdentityAttestation(
     val platformId: String? = null,
 ) {
     internal companion object {
-        /** Parse an [IdentityAttestation] from a bridge JSON object. */
+        /**
+         * Parse an [IdentityAttestation] from a bridge JSON object.
+         *
+         * Revocation status decoding fails closed: unknown JSON shapes
+         * throw [IllegalArgumentException] rather than defaulting to
+         * [RevocationStatus.Active]. If the Rust enum adds a new
+         * variant (e.g. `Suspended`), Kotlin SDK callers MUST see the
+         * decode failure rather than silently mis-categorize a
+         * suspended attestation as active — that would be a
+         * security-relevant fail-open default.
+         */
         fun fromJsonObject(obj: JsonObject): IdentityAttestation {
             val rsElement = obj["revocation_status"]
             val revocationStatus = when {
                 rsElement == null -> RevocationStatus.Active
+                rsElement is JsonPrimitive && rsElement.content == "Active" -> RevocationStatus.Active
                 rsElement is JsonObject && rsElement.containsKey("Revoked") -> {
                     val revoked = rsElement["Revoked"]!!.jsonObject
                     RevocationStatus.Revoked(
@@ -478,7 +585,11 @@ data class IdentityAttestation(
                         reason = revoked["reason"]?.jsonPrimitive?.content,
                     )
                 }
-                else -> RevocationStatus.Active
+                else -> throw IllegalArgumentException(
+                    "Unrecognized revocation_status JSON shape: $rsElement. " +
+                        "Expected JsonPrimitive(\"Active\") or JsonObject({\"Revoked\": {...}}). " +
+                        "Failing closed rather than defaulting to Active.",
+                )
             }
             return IdentityAttestation(
                 id = obj["id"]!!.jsonPrimitive.content,

@@ -5249,6 +5249,7 @@ dependencies = [
  "rmp-serde",
  "scp-event-log",
  "scp-ffi-common",
+ "scp-identity",
  "scp-protocol",
  "serde",
  "serde_bytes",
@@ -5264,6 +5265,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+ "z-base-32",
  "zeroize",
 ]
 
@@ -5276,6 +5278,7 @@ dependencies = [
  "ed25519-dalek 2.2.0",
  "hex",
  "mainline",
+ "rand 0.8.5",
  "reqwest",
  "scp-platform",
  "scp-primitives",
@@ -5287,6 +5290,7 @@ dependencies = [
  "tokio",
  "tracing",
  "z-base-32",
+ "zeroize",
 ]
 
 [[package]]
@@ -5389,6 +5393,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "uuid",
  "x25519-dalek 2.0.1",
  "zeroize",

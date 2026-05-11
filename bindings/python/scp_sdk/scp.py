@@ -427,7 +427,7 @@ class SCP:
         if not hasattr(self._native, "identity_attest_device"):
             raise IdentityError(
                 "Device attestation requires the 'allow_in_memory_custody' feature",
-                "SCP-IDENT-1050",
+                "SCP-IDENT-1015",
             )
         return await asyncio.to_thread(self._native.identity_attest_device, identity_did)
 
@@ -540,11 +540,21 @@ class SCP:
         return Identity(raw)
 
     async def identity_migrate(self, identity: Any) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_migrate`` (returns :class:`Identity`)."""
+        """Delegate to ``_scp_core.SCP.identity_migrate``.
+
+        The bridge returns a tuple ``(PyIdentity, rotation_event_json)``
+        — the JSON-serialized ``DidRotationEvent`` (spec §9.12,
+        ADR-003 §4b/4c) is attached to the returned :class:`Identity`
+        wrapper as ``identity.rotation_event_json`` so SDK callers can
+        distribute the event to active context members per spec
+        §3.2.1 step 4b.
+        """
         from scp_sdk.identity import Identity
 
-        raw = await asyncio.to_thread(self._native.identity_migrate, identity)
-        return Identity(raw)
+        raw_handle, rotation_event_json = await asyncio.to_thread(
+            self._native.identity_migrate, identity
+        )
+        return Identity(raw_handle, rotation_event_json=rotation_event_json)
 
     async def identity_remove_agent_key(self, identity: Any) -> Any:
         """Delegate to ``_scp_core.SCP.identity_remove_agent_key`` (returns :class:`Identity`)."""
@@ -609,7 +619,7 @@ class SCP:
         if not hasattr(self._native, "identity_verify_device_attestation"):
             raise IdentityError(
                 "Device attestation verification requires the 'allow_in_memory_custody' feature",
-                "SCP-IDENT-1051",
+                "SCP-IDENT-1016",
             )
         return await asyncio.to_thread(
             self._native.identity_verify_device_attestation, did, token_base64

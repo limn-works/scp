@@ -379,9 +379,11 @@ impl Scp {
                         InMemoryKeyCustody::from_seed_bytes(**seed)
                     });
                 let key_custody = Arc::new(crate::identity::OpaqueInMemoryKeyCustody(in_memory));
+                let pre_rotation_custody =
+                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                 let dht = DidDht::new();
-                let (scp_identity, document) = dht
-                    .create(&key_custody.0)
+                let (scp_identity, document, pre_rotation_handle) = dht
+                    .create(&key_custody.0, pre_rotation_custody.as_ref())
                     .await
                     .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
@@ -399,6 +401,8 @@ impl Scp {
                         custody: Arc::clone(&key_custody),
                         document: document.clone(),
                         identity_link_attestations: Vec::new(),
+                        pre_rotation_handle,
+                        pre_rotation_custody,
                     },
                 );
 
@@ -415,6 +419,7 @@ impl Scp {
                         bi: Arc::clone(&self.inner),
                         verifying_key_hex,
                         instance_id: bi.instance_id(),
+                        rotation_event_json: None,
                     }),
                 };
                 crate::increment_handle_count();
@@ -499,9 +504,11 @@ impl Scp {
                 let key_custody = Arc::new(crate::identity::OpaqueInMemoryKeyCustody(
                     InMemoryKeyCustody::new(),
                 ));
+                let pre_rotation_custody =
+                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                 let dht = DidDht::new();
-                let (scp_identity, document) = dht
-                    .create_with_agent_key(&key_custody.0)
+                let (scp_identity, document, pre_rotation_handle) = dht
+                    .create_with_agent_key(&key_custody.0, pre_rotation_custody.as_ref())
                     .await
                     .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
@@ -519,6 +526,8 @@ impl Scp {
                         custody: Arc::clone(&key_custody),
                         document: document.clone(),
                         identity_link_attestations: Vec::new(),
+                        pre_rotation_handle,
+                        pre_rotation_custody,
                     },
                 );
 
@@ -535,6 +544,7 @@ impl Scp {
                         bi: Arc::clone(&self.inner),
                         verifying_key_hex,
                         instance_id: bi.instance_id(),
+                        rotation_event_json: None,
                     }),
                 };
                 crate::increment_handle_count();
@@ -612,6 +622,7 @@ impl Scp {
                         bi: Arc::clone(&self.inner),
                         verifying_key_hex,
                         instance_id: bi.instance_id(),
+                        rotation_event_json: None,
                     }),
                 };
                 crate::increment_handle_count();
@@ -636,6 +647,7 @@ impl Scp {
                 bi: Arc::clone(&self.inner),
                 verifying_key_hex: None,
                 instance_id: bi.instance_id(),
+                rotation_event_json: None,
             }),
         };
         crate::increment_handle_count();
@@ -3843,8 +3855,12 @@ mod concurrency_cap_tests {
             .unwrap();
 
         let custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::new();
-        let (identity, document) = rt.block_on(dht.create(&custody.0)).unwrap();
+        let (identity, document, pre_rotation_handle) = rt
+            .block_on(dht.create(&custody.0, pre_rotation_custody.as_ref()))
+            .unwrap();
         let did = identity.did.clone();
 
         let bi = Arc::new(NapiBridgeInstance::new_napi());
@@ -3856,6 +3872,8 @@ mod concurrency_cap_tests {
                 custody,
                 document,
                 identity_link_attestations: Vec::new(),
+                pre_rotation_handle,
+                pre_rotation_custody,
             },
         );
 

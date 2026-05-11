@@ -254,6 +254,24 @@ impl From<ScpPyError> for PyErr {
 
 impl From<scp_identity::IdentityError> for ScpPyError {
     fn from(e: scp_identity::IdentityError) -> Self {
+        use scp_identity::IdentityError as IE;
+        use scp_platform::PreRotationCustodyError as PE;
+
+        if let IE::PreRotation(pre_err) = &e {
+            let code = match pre_err {
+                PE::HandleNotFound => codes::IDENT_1047,
+                PE::Unavailable(_) => codes::IDENT_1048,
+                PE::UserDeclined => codes::IDENT_1049,
+                PE::Storage(_) => codes::IDENT_1050,
+                PE::InvalidCallbackResponse(_) => codes::IDENT_1051,
+                PE::CommitmentMismatch => codes::IDENT_1052,
+            };
+            return Self::IdentityError {
+                message: format!("{e}"),
+                code: code.to_owned(),
+            };
+        }
+
         Self::IdentityError {
             message: format!(
                 "{e} — check DID format, key custody configuration, or DHT connectivity"
@@ -674,4 +692,74 @@ pub fn register_exceptions(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("UcanError", m.py().get_type::<UcanError>())?;
     m.add("ValidationError", m.py().get_type::<ValidationError>())?;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::panic, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use scp_platform::PreRotationCustodyError;
+
+    fn code_of(e: ScpPyError) -> String {
+        match e {
+            ScpPyError::IdentityError { code, .. } => code,
+            other => panic!("expected IdentityError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_rotation_handle_not_found_surfaces_typed_code() {
+        let err: ScpPyError =
+            scp_identity::IdentityError::PreRotation(PreRotationCustodyError::HandleNotFound)
+                .into();
+        assert_eq!(code_of(err), codes::IDENT_1047);
+    }
+
+    #[test]
+    fn pre_rotation_unavailable_surfaces_typed_code() {
+        let err: ScpPyError = scp_identity::IdentityError::PreRotation(
+            PreRotationCustodyError::Unavailable("hardware key not connected".into()),
+        )
+        .into();
+        assert_eq!(code_of(err), codes::IDENT_1048);
+    }
+
+    #[test]
+    fn pre_rotation_user_declined_surfaces_typed_code() {
+        let err: ScpPyError =
+            scp_identity::IdentityError::PreRotation(PreRotationCustodyError::UserDeclined).into();
+        assert_eq!(code_of(err), codes::IDENT_1049);
+    }
+
+    #[test]
+    fn pre_rotation_storage_surfaces_typed_code() {
+        let err: ScpPyError = scp_identity::IdentityError::PreRotation(
+            PreRotationCustodyError::Storage("disk full".into()),
+        )
+        .into();
+        assert_eq!(code_of(err), codes::IDENT_1050);
+    }
+
+    #[test]
+    fn pre_rotation_invalid_callback_response_surfaces_typed_code() {
+        let err: ScpPyError = scp_identity::IdentityError::PreRotation(
+            PreRotationCustodyError::InvalidCallbackResponse("handle is empty".into()),
+        )
+        .into();
+        assert_eq!(code_of(err), codes::IDENT_1051);
+    }
+
+    #[test]
+    fn pre_rotation_commitment_mismatch_surfaces_typed_code() {
+        let err: ScpPyError =
+            scp_identity::IdentityError::PreRotation(PreRotationCustodyError::CommitmentMismatch)
+                .into();
+        assert_eq!(code_of(err), codes::IDENT_1052);
+    }
+
+    #[test]
+    fn non_pre_rotation_identity_errors_keep_generic_envelope() {
+        let err: ScpPyError = scp_identity::IdentityError::InvalidDidFormat("bad".into()).into();
+        assert_eq!(code_of(err), codes::IDENT_1001);
+    }
 }

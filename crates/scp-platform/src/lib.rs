@@ -73,5 +73,6 @@ pub use encrypted::EncryptedStorage;
 pub use error::PlatformError;
 pub use traits::{
     CustodyType, DeviceAttestation, DeviceAttestationToken, KeyCustody, KeyHandle, KeyType,
+    PreRotationCustody, PreRotationCustodyError, PreRotationCustodyKind, PreRotationKeyHandle,
     PseudonymKeypair, PublicKey, Push, PushToken, SharedSecret, Signature, Storage, WakeSignal,
 };

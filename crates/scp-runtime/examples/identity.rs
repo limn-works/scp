@@ -13,12 +13,13 @@ use scp_identity::DidMethod;
 use scp_identity::cache::DidCache;
 use scp_identity::dht::DidDht;
 use scp_identity::dht_client::InMemoryDhtClient;
-use scp_platform::testing::InMemoryKeyCustody;
+use scp_platform::testing::{InMemoryKeyCustody, InMemoryPreRotationCustody};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Set up key custody — holds Ed25519 key material in memory.
     let custody = Arc::new(InMemoryKeyCustody::new());
+    let pre_rotation_custody = Arc::new(InMemoryPreRotationCustody::new());
 
     // 2. Wire the DID method with an in-memory DHT client and cache.
     let dht_client = Arc::new(InMemoryDhtClient::new());
@@ -27,7 +28,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let did_dht = DidDht::with_client_and_signer(dht_client, cache, sign_fn);
 
     // 3. Create the identity — generates keys and builds the DID document.
-    let (identity, document) = did_dht.create(&*custody).await?;
+    let (identity, document, _pre_rotation_handle) =
+        did_dht.create(&*custody, &*pre_rotation_custody).await?;
 
     println!("DID: {}", identity.did);
     println!("Identity key handle: {:?}", identity.identity_key);

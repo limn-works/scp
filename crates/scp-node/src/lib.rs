@@ -2856,7 +2856,29 @@ async fn resolve_identity<K: KeyCustody, D: DidMethod>(
             key_custody,
             did_method,
         } => {
-            let (identity, document) = did_method.create(&*key_custody).await?;
+            // KNOWN LIMITATION: this path drops the `PreRotationKeyHandle`
+            // because `ApplicationNode<K, D, S, Dom, Id>`'s generic
+            // parameter list does not yet carry a `P: PreRotationCustody`
+            // slot. As a consequence, identities produced by this code
+            // path CANNOT be migrated later — the migrate flow needs both
+            // the handle and the custody instance to call
+            // `dht::migrate_identity`. The current shipped backend is
+            // `InMemoryPreRotationCustody` which is process-local
+            // anyway, so the migration capability would be lost on
+            // process restart even if we persisted the handle. Widening
+            // the builder to accept a real `PreRotationCustody` is
+            // tracked alongside the production custody backends.
+            let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
+            let (identity, document, _pre_rotation_handle) = did_method
+                .create(&*key_custody, &pre_rotation_custody)
+                .await?;
+            tracing::warn!(
+                did = %identity.did,
+                "identity created without a persistent PreRotationCustody — migration \
+                 (Layer-2 DID rotation) will be impossible until the builder API is \
+                 widened to accept a real backend. Recovery from `#0` compromise via \
+                 spec §9.7.4.1 is unreachable for this identity."
+            );
             Ok((identity, document, did_method))
         }
         IdentitySource::Explicit(e) => Ok((e.identity, e.document, e.did_method)),
@@ -3006,7 +3028,26 @@ async fn resolve_identity_persistent<K: KeyCustody, D: DidMethod, S: Storage>(
                 Ok((persisted.identity, persisted.document, did_method))
             } else {
                 // 3. Generate a new identity and persist it.
-                let (identity, document) = did_method.create(&*key_custody).await?;
+                //
+                // Same KNOWN LIMITATION as `resolve_identity` above: the
+                // `PreRotationKeyHandle` is dropped because the builder
+                // does not yet carry a `P: PreRotationCustody` generic
+                // slot. Identities produced via this persistent path
+                // cannot migrate. With `InMemoryPreRotationCustody` as
+                // the only shipped backend, the handle would be
+                // process-local anyway and lost on restart.
+                let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
+                let (identity, document, _pre_rotation_handle) = did_method
+                    .create(&*key_custody, &pre_rotation_custody)
+                    .await?;
+                tracing::warn!(
+                    did = %identity.did,
+                    "persisted identity created without a persistent PreRotationCustody — \
+                     migration (Layer-2 DID rotation) will be impossible after process \
+                     restart. Recovery from `#0` compromise via spec §9.7.4.1 is unreachable \
+                     for this identity until the builder API is widened to accept a real \
+                     backend."
+                );
                 let persisted = PersistedIdentity {
                     identity: identity.clone(),
                     document: document.clone(),
@@ -3724,8 +3765,13 @@ impl DidMethod for NoOpDidMethod {
     fn create(
         &self,
         _key_custody: &impl KeyCustody,
-    ) -> impl std::future::Future<Output = Result<(ScpIdentity, DidDocument), IdentityError>> + Send
-    {
+        _pre_rotation_custody: &impl scp_platform::PreRotationCustody,
+    ) -> impl std::future::Future<
+        Output = Result<
+            (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+            IdentityError,
+        >,
+    > + Send {
         std::future::ready(Err(IdentityError::DhtPublishFailed(
             "NoOpDidMethod: not configured".to_owned(),
         )))
@@ -3912,8 +3958,12 @@ mod tests {
     /// Helper: creates an identity and document for explicit identity tests.
     async fn create_test_identity() -> (ScpIdentity, DidDocument, Arc<InMemoryKeyCustody>) {
         let custody = Arc::new(InMemoryKeyCustody::new());
+        let pre_rotation_custody = scp_platform::testing::InMemoryPreRotationCustody::new();
         let did_dht = make_test_dht(&custody);
-        let (identity, document) = did_dht.create(&*custody).await.unwrap();
+        let (identity, document, _pre_rotation_handle) = did_dht
+            .create(&*custody, &pre_rotation_custody)
+            .await
+            .unwrap();
         (identity, document, custody)
     }
 
@@ -4038,10 +4088,14 @@ mod tests {
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
+                pre_rotation_custody: &impl scp_platform::PreRotationCustody,
             ) -> impl std::future::Future<
-                Output = Result<(ScpIdentity, DidDocument), IdentityError>,
+                Output = Result<
+                    (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+                    IdentityError,
+                >,
             > + Send {
-                self.inner.create(key_custody)
+                self.inner.create(key_custody, pre_rotation_custody)
             }
 
             fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
@@ -4168,10 +4222,14 @@ mod tests {
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
+                pre_rotation_custody: &impl scp_platform::PreRotationCustody,
             ) -> impl std::future::Future<
-                Output = Result<(ScpIdentity, DidDocument), IdentityError>,
+                Output = Result<
+                    (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+                    IdentityError,
+                >,
             > + Send {
-                self.inner.create(key_custody)
+                self.inner.create(key_custody, pre_rotation_custody)
             }
 
             fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
@@ -4648,10 +4706,14 @@ mod tests {
             fn create(
                 &self,
                 key_custody: &impl KeyCustody,
+                pre_rotation_custody: &impl scp_platform::PreRotationCustody,
             ) -> impl std::future::Future<
-                Output = Result<(ScpIdentity, DidDocument), IdentityError>,
+                Output = Result<
+                    (ScpIdentity, DidDocument, scp_platform::PreRotationKeyHandle),
+                    IdentityError,
+                >,
             > + Send {
-                self.inner.create(key_custody)
+                self.inner.create(key_custody, pre_rotation_custody)
             }
 
             fn verify(&self, did_string: &str, public_key: &[u8]) -> bool {
@@ -5911,6 +5973,74 @@ mod tests {
             msg.contains("not found in custody"),
             "expected custody validation error, got: {msg}"
         );
+    }
+
+    /// Regression: persisted `ScpIdentity` blobs from interim builds
+    /// (where `pre_rotation_key: KeyHandle` was briefly a field on the
+    /// struct) MUST deserialize cleanly into the post-revert struct,
+    /// since msgpack-named ignores unknown fields and the
+    /// `PreRotationCustody` workstream replaced that field with a
+    /// separate cold-storage substrate. Without this regression test,
+    /// a future change adding `#[serde(deny_unknown_fields)]` would
+    /// silently break upgrades from interim builds.
+    #[tokio::test]
+    async fn identity_with_storage_deserialises_blob_with_extra_pre_rotation_key_field() {
+        use scp_platform::traits::KeyHandle;
+
+        // Synthesize a `PersistedIdentity` shape that mirrors the
+        // interim-build serialization: same fields plus an extra
+        // `pre_rotation_key` slot.
+        #[derive(serde::Serialize)]
+        struct InterimIdentity {
+            identity_key: KeyHandle,
+            active_signing_key: KeyHandle,
+            agent_signing_key: Option<KeyHandle>,
+            pre_rotation_commitment: [u8; 32],
+            // The extra field that should be silently ignored on read.
+            pre_rotation_key: KeyHandle,
+            did: String,
+        }
+
+        #[derive(serde::Serialize)]
+        struct InterimPersistedIdentity {
+            identity: InterimIdentity,
+            document: DidDocument,
+        }
+
+        let interim = InterimPersistedIdentity {
+            identity: InterimIdentity {
+                identity_key: KeyHandle::new(1),
+                active_signing_key: KeyHandle::new(2),
+                agent_signing_key: None,
+                pre_rotation_commitment: [7u8; 32],
+                pre_rotation_key: KeyHandle::new(3),
+                did: "did:dht:zinterim".to_owned(),
+            },
+            document: DidDocument {
+                context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+                id: "did:dht:zinterim".to_owned(),
+                verification_method: vec![],
+                authentication: vec![],
+                assertion_method: vec![],
+                also_known_as: vec![],
+                service: vec![],
+            },
+        };
+
+        let envelope = StoredValue {
+            version: CURRENT_STORE_VERSION,
+            data: &interim,
+        };
+        let bytes = rmp_serde::to_vec_named(&envelope).unwrap();
+
+        // The post-revert struct (no `pre_rotation_key` field) MUST
+        // deserialize successfully — the extra field is silently
+        // dropped.
+        let decoded: StoredValue<PersistedIdentity> = rmp_serde::from_slice(&bytes)
+            .expect("interim-build blob with extra pre_rotation_key field MUST deserialize");
+        assert_eq!(decoded.version, CURRENT_STORE_VERSION);
+        assert_eq!(decoded.data.identity.did, "did:dht:zinterim");
+        assert_eq!(decoded.data.identity.pre_rotation_commitment, [7u8; 32]);
     }
 
     #[tokio::test]

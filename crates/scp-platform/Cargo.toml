@@ -46,6 +46,7 @@ sync = ["dep:rmp-serde"]
 serde = { workspace = true }
 tokio.workspace = true
 thiserror.workspace = true
+tracing = { workspace = true }
 zeroize = { workspace = true }
 
 # sync dependencies, gated behind the `sync` feature flag.

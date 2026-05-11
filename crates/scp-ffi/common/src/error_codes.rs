@@ -57,6 +57,28 @@ pub const IDENT_1011: &str = "SCP-IDENT-1011";
 pub const IDENT_1012: &str = "SCP-IDENT-1012";
 /// `UniFFI` identity passphrase error.
 pub const IDENT_1013: &str = "SCP-IDENT-1013";
+/// DID method or format invalid.
+///
+/// Distinct from `IDENT_1004` (key generation failure) which is a
+/// runtime / cryptographic error category. `IDENT_1014` is for
+/// input-validation failures: unsupported DID method prefix, invalid
+/// `z`-base-32 payload, non-canonical multibase encoding, payload
+/// length wrong for the declared key type, or decoded bytes that fail
+/// curve-point validation.
+pub const IDENT_1014: &str = "SCP-IDENT-1014";
+/// Device attestation feature unavailable.
+///
+/// Surfaced by the Python SDK shim when the `PyO3` extension was built
+/// without the `allow_in_memory_custody` feature: the `identity_attest_device`
+/// method is not exposed on the native bridge.
+pub const IDENT_1015: &str = "SCP-IDENT-1015";
+/// Device attestation verification feature unavailable.
+///
+/// Surfaced by the Python SDK shim when the `PyO3` extension was built
+/// without the `allow_in_memory_custody` feature: the
+/// `identity_verify_device_attestation` method is not exposed on the
+/// native bridge.
+pub const IDENT_1016: &str = "SCP-IDENT-1016";
 /// Identity agent key creation.
 pub const IDENT_1020: &str = "SCP-IDENT-1020";
 /// Identity DID document error.
@@ -111,6 +133,34 @@ pub const IDENT_1045: &str = "SCP-IDENT-1045";
 /// stubs when a caller invokes them directly instead of passing an
 /// `SCP`-bound closure.
 pub const IDENT_1046: &str = "SCP-IDENT-1046";
+
+// -----------------------------------------------------------------------
+// Pre-rotation custody errors (one code per PreRotationCustodyError variant)
+//
+// Surfaced when `IdentityError::PreRotation(_)` crosses the FFI boundary.
+// SDK consumers can match on `.code` to distinguish a missing handle from
+// a substrate-unavailable backend, a user-declined biometric, an internal
+// storage error, a callback malformation, or a commitment-integrity
+// failure — without string-matching the message body.
+// -----------------------------------------------------------------------
+
+/// Pre-rotation custody handle not found in the backing store.
+pub const IDENT_1047: &str = "SCP-IDENT-1047";
+/// Pre-rotation custody substrate temporarily unavailable
+/// (hardware not connected, network unreachable, etc.).
+pub const IDENT_1048: &str = "SCP-IDENT-1048";
+/// Pre-rotation custody operation declined by user (biometric refusal,
+/// passkey cancellation, etc.).
+pub const IDENT_1049: &str = "SCP-IDENT-1049";
+/// Pre-rotation custody internal storage error.
+pub const IDENT_1050: &str = "SCP-IDENT-1050";
+/// Pre-rotation custody callback returned an invalid response
+/// (malformed handle, length mismatch, schema violation, etc.).
+pub const IDENT_1051: &str = "SCP-IDENT-1051";
+/// Pre-rotation custody commitment-integrity failure: revealed public key
+/// did not match the stored commitment. Indicates a substrate-level
+/// tampering or corruption event.
+pub const IDENT_1052: &str = "SCP-IDENT-1052";
 
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)
