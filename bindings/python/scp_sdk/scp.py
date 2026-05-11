@@ -104,13 +104,16 @@ class SqliteStorage(TypedDict):
 StorageConfig = InMemoryStorage | SqliteStorage
 
 
-def _native_cls() -> Any:
-    """Return the PyO3-native ``SCP`` class from the ``_scp_core`` extension.
+def _native_mod() -> Any:
+    """Return the ``_scp_core`` PyO3 extension module.
 
     Raised at call time (not import time) so that pure-Python environments
     — where the native extension isn't available — can still ``import
     scp_sdk`` without an ImportError. The caller sees a meaningful
-    :class:`ScpError` the first time they actually construct an instance.
+    :class:`ScpError` the first time they actually use the bridge.
+
+    Used by SDK wrappers that route to module-level free functions per
+    ADR-048 §1 (pure helpers exposed as ``_scp_core.<name>``).
     """
     try:
         import _scp_core  # type: ignore[import-not-found]
@@ -120,7 +123,19 @@ def _native_cls() -> Any:
             "Install scp-python with: pip install scp-python",
             code="SCP-UNKNOWN-0001",
         ) from exc
-    cls = getattr(_scp_core, "SCP", None)
+    return _scp_core
+
+
+def _native_cls() -> Any:
+    """Return the PyO3-native ``SCP`` class from the ``_scp_core`` extension.
+
+    Raised at call time (not import time) so that pure-Python environments
+    — where the native extension isn't available — can still ``import
+    scp_sdk`` without an ImportError. The caller sees a meaningful
+    :class:`ScpError` the first time they actually construct an instance.
+    """
+    mod = _native_mod()
+    cls = getattr(mod, "SCP", None)
     if cls is None:
         raise ScpError(
             "_scp_core does not export the SCP class — rebuild the native "
@@ -609,21 +624,22 @@ class SCP:
         return Identity(raw)
 
     async def identity_verify_device_attestation(self, did: str, token_base64: str) -> Any:
-        """Delegate to ``_scp_core.SCP.identity_verify_device_attestation``.
+        """Delegate to ``_scp_core.identity_verify_device_attestation``.
+
+        ADR-048 §1: pure helper exposed as a module-level free function.
 
         Raises :class:`~scp_sdk.errors.IdentityError` when the bridge was
         not built with the ``allow_in_memory_custody`` feature.
         """
         from scp_sdk.errors import IdentityError
 
-        if not hasattr(self._native, "identity_verify_device_attestation"):
+        mod = _native_mod()
+        if not hasattr(mod, "identity_verify_device_attestation"):
             raise IdentityError(
                 "Device attestation verification requires the 'allow_in_memory_custody' feature",
                 "SCP-IDENT-1016",
             )
-        return await asyncio.to_thread(
-            self._native.identity_verify_device_attestation, did, token_base64
-        )
+        return await asyncio.to_thread(mod.identity_verify_device_attestation, did, token_base64)
 
     async def remove_identity_link_attestation(self, did: str, attestation_id: str) -> bool:
         """Remove an identity link attestation.
@@ -645,9 +661,13 @@ class SCP:
     async def verify_identity_link_attestation(
         self, attestation_json: str, issuer_public_key_hex: str
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.py_verify_identity_link_attestation``."""
+        """Delegate to ``_scp_core.py_verify_identity_link_attestation``.
+
+        ADR-048 §1: pure helper exposed as a module-level free function.
+        """
+        mod = _native_mod()
         return await asyncio.to_thread(
-            self._native.py_verify_identity_link_attestation,
+            mod.py_verify_identity_link_attestation,
             attestation_json,
             issuer_public_key_hex,
         )
@@ -1483,14 +1503,17 @@ class SCP:
     # region SCPID
 
     async def scpid_challenge(self, audience: str, ttl_seconds: int = 300) -> Any:
-        """Delegate to ``_scp_core.SCP.scpid_challenge``.
+        """Delegate to ``_scp_core.scpid_challenge``.
+
+        ADR-048 §1: pure helper exposed as a module-level free function.
 
         Returns an :class:`~scp_sdk.auth.ScpIdChallenge` parsed from the
         bridge's JSON payload.
         """
         from scp_sdk.auth import ScpIdChallenge
 
-        raw = await asyncio.to_thread(self._native.scpid_challenge, audience, ttl_seconds)
+        mod = _native_mod()
+        raw = await asyncio.to_thread(mod.scpid_challenge, audience, ttl_seconds)
         return ScpIdChallenge.from_json(raw) if isinstance(raw, str) else raw
 
     async def scpid_sign(self, did: str, signing_key_id: str, challenge_json: str) -> Any:
@@ -1542,9 +1565,13 @@ class SCP:
         context_state: str = "unknown",
         counterparties: list[str] | None = None,
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.evaluate_provenance_quality``."""
+        """Delegate to ``_scp_core.evaluate_provenance_quality``.
+
+        ADR-048 §1: pure helper exposed as a module-level free function.
+        """
+        mod = _native_mod()
         return await asyncio.to_thread(
-            self._native.evaluate_provenance_quality,
+            mod.evaluate_provenance_quality,
             source_context,
             source_type,
             context_state,
@@ -1576,29 +1603,41 @@ class SCP:
     async def provenance_check_chain_depth(
         self, chain_depth: int, max_depth: int | None = None
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.provenance_check_chain_depth``."""
-        return await asyncio.to_thread(
-            self._native.provenance_check_chain_depth, chain_depth, max_depth
-        )
+        """Delegate to ``_scp_core.provenance_check_chain_depth``.
+
+        ADR-048 §1: pure helper exposed as a module-level free function.
+        """
+        mod = _native_mod()
+        return await asyncio.to_thread(mod.provenance_check_chain_depth, chain_depth, max_depth)
 
     async def provenance_pseudonymize_counterparties(
         self, provenance_json: str, pseudonym_key_hex: str
     ) -> Any:
-        """Delegate to ``_scp_core.SCP.provenance_pseudonymize_counterparties``."""
+        """Delegate to ``_scp_core.provenance_pseudonymize_counterparties``.
+
+        ADR-048 §1: pure helper exposed as a module-level free function.
+        """
+        mod = _native_mod()
         return await asyncio.to_thread(
-            self._native.provenance_pseudonymize_counterparties, provenance_json, pseudonym_key_hex
+            mod.provenance_pseudonymize_counterparties, provenance_json, pseudonym_key_hex
         )
 
     async def provenance_redact_counterparties(self, provenance_json: str) -> Any:
-        """Delegate to ``_scp_core.SCP.provenance_redact_counterparties``."""
-        return await asyncio.to_thread(
-            self._native.provenance_redact_counterparties, provenance_json
-        )
+        """Delegate to ``_scp_core.provenance_redact_counterparties``.
+
+        ADR-048 §1: pure helper exposed as a module-level free function.
+        """
+        mod = _native_mod()
+        return await asyncio.to_thread(mod.provenance_redact_counterparties, provenance_json)
 
     async def provenance_update_source_type(self, provenance_json: str, new_state: str) -> Any:
-        """Delegate to ``_scp_core.SCP.provenance_update_source_type``."""
+        """Delegate to ``_scp_core.provenance_update_source_type``.
+
+        ADR-048 §1: pure helper exposed as a module-level free function.
+        """
+        mod = _native_mod()
         return await asyncio.to_thread(
-            self._native.provenance_update_source_type, provenance_json, new_state
+            mod.provenance_update_source_type, provenance_json, new_state
         )
 
     # endregion Provenance

@@ -1,14 +1,18 @@
 //! `PyO3` bridge functions for SCPID authentication (§3.11).
 //!
-//! Exposes SCPID challenge generation, signing, and verification to Python
-//! as methods on the `SCP` class:
+//! Exposes SCPID challenge generation, signing, and verification to Python.
+//! Pure helpers are module-level `#[pyfunction]` exports (ADR-048 §1);
+//! stateful operations are methods on the `SCP` class:
 //!
-//! - `PyScp::scpid_challenge` — Generate an SCPID challenge for a relying party.
+//! - `scpid_challenge` — Generate an SCPID challenge for a relying party
+//!   (free fn, pure helper).
 //! - `PyScp::scpid_sign` — Sign an SCPID challenge with a registered identity's key.
 //! - `PyScp::scpid_verify` — Verify a signed SCPID response (relying-party side).
 //!
-//! Migrated from flat `#[pyfunction]` exports to `#[pymethods] impl PyScp`
-//! methods in Phase 4 PR 4 sub-slice C (#1549).
+//! Originally migrated from flat `#[pyfunction]` exports to `#[pymethods]
+//! impl PyScp` methods in Phase 4 PR 4 sub-slice C; `scpid_challenge`
+//! was demoted back to a free fn under ADR-048 §1 because its body never
+//! reads `self`.
 //!
 //! See spec §3.11 and the `scp-core` `scpid` module.
 
@@ -18,7 +22,8 @@ use std::time::Duration;
 use pyo3::prelude::*;
 
 use scp_core::identity::{
-    ScpIdChallenge, ScpIdResponse, scpid_challenge, scpid_sign, scpid_verify,
+    ScpIdChallenge, ScpIdResponse, scpid_challenge as core_scpid_challenge, scpid_sign,
+    scpid_verify,
 };
 use scp_identity::SigningKeyId;
 
@@ -26,45 +31,50 @@ use crate::error::ScpPyError;
 use crate::runtime::with_identity;
 
 // ---------------------------------------------------------------------------
-// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
+// Pure helpers — module-level `#[pyfunction]` exports (ADR-048 §1).
+// ---------------------------------------------------------------------------
+
+/// Generates an SCPID challenge for the given audience (§3.11.8).
+///
+/// Returns the challenge as a JSON string containing `protocol`, `nonce`,
+/// `audience`, `issued_at`, and `expires_at` fields.
+///
+/// # Arguments
+///
+/// * `audience` — URI identifying the relying party (e.g., `"https://app.example.com"`).
+/// * `ttl_seconds` — Challenge validity window in seconds (1–300).
+///
+/// # Errors
+///
+/// Raises `ValidationError` if `audience` is empty, exceeds 2048 bytes,
+/// or `ttl_seconds` is 0 or exceeds 300.
+// ttl_seconds is u64 to match the `Duration::from_secs` parameter type.
+// NAPI/WASM bridges use u32 (idiomatic for JS/WASM; max valid TTL is 300s).
+#[pyfunction]
+pub fn scpid_challenge(audience: String, ttl_seconds: u64) -> PyResult<String> {
+    let challenge =
+        core_scpid_challenge(&audience, Duration::from_secs(ttl_seconds)).map_err(|e| {
+            ScpPyError::ValidationError {
+                message: e.to_string(),
+                code: codes::IDENT_1038.to_string(),
+            }
+        })?;
+
+    serde_json::to_string(&challenge).map_err(|e| {
+        ScpPyError::IdentityError {
+            message: format!("failed to serialize SCPID challenge: {e}"),
+            code: codes::IDENT_1037.to_string(),
+        }
+        .into()
+    })
+}
+
+// ---------------------------------------------------------------------------
+// PyScp methods — stateful SCPID operations.
 // ---------------------------------------------------------------------------
 
 #[pymethods]
 impl crate::scp::PyScp {
-    /// Generates an SCPID challenge for the given audience (§3.11.8).
-    ///
-    /// Returns the challenge as a JSON string containing `protocol`, `nonce`,
-    /// `audience`, `issued_at`, and `expires_at` fields.
-    ///
-    /// # Arguments
-    ///
-    /// * `audience` — URI identifying the relying party (e.g., `"https://app.example.com"`).
-    /// * `ttl_seconds` — Challenge validity window in seconds (1–300).
-    ///
-    /// # Errors
-    ///
-    /// Raises `ValidationError` if `audience` is empty, exceeds 2048 bytes,
-    /// or `ttl_seconds` is 0 or exceeds 300.
-    // ttl_seconds is u64 to match the `Duration::from_secs` parameter type.
-    // NAPI/WASM bridges use u32 (idiomatic for JS/WASM; max valid TTL is 300s).
-    pub fn scpid_challenge(&self, audience: String, ttl_seconds: u64) -> PyResult<String> {
-        let challenge =
-            scpid_challenge(&audience, Duration::from_secs(ttl_seconds)).map_err(|e| {
-                ScpPyError::ValidationError {
-                    message: e.to_string(),
-                    code: codes::IDENT_1038.to_string(),
-                }
-            })?;
-
-        serde_json::to_string(&challenge).map_err(|e| {
-            ScpPyError::IdentityError {
-                message: format!("failed to serialize SCPID challenge: {e}"),
-                code: codes::IDENT_1037.to_string(),
-            }
-            .into()
-        })
-    }
-
     /// Signs an SCPID challenge with a registered identity's key (§3.11.3).
     ///
     /// Looks up the identity by DID in this bridge's registry, selects the
@@ -266,15 +276,16 @@ const fn scpid_error_code(e: &scp_core::identity::ScpIdError) -> &'static str {
 
 /// Registers SCPID bridge helpers on the `_scp_core` module.
 ///
-/// Post-migration (Phase 4 PR 4 sub-slice C) SCPID operations are exposed
-/// as methods on `SCP` (see the `#[pymethods]` block above) and registered
-/// automatically with the class. This function is retained to preserve the
-/// module-init call sequence; it is currently a no-op.
+/// Stateful SCPID operations (`scpid_sign`, `scpid_verify`) are methods on
+/// the `SCP` class (see the `#[pymethods]` block above) and registered
+/// automatically with the class. The pure `scpid_challenge` helper is a
+/// module-level `#[pyfunction]` registered here (ADR-048 §1).
 ///
 /// # Errors
 ///
 /// Returns `PyErr` if registration fails.
-pub const fn register_scpid(_m: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn register_scpid(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(scpid_challenge, m)?)?;
     Ok(())
 }
 
@@ -299,10 +310,7 @@ mod tests {
     #[test]
     fn challenge_returns_valid_json() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp();
-        let json = scp
-            .scpid_challenge("https://example.com".to_owned(), 60)
-            .unwrap();
+        let json = scpid_challenge("https://example.com".to_owned(), 60).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["protocol"], "scpid/1.0");
         assert_eq!(v["audience"], "https://example.com");
@@ -314,24 +322,21 @@ mod tests {
     #[test]
     fn challenge_rejects_zero_ttl() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp();
-        let result = scp.scpid_challenge("https://example.com".to_owned(), 0);
+        let result = scpid_challenge("https://example.com".to_owned(), 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn challenge_rejects_excessive_ttl() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp();
-        let result = scp.scpid_challenge("https://example.com".to_owned(), 301);
+        let result = scpid_challenge("https://example.com".to_owned(), 301);
         assert!(result.is_err());
     }
 
     #[test]
     fn challenge_rejects_empty_audience() {
         pyo3::prepare_freethreaded_python();
-        let scp = default_scp();
-        let result = scp.scpid_challenge(String::new(), 60);
+        let result = scpid_challenge(String::new(), 60);
         assert!(result.is_err());
     }
 

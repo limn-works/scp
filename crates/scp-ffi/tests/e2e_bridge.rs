@@ -683,26 +683,21 @@ fn discovery_context_discover_invalid_query_fails() {
 #[test]
 fn provenance_evaluate_quality_returns_tier() {
     setup();
-    let q = _scp_core::scp::PyScp::new()
-        .evaluate_provenance_quality(
-            Some("ctx-source".to_owned()),
-            "persistent",
-            "active",
-            Some(vec!["did:key:alice".to_owned()]),
-        )
-        .unwrap();
+    let q = _scp_core::provenance::evaluate_provenance_quality(
+        Some("ctx-source".to_owned()),
+        "persistent",
+        "active",
+        Some(vec!["did:key:alice".to_owned()]),
+    )
+    .unwrap();
     assert!(q <= 3);
 }
 
 #[test]
 fn provenance_evaluate_quality_invalid_source_type() {
     setup();
-    let r = _scp_core::scp::PyScp::new().evaluate_provenance_quality(
-        None,
-        "invalid_type",
-        "active",
-        None,
-    );
+    let r =
+        _scp_core::provenance::evaluate_provenance_quality(None, "invalid_type", "active", None);
     assert!(r.is_err());
 }
 
@@ -768,18 +763,23 @@ fn provenance_attach_increments_chain_depth() {
 #[test]
 fn provenance_check_chain_depth_within_limit() {
     setup();
-    assert!(_scp_core::scp::PyScp::new().provenance_check_chain_depth(0, None));
-    assert!(_scp_core::scp::PyScp::new().provenance_check_chain_depth(3, None));
+    assert!(_scp_core::provenance::provenance_check_chain_depth(0, None));
+    assert!(_scp_core::provenance::provenance_check_chain_depth(3, None));
 }
 
 #[test]
 fn provenance_check_chain_depth_exceeds_limit() {
     setup();
     // Default is now 8 (ADR-043), so depth 4 is within default.
-    assert!(_scp_core::scp::PyScp::new().provenance_check_chain_depth(4, None));
+    assert!(_scp_core::provenance::provenance_check_chain_depth(4, None));
     // Depth 9 exceeds default of 8.
-    assert!(!_scp_core::scp::PyScp::new().provenance_check_chain_depth(9, None));
-    assert!(!_scp_core::scp::PyScp::new().provenance_check_chain_depth(2, Some(1)));
+    assert!(!_scp_core::provenance::provenance_check_chain_depth(
+        9, None
+    ));
+    assert!(!_scp_core::provenance::provenance_check_chain_depth(
+        2,
+        Some(1)
+    ));
 }
 
 #[test]
@@ -1104,10 +1104,14 @@ fn cross_domain_identity_context_tool_eventlog_provenance() {
             dGVzdC1zaWduYXR1cmUtYnl0ZXMtMDAwMDAwMDAwMDAw";
         scp.ucan_revoke(&ctx_id, dummy, &did_a).unwrap();
 
-        // Evaluate provenance.
-        let q = scp
-            .evaluate_provenance_quality(Some(ctx_id), "persistent", "active", None)
-            .unwrap();
+        // Evaluate provenance (pure helper — module-level free fn per ADR-048 §1).
+        let q = _scp_core::provenance::evaluate_provenance_quality(
+            Some(ctx_id),
+            "persistent",
+            "active",
+            None,
+        )
+        .unwrap();
         assert!(q <= 3);
     });
 }
