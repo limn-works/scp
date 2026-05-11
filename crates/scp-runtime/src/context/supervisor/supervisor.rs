@@ -1788,11 +1788,31 @@ impl Supervisor {
         Ok(Box::pin(handlers::broadcast::dispatch_from_shim(self, cmd)).await)
     }
 
-    /// Dispatch a [`BroadcastCommand`] through the migration shim with
-    /// an explicit key custody reference (ADR-049 commit 11 / plan row
-    /// 11). Required for publish variants; non-publish variants fall
-    /// through to the same handler body used by
-    /// [`Self::dispatch_broadcast_command`] (the custody is unused).
+    /// Dispatch a [`BroadcastCommand`] with an explicit key custody
+    /// reference (ADR-049 commit 11 / plan row 11).
+    ///
+    /// # Why a custody-generic shim still exists
+    ///
+    /// [`KeyCustody`](scp_platform::KeyCustody) is an RPITIT trait whose
+    /// methods return `impl Future` — it is not `dyn`-safe, so a custody
+    /// reference cannot be erased and shipped across the actor mailbox.
+    /// The publish variants (`PublishBroadcast`, `PublishBroadcastContent`)
+    /// need the caller's custody to derive the sender key, and so they
+    /// remain on this generic shim path for the foreseeable future.
+    ///
+    /// # Routing
+    ///
+    /// - **Non-publish variants** (`Subscribe`, `Unsubscribe`, `Block`,
+    ///   `Unblock`, key request, queries) have a per-context owner and a
+    ///   `context_id` surfaced by
+    ///   [`Self::broadcast_command_context_id`]. They route through the
+    ///   per-context actor mailbox.
+    /// - **Publish variants** are intentionally returned as `None` from
+    ///   `broadcast_command_context_id`, fall through the mailbox check,
+    ///   and dispatch on the custody-generic shim below.
+    ///
+    /// This split is permanent: only the publish path needs custody; the
+    /// rest is identical to [`Self::dispatch_broadcast_command`].
     ///
     /// # Errors
     ///
@@ -1804,16 +1824,24 @@ impl Supervisor {
         cmd: BroadcastCommand,
         custody: &C,
     ) -> Result<Outcome<()>, ContextError> {
-        // Non-publish variants do not need the custody reference and
-        // can use the mailbox-routed actor path. Publish variants are
-        // intentionally excluded by `broadcast_command_context_id` and
-        // remain on the generic shim below.
+        // Mailbox-first for non-publish variants. The mailbox path
+        // returns the same `Outcome` shape as the shim path; the
+        // dispatch-side `BroadcastCommand` enum already carries every
+        // payload the actor needs.
         if let Some(ctx_id) = Self::broadcast_command_context_id(&cmd)
             && let Some(actor) = self.lookup(ctx_id)
         {
             return Self::dispatch_via_mailbox(&actor, ContextCommand::Broadcast(cmd)).await;
         }
 
+        // Publish-only escape: `dispatch_from_shim_with_custody` carries
+        // the custody reference into `shim_handle_publish_broadcast` /
+        // `_publish_broadcast_content`. Non-publish variants reaching
+        // this branch (e.g. when no per-context actor is registered yet)
+        // ignore the custody and route through the shared no-custody
+        // shim. See the function comment above — `KeyCustody` is not
+        // `dyn`-safe, so this generic dispatch cannot be folded into the
+        // mailbox path.
         Ok(
             Box::pin(handlers::broadcast::dispatch_from_shim_with_custody(
                 self, cmd, custody,
