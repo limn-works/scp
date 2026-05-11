@@ -1295,8 +1295,54 @@ impl Supervisor {
         &self,
         cmd: EconomyCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 commit 12 — economy handler takes `&Supervisor`.
+        // ADR-049 Phase 2A finalization — route through the per-context
+        // actor mailbox when every receipt in the batch agrees on a
+        // single `Some(context_id)` and an actor is registered for it.
+        // Mixed-context batches and relay-level (`None`) receipts have
+        // no single owning actor and fall through to the shim, which
+        // resolves the payment adapter from the supervisor's lifted
+        // provider slot. The actor-shape and shim-shape helpers both
+        // delegate to the same `economy_helpers::verify_payment_receipts`
+        // body (the read uses only `deps.payment_adapter`), so the two
+        // paths are observably equivalent — routing chooses the
+        // serialization point, not the work.
+        if let Some(ctx_id) = Self::economy_command_context_id(&cmd) {
+            let ctx_id_owned = ctx_id.to_owned();
+            if let Some(actor) = self.lookup(&ctx_id_owned) {
+                return Self::dispatch_via_mailbox(&actor, ContextCommand::Economy(cmd)).await;
+            }
+        }
         Ok(handlers::economy::dispatch_from_shim(self, cmd).await)
+    }
+
+    /// Extract the target context_id from an [`EconomyCommand`] when one
+    /// can be unambiguously derived.
+    ///
+    /// Returns `Some(ctx_id)` only when every receipt in a
+    /// [`EconomyCommand::VerifyPaymentReceipts`] batch carries the same
+    /// `Some(context_id)`. Returns `None` for:
+    ///
+    /// - [`EconomyCommand::Placeholder`] (no target).
+    /// - Empty receipt batches (no target).
+    /// - Heterogeneous batches whose receipts straddle multiple contexts
+    ///   (no single owning actor).
+    /// - Batches containing any relay-level receipt (`context_id == None`).
+    fn economy_command_context_id(cmd: &EconomyCommand) -> Option<&str> {
+        match cmd {
+            EconomyCommand::Placeholder { .. } => None,
+            EconomyCommand::VerifyPaymentReceipts { receipts, .. } => {
+                let mut iter = receipts.iter();
+                let first = iter.next()?.context_id.as_ref()?;
+                let first_str = first.as_str();
+                for r in iter {
+                    match r.context_id.as_ref() {
+                        Some(c) if c.as_str() == first_str => {}
+                        _ => return None,
+                    }
+                }
+                Some(first_str)
+            }
+        }
     }
 
     /// Dispatch a [`TrustRecoveryCommand`] through the migration shim
