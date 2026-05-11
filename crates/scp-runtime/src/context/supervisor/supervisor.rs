@@ -1435,6 +1435,34 @@ impl Supervisor {
                 let _ = reply.send(reply_result);
                 outcome
             }
+            // Sweep variants are dispatched per-actor by the iterating
+            // entry points in `lifecycle_helpers` — they should never
+            // reach the direct path (which has no actor to target). If
+            // a caller mistakenly routes one through
+            // `dispatch_lifecycle_command`, surface a typed error on
+            // the reply oneshot rather than panicking.
+            LifecycleCommand::FlushSnapshot { reply } => {
+                let err = ContextError::InvalidState(
+                    "LifecycleCommand::FlushSnapshot reached dispatch_lifecycle_direct — \
+                     sweep variants must be dispatched via the iterating entry points in \
+                     `lifecycle_helpers::flush_all_contexts*`"
+                        .to_owned(),
+                );
+                let sketch = ContextError::InvalidState(format!("{err}"));
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
+            LifecycleCommand::ShutdownSelf { reply } => {
+                let err = ContextError::InvalidState(
+                    "LifecycleCommand::ShutdownSelf reached dispatch_lifecycle_direct — \
+                     sweep variants must be dispatched via the iterating entry points in \
+                     `lifecycle_helpers::shutdown_all_contexts*`"
+                        .to_owned(),
+                );
+                let sketch = ContextError::InvalidState(format!("{err}"));
+                let _ = reply.send(Err(err));
+                Outcome::err(sketch)
+            }
         }
     }
 
@@ -3997,8 +4025,14 @@ impl Supervisor {
             // params. The dispatch helper routes ImportContext through
             // the direct-shim path until the lifecycle handler is
             // rewritten to surface that derivation. Placeholder has no
-            // target at all.
-            LifecycleCommand::ImportContext { .. } | LifecycleCommand::Placeholder { .. } => None,
+            // target at all. Sweep commands (`FlushSnapshot`,
+            // `ShutdownSelf`) are dispatched per-actor by the
+            // supervisor's iterating entry points in `lifecycle_helpers`;
+            // routing target is decided at the iteration site.
+            LifecycleCommand::ImportContext { .. }
+            | LifecycleCommand::Placeholder { .. }
+            | LifecycleCommand::FlushSnapshot { .. }
+            | LifecycleCommand::ShutdownSelf { .. } => None,
         }
     }
 
@@ -4078,7 +4112,16 @@ impl Supervisor {
             GovernanceCommand::ExecuteGovernanceAction { payload, .. } => {
                 Some(payload.context_id.as_str())
             }
-            GovernanceCommand::Placeholder { .. } => None,
+            // Sweep commands are dispatched per-actor by the supervisor's
+            // iterating entry points in `governance_helpers`; the variant
+            // carries no `context_id` field because the routing target is
+            // decided at the iteration site (one command per known
+            // actor). Returning `None` here keeps `dispatch_governance_command`
+            // from accepting them — sweeps must use the iterating helpers.
+            GovernanceCommand::Placeholder { .. }
+            | GovernanceCommand::EvaluatePeriodicConsequences { .. }
+            | GovernanceCommand::ProcessPendingCommits { .. }
+            | GovernanceCommand::EvaluateTimeouts { .. } => None,
         }
     }
 

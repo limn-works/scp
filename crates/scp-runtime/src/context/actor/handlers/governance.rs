@@ -197,6 +197,15 @@ async fn dispatch_state(
             ))
             .await
         }
+        GovernanceCommand::EvaluatePeriodicConsequences { reply } => {
+            handle_evaluate_periodic_consequences_actor(state, deps, reply)
+        }
+        GovernanceCommand::ProcessPendingCommits { reply } => {
+            Box::pin(handle_process_pending_commits_actor(state, deps, reply)).await
+        }
+        GovernanceCommand::EvaluateTimeouts { reply } => {
+            Box::pin(handle_evaluate_timeouts_actor(state, deps, reply)).await
+        }
         // Placeholder is a no-op handshake target reserved for mailbox
         // tests. Returns NotImplemented synchronously; no state mutation.
         GovernanceCommand::Placeholder { reply } => reply_not_implemented(reply),
@@ -716,4 +725,440 @@ fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Ou
                        deleted in commit 12 with the shim";
     let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
     Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
+}
+
+// ---------------------------------------------------------------------------
+// Sweep handlers (Phase 2A finalization — sweep helper relocation)
+// ---------------------------------------------------------------------------
+
+/// Handle [`GovernanceCommand::EvaluatePeriodicConsequences`] (actor-shape).
+///
+/// Per-actor body of the relocated sweep. Evaluates consequence rules
+/// against the actor's own `state` and applies any triggered actions
+/// (suspend / revoke / etc.) to `state.membership` /
+/// `state.role_state`. Mirrors the per-context body of
+/// `evaluate_periodic_consequences_legacy` (which read
+/// `Supervisor::contexts` DashMap directly); the actor-shape variant
+/// operates on `&mut state` and never touches the supervisor's DashMap.
+fn handle_evaluate_periodic_consequences_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    use scp_protocol::trust::consequence::{TriggeredConsequence, evaluate_consequence_rules};
+
+    use crate::context::governance_logic::{
+        ConsequenceStateSplit, EnforceConsequencesCtx, enforce_triggered_consequences,
+        event_log_entries_for_consequences,
+    };
+
+    let rules = state.governance.consequence_rules.clone();
+    if rules.is_empty() {
+        let _ = reply.send(Ok(()));
+        return Outcome::ok(());
+    }
+    let now = deps.clock.now_secs();
+    let context_id = state.handle.context_id().to_owned();
+    let member_dids: Vec<scp_identity::DID> =
+        state.membership.members().map(|m| m.did.clone()).collect();
+    let events = event_log_entries_for_consequences(
+        &state.receive_buffer,
+        &context_id,
+        now,
+        deps.event_log.as_ref(),
+    );
+
+    let mut results: Vec<(scp_identity::DID, Vec<TriggeredConsequence>)> = Vec::new();
+    for member_did in member_dids {
+        let triggered = evaluate_consequence_rules(&rules, &events, member_did.as_ref(), now);
+        if !triggered.is_empty() {
+            results.push((member_did, triggered));
+        }
+    }
+    if results.is_empty() {
+        let _ = reply.send(Ok(()));
+        return Outcome::ok(());
+    }
+    let mut split = ConsequenceStateSplit::from_state(state);
+    for (member_did, triggered) in &results {
+        enforce_triggered_consequences(
+            &mut split,
+            &EnforceConsequencesCtx {
+                context_id: &context_id,
+                member_did,
+                now,
+                triggered,
+                rules: &rules,
+                clock: deps.clock.as_ref(),
+                event_log: deps.event_log.as_ref(),
+                event_tx: deps.event_tx.as_ref(),
+            },
+        );
+    }
+    let _ = reply.send(Ok(()));
+    Outcome::ok_mutated(())
+}
+
+/// Handle [`GovernanceCommand::ProcessPendingCommits`] (actor-shape).
+///
+/// Per-actor body of the relocated sweep (PR #1606 C6). Walks
+/// `state.pending_commits`, retries any commits whose `next_attempt_at
+/// <= now`, and either dequeues on success, updates retry count on
+/// transient failure, or marks the context fail-closed once the retry
+/// budget is exhausted.
+///
+/// Mirrors the per-context body of `process_pending_commits_legacy`.
+/// The legacy body executed transport sends with the contexts lock
+/// RELEASED; the actor-shape body keeps the same property by snapshotting
+/// the queue, releasing the borrow on `state` for the transport phase
+/// (the transport adapter takes no `&state`), then re-acquiring `&mut
+/// state` for the result-application phase. The actor's own dispatch
+/// loop owns the `&mut state` borrow exclusively, so other commands
+/// cannot interleave between phases — this preserves the legacy "queue
+/// is only mutated by this task between phases" invariant.
+async fn handle_process_pending_commits_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    use scp_protocol::context::membership::ContextEvent;
+
+    use crate::context::state::{
+        CommitFaultMarker, CommitOperation, MAX_COMMIT_AGE_SECS, MAX_COMMIT_RETRIES, PendingCommit,
+        commit_retry_backoff, context_id_to_bytes,
+    };
+
+    if state.commit_fault.is_some() {
+        let _ = reply.send(Ok(()));
+        return Outcome::ok(());
+    }
+    let snapshot: Vec<PendingCommit> = state.pending_commits.iter().cloned().collect();
+    if snapshot.is_empty() {
+        let _ = reply.send(Ok(()));
+        return Outcome::ok(());
+    }
+    let now = deps.clock.now_secs();
+    let context_id = state.handle.context_id().to_owned();
+    let context_id_bytes = context_id_to_bytes(&context_id);
+
+    // Phase A: classify outcomes with no `&mut state` mutations.
+    //
+    // The legacy body executed `transport.send_message` with the
+    // contexts DashMap lock RELEASED to avoid holding the per-context
+    // mutex across network I/O. The actor-shape body achieves the same
+    // observable property: the transport adapter is `Arc<dyn ...>` and
+    // takes no `&state`, so the send sites here do not borrow `state`
+    // even though the surrounding function holds `&mut state`. The
+    // actor's `dispatch_state` arm owns the borrow exclusively for the
+    // command's lifetime, so other commands cannot interleave.
+    enum CommitRetryOutcomeKind {
+        Success {
+            attempts: u32,
+            operation: CommitOperation,
+        },
+        Retry {
+            error: String,
+            next_attempt_at: u64,
+            new_retry_count: u32,
+            operation: CommitOperation,
+        },
+        Failed {
+            reason: String,
+            attempts: u32,
+            operation: CommitOperation,
+        },
+    }
+    struct CommitRetryOutcome {
+        index: usize,
+        kind: CommitRetryOutcomeKind,
+    }
+
+    let mut outcomes: Vec<CommitRetryOutcome> = Vec::new();
+    for (idx, pending) in snapshot.iter().enumerate() {
+        if now < pending.next_attempt_at {
+            continue;
+        }
+        let age = now.saturating_sub(pending.first_attempt_at);
+        if age >= MAX_COMMIT_AGE_SECS {
+            outcomes.push(CommitRetryOutcome {
+                index: idx,
+                kind: CommitRetryOutcomeKind::Failed {
+                    reason: format!("max age exceeded ({age}s >= {MAX_COMMIT_AGE_SECS}s)"),
+                    attempts: pending.retry_count,
+                    operation: pending.operation.clone(),
+                },
+            });
+            continue;
+        }
+        match deps
+            .transport
+            .send_message(&pending.routing_id, &pending.commit_bytes)
+        {
+            Ok(()) => {
+                outcomes.push(CommitRetryOutcome {
+                    index: idx,
+                    kind: CommitRetryOutcomeKind::Success {
+                        attempts: pending.retry_count,
+                        operation: pending.operation.clone(),
+                    },
+                });
+            }
+            Err(e) => {
+                let new_retry_count = pending.retry_count.saturating_add(1);
+                if new_retry_count > MAX_COMMIT_RETRIES {
+                    outcomes.push(CommitRetryOutcome {
+                        index: idx,
+                        kind: CommitRetryOutcomeKind::Failed {
+                            reason: e.to_string(),
+                            attempts: new_retry_count,
+                            operation: pending.operation.clone(),
+                        },
+                    });
+                } else {
+                    let backoff = commit_retry_backoff(new_retry_count);
+                    outcomes.push(CommitRetryOutcome {
+                        index: idx,
+                        kind: CommitRetryOutcomeKind::Retry {
+                            error: e.to_string(),
+                            next_attempt_at: now.saturating_add(backoff),
+                            new_retry_count,
+                            operation: pending.operation.clone(),
+                        },
+                    });
+                }
+            }
+        }
+    }
+    if outcomes.is_empty() {
+        let _ = reply.send(Ok(()));
+        return Outcome::ok(());
+    }
+
+    // Phase B: apply outcomes to `state.pending_commits`.
+    let mut event_log_writes: Vec<&'static str> = Vec::new();
+    let queue_len = state.pending_commits.len();
+    let mut to_remove: Vec<usize> = Vec::new();
+    for outcome in outcomes {
+        if outcome.index >= queue_len {
+            continue;
+        }
+        match outcome.kind {
+            CommitRetryOutcomeKind::Success {
+                attempts,
+                operation,
+            } => {
+                state.emit_event(
+                    ContextEvent::CommitBroadcastSucceeded {
+                        operation: operation.label(),
+                        attempts,
+                    },
+                    &context_id,
+                    deps.event_tx.as_ref(),
+                );
+                event_log_writes.push("CommitBroadcastSucceeded");
+                to_remove.push(outcome.index);
+            }
+            CommitRetryOutcomeKind::Retry {
+                error,
+                next_attempt_at,
+                new_retry_count,
+                operation,
+            } => {
+                if let Some(entry) = state.pending_commits.get_mut(outcome.index) {
+                    entry.retry_count = new_retry_count;
+                    entry.next_attempt_at = next_attempt_at;
+                    entry.last_error = Some(error.clone());
+                }
+                state.emit_event(
+                    ContextEvent::CommitBroadcastPending {
+                        operation: operation.label(),
+                        error,
+                        attempt: new_retry_count,
+                    },
+                    &context_id,
+                    deps.event_tx.as_ref(),
+                );
+                event_log_writes.push("CommitBroadcastPending");
+            }
+            CommitRetryOutcomeKind::Failed {
+                reason,
+                attempts,
+                operation,
+            } => {
+                let now_failed = deps.clock.now_secs();
+                state.commit_fault = Some(CommitFaultMarker {
+                    operation: operation.clone(),
+                    reason: reason.clone(),
+                    failed_at: now_failed,
+                    retry_count: attempts,
+                });
+                state.emit_event(
+                    ContextEvent::CommitBroadcastFailed {
+                        operation: operation.label(),
+                        reason,
+                        attempts,
+                    },
+                    &context_id,
+                    deps.event_tx.as_ref(),
+                );
+                event_log_writes.push("CommitBroadcastFailed");
+                to_remove.push(outcome.index);
+            }
+        }
+    }
+    to_remove.sort_unstable_by(|a, b| b.cmp(a));
+    for idx in to_remove {
+        state.pending_commits.remove(idx);
+    }
+
+    // Phase C: append durable event log entries with no lock concern
+    // (event_log adapter is `Arc<dyn ...>`, takes no `&state`).
+    let mut retry_event_count: u64 = 0;
+    for label in event_log_writes {
+        if let Err(e) = deps
+            .event_log
+            .append_context_event(&context_id_bytes, label, "system")
+        {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to append commit retry event to durable log"
+            );
+        }
+        retry_event_count += 1;
+    }
+    if retry_event_count > 0 {
+        state.checkpoint_events_since += retry_event_count;
+    }
+    let _ = reply.send(Ok(()));
+    Outcome::ok_mutated(())
+}
+
+/// Handle [`GovernanceCommand::EvaluateTimeouts`] (actor-shape).
+///
+/// Per-actor body of the relocated sweep. Runs one tick of the
+/// governance timeout / consequence pipeline for THIS actor's context.
+/// Mirrors the per-context body of `start_governance_timeout_task_legacy`
+/// — phases 1 through 5.
+///
+/// Replies `Ok(true)` to continue the supervisor's timer loop, `Ok(false)`
+/// to stop (context closing or removed; matches the legacy timer
+/// closure's `bool` return). The supervisor-side timer-spawn entry point
+/// in [`governance_helpers::start_governance_timeout_task`](crate::context::governance_helpers::start_governance_timeout_task)
+/// drives the cadence; per-actor governance-timeout actors land in Phase
+/// 2B per ADR-049.
+async fn handle_evaluate_timeouts_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    reply: oneshot::Sender<Result<bool, ContextError>>,
+) -> Outcome<()> {
+    use std::collections::HashSet;
+
+    use scp_identity::DID;
+
+    use crate::context::governance::timeout::{
+        collect_active_voters, process_pending_proposals, update_detection_state,
+    };
+    use crate::context::governance_helpers::build_governance_context;
+
+    let context_id = state.handle.context_id().to_owned();
+
+    // Phase 1: read state, process proposals, detect deadlock.
+    let current_state = state.handle.try_read_state();
+    if !matches!(
+        current_state,
+        Some(scp_protocol::context::ContextState::Active)
+    ) {
+        // None = write-contended, continue next tick.
+        // Not Active = context closing, stop the loop.
+        let continue_loop = current_state.is_none();
+        let _ = reply.send(Ok(continue_loop));
+        return Outcome::ok(());
+    }
+
+    let gov_ctx = build_governance_context(state, deps.clock.as_ref());
+
+    let current_members: HashSet<DID> =
+        state.membership.members().map(|m| m.did.clone()).collect();
+    let departed: Vec<DID> = state
+        .governance
+        .last_known_members
+        .difference(&current_members)
+        .cloned()
+        .collect();
+    state.governance.last_known_members = current_members;
+
+    state
+        .governance
+        .evict_stale_entries(deps.clock.now_secs());
+
+    let epoch_resets: Vec<DID> = std::mem::take(&mut state.governance.pending_epoch_resets);
+
+    let mls_epoch = state.epoch.mls_epoch;
+    let recovery_in_progress = state.governance.deadlock.recovery_in_progress;
+
+    let active_voters = collect_active_voters(state.governance.engine.as_ref());
+
+    let result = process_pending_proposals(
+        state.governance.engine.as_mut(),
+        &gov_ctx,
+        &departed,
+        &epoch_resets,
+    );
+
+    update_detection_state(
+        &mut state.governance.deadlock,
+        state.governance.engine.as_ref(),
+        &gov_ctx,
+        &active_voters,
+    );
+
+    let conditions = crate::context::governance::timeout::detect_deadlock(
+        state.governance.engine.as_ref(),
+        &gov_ctx,
+        &state.governance.deadlock,
+    );
+
+    // Phase 2: translate timeout events.
+    let ctx_events = crate::context::governance_helpers_legacy::translate_timeout_events_legacy(
+        &result.events,
+        mls_epoch,
+        &conditions,
+        recovery_in_progress,
+    );
+
+    // Phase 3: write results back, update recovery state.
+    let needs_write = !ctx_events.is_empty()
+        || (conditions.is_empty() && recovery_in_progress)
+        || (!conditions.is_empty() && !recovery_in_progress);
+    if needs_write {
+        for ctx_event in ctx_events {
+            state.emit_event(ctx_event, &context_id, deps.event_tx.as_ref());
+        }
+        if conditions.is_empty() && recovery_in_progress {
+            state.governance.deadlock.recovery_in_progress = false;
+        } else if !conditions.is_empty() && !recovery_in_progress {
+            state.governance.deadlock.recovery_in_progress = true;
+        }
+    }
+
+    // Phase 4: periodic consequence evaluation (#1531). Reuses the
+    // actor-shape sweep body via direct call rather than a nested
+    // mailbox dispatch — both operate on `&mut state` already owned by
+    // this handler.
+    let (consequence_reply_tx, _consequence_reply_rx) = oneshot::channel();
+    let _ = handle_evaluate_periodic_consequences_actor(state, deps, consequence_reply_tx);
+
+    // Phase 5 (PR #1606 C6): drain MLS commit retry queue. Same pattern
+    // as Phase 4 — direct in-handler call.
+    let (commits_reply_tx, _commits_reply_rx) = oneshot::channel();
+    let _ = Box::pin(handle_process_pending_commits_actor(
+        state,
+        deps,
+        commits_reply_tx,
+    ))
+    .await;
+
+    let _ = reply.send(Ok(true));
+    Outcome::ok_mutated(())
 }

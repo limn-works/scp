@@ -651,6 +651,68 @@ pub enum LifecycleCommand {
         /// Oneshot reply channel.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
+
+    /// Sweep: best-effort flush of THIS actor's snapshot to the configured
+    /// persistence provider.
+    ///
+    /// Dispatched per-actor by the supervisor's iterating sweep entry
+    /// point
+    /// [`lifecycle_helpers::flush_all_contexts`](crate::context::lifecycle_helpers::flush_all_contexts)
+    /// (and its sync wrapper). The supervisor iterates
+    /// `supervisor.actors` and sends one of these commands per actor;
+    /// each actor flushes its own state with no cross-actor lock.
+    ///
+    /// Mirrors the per-context body of the legacy
+    /// `flush_all_contexts_legacy` (which iterated the supervisor's
+    /// `contexts` DashMap and took a per-context lock with
+    /// [`FLUSH_LOCK_BUDGET`](crate::context::lifecycle_helpers::FLUSH_LOCK_BUDGET)).
+    /// The actor path needs no separate lock budget — the actor's own
+    /// dispatch loop serializes by construction, so the command sits in
+    /// the mailbox until the actor is idle. The handler builds a snapshot
+    /// from `&state` (and any broadcast context) and calls the
+    /// persistence provider directly.
+    ///
+    /// Reply replies `Ok(())` regardless of per-context persist outcome;
+    /// persist failures log via `tracing::warn!` inside the handler and
+    /// increment `crate::metrics::record_persistence_failure()` so the
+    /// legacy `_legacy` body's observable side effects are preserved.
+    FlushSnapshot {
+        /// Oneshot reply channel. Always replies `Ok(())` — best-effort
+        /// flush contract.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Sweep: shut down THIS actor's per-context resources (best-effort
+    /// local cleanup only).
+    ///
+    /// Dispatched per-actor by the supervisor's iterating sweep entry
+    /// points
+    /// [`lifecycle_helpers::shutdown_all_contexts`](crate::context::lifecycle_helpers::shutdown_all_contexts)
+    /// (and its sync wrapper). The supervisor iterates
+    /// `supervisor.actors` and sends one of these commands per actor.
+    ///
+    /// Mirrors the per-context body of the legacy
+    /// `shutdown_all_contexts_legacy`. Destroys per-context sender keys
+    /// + MLS groups + event logs in that order (zeroize secrets before
+    /// tearing down structure). Does NOT send leave messages or notify
+    /// remote peers — used by `scp_ffi_common::BridgeInstance::shutdown`
+    /// for process exit / test teardown.
+    ///
+    /// The handler operates on the actor's owned `&mut state` so the
+    /// secrets are zeroed in place. Supervisor-level state (standing
+    /// contexts, local DIDs, wrapping keys, task set) is cleared by the
+    /// supervisor's iterating entry point AFTER the per-actor commands
+    /// complete — that supervisor-scope cleanup is shared across
+    /// contexts and lives outside any single actor's responsibility.
+    ///
+    /// Reply replies `Ok(())` regardless of per-resource destroy
+    /// outcome; failures log via `tracing::debug!` (the resource may
+    /// already be gone) inside the handler.
+    ShutdownSelf {
+        /// Oneshot reply channel. Always replies `Ok(())` — best-effort
+        /// shutdown contract.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
 }
 
 /// Reply-channel type alias for
@@ -941,6 +1003,82 @@ pub enum GovernanceCommand {
         context_id: String,
         /// Oneshot reply channel. Carries the cleared fault marker.
         reply: oneshot::Sender<Result<crate::context::state::CommitFaultMarker, ContextError>>,
+    },
+
+    /// Sweep: evaluate consequence rules for THIS actor's context, applying
+    /// any triggered consequences (suspend / revoke / etc.) to membership.
+    ///
+    /// Dispatched per-actor by the supervisor's iterating sweep entry
+    /// point
+    /// [`governance_helpers::evaluate_periodic_consequences`](crate::context::governance_helpers::evaluate_periodic_consequences).
+    /// The supervisor iterates `supervisor.actors` and sends one of these
+    /// commands per actor; aggregate completion is implicit (the
+    /// iterator waits for each reply in turn).
+    ///
+    /// Mirrors the legacy
+    /// `evaluate_periodic_consequences_legacy` body (which iterated the
+    /// supervisor's `contexts` DashMap and operated on a single
+    /// context's state per call). The actor-shape handler operates on
+    /// `&mut PerContextState` for the SINGLE actor — sweep iteration
+    /// happens at the supervisor level.
+    ///
+    /// Reply replies `Ok(())` regardless of whether any consequences
+    /// fired; the legacy method has no error path (per-rule enforcement
+    /// failures log via `tracing::warn!` inside `enforce_triggered_consequences`).
+    EvaluatePeriodicConsequences {
+        /// Oneshot reply channel. Always replies `Ok(())` (matches the
+        /// legacy method's no-error contract).
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Sweep: process THIS actor's pending MLS commit retry queue (PR
+    /// #1606 C6).
+    ///
+    /// Dispatched per-actor by the supervisor's iterating sweep entry
+    /// point
+    /// [`governance_helpers::process_pending_commits`](crate::context::governance_helpers::process_pending_commits).
+    /// The supervisor iterates `supervisor.actors` and sends one of
+    /// these commands per actor.
+    ///
+    /// Mirrors the legacy `process_pending_commits_legacy` body.
+    /// Iterates `state.pending_commits`, retries any commits whose
+    /// `next_attempt_at <= now`, and either dequeues on success, updates
+    /// retry count on transient failure, or marks the context fail-
+    /// closed once the retry budget is exhausted. All transport sends
+    /// happen with the actor's state lock RELEASED (the actor's
+    /// `dispatch_state` arm releases its `&mut state` borrow for the
+    /// transport call by snapshotting + reacquiring; see the handler
+    /// for the phase split).
+    ///
+    /// Reply replies `Ok(())` regardless of per-commit outcomes; the
+    /// legacy method has no error path (per-commit failures log via
+    /// `tracing::warn!` and emit `CommitBroadcast*` receive-buffer
+    /// events).
+    ProcessPendingCommits {
+        /// Oneshot reply channel. Always replies `Ok(())` (matches the
+        /// legacy method's no-error contract).
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Sweep: run one tick of the governance timeout / consequence
+    /// pipeline for THIS actor's context. Mirrors the per-context body of
+    /// `start_governance_timeout_task_legacy` (Phase 1 through Phase 5).
+    ///
+    /// Dispatched per-actor by the supervisor's iterating sweep entry
+    /// point
+    /// [`governance_helpers::start_governance_timeout_task`](crate::context::governance_helpers::start_governance_timeout_task)
+    /// which still owns timer spawn (the per-actor governance-timeout
+    /// task lands in Phase 2B per ADR-049). For now, the spawn-time
+    /// closure dispatches this command on each tick instead of
+    /// reaching into the supervisor's `contexts` DashMap directly.
+    ///
+    /// Reply carries `Ok(continue_loop)` — `true` to keep ticking,
+    /// `false` to stop (context closing or removed). Matches the
+    /// legacy timer closure's `bool` return.
+    EvaluateTimeouts {
+        /// Oneshot reply channel. `Ok(true)` continues the timer loop;
+        /// `Ok(false)` stops it.
+        reply: oneshot::Sender<Result<bool, ContextError>>,
     },
 }
 

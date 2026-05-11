@@ -946,6 +946,20 @@ impl ContextActor {
                 reply,
                 "lifecycle::restore_context_access_key (use Supervisor::dispatch_lifecycle_command during commits 9-11)",
             ),
+            // Sweep variants — the skeleton dispatch is the legacy
+            // mailbox-test stub; real sweep dispatch goes via
+            // `handlers::lifecycle::dispatch` against an actor's owned
+            // `&mut state`. The skeleton path returns NotImplemented so
+            // a misrouted sweep surfaces a typed error rather than
+            // silently completing.
+            LifecycleCommand::FlushSnapshot { reply } => ack_not_impl(
+                reply,
+                "lifecycle::flush_snapshot (sweep — use lifecycle_helpers::flush_all_contexts iterator)",
+            ),
+            LifecycleCommand::ShutdownSelf { reply } => ack_not_impl(
+                reply,
+                "lifecycle::shutdown_self (sweep — use lifecycle_helpers::shutdown_all_contexts iterator)",
+            ),
         }
     }
 
@@ -1023,6 +1037,24 @@ impl ContextActor {
             GovernanceCommand::AcknowledgeCommitFault { reply, .. } => ack_not_impl(
                 reply,
                 "governance::acknowledge_commit_fault (use Supervisor::dispatch_governance_command during commits 10-11)",
+            ),
+            // Sweep variants — the skeleton dispatch is the legacy
+            // mailbox-test stub; real sweep dispatch goes via
+            // `handlers::governance::dispatch` against an actor's owned
+            // `&mut state`. The skeleton path returns NotImplemented so
+            // a misrouted sweep surfaces a typed error rather than
+            // silently completing.
+            GovernanceCommand::EvaluatePeriodicConsequences { reply } => ack_not_impl(
+                reply,
+                "governance::evaluate_periodic_consequences (sweep — use governance_helpers::evaluate_periodic_consequences iterator)",
+            ),
+            GovernanceCommand::ProcessPendingCommits { reply } => ack_not_impl(
+                reply,
+                "governance::process_pending_commits (sweep — use governance_helpers::process_pending_commits iterator)",
+            ),
+            GovernanceCommand::EvaluateTimeouts { reply } => ack_not_impl(
+                reply,
+                "governance::evaluate_timeouts (sweep — use governance_helpers::start_governance_timeout_task iterator)",
             ),
         }
     }

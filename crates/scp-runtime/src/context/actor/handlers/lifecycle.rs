@@ -200,6 +200,10 @@ async fn dispatch_actor_inner(
             &caller_did,
             reply,
         ),
+        LifecycleCommand::FlushSnapshot { reply } => {
+            handle_flush_snapshot_actor(state, deps, reply)
+        }
+        LifecycleCommand::ShutdownSelf { reply } => handle_shutdown_self_actor(state, deps, reply),
     }
 }
 
@@ -447,4 +451,129 @@ fn reply_not_implemented(reply: oneshot::Sender<Result<(), ContextError>>) -> Ou
                        ADR-049";
     let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
     Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
+}
+
+// ---------------------------------------------------------------------------
+// Sweep handlers (Phase 2A finalization — sweep helper relocation)
+// ---------------------------------------------------------------------------
+
+/// Handle [`LifecycleCommand::FlushSnapshot`] (actor-shape).
+///
+/// Per-actor body of the relocated sweep. Builds a snapshot from
+/// `&state`, exports the MLS crypto state via `deps.crypto`, and
+/// persists both the context snapshot and any broadcast-context
+/// snapshot via `deps.persistence`. Mirrors the per-context body of
+/// `flush_all_contexts_legacy` (which iterated `Supervisor::contexts`).
+///
+/// Best-effort: persist failures log via `tracing::warn!` and
+/// increment `crate::metrics::record_persistence_failure()`; the
+/// reply oneshot always carries `Ok(())`.
+fn handle_flush_snapshot_actor(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    use crate::context::state::context_id_to_bytes;
+
+    let context_id = state.handle.context_id().to_owned();
+    let mut snapshot = crate::context::manager_methods::snapshot_context(state);
+    // Export MLS crypto state alongside the context snapshot (#645).
+    // On export failure, mark snapshot needs_reconnect=true and persist
+    // an empty crypto blob (AC3 bug 2 — same contract as
+    // manager_methods::persist_context_snapshot).
+    let ctx_id_bytes = context_id_to_bytes(&context_id);
+    match deps.crypto.export_crypto_state(&ctx_id_bytes) {
+        Ok(crypto_state) => snapshot.mls_crypto_state = crypto_state,
+        Err(e) => {
+            snapshot.needs_reconnect = true;
+            snapshot.mls_crypto_state = Vec::new();
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to export MLS crypto state for persistence; \
+                 snapshot marked needs_reconnect=true so restore \
+                 fires the §23.11 reconnection pipeline"
+            );
+        }
+    }
+    if let Err(e) = deps.persistence.persist_context(&context_id, &snapshot) {
+        crate::metrics::record_persistence_failure();
+        tracing::warn!(
+            context_id = %context_id,
+            error = %e,
+            "failed to persist context snapshot"
+        );
+    }
+    // Broadcast snapshot (no-op if not a broadcast context).
+    if let Some(ref bc) = state.broadcast_context {
+        let bc_snapshot = scp_protocol::context::broadcast::BroadcastContext::to_snapshot(bc);
+        if let Err(e) = deps
+            .persistence
+            .persist_broadcast(&context_id, &bc_snapshot)
+        {
+            tracing::warn!(
+                context_id = %context_id,
+                error = %e,
+                "failed to persist broadcast snapshot"
+            );
+        }
+    }
+    let _ = reply.send(Ok(()));
+    Outcome::ok(())
+}
+
+/// Handle [`LifecycleCommand::ShutdownSelf`] (actor-shape).
+///
+/// Per-actor body of the relocated sweep. Destroys this actor's
+/// per-context sender keys + MLS group + event log (in that order so
+/// secrets zeroize before structure tears down). Mirrors the
+/// per-context body of `shutdown_all_contexts_legacy`.
+///
+/// Best-effort: each destroy failure logs via `tracing::debug!` (the
+/// resource may already be gone, e.g., the actor is being shutdown
+/// twice) and the reply oneshot always carries `Ok(())`.
+///
+/// Supervisor-level cleanup (standing contexts, local DIDs, wrapping
+/// keys, task set) is the iterating entry point's responsibility —
+/// each actor only owns its own per-context resources.
+fn handle_shutdown_self_actor(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    use crate::context::state::context_id_to_bytes;
+
+    let context_id = state.handle.context_id().to_owned();
+    let ctx_id_bytes = context_id_to_bytes(&context_id);
+
+    if let Err(e) = deps.crypto.destroy_sender_key(&ctx_id_bytes) {
+        tracing::debug!(
+            context_id = %context_id,
+            error = %e,
+            "failed to destroy sender key during shutdown — may already be gone"
+        );
+    }
+    if let Err(e) = deps.crypto.destroy_mls_group(&ctx_id_bytes) {
+        tracing::debug!(
+            context_id = %context_id,
+            error = %e,
+            "failed to destroy MLS group during shutdown — may already be gone"
+        );
+    }
+    if let Err(e) = deps.event_log.destroy_event_log(&ctx_id_bytes) {
+        tracing::debug!(
+            context_id = %context_id,
+            error = %e,
+            "failed to destroy event log during shutdown — may already be gone"
+        );
+    }
+    // Cancel any per-actor background tasks (TTL timer + governance
+    // timeout). These hold task handles inside `state` directly;
+    // cancelling them here mirrors the legacy `_legacy` body's
+    // `task_set.abort_all()` except scoped to this actor's tasks
+    // rather than the supervisor's global set.
+    state.ttl.timer.cancel();
+    state.governance.timeout_task.cancel();
+    let _ = reply.send(Ok(()));
+    Outcome::ok_mutated(())
 }
