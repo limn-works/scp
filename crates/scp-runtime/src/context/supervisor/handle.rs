@@ -506,6 +506,42 @@ impl SupervisorHandle {
             .await
     }
 
+    /// Spawn a per-context `ContextActor` that proxies its state through
+    /// the legacy `Supervisor::contexts` DashMap entry (ADR-049 Phase 2A
+    /// finalization bootstrap dual-write).
+    ///
+    /// Capability-reduced wrapper around
+    /// [`Supervisor::spawn_actor_dashmap_backed`](crate::context::supervisor::Supervisor::spawn_actor_dashmap_backed).
+    /// The lifecycle bootstrap in [`crate::context::lifecycle_helpers`]
+    /// calls this after [`Self::insert_context`] / [`Self::replace_context`]
+    /// stamps the DashMap entry — every production context construction
+    /// thus populates BOTH the legacy contexts DashMap AND the actor
+    /// registry. Subsequent finalization sessions delete the legacy
+    /// DashMap once every consumer is ported.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if the bootstrap caller
+    ///   did not first insert / replace the per-context state in the
+    ///   supervisor's DashMap.
+    ///
+    /// # Visibility
+    ///
+    /// `pub(in crate::context)` — only lifecycle bootstrap reaches this.
+    /// The returned `ContextActorHandle` is dropped by the bootstrap
+    /// caller (the registration in `Supervisor::actors` keeps the
+    /// actor's mailbox alive for the lifetime of the context).
+    #[allow(private_interfaces, dead_code)]
+    pub(in crate::context) async fn spawn_actor_for_context(
+        &self,
+        context_id: String,
+        deps: crate::context::actor::deps::ActorDeps,
+    ) -> Result<crate::context::actor::handle::ContextActorHandle, ContextError> {
+        self.supervisor
+            .spawn_actor_dashmap_backed(context_id, deps, None)
+            .await
+    }
+
     /// Despawn the actor registered for `context_id`, removing the
     /// entry from `Supervisor::actors` under the supervisor's
     /// `write_lock` so concurrent registrations cannot race.

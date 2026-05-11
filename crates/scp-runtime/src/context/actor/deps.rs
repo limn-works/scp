@@ -204,6 +204,44 @@ pub struct ActorDeps {
     pub local_dids: Arc<ArcSwap<HashSet<DID>>>,
 }
 
+impl ActorDeps {
+    /// Build a fresh [`ActorDeps`] bundle by cloning every field of
+    /// `self` (ADR-049 Phase 2A finalization bootstrap dual-write).
+    ///
+    /// The bundle is intentionally not `Clone` (single-owner ownership
+    /// discipline — see the type-level doc) but every field is an
+    /// `Arc`-like clone-cheap handle. The lifecycle bootstrap calls
+    /// this when it needs to keep its own `&ActorDeps` borrow while
+    /// also handing an owned `ActorDeps` to the actor task spawned for
+    /// the freshly-registered context.
+    ///
+    /// # Visibility
+    ///
+    /// `pub(in crate::context)` — only lifecycle bootstrap calls this.
+    /// External crates and FFI bridges never construct or duplicate
+    /// `ActorDeps`.
+    #[must_use]
+    #[allow(dead_code)] // first production caller lands with the bootstrap wiring in this PR
+    pub(in crate::context) fn clone_for_spawn(&self) -> Self {
+        Self {
+            crypto: Arc::clone(&self.crypto),
+            transport: Arc::clone(&self.transport),
+            persistence: Arc::clone(&self.persistence),
+            event_log: Arc::clone(&self.event_log),
+            supervisor: self.supervisor.clone(),
+            key_package_store: self.key_package_store.clone(),
+            mls: Arc::clone(&self.mls),
+            hpke: Arc::clone(&self.hpke),
+            mls_storage: Arc::clone(&self.mls_storage),
+            clock: Arc::clone(&self.clock),
+            event_tx: self.event_tx.clone(),
+            key_resolver: Arc::clone(&self.key_resolver),
+            payment_adapter: self.payment_adapter.as_ref().map(Arc::clone),
+            local_dids: Arc::clone(&self.local_dids),
+        }
+    }
+}
+
 // Compile-time witness that `ActorDeps` is `Send + Sync` — the bundle
 // is moved into a `tokio::spawn`'d task.
 const fn _assert_send_sync() {

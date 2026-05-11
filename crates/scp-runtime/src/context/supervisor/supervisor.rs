@@ -1535,6 +1535,75 @@ impl Supervisor {
         handle
     }
 
+    /// Spawn a `ContextActor` that proxies its state through the legacy
+    /// [`Self::contexts`] DashMap entry for `context_id` (ADR-049
+    /// Phase 2A finalization bootstrap dual-write).
+    ///
+    /// Looks up the `Arc<tokio::sync::Mutex<PerContextState>>` already
+    /// registered by [`crate::context::manager_methods::insert_context`]
+    /// / [`crate::context::supervisor::handle::SupervisorHandle::replace_context`],
+    /// hands it to
+    /// [`crate::context::actor::ContextActor::new_dashmap_backed`], and
+    /// registers the resulting [`ContextActorHandle`] in
+    /// [`Self::actors`] under [`Self::write_lock`] so the registration
+    /// is atomic with respect to other spawn / despawn writers.
+    ///
+    /// During the dual-write window the actor does NOT own a fresh
+    /// `PerContextState` payload: the per-context state lives once, in
+    /// the DashMap, and the actor proxies every command through that
+    /// `Arc<Mutex<...>>`. Subsequent finalization sessions delete the
+    /// DashMap entirely; at that point the bootstrap path switches to
+    /// [`Self::spawn_actor_with_state`] (owned state).
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] if no DashMap entry
+    ///   exists for `context_id` — the bootstrap caller must have
+    ///   completed the legacy insert / replace before invoking this
+    ///   method.
+    ///
+    /// # Visibility
+    ///
+    /// `pub(in crate::context)` — only the lifecycle bootstrap in
+    /// [`crate::context::lifecycle_helpers`] reaches this, via the
+    /// capability-reduced
+    /// [`crate::context::supervisor::handle::SupervisorHandle::spawn_actor_for_context`]
+    /// wrapper.
+    #[allow(dead_code)] // first production caller lands with the bootstrap wiring in this PR
+    pub(in crate::context) async fn spawn_actor_dashmap_backed(
+        &self,
+        context_id: String,
+        deps: crate::context::actor::deps::ActorDeps,
+        mailbox_capacity: Option<usize>,
+    ) -> Result<ContextActorHandle, ContextError> {
+        // Resolve the per-context state Arc through the existing
+        // manager-methods lookup — that path returns the same error
+        // surface (`ContextNotRegistered`) callers already handle.
+        let state_arc = crate::context::manager_methods::get_context_arc(self, &context_id)?;
+
+        let capacity = mailbox_capacity.unwrap_or(ACTOR_MAILBOX_CAPACITY);
+        let (tx, rx) = tokio::sync::mpsc::channel::<ContextCommand>(capacity);
+
+        let handle = ContextActorHandle::from_sender(tx);
+        {
+            let _guard = self.write_lock.lock().await;
+            self.actors.insert(context_id.clone(), handle.clone());
+        }
+
+        let inbox = rx;
+        tokio::spawn(async move {
+            Box::pin(
+                crate::context::actor::ContextActor::new_dashmap_backed(
+                    context_id, deps, state_arc, inbox,
+                )
+                .run(),
+            )
+            .await;
+        });
+
+        Ok(handle)
+    }
+
     /// Despawn the actor registered for `context_id`, removing the
     /// entry from [`Self::actors`] under the supervisor's
     /// [`Self::write_lock`] so a concurrent re-registration cannot

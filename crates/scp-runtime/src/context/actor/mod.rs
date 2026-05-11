@@ -178,6 +178,24 @@ pub struct ContextActor {
     /// the actor's terminal-NotImplemented fallback because they have
     /// no state/deps to operate on).
     shim_supervisor: Option<Arc<crate::context::supervisor::Supervisor>>,
+    /// **Dual-write transition mode (ADR-049 Phase 2A finalization).**
+    /// When `Some`, the actor does not own its `PerContextState` directly;
+    /// instead it proxies every command through this `Arc<Mutex<...>>`
+    /// pulled from `Supervisor::contexts` at spawn time. The bootstrap
+    /// path (`create_context` / `restore_context` / `import_context` in
+    /// `lifecycle_helpers.rs`) inserts the state into the legacy DashMap
+    /// via `insert_context` / `replace_context`, then spawns the actor
+    /// in this mode pointing at the same `Arc`.
+    ///
+    /// This is mutually exclusive with [`Self::state`] / [`Self::deps`]
+    /// being `Some` — the dual-write actor leaves those `None` (its
+    /// `dispatch` branch locks `state_arc` per command instead of
+    /// take-and-restore).
+    ///
+    /// Subsequent finalization sessions delete the DashMap entirely; at
+    /// that point `state_arc` goes away and the actor reverts to owned
+    /// state via [`Self::new`].
+    state_arc: Option<Arc<tokio::sync::Mutex<state::PerContextState>>>,
 }
 
 impl ContextActor {
@@ -236,6 +254,52 @@ impl ContextActor {
             last_persisted_at: Instant::now(),
             dirty: false,
             shim_supervisor,
+            state_arc: None,
+        }
+    }
+
+    /// Construct an actor that proxies its state through the
+    /// supervisor's legacy [`Supervisor::contexts`] DashMap entry, owning
+    /// only [`ActorDeps`] (ADR-049 Phase 2A finalization bootstrap
+    /// dual-write).
+    ///
+    /// `state_arc` is the [`Arc<tokio::sync::Mutex<PerContextState>>`]
+    /// already registered in the supervisor's contexts map by the
+    /// lifecycle bootstrap path (`insert_context` / `replace_context`).
+    /// Every command this actor dispatches locks `state_arc` for the
+    /// duration of the handler, mirroring the contract that the legacy
+    /// shim's `Supervisor::dispatch_command` upheld.
+    ///
+    /// The actor does NOT own a `PerContextState` value during the
+    /// dual-write window — the DashMap is the single canonical store.
+    /// Subsequent finalization sessions delete the DashMap and switch
+    /// to [`Self::new`] (owned-state) for every bootstrap call.
+    ///
+    /// `context_id` is the hex-encoded 32-byte context ID (the same
+    /// string the supervisor's actor / contexts maps use as a key).
+    #[allow(dead_code)] // first production caller lands with the bootstrap wiring in this PR
+    pub(in crate::context) fn new_dashmap_backed(
+        context_id: String,
+        deps: deps::ActorDeps,
+        state_arc: Arc<tokio::sync::Mutex<state::PerContextState>>,
+        inbox: mpsc::Receiver<ContextCommand>,
+    ) -> Self {
+        let shim_supervisor = Some(deps.supervisor.shim_supervisor());
+        Self {
+            context_id,
+            inbox,
+            // Dual-write mode: the per-context state lives in `state_arc`,
+            // not in `state` / `deps`. The dispatch branch in
+            // [`Self::dispatch`] locks `state_arc` per command instead of
+            // the take-and-restore path used for owned-state actors.
+            state: None,
+            deps: Some(deps),
+            ttl_timer: None,
+            governance_timeout: None,
+            last_persisted_at: Instant::now(),
+            dirty: false,
+            shim_supervisor,
+            state_arc: Some(state_arc),
         }
     }
 
@@ -281,6 +345,7 @@ impl ContextActor {
             last_persisted_at: Instant::now(),
             dirty: false,
             shim_supervisor: None,
+            state_arc: None,
         }
     }
 
@@ -398,6 +463,26 @@ impl ContextActor {
     /// `skeleton_dispatch` and ACK every variant with
     /// `NotImplemented`.
     async fn dispatch(&mut self, cmd: ContextCommand) {
+        // Dual-write transition path (ADR-049 Phase 2A finalization
+        // bootstrap dual-write): the actor proxies a `PerContextState`
+        // that still lives in `Supervisor::contexts`. Lock the per-
+        // context mutex for the duration of the handler and run the
+        // same `dispatch_state` body the owned-state path uses.
+        if let Some(state_arc) = self.state_arc.clone() {
+            #[allow(clippy::expect_used)]
+            let deps = self
+                .deps
+                .as_ref()
+                .expect("dashmap-backed actor lost deps — invariant violation");
+            let mut guard = state_arc.lock().await;
+            let outcome = Self::dispatch_state(&mut guard, deps, cmd).await;
+            drop(guard);
+            if outcome.mutated {
+                self.dirty = true;
+            }
+            return;
+        }
+
         // Skeleton path: no state, no deps. Fall through to the
         // synchronous ACK helper that replies `NotImplemented` to every
         // variant. Used by the pre-Phase-2A test fixtures.
