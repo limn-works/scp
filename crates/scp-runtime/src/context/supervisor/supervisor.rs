@@ -2242,20 +2242,47 @@ impl Supervisor {
         crate::context::lifecycle_helpers_legacy::restore_all_contexts_legacy(self).await
     }
 
-    /// Passthrough to
-    /// [`crate::context::lifecycle_helpers::restore_context`] — used by
-    /// FFI integration tests that restore individual contexts.
+    /// Restore a single previously-persisted context from storage via
+    /// the actor mailbox.
+    ///
+    /// Builds a [`LifecycleCommand::RestoreContext`] with an embedded
+    /// reply oneshot. Note: `context_id` and `handle.context_id()` must
+    /// agree (the legacy helper carries both for historical reasons);
+    /// the command payload uses `handle.context_id()`, and a caller-
+    /// supplied `context_id` argument that does not match is ignored.
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] from the helper.
+    /// Propagates [`ContextError`] from the handler.
     pub async fn restore_context(
         &self,
         context_id: &str,
         handle: &crate::context::ContextHandle,
     ) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers_legacy::restore_context_legacy(self, context_id, handle)
-            .await
+        // The legacy method takes both `context_id` and `handle`
+        // because the original helper signature predates `ContextHandle`
+        // exposing its own `context_id()` accessor. The boxed payload
+        // here is built from the handle (the authoritative source); the
+        // separate `context_id` parameter is retained on the signature
+        // for caller compatibility and silently overridden when the two
+        // disagree.
+        debug_assert_eq!(
+            context_id,
+            handle.context_id(),
+            "Supervisor::restore_context — context_id argument must match handle.context_id()"
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let payload = Box::new(crate::context::actor::commands::RestoreContextPayload {
+            context_id: handle.context_id().to_owned(),
+            params: handle.params().clone(),
+        });
+        let cmd = LifecycleCommand::RestoreContext { payload, reply: tx };
+        self.dispatch_lifecycle_command(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::restore_context — actor reply channel closed".to_owned(),
+            )
+        })?
     }
 
     /// Best-effort flush of every context's snapshot to the configured
@@ -2553,15 +2580,25 @@ impl Supervisor {
         .await
     }
 
-    /// Passthrough to
-    /// [`crate::context::lifecycle_helpers::create_context`] — used by
-    /// FFI integration tests that need to bypass the full bridge
-    /// lifecycle entry points.
+    /// Create a new MLS-backed (or broadcast-mode) context via the
+    /// actor mailbox.
+    ///
+    /// Builds a [`LifecycleCommand::CreateContext`] with an embedded
+    /// reply oneshot, enqueues it via
+    /// [`Self::dispatch_lifecycle_command`], and awaits the typed
+    /// reply. The dispatch helper routes through the per-context actor
+    /// mailbox once an actor is registered; on first creation the
+    /// `lookup` lookup returns `None` and the dispatch falls through to
+    /// the direct-shim path that spawns the actor as part of the
+    /// create handshake.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextCreationError`](scp_protocol::context::builder::ContextCreationError) if the
-    /// supervisor's providers are not wired or context creation fails.
+    /// Returns
+    /// [`ContextCreationError`](scp_protocol::context::builder::ContextCreationError)
+    /// if the supervisor's providers are not wired or context creation
+    /// fails. A dropped reply channel maps to
+    /// [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed).
     pub async fn create_context(
         &self,
         context_id: String,
@@ -2570,23 +2607,43 @@ impl Supervisor {
         local_pseudonym: Option<[u8; 32]>,
     ) -> Result<crate::context::ContextHandle, scp_protocol::context::builder::ContextCreationError>
     {
-        crate::context::lifecycle_helpers_legacy::create_context_legacy(
-            self,
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let payload = Box::new(crate::context::actor::commands::CreateContextPayload {
             context_id,
             params,
             creator_did,
             local_pseudonym,
-        )
-        .await
+        });
+        let cmd = LifecycleCommand::CreateContext { payload, reply: tx };
+        if let Err(e) = self.dispatch_lifecycle_command(cmd).await {
+            return Err(
+                scp_protocol::context::builder::ContextCreationError::CreationFailed(format!(
+                    "Supervisor::create_context — dispatch failed: {e}"
+                )),
+            );
+        }
+        match rx.await {
+            Ok(result) => result,
+            Err(_) => Err(
+                scp_protocol::context::builder::ContextCreationError::CreationFailed(
+                    "Supervisor::create_context — actor reply channel closed".to_owned(),
+                ),
+            ),
+        }
     }
 
-    /// Passthrough to
-    /// [`crate::context::lifecycle_helpers::join_context`] — adds a new
-    /// member to an existing context via the helper.
+    /// Adds a new member to an existing context via the actor mailbox.
+    ///
+    /// Builds a [`LifecycleCommand::JoinContext`] with an embedded
+    /// reply oneshot, enqueues it via
+    /// [`Self::dispatch_lifecycle_command`], and awaits the actor's
+    /// typed reply. The dispatch helper routes through the per-context
+    /// actor mailbox once one is registered; before that the direct-
+    /// shim path completes the join handshake and spawns the actor.
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] from the helper.
+    /// Propagates [`ContextError`] from the handler.
     pub async fn join_context(
         &self,
         handle: &crate::context::ContextHandle,
@@ -2594,33 +2651,53 @@ impl Supervisor {
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
         local_pseudonym: Option<[u8; 32]>,
     ) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers_legacy::join_context_legacy(
-            self,
-            handle,
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let payload = Box::new(crate::context::actor::commands::JoinContextPayload {
+            context_id: handle.context_id().to_owned(),
+            params: handle.params().clone(),
             key_package,
-            spending_ucan,
+            spending_ucan: spending_ucan.cloned(),
             local_pseudonym,
-        )
-        .await
+        });
+        let cmd = LifecycleCommand::JoinContext { payload, reply: tx };
+        self.dispatch_lifecycle_command(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::join_context — actor reply channel closed".to_owned(),
+            )
+        })?
     }
 
-    /// Passthrough to
-    /// [`crate::context::lifecycle_helpers::leave_context`] — removes a
-    /// member from an existing context via the helper.
+    /// Removes a member from an existing context via the actor mailbox.
+    ///
+    /// Builds a [`LifecycleCommand::LeaveContext`] with an embedded
+    /// reply oneshot, enqueues it via
+    /// [`Self::dispatch_lifecycle_command`], and awaits the typed
+    /// reply.
     ///
     /// # Errors
     ///
-    /// Propagates [`ContextError`] from the helper.
+    /// Propagates [`ContextError`] from the handler.
     pub async fn leave_context(
         &self,
         handle: &crate::context::ContextHandle,
         caller_did: &DID,
         member_did: &DID,
     ) -> Result<(), ContextError> {
-        crate::context::lifecycle_helpers_legacy::leave_context_legacy(
-            self, handle, caller_did, member_did,
-        )
-        .await
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let payload = Box::new(crate::context::actor::commands::LeaveContextPayload {
+            context_id: handle.context_id().to_owned(),
+            params: handle.params().clone(),
+            caller_did: caller_did.clone(),
+            member_did: member_did.clone(),
+        });
+        let cmd = LifecycleCommand::LeaveContext { payload, reply: tx };
+        self.dispatch_lifecycle_command(cmd).await?;
+        rx.await.map_err(|_| {
+            ContextError::TransportFailed(
+                "Supervisor::leave_context — actor reply channel closed".to_owned(),
+            )
+        })?
     }
 
     /// Encrypts and broadcasts a payload through the context's MLS
@@ -2951,13 +3028,25 @@ impl Supervisor {
     }
 
     /// Extract the target context_id from a [`LifecycleCommand`].
-    /// Returns `None` for variants that do not carry one (Placeholder)
-    /// or carry it inside an opaque payload (CreateContext / JoinContext /
-    /// ImportContext / RestoreContext — the boxed payload's inner field
-    /// is not visible without unboxing). Used by
-    /// [`Self::dispatch_lifecycle_command`] to decide whether to route
-    /// through an actor's mailbox.
-    const fn lifecycle_command_context_id(cmd: &LifecycleCommand) -> Option<&str> {
+    ///
+    /// Returns `None` for [`LifecycleCommand::Placeholder`] (no target)
+    /// and [`LifecycleCommand::ImportContext`] (the export envelope
+    /// carries the canonical 32-byte hash, not a string context_id —
+    /// the legacy `import_context` derives the string from the
+    /// envelope's params; until the lifecycle handler is rewritten to
+    /// surface that derivation here, ImportContext routes through the
+    /// direct-shim path so the legacy method can do the derivation).
+    ///
+    /// Every other variant — including the boxed-payload variants
+    /// `CreateContext`, `JoinContext`, `LeaveContext`, `CloseContext`,
+    /// `RestoreContext` — destructures the payload to surface its
+    /// `context_id`. For `CreateContext` / `JoinContext` /
+    /// `RestoreContext` the actor may not yet exist (the context is
+    /// being bootstrapped), in which case [`Self::lookup`] returns
+    /// `None` and the dispatch helper falls through to the direct-shim
+    /// path that spawns the actor as part of the create / join /
+    /// restore handshake.
+    fn lifecycle_command_context_id(cmd: &LifecycleCommand) -> Option<&str> {
         match cmd {
             LifecycleCommand::ExportContext { context_id, .. }
             | LifecycleCommand::GenerateContextAccessKey { context_id, .. }
@@ -2965,13 +3054,18 @@ impl Supervisor {
             | LifecycleCommand::RestoreContextAccessKey { context_id, .. } => {
                 Some(context_id.as_str())
             }
-            // CreateContext / JoinContext / ImportContext / RestoreContext
-            // / LeaveContext / CloseContext / Placeholder either operate on
-            // a context that does not yet exist or carry their context_id
-            // inside a boxed payload not destructured here. Mailbox
-            // routing for these would require unboxing; for Phase 2A they
-            // continue through the direct-shim path.
-            _ => None,
+            LifecycleCommand::CreateContext { payload, .. } => Some(payload.context_id.as_str()),
+            LifecycleCommand::JoinContext { payload, .. } => Some(payload.context_id.as_str()),
+            LifecycleCommand::LeaveContext { payload, .. } => Some(payload.context_id.as_str()),
+            LifecycleCommand::CloseContext { payload, .. } => Some(payload.context_id.as_str()),
+            LifecycleCommand::RestoreContext { payload, .. } => Some(payload.context_id.as_str()),
+            // ImportContext carries no string context_id — the legacy
+            // `import_context` helper derives it from the envelope's
+            // params. The dispatch helper routes ImportContext through
+            // the direct-shim path until the lifecycle handler is
+            // rewritten to surface that derivation. Placeholder has no
+            // target at all.
+            LifecycleCommand::ImportContext { .. } | LifecycleCommand::Placeholder { .. } => None,
         }
     }
 
