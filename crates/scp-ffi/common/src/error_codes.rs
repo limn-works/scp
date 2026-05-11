@@ -121,6 +121,34 @@ pub const IDENT_1045: &str = "SCP-IDENT-1045";
 /// `SCP`-bound closure.
 pub const IDENT_1046: &str = "SCP-IDENT-1046";
 
+// -----------------------------------------------------------------------
+// Pre-rotation custody errors (one code per PreRotationCustodyError variant)
+//
+// Surfaced when `IdentityError::PreRotation(_)` crosses the FFI boundary.
+// SDK consumers can match on `.code` to distinguish a missing handle from
+// a substrate-unavailable backend, a user-declined biometric, an internal
+// storage error, a callback malformation, or a commitment-integrity
+// failure — without string-matching the message body.
+// -----------------------------------------------------------------------
+
+/// Pre-rotation custody handle not found in the backing store.
+pub const IDENT_1047: &str = "SCP-IDENT-1047";
+/// Pre-rotation custody substrate temporarily unavailable
+/// (hardware not connected, network unreachable, etc.).
+pub const IDENT_1048: &str = "SCP-IDENT-1048";
+/// Pre-rotation custody operation declined by user (biometric refusal,
+/// passkey cancellation, etc.).
+pub const IDENT_1049: &str = "SCP-IDENT-1049";
+/// Pre-rotation custody internal storage error.
+pub const IDENT_1050: &str = "SCP-IDENT-1050";
+/// Pre-rotation custody callback returned an invalid response
+/// (malformed handle, length mismatch, schema violation, etc.).
+pub const IDENT_1051: &str = "SCP-IDENT-1051";
+/// Pre-rotation custody commitment-integrity failure: revealed public key
+/// did not match the stored commitment. Indicates a substrate-level
+/// tampering or corruption event.
+pub const IDENT_1052: &str = "SCP-IDENT-1052";
+
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)
 // -------------------------------------------------------------------------

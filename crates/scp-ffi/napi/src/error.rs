@@ -125,6 +125,24 @@ impl From<ScpNapiError> for napi::Error {
 
 impl From<scp_identity::IdentityError> for ScpNapiError {
     fn from(e: scp_identity::IdentityError) -> Self {
+        use scp_identity::IdentityError as IE;
+        use scp_platform::PreRotationCustodyError as PE;
+
+        if let IE::PreRotation(pre_err) = &e {
+            let code = match pre_err {
+                PE::HandleNotFound => codes::IDENT_1047,
+                PE::Unavailable(_) => codes::IDENT_1048,
+                PE::UserDeclined => codes::IDENT_1049,
+                PE::Storage(_) => codes::IDENT_1050,
+                PE::InvalidCallbackResponse(_) => codes::IDENT_1051,
+                PE::CommitmentMismatch => codes::IDENT_1052,
+            };
+            return Self::Identity {
+                message: format!("{e}"),
+                code: code.to_owned(),
+            };
+        }
+
         Self::Identity {
             message: format!(
                 "{e} — check DID format, key custody configuration, or DHT connectivity"
