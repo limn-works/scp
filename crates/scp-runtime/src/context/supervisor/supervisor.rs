@@ -1620,14 +1620,128 @@ impl Supervisor {
         &self,
         cmd: StandingCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 Phase 2A item 5 — try the actor mailbox first.
+        // ADR-049 Phase 2A finalization — try the actor mailbox first
+        // for variants whose `(local_did, peer_did)` deterministically
+        // maps to an existing per-context actor. Variants that don't
+        // carry both DIDs (count / has / register / reconnect-all) are
+        // supervisor-scoped and route directly through the
+        // [`Supervisor`] standing-index methods below.
         if let Some(ctx_id) = Self::standing_command_context_id(&cmd)
-            && let Some(actor) = self.lookup(ctx_id)
+            && let Some(actor) = self.lookup(&ctx_id)
         {
             return Self::dispatch_via_mailbox(&actor, ContextCommand::Standing(cmd)).await;
         }
-        // Direct-shim fallback.
-        Ok(Box::pin(handlers::standing::dispatch_from_shim(self, cmd)).await)
+        // Direct supervisor-scoped dispatch. No shim — every variant is
+        // handled inline via the supervisor's standing-index methods
+        // (`standing_context_legacy` / `reconnect_all_standing_legacy`
+        // remain as production survivors).
+        Ok(Box::pin(self.dispatch_standing_direct(cmd)).await)
+    }
+
+    /// Direct supervisor-scoped dispatch for [`StandingCommand`]
+    /// variants that have no per-context actor target (or whose actor
+    /// is not yet spawned — the `StandingContext` get-or-create path
+    /// creates the underlying context on first call).
+    ///
+    /// Each arm wraps a supervisor-scoped operation in a 30s timeout
+    /// budget matching the actor-handler shape (plan §"Transport
+    /// timeouts inside actor handlers"). Reply channels carry the typed
+    /// per-variant result.
+    async fn dispatch_standing_direct(&self, cmd: StandingCommand) -> Outcome<()> {
+        use crate::context::standing_helpers_legacy;
+        const STANDING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+        match cmd {
+            StandingCommand::Placeholder { reply } => {
+                const MSG: &str =
+                    "StandingCommand::Placeholder — handshake target; no production work";
+                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
+                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
+            }
+            StandingCommand::StandingContext {
+                local_did,
+                peer_did,
+                reply,
+            } => {
+                let fut =
+                    standing_helpers_legacy::standing_context_legacy(self, &local_did, &peer_did);
+                let (outcome, reply_result) =
+                    match tokio::time::timeout(STANDING_TIMEOUT, fut).await {
+                        Ok(Ok(ctx_id)) => (Outcome::ok_mutated(()), Ok(ctx_id)),
+                        Ok(Err(e)) => (
+                            Outcome::err_mutated(standing_outcome_error_sketch(&e)),
+                            Err(e),
+                        ),
+                        Err(_elapsed) => {
+                            let err = ContextError::TransportTimeout(format!(
+                                "standing_context exceeded {STANDING_TIMEOUT:?} budget"
+                            ));
+                            (
+                                Outcome::err_mutated(standing_outcome_error_sketch(&err)),
+                                Err(err),
+                            )
+                        }
+                    };
+                let _ = reply.send(reply_result);
+                outcome
+            }
+            StandingCommand::StandingContextCount { reply } => {
+                // Lock-free ArcSwap read (ADR-049 §Decision 12).
+                let count = self.standing_contexts.load().len();
+                let _ = reply.send(Ok(count));
+                Outcome::ok(())
+            }
+            StandingCommand::HasStandingContext { peer_did, reply } => {
+                // Lock-free ArcSwap read (ADR-049 §Decision 12).
+                let has = self
+                    .standing_contexts
+                    .load()
+                    .contains_key(peer_did.as_ref());
+                let _ = reply.send(Ok(has));
+                Outcome::ok(())
+            }
+            StandingCommand::RegisterStandingContext { peer_did, reply } => {
+                // ArcSwap + write_lock for the standing-index mutation
+                // (ADR-049 §Decision 12).
+                let _guard = self.write_lock.lock().await;
+                let snapshot = self.standing_contexts.load_full();
+                let mut updated: HashMap<String, DID> = (*snapshot).clone();
+                updated.insert(peer_did.to_string(), peer_did);
+                self.standing_contexts.store(Arc::new(updated));
+                let _ = reply.send(Ok(()));
+                Outcome::ok_mutated(())
+            }
+            StandingCommand::ReconnectAllStanding { reply } => {
+                let fut = standing_helpers_legacy::reconnect_all_standing_legacy(self);
+                let (outcome, reply_result) =
+                    match tokio::time::timeout(STANDING_TIMEOUT, fut).await {
+                        Ok(Ok(count)) => (Outcome::ok_mutated(()), Ok(count)),
+                        Ok(Err(e)) => (
+                            Outcome::err_mutated(standing_outcome_error_sketch(&e)),
+                            Err(e),
+                        ),
+                        Err(_elapsed) => {
+                            let err = ContextError::TransportTimeout(format!(
+                                "reconnect_all_standing exceeded {STANDING_TIMEOUT:?} budget"
+                            ));
+                            (
+                                Outcome::err_mutated(standing_outcome_error_sketch(&err)),
+                                Err(err),
+                            )
+                        }
+                    };
+                let _ = reply.send(reply_result);
+                outcome
+            }
+            StandingCommand::InitiateStandingPairCreate { reply, .. } => {
+                const MSG: &str = "standing::initiate_standing_pair_create — saga wiring deferred to \
+                     commit 11.5 per 5 enumerated spec gaps; see \
+                     .docs/adrs/DEFERRED-commit-11-saga-use-cases.md (gap 1: standing-pair \
+                     2-phase decomposition)";
+                let _ = reply.send(Err(ContextError::NotImplemented(MSG.to_owned())));
+                Outcome::err(ContextError::NotImplemented(MSG.to_owned()))
+            }
+        }
     }
 
     /// Dispatch a [`ToolsCommand`] through the migration shim
@@ -3337,13 +3451,40 @@ impl Supervisor {
     }
 
     /// Extract the target context_id from a [`StandingCommand`].
-    /// Most variants identify the standing peer by `peer_did` rather
-    /// than a context_id and have no actor target — return `None`.
-    /// Phase 2A leaves StandingCommand on the direct-shim path; the
-    /// mailbox-routing extension lands when standing-pair sagas land in
-    /// a follow-on Phase 2 chunk.
-    const fn standing_command_context_id(_cmd: &StandingCommand) -> Option<&str> {
-        None
+    ///
+    /// Variants that carry both `local_did` and `peer_did` derive their
+    /// context_id deterministically via
+    /// [`crate::context::standing_helpers::generate_standing_context_id`]
+    /// — this returns `Some(<derived_id>)` so the dispatch helper can
+    /// route through any per-context actor that already exists for the
+    /// derived ID. The other variants are supervisor-scoped (count /
+    /// has / register / reconnect-all) — they touch the supervisor's
+    /// standing index directly, not per-context state, so they return
+    /// `None` and dispatch routes them to the SupervisorHandle.
+    ///
+    /// Returns an owned `String` rather than `&str` because the derived
+    /// ID is computed on demand from the variant's DID fields; there is
+    /// no backing string to borrow.
+    fn standing_command_context_id(cmd: &StandingCommand) -> Option<String> {
+        match cmd {
+            StandingCommand::StandingContext {
+                local_did,
+                peer_did,
+                ..
+            }
+            | StandingCommand::InitiateStandingPairCreate {
+                local_did,
+                peer_did,
+                ..
+            } => Some(
+                crate::context::standing_helpers::generate_standing_context_id(local_did, peer_did),
+            ),
+            StandingCommand::Placeholder { .. }
+            | StandingCommand::StandingContextCount { .. }
+            | StandingCommand::HasStandingContext { .. }
+            | StandingCommand::RegisterStandingContext { .. }
+            | StandingCommand::ReconnectAllStanding { .. } => None,
+        }
     }
 
     /// Extract the target context_id from a [`ToolsCommand`].
@@ -3380,6 +3521,29 @@ impl Supervisor {
             | QueriesCommand::RemainingBudgetForTest { context_id, .. }
             | QueriesCommand::VelocityForTest { context_id, .. } => Some(context_id.as_str()),
         }
+    }
+}
+
+/// Produce a best-effort clone-equivalent `ContextError` for the
+/// supervisor's [`Outcome`] sink — mirrors the per-handler
+/// `outcome_error_sketch` pattern used in `handlers::*`. Kept in
+/// `supervisor.rs` to scope the helper to the standing-direct dispatch
+/// path; the actor handlers each carry their own equivalent sketch.
+fn standing_outcome_error_sketch(err: &ContextError) -> ContextError {
+    match err {
+        ContextError::TransportTimeout(msg) => ContextError::TransportTimeout(msg.clone()),
+        ContextError::TransportFailed(msg) => ContextError::TransportFailed(msg.clone()),
+        ContextError::CryptoFailed(msg) => ContextError::CryptoFailed(msg.clone()),
+        ContextError::PermissionDenied(msg) => ContextError::PermissionDenied(msg.clone()),
+        ContextError::MemberNotFound(msg) => ContextError::MemberNotFound(msg.clone()),
+        ContextError::ContextNotRegistered(msg) => ContextError::ContextNotRegistered(msg.clone()),
+        ContextError::ContextNotActive => ContextError::ContextNotActive,
+        ContextError::MembershipFailed(msg) => ContextError::MembershipFailed(msg.clone()),
+        ContextError::EventLogFailed(msg) => ContextError::EventLogFailed(msg.clone()),
+        ContextError::GovernanceFailed(msg) => ContextError::GovernanceFailed(msg.clone()),
+        ContextError::InvalidState(msg) => ContextError::InvalidState(msg.clone()),
+        ContextError::NotImplemented(msg) => ContextError::NotImplemented(msg.clone()),
+        other => ContextError::CryptoFailed(format!("{other}")),
     }
 }
 
