@@ -725,7 +725,10 @@ pub async fn send_message_legacy(
             let Some(sk) = signing_key else {
                 // Phase 1 failed after ticket creation — drain it.
                 // Use inline variant: we already hold the per-context lock.
-                crate::context::economy_logic::rollback_economy_ticket_inline(&mut ctx.governance, ticket);
+                crate::context::economy_logic::rollback_economy_ticket_inline(
+                    &mut ctx.governance,
+                    ticket,
+                );
                 return Err(ContextError::CryptoFailed(
                     "signing key required for broadcast publish".into(),
                 ));
@@ -734,7 +737,10 @@ pub async fn send_message_legacy(
                 Ok(env) => env,
                 Err(e) => {
                     // Use inline variant: we already hold the per-context lock.
-                    crate::context::economy_logic::rollback_economy_ticket_inline(&mut ctx.governance, ticket);
+                    crate::context::economy_logic::rollback_economy_ticket_inline(
+                        &mut ctx.governance,
+                        ticket,
+                    );
                     return Err(e);
                 }
             };
@@ -754,7 +760,10 @@ pub async fn send_message_legacy(
             // Assign sequence under lock — SequenceTracker rejects duplicates.
             let Some(seq) = ctx.membership.next_sequence_number(sender_did) else {
                 // Use inline variant: we already hold the per-context lock.
-                crate::context::economy_logic::rollback_economy_ticket_inline(&mut ctx.governance, ticket);
+                crate::context::economy_logic::rollback_economy_ticket_inline(
+                    &mut ctx.governance,
+                    ticket,
+                );
                 return Err(ContextError::MemberNotFound(format!(
                     "cannot assign sequence: {sender_did} is not a member"
                 )));
@@ -1387,7 +1396,8 @@ pub async fn finalize_send_legacy(
                 sender_did.as_ref(),
                 now,
             );
-            let mut split = crate::context::governance_logic::ConsequenceStateSplit::from_state(ctx);
+            let mut split =
+                crate::context::governance_logic::ConsequenceStateSplit::from_state(ctx);
             crate::context::governance_logic::enforce_triggered_consequences(
                 &mut split,
                 &crate::context::governance_logic::EnforceConsequencesCtx {

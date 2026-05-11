@@ -169,12 +169,11 @@ pub fn validate_consequence_rules_for_import(
 // the legacy `evaluate_sybil_resistance(&PerContextState, ...)` /
 // `post_join_bookkeeping(&mut PerContextState, ...)` /
 // `enforce_join_economy(&mut PerContextState, ...)` wrappers were carried
-// alongside their `_split` counterparts only because the legacy and actor
-// struct types diverged. With the unified struct (single
+// alongside their field-disjoint counterparts only because the legacy
+// and actor struct types diverged. With the unified struct (single
 // `PerContextState`), each public entry point now takes the field
 // sub-borrows directly — callers build them from the unified struct at
-// the call site. The `_split` suffix is dropped below; the legacy
-// `&PerContextState` wrappers are gone.
+// the call site. The legacy `&PerContextState` wrappers are gone.
 
 /// Returns the spec §19.7 default per-DID message pricing configuration.
 ///

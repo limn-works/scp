@@ -48,10 +48,16 @@ use zeroize::Zeroizing;
 use crate::context::actor::commands::QueriesCommand;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::outcome::Outcome;
+// ADR-049 Phase 2A finalization keystone (commit 12 phase 2A
+// finalization — type unification, single PerContextState): the prior
+// `ActorPerContextState` / legacy alias pair collapsed to a single
+// type. The `ActorPerContextState` alias is preserved here purely as a
+// variable-name affordance for the dispatch surface — the legacy alias
+// is gone because the shim's `dispatch_from_shim` entry now reaches
+// the same type directly through the actor module path.
 use crate::context::actor::state::PerContextState as ActorPerContextState;
 use crate::context::builder::ContextEventLogProvider;
 use crate::context::queries_helpers;
-use crate::context::state::PerContextState as LegacyPerContextState;
 
 /// Actor-shape dispatch — routes a [`QueriesCommand`] against the
 /// actor's owned `&PerContextState` and `&ActorDeps`.
@@ -257,7 +263,7 @@ pub(crate) async fn dispatch(
 /// every borrow the read needs.
 #[allow(clippy::too_many_lines)] // flat match over every query variant
 pub(crate) fn dispatch_from_shim(
-    state: &LegacyPerContextState,
+    state: &ActorPerContextState,
     event_log: &Arc<dyn ContextEventLogProvider>,
     cmd: QueriesCommand,
 ) -> Outcome<()> {

@@ -5693,7 +5693,8 @@ pub async fn evaluate_periodic_consequences_legacy(
             return;
         }
         let member_dids: Vec<DID> = ctx.membership.members().map(|m| m.did.clone()).collect();
-        let events = event_log_entries_for_consequences(&ctx.receive_buffer, ctx_id, now, event_log);
+        let events =
+            event_log_entries_for_consequences(&ctx.receive_buffer, ctx_id, now, event_log);
         (rules, member_dids, events)
     };
     // Lock dropped — pure evaluation with no lock held.

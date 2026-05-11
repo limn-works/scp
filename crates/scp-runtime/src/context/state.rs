@@ -1193,7 +1193,6 @@ pub(crate) const PSEUDONYM_ANNOUNCEMENT_TAG: &str = "\0scp:pseudonym-announce:v1
 // stores the unified type until that map is deleted later in finalization.
 pub(crate) use crate::context::actor::state::PerContextState;
 
-
 /// Pushes a [`ContextEvent`] into the receive buffer and, when a broadcast
 /// channel is provided, sends a sanitized copy on it too.
 ///

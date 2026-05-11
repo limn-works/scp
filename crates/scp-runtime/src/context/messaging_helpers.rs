@@ -1516,13 +1516,12 @@ pub fn deliver_message_and_drain_buffered(
         }
         let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
         if !consequence_rules.is_empty() {
-            let recv_events =
-                crate::context::governance_logic::event_log_entries_for_consequences(
-                    &state.receive_buffer,
-                    context_id,
-                    now,
-                    &*deps.event_log,
-                );
+            let recv_events = crate::context::governance_logic::event_log_entries_for_consequences(
+                &state.receive_buffer,
+                context_id,
+                now,
+                &*deps.event_log,
+            );
             let recv_triggered =
                 evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
             let recv_member_did = DID(sender_did.to_owned());
@@ -1628,13 +1627,12 @@ pub fn deliver_message_and_drain_buffered(
     }
     let consequence_rules: Vec<ConsequenceRule> = state.governance.consequence_rules.clone();
     if !consequence_rules.is_empty() {
-        let recv_events =
-            crate::context::governance_logic::event_log_entries_for_consequences(
-                &state.receive_buffer,
-                context_id,
-                now,
-                &*deps.event_log,
-            );
+        let recv_events = crate::context::governance_logic::event_log_entries_for_consequences(
+            &state.receive_buffer,
+            context_id,
+            now,
+            &*deps.event_log,
+        );
         let recv_triggered =
             evaluate_consequence_rules(&consequence_rules, &recv_events, sender_did, now);
         let recv_member_did = DID(sender_did.to_owned());

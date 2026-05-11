@@ -58,7 +58,8 @@ pub fn dispatch_consequences(
     let rules: Vec<ConsequenceRule> = ctx.governance.consequence_rules.clone();
 
     // Collect event log entries for consequence evaluation (ADR-017).
-    let events = event_log_entries_for_consequences(&ctx.receive_buffer, context_id, now, event_log);
+    let events =
+        event_log_entries_for_consequences(&ctx.receive_buffer, context_id, now, event_log);
 
     // Evaluate which consequences are triggered.
     let triggered: Vec<TriggeredConsequence> =
@@ -925,7 +926,8 @@ pub fn check_proposer_eligibility(
         let merkle_root = event_log
             .event_log_merkle_root(&context_id_bytes)
             .unwrap_or([0u8; 32]);
-        let events = event_log_entries_for_consequences(&ctx.receive_buffer, &context_id, now, event_log);
+        let events =
+            event_log_entries_for_consequences(&ctx.receive_buffer, &context_id, now, event_log);
         if !events.is_empty() {
             match scp_protocol::trust::participation::compute_participation_record(
                 &events,

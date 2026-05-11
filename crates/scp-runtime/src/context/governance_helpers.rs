@@ -51,8 +51,7 @@ use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
 use crate::context::governance_logic::ConsequenceStateSplit;
 use crate::context::governance_logic::{
-    EnforceConsequencesCtx, enforce_triggered_consequences,
-    event_log_entries_for_consequences,
+    EnforceConsequencesCtx, enforce_triggered_consequences, event_log_entries_for_consequences,
 };
 use crate::context::state::{
     CEILING_CHANGE_NOTIFICATION_PERIOD_SECS, CommitFaultMarker, CommitOperation,
@@ -2724,12 +2723,8 @@ fn actor_check_proposer_eligibility(
         let merkle_root = event_log
             .event_log_merkle_root(&context_id_bytes)
             .unwrap_or([0u8; 32]);
-        let events = event_log_entries_for_consequences(
-            &state.receive_buffer,
-            &context_id,
-            now,
-            event_log,
-        );
+        let events =
+            event_log_entries_for_consequences(&state.receive_buffer, &context_id, now, event_log);
         if !events.is_empty() {
             match compute_participation_record(
                 &events,

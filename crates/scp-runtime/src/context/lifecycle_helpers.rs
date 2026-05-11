@@ -95,12 +95,12 @@ use crate::context::state::{
 use crate::context::ttl::{self, CloseResult, TtlTimer};
 
 // ADR-049 Phase 2A finalization keystone (commit 12 phase 2A finalization
-// — type unification, single PerContextState): the prior
-// `LegacyPerContextState` alias resolved to the legacy struct, which has
-// been deleted. Every bootstrap call site now constructs the unified
-// `PerContextState` directly. The contexts DashMap is still the
-// production source of truth — subsequent finalization commits delete
-// the DashMap and route bootstrap through `spawn_actor_with_state`.
+// — type unification, single PerContextState): the prior alias to the
+// legacy struct was deleted alongside the struct itself. Every bootstrap
+// call site now constructs the unified `PerContextState` directly. The
+// contexts DashMap is still the production source of truth — subsequent
+// finalization commits delete the DashMap and route bootstrap through
+// `spawn_actor_with_state`.
 
 // ---------------------------------------------------------------------------
 // 1. export_context (per-context, read-only)

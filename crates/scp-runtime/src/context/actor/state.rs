@@ -887,7 +887,10 @@ impl PerContextState {
         event: scp_protocol::context::membership::ContextEvent,
         context_id: &str,
         tx: Option<
-            &tokio::sync::broadcast::Sender<(String, scp_protocol::context::membership::ContextEvent)>,
+            &tokio::sync::broadcast::Sender<(
+                String,
+                scp_protocol::context::membership::ContextEvent,
+            )>,
         >,
     ) {
         crate::context::state::emit_event_into(&mut self.receive_buffer, event, context_id, tx);
