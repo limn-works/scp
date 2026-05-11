@@ -66,11 +66,17 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 scp-ffi-common = { path = "common", features = ["testing"] }
 # Tests need InMemoryKeyCustody.
 scp-platform = { path = "../scp-platform", features = ["testing"] }
+serde = { workspace = true, features = ["derive"] }
 tempfile = "3"
 
 [[test]]
 name = "e2e_bridge"
 path = "tests/e2e_bridge.rs"
+required-features = ["allow_in_memory_custody"]
+
+[[test]]
+name = "outlet_stream_vectors_real"
+path = "tests/outlet_stream_vectors_real.rs"
 required-features = ["allow_in_memory_custody"]
 
 [lints]

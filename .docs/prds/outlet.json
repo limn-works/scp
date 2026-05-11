@@ -2315,12 +2315,16 @@
       "severity": "major",
       "status": "done",
       "files": [
-        "crates/scp-ffi/src/outlets.rs",
-        "crates/scp-ffi/napi/src/outlets.rs",
+        "crates/scp-ffi/src/outlet_stream.rs",
+        "crates/scp-ffi/napi/src/outlet_stream.rs",
+        "crates/scp-ffi/uniffi/src/outlet_stream.rs",
         "crates/scp-ffi/uniffi/src/scp.udl",
-        "crates/scp-ffi/uniffi/src/scp.rs",
-        "crates/scp-ffi/wasm/src/outlets.rs",
-        "bridge_ratchet_baseline.json",
+        "crates/scp-ffi/wasm/src/outlet_stream.rs",
+        "crates/scp-ffi/wasm/src/manager.rs",
+        "crates/scp-runtime/src/context/outlets/dispatch.rs",
+        "crates/scp-runtime/src/context/outlets/stream.rs",
+        "crates/scp-protocol/src/context/outlets/stream.rs",
+        "crates/scp-ffi/bridge_ratchet_baseline.json",
         "ratchet/once-lock-count.json"
       ],
       "description": "Plumb streaming through all 4 FFI bridges. PyO3: `context_outlet_invoke_stream` returns an async iterator wrapping Python asyncio queue; chunks flow through via a background task. UniFFI: `outlet_invoke_stream` returns an `OutletStreamHandle` with `next() -> Option<OutletStreamChunk>` (polling) AND a callback interface (push). NAPI: `contextOutletInvokeStream` returns an object with AsyncIterator protocol. WASM: `outletInvokeStream` returns an object with `{ next() -> Promise<Option<Chunk>> }`. Each bridge also exposes `outlet_stream_grant_credit(request_id, grant)` and `outlet_stream_cancel(request_id)`.",
@@ -2383,7 +2387,9 @@
         "bindings/python/scp_sdk/outlets.py",
         "bindings/typescript/src/outlets.ts",
         "bindings/swift/Sources/SCP/Outlets.swift",
-        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Outlets.kt"
+        "bindings/swift/Sources/SCP/Outlets+Streaming.swift",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/Outlets.kt",
+        "bindings/kotlin/scp-kt/src/main/kotlin/works/limn/scp/OutletsStreaming.kt"
       ],
       "description": "Add credit / cancellation control-plane methods to the InvocationHandle returned by the single public `invoke()` verb defined in SCP-OUT-006. Per SCP-OUT-006, `invoke()` is the ONLY public verb at the SDK surface \u2014 there is no `invoke_stream` at the public API layer. FFI-level `invoke_stream` (SCP-OUT-037) remains internal and is called by `invoke()`'s implementation. This story extends the InvocationHandle with TWO control-plane methods \u2014 `grantCredit(grant: u32)` and `cancel()` \u2014 and implements the per-language iteration idioms that surface chunks while the invocation is active. Python: `handle = ctx.outlets.invoke(id, input)` is both awaitable (`await handle` returns End.aggregate) and async-iterable (`async for chunk in handle:`); `handle.grant_credit(grant)` and `handle.cancel()` are control-plane methods. TypeScript: `handle = ctx.outlets.invoke(id, input)` is PromiseLike<Aggregate> and AsyncIterable<OutletStreamChunk>; `handle.grantCredit(grant)` and `handle.cancel()`. Swift: `handle = try await ctx.outlets.invoke(id: id, input: input)` exposes `AsyncSequence` conformance and an awaited `handle.aggregate`; `handle.grantCredit(grant:)` and `handle.cancel()`. Kotlin: `handle = ctx.outlets.invoke(id, input)` exposes `suspend fun aggregate(): Aggregate` and `fun asFlow(): Flow<OutletStreamChunk>`; `suspend fun grantCredit(grant: UInt)` and `suspend fun cancel()`. Each SDK's grantCredit constructs an OutletStreamCredit message, signs it with the invoker's key (per \u00a75.4.5 SCP-OUTLET-CREDIT-V1 preimage), and sends it to the executor; cancel sends OutletCancel. Progress chunks are surfaced (not filtered); End.aggregate validation matches aggregate_schema per \u00a75.4.5.",
       "acceptanceCriteria": [
@@ -2441,9 +2447,14 @@
       "files": [
         "tests/conformance/vectors/outlet_stream_vectors.json",
         "crates/scp-testing/tests/integration/outlet_stream_conformance.rs",
+        "crates/scp-testing/tests/integration/outlet_stream_vectors_through_open_path.rs",
+        "crates/scp-ffi/tests/outlet_stream_vectors_real.rs",
+        "crates/scp-ffi/napi/tests/outlet_stream_vectors_real.rs",
+        "crates/scp-ffi/uniffi/tests/outlet_stream_vectors_real.rs",
+        "crates/scp-ffi/wasm/src/manager.rs",
         ".docs/specs/25-test-vectors.md"
       ],
-      "description": "Author a conformance vector set that exercises every streaming edge case per \u00a75.4.5. Seven vectors: (1) non-streaming one-shot Action (Data + End); (2) 10-chunk streaming Query; (3) cancellation mid-stream via OutletCancel; (4) terminal error mid-stream (Error { terminal: true }) \u2014 stream closes; (5) recoverable error mid-stream (Error { terminal: false }) followed by Data chunks \u2014 stream continues; (6) sequence gap \u2014 receiver observes missing sequence and cancels with SCP-TOOL-6134; (7) credit exhaustion \u2014 receiver sends no grant; executor stalls and framework cancels with SCP-TOOL-6133. Each vector is round-tripped through every bridge.",
+      "description": "Author a conformance vector set that exercises every streaming edge case per \u00a75.4.5. Seven vectors: (1) non-streaming one-shot Action (Data + End); (2) 10-chunk streaming Query; (3) cancellation mid-stream via OutletCancel; (4) terminal error mid-stream (Error { terminal: true }) \u2014 stream closes; (5) recoverable error mid-stream (Error { terminal: false }) followed by Data chunks \u2014 stream continues; (6) sequence gap \u2014 receiver observes missing sequence and cancels with SCP-TOOL-6131 (slug execution.stream-gap; round-5 slug consolidation collapsed the prior 6134 slot into 6131 alongside execution.credit-exhausted, since both ride the same \u00a75.4.4 Execution-credit sub-class \u2014 see crates/scp-protocol/src/context/outlets/error_codes.rs CODE_EXECUTION_CREDIT); (7) credit exhaustion \u2014 receiver sends no grant; executor stalls and framework cancels with SCP-TOOL-6133. Each vector is round-tripped through every bridge.",
       "acceptanceCriteria": [
         "File tests/conformance/vectors/outlet_stream_vectors.json has exactly 7 vectors with names non_streaming, multi_chunk, cancellation, error_terminal, error_recoverable, sequence_gap, credit_exhaustion",
         "Each vector specifies: name, open (OutletStreamOpen fields), chunks (ordered list of OutletStreamChunk), credits (list of OutletStreamCredit grants with timing), expected_end_status (Ok/Error/Cancelled), expected_error_code (optional)",
