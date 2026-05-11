@@ -2399,6 +2399,19 @@ impl<'ast> syn::visit::Visit<'ast> for SelfRefScanner {
     /// macro's opaque tokens. Walk the token stream byte-by-byte looking
     /// for the `self` / `Self` identifier — sufficient because both are
     /// keywords and cannot appear as unrelated substrings.
+    ///
+    /// **Known limitation — identifier-splitting macros.** Macros that
+    /// CONSTRUCT the `self` / `Self` ident from sub-tokens evade this
+    /// walker: `paste::paste!([<se lf>])`, `concat_idents!(se, lf)` (nightly),
+    /// custom proc-macros that emit `Ident::new("self", ...)` programmatically.
+    /// Any such macro inside the body would let an undecorated method pass
+    /// even though it never reads from the receiver. SCP bridge code does
+    /// not currently use these macros; if you reach for one in a `&self`
+    /// method, prefer making the method a free fn (per ADR-048 §1) over
+    /// rebinding the scanner's blindspot. Strengthening this scanner to
+    /// expand recognised expression macros and reject everything else is
+    /// tracked as a future hardening if the codebase ever adopts a macro
+    /// in this shape.
     fn visit_macro(&mut self, m: &'ast syn::Macro) {
         if tokens_have_self_or_self_kw(m.tokens.clone()) {
             self.found = true;

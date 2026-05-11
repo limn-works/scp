@@ -3828,7 +3828,7 @@ fn decode_attestation_public_key(issuer_public_key_hex: &str) -> Result<Option<[
 ///
 /// See spec §3.5.1.
 #[wasm_bindgen]
-pub fn identity_verify_link_attestation_signature(
+pub fn identity_verify_link_attestation(
     attestation_json: String,
     issuer_public_key_hex: String,
 ) -> Promise {

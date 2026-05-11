@@ -2847,7 +2847,7 @@
       "wasm": [
         "identity_create_link_attestation"
       ],
-      "_note": "WASM diverges from native bridges in attestation signer key. PyO3/NAPI/UniFFI sign with core_id.active_signing_key (#active per spec \u00a73.5.1; crates/scp-ffi/src/identity.rs and equivalents in napi/uniffi). WASM identity_create_link_attestation (crates/scp-ffi/wasm/src/identity.rs:2632) signs with signing_key_bytes (#0 identity key per spec \u00a73.5.2). Cross-bridge verification must know the issuer bridge to choose the correct verification key. Symmetry harness must NOT treat these as byte-equivalent operations. Tracked for spec-vs-impl reconciliation (align WASM to #active or formally document #0 per spec \u00a73.5.2); see ADR-048 \u00a77 + .docs/lessons/per-sdk-idiom-not-cross-language-dogma.md."
+      "_note": "RESOLVED 2026-04-26 by PR #1719: WASM was aligned to #active signing per spec \u00a73.5.2 wire format (previously signed with #0). See ADR-048 \u00a77b cross-bridge semantic divergence registry. This note retained for one release cycle so consumers verifying signatures cached from old WASM builds know the signing-key shift occurred."
     },
     {
       "canonical": "node_start_in_memory",
@@ -2987,7 +2987,7 @@
         "identity_verify_link_attestation"
       ],
       "wasm": [
-        "identity_verify_link_attestation_signature"
+        "identity_verify_link_attestation"
       ]
     }
   ],
