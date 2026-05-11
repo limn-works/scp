@@ -864,14 +864,6 @@ impl PerContextState {
         &self.governance.velocity_tracker
     }
 
-    /// Mutable send-sequence tracker (ADR-049 commit 8). Caller passes
-    /// this to [`crate::context::actor::SequenceReservation::reserve`]
-    /// to reserve the next send-sequence number with RAII rollback.
-    #[must_use]
-    pub(crate) const fn send_tracker_mut(&mut self) -> &mut SendSequenceTracker {
-        &mut self.send_tracker
-    }
-
     /// Pushes an event to the receive buffer and, if a broadcast channel
     /// is provided, sends a sanitized copy there too. Mirrors the
     /// security invariants of the standalone

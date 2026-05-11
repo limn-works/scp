@@ -50,7 +50,6 @@ use crate::context::actor::commands::{
 use crate::context::actor::handle::ContextActorHandle;
 use crate::context::actor::handlers;
 use crate::context::actor::outcome::Outcome;
-use crate::context::actor::sequence::SendSequenceTracker;
 use crate::context::actor::state::WrappingKeyPair;
 use crate::context::builder::{ContextEventLogProvider, ContextTransportProvider};
 use crate::context::persistence::ContextPersistence;
@@ -977,64 +976,14 @@ impl Supervisor {
     /// Dispatch a mutating [`MessagingCommand`] through the migration
     /// shim (ADR-049 commit 8 / plan row 8).
     ///
-    /// Contract (byte-identical to the legacy
-    /// [`ContextManager::send_message`](crate::context::supervisor::Supervisor::send_message)
-    /// / [`ContextManager::deliver_incoming`](crate::context::messaging_helpers::deliver_incoming)
-    /// it replaces):
-    ///
-    /// 1. Takes the tracker out of the per-context state under a brief
-    ///    lock (`std::mem::take` replaces it with a fresh
-    ///    [`SendSequenceTracker`](crate::context::actor::SendSequenceTracker)
-    ///    whose high-water mark matches the previous one).
-    /// 2. Drops the lock so the delegated
-    ///    [`Supervisor`](crate::context::supervisor::Supervisor)
-    ///    call can re-acquire it internally without deadlock.
-    /// 3. Invokes
-    ///    [`handlers::messaging::dispatch_from_shim`](crate::context::actor::handlers::messaging::dispatch_from_shim)
-    ///    with the attached manager Arc and a `&mut` borrow of the
-    ///    taken tracker. The handler exercises
-    ///    [`SequenceReservation`](crate::context::actor::SequenceReservation)
-    ///    on that tracker, wraps the delegated
-    ///    [`ContextManager::send_message`](crate::context::supervisor::Supervisor::send_message)
-    ///    / [`ContextManager::deliver_incoming`](crate::context::messaging_helpers::deliver_incoming)
-    ///    call in `tokio::time::timeout` with a 30s budget, and maps
-    ///    a timeout to
-    ///    [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout).
-    /// 4. After the handler returns, the dispatcher re-acquires the
-    ///    lock briefly to swap the (now reservation-committed or
-    ///    rollback-reverted) tracker back into the per-context state.
-    ///    Subsequent sends see the post-handler high-water mark.
-    ///
-    /// # Why the take-and-swap pattern
-    ///
-    /// The handler takes `&mut SendSequenceTracker`. If the dispatcher
-    /// held a `tokio::sync::OwnedMutexGuard<PerContextState>` the
-    /// borrow would live across the delegated `cm.send_message(...).await`
-    /// and deadlock the re-entrant per-context mutex acquisition inside
-    /// `ContextManager::send_message`. The take-and-swap workaround
-    /// makes the tracker reservation lock-free: the dispatcher owns
-    /// the tracker for the handler's await points, and the per-context
-    /// lock is held for zero duration during the delegated call. This
-    /// preserves deadlock safety during the shim period. Commit 12
-    /// replaces this with a direct `&mut PerContextState` on the
-    /// actor's owned state (no lock involved, the actor serializes by
-    /// construction).
-    ///
-    /// # Missing ActorDeps during the shim
-    ///
-    /// `ActorDeps` requires a `SupervisorHandle`, `KeyPackageStoreActor`
-    /// handle, `MlsBackend`, `HpkeBackend`, and `OpenMlsStorageAdapter`
-    /// — all of which wire up in commits 9-11. For the shim's messaging
-    /// path those fields are unused: the handler delegates every
-    /// transport/MLS call to the attached
-    /// [`Supervisor`](crate::context::supervisor::Supervisor)'s
-    /// pre-existing providers. Rather than construct placeholder deps
-    /// on every call, the shim forwards `None` for the deps argument
-    /// via the overload
-    /// [`handlers::messaging::dispatch_from_shim`](crate::context::actor::handlers::messaging::dispatch_from_shim),
-    /// which shares the same match arms as the post-refactor
-    /// [`handlers::messaging::dispatch`](crate::context::actor::handlers::messaging::dispatch)
-    /// but takes no [`ActorDeps`](crate::context::actor::ActorDeps).
+    /// Routes the command through the per-context actor's mailbox via
+    /// [`Self::dispatch_via_mailbox`]. The actor's `run()` loop pulls
+    /// the command and dispatches it via the actor-shape `dispatch(state,
+    /// deps, cmd)` entry point, which exercises the actor-owned
+    /// [`SendSequenceTracker`](crate::context::actor::SendSequenceTracker)
+    /// directly. The handler wraps every transport/MLS call in
+    /// [`tokio::time::timeout`] with a 30-second budget; a timeout maps
+    /// to [`ContextError::TransportTimeout`](scp_protocol::context::ContextError::TransportTimeout).
     ///
     /// # Errors
     ///
@@ -1042,94 +991,31 @@ impl Supervisor {
     ///   [`Supervisor`](crate::context::supervisor::Supervisor) has
     ///   been attached yet — the caller must call
     ///   [`Self::with_providers`] first.
-    /// - [`ContextError::ContextNotRegistered`] if the command targets a
-    ///   context that has not been created / joined / imported on the
-    ///   attached manager.
-    /// - Any typed error returned by the delegated
-    ///   `ContextManager::send_message` /
-    ///   `ContextManager::deliver_incoming` call (`CryptoFailed`,
-    ///   `PermissionDenied`, `MemberNotFound`, `RateLimited`, etc.).
+    /// - [`ContextError::ContextNotRegistered`] if no actor has been
+    ///   spawned for `ctx_id`. Every production context creation path
+    ///   (create / join / restore / import) spawns an actor before the
+    ///   supervisor returns control to FFI, so this error indicates a
+    ///   sequencing or test-setup bug.
+    /// - Any typed error returned by the delegated handler
+    ///   (`CryptoFailed`, `PermissionDenied`, `MemberNotFound`,
+    ///   `RateLimited`, etc.).
     /// - [`ContextError::TransportTimeout`] if the delegated call
     ///   exceeds the 30-second handler budget.
-    //
-    // `significant_drop_tightening` allow (function-level): Phase C's
-    // lock-scope block holds a `tokio::sync::MutexGuard` across a
-    // read-modify-write on the live send-tracker. Splitting the guard
-    // into two acquisitions (read then write) opens a TOCTOU window
-    // where a concurrent actor-path caller could advance `live`
-    // between our read and our write, regressing the high-water mark
-    // we compute. The lock scope is already minimal — three
-    // sequential expressions with no awaits. The block-level
-    // attribute form clippy suggests is not applicable to a `{ }`
-    // expression without a wrapping fn.
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn dispatch_command(
         &self,
         ctx_id: &str,
         cmd: MessagingCommand,
     ) -> Result<Outcome<()>, ContextError> {
-        // ADR-049 Phase 2A item 5: route through the per-context
-        // ContextActor's mailbox if one is registered. The actor's
-        // run() loop inside its tokio task observes the inbound
-        // command, dispatches it (still via dispatch_from_shim during
-        // the helper-migration window), and replies on the embedded
-        // oneshot. Keeps the actor model in the dispatch path so a
-        // future session can flip handler bodies onto `&mut state`
-        // without touching this method again.
-        //
-        // The mailbox path serializes commands per-context and applies
-        // the 30-second mailbox-send timeout from
-        // `ContextActorHandle::send_with_timeout`.
-        if let Some(actor) = self.lookup(ctx_id) {
-            return Self::dispatch_via_mailbox(&actor, ContextCommand::Messaging(cmd)).await;
-        }
-
-        // Legacy fallback: no actor registered for this context. The
-        // direct take-and-merge path below holds the per-context
-        // Mutex<PerContextState> and calls dispatch_from_shim
-        // synchronously. Removed when the lifecycle path migrates to
-        // spawn an actor on every create/join/import.
-        let arc = crate::context::manager_methods::get_context_arc_pub(self, ctx_id)?;
-
-        // Phase A: take the tracker out under a brief lock. See the
-        // doc comment for the deadlock-avoidance rationale.
-        let mut taken_tracker = {
-            let mut guard = arc.lock().await;
-            std::mem::take(guard.send_tracker_mut())
-        };
-
-        // Phase B: invoke the handler with the attached manager + a
-        // mutable borrow of the taken tracker. No per-context lock is
-        // held during this await so the delegated
-        // `cm.send_message(...)` call inside the handler acquires the
-        // same mutex without contention.
-        // ADR-049 commit 12c.9c — messaging handler takes `&Supervisor`
-        // so it can read lifted provider slots directly; `cm` is
-        // resolved from `self.crypto_ref()/etc.` inside the
-        // handler's `handle_send_message` helper.
-        let outcome = handlers::messaging::dispatch_from_shim(self, &mut taken_tracker, cmd).await;
-
-        // Phase C: swap the (committed or rolled-back) tracker back
-        // in. If another task concurrently reserved a number on the
-        // manager's in-place tracker (via the legacy path) while ours
-        // was taken, we merge by taking the max high-water mark so
-        // neither side regresses. In practice the legacy path does not
-        // use `send_tracker` — it uses `MembershipState::next_sequence_number`
-        // — so the merge is a no-op during the shim period. Future-
-        // proofed so a stray legacy advance cannot regress on resume.
-        let taken_hw = taken_tracker.last_issued();
-        {
-            // See the function-level
-            // `#[allow(clippy::significant_drop_tightening)]` for the
-            // TOCTOU rationale on this guard's span.
-            let mut guard = arc.lock().await;
-            let live = guard.send_tracker_mut();
-            let live_hw = live.last_issued();
-            let merged = taken_hw.max(live_hw);
-            *live = SendSequenceTracker::from_persisted(merged);
-        }
-
-        Ok(outcome)
+        // ADR-049 Phase 2A finalization — mailbox-only. The
+        // handler-side `dispatch_from_shim` and the take-and-swap
+        // tracker dance have been deleted; the actor owns
+        // `state.send_tracker` and serializes by construction.
+        let actor = self.lookup(ctx_id).ok_or_else(|| {
+            ContextError::ContextNotRegistered(format!(
+                "dispatch_command — no actor registered for context_id `{ctx_id}`"
+            ))
+        })?;
+        Self::dispatch_via_mailbox(&actor, ContextCommand::Messaging(cmd)).await
     }
 
     /// Dispatch a mutating [`LifecycleCommand`] through the migration

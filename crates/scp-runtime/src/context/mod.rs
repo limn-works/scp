@@ -46,7 +46,6 @@ pub(crate) mod lifecycle_helpers_legacy;
 pub(crate) mod lifecycle_logic;
 pub(crate) mod manager_methods;
 pub(crate) mod messaging_helpers;
-pub(crate) mod messaging_helpers_legacy;
 pub mod persistence;
 pub mod policy;
 pub mod providers;
