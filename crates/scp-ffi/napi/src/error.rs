@@ -207,6 +207,21 @@ impl From<scp_core::context::ContextError> for ScpNapiError {
                 message: format!("{e}"),
                 code: codes::CTX_2092.to_owned(),
             },
+            // §9.10.4: encrypted fan-out aborted because no peer has
+            // announced a per-member routing ID yet. Surface the canonical
+            // code so TypeScript callers can distinguish this transient
+            // bootstrap state from a permanent failure via `.code`.
+            CE::PseudonymRegistryEmpty { .. } => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2093.to_owned(),
+            },
+            // §5.14: a per-member pseudonym was requested for a broadcast
+            // context, which routes on the shared RID and carries no
+            // per-member pseudonym state.
+            CE::NotPseudonymousContext { .. } => Self::Context {
+                message: format!("{e}"),
+                code: codes::CTX_2094.to_owned(),
+            },
             // Recover embedded SCP-ECON-/SCP-TOOL-/SCP-PERM- codes from
             // the runtime's `PermissionDenied(String)` catch-all so the
             // typed-envelope contract holds for tool-economy failures.
@@ -599,5 +614,34 @@ mod tests {
     fn non_pre_rotation_identity_errors_keep_generic_envelope() {
         let err: ScpNapiError = scp_identity::IdentityError::InvalidDidFormat("bad".into()).into();
         assert_eq!(code_of(err), codes::IDENT_1001);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod context_error_code_tests {
+    use super::*;
+
+    #[test]
+    fn pseudonym_registry_empty_maps_to_ctx_2093() {
+        let err = ScpNapiError::from(scp_core::context::ContextError::PseudonymRegistryEmpty {
+            context_id: "ctx-1".to_owned(),
+            member_count: 3,
+        });
+        match err {
+            ScpNapiError::Context { code, .. } => assert_eq!(code, codes::CTX_2093),
+            other => panic!("expected Context variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_pseudonymous_context_maps_to_ctx_2094() {
+        let err = ScpNapiError::from(scp_core::context::ContextError::NotPseudonymousContext {
+            context_id: "ctx-1".to_owned(),
+        });
+        match err {
+            ScpNapiError::Context { code, .. } => assert_eq!(code, codes::CTX_2094),
+            other => panic!("expected Context variant, got {other:?}"),
+        }
     }
 }

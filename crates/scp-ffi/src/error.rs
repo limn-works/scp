@@ -185,6 +185,18 @@ impl ScpPyError {
         }
     }
 
+    /// Identity error with an explicit, caller-supplied error code.
+    ///
+    /// Used where a specific `SCP-IDENT-*` code carries actionable meaning
+    /// (e.g. the pseudonym-derivation failure paths) instead of the generic
+    /// `SCP-IDENT-1001`.
+    pub fn identity_with_code(msg: impl Into<String>, code: &str) -> Self {
+        Self::IdentityError {
+            message: msg.into(),
+            code: code.to_owned(),
+        }
+    }
+
     /// Context error with the given message and the generic context code.
     pub fn context(msg: impl Into<String>) -> Self {
         Self::ContextError {
@@ -353,6 +365,21 @@ impl From<scp_core::context::ContextError> for ScpPyError {
             CE::ImportRejected { .. } => Self::ContextError {
                 message: format!("{e}"),
                 code: codes::CTX_2092.to_owned(),
+            },
+            // §9.10.4: encrypted fan-out aborted because no peer has
+            // announced a per-member routing ID yet. Surface the canonical
+            // code so Python callers can distinguish this transient bootstrap
+            // state from a permanent failure without parsing the message body.
+            CE::PseudonymRegistryEmpty { .. } => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2093.to_owned(),
+            },
+            // §5.14: a per-member pseudonym was requested for a broadcast
+            // context, which routes on the shared RID and carries no
+            // per-member pseudonym state.
+            CE::NotPseudonymousContext { .. } => Self::ContextError {
+                message: format!("{e}"),
+                code: codes::CTX_2094.to_owned(),
             },
             // `PermissionDenied(String)` is the catch-all the runtime
             // uses for tool-economy and tool-invocation failures
@@ -773,4 +800,32 @@ mod tests {
         let err: ScpPyError = scp_identity::IdentityError::InvalidDidFormat("bad".into()).into();
         assert_eq!(code_of(err), codes::IDENT_1001);
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod context_error_code_tests {
+    use super::*;
+
+    #[test]
+    fn pseudonym_registry_empty_maps_to_ctx_2093() {
+        let err = ScpPyError::from(scp_core::context::ContextError::PseudonymRegistryEmpty {
+            context_id: "ctx-1".to_owned(),
+            member_count: 3,
+        });
+        match err {
+            ScpPyError::ContextError { code, .. } => assert_eq!(code, codes::CTX_2093),
+            other => panic!("expected ContextError variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn not_pseudonymous_context_maps_to_ctx_2094() {
+        let err = ScpPyError::from(scp_core::context::ContextError::NotPseudonymousContext {
+            context_id: "ctx-1".to_owned(),
+        });
+        match err {
+            ScpPyError::ContextError { code, .. } => assert_eq!(code, codes::CTX_2094),
+            other => panic!("expected ContextError variant, got {other:?}"),
+        }
 }

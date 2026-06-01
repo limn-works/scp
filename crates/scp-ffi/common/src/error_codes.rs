@@ -314,6 +314,10 @@ pub const CTX_2075: &str = "SCP-CTX-2075";
 pub const CTX_2091: &str = "SCP-CTX-2091";
 /// Context economy spending error.
 pub const CTX_2092: &str = "SCP-CTX-2092";
+/// Pseudonym registry empty — peers have not announced routing IDs (§9.10.4).
+pub const CTX_2093: &str = "SCP-CTX-2093";
+/// Per-member pseudonym requested for a non-pseudonymous (broadcast) context (§5.14).
+pub const CTX_2094: &str = "SCP-CTX-2094";
 /// Bridge connector context creation error.
 pub const CTX_2100: &str = "SCP-CTX-2100";
 /// Bridge connector context join error.
