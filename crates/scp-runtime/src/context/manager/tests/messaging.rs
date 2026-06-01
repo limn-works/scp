@@ -4818,6 +4818,86 @@ async fn send_message_encrypted_empty_registry_raises_pseudonym_registry_empty()
     }
 }
 
+/// §9.10.4 bootstrap channel: a `PseudonymAnnouncement` payload still succeeds
+/// even when the pseudonym registry is empty, because announcements are the one
+/// payload class permitted to address the shared `context_routing_id`. This is
+/// how peers learn each other's pseudonyms before app data can fan out on
+/// pseudonym-only paths.
+#[tokio::test]
+async fn send_message_announcement_uses_bootstrap_channel_with_empty_registry() {
+    use super::super::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
+
+    let transport = MockTransport::connected();
+    let routing_ids = transport.routing_ids_handle();
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(transport),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+
+    manager.register_local_did("did:key:alice".into()).await;
+
+    let handle = manager
+        .create_context(
+            "bootstrap-ctx".into(),
+            params,
+            "did:key:alice".into(),
+            [0u8; 32],
+        )
+        .await
+        .unwrap();
+
+    // Add Bob as a second member; registry stays empty (no pseudonyms known).
+    {
+        let arc = manager.get_context_arc("bootstrap-ctx").unwrap();
+        let mut guard = arc.lock().await;
+        let ctx = &mut *guard;
+        ctx.membership
+            .add_member("did:key:bob".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:bob".to_owned());
+        let bob_access_key =
+            scp_protocol::crypto::access_keys::generate_access_key("bootstrap-ctx", "did:key:bob");
+        ctx.access
+            .access_key_store
+            .set("bootstrap-ctx", "did:key:bob", bob_access_key);
+    }
+
+    // Alice announces her own pseudonym via the bootstrap channel.
+    let announcement = PseudonymAnnouncement {
+        tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+        member_did: "did:key:alice".to_owned(),
+        pseudonym: [0xA1u8; 32],
+    };
+    let payload = rmp_serde::to_vec_named(&announcement).unwrap();
+
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    manager
+        .send_message(&handle, &alice_did, &payload, Some(&alice_sk), None, None)
+        .await
+        .expect("announcement send must succeed via bootstrap channel");
+
+    // The send must address the shared context routing ID so peers whose
+    // pseudonym we have not yet learned still receive the announcement.
+    let sent_rids = routing_ids.lock().unwrap();
+    let shared_rid = scp_protocol::context::context_routing_id("bootstrap-ctx");
+    assert!(
+        sent_rids.contains(&shared_rid),
+        "announcement must address the shared context routing ID (bootstrap channel)"
+    );
+}
+
 /// Verifies that a forged `PseudonymAnnouncement` where `member_did` does not
 /// match the MLS-authenticated sender is rejected with `PermissionDenied`.
 #[tokio::test]
