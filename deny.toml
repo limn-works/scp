@@ -49,6 +49,16 @@ ignore = [
     # libcrux-sha3: incorrect incremental SHAKE XOF output. Transitive via
     # openmls -> openmls_libcrux_crypto. Awaiting openmls upgrade.
     "RUSTSEC-2026-0074",
+    # libcrux-chacha20poly1305: panic when `encrypt` is given a ciphertext
+    # buffer longer than `ptxt.len() + TAG_LEN`. Transitive via openmls ->
+    # openmls_libcrux_crypto -> libcrux-aead, which pins
+    # libcrux-chacha20poly1305 = "=0.0.6"; no openmls release past 0.8.1
+    # exists, so it cannot be upgraded. SCP's MLS ciphersuite is AES-128-GCM
+    # (MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519), so the ChaCha20-Poly1305
+    # encrypt path is not selected, and OpenMLS sizes the ciphertext buffer
+    # internally rather than from attacker-controlled input. Awaiting openmls
+    # upgrade.
+    "RUSTSEC-2026-0124",
     # rand 0.8.5 unsound: aliased mutable reference when a custom logger
     # calls `rand::rng()` during ThreadRng reseed. Transitive via
     # hpke-rs-rust-crypto -> openmls_rust_crypto. Cannot upgrade: hpke-rs
