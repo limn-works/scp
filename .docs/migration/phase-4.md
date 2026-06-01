@@ -233,11 +233,17 @@ function runs a cheap runtime check and returns `SCP-PERM-3030` on
 mismatch. The check is enforced mechanically by
 `scripts/check-handle-affinity.sh`.
 
+The `instance_id` field is a Rust-inherent enforcement artifact, not a
+public property: handle types do **not** expose an `instanceId` getter
+(ADR-048 §4). Only the `SCP` class itself surfaces `instanceId`. Affinity
+is observed only through misuse — passing a handle to the wrong instance
+throws `SCP-PERM-3030`:
+
 ```swift
 let a = SCP()
 let b = SCP()
 let ctx = try await a.contextCreate(params)
-// ctx.instanceId == a.instanceId
+// ctx has no instanceId getter — affinity is enforced Rust-side.
 
 try await b.contextSend(ctx, payload)
 // throws ScpError.Permission(code: "SCP-PERM-3030")
@@ -339,7 +345,16 @@ final class LifecycleTests: XCTestCase {
     func testContextCreate() async throws {
         try scp.registerLocalDid(didString)
         let ctx = try await scp.contextCreate(params)
-        XCTAssertEqual(ctx.instanceId, scp.instanceId)
+        // Handles expose no instanceId getter (ADR-048 §4); affinity is
+        // observed via misuse — a handle from one SCP rejected by another.
+        let other = SCP()
+        do {
+            try await other.contextSend(ctx, payload)
+            XCTFail("expected cross-instance handle misuse to throw")
+        } catch let ScpError.Permission(_, code) {
+            XCTAssertEqual(code, "SCP-PERM-3030")
+        }
+        try await other.shutdown(timeout: 5)
     }
 }
 ```
@@ -370,7 +385,14 @@ class LifecycleTests {
     fun `context_create`() = runBlocking {
         scp.registerLocalDid(didString)
         val ctx = scp.contextCreate(params)
-        assertEquals(scp.instanceId, ctx.instanceId)
+        // Handles expose no instanceId getter (ADR-048 §4); affinity is
+        // observed via misuse — a handle from one SCP rejected by another.
+        val other = SCP()
+        val ex = assertFailsWith<ScpException.Permission> {
+            other.contextSend(ctx, payload)
+        }
+        assertEquals("SCP-PERM-3030", ex.code)
+        other.shutdown(5.seconds)
     }
 }
 ```
