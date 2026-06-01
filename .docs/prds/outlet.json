@@ -2313,7 +2313,7 @@
       "gate": "gate-streaming",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "crates/scp-ffi/src/outlet_stream.rs",
         "crates/scp-ffi/napi/src/outlet_stream.rs",
@@ -2382,7 +2382,7 @@
       "gate": "gate-streaming",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "bindings/python/scp_sdk/outlets.py",
         "bindings/typescript/src/outlets.ts",
@@ -2443,7 +2443,7 @@
       "gate": "gate-streaming",
       "priority": "P1",
       "severity": "major",
-      "status": "done",
+      "status": "pending",
       "files": [
         "tests/conformance/vectors/outlet_stream_vectors.json",
         "crates/scp-testing/tests/integration/outlet_stream_conformance.rs",
