@@ -430,6 +430,31 @@ pub enum ContextError {
         /// Total number of send attempts.
         attempts: u32,
     },
+
+    /// An encrypted application message could not be delivered because the
+    /// context has peers but the local pseudonym registry is empty — the
+    /// fan-out would produce zero sends and silently drop the message.
+    ///
+    /// Raised specifically for multi-member encrypted contexts where no
+    /// peer pseudonym has been learned yet. Callers should retry after the
+    /// pseudonym announcement protocol (§9.10.4) completes; announcements
+    /// themselves use the shared-RID bootstrap channel and are NOT subject
+    /// to this error.
+    ///
+    /// Single-member encrypted contexts with empty registries succeed as a
+    /// no-op (no peers to fan out to) — this variant is not raised for them.
+    /// Mapped to `SCP-CTX-2093` in FFI bridge translators.
+    #[error(
+        "SCP-CTX-2093: pseudonym registry empty for context '{context_id}' \
+         (member_count={member_count}) — peers have not announced routing IDs; \
+         app-data send aborted to avoid silent drop"
+    )]
+    PseudonymRegistryEmpty {
+        /// The affected context ID.
+        context_id: String,
+        /// Current member count at rejection time.
+        member_count: usize,
+    },
 }
 
 // ---------------------------------------------------------------------------
