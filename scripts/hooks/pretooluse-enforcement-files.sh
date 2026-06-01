@@ -50,7 +50,14 @@ tool_json=$(cat)
 # would fail-closed with non-JSON stderr — which Claude Code's hook-output
 # validator then rejects. Validate our preconditions explicitly and no-op
 # otherwise.
-tool_name=$(printf '%s' "$tool_json" | jq -r '.tool_name // ""')
+tool_name=$(printf '%s' "$tool_json" | jq -r '.tool_name // ""' 2>/dev/null) || {
+    # `set -e` would otherwise kill the script with jq's exit code (e.g. 5 on
+    # a parse error) BEFORE any controlled handler runs, surfacing a
+    # non-blocking error to Claude Code instead of the intended block. Fail
+    # CLOSED with exit 2 on any payload jq cannot parse.
+    echo "enforcement-file hook: jq failed to parse payload; failing closed" >&2
+    exit 2
+}
 case "$tool_name" in
     Edit|Write|MultiEdit|Bash) ;;
     *) exit 0 ;;
@@ -78,12 +85,27 @@ if [[ "$tool_name" == "Bash" ]]; then
             # Allow READ-style operations (cat / less / head / tail / view
             # / file / wc / grep without -i / sed without -i flag / etc.).
             # The threat is WRITE — heuristically detect write verbs.
+            #
+            # The verb list is WRITE-SPECIFIC on purpose. General-purpose
+            # interpreters (`bun`, `node`, `python script.py`) are NOT in it:
+            # they read protected files as arguments far more often than they
+            # write them (e.g. `python3.12 scripts/validate-prd.py`,
+            # `node lint.js scripts/bridge-aliases.json`), so listing them
+            # blocked legitimate reads. A genuine interpreter WRITE still goes
+            # through a redirect (`node gen.js > file`) or `tee`, both caught
+            # below; `python -c '…open(…,"w")…'` is the one realistic in-band
+            # interpreter-write and is matched explicitly. Indirect writes via
+            # an intermediate script remain a documented limitation (CI is the
+            # canonical backstop).
+            #
             # POSIX `[[:space:]]` classes (not `[ \t]`, whose literal `t`
             # would exclude any path component containing the letter t, e.g.
-            # `scripts/`). `[^[:space:]|]*` after the redirect absorbs a path
-            # prefix (e.g. `> scripts/bridge-aliases.json`) before the basename.
-            if echo "$command_str" | grep -qE '\b(tee|mv|cp|cat[^|]*>|sed[[:space:]]+-i|python3?(\.[0-9]+)?[[:space:]]+(-c[[:space:]]+|.*\.py)|bun|node)[[:space:]].*'"$basename" \
-               || echo "$command_str" | grep -qE '>>?[[:space:]]*[^[:space:]|]*'"$basename"; then
+            # `scripts/`). The redirect branch allows an optional `|`
+            # (force-clobber `>|` / `>>|`) right after the operator, then
+            # `[^[:space:]|]*` absorbs a path prefix (e.g.
+            # `>| scripts/bridge-aliases.json`) before the basename.
+            if echo "$command_str" | grep -qE '\b(tee|mv|cp|cat[^|]*>|sed[[:space:]]+-i|python3?(\.[0-9]+)?[[:space:]]+-c)[[:space:]].*'"$basename" \
+               || echo "$command_str" | grep -qE '>>?\|?[[:space:]]*[^[:space:]|]*'"$basename"; then
                 echo "enforcement file protected (Bash write): $basename" >&2
                 echo "Detected an apparent write/redirect to a protected" \
                      "enforcement file via Bash. Use a dedicated PR." >&2
@@ -106,7 +128,10 @@ paths=$(
             | .[]
         ' 2>/dev/null
 ) || {
-    echo "enforcement-file hook: jq failed to parse tool_input; failing closed" >&2
+    # Reached when jq runs but yields no editable file_path (the `-e` flag
+    # exits non-zero on empty output). Parse errors are already handled at the
+    # `tool_name` extraction above, so this is the no-file_path case.
+    echo "enforcement-file hook: no editable file_path in tool_input; failing closed" >&2
     exit 2
 }
 
