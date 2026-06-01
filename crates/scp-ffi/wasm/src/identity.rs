@@ -5980,4 +5980,29 @@ mod tests {
             );
         }
     }
+
+    proptest::proptest! {
+        // 1024 random 32-byte inputs per run. The encoder operates on a
+        // 32-bit chunk of state at a time, so any off-by-one indexing in
+        // the residual-bits branch or chunk-boundary drift surfaces
+        // within a few hundred random vectors — 1024 is a comfortable
+        // margin without inflating test wall-clock.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(1024))]
+
+        #[test]
+        fn wasm_zbase32_encode_matches_native_proptest(
+            input in proptest::array::uniform32(proptest::num::u8::ANY),
+        ) {
+            let wasm_encoded = zbase32_encode(&input);
+            let native_encoded = zbase32::encode(&input);
+            proptest::prop_assert_eq!(
+                wasm_encoded,
+                native_encoded,
+                "WASM zbase32_encode output MUST match the canonical \
+                 z-base-32 encoder byte-for-byte for every 32-byte \
+                 input (drift breaks DID interoperability across \
+                 bridges)"
+            );
+        }
+    }
 }

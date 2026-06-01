@@ -5244,6 +5244,7 @@ dependencies = [
  "openmls_basic_credential",
  "openmls_rust_crypto 0.5.1",
  "openmls_traits 0.5.0",
+ "proptest",
  "rand 0.8.5",
  "rand_core 0.6.4",
  "rmp-serde",
