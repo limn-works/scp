@@ -397,6 +397,28 @@ impl ContextManager {
         handle: &ContextHandle,
     ) -> Result<(), ContextError> {
         let (mut ctx_snapshot, broadcast_ctx) = self.load_persisted_context_state(context_id)?;
+        // §9.10.4 / §5.14 + FIX 4: Validate that the persisted snapshot's
+        // `context_params.mode` and `routing` variant are consistent. A
+        // tampered or corrupted snapshot claiming `mode = Encrypted` with
+        // `routing = Broadcast` (or vice-versa) would otherwise materialize
+        // a `PerContextState` whose routing variant contradicts the
+        // encryption state the rest of the runtime enforces — silently
+        // breaking every per-member invariant on this context. Fail loudly
+        // instead of loading. Exception: degraded snapshots
+        // (`needs_reconnect = true`) built by `build_degraded_snapshot` are
+        // always consistent by construction; the check is still cheap and
+        // runs uniformly.
+        match (ctx_snapshot.context_params.mode, &ctx_snapshot.routing) {
+            (ContextMode::Encrypted, ContextRouting::Encrypted { .. })
+            | (ContextMode::Broadcast, ContextRouting::Broadcast) => {}
+            (mode, routing) => {
+                return Err(ContextError::PersistenceFailed(format!(
+                    "restore: context_params.mode ({mode:?}) and routing variant \
+                     ({routing:?}) disagree — refusing to load shape-inconsistent snapshot \
+                     (possible tampering or a pre-fix degraded snapshot)"
+                )));
+            }
+        }
         self.restore_event_log_best_effort(context_id);
         // C3: Validate consequence rules on restore — reject tampered
         // rules. Uses validate_against_config to enforce the opt-in
