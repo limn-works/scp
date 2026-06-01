@@ -70,9 +70,32 @@ check_code() {
         SCP-UNKNOWN)  ;; # Sentinel for unmapped bridge errors — allowed
         SCP-TEST)     ;; # Test sentinel — allowed
         *)
+            # Blind-spot guard: a prefix that is a *superstring* of a
+            # canonical error category (e.g. `SCP-IDENTITY` extends the
+            # canonical `SCP-IDENT`) is almost certainly a mistyped error
+            # code, not a PRD story ID. These previously slipped through
+            # because their number part was < 1000 (e.g. SCP-IDENTITY-0001),
+            # which the story-ID heuristic below silently skipped. Flag them
+            # regardless of the number so out-of-namespace error codes can
+            # never masquerade as story references.
+            local canonical typo_of_canonical=""
+            for canonical in SCP-IDENT SCP-CTX SCP-PERM SCP-CRYPTO SCP-TRANS \
+                             SCP-TOOL SCP-VALID SCP-STORAGE SCP-ATTEST SCP-MCP \
+                             SCP-GOV SCP-ECON; do
+                # Match a canonical prefix followed by more letters
+                # (e.g. SCP-IDENT -> SCP-IDENTITY). Exact matches are handled
+                # by the dedicated arms above and never reach this branch.
+                if [[ "$prefix" == "$canonical"* && "$prefix" != "$canonical" ]]; then
+                    typo_of_canonical="$canonical"
+                    break
+                fi
+            done
+            if [[ -n "$typo_of_canonical" ]]; then
+                echo "VIOLATION: $file:$line_num: $code — prefix '$prefix' is not canonical; did you mean '$typo_of_canonical'? (error codes must use the exact canonical prefix and its allocated range)"
+                VIOLATIONS=$((VIOLATIONS + 1))
             # PRD story IDs (e.g. SCP-AB-016, SCP-PERSIST-062) use numbers
-            # < 1000. Error codes start at 1000+. Skip story references.
-            if [[ $num -ge 1000 ]]; then
+            # < 1000. Error codes start at 1000+. Skip genuine story refs.
+            elif [[ $num -ge 1000 ]]; then
                 echo "VIOLATION: $file:$line_num: $code — non-canonical prefix '$prefix'"
                 VIOLATIONS=$((VIOLATIONS + 1))
             fi

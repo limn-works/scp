@@ -7521,62 +7521,69 @@ impl Scp {
 
                 // §9.10.4: Derive the context-scoped pseudonym routing ID via the
                 // retained KeyCustody BEFORE context creation so it can be passed
-                // to the ContextManager for per-member routing. Custody /
-                // derivation failure is a hard error for encrypted contexts —
-                // we do NOT silently fall back. Broadcast contexts don't use
-                // per-member pseudonyms (spec §5.14) but we still derive one
-                // here; the runtime ignores it for that mode.
-                let identity_key = identity
-                    .core_id
-                    .as_ref()
-                    .map(|id| id.identity_key)
-                    .ok_or_else(|| ScpError::Identity {
-                        msg: "identity missing core_id — cannot derive pseudonym".into(),
-                        code: "SCP-IDENTITY-0001".into(),
-                    })?;
-                let pseudonym_pk = if let Some(ref cb) = callback_custody {
-                    cb.derive_pseudonym(&identity_key, context_id.as_bytes())
-                        .await
-                        .map_err(|e| ScpError::Identity {
-                            msg: format!("pseudonym derivation failed: {e}"),
-                            code: "SCP-IDENTITY-0002".into(),
-                        })?
-                        .public_key
+                // to the ContextManager for per-member routing. Broadcast contexts
+                // have NO per-member pseudonym (spec §5.14): the runtime builds
+                // `ContextRouting::Broadcast` and ignores this argument, so we skip
+                // derivation entirely — deriving would force a custody requirement
+                // with no cryptographic basis, denying broadcast creation when
+                // custody is absent. Encrypted / pseudonymous contexts require a
+                // real pseudonym: custody / derivation failure there is a hard
+                // error, no silent fallback.
+                let local_pseudonym: [u8; 32] = if matches!(params.mode, ContextMode::Broadcast) {
+                    [0u8; 32]
                 } else {
-                    #[cfg(feature = "allow_in_memory_custody")]
-                    {
-                        let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
-                            ScpError::Identity {
-                                msg: "no custody provider available for pseudonym derivation"
-                                    .into(),
-                                code: "SCP-IDENTITY-0003".into(),
-                            }
+                    let identity_key = identity
+                        .core_id
+                        .as_ref()
+                        .map(|id| id.identity_key)
+                        .ok_or_else(|| ScpError::Identity {
+                            msg: "identity missing core_id — cannot derive pseudonym".into(),
+                            code: codes::IDENT_1054.to_owned(),
                         })?;
-                        imc.0
-                            .derive_pseudonym(&identity_key, context_id.as_bytes())
+                    let pseudonym_pk = if let Some(ref cb) = callback_custody {
+                        cb.derive_pseudonym(&identity_key, context_id.as_bytes())
                             .await
                             .map_err(|e| ScpError::Identity {
                                 msg: format!("pseudonym derivation failed: {e}"),
-                                code: "SCP-IDENTITY-0002".into(),
+                                code: codes::IDENT_1055.to_owned(),
                             })?
                             .public_key
-                    }
-                    #[cfg(not(feature = "allow_in_memory_custody"))]
-                    {
-                        return Err(ScpError::Identity {
-                            msg: "no custody provider available for pseudonym derivation".into(),
-                            code: "SCP-IDENTITY-0003".into(),
-                        });
-                    }
-                };
-                let local_pseudonym: [u8; 32] =
+                    } else {
+                        #[cfg(feature = "allow_in_memory_custody")]
+                        {
+                            let imc = identity.in_memory_custody.as_ref().ok_or_else(|| {
+                                ScpError::Identity {
+                                    msg: "no custody provider available for pseudonym derivation"
+                                        .into(),
+                                    code: codes::IDENT_1056.to_owned(),
+                                }
+                            })?;
+                            imc.0
+                                .derive_pseudonym(&identity_key, context_id.as_bytes())
+                                .await
+                                .map_err(|e| ScpError::Identity {
+                                    msg: format!("pseudonym derivation failed: {e}"),
+                                    code: codes::IDENT_1055.to_owned(),
+                                })?
+                                .public_key
+                        }
+                        #[cfg(not(feature = "allow_in_memory_custody"))]
+                        {
+                            return Err(ScpError::Identity {
+                                msg: "no custody provider available for pseudonym derivation"
+                                    .into(),
+                                code: codes::IDENT_1056.to_owned(),
+                            });
+                        }
+                    };
                     pseudonym_pk
                         .as_bytes()
                         .try_into()
                         .map_err(|_| ScpError::Identity {
                             msg: "pseudonym public key must be 32 bytes".into(),
-                            code: "SCP-IDENTITY-0004".into(),
-                        })?;
+                            code: codes::IDENT_1057.to_owned(),
+                        })?
+                };
 
                 // Delegate to the shared ContextManager with pseudonym.
                 let manager = bi.context_manager_or_error()?;
@@ -7776,60 +7783,71 @@ impl Scp {
                 };
 
                 // §9.10.4: Derive pseudonym for per-member routing. Uses the
-                // identity's custody provider (callback or in-memory). Hard
-                // error on custody / derivation failure — no silent fallback.
-                let identity_key = identity
-                    .core_id
-                    .as_ref()
-                    .map(|id| id.identity_key)
-                    .ok_or_else(|| ScpError::Identity {
-                        msg: "identity missing core_id — cannot derive pseudonym".into(),
-                        code: "SCP-IDENTITY-0001".into(),
-                    })?;
-                let pseudonym_pk = if let Some(ref cb) = identity.callback_custody {
-                    cb.derive_pseudonym(&identity_key, handle.context_id.as_bytes())
-                        .await
-                        .map_err(|e| ScpError::Identity {
-                            msg: format!("pseudonym derivation failed: {e}"),
-                            code: "SCP-IDENTITY-0002".into(),
-                        })?
-                        .public_key
+                // identity's custody provider (callback or in-memory). Broadcast
+                // contexts have NO per-member pseudonym (spec §5.14): the runtime
+                // builds `ContextRouting::Broadcast` and ignores this argument,
+                // so we skip derivation entirely. Encrypted / pseudonymous
+                // contexts require a real pseudonym: custody / derivation failure
+                // there is a hard error, no silent fallback.
+                let local_pseudonym: [u8; 32] = if matches!(
+                    handle.core_context_params.mode,
+                    scp_core::context::params::ContextMode::Broadcast
+                ) {
+                    [0u8; 32]
                 } else {
-                    #[cfg(feature = "allow_in_memory_custody")]
-                    {
-                        let custody = identity.in_memory_custody.as_ref().ok_or_else(|| {
-                            ScpError::Identity {
-                                msg: "no custody provider available for pseudonym derivation"
-                                    .into(),
-                                code: "SCP-IDENTITY-0003".into(),
-                            }
+                    let identity_key = identity
+                        .core_id
+                        .as_ref()
+                        .map(|id| id.identity_key)
+                        .ok_or_else(|| ScpError::Identity {
+                            msg: "identity missing core_id — cannot derive pseudonym".into(),
+                            code: codes::IDENT_1054.to_owned(),
                         })?;
-                        custody
-                            .0
-                            .derive_pseudonym(&identity_key, handle.context_id.as_bytes())
+                    let pseudonym_pk = if let Some(ref cb) = identity.callback_custody {
+                        cb.derive_pseudonym(&identity_key, handle.context_id.as_bytes())
                             .await
                             .map_err(|e| ScpError::Identity {
                                 msg: format!("pseudonym derivation failed: {e}"),
-                                code: "SCP-IDENTITY-0002".into(),
+                                code: codes::IDENT_1055.to_owned(),
                             })?
                             .public_key
-                    }
-                    #[cfg(not(feature = "allow_in_memory_custody"))]
-                    {
-                        return Err(ScpError::Identity {
-                            msg: "no custody provider available for pseudonym derivation".into(),
-                            code: "SCP-IDENTITY-0003".into(),
-                        });
-                    }
-                };
-                let local_pseudonym: [u8; 32] =
+                    } else {
+                        #[cfg(feature = "allow_in_memory_custody")]
+                        {
+                            let custody = identity.in_memory_custody.as_ref().ok_or_else(|| {
+                                ScpError::Identity {
+                                    msg: "no custody provider available for pseudonym derivation"
+                                        .into(),
+                                    code: codes::IDENT_1056.to_owned(),
+                                }
+                            })?;
+                            custody
+                                .0
+                                .derive_pseudonym(&identity_key, handle.context_id.as_bytes())
+                                .await
+                                .map_err(|e| ScpError::Identity {
+                                    msg: format!("pseudonym derivation failed: {e}"),
+                                    code: codes::IDENT_1055.to_owned(),
+                                })?
+                                .public_key
+                        }
+                        #[cfg(not(feature = "allow_in_memory_custody"))]
+                        {
+                            return Err(ScpError::Identity {
+                                msg: "no custody provider available for pseudonym derivation"
+                                    .into(),
+                                code: codes::IDENT_1056.to_owned(),
+                            });
+                        }
+                    };
                     pseudonym_pk
                         .as_bytes()
                         .try_into()
                         .map_err(|_| ScpError::Identity {
                             msg: "pseudonym public key must be 32 bytes".into(),
-                            code: "SCP-IDENTITY-0004".into(),
-                        })?;
+                            code: codes::IDENT_1057.to_owned(),
+                        })?
+                };
 
                 manager
                     .join_context(
@@ -14193,63 +14211,72 @@ impl Scp {
                 bi.init_context_manager_with_did(&export.exporter_did.0);
 
                 // §9.10.4: Derive the importer's OWN per-context pseudonym BEFORE
-                // the runtime import. Hard error on custody / derivation failure
-                // for encrypted contexts — no silent zero-pseudonym fallback
+                // the runtime import. Broadcast contexts have NO per-member
+                // pseudonym (spec §5.14): the runtime builds
+                // `ContextRouting::Broadcast` and ignores this argument, so we
+                // skip derivation entirely — deriving would force a custody
+                // requirement with no cryptographic basis, denying broadcast
+                // imports when custody is absent. Encrypted / pseudonymous
+                // imports require a real pseudonym: custody / derivation failure
+                // there is a hard error, no silent zero-pseudonym fallback
                 // (would reintroduce the membership-enumeration attack vector).
-                // Broadcast contexts don't use per-member pseudonyms; the runtime
-                // ignores the value for that mode, but we still derive so the
-                // post-import announcement path works uniformly.
-                let identity_key = importer_identity
-                    .core_id
-                    .as_ref()
-                    .map(|id| id.identity_key)
-                    .ok_or_else(|| ScpError::Identity {
-                        msg: "importer identity missing core_id — cannot derive pseudonym".into(),
-                        code: "SCP-IDENTITY-0001".into(),
-                    })?;
-                let pseudonym_pk = if let Some(ref cb) = importer_identity.callback_custody {
-                    cb.derive_pseudonym(&identity_key, context_id.as_bytes())
-                        .await
-                        .map_err(|e| ScpError::Identity {
-                            msg: format!("pseudonym derivation failed: {e}"),
-                            code: "SCP-IDENTITY-0002".into(),
-                        })?
-                        .public_key
-                } else {
-                    #[cfg(feature = "allow_in_memory_custody")]
-                    {
-                        let imc = importer_identity
-                            .in_memory_custody
-                            .as_ref()
-                            .ok_or_else(|| ScpError::Identity {
-                                msg: "no custody provider available for pseudonym derivation".into(),
-                                code: "SCP-IDENTITY-0003".into(),
-                            })?;
-                        imc.0
-                            .derive_pseudonym(&identity_key, context_id.as_bytes())
-                            .await
-                            .map_err(|e| ScpError::Identity {
-                                msg: format!("pseudonym derivation failed: {e}"),
-                                code: "SCP-IDENTITY-0002".into(),
-                            })?
-                            .public_key
-                    }
-                    #[cfg(not(feature = "allow_in_memory_custody"))]
-                    {
-                        return Err(ScpError::Identity {
-                            msg: "no custody provider available for pseudonym derivation".into(),
-                            code: "SCP-IDENTITY-0003".into(),
-                        });
-                    }
-                };
                 let local_pseudonym: [u8; 32] =
-                    pseudonym_pk
-                        .as_bytes()
-                        .try_into()
-                        .map_err(|_| ScpError::Identity {
-                            msg: "pseudonym public key must be 32 bytes".into(),
-                            code: "SCP-IDENTITY-0004".into(),
-                        })?;
+                    if matches!(mode, scp_core::context::params::ContextMode::Broadcast) {
+                        [0u8; 32]
+                    } else {
+                        let identity_key = importer_identity
+                            .core_id
+                            .as_ref()
+                            .map(|id| id.identity_key)
+                            .ok_or_else(|| ScpError::Identity {
+                                msg: "importer identity missing core_id — cannot derive pseudonym"
+                                    .into(),
+                                code: codes::IDENT_1054.to_owned(),
+                            })?;
+                        let pseudonym_pk = if let Some(ref cb) = importer_identity.callback_custody {
+                            cb.derive_pseudonym(&identity_key, context_id.as_bytes())
+                                .await
+                                .map_err(|e| ScpError::Identity {
+                                    msg: format!("pseudonym derivation failed: {e}"),
+                                    code: codes::IDENT_1055.to_owned(),
+                                })?
+                                .public_key
+                        } else {
+                            #[cfg(feature = "allow_in_memory_custody")]
+                            {
+                                let imc = importer_identity.in_memory_custody.as_ref().ok_or_else(
+                                    || ScpError::Identity {
+                                        msg: "no custody provider available for pseudonym derivation"
+                                            .into(),
+                                        code: codes::IDENT_1056.to_owned(),
+                                    },
+                                )?;
+                                imc.0
+                                    .derive_pseudonym(&identity_key, context_id.as_bytes())
+                                    .await
+                                    .map_err(|e| ScpError::Identity {
+                                        msg: format!("pseudonym derivation failed: {e}"),
+                                        code: codes::IDENT_1055.to_owned(),
+                                    })?
+                                    .public_key
+                            }
+                            #[cfg(not(feature = "allow_in_memory_custody"))]
+                            {
+                                return Err(ScpError::Identity {
+                                    msg: "no custody provider available for pseudonym derivation"
+                                        .into(),
+                                    code: codes::IDENT_1056.to_owned(),
+                                });
+                            }
+                        };
+                        pseudonym_pk
+                            .as_bytes()
+                            .try_into()
+                            .map_err(|_| ScpError::Identity {
+                                msg: "pseudonym public key must be 32 bytes".into(),
+                                code: codes::IDENT_1057.to_owned(),
+                            })?
+                    };
 
                 let manager = bi.context_manager_or_error()?;
                 manager
