@@ -46,6 +46,13 @@ ignore = [
     # openmls_libcrux_crypto -> libcrux-aead. Standalone MAC not used by SCP;
     # OpenMLS uses AEAD path which is unaffected. Awaiting openmls upgrade.
     "RUSTSEC-2026-0073",
+    # libcrux-chacha20poly1305: panic when caller supplies a ciphertext buffer
+    # longer than `ptxt.len() + TAG_LEN`. Transitive via openmls ->
+    # openmls_libcrux_crypto -> libcrux-aead. SCP never sizes the ciphertext
+    # buffer from attacker-controlled input — buffer length is always
+    # `ptxt.len() + TAG_LEN` per the AEAD trait contract OpenMLS implements.
+    # Awaiting openmls / libcrux upstream patch.
+    "RUSTSEC-2026-0124",
     # libcrux-sha3: incorrect incremental SHAKE XOF output. Transitive via
     # openmls -> openmls_libcrux_crypto. Awaiting openmls upgrade.
     "RUSTSEC-2026-0074",
