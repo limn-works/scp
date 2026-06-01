@@ -1218,6 +1218,24 @@ fn resolve_signing_key(
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
+/// Looks up the imported context's params from the manager so a temporary
+/// `ContextHandle` can be constructed for `send_pseudonym_announcement`.
+///
+/// The handle only needs to carry the correct `context_id` and `params`;
+/// membership and crypto state live in the `ContextManager`.
+fn export_manager_params(
+    context_id: &str,
+    mgr: &std::sync::Arc<scp_core::context::ContextManager>,
+    rt: &tokio::runtime::Runtime,
+) -> PyResult<scp_core::context::params::ContextParams> {
+    let ctx_id = context_id.to_owned();
+    let mgr_clone = mgr.clone();
+    rt.block_on(async move { mgr_clone.context_params(&ctx_id).await })
+        .ok_or_else(|| {
+            PyRuntimeError::new_err(format!("context '{context_id}' not registered after import"))
+        })
+}
+
 /// Validates all user-controlled string fields on a governance action.
 #[cfg(test)]
 fn validate_governance_action_strings(
@@ -2410,16 +2428,19 @@ impl crate::scp::PyScp {
     /// - `RuntimeError` if deserialization, validation, or import fails.
     /// - `ValueError` if the data is malformed.
     #[pyo3(signature = (data,))]
-    pub fn context_import(&self, data: &[u8]) -> PyResult<String> {
+    pub fn context_import(&self, data: &[u8], importer_did: &str) -> PyResult<String> {
         let bi = &*self.inner;
         let export = scp_core::context::export_import::deserialize_export(data).map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("invalid export data: {e}"))
         })?;
 
         let context_id = export.snapshot.context_id.clone();
+        let mode = export.snapshot.context_params.mode;
 
-        // Validate the exporter DID before passing to init_context_manager (#1324).
+        // Validate the exporter DID (retained for MLS credential binding below)
+        // and the importer DID (used for pseudonym derivation).
         validate::validate_did(&export.exporter_did.0)?;
+        validate::validate_did(importer_did)?;
 
         // Ensure the ContextManager is initialized — context_import is a valid
         // first operation (e.g. a device receiving exported context data).
@@ -2436,8 +2457,57 @@ impl crate::scp::PyScp {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         let mgr = mgr.clone();
 
-        rt.block_on(mgr.import_context(export, [0u8; 32]))
+        // §9.10.4: Derive the importer's OWN per-context pseudonym before the
+        // runtime import. Hard error on custody/derivation failure for encrypted
+        // contexts — no silent zero-pseudonym fallback (that would reintroduce
+        // the zero-pseudonym / membership-enumeration attack). Broadcast
+        // contexts don't use per-member pseudonyms; the runtime's
+        // `build_routing_for_mode` ignores the value for that mode.
+        let local_pseudonym: [u8; 32] = crate::runtime::with_identity(bi, importer_did, |entry| {
+            let rt = crate::runtime().map_err(|e| {
+                crate::error::ScpPyError::identity(format!("runtime not available: {e}"))
+            })?;
+            let pseudonym = rt.block_on(async {
+                entry
+                    .custody
+                    .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
+                    .await
+            });
+            let pk = pseudonym
+                .map_err(|e| {
+                    crate::error::ScpPyError::identity(format!("pseudonym derivation failed: {e}"))
+                })?
+                .public_key;
+            let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
+                crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
+            })?;
+            Ok(bytes)
+        })
+        .map_err(|e| PyRuntimeError::new_err(format!("pseudonym derivation failed: {e}")))?;
+
+        rt.block_on(mgr.import_context(export, local_pseudonym))
             .map_err(|e| PyRuntimeError::new_err(format!("context import failed: {e}")))?;
+
+        // §9.10.4: Emit a PseudonymAnnouncement so peers learn this importer's
+        // per-context routing ID. Encrypted contexts only — broadcast contexts
+        // use the shared `broadcast_routing_id` and have no pseudonym registry.
+        // Without this announcement peers' registries remain stale and future
+        // app-message fan-out would miss the importer entirely.
+        if !matches!(mode, scp_core::context::params::ContextMode::Broadcast)
+            && let Ok(sk) = resolve_signing_key(bi, importer_did)
+        {
+            let core_params = export_manager_params(&context_id, &mgr, rt)?;
+            let sender_did = scp_identity::DID(importer_did.to_owned());
+            let temp_handle =
+                scp_core::context::ContextHandle::new(context_id.clone(), core_params);
+            rt.block_on(async {
+                let _ = temp_handle
+                    .transition_to(&scp_core::context::ContextState::Active)
+                    .await;
+                mgr.send_pseudonym_announcement(&temp_handle, &sender_did, &sk)
+                    .await;
+            });
+        }
 
         Ok(context_id)
     }

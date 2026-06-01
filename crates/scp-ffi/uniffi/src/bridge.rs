@@ -14151,7 +14151,26 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `context_import`.
-    pub async fn context_import(&self, data: Vec<u8>) -> Result<String, ScpError> {
+    ///
+    /// # Arguments
+    ///
+    /// * `data` — serialized context export bytes.
+    /// * `importer_identity` — the local identity importing the context.
+    ///   Required so the importer's own per-context pseudonym (§9.10.4) can
+    ///   be derived from their custody-held identity key. Passing `[0u8; 32]`
+    ///   here (the pre-fix behavior) would re-introduce the zero-pseudonym /
+    ///   membership-enumeration attack vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpError::Context` if deserialization, validation, or import
+    /// fails, or `ScpError::Identity` if the importer's pseudonym cannot be
+    /// derived from custody (e.g. no custody provider configured).
+    pub async fn context_import(
+        &self,
+        data: Vec<u8>,
+        importer_identity: Arc<Identity>,
+    ) -> Result<String, ScpError> {
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
@@ -14163,6 +14182,7 @@ impl Scp {
                         }
                     })?;
                 let context_id = export.snapshot.context_id.clone();
+                let mode = export.snapshot.context_params.mode;
 
                 // Ensure the ContextManager is initialized using the exporter's
                 // DID (carried on the envelope) — context_import is a valid
@@ -14172,11 +14192,112 @@ impl Scp {
                 validate_did(&export.exporter_did.0)?;
                 bi.init_context_manager_with_did(&export.exporter_did.0);
 
+                // §9.10.4: Derive the importer's OWN per-context pseudonym BEFORE
+                // the runtime import. Hard error on custody / derivation failure
+                // for encrypted contexts — no silent zero-pseudonym fallback
+                // (would reintroduce the membership-enumeration attack vector).
+                // Broadcast contexts don't use per-member pseudonyms; the runtime
+                // ignores the value for that mode, but we still derive so the
+                // post-import announcement path works uniformly.
+                let identity_key = importer_identity
+                    .core_id
+                    .as_ref()
+                    .map(|id| id.identity_key)
+                    .ok_or_else(|| ScpError::Identity {
+                        msg: "importer identity missing core_id — cannot derive pseudonym".into(),
+                        code: "SCP-IDENTITY-0001".into(),
+                    })?;
+                let pseudonym_pk = if let Some(ref cb) = importer_identity.callback_custody {
+                    cb.derive_pseudonym(&identity_key, context_id.as_bytes())
+                        .await
+                        .map_err(|e| ScpError::Identity {
+                            msg: format!("pseudonym derivation failed: {e}"),
+                            code: "SCP-IDENTITY-0002".into(),
+                        })?
+                        .public_key
+                } else {
+                    #[cfg(feature = "allow_in_memory_custody")]
+                    {
+                        let imc = importer_identity
+                            .in_memory_custody
+                            .as_ref()
+                            .ok_or_else(|| ScpError::Identity {
+                                msg: "no custody provider available for pseudonym derivation".into(),
+                                code: "SCP-IDENTITY-0003".into(),
+                            })?;
+                        imc.0
+                            .derive_pseudonym(&identity_key, context_id.as_bytes())
+                            .await
+                            .map_err(|e| ScpError::Identity {
+                                msg: format!("pseudonym derivation failed: {e}"),
+                                code: "SCP-IDENTITY-0002".into(),
+                            })?
+                            .public_key
+                    }
+                    #[cfg(not(feature = "allow_in_memory_custody"))]
+                    {
+                        return Err(ScpError::Identity {
+                            msg: "no custody provider available for pseudonym derivation".into(),
+                            code: "SCP-IDENTITY-0003".into(),
+                        });
+                    }
+                };
+                let local_pseudonym: [u8; 32] =
+                    pseudonym_pk
+                        .as_bytes()
+                        .try_into()
+                        .map_err(|_| ScpError::Identity {
+                            msg: "pseudonym public key must be 32 bytes".into(),
+                            code: "SCP-IDENTITY-0004".into(),
+                        })?;
+
                 let manager = bi.context_manager_or_error()?;
                 manager
-                    .import_context(export, [0u8; 32])
+                    .import_context(export, local_pseudonym)
                     .await
                     .map_err(ScpError::from)?;
+
+                // §9.10.4: Emit a PseudonymAnnouncement so peers learn this
+                // importer's per-context routing ID. Encrypted contexts only.
+                if !matches!(mode, scp_core::context::params::ContextMode::Broadcast) {
+                    let signing_key_handle = importer_identity
+                        .core_id
+                        .as_ref()
+                        .map(|id| id.active_signing_key);
+                    if let Some(key_handle) = signing_key_handle {
+                        let exported_sk = if let Some(ref cb) = importer_identity.callback_custody {
+                            cb.export_ed25519_signing_key(&key_handle).await.ok()
+                        } else {
+                            #[cfg(feature = "allow_in_memory_custody")]
+                            {
+                                match importer_identity.in_memory_custody.as_ref() {
+                                    Some(imc) => {
+                                        imc.0.export_ed25519_signing_key(&key_handle).await.ok()
+                                    }
+                                    None => None,
+                                }
+                            }
+                            #[cfg(not(feature = "allow_in_memory_custody"))]
+                            {
+                                None
+                            }
+                        };
+                        if let Some(sk) = exported_sk
+                            && let Some(params) = manager.context_params(&context_id).await
+                        {
+                            let sender_did = scp_identity::DID(importer_identity.did.clone());
+                            let temp_handle =
+                                scp_core::context::ContextHandle::new(context_id.clone(), params);
+                            let _ = temp_handle
+                                .transition_to(&scp_core::context::ContextState::Active)
+                                .await;
+                            manager
+                                .send_pseudonym_announcement(&temp_handle, &sender_did, &sk)
+                                .await;
+                        }
+                    }
+                }
+
                 Ok(context_id)
             })
             .await

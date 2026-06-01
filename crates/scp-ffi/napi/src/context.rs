@@ -2870,9 +2870,19 @@ pub(crate) async fn context_export_on(
 }
 
 /// Per-bridge-instance implementation of [`context_import`].
+///
+/// # Arguments
+///
+/// * `data` — serialized context export bytes.
+/// * `importer_identity` — the local identity handle importing the context.
+///   Required so the importer's own per-context pseudonym (§9.10.4) can be
+///   derived from their custody-held identity key. Passing `[0u8; 32]` here
+///   (the pre-fix behavior) would re-introduce the zero-pseudonym /
+///   membership-enumeration vector.
 pub(crate) async fn context_import_on(
     bi: &NapiBridgeInstance,
     data: Vec<u8>,
+    importer_identity: &NapiIdentity,
 ) -> napi::Result<String> {
     let export = scp_core::context::export_import::deserialize_export(&data).map_err(|e| {
         NapiError::from(ScpNapiError::Context {
@@ -2881,6 +2891,7 @@ pub(crate) async fn context_import_on(
         })
     })?;
     let context_id = export.snapshot.context_id.clone();
+    let mode = export.snapshot.context_params.mode;
 
     // Validate the exporter DID before passing to init_context_manager (#1324).
     validate_did(&export.exporter_did.0).map_err(|e| napi::Error::from(ScpNapiError::from(e)))?;
@@ -2891,11 +2902,60 @@ pub(crate) async fn context_import_on(
     // Passes the exporter DID to MlsCryptoProvider for real MLS encryption (#1294).
     crate::runtime::init_context_manager(bi, &export.exporter_did.0);
 
+    // §9.10.4: Derive the importer's OWN per-context pseudonym BEFORE the
+    // runtime import. Hard error on custody/derivation failure for encrypted
+    // contexts — no silent zero-pseudonym fallback (that would reintroduce
+    // the zero-pseudonym / membership-enumeration attack). Broadcast contexts
+    // don't use per-member pseudonyms; the runtime's `build_routing_for_mode`
+    // ignores the value for that mode, but we still derive so the post-import
+    // pseudonym announcement path works uniformly.
+    let local_pseudonym = derive_context_pseudonym(importer_identity, &context_id).await?;
+
     let manager = context_manager(bi)?;
     manager
-        .import_context(export, [0u8; 32])
+        .import_context(export, local_pseudonym)
         .await
         .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+    // §9.10.4: Emit a PseudonymAnnouncement so peers learn this importer's
+    // per-context routing ID. Encrypted contexts only — broadcast contexts
+    // use the shared `broadcast_routing_id` and carry no pseudonym registry.
+    // Without this announcement peers' registries stay stale and fan-out
+    // app-message sends would miss the importer entirely.
+    if !matches!(mode, scp_core::context::params::ContextMode::Broadcast) {
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            let importer_did = importer_identity.inner.did.clone();
+            let custody_and_key =
+                importer_identity
+                    .inner
+                    .in_memory_custody
+                    .as_ref()
+                    .and_then(|c| {
+                        importer_identity
+                            .inner
+                            .scp_identity
+                            .as_ref()
+                            .map(|id| (c.clone(), id.active_signing_key))
+                    });
+            if let Some((custody, key_handle)) = custody_and_key
+                && let Ok(sk) = custody.0.export_ed25519_signing_key(&key_handle).await
+            {
+                let sender_did = DID(importer_did.clone());
+                if let Some(params) = manager.context_params(&context_id).await {
+                    let temp_handle =
+                        scp_core::context::ContextHandle::new(context_id.clone(), params);
+                    let _ = temp_handle
+                        .transition_to(&scp_core::context::ContextState::Active)
+                        .await;
+                    manager
+                        .send_pseudonym_announcement(&temp_handle, &sender_did, &sk)
+                        .await;
+                }
+            }
+        }
+    }
+
     Ok(context_id)
 }
 
