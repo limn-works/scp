@@ -104,7 +104,12 @@ if [[ "$tool_name" == "Bash" ]]; then
             # (force-clobber `>|` / `>>|`) right after the operator, then
             # `[^[:space:]|]*` absorbs a path prefix (e.g.
             # `>| scripts/bridge-aliases.json`) before the basename.
-            if echo "$command_str" | grep -qE '\b(tee|mv|cp|cat[^|]*>|sed[[:space:]]+-i|python3?(\.[0-9]+)?[[:space:]]+-c)[[:space:]].*'"$basename" \
+            # `sed[[:space:]]+(-i|--in-place)[^[:space:]]*` matches every
+            # in-place form: GNU `sed -i`, BSD/macOS suffix-attached `sed -i''`
+            # / `sed -i.bak` (idiomatic on darwin), and `sed --in-place[=.bak]`.
+            # `[^[:space:]]*` absorbs the optional suffix before the common
+            # `[[:space:]].*basename` tail.
+            if echo "$command_str" | grep -qE '\b(tee|mv|cp|cat[^|]*>|sed[[:space:]]+(-i|--in-place)[^[:space:]]*|python3?(\.[0-9]+)?[[:space:]]+-c)[[:space:]].*'"$basename" \
                || echo "$command_str" | grep -qE '>>?\|?[[:space:]]*[^[:space:]|]*'"$basename"; then
                 echo "enforcement file protected (Bash write): $basename" >&2
                 echo "Detected an apparent write/redirect to a protected" \
