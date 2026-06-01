@@ -482,9 +482,13 @@ fn is_pseudonym_announcement_payload(payload: &[u8]) -> bool {
 /// - `broadcast_routing_id(context_id)` — the derivable `SHA-256(context_id)`
 ///   broadcast RID; same leak vector as above.
 ///
-/// Honest pseudonyms are `SHA-256` of a context keypair public key and will
-/// collide with these reserved values only with negligible probability, so
-/// rejecting them costs nothing for legitimate members.
+/// Honest pseudonyms are the raw 32-byte Ed25519 public key of the member's
+/// per-context keypair (the FFI announces `pseudonym.public_key.as_bytes()` —
+/// the value is stored and routed on verbatim, NOT hashed). They collide with
+/// these reserved values only with negligible probability, so rejecting them
+/// costs nothing for legitimate members. (Do not add a hash on any single
+/// path: routing compares the stored bytes directly, so hashing one side
+/// would silently break fan-out.)
 fn is_reserved_pseudonym(pseudonym: &[u8; 32], context_id: &str) -> bool {
     *pseudonym == [0u8; 32]
         || *pseudonym == scp_protocol::context::context_routing_id(context_id)
