@@ -4764,3 +4764,57 @@ async fn import_context_rebuilds_encrypted_routing_from_caller_pseudonym() {
         }
     }
 }
+
+/// §9.10.4 / FIX 4: `restore_context` must refuse to load a snapshot whose
+/// `context_params.mode` and `routing` variant disagree. A snapshot claiming
+/// `mode = Encrypted` with `routing = Broadcast` (or vice-versa) would
+/// otherwise materialize a `PerContextState` whose routing contradicts the
+/// encryption state, silently breaking every per-member invariant.
+#[tokio::test]
+async fn restore_context_rejects_mode_routing_variant_mismatch() {
+    use super::ContextPersistence as _;
+
+    let persistence = Arc::new(MockContextPersistence::default());
+
+    // Build an Encrypted-mode snapshot but pair it with Broadcast routing.
+    let mut snapshot = c3_test_snapshot("restore-mismatch-ctx");
+    assert_eq!(
+        snapshot.context_params.mode,
+        scp_protocol::context::ContextMode::Encrypted
+    );
+    // c3_test_snapshot already sets routing = Broadcast, producing the
+    // inconsistency we want. Make it explicit + non-degraded so the
+    // consistency check is the only thing that can reject it.
+    snapshot.routing = super::ContextRouting::Broadcast;
+    snapshot.needs_reconnect = false;
+    persistence
+        .persist_context("restore-mismatch-ctx", &snapshot)
+        .unwrap();
+
+    let manager = ContextManager::with_persistence(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        Box::new(SharedMockPersistence(Arc::clone(&persistence))),
+        noop_key_resolver(),
+    );
+
+    let handle = ContextHandle::new(
+        "restore-mismatch-ctx".to_owned(),
+        snapshot.context_params.clone(),
+    );
+
+    let result = manager
+        .restore_context("restore-mismatch-ctx", &handle)
+        .await;
+
+    match result {
+        Err(ContextError::PersistenceFailed(msg)) => {
+            assert!(
+                msg.contains("mode") && msg.contains("routing"),
+                "error must mention both mode and routing: {msg}"
+            );
+        }
+        other => panic!("expected PersistenceFailed on mode/routing mismatch, got: {other:?}"),
+    }
+}
