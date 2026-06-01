@@ -315,8 +315,8 @@ public extension SCP {
     }
 
     /// Forwards to ``Scp/contextImport`` on ``inner``.
-    func contextImport(data: Data) async throws -> String {
-        try await inner.contextImport(data: data)
+    func contextImport(data: Data, importerIdentity: Identity) async throws -> String {
+        try await inner.contextImport(data: data, importerIdentity: importerIdentity)
     }
 
     /// Forwards to ``Scp/contextIsMember`` on ``inner``.

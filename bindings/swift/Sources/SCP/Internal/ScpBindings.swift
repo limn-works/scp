@@ -2207,8 +2207,8 @@ public protocol ScpProtocol: AnyObject, Sendable {
     /**
      * Per-instance equivalent of the free-function `context_import`.
      */
-    func contextImport(data: Data) async throws  -> String
-    
+    func contextImport(data: Data, importerIdentity: Identity) async throws  -> String
+
     /**
      * Per-instance equivalent of the free-function `context_is_member`.
      *
@@ -3780,13 +3780,13 @@ open func contextHandleTtlExpiry(handle: ContextHandle)async throws   {
     /**
      * Per-instance equivalent of the free-function `context_import`.
      */
-open func contextImport(data: Data)async throws  -> String  {
+open func contextImport(data: Data, importerIdentity: Identity)async throws  -> String  {
     return
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_scp_ffi_uniffi_fn_method_scp_context_import(
                     self.uniffiClonePointer(),
-                    FfiConverterData.lower(data)
+                    FfiConverterData.lower(data),FfiConverterTypeIdentity_lower(importerIdentity)
                 )
             },
             pollFunc: ffi_scp_ffi_uniffi_rust_future_poll_rust_buffer,
