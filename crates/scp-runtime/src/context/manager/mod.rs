@@ -2460,7 +2460,7 @@ impl ContextManager {
                 // snapshot's `context_params.mode` stays consistent with
                 // whatever it was before (prevents mode flip-flopping across
                 // successive degraded writes).
-                Some(existing.context_params.mode)
+                existing.context_params.mode
             }
             Ok(None) => {
                 // No prior persisted snapshot for this context. The mode is
@@ -2495,7 +2495,11 @@ impl ContextManager {
                 return;
             }
         };
-        let mode = prior_mode.unwrap_or(ContextMode::Encrypted);
+        // Every `None`-producing match arm returns early, so `prior_mode` is
+        // always a concrete `ContextMode` here — the type no longer admits a
+        // guessed `Encrypted` default that could be paired with a mismatched
+        // routing variant.
+        let mode = prior_mode;
         let snapshot = Self::build_degraded_snapshot(context_id, mode);
         if let Err(e) = persistence.persist_context(context_id, &snapshot) {
             crate::metrics::record_persistence_failure();
