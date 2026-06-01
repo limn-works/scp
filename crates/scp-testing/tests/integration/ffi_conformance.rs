@@ -144,7 +144,6 @@ struct BridgeExemptions {
 struct ExemptionEntry {
     canonical: String,
     #[serde(default)]
-    #[allow(dead_code)]
     reason: String,
 }
 
@@ -997,6 +996,87 @@ fn napi_bridge_covers_core_operations() {
          implemented but still listed as exempt): {stale_exemptions:?}. \
          Remove them from exemptions.napi."
     );
+}
+
+/// Returns true iff `reason` cites a DURABLE provenance artifact: an ADR
+/// (`ADR-NNN`), a spec section (`§N…`), or a PRD story (`SCP-NNN`). Issue /
+/// PR numbers are deliberately NOT accepted — they are ephemeral and project
+/// policy forbids issue references in tracked source/data. An exemption is a
+/// permanent statement that an operation is intentionally absent from a
+/// bridge; it must point at the artifact that justifies the absence, not at a
+/// mutable ticket or a hand-wave like "known gap".
+fn cites_durable_provenance(reason: &str) -> bool {
+    // `prefix` immediately followed by an ASCII digit (e.g. `ADR-0`, `SCP-2`,
+    // `§9`). `§` is a 2-byte UTF-8 char, so `i + prefix.len()` lands on a char
+    // boundary and the slice is safe.
+    let has_numbered = |prefix: &str| {
+        reason.match_indices(prefix).any(|(i, _)| {
+            reason[i + prefix.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })
+    };
+    has_numbered("ADR-") || has_numbered("SCP-") || has_numbered("§")
+}
+
+/// Every per-bridge exemption MUST justify itself by citing a durable
+/// provenance artifact (ADR / spec section / PRD story). This closes the
+/// hole where an exemption could be added with an unsubstantiated reason
+/// ("not yet implemented", "known gap") that silently suppresses a real
+/// parity finding forever. The exemption is the override for the
+/// coverage gate — so the override itself must trace to an artifact, per the
+/// project's provenance-everywhere tenet.
+#[test]
+fn every_exemption_reason_cites_durable_provenance() {
+    let file = aliases();
+    let mut offenders: Vec<String> = Vec::new();
+    for (bridge, entries) in [
+        ("pyo3", &file.exemptions.pyo3),
+        ("uniffi", &file.exemptions.uniffi),
+        ("napi", &file.exemptions.napi),
+        ("wasm", &file.exemptions.wasm),
+    ] {
+        for entry in entries {
+            if !cites_durable_provenance(&entry.reason) {
+                offenders.push(format!(
+                    "{bridge}/{}: reason {:?} cites no ADR-/§/SCP- artifact",
+                    entry.canonical, entry.reason
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "bridge-aliases.json exemption(s) lack durable provenance \
+         (cite an ADR-NNN, spec §section, or SCP-NNN story — not an issue \
+         number, not a hand-wave): {offenders:#?}"
+    );
+}
+
+#[test]
+fn provenance_detector_accepts_durable_artifacts() {
+    assert!(cites_durable_provenance(
+        "WASM lacks the tokio runtime per ADR-034"
+    ));
+    assert!(cites_durable_provenance(
+        "Sender-side key layer, separate from MLS (spec §9.16)"
+    ));
+    assert!(cites_durable_provenance(
+        "Tracked by PRD story SCP-214 criterion 10"
+    ));
+}
+
+#[test]
+fn provenance_detector_rejects_hand_waves_and_issue_refs() {
+    // Hand-wave with no artifact.
+    assert!(!cites_durable_provenance("not yet exported (known gap)"));
+    // Issue / PR numbers are ephemeral and policy-forbidden — not provenance.
+    assert!(!cites_durable_provenance("see issue #1543 and PR #1735"));
+    // Bare prefix with no number must not pass.
+    assert!(!cites_durable_provenance("documented in an ADR- somewhere"));
+    assert!(!cites_durable_provenance("see § for details"));
+    assert!(!cites_durable_provenance(""));
 }
 
 /// WASM bridge has intentionally fewer operations per ADR-034.

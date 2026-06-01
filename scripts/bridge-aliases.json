@@ -67,7 +67,9 @@
       "uniffi": [
         "identity_migrate"
       ],
-      "napi": [],
+      "napi": [
+        "migrate"
+      ],
       "wasm": [
         "identity_migrate"
       ]
@@ -2995,12 +2997,7 @@
     "_comment": "Per-bridge exemptions for operations that are intentionally not implemented in that bridge. This is a MIRROR of the language-level exemptions in .docs/standards/sdk-capability-matrix.json, keyed by bridge name (pyo3 / uniffi / napi / wasm) rather than SDK language. The symmetry script consults this map in addition to the wasm_required flag before emitting a finding.",
     "pyo3": [],
     "uniffi": [],
-    "napi": [
-      {
-        "canonical": "identity_migrate",
-        "reason": "not yet exported in NAPI bridge (known gap)"
-      }
-    ],
+    "napi": [],
     "wasm": [
       {
         "canonical": "scpid_verify",
