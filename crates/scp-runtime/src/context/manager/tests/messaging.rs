@@ -5117,6 +5117,147 @@ async fn reserved_pseudonym_announcement_rejected() {
     }
 }
 
+/// FIX 4 (§9.10.4 defense-in-depth): a member announcing a pseudonym value
+/// that is already registered under a DIFFERENT member's DID must be rejected
+/// at ingest, and the registry must keep the original owner's mapping. A
+/// member re-announcing the SAME value for their OWN DID (key-rotation
+/// rebroadcast) must still be accepted.
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // One scenario: reject cross-DID collision + accept same-DID re-announce.
+async fn announcement_colliding_with_other_member_rid_rejected() {
+    use super::super::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
+
+    const CTX: &str = "collision-pseudonym-ctx";
+    // A non-reserved value owned by an existing peer (Carol).
+    let carol_rid = [0x5Au8; 32];
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    manager.register_local_did("did:key:alice".into()).await;
+    let _handle = manager
+        .create_context(
+            CTX.into(),
+            governance_params(),
+            "did:key:alice".into(),
+            [0u8; 32],
+        )
+        .await
+        .unwrap();
+
+    // Seed Carol's RID into the registry and register Bob as a member.
+    {
+        let arc = manager.get_context_arc(CTX).unwrap();
+        let mut guard = arc.lock().await;
+        let ctx = &mut *guard;
+        if let super::ContextRouting::Pseudonymous {
+            pseudonym_registry, ..
+        } = &mut ctx.routing
+        {
+            pseudonym_registry.insert("did:key:carol".into(), carol_rid);
+        }
+        ctx.membership
+            .add_member("did:key:bob".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:bob".to_owned());
+        let bob_did: DID = "did:key:bob".into();
+        let _ = scp_protocol::context::roles::system_assign_role(
+            &mut ctx.role_state,
+            &bob_did,
+            "member",
+            &scp_primitives::SystemClock,
+        );
+    }
+
+    let context_id_bytes = scp_protocol::context::context_id_bytes(CTX);
+
+    // Bob announces Carol's RID — must be rejected.
+    let collide = PseudonymAnnouncement {
+        tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+        member_did: "did:key:bob".to_owned(),
+        pseudonym: carol_rid,
+    };
+    let payload = rmp_serde::to_vec_named(&collide).unwrap();
+    let inner = minimal_inner_envelope(CTX, "did:key:bob", 1);
+    let result = manager
+        .deliver_message_and_drain_buffered(
+            CTX,
+            &context_id_bytes,
+            "did:key:bob",
+            &inner,
+            &payload,
+            false,
+        )
+        .await;
+    assert!(
+        matches!(
+            result,
+            Err(scp_protocol::context::ContextError::PermissionDenied(_))
+        ),
+        "announcing another member's RID must be rejected, got {result:?}"
+    );
+
+    // Registry must be unchanged: Carol still owns the RID, Bob has none.
+    {
+        let arc = manager.get_context_arc(CTX).unwrap();
+        let guard = arc.lock().await;
+        let registry = guard
+            .routing
+            .peer_registry()
+            .expect("encrypted context has a peer registry");
+        assert_eq!(
+            registry.get("did:key:carol"),
+            Some(&carol_rid),
+            "Carol's RID must remain unchanged after a colliding announcement"
+        );
+        assert!(
+            !registry.contains_key("did:key:bob"),
+            "Bob's colliding announcement must not be stored"
+        );
+    }
+
+    // Carol re-announcing her OWN RID (same value, same DID) must be allowed.
+    manager.register_local_did("did:key:carol".into()).await;
+    {
+        let arc = manager.get_context_arc(CTX).unwrap();
+        let mut guard = arc.lock().await;
+        let ctx = &mut *guard;
+        ctx.membership
+            .add_member("did:key:carol".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:carol".to_owned());
+        let carol_did: DID = "did:key:carol".into();
+        let _ = scp_protocol::context::roles::system_assign_role(
+            &mut ctx.role_state,
+            &carol_did,
+            "member",
+            &scp_primitives::SystemClock,
+        );
+    }
+    let reannounce = PseudonymAnnouncement {
+        tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+        member_did: "did:key:carol".to_owned(),
+        pseudonym: carol_rid,
+    };
+    let payload = rmp_serde::to_vec_named(&reannounce).unwrap();
+    let inner = minimal_inner_envelope(CTX, "did:key:carol", 1);
+    let result = manager
+        .deliver_message_and_drain_buffered(
+            CTX,
+            &context_id_bytes,
+            "did:key:carol",
+            &inner,
+            &payload,
+            false,
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "same-DID re-announce of one's own RID must be allowed, got {result:?}"
+    );
+}
+
 // -----------------------------------------------------------------------
 // Event channel tests (#1539 AC3)
 // -----------------------------------------------------------------------

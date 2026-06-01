@@ -348,6 +348,18 @@ fn deliver_plaintext_or_announcement(
         // Broadcast contexts should never receive a pseudonym announcement;
         // if one arrives we drop it without updating state.
         if let Some(pseudonym_registry) = ctx.routing.peer_registry_mut() {
+            // §9.10.4 defense-in-depth: reject a routing ID already claimed by
+            // a DIFFERENT member. Same-DID re-announce (key-rotation rebroadcast)
+            // is still allowed. Leave the registry unchanged on collision.
+            if pseudonym_collides_with_other_did(pseudonym_registry, &did, &announcement.pseudonym)
+            {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    "pseudonym announcement collides with another member's routing ID — dropping"
+                );
+                return None;
+            }
             pseudonym_registry.insert(did.clone(), announcement.pseudonym);
         } else {
             tracing::warn!(
@@ -493,6 +505,29 @@ fn is_reserved_pseudonym(pseudonym: &[u8; 32], context_id: &str) -> bool {
     *pseudonym == [0u8; 32]
         || *pseudonym == scp_protocol::context::context_routing_id(context_id)
         || *pseudonym == scp_protocol::context::broadcast_routing_id(context_id)
+}
+
+/// Returns `true` if `pseudonym` is already registered in `registry` under a
+/// DID OTHER than `announcer_did` (§9.10.4 defense-in-depth).
+///
+/// The announcement path already enforces `announcement.member_did ==
+/// sender_did`, so a member can only announce a routing ID for their own DID.
+/// This guards the remaining vector: a member claiming a routing ID that an
+/// existing peer already legitimately uses. Accepting it would let two DIDs
+/// resolve to the same routing ID — a relay would then receive both members'
+/// app-data fan-out at one address, and honest senders addressing the
+/// colliding DID could misroute to the wrong member. A member re-announcing
+/// the SAME value for their OWN DID is legitimate (key rotation re-broadcast)
+/// and is NOT a collision, so the `other_did != announcer_did` clause must
+/// hold for a hit.
+fn pseudonym_collides_with_other_did(
+    registry: &super::HashMap<DID, [u8; 32]>,
+    announcer_did: &DID,
+    pseudonym: &[u8; 32],
+) -> bool {
+    registry.iter().any(|(other_did, other_pseudonym)| {
+        other_pseudonym == pseudonym && other_did != announcer_did
+    })
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -1561,6 +1596,24 @@ impl ContextManager {
             // contexts. Broadcast contexts should never carry pseudonym
             // announcements; reject as a spec-level violation.
             if let Some(pseudonym_registry) = ctx.routing.peer_registry_mut() {
+                // §9.10.4 defense-in-depth: reject a routing ID already claimed
+                // by a DIFFERENT member. Same-DID re-announce (key-rotation
+                // rebroadcast) stays allowed. Registry left unchanged on
+                // collision — consistent with the reserved-value rejection above.
+                if pseudonym_collides_with_other_did(
+                    pseudonym_registry,
+                    &announced_did,
+                    &announcement.pseudonym,
+                ) {
+                    tracing::warn!(
+                        context_id,
+                        sender_did,
+                        "pseudonym announcement collides with another member's routing ID — rejecting"
+                    );
+                    return Err(ContextError::PermissionDenied(
+                        "pseudonym announcement collides with another member's routing ID".into(),
+                    ));
+                }
                 pseudonym_registry.insert(announced_did.clone(), announcement.pseudonym);
             } else {
                 return Err(ContextError::PermissionDenied(
