@@ -2958,8 +2958,9 @@ pub fn check_scoped_capability(
     granted_capabilities: Vec<String>,
     required_capability: String,
 ) -> bool {
-    // Pure capability check — no bridge-instance state involved, so there's
-    // no per-instance `_on` variant. The `Scp` method just forwards directly.
+    // Pure capability check — no bridge-instance state involved, so it is a
+    // module-level free fn (ADR-048 §1), not a method on the `Scp` object, and
+    // has no per-instance `_on` variant.
     check_scoped_capability_inner(granted_capabilities, required_capability)
 }
 
