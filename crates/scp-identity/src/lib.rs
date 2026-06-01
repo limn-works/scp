@@ -48,9 +48,9 @@ pub use attestation::{
 };
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use dht::{
-    DidDht, InMemorySequenceStore, PostResolveHook, SequenceStore, decode_multibase_key,
-    did_from_ed25519_public_key, extract_public_key, verify_bep44_signature, verify_migration,
-    verify_self_certification,
+    DidDht, InMemorySequenceStore, MigrationPartialState, PostResolveHook, SequenceStore,
+    decode_multibase_key, did_from_ed25519_public_key, extract_public_key, verify_bep44_signature,
+    verify_migration, verify_self_certification,
 };
 // SigningKeyId re-exported from scp-primitives (see pub use above).
 pub use dht_client::{DhtClient, InMemoryDhtClient};
@@ -152,6 +152,47 @@ impl std::fmt::Debug for ScpIdentity {
             )
             .finish()
     }
+}
+
+/// Identifies which DHT publish step inside
+/// [`DidDht::migrate_identity`](crate::dht::DidDht::migrate_identity) failed,
+/// and therefore which step a resume attempt must re-run.
+///
+/// `migrate_identity` performs two DHT publishes:
+///
+/// - **Step 7** — publish the NEW DID document so verifiers following
+///   `alsoKnownAs[new_did]` always find a published successor. Failure here
+///   maps to [`MigrationResumePhase::PublishNew`]. Resume re-runs step 7,
+///   step 7b (destroy OLD operational keys), and step 8 (republish OLD
+///   document with `alsoKnownAs`).
+/// - **Step 8** — republish the OLD DID document with
+///   `alsoKnownAs = new_did` (with `#active`/`#agent` retired). Failure
+///   here maps to [`MigrationResumePhase::RepublishOldAlsoKnownAs`]. Resume
+///   re-runs only step 8 — the NEW document is already on the DHT, and
+///   OLD operational keys are already destroyed.
+///
+/// Carried inside [`IdentityError::MigrationPublishFailed`] alongside a
+/// [`MigrationPartialState`](crate::dht::MigrationPartialState) that holds
+/// the byte-identical artifacts the resume call must republish (spec
+/// §9.7.4.1, ADR-046 byte parity).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MigrationResumePhase {
+    /// Step 7 — publish of the NEW DID document failed.
+    ///
+    /// At the moment of failure, the OLD pre-rotation handle is consumed
+    /// (step 5), the NEW pre-rotation handle is registered in cold custody
+    /// (step 4), the NEW `#0`/`#active` are present in operational custody
+    /// (steps 5/3), and the OLD operational keys are still intact. Resume
+    /// re-runs step 7 (publish NEW), step 7b (destroy OLD operational keys),
+    /// and step 8 (publish OLD with `alsoKnownAs`).
+    PublishNew,
+    /// Step 8 — republish of the OLD DID document with `alsoKnownAs` failed.
+    ///
+    /// At the moment of failure, the NEW DID document is already published
+    /// (step 7 succeeded), and the OLD `#active` / `#agent` keys are already
+    /// destroyed (step 7b ran). The OLD `#0` is intentionally retained so
+    /// step 8 can re-sign the republish. Resume re-runs only step 8.
+    RepublishOldAlsoKnownAs,
 }
 
 /// Errors produced by identity operations.
@@ -262,6 +303,38 @@ pub enum IdentityError {
         count: usize,
         /// The maximum allowed.
         max: usize,
+    },
+
+    /// A DHT publish step inside [`DidDht::migrate_identity`](crate::dht::DidDht::migrate_identity)
+    /// failed AFTER the irreversible cold-custody mutation (step 5
+    /// `destroy_after_migration`) — meaning the caller cannot simply
+    /// re-invoke `migrate_identity`. The carried
+    /// [`MigrationPartialState`](crate::dht::MigrationPartialState) is the
+    /// byte-identical artifact set needed by
+    /// [`DidDht::resume_migration_publish`](crate::dht::DidDht::resume_migration_publish)
+    /// to finish the migration without re-deriving keys.
+    ///
+    /// `partial` is boxed to keep [`IdentityError`]'s size bounded — the
+    /// partial state holds two full identities, two documents, and a
+    /// rotation event, which would otherwise inflate every `Err` path in
+    /// the crate.
+    #[error("migration publish failed at {phase:?}: {source}")]
+    MigrationPublishFailed {
+        /// Which publish step failed; dictates which steps the resume
+        /// path must re-run.
+        phase: MigrationResumePhase,
+        /// The recovery handle — pass to
+        /// [`DidDht::resume_migration_publish`](crate::dht::DidDht::resume_migration_publish)
+        /// to finish the migration. Boxed to keep [`IdentityError`] size
+        /// bounded; the partial state aggregates two full identities,
+        /// two documents, the rotation event, and a pre-rotation handle.
+        partial: Box<crate::dht::MigrationPartialState>,
+        /// The underlying publish failure (DHT, relay, or sequence-store
+        /// error). Boxed for `IdentityError` size, and surfaced via
+        /// [`std::error::Error::source`] so callers can drill into the
+        /// root cause.
+        #[source]
+        source: Box<Self>,
     },
 }
 

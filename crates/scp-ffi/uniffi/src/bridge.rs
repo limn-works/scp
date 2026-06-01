@@ -616,6 +616,17 @@ impl From<scp_identity::IdentityError> for ScpError {
             };
         }
 
+        // `MigrationPublishFailed` is the typed recovery handle from
+        // `DidDht::migrate_identity` (phase-1 surface). Structured
+        // partial-state plumbing lands in subsequent PRs — this arm only
+        // surfaces the code + message body.
+        if matches!(&e, IE::MigrationPublishFailed { .. }) {
+            return Self::Identity {
+                msg: format!("{e}"),
+                code: codes::IDENT_1053.to_owned(),
+            };
+        }
+
         Self::Identity {
             msg: format!("{e} — check DID format, key custody configuration, or DHT connectivity"),
             code: codes::IDENT_1001.to_owned(),

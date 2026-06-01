@@ -33,7 +33,7 @@ use scp_platform::traits::{KeyCustody, KeyType, PreRotationCustody, PreRotationK
 use super::cache::{Clock, DidCache, DidResolutionResult, Staleness, SystemClock};
 use super::dht_client::{DhtClient, InMemoryDhtClient};
 use super::document::{DidDocument, DidRotationEvent, MigrationProof, PreRotationProof};
-use super::{DidMethod, IdentityError, ScpIdentity};
+use super::{DidMethod, IdentityError, MigrationResumePhase, ScpIdentity};
 
 /// The `did:dht` DID method prefix.
 const DID_DHT_PREFIX: &str = "did:dht:";
@@ -388,6 +388,99 @@ impl<D: DhtClient> DidDht<D, SystemClock> {
             sign_fn: None,
             sequence_store: None,
             post_resolve_hook: None,
+        }
+    }
+}
+
+/// Recovery handle for [`DidDht::migrate_identity`] DHT-publish failures.
+///
+/// `migrate_identity` performs two DHT publishes (step 7 publishes the NEW
+/// DID document, step 8 republishes the OLD document with `alsoKnownAs`).
+/// Both publishes happen AFTER the irreversible cold-custody mutation in
+/// step 5 (`PreRotationCustody::destroy_after_migration`), which consumes
+/// the OLD pre-rotation handle and surfaces its private bytes as the NEW
+/// `#0`. By the time either publish runs, the caller cannot recover by
+/// re-invoking `migrate_identity` (step 1's `reveal_public_key` would fail
+/// against the now-missing handle). Instead, when either publish fails,
+/// `migrate_identity` returns [`IdentityError::MigrationPublishFailed`]
+/// carrying this state, and the caller passes it to
+/// [`DidDht::resume_migration_publish`] to finish the migration.
+///
+/// # Byte-parity invariant
+///
+/// The carried [`Self::rotation_event`] holds the migration proof signed
+/// at step 2 (under the OLD `#0`) and the pre-rotation proof carrying the
+/// `revealed_key` bytes from step 1. Both are byte-identical to what a
+/// successful first-pass `migrate_identity` would have returned —
+/// `SHA-256(rotation_event.pre_rotation_proof.revealed_key) ==
+/// new_document.pre_rotation_service().commitment` MUST hold both before
+/// and after [`DidDht::resume_migration_publish`] succeeds (ADR-046 byte
+/// parity). Resume re-uses the carried artifacts verbatim; it does NOT
+/// re-derive keys or re-sign proofs.
+///
+/// # OLD `#0` retention contract
+///
+/// Step 7b (`destroy_old_operational_keys`) destroys the OLD `#active`
+/// and `#agent` keys but intentionally retains the OLD `#0`. Step 8 needs
+/// `#0` to sign the BEP44 publish of the OLD document with `alsoKnownAs`,
+/// and any later forwarding republish (recommended 90 days, ADR-003 §4b)
+/// uses the same key. [`Self::old_identity`] therefore continues to carry
+/// the OLD `#0` handle even after step 7b runs; consumers of this struct
+/// MUST NOT destroy it before resume completes.
+///
+/// # Idempotency
+///
+/// Calling [`DidDht::resume_migration_publish`] more than once with the
+/// same `MigrationPartialState` is safe: the second call republishes
+/// byte-identical documents under BEP44 sequence-number monotonicity (a
+/// new `seq` is allocated each time and the DHT accepts higher
+/// sequences), and step 7b's `destroy_key` is itself idempotent (it
+/// surfaces `KeyNotFound` as a `warn!` and proceeds). The carried
+/// artifacts are read-only.
+#[derive(Debug, Clone)]
+pub struct MigrationPartialState {
+    /// Which step failed; dictates which steps a resume call must re-run.
+    pub phase: MigrationResumePhase,
+    /// The NEW [`ScpIdentity`] constructed by step 6 (its `#0` is the
+    /// migrated OLD pre-rotation private key; its `#active` is a fresh
+    /// keypair generated at step 3). Resume publishes its document.
+    pub new_identity: ScpIdentity,
+    /// The NEW DID document constructed by step 6. Carried byte-identical
+    /// so resume re-publishes the same value the first pass would have.
+    pub new_document: DidDocument,
+    /// The [`DidRotationEvent`] hoisted from step 9 — signed at step 2
+    /// under the OLD `#0` and carrying the revealed pre-rotation public
+    /// from step 1. Returned verbatim by a successful resume so callers
+    /// can distribute it to active contexts (ADR-003 §4b).
+    pub rotation_event: DidRotationEvent,
+    /// The NEW pre-rotation handle registered in cold custody by step 4.
+    /// Caller persists this for the next migration cycle.
+    pub new_pre_rotation_handle: PreRotationKeyHandle,
+    /// The OLD [`ScpIdentity`] (the one passed into `migrate_identity`).
+    /// Its `#0` is still present in operational custody — step 8 uses it
+    /// to sign the republish — even after step 7b destroyed `#active`
+    /// (and `#agent` if present).
+    pub old_identity: ScpIdentity,
+    /// The OLD DID document. Resume clones this, calls
+    /// `set_also_known_as(new_identity.did)` +
+    /// `retire_operational_keys_for_migration()`, and publishes the
+    /// result under the OLD `#0`.
+    pub old_document: DidDocument,
+}
+
+impl MigrationPartialState {
+    /// Unpack the partial state from a
+    /// [`IdentityError::MigrationPublishFailed`] error. Returns `None`
+    /// for any other variant.
+    ///
+    /// Useful when a caller bubbled the error up through `?` and only
+    /// wants to peek at the recovery handle without destructuring the
+    /// `IdentityError` enum manually.
+    #[must_use]
+    pub fn from_error(err: &IdentityError) -> Option<&Self> {
+        match err {
+            IdentityError::MigrationPublishFailed { partial, .. } => Some(partial),
+            _ => None,
         }
     }
 }
@@ -1213,7 +1306,10 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
     ///
     /// Returns errors if key generation, signing, or DHT publishing fails.
     ///
-    /// See ADR-003 acceptance criterion 4b and spec §9.7.4.1 §6.
+    /// See ADR-003 acceptance criterion 4b and spec §9.7.4.1 §6, and
+    /// [`Self::resume_migration_publish`] for the recovery path when one
+    /// of the DHT publishes (step 7 or step 8) fails after the
+    /// cold-custody consumption point.
     pub async fn migrate_identity(
         &self,
         identity: &ScpIdentity,
@@ -1375,60 +1471,119 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             did: new_did.clone(),
         };
 
-        // Step 7: Publish the NEW DID document FIRST. Doing this before
-        // the OLD doc's `alsoKnownAs` update ensures verifiers who
-        // follow `alsoKnownAs[new_did]` will always find a published
-        // new document — there is no window where the old doc claims
-        // a successor that doesn't exist on the DHT yet.
-        self.publish_document(&new_identity, &new_document).await?;
-
-        // Step 7b (spec §9.12, "compromise recovery"): destroy the OLD
-        // identity's `#active` and (when present) `#agent` operational
-        // keys. See `destroy_old_operational_keys` for the rationale.
-        destroy_old_operational_keys(key_custody, identity).await;
-
-        // Step 8: Update the OLD DID document with `alsoKnownAs` pointing
-        // at the now-published new DID, and publish. A failure here
-        // leaves the new identity fully published and the OLD document
-        // unchanged on the DHT.
-        //
-        // Recovery is NOT a simple `migrate_identity` retry: by the
-        // time control reaches step 8, step 5 has consumed the OLD
-        // pre-rotation key (`destroy_after_migration`) and step 7b
-        // has destroyed the OLD `#active` (and `#agent` if present).
-        // A second call to `migrate_identity` would fail at step 1
-        // (`reveal_public_key` against a missing pre-rotation handle)
-        // and at step 2 (`build_migration_proof` cannot sign with a
-        // destroyed `#active`).
-        //
-        // Manual recovery requires calling `set_also_known_as` plus
-        // `publish_document` directly on this `DidDht` instance,
-        // signed with `old_identity.identity_key` (`#0`) which is
-        // intentionally retained in operational custody for exactly
-        // this case. A future SDK API surfacing
-        // partial-migration recovery is deliberately deferred to
-        // keep this fix scope-bounded.
-        let mut updated_old_doc = old_document.clone();
-        updated_old_doc.set_also_known_as(&new_did);
-        // Defense-in-depth (spec §9.12): the OLD document post-migration
-        // serves as a forwarding record only. Step 7b destroyed the
-        // OLD `#active` (and `#agent` if present) in operational
-        // custody; leaving those verification methods listed in the
-        // republished document would let a verifier still treat the
-        // destroyed keys as authoritative. `#0` is preserved (it
-        // signs this republish) and any `#retired-*` history from
-        // earlier Layer-1 rotations remains auditable.
-        updated_old_doc.retire_operational_keys_for_migration();
-        self.publish_document(identity, &updated_old_doc).await?;
-
-        // Step 9: Build and return the rotation event.
+        // Hoisted step 9: build `rotation_event` BEFORE step 7 so a
+        // partial-publish failure carries it back verbatim (ADR-046).
         let rotation_event = DidRotationEvent {
             old_did: identity.did.clone(),
-            new_did,
+            new_did: new_did.clone(),
             migration_proof,
             pre_rotation_proof,
             rotated_at,
         };
+
+        // Steps 7 + 7b + 8: run the publish chain. On failure, the helper
+        // wraps the partial state in `MigrationPublishFailed` so the
+        // caller can finish via `resume_migration_publish`. A retry of
+        // `migrate_identity` is impossible at this point — step 5
+        // already consumed the OLD pre-rotation handle.
+        self.run_migration_publish_chain(
+            MigrationPartialState {
+                phase: MigrationResumePhase::PublishNew,
+                new_identity,
+                new_document,
+                rotation_event,
+                new_pre_rotation_handle,
+                old_identity: identity.clone(),
+                old_document: old_document.clone(),
+            },
+            key_custody,
+        )
+        .await
+    }
+
+    /// Runs the publish chain (step 7 → step 7b → step 8) for a fresh or
+    /// resumed migration. The supplied `state.phase` controls where the
+    /// chain enters:
+    ///
+    /// - [`MigrationResumePhase::PublishNew`] — runs all three steps.
+    /// - [`MigrationResumePhase::RepublishOldAlsoKnownAs`] — runs only
+    ///   step 8 (step 7 already succeeded, step 7b already ran during
+    ///   the original `migrate_identity` call).
+    ///
+    /// On success: returns the artifacts the caller would otherwise have
+    /// received from a first-pass `migrate_identity`. On failure: returns
+    /// [`IdentityError::MigrationPublishFailed`] with a
+    /// [`MigrationPartialState`] reflecting the current phase the caller
+    /// must resume from.
+    async fn run_migration_publish_chain(
+        &self,
+        state: MigrationPartialState,
+        key_custody: &impl KeyCustody,
+    ) -> Result<
+        (
+            ScpIdentity,
+            DidDocument,
+            DidRotationEvent,
+            PreRotationKeyHandle,
+        ),
+        IdentityError,
+    > {
+        let MigrationPartialState {
+            phase,
+            new_identity,
+            new_document,
+            rotation_event,
+            new_pre_rotation_handle,
+            old_identity,
+            old_document,
+        } = state;
+
+        if phase == MigrationResumePhase::PublishNew {
+            // Step 7: publish the NEW DID document FIRST so verifiers
+            // following `alsoKnownAs[new_did]` always find a published
+            // successor.
+            if let Err(source) = self.publish_document(&new_identity, &new_document).await {
+                return Err(IdentityError::MigrationPublishFailed {
+                    phase: MigrationResumePhase::PublishNew,
+                    partial: Box::new(MigrationPartialState {
+                        phase: MigrationResumePhase::PublishNew,
+                        new_identity,
+                        new_document,
+                        rotation_event,
+                        new_pre_rotation_handle,
+                        old_identity,
+                        old_document,
+                    }),
+                    source: Box::new(source),
+                });
+            }
+
+            // Step 7b (spec §9.12, "compromise recovery"): destroy the
+            // OLD `#active` and (when present) `#agent` operational keys.
+            destroy_old_operational_keys(key_custody, &old_identity).await;
+        }
+
+        // Step 8: republish OLD with `alsoKnownAs` + retire OLD operational
+        // VMs (spec §9.12). On failure, surface a partial state at the
+        // step-8-only phase — the caller's next resume runs only step 8.
+        if let Err(source) = self
+            .publish_old_doc_with_also_known_as(&old_identity, &old_document, &new_identity.did)
+            .await
+        {
+            return Err(IdentityError::MigrationPublishFailed {
+                phase: MigrationResumePhase::RepublishOldAlsoKnownAs,
+                partial: Box::new(MigrationPartialState {
+                    phase: MigrationResumePhase::RepublishOldAlsoKnownAs,
+                    new_identity,
+                    new_document,
+                    rotation_event,
+                    new_pre_rotation_handle,
+                    old_identity,
+                    old_document,
+                }),
+                source: Box::new(source),
+            });
+        }
 
         Ok((
             new_identity,
@@ -1436,6 +1591,117 @@ impl<D: DhtClient, C: Clock> DidDht<D, C> {
             rotation_event,
             new_pre_rotation_handle,
         ))
+    }
+
+    /// Step-8 helper shared by [`Self::migrate_identity`] and
+    /// [`Self::resume_migration_publish`]: clone the OLD document, set
+    /// `alsoKnownAs` to `new_did`, retire its operational verification
+    /// methods (spec §9.12), and publish under the OLD `#0`.
+    ///
+    /// On failure: surfaces the underlying `publish_document` error so
+    /// the caller can wrap it in
+    /// [`IdentityError::MigrationPublishFailed`] with the correct
+    /// `MigrationPartialState`. This helper does NOT wrap on its own —
+    /// `migrate_identity` and `resume_migration_publish` own the partial
+    /// state they want to surface.
+    async fn publish_old_doc_with_also_known_as(
+        &self,
+        old_identity: &ScpIdentity,
+        old_document: &DidDocument,
+        new_did: &str,
+    ) -> Result<(), IdentityError> {
+        let mut updated_old_doc = old_document.clone();
+        updated_old_doc.set_also_known_as(new_did);
+        updated_old_doc.retire_operational_keys_for_migration();
+        self.publish_document(old_identity, &updated_old_doc).await
+    }
+
+    /// Finish a [`Self::migrate_identity`] call that returned
+    /// [`IdentityError::MigrationPublishFailed`].
+    ///
+    /// `migrate_identity` performs two DHT publishes (step 7 publishes the
+    /// NEW DID document; step 8 republishes the OLD document with
+    /// `alsoKnownAs`). Both publishes happen AFTER the irreversible
+    /// cold-custody consumption point (step 5
+    /// `destroy_after_migration`). When either publish fails, the caller
+    /// cannot recover by re-invoking `migrate_identity`: the OLD
+    /// pre-rotation handle is gone, the OLD `#active` is destroyed (if
+    /// step 7 succeeded but step 8 failed), and the NEW operational
+    /// keys are already minted. This function picks up exactly where
+    /// `migrate_identity` left off using the carried
+    /// [`MigrationPartialState`].
+    ///
+    /// # Behavior by phase
+    ///
+    /// - [`MigrationResumePhase::PublishNew`] — re-runs step 7 (publish
+    ///   NEW), step 7b (destroy OLD `#active`/`#agent`), and step 8
+    ///   (publish OLD with `alsoKnownAs`). If step 7 succeeds but step 8
+    ///   fails, returns `MigrationPublishFailed { phase:
+    ///   RepublishOldAlsoKnownAs, .. }` so the caller can resume from
+    ///   the step-8-only checkpoint without re-running step 7b.
+    /// - [`MigrationResumePhase::RepublishOldAlsoKnownAs`] — re-runs
+    ///   only step 8. Step 7b is NOT re-run (it already ran during the
+    ///   original `migrate_identity` call) — `destroy_key` is idempotent
+    ///   in practice (subsequent calls surface `KeyNotFound` and are
+    ///   logged as `warn!`), so re-running would be safe but is
+    ///   skipped to keep the resume path minimal.
+    ///
+    /// # Idempotency
+    ///
+    /// BEP44 publishes use a monotonically increasing sequence number
+    /// (see `publish_document`'s use of [`AtomicU64::fetch_add`]), so
+    /// republishing byte-identical documents under fresh sequences is
+    /// safe: peers accept the higher-`seq` record and the document
+    /// value is unchanged. Calling `resume_migration_publish` more than
+    /// once with the same state is therefore safe.
+    ///
+    /// # Byte parity (ADR-046)
+    ///
+    /// The returned `(new_identity, new_document, rotation_event,
+    /// new_pre_rotation_handle)` tuple is byte-identical to what a
+    /// successful first-pass `migrate_identity` would have returned —
+    /// it is moved out of the supplied `MigrationPartialState` verbatim.
+    /// In particular,
+    /// `SHA-256(rotation_event.pre_rotation_proof.revealed_key) ==
+    /// new_document.pre_rotation_service().commitment` holds without
+    /// re-derivation: the proof was signed at step 2 (under the OLD
+    /// `#0`, which is still in operational custody for step 8) and
+    /// carried verbatim.
+    ///
+    /// # OLD `#0` retention
+    ///
+    /// Step 7b destroys OLD `#active` and `#agent` but intentionally
+    /// retains OLD `#0`. Step 8 needs `#0` to sign the BEP44 publish.
+    /// `key_custody` is the parameter that holds it — pass the SAME
+    /// custody instance that was passed to the original `migrate_identity`
+    /// call. Passing a different one (or one from which OLD `#0` was
+    /// destroyed) will produce a sign error at step 8 surfaced as
+    /// `MigrationPublishFailed`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::MigrationPublishFailed`] if any publish
+    /// in the resume path fails. The returned partial state may carry
+    /// a different `phase` than the input — e.g. a `PublishNew`
+    /// resume that succeeds step 7 but fails step 8 returns a
+    /// `RepublishOldAlsoKnownAs` partial state.
+    pub async fn resume_migration_publish(
+        &self,
+        state: MigrationPartialState,
+        key_custody: &impl KeyCustody,
+    ) -> Result<
+        (
+            ScpIdentity,
+            DidDocument,
+            DidRotationEvent,
+            PreRotationKeyHandle,
+        ),
+        IdentityError,
+    > {
+        // Defer to the shared publish chain. `state.phase` selects the
+        // entry point: `PublishNew` re-runs steps 7 + 7b + 8;
+        // `RepublishOldAlsoKnownAs` runs only step 8.
+        self.run_migration_publish_chain(state, key_custody).await
     }
 
     /// Builds a migration proof by signing
@@ -6141,5 +6407,613 @@ mod tests {
         let (id1, _, _, _) = DidDht::create_in_memory().await.unwrap();
         let (id2, _, _, _) = DidDht::create_in_memory().await.unwrap();
         assert_ne!(id1.did, id2.did, "each call must produce a unique DID");
+    }
+
+    // -----------------------------------------------------------------------
+    // migrate_identity partial-publish recovery tests
+    //
+    // These tests assert the typed recovery handle surfaced when one of
+    // `migrate_identity`'s two DHT publishes (step 7 or step 8) fails after
+    // the irreversible cold-custody mutation (step 5
+    // `destroy_after_migration`). Spec §9.7.4.1 and ADR-003 §4b cover the
+    // protocol contract; ADR-046 governs the byte-parity invariant.
+    // -----------------------------------------------------------------------
+
+    /// Modes for [`FailingPublishDhtClient`]. Each variant decides what the
+    /// next `publish` call does.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum FailingPublishMode {
+        /// All publishes succeed and are forwarded to the inner
+        /// [`InMemoryDhtClient`].
+        Healthy,
+        /// Fail the FIRST publish (the step-7 publish of the NEW DID
+        /// document in `migrate_identity`).
+        FailOnNew,
+        /// Forward the first publish (step 7) but fail the second (step 8
+        /// republish of the OLD document with `alsoKnownAs`).
+        FailOnOldAfterNew,
+    }
+
+    /// DHT client that records publish order and can be driven to fail on
+    /// either the first or second publish during a single migration. Used
+    /// to construct controlled partial-publish failures.
+    ///
+    /// Mode is read once at the start of each `publish` and reflected in
+    /// the recorded outcome — the harness flips the mode atomically
+    /// between `migrate_identity` calls when simulating Failing → Healthy
+    /// transitions.
+    struct FailingPublishDhtClient {
+        published: tokio::sync::Mutex<Vec<String>>,
+        call_count: std::sync::atomic::AtomicUsize,
+        mode: tokio::sync::Mutex<FailingPublishMode>,
+        inner: InMemoryDhtClient,
+    }
+
+    impl FailingPublishDhtClient {
+        fn new(initial_mode: FailingPublishMode) -> Self {
+            Self {
+                published: tokio::sync::Mutex::new(Vec::new()),
+                call_count: std::sync::atomic::AtomicUsize::new(0),
+                mode: tokio::sync::Mutex::new(initial_mode),
+                inner: InMemoryDhtClient::new(),
+            }
+        }
+
+        async fn set_mode(&self, mode: FailingPublishMode) {
+            *self.mode.lock().await = mode;
+        }
+
+        async fn snapshot(&self) -> Vec<String> {
+            self.published.lock().await.clone()
+        }
+    }
+
+    #[allow(clippy::manual_async_fn)]
+    impl DhtClient for FailingPublishDhtClient {
+        fn publish(
+            &self,
+            public_key: &[u8; 32],
+            signature: &[u8; 64],
+            value: &[u8],
+            seq: u64,
+        ) -> impl Future<Output = Result<(), IdentityError>> + Send {
+            let pk = *public_key;
+            let sig = *signature;
+            let val = value.to_vec();
+            async move {
+                let mode = *self.mode.lock().await;
+                // Track call index BEFORE deciding to fail so the
+                // recorded order reflects what migrate_identity attempted.
+                let idx = self
+                    .call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let did = format!("did:dht:z{}", zbase32::encode(&pk));
+                match mode {
+                    FailingPublishMode::FailOnNew => {
+                        // Don't record: nothing actually hit the wire.
+                        return Err(IdentityError::DhtPublishFailed(
+                            "simulated step-7 publish failure".to_owned(),
+                        ));
+                    }
+                    FailingPublishMode::FailOnOldAfterNew if idx == 1 => {
+                        // The OLD republish (second publish in migrate_identity).
+                        // Don't record — it failed.
+                        return Err(IdentityError::DhtPublishFailed(
+                            "simulated step-8 publish failure".to_owned(),
+                        ));
+                    }
+                    _ => {}
+                }
+                self.published.lock().await.push(did);
+                self.inner.publish(&pk, &sig, &val, seq).await
+            }
+        }
+
+        fn resolve(
+            &self,
+            public_key: &[u8; 32],
+        ) -> impl Future<Output = Result<Option<crate::dht_client::DhtRecord>, IdentityError>> + Send
+        {
+            let pk = *public_key;
+            async move { self.inner.resolve(&pk).await }
+        }
+    }
+
+    /// Helper: builds a `DidDht` over a [`FailingPublishDhtClient`] sharing
+    /// the supplied custody for signing. Mirrors `make_dht_with_custody`
+    /// but parameterized on the failing client.
+    fn make_dht_with_failing_client(
+        custody: &Arc<InMemoryKeyCustody>,
+        client: Arc<FailingPublishDhtClient>,
+    ) -> DidDht<FailingPublishDhtClient, Arc<TestClock>> {
+        let clock = Arc::new(TestClock::new(1_000_000));
+        let cache = Arc::new(DidCache::with_clock(clock));
+        let sign_fn =
+            DidDht::<FailingPublishDhtClient, Arc<TestClock>>::make_sign_fn(Arc::clone(custody));
+        DidDht::with_client_and_signer(client, cache, sign_fn)
+    }
+
+    /// Builds a published source identity + handles the failing-client
+    /// setup needs to drive a migration attempt. Returns the published
+    /// document so callers can pass it back to `migrate_identity`.
+    async fn setup_failing_migration_inputs(
+        custody: &Arc<InMemoryKeyCustody>,
+        dht: &DidDht<FailingPublishDhtClient, Arc<TestClock>>,
+    ) -> (
+        ScpIdentity,
+        DidDocument,
+        PreRotationKeyHandle,
+        Arc<scp_platform::testing::InMemoryPreRotationCustody>,
+    ) {
+        let pre_rotation_custody =
+            Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+        let (identity, document, pre_rotation_handle) = dht
+            .create(&**custody, &*pre_rotation_custody)
+            .await
+            .unwrap();
+        // Publish the source document so the recorder starts in a known
+        // post-create state. This uses ONE publish slot of the recorder.
+        dht.publish_document(&identity, &document).await.unwrap();
+        (
+            identity,
+            document,
+            pre_rotation_handle,
+            pre_rotation_custody,
+        )
+    }
+
+    /// Step 7 fails: the partial state MUST carry the new identity, the
+    /// new document, the freshly-registered pre-rotation handle (with
+    /// `revealed_key` matching the commitment), and the unchanged OLD
+    /// identity. Cold custody MUST already hold the new pre-rotation key.
+    #[tokio::test]
+    async fn migrate_identity_returns_publish_failed_when_new_publish_fails() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        // Source identity is created and published with the client in
+        // Healthy mode, then we flip to FailOnNew.
+        let client = Arc::new(FailingPublishDhtClient::new(FailingPublishMode::Healthy));
+        let dht = make_dht_with_failing_client(&custody, Arc::clone(&client));
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            setup_failing_migration_inputs(&custody, &dht).await;
+
+        client.set_mode(FailingPublishMode::FailOnNew).await;
+
+        let rotated_at = 1_700_000_000u64;
+        let err = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .expect_err("publish failure must surface as Err");
+
+        let partial = MigrationPartialState::from_error(&err)
+            .expect("must be MigrationPublishFailed { PublishNew, .. }");
+        assert_eq!(partial.phase, MigrationResumePhase::PublishNew);
+
+        // The new DID differs from the source DID — the migration
+        // produced a brand-new self-cert DID even though publish failed.
+        assert_ne!(partial.new_identity.did, identity.did);
+
+        // SHA-256(revealed_key) MUST equal the OLD document's
+        // PreRotationCommitment service entry's commitment. The OLD doc
+        // is the one captured in `partial.old_document` — which is the
+        // same `document` we published.
+        let revealed_key = partial
+            .rotation_event
+            .pre_rotation_proof
+            .as_ref()
+            .expect("STRONG-assurance migration must carry pre_rotation_proof")
+            .revealed_key;
+        let hashed_revealed: [u8; 32] = Sha256::digest(revealed_key).into();
+        let service_endpoint = &partial
+            .old_document
+            .pre_rotation_service()
+            .expect("OLD document published a PreRotationCommitment service")
+            .service_endpoint;
+        let hex_part = service_endpoint
+            .strip_prefix("sha256:")
+            .expect("PreRotationCommitment serviceEndpoint MUST be sha256:<hex>");
+        let commitment_bytes: [u8; 32] = hex::decode(hex_part)
+            .expect("commitment is valid hex")
+            .try_into()
+            .expect("commitment is 32 bytes");
+        assert_eq!(
+            hashed_revealed, commitment_bytes,
+            "SHA-256(revealed_key) MUST equal the published commitment (ADR-046 byte parity)"
+        );
+
+        // The freshly-registered new pre-rotation handle MUST be live in
+        // cold custody — step 4 succeeded before step 7 was reached.
+        pre_rotation_custody
+            .reveal_public_key(&partial.new_pre_rotation_handle)
+            .await
+            .expect("new_pre_rotation_handle must be registered in cold custody");
+    }
+
+    /// Step 8 fails: the partial state MUST carry phase
+    /// `RepublishOldAlsoKnownAs`, and the OLD `#active` MUST already be
+    /// destroyed (step 7b ran). The OLD `#0` MUST still be present.
+    #[tokio::test]
+    async fn migrate_identity_returns_publish_failed_when_old_republish_fails() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let client = Arc::new(FailingPublishDhtClient::new(FailingPublishMode::Healthy));
+        let dht = make_dht_with_failing_client(&custody, Arc::clone(&client));
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            setup_failing_migration_inputs(&custody, &dht).await;
+
+        // Reset the call count so FailOnOldAfterNew fires on the 2nd
+        // call made by migrate_identity (not the source-publish call).
+        client
+            .call_count
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        client.set_mode(FailingPublishMode::FailOnOldAfterNew).await;
+
+        let old_active = identity.active_signing_key;
+        let old_identity_key = identity.identity_key;
+
+        let rotated_at = 1_700_000_000u64;
+        let err = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .expect_err("step-8 publish failure must surface as Err");
+
+        let partial = MigrationPartialState::from_error(&err)
+            .expect("must be MigrationPublishFailed { RepublishOldAlsoKnownAs, .. }");
+        assert_eq!(partial.phase, MigrationResumePhase::RepublishOldAlsoKnownAs);
+
+        // OLD `#active` MUST be destroyed (step 7b ran before step 8).
+        let after_active = custody.public_key(&old_active).await;
+        assert!(
+            matches!(after_active, Err(scp_platform::PlatformError::KeyNotFound)),
+            "OLD #active MUST be destroyed before step 8 runs; got {after_active:?}"
+        );
+
+        // OLD `#0` MUST be retained — the resume path needs it to sign
+        // the step-8 republish.
+        custody
+            .public_key(&old_identity_key)
+            .await
+            .expect("OLD #0 MUST be retained for resume to sign step 8");
+    }
+
+    /// After a step-7 failure, swap the client to Healthy and call
+    /// resume. Result MUST equal the would-be first-pass success, and
+    /// the migration-side publish order MUST be `[new_did, old_did]`.
+    #[tokio::test]
+    async fn resume_migration_publish_completes_after_publish_new_failure() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let client = Arc::new(FailingPublishDhtClient::new(FailingPublishMode::Healthy));
+        let dht = make_dht_with_failing_client(&custody, Arc::clone(&client));
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            setup_failing_migration_inputs(&custody, &dht).await;
+
+        let pre_migration_publishes = client.snapshot().await.len();
+
+        client.set_mode(FailingPublishMode::FailOnNew).await;
+        let rotated_at = 1_700_000_000u64;
+        let err = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .expect_err("step-7 publish failure must surface as Err");
+        let partial = MigrationPartialState::from_error(&err)
+            .expect("must be MigrationPublishFailed { PublishNew, .. }")
+            .clone();
+
+        // Snapshot expected return artifacts BEFORE moving into resume.
+        let expected_new_did = partial.new_identity.did.clone();
+        let expected_new_doc = partial.new_document.clone();
+        let expected_event = partial.rotation_event.clone();
+        let expected_new_handle = partial.new_pre_rotation_handle;
+
+        // Heal the client and resume.
+        client.set_mode(FailingPublishMode::Healthy).await;
+        let (resumed_identity, resumed_doc, resumed_event, resumed_handle) = dht
+            .resume_migration_publish(partial, &*custody)
+            .await
+            .expect("resume MUST complete on a healthy client");
+
+        assert_eq!(resumed_identity.did, expected_new_did);
+        assert_eq!(resumed_doc, expected_new_doc);
+        assert_eq!(resumed_event, expected_event);
+        assert_eq!(resumed_handle, expected_new_handle);
+
+        // Resume must have performed exactly [new_did, old_did] in that
+        // order on the wire (step 7 then step 8).
+        let after = client.snapshot().await;
+        let migration_publishes = &after[pre_migration_publishes..];
+        assert_eq!(
+            migration_publishes.len(),
+            2,
+            "resume of a PublishNew failure must publish exactly the new DID then the old DID; got {migration_publishes:?}"
+        );
+        assert_eq!(migration_publishes[0], expected_new_did);
+        assert_eq!(migration_publishes[1], identity.did);
+    }
+
+    /// After a step-8 failure, swap the client to Healthy and call
+    /// resume. Only ONE additional publish (the OLD republish) must
+    /// occur — the resume MUST NOT re-publish the NEW document.
+    #[tokio::test]
+    async fn resume_migration_publish_completes_after_old_republish_failure() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let client = Arc::new(FailingPublishDhtClient::new(FailingPublishMode::Healthy));
+        let dht = make_dht_with_failing_client(&custody, Arc::clone(&client));
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            setup_failing_migration_inputs(&custody, &dht).await;
+
+        // FailOnOldAfterNew fires on the 2nd publish — reset count.
+        client
+            .call_count
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        client.set_mode(FailingPublishMode::FailOnOldAfterNew).await;
+
+        let publishes_before_migrate = client.snapshot().await.len();
+        let rotated_at = 1_700_000_000u64;
+        let err = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .expect_err("step-8 publish failure must surface as Err");
+        let partial = MigrationPartialState::from_error(&err)
+            .expect("must be MigrationPublishFailed")
+            .clone();
+        assert_eq!(partial.phase, MigrationResumePhase::RepublishOldAlsoKnownAs);
+
+        // The failed migration attempt published ONE document (step 7
+        // succeeded; step 8 was rejected). Snapshot now to count the
+        // delta from resume in isolation.
+        let publishes_before_resume = client.snapshot().await.len();
+        assert_eq!(
+            publishes_before_resume - publishes_before_migrate,
+            1,
+            "step 7 succeeded, step 8 did not — exactly one publish must be on the wire"
+        );
+
+        client.set_mode(FailingPublishMode::Healthy).await;
+        dht.resume_migration_publish(partial, &*custody)
+            .await
+            .expect("resume MUST complete on a healthy client");
+
+        let publishes_after_resume = client.snapshot().await.len();
+        assert_eq!(
+            publishes_after_resume - publishes_before_resume,
+            1,
+            "resume of a RepublishOldAlsoKnownAs failure must perform EXACTLY one publish (step 8 only), NOT re-publish the new document"
+        );
+    }
+
+    /// Idempotency: calling resume twice on a healthy client after a
+    /// step-7 failure MUST both succeed. The second call republishes
+    /// byte-identical documents under fresh BEP44 sequence numbers.
+    #[tokio::test]
+    async fn resume_migration_publish_is_idempotent() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let client = Arc::new(FailingPublishDhtClient::new(FailingPublishMode::Healthy));
+        let dht = make_dht_with_failing_client(&custody, Arc::clone(&client));
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            setup_failing_migration_inputs(&custody, &dht).await;
+
+        client.set_mode(FailingPublishMode::FailOnNew).await;
+        let rotated_at = 1_700_000_000u64;
+        let err = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .expect_err("step-7 publish failure must surface as Err");
+        let partial = MigrationPartialState::from_error(&err)
+            .expect("must be MigrationPublishFailed")
+            .clone();
+
+        client.set_mode(FailingPublishMode::Healthy).await;
+        let first = dht
+            .resume_migration_publish(partial.clone(), &*custody)
+            .await
+            .expect("first resume MUST succeed");
+        let second = dht
+            .resume_migration_publish(partial, &*custody)
+            .await
+            .expect("second resume MUST succeed (idempotent under BEP44 monotonicity)");
+
+        assert_eq!(first.0.did, second.0.did);
+        assert_eq!(first.1, second.1);
+        assert_eq!(first.2, second.2);
+        assert_eq!(first.3, second.3);
+    }
+
+    /// Byte-parity gate (ADR-046): the
+    /// `SHA-256(revealed_key) == commitment` invariant on the carried
+    /// `rotation_event` MUST hold byte-for-byte BOTH before and after
+    /// resume. Resume MUST NOT re-derive or re-sign.
+    #[tokio::test]
+    async fn resume_migration_publish_preserves_sha256_commitment_invariant() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let client = Arc::new(FailingPublishDhtClient::new(FailingPublishMode::Healthy));
+        let dht = make_dht_with_failing_client(&custody, Arc::clone(&client));
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            setup_failing_migration_inputs(&custody, &dht).await;
+
+        client.set_mode(FailingPublishMode::FailOnNew).await;
+        let rotated_at = 1_700_000_000u64;
+        let err = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .expect_err("step-7 publish failure must surface as Err");
+        let partial = MigrationPartialState::from_error(&err)
+            .expect("must be MigrationPublishFailed")
+            .clone();
+
+        // BEFORE-resume gate.
+        let before_proof = partial
+            .rotation_event
+            .pre_rotation_proof
+            .as_ref()
+            .expect("STRONG-assurance migration must carry pre_rotation_proof")
+            .clone();
+        let new_pre_rotation_pub_bytes = pre_rotation_custody
+            .reveal_public_key(&partial.new_pre_rotation_handle)
+            .await
+            .expect("new pre-rotation handle MUST be live in cold custody");
+        // The carried `revealed_key` is the OLD pre-rotation public — the
+        // bytes that were revealed at step 1 of migrate_identity (NOT the
+        // new pre-rotation public). The byte-parity invariant binds those
+        // bytes to the OLD document's commitment.
+        let old_service_endpoint = &partial
+            .old_document
+            .pre_rotation_service()
+            .expect("OLD doc publishes a PreRotationCommitment service")
+            .service_endpoint;
+        let old_hex = old_service_endpoint
+            .strip_prefix("sha256:")
+            .expect("serviceEndpoint MUST be sha256:<hex>");
+        let old_commitment_bytes: [u8; 32] = hex::decode(old_hex)
+            .expect("commitment hex valid")
+            .try_into()
+            .expect("commitment is 32 bytes");
+        let hashed_revealed_before: [u8; 32] = Sha256::digest(before_proof.revealed_key).into();
+        assert_eq!(hashed_revealed_before, old_commitment_bytes);
+        assert_eq!(before_proof.commitment, old_commitment_bytes);
+
+        // The NEW document's commitment binds the NEW pre-rotation
+        // public — independent invariant, also checked before resume.
+        let new_doc_service_endpoint = &partial
+            .new_document
+            .pre_rotation_service()
+            .expect("NEW doc publishes a PreRotationCommitment service")
+            .service_endpoint;
+        let new_hex = new_doc_service_endpoint
+            .strip_prefix("sha256:")
+            .expect("serviceEndpoint MUST be sha256:<hex>");
+        let new_commitment_bytes: [u8; 32] = hex::decode(new_hex)
+            .expect("commitment hex valid")
+            .try_into()
+            .expect("commitment is 32 bytes");
+        let hashed_new_pre_rot_before: [u8; 32] = Sha256::digest(new_pre_rotation_pub_bytes).into();
+        assert_eq!(hashed_new_pre_rot_before, new_commitment_bytes);
+
+        // Heal and resume.
+        client.set_mode(FailingPublishMode::Healthy).await;
+        let (resumed_identity, resumed_doc, resumed_event, resumed_handle) = dht
+            .resume_migration_publish(partial, &*custody)
+            .await
+            .expect("resume MUST succeed");
+
+        // AFTER-resume gate: byte-identical proof bytes.
+        let after_proof = resumed_event
+            .pre_rotation_proof
+            .as_ref()
+            .expect("resumed event MUST carry pre_rotation_proof");
+        assert_eq!(before_proof.revealed_key, after_proof.revealed_key);
+        assert_eq!(before_proof.commitment, after_proof.commitment);
+        let hashed_revealed_after: [u8; 32] = Sha256::digest(after_proof.revealed_key).into();
+        assert_eq!(hashed_revealed_after, old_commitment_bytes);
+
+        // The resumed return MUST also publish a document whose commitment
+        // hashes the resumed new pre-rotation public byte-for-byte.
+        let resumed_pre_rot_pub_bytes = pre_rotation_custody
+            .reveal_public_key(&resumed_handle)
+            .await
+            .expect("resumed pre-rotation handle MUST be live");
+        let hashed_resumed: [u8; 32] = Sha256::digest(resumed_pre_rot_pub_bytes).into();
+        let resumed_endpoint = &resumed_doc
+            .pre_rotation_service()
+            .expect("resumed doc publishes PreRotationCommitment service")
+            .service_endpoint;
+        let resumed_hex = resumed_endpoint
+            .strip_prefix("sha256:")
+            .expect("serviceEndpoint MUST be sha256:<hex>");
+        let resumed_commitment: [u8; 32] = hex::decode(resumed_hex)
+            .expect("commitment hex valid")
+            .try_into()
+            .expect("commitment is 32 bytes");
+        assert_eq!(hashed_resumed, resumed_commitment);
+        // And the resumed identity's DID is unchanged — same key, same DID.
+        assert_eq!(resumed_identity.did, resumed_doc.id);
+    }
+
+    /// Driving Failing → Failing: the second `MigrationPublishFailed`
+    /// MUST carry partial-state fields equal to the first's. Resume
+    /// re-uses carried artifacts verbatim — no field is re-derived.
+    #[tokio::test]
+    async fn resume_migration_publish_failure_carries_same_partial_state() {
+        let custody = Arc::new(InMemoryKeyCustody::new());
+        let client = Arc::new(FailingPublishDhtClient::new(FailingPublishMode::Healthy));
+        let dht = make_dht_with_failing_client(&custody, Arc::clone(&client));
+        let (identity, document, pre_rotation_handle, pre_rotation_custody) =
+            setup_failing_migration_inputs(&custody, &dht).await;
+
+        client.set_mode(FailingPublishMode::FailOnNew).await;
+        let rotated_at = 1_700_000_000u64;
+        let err_first = dht
+            .migrate_identity(
+                &identity,
+                &document,
+                &pre_rotation_handle,
+                &*pre_rotation_custody,
+                &*custody,
+                rotated_at,
+            )
+            .await
+            .expect_err("first attempt MUST fail at step 7");
+        let first = MigrationPartialState::from_error(&err_first)
+            .expect("must be MigrationPublishFailed")
+            .clone();
+
+        // Drive resume into another failure (client still FailOnNew).
+        let err_second = dht
+            .resume_migration_publish(first.clone(), &*custody)
+            .await
+            .expect_err("resume MUST also fail while client is still FailOnNew");
+        let second = MigrationPartialState::from_error(&err_second)
+            .expect("must be MigrationPublishFailed")
+            .clone();
+
+        assert_eq!(first.phase, second.phase);
+        assert_eq!(first.new_identity.did, second.new_identity.did);
+        assert_eq!(first.new_document, second.new_document);
+        assert_eq!(first.rotation_event, second.rotation_event);
+        assert_eq!(
+            first.new_pre_rotation_handle,
+            second.new_pre_rotation_handle
+        );
+        assert_eq!(first.old_identity.did, second.old_identity.did);
+        assert_eq!(first.old_document, second.old_document);
     }
 }

@@ -162,6 +162,20 @@ pub const IDENT_1051: &str = "SCP-IDENT-1051";
 /// tampering or corruption event.
 pub const IDENT_1052: &str = "SCP-IDENT-1052";
 
+/// `DidDht::migrate_identity` partial-publish failure.
+///
+/// Surfaced when one of `migrate_identity`'s two DHT publishes (step 7
+/// publish-new or step 8 republish-old-with-alsoKnownAs) fails AFTER the
+/// irreversible cold-custody mutation in step 5
+/// (`PreRotationCustody::destroy_after_migration`). The caller cannot
+/// recover by re-invoking `migrate_identity` — the OLD pre-rotation
+/// handle is gone. The Rust core returns
+/// `IdentityError::MigrationPublishFailed` carrying a typed
+/// `MigrationPartialState` recovery handle; the structured FFI surface
+/// for that handle is added in subsequent PRs (per ADR-048 §7 per-SDK
+/// idiom). Phase-1 surface is JUST this code + the error message body.
+pub const IDENT_1053: &str = "SCP-IDENT-1053";
+
 // -------------------------------------------------------------------------
 // Context (SCP-CTX- 2000--2999)
 // -------------------------------------------------------------------------

@@ -88,6 +88,14 @@ behavior and runs in CI.
 
 ## [Unreleased] - 2026-04-18
 
+### `DidDht::migrate_identity` partial-publish recovery handle
+
+- **New `IdentityError::MigrationPublishFailed { phase, partial, source }` variant.** When either of `migrate_identity`'s two DHT publishes (step 7 publish-new, step 8 republish-old-with-`alsoKnownAs`) fails AFTER the irreversible cold-custody mutation at step 5 (`destroy_after_migration`), the function now returns this typed error instead of a generic `DhtPublishFailed`. The carried `Box<MigrationPartialState>` holds the byte-identical artifacts (new identity, new document, rotation event with the step-2 migration proof and pre-rotation proof, new pre-rotation handle, old identity, old document) needed to finish the migration.
+- **New `MigrationResumePhase` enum** (`PublishNew` | `RepublishOldAlsoKnownAs`) — identifies which publish step failed and which steps a resume call must re-run.
+- **New `DidDht::resume_migration_publish(state, key_custody)` method.** Picks up exactly where `migrate_identity` left off: for `PublishNew`, re-runs step 7 + step 7b + step 8; for `RepublishOldAlsoKnownAs`, re-runs only step 8. Idempotent under BEP44 sequence monotonicity. Returns the same `(new_identity, new_document, rotation_event, new_pre_rotation_handle)` tuple a successful first-pass would have returned — byte-identical (ADR-046 byte parity).
+- **Bridge surface (phase 1).** Each FFI bridge (PyO3, NAPI, UniFFI) maps `MigrationPublishFailed` to the new error code `SCP-IDENT-1053` with the error message body. Structured partial-state plumbing per language idiom lands in subsequent PRs (ADR-048 §7). WASM has no native `migrate_identity` path and is unchanged.
+- **Specs / ADR.** `.docs/specs/09-security-model.md` §9.7.4.1 gains a "Partial-publish recovery" paragraph. `.docs/adrs/phase-1.md` §4b gains a forward-reference bullet. New evergreen lesson at `.docs/lessons/migration-publish-recovery-handle.md` covers the general principle ("multi-step operations that consume irreversible state mid-pipeline MUST surface a typed recovery handle").
+
 ### Per-instance MCP stdio allowlist (PR #1725)
 
 **Security fix.** Closes a realm-local RCE-pivot vulnerability: previously, calling
