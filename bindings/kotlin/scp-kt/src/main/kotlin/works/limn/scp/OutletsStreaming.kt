@@ -234,9 +234,9 @@ class OutletStreamFlow internal constructor(
      *
      * Abnormal-closure handling: if `handle.next()` returns `null`
      * BEFORE a terminal chunk has been emitted, the flow throws
-     * [ExecutionError] with code `SCP-TOOL-6131` (slug
-     * `execution.stream-gap`) per §5.4.4. Synthesising a silent
-     * end-of-flow on receiver close would let callers mistake a
+     * [ExecutionError] with code `SCP-TOOL-6131` and NO slug per §5.4.4
+     * (converged with Python / TypeScript / Swift). Synthesising a
+     * silent end-of-flow on receiver close would let callers mistake a
      * transport drop, executor crash, or bridge fault for a clean
      * stream completion.
      */
@@ -336,10 +336,15 @@ internal fun outletStreamFlowFromNext(
             if (terminalObserved) {
                 return@flow
             }
+            // Abnormal closure — `next()` returned null before any
+            // terminal chunk. Code `SCP-TOOL-6131`, NO slug — converged
+            // with Python / TypeScript / Swift. The spec registers no
+            // slug for this 6131 condition (the prior `execution.stream-gap`
+            // string was an unregistered divergence), so we omit it
+            // (defaults to null).
             throw ExecutionError(
                 message = "stream closed without terminal chunk",
                 code = "SCP-TOOL-6131",
-                slug = "execution.stream-gap",
             )
         }
         if (raw.payloadType == "end" || (raw.payloadType == "error" && raw.terminal == true)) {

@@ -195,20 +195,20 @@ if (bridge === null || serverAddon === null) {
 
       const payload = decodeJwtPayload(token.encoded);
       expect(payload).toHaveProperty("nb");
-      const nb = payload["nb"] as Record<string, unknown>;
+      const nb = payload.nb as Record<string, unknown>;
       expect(nb).toBeTruthy();
 
       // AC-7: every populated input field round-trips byte-for-byte.
-      expect(nb["amountMaxPerCall"]).toBe(100);
-      expect(nb["amountMaxCumulative"]).toBe(1_000);
-      expect(nb["validFrom"]).toBe(1_700_000_000);
-      expect(nb["validUntil"]).toBe(1_700_003_600);
-      expect(nb["maxCalls"]).toBe(42);
+      expect(nb.amountMaxPerCall).toBe(100);
+      expect(nb.amountMaxCumulative).toBe(1_000);
+      expect(nb.validFrom).toBe(1_700_000_000);
+      expect(nb.validUntil).toBe(1_700_003_600);
+      expect(nb.maxCalls).toBe(42);
       // rateWindow is normalized to the {max, windowSecs} wire shape.
-      expect(nb["rateWindow"]).toEqual({ max: 1, windowSecs: 60 });
-      expect(nb["allowedAdapters"]).toEqual(["native", "openai-compatible"]);
-      expect(nb["allowedTargetDids"]).toEqual(["did:dht:zMember", "did:dht:zOther"]);
-      expect(nb["originKind"]).toBe("Action");
+      expect(nb.rateWindow).toEqual({ max: 1, windowSecs: 60 });
+      expect(nb.allowedAdapters).toEqual(["native", "openai-compatible"]);
+      expect(nb.allowedTargetDids).toEqual(["did:dht:zMember", "did:dht:zOther"]);
+      expect(nb.originKind).toBe("Action");
 
       // Absent fields are omitted, never serialized as null
       // (SCP-OUT-018: skip_serializing_if = "Option::is_none").
@@ -248,15 +248,15 @@ if (bridge === null || serverAddon === null) {
         caveatsToWireJson(caveats),
       );
       const payload = decodeJwtPayload(token.encoded);
-      const nb = payload["nb"] as Record<string, unknown>;
-      expect(nb["hoursOfDay"]).toBe(0x00ff_ffff);
-      expect(nb["daysOfWeek"]).toBe(0x7f);
-      expect(nb["inputSchema"]).toEqual({
+      const nb = payload.nb as Record<string, unknown>;
+      expect(nb.hoursOfDay).toBe(0x00ff_ffff);
+      expect(nb.daysOfWeek).toBe(0x7f);
+      expect(nb.inputSchema).toEqual({
         type: "object",
         properties: { x: { type: "number" } },
         required: ["x"],
       });
-      expect(nb["originKind"]).toBe("Query");
+      expect(nb.originKind).toBe("Query");
 
       // Fields the SDK did not populate must be omitted from `nb`.
       expect(nb).not.toHaveProperty("amountMaxPerCall");

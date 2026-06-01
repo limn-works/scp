@@ -32,6 +32,7 @@ from scp_sdk.errors import (
     OutletError,
     OutletExecutionError,
     OutletNotFoundError,
+    OutletProtocolError,
     ScpError,
     TransportError,
     UcanPermissionError,
@@ -464,9 +465,16 @@ class TestInvocationHandle:
         with patch("scp_sdk.outlets._scp_core", mock_bridge):
             handle = _ns().invoke(_DUMMY_OUTLET, {}, _DUMMY_UCAN)
             await handle
-            with pytest.raises(ContextError):
+            # Cross-SDK consistency-B: the dual-consumption guard raises
+            # the Protocol-class OutletProtocolError (slug
+            # protocol.handle-double-consumed, code SCP-TOOL-6020), NOT a
+            # generic ContextError, so all four SDKs surface the same shape.
+            with pytest.raises(OutletProtocolError) as exc_info:
                 async for _chunk in handle:
                     pass
+            assert exc_info.value.code == "SCP-TOOL-6020"
+            assert exc_info.value.slug == "protocol.handle-double-consumed"
+            assert exc_info.value.class_wire == "protocol"
 
 
 # ---------------------------------------------------------------------------

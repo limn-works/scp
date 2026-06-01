@@ -23,10 +23,9 @@ import Foundation
 
 // MARK: - StreamChunk (Swift-native record)
 
-/// One chunk yielded by ``OutletStreamSequence`` or pushed to a
-/// ``OutletStreamSubscriber``. Mirrors the §5.4.5 wire form variant-by-
-/// variant — callers branch on `payloadType` and read the variant
-/// fields directly.
+/// One chunk pushed to an ``OutletStreamSubscriber`` (push-style
+/// streaming). Mirrors the §5.4.5 wire form variant-by-variant —
+/// callers branch on `payloadType` and read the variant fields directly.
 public struct OutletStreamChunkRecordSwift: Sendable, Equatable {
     /// 16-byte §5.4.5 `request_id` of the stream this chunk belongs to.
     public let requestId: Data
@@ -63,156 +62,23 @@ public struct OutletStreamChunkRecordSwift: Sendable, Equatable {
     }
 }
 
-// MARK: - OutletStreamSequence (AsyncSequence wrapper)
-
-/// `AsyncSequence` wrapper around the UniFFI-generated
-/// `OutletStreamHandle`. Iteration drives `next()` until the handle
-/// reports `done`; subsequent iteration yields no values.
-///
-/// Construct via ``Context/openOutletStream(outletId:inputJson:ucanToken:caveatsBindingHex:streamEpoch:proofTokens:creditWindow:estimatedChunkCount:)``.
-public struct OutletStreamSequence: AsyncSequence, Sendable {
-    public typealias Element = OutletStreamChunkRecordSwift
-    public typealias AsyncIterator = OutletStreamIterator
-
-    /// The UniFFI handle. `internal` so extensions can call control-plane
-    /// operations on the same handle without exposing it publicly.
-    let handle: OutletStreamHandle
-
-    public init(handle: OutletStreamHandle) {
-        self.handle = handle
-    }
-
-    public func makeAsyncIterator() -> OutletStreamIterator {
-        OutletStreamIterator(handle: handle)
-    }
-
-    /// 32-char lowercase hex `request_id`. Use this to address the stream
-    /// from the SDK control-plane methods.
-    public var requestIdHex: String {
-        handle.requestId()
-    }
-
-    /// Returns `true` once a terminal chunk has been observed (or the
-    /// receiver has been closed).
-    public var isDone: Bool {
-        handle.done()
-    }
-
-    /// Signs and applies an `OutletStreamCredit` grant for this stream.
-    ///
-    /// `grant` must be > 0 (round-6 uniform `InvalidGrant` rule).
-    /// Returns the new total credit budget on success. `callerDid`
-    /// MUST match the pinned invoker DID at stream open — CRITICAL #1
-    /// fix: the bridge rejects mismatched callers as
-    /// `authorization.denied`.
-    @discardableResult
-    public func grantCredit(_ grant: UInt32, callerDid: String) async throws -> UInt32 {
-        try await outletStreamGrantCredit(
-            requestIdHex: requestIdHex,
-            callerDid: callerDid,
-            grant: grant
-        )
-    }
-
-    /// Applies an `OutletCancel` to this stream.
-    ///
-    /// CRITICAL #3 — `next_seq` is no longer accepted; the bridge
-    /// derives the canonical next-emission cursor from runtime state.
-    /// CRITICAL #1 — `callerDid` MUST match the pinned invoker DID.
-    @discardableResult
-    public func cancel(callerDid: String) async throws -> UInt64? {
-        try await handle.cancel(callerDid: callerDid)
-    }
-}
-
-/// `AsyncIterator` for `OutletStreamSequence`.
-public struct OutletStreamIterator: AsyncIteratorProtocol, Sendable {
-    let handle: OutletStreamHandle
-    /// Tracks whether a terminal chunk (End / Error{terminal:true}) has
-    /// been yielded by `next()`. Mutated on each call so the next-after-
-    /// terminal `nil` is recognised as a normal end-of-iteration vs. an
-    /// abnormal closure that warrants surfacing as `execution.stream-gap`.
-    private var terminalObserved: Bool = false
-
-    public init(handle: OutletStreamHandle) {
-        self.handle = handle
-    }
-
-    public mutating func next() async throws -> OutletStreamChunkRecordSwift? {
-        guard let raw = try await handle.next() else {
-            // Abnormal closure — handle.next() returned nil before the
-            // executor emitted a terminal chunk. Surface as
-            // `execution.stream-gap` (`SCP-TOOL-6131`) per §5.4.4 so
-            // callers cannot mistake a stream gap for a clean end of
-            // iteration. If a terminal chunk WAS observed in a prior
-            // call, this `nil` is the normal end-of-receiver marker and
-            // we signal end-of-iteration per `AsyncIteratorProtocol`.
-            if terminalObserved {
-                return nil
-            }
-            let env = OutletEnvelope(
-                classWire: .execution,
-                code: "SCP-TOOL-6131",
-                slug: "execution.stream-gap",
-                message: "stream closed without terminal chunk",
-                retry: .never,
-                detail: nil,
-                sourceChain: [],
-                padNonce: nil,
-                registrationEventId: nil
-            )
-            throw OutletError.execution(env)
-        }
-        let record = OutletStreamChunkRecordSwift(from: raw)
-        if record.payloadType == "end" ||
-            (record.payloadType == "error" && record.terminal == true) {
-            terminalObserved = true
-        }
-        return record
-    }
-}
-
 // MARK: - Context streaming entry points
 
 extension Context {
-    /// Internal §5.4.5 streaming entry point. Per SCP-OUT-038 AC1 the
-    /// public surface exposes ONLY `ctx.outlets.invoke(...)`; this
-    /// helper is `internal` so the SDK's invoke implementation can
-    /// open a streaming session without surfacing the verb at the
-    /// public API.
-    ///
-    /// Mirrors the PyO3 / NAPI / Kotlin contracts: re-validates the
-    /// UCAN under the full 11-step ADR-016 pipeline, reserves a
-    /// per-stream `request_id`, and registers the session for later
-    /// `grantCredit` / `cancel` lookups.
-    func openOutletStreamSession(
-        outletId: String,
-        inputJson: String,
-        ucanToken: String,
-        caveatsBindingHex: String,
-        streamEpoch: UInt64,
-        proofTokens: [String]? = nil,
-        creditWindow: UInt32? = nil,
-        estimatedChunkCount: UInt32? = nil
-    ) async throws -> OutletStreamSequence {
-        let raw = try await outletInvokeStream(
-            handle: handle,
-            outletId: outletId,
-            inputJson: inputJson,
-            identity: identity,
-            ucanToken: ucanToken,
-            caveatsBindingHex: caveatsBindingHex,
-            streamEpoch: streamEpoch,
-            proofTokens: proofTokens,
-            creditWindow: creditWindow,
-            estimatedChunkCount: estimatedChunkCount
-        )
-        return OutletStreamSequence(handle: raw)
-    }
-
-    /// Push-style variant of `openOutletStreamSession` — internal per
-    /// AC1; routes through the streaming UniFFI export with a caller-
+    /// Push-style §5.4.5 streaming entry point — internal per AC1;
+    /// routes through the streaming UniFFI export with a caller-
     /// supplied `OutletStreamSubscriber`.
+    ///
+    /// The pull-style session opener (`openOutletStreamSession`) and its
+    /// `AsyncSequence` wrapper (`OutletStreamSequence` /
+    /// `OutletStreamIterator`) were removed: the SDK's single public verb
+    /// `ctx.outlets.invoke(...)` drives streaming through
+    /// `makeStreamingHandle`, which calls `outletInvokeStream` +
+    /// `pumpStreamingChunks` directly. The parallel surface was redundant
+    /// and — worse — carried a divergent abnormal-closure slug
+    /// (`execution.stream-gap`, unregistered in the spec). The pull
+    /// control plane is now exclusively the `InvocationHandle` methods;
+    /// the canonical abnormal-closure error lives in `streamGapEnvelope()`.
     @discardableResult
     func openOutletStreamSessionWithSubscriber(
         outletId: String,
@@ -289,7 +155,7 @@ func makeRevocationRecheckTask(
                 // (already terminated / pending) stop the loop
                 // naturally because outletStreamTerminate's contract
                 // is idempotent on the runtime side.
-                _ = try? await OutletStream.terminate(
+                _ = try? await OutletsStreaming.terminate(
                     requestIdHex: requestIdHex,
                     callerDid: invokerDid,
                     reason: .revokedMidStream,
@@ -380,13 +246,20 @@ func pumpStreamingChunksWithNext(
     }
 }
 
-/// `execution.stream-gap` envelope for the abnormal-closure path
-/// (bridge receiver returned `nil` before any terminal chunk).
+/// Abnormal-closure envelope for the §5.4.4 stream-gap path (bridge
+/// receiver returned `nil` before any terminal chunk).
+///
+/// Code `SCP-TOOL-6131`, NO slug — matching the Python reference and the
+/// other SDKs. The spec registers no slug for this condition (the
+/// `execution.stream-gap` string was never a registered slug — only a
+/// prose label in §5.4.4 for the shared 6131 code band), so the SDK
+/// MUST NOT attach one. `OutletEnvelope.slug` is a non-optional `String`,
+/// so "no slug" is the empty string.
 private func streamGapEnvelope() -> OutletEnvelope {
     OutletEnvelope(
         classWire: .execution,
         code: "SCP-TOOL-6131",
-        slug: "execution.stream-gap",
+        slug: "",
         message: "stream closed without terminal chunk",
         retry: .never,
         detail: nil,
@@ -493,8 +366,13 @@ public enum OutletsStreaming {
     /// Signs and applies an `OutletStreamCredit` grant against an active
     /// stream identified by `requestIdHex`. `callerDid` MUST match the
     /// pinned invoker DID at stream open (CRITICAL #1).
+    ///
+    /// `internal` — the public credit control plane is exclusively
+    /// `InvocationHandle.grantCredit(_:)`. This free-function form exists
+    /// only for framework-internal call sites that already hold a
+    /// `requestIdHex` + pinned `callerDid`.
     @discardableResult
-    public static func grantCredit(
+    static func grantCredit(
         requestIdHex: String,
         callerDid: String,
         grant: UInt32
@@ -510,8 +388,11 @@ public enum OutletsStreaming {
     /// `callerDid` MUST match the pinned invoker DID. CRITICAL #3 —
     /// `next_seq` is no longer caller-supplied; the bridge derives
     /// the canonical next-emission cursor from runtime state.
+    ///
+    /// `internal` — the public cancel control plane is exclusively
+    /// `InvocationHandle.cancel()`.
     @discardableResult
-    public static func cancel(
+    static func cancel(
         requestIdHex: String,
         callerDid: String
     ) async throws -> UInt64? {
@@ -532,7 +413,11 @@ public enum OutletsStreaming {
     /// default message.
     ///
     /// `callerDid` MUST match the pinned invoker DID (CRITICAL #1).
-    public static func terminate(
+    ///
+    /// `internal` — used by the framework revocation-recheck loop
+    /// (`makeRevocationRecheckTask`) to force-close a stream whose UCAN
+    /// was revoked mid-stream. Not part of the public control plane.
+    static func terminate(
         requestIdHex: String,
         callerDid: String,
         reason: TerminateReason,

@@ -566,6 +566,7 @@ public final class CaveatBuilder {
 /// `OutletError.streamAlreadyClosed`.
 public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     public typealias Element = OutletStreamChunk
+    public typealias AsyncIterator = GuardedStreamIterator
 
     private let stream: AsyncThrowingStream<OutletStreamChunk, Error>
     private let aggregateTask: Task<Aggregate, Error>
@@ -587,6 +588,15 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     /// chunk is observed. `@unchecked Sendable` is preserved because all
     /// mutations happen on the pump's serial queue.
     private let terminatedFlag = TerminatedFlag()
+
+    /// Dual-consumption mutual-exclusion guard. A handle backed by a
+    /// single underlying source cannot be drained as BOTH `await
+    /// handle.aggregate` and `for try await chunk in handle`. The first
+    /// consumer wins; the second trips the guard. Mirrors Python
+    /// `_consumed`, TypeScript `consumed`, and the Kotlin reference
+    /// `consumedMode` — the convergence target is the Protocol-class
+    /// shape (code `SCP-TOOL-6020`, slug `protocol.handle-double-consumed`).
+    private let consumedModeBox = ConsumedModeBox()
 
     public init(
         requestIdHex: String? = nil,
@@ -661,16 +671,34 @@ public final class InvocationHandle: @unchecked Sendable, AsyncSequence {
     /// `aggregateSchemaJson` is bound to the handle, the aggregate is
     /// validated against the schema before resolving. Throws
     /// `OutletError.output(...)` on schema mismatch.
+    ///
+    /// Claims the handle for "aggregate" consumption — if it was already
+    /// iterated as a stream, throws `OutletError.protocol(...)` with slug
+    /// `protocol.handle-double-consumed` (code `SCP-TOOL-6020`).
     public var aggregate: Aggregate {
         get async throws {
+            try consumedModeBox.claim("aggregate")
             let agg = try await aggregateTask.value
             try validateAggregate(agg)
             return agg
         }
     }
 
-    public func makeAsyncIterator() -> AsyncThrowingStream<OutletStreamChunk, Error>.AsyncIterator {
-        stream.makeAsyncIterator()
+    /// Makes the chunk async-iterator, claiming the handle for "stream"
+    /// consumption. `AsyncSequence.makeAsyncIterator()` is non-throwing,
+    /// so on a dual-consumption conflict (the handle was already awaited
+    /// for its aggregate) we cannot throw here — instead we return a
+    /// `GuardedStreamIterator` whose first `next()` throws the same
+    /// `OutletError.protocol(...)` (slug `protocol.handle-double-consumed`,
+    /// code `SCP-TOOL-6020`). On the happy path the guarded iterator
+    /// transparently delegates to the real stream iterator.
+    public func makeAsyncIterator() -> GuardedStreamIterator {
+        do {
+            try consumedModeBox.claim("stream")
+        } catch {
+            return GuardedStreamIterator(pendingError: error)
+        }
+        return GuardedStreamIterator(underlying: stream.makeAsyncIterator())
     }
 
     /// SCP-OUT-038 AC2/AC3 — issues an additional credit grant.
@@ -840,6 +868,81 @@ private final class TerminatedFlag: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return flag
+    }
+}
+
+/// Internal — thread-safe dual-consumption mutual-exclusion guard for
+/// `InvocationHandle`. Tracks the first consumption mode chosen by the
+/// caller (`"aggregate"` or `"stream"`); a subsequent claim in a
+/// different mode throws the §5.4.4 Protocol-class double-consume error.
+///
+/// `NSLock`-backed, analogous to `TerminatedFlag`, so `claim` is safe to
+/// call from the `aggregate` getter and `makeAsyncIterator()` on any
+/// thread. Re-claiming the SAME mode is a no-op (idempotent) so a caller
+/// that, e.g., obtains the iterator twice in stream mode is not punished.
+private final class ConsumedModeBox: @unchecked Sendable {
+    private var mode: String?
+    private let lock = NSLock()
+
+    /// Claims the handle for `mode`. Throws `OutletError.protocol(...)`
+    /// with slug `protocol.handle-double-consumed` (code `SCP-TOOL-6020`)
+    /// when the handle was already claimed for a DIFFERENT mode.
+    func claim(_ mode: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        if let current = self.mode {
+            if current != mode {
+                throw OutletError.protocol(
+                    OutletEnvelope(
+                        classWire: .protocol,
+                        code: "SCP-TOOL-6020",
+                        slug: "protocol.handle-double-consumed",
+                        message: "InvocationHandle already consumed as \(current); cannot switch to \(mode)",
+                        retry: .never,
+                        detail: nil,
+                        sourceChain: [],
+                        padNonce: nil,
+                        registrationEventId: nil
+                    )
+                )
+            }
+            return
+        }
+        self.mode = mode
+    }
+}
+
+/// Public `AsyncIteratorProtocol` for `InvocationHandle`.
+///
+/// On the happy path it transparently delegates to the underlying
+/// `AsyncThrowingStream` iterator. When the handle was already awaited
+/// for its aggregate, `makeAsyncIterator()` (which cannot throw) returns
+/// a guarded instance carrying a `pendingError`; the FIRST `next()` call
+/// throws it — surfacing the §5.4.4 double-consume Protocol error
+/// (`protocol.handle-double-consumed`, `SCP-TOOL-6020`) at iteration time.
+public struct GuardedStreamIterator: AsyncIteratorProtocol {
+    private var underlying: AsyncThrowingStream<OutletStreamChunk, Error>.AsyncIterator?
+    private var pendingError: Error?
+
+    init(underlying: AsyncThrowingStream<OutletStreamChunk, Error>.AsyncIterator) {
+        self.underlying = underlying
+        pendingError = nil
+    }
+
+    init(pendingError: Error) {
+        underlying = nil
+        self.pendingError = pendingError
+    }
+
+    public mutating func next() async throws -> OutletStreamChunk? {
+        if let err = pendingError {
+            // Surface the dual-consumption error exactly once, then leave
+            // the iterator exhausted so a re-poll returns end-of-sequence.
+            pendingError = nil
+            throw err
+        }
+        guard underlying != nil else { return nil }
+        return try await underlying?.next()
     }
 }
 

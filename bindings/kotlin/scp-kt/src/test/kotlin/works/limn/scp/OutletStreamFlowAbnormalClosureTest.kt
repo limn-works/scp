@@ -2,9 +2,10 @@
 //
 // When the bridge's `OutletStreamHandle.next()` returns `null` BEFORE
 // the executor emits a terminal chunk (End / Error{terminal:true}),
-// the SDK MUST surface this as `ExecutionError` (`SCP-TOOL-6131` /
-// `execution.stream-gap`) per §5.4.4 — NOT a silent end-of-flow that
-// callers would mistake for clean completion.
+// the SDK MUST surface this as `ExecutionError` (`SCP-TOOL-6131`, NO
+// slug) per §5.4.4 — NOT a silent end-of-flow that callers would
+// mistake for clean completion. The no-slug shape is converged across
+// Python / TypeScript / Swift / Kotlin.
 //
 // The production `OutletStreamFlow.asFlow()` method calls into
 // `outletStreamFlowFromNext` (the testable seam carved out for this
@@ -17,6 +18,7 @@ package works.limn.scp
 
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlinx.coroutines.flow.toList
 import kotlinx.coroutines.test.runTest
@@ -87,7 +89,8 @@ class OutletStreamFlowAbnormalClosureTest {
             flow.toList()
         }
         assertEquals("SCP-TOOL-6131", err.code)
-        assertEquals("execution.stream-gap", err.slug)
+        // Converged no-slug shape — abnormal closure carries no slug.
+        assertNull(err.slug)
         assertTrue(err.message?.contains("stream closed without terminal chunk") == true)
     }
 

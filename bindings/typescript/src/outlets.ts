@@ -21,10 +21,12 @@
  * Error-code prefix remains `SCP-TOOL-*` (§9.18 — registered namespace).
  */
 
+import { Ajv, type ValidateFunction } from "ajv";
 import {
   Credit,
   OutletError,
   OutletExecutionError,
+  OutletProtocolError,
   OutputError,
   StreamAlreadyClosed,
   ValidationError,
@@ -343,6 +345,53 @@ export interface OutletDefinition extends ToolDefinition {
 export type OutletCost = ToolCost;
 
 // ---------------------------------------------------------------------------
+// Aggregate-schema validation (SCP-OUT-038 AC12).
+// ---------------------------------------------------------------------------
+
+/**
+ * Shared Ajv instance used to compile and run §5.4.5 `aggregate_schema`
+ * validators on the End-chunk aggregate.
+ *
+ * Configured to MATCH the Python reference (`jsonschema.validate` with its
+ * default checker):
+ *
+ * - `allErrors: false` — short-circuit on the first failure, mirroring
+ *   `jsonschema`'s default single-error raise (we only surface one message).
+ * - `strict: false` — `jsonschema` tolerates unknown keywords and does not
+ *   reject schemas that use draft features Ajv would otherwise flag in
+ *   strict mode; disabling strict mode keeps the two validators lenient in
+ *   the same places.
+ * - No `ajv-formats` plugin — Python's default `jsonschema` validator treats
+ *   `format` as an annotation only (it does NOT assert formats unless a
+ *   format-checker is explicitly attached), so we MUST NOT assert `format`
+ *   either. Leaving the plugin out makes Ajv ignore `format`, matching the
+ *   reference's annotation-only behavior.
+ *
+ * Ajv is pure JavaScript with no Node built-in dependencies, so it is
+ * isomorphic and ships unchanged in the browser/WASM bundle.
+ */
+const aggregateAjv = new Ajv({ allErrors: false, strict: false });
+
+/**
+ * Compiled-validator cache keyed by the bound schema object. `validateAggregate`
+ * runs on EVERY End chunk; compiling once per schema (not per chunk) keeps the
+ * receive path cheap. A `WeakMap` lets the compiled validator be collected when
+ * the schema object itself is released.
+ */
+const aggregateValidatorCache = new WeakMap<object, ValidateFunction>();
+
+/** Returns the cached compiled validator for `schema`, compiling on first use. */
+function compiledAggregateValidator(schema: object): ValidateFunction {
+  const cached = aggregateValidatorCache.get(schema);
+  if (cached !== undefined) {
+    return cached;
+  }
+  const validate = aggregateAjv.compile(schema);
+  aggregateValidatorCache.set(schema, validate);
+  return validate;
+}
+
+// ---------------------------------------------------------------------------
 // InvocationHandle — dual consumption (await aggregate / async iterate chunks).
 // ---------------------------------------------------------------------------
 
@@ -496,9 +545,16 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
 
   private guard(mode: "aggregate" | "stream"): void {
     if (this.consumed !== null && this.consumed !== mode) {
-      throw new OutletError(
+      // Dual-consumption guard — a handle backed by a single underlying
+      // source cannot be drained as BOTH `await handle` (aggregate) and
+      // `for await … of handle` (stream). The cross-SDK convergence
+      // target (Kotlin reference, OUT-038 AC13 lifecycle-under-Protocol)
+      // is the Protocol-class shape: code `SCP-TOOL-6020`, slug
+      // `protocol.handle-double-consumed`.
+      throw new OutletProtocolError(
         `InvocationHandle already consumed as ${this.consumed}; cannot switch to ${mode}`,
         "SCP-TOOL-6020",
+        { slug: "protocol.handle-double-consumed", retry: { policy: "never" } },
       );
     }
     this.consumed = mode;
@@ -506,57 +562,35 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
 
   /**
    * Validates a candidate End.aggregate against the registered
-   * aggregate_schema (SCP-OUT-038 AC12). No-op when no schema is
-   * bound to the handle.
+   * `aggregate_schema` (SCP-OUT-038 AC12). No-op when no schema is bound
+   * to the handle (matches the Python reference's
+   * `if schema is None: return`).
    *
-   * Currently performs a structural pass-through: the JSON-schema
-   * validator is bridge-resolved (the bridge already canonicalises +
-   * validates the registration-time `aggregate_schema`). This SDK-side
-   * hook is defense in depth — when the schema describes a JSON Schema
-   * object, we accept the value; we throw {@link OutputError} only when
-   * a schema is bound AND the candidate is `undefined` / `null`. The
-   * full JSON-schema engine wiring is intentionally local to keep the
-   * SDK dependency-free; consumers that need stricter validation can
-   * subclass and override.
+   * Runs the FULL JSON-schema validator via {@link aggregateAjv}, the same
+   * coverage the Python reference gets from `jsonschema.validate`. The
+   * compiled validator is cached per schema object (see
+   * {@link compiledAggregateValidator}) so compilation happens once, not on
+   * every End chunk.
+   *
+   * On failure: throws {@link OutputError} with code `SCP-TOOL-6140` and a
+   * message matching Python's shape (`End.aggregate does not match
+   * aggregate_schema: …`). A `null` aggregate against a bound schema is
+   * rejected the same way the reference does — `null` is fed to the
+   * validator, which fails unless the schema admits `null`.
    */
   private validateAggregate(value: unknown): void {
     if (this.aggregateSchema === null) {
       return;
     }
-    if (value === undefined || value === null) {
+    const validate = compiledAggregateValidator(this.aggregateSchema);
+    // `undefined` is not a JSON value — normalize to `null` so the schema
+    // engine evaluates the same instance the wire would have carried.
+    const instance = value === undefined ? null : value;
+    if (!validate(instance)) {
       throw new OutputError(
-        "End.aggregate is null/undefined but aggregate_schema requires a value",
+        `End.aggregate does not match aggregate_schema: ${aggregateAjv.errorsText(validate.errors)}`,
         "SCP-TOOL-6140",
       );
-    }
-    // If the bound schema declares `type` and we can do a cheap match,
-    // do so — otherwise accept (the bridge has already validated at
-    // registration time per §5.4.5).
-    const declaredType = this.aggregateSchema.type;
-    if (typeof declaredType === "string") {
-      const actual = Array.isArray(value) ? "array" : typeof value;
-      const matches =
-        declaredType === actual ||
-        (declaredType === "integer" && actual === "number" && Number.isInteger(value)) ||
-        (declaredType === "object" && actual === "object" && !Array.isArray(value));
-      if (!matches) {
-        throw new OutputError(
-          `End.aggregate type '${actual}' does not match aggregate_schema type '${declaredType}'`,
-          "SCP-TOOL-6140",
-        );
-      }
-    }
-    const required = this.aggregateSchema.required;
-    if (Array.isArray(required) && typeof value === "object" && !Array.isArray(value)) {
-      const obj = value as Record<string, unknown>;
-      for (const key of required) {
-        if (typeof key === "string" && !(key in obj)) {
-          throw new OutputError(
-            `End.aggregate missing required field '${key}' per aggregate_schema`,
-            "SCP-TOOL-6140",
-          );
-        }
-      }
     }
   }
 
@@ -582,41 +616,63 @@ export class InvocationHandle implements PromiseLike<Aggregate>, AsyncIterable<O
   // AsyncIterable: enables `for await (const chunk of handle)`. Per
   // SCP-OUT-038 AC14 the iterator yields the terminal `end` chunk
   // (10 Data + End ⇒ 11 chunks observed).
+  /**
+   * Resolve one iterator step from a dequeued channel item. Returns the
+   * {@link IteratorResult} to hand back, or throws the error the iterator
+   * must reject with. Extracted from the {@link Symbol.asyncIterator}
+   * closure to keep that closure's cognitive complexity in budget.
+   *
+   * `state.endYielded` carries the per-iterator terminal-observation flag
+   * by reference so this method can flip it on End / terminal Error.
+   */
+  private iteratorStep(
+    item: OutletStreamChunk | Error | null,
+    state: { endYielded: boolean },
+  ): IteratorResult<OutletStreamChunk> {
+    if (item === null) {
+      // Clean end-of-iteration vs. abnormal closure (mirrors the Python
+      // `__anext__` contract exactly):
+      // - terminal chunk already yielded ⇒ this `null` is the normal
+      //   end-of-queue marker ⇒ done.
+      // - otherwise the bridge receiver closed without the executor ever
+      //   emitting a terminal chunk ⇒ surface `SCP-TOOL-6131` (no slug)
+      //   so the caller sees a real error, not silent completion.
+      if (state.endYielded) {
+        return { value: undefined, done: true };
+      }
+      throw new OutletExecutionError("stream closed without terminal chunk", "SCP-TOOL-6131");
+    }
+    if (item instanceof Error) {
+      throw item;
+    }
+    // AC14: yield End as a chunk; subsequent next() resolves done.
+    if (item.payloadType === "end") {
+      state.endYielded = true;
+      this.validateAggregate(item.aggregate);
+      return { value: item, done: false };
+    }
+    if (item.payloadType === "error" && item.terminal === true) {
+      state.endYielded = true;
+    }
+    return { value: item, done: false };
+  }
+
   [Symbol.asyncIterator](): AsyncIterator<OutletStreamChunk> {
     this.guard("stream");
-    let endYielded = false;
+    const state = { endYielded: false };
     return {
       next: () =>
         new Promise<IteratorResult<OutletStreamChunk>>((resolve, reject) => {
-          if (endYielded) {
+          if (state.endYielded) {
             resolve({ value: undefined, done: true });
             return;
           }
           const handleItem = (item: OutletStreamChunk | Error | null): void => {
-            if (item === null) {
-              resolve({ value: undefined, done: true });
-              return;
+            try {
+              resolve(this.iteratorStep(item, state));
+            } catch (err) {
+              reject(err);
             }
-            if (item instanceof Error) {
-              reject(item);
-              return;
-            }
-            // AC14: yield End as a chunk; subsequent next() resolves done.
-            if (item.payloadType === "end") {
-              endYielded = true;
-              try {
-                this.validateAggregate(item.aggregate);
-              } catch (err) {
-                reject(err);
-                return;
-              }
-              resolve({ value: item, done: false });
-              return;
-            }
-            if (item.payloadType === "error" && item.terminal === true) {
-              endYielded = true;
-            }
-            resolve({ value: item, done: false });
           };
           const queued = this.chunks.shift();
           if (queued !== undefined) handleItem(queued);
@@ -750,12 +806,13 @@ interface InvocationHandleSink {
  *
  * Abnormal-closure handling: if the bridge receiver returns `null`
  * BEFORE a terminal chunk (`End` / `Error{terminal: true}`) was
- * observed, the SDK surfaces an `execution.stream-gap` error
- * (`SCP-TOOL-6131`) per §5.4.4 — synthesising a degenerate
+ * observed, the SDK surfaces an {@link OutletExecutionError} with code
+ * `SCP-TOOL-6131` and NO slug per §5.4.4 — synthesising a degenerate
  * `End{value: null}` would mask a transport drop, executor crash, or
- * bridge fault as a successful aggregate-null outcome. The runtime
- * emits `execution.stream-gap` for the analogous mid-stream-gap
- * condition, so the SDK uses the same slug + code on the consumer side.
+ * bridge fault as a successful aggregate-null outcome. The code matches
+ * the abnormal-closure error every SDK emits on the consumer side
+ * (Python / Swift / Kotlin); none of them attaches a slug, since the
+ * spec registers no slug for this condition.
  */
 async function pumpStreamingBridge(
   stream: BridgeOutletInvocationStream,
@@ -769,7 +826,7 @@ async function pumpStreamingBridge(
         if (!terminalObserved) {
           // Abnormal closure — the bridge receiver closed without the
           // executor emitting a terminal chunk. Surface as an
-          // `execution.stream-gap` (SCP-TOOL-6131) instead of
+          // OutletExecutionError (SCP-TOOL-6131, no slug) instead of
           // synthesising an aggregate-null End so callers cannot
           // mistake a transport drop / executor crash for a successful
           // run that simply returned `null`.

@@ -108,8 +108,8 @@ extension Tag {
 // against synthetic `OutletStreamChunkRecord` sequences. When the
 // bridge returns `nil` BEFORE a terminal chunk, the pump MUST reject
 // the aggregate with `OutletError.execution(...)` carrying
-// `SCP-TOOL-6131` / `execution.stream-gap` per §5.4.4 — NOT resolve
-// with a degenerate `Aggregate(valueJson: "null")`.
+// `SCP-TOOL-6131` and NO slug per §5.4.4 — NOT resolve with a
+// degenerate `Aggregate(valueJson: "null")`.
 
 @Suite(.tags(.streaming))
 struct AbnormalClosureTests {
@@ -165,7 +165,9 @@ struct AbnormalClosureTests {
         #expect(err != nil)
         if case let .execution(env)? = err as? OutletError {
             #expect(env.code == "SCP-TOOL-6131")
-            #expect(env.slug == "execution.stream-gap")
+            // Convergence: abnormal closure carries NO slug across all SDKs
+            // (the spec registers none for this 6131 condition).
+            #expect(env.slug == "")
             #expect(env.message.contains("stream closed without terminal chunk"))
         } else {
             Issue.record("expected OutletError.execution, got \(String(describing: err))")
@@ -201,6 +203,92 @@ struct AbnormalClosureTests {
         let agg = resolvedAgg.get()
         #expect(agg != nil)
         #expect(agg?.valueJson == #"{"sum":1}"#)
+    }
+}
+
+// MARK: - Dual-consumption guard (consistency-B)
+
+//
+// A handle backed by a single underlying source cannot be drained as
+// BOTH `await handle.aggregate` and `for try await chunk in handle`. The
+// cross-SDK convergence target (Kotlin reference, OUT-038 AC13
+// lifecycle-under-Protocol) is the Protocol-class shape: code
+// `SCP-TOOL-6020`, slug `protocol.handle-double-consumed`. Because
+// `makeAsyncIterator()` is non-throwing, a stream-after-aggregate
+// conflict surfaces on the iterator's first `next()`.
+
+@Suite(.tags(.streaming))
+struct DualConsumptionGuardTests {
+    /// Builds a handle whose pump yields a single End chunk and resolves
+    /// the aggregate — enough to exercise either consumption mode.
+    private func makeEndHandle() -> InvocationHandle {
+        InvocationHandle(requestIdHex: nil, aggregateSchemaJson: nil) { yieldChunk, resolveAggregate, _ in
+            let chunk = OutletStreamChunk(
+                requestId: Data(count: 16),
+                sequence: 0,
+                payload: .end(aggregate: #"{"sum":1}"#, executionTimeMs: 0)
+            )
+            yieldChunk(chunk)
+            resolveAggregate(Aggregate(valueJson: #"{"sum":1}"#))
+        }
+    }
+
+    @Test("aggregate then iterate throws protocol.handle-double-consumed on first next()")
+    func aggregateThenIterate() async throws {
+        let handle = makeEndHandle()
+        _ = try await handle.aggregate // claim "aggregate"
+        var iterator = handle.makeAsyncIterator() // non-throwing; guarded
+        var caught: Error?
+        do {
+            _ = try await iterator.next()
+        } catch {
+            caught = error
+        }
+        #expect(caught != nil)
+        if case let .protocol(env)? = caught as? OutletError {
+            #expect(env.code == "SCP-TOOL-6020")
+            #expect(env.slug == "protocol.handle-double-consumed")
+            #expect(env.classWire == .protocol)
+        } else {
+            Issue.record("expected OutletError.protocol, got \(String(describing: caught))")
+        }
+    }
+
+    @Test("iterate then aggregate throws protocol.handle-double-consumed")
+    func iterateThenAggregate() async throws {
+        let handle = makeEndHandle()
+        var iterator = handle.makeAsyncIterator() // claim "stream"
+        _ = try await iterator.next() // drains the End chunk cleanly
+        var caught: Error?
+        do {
+            _ = try await handle.aggregate
+        } catch {
+            caught = error
+        }
+        #expect(caught != nil)
+        if case let .protocol(env)? = caught as? OutletError {
+            #expect(env.code == "SCP-TOOL-6020")
+            #expect(env.slug == "protocol.handle-double-consumed")
+        } else {
+            Issue.record("expected OutletError.protocol, got \(String(describing: caught))")
+        }
+    }
+
+    @Test("same-mode re-consumption is idempotent (two iterators, no throw)")
+    func sameModeIdempotent() async throws {
+        let handle = makeEndHandle()
+        var first = handle.makeAsyncIterator()
+        _ = try await first.next()
+        // Re-claiming "stream" must NOT throw — the guard only rejects a
+        // DIFFERENT mode.
+        var second = handle.makeAsyncIterator()
+        var threw = false
+        do {
+            _ = try await second.next()
+        } catch {
+            threw = true
+        }
+        #expect(threw == false)
     }
 }
 
