@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Enforcement infra hardening — PR-E (PR #1735)
 
-Four enforcement-infra improvements that close gaps surfaced in the #1543
+Five enforcement-infra improvements that close gaps surfaced in the #1543
 review series, plus the §1 cleanup the new gate identified. No protocol
 behaviour change; all changes are mechanical hardening of the bridge
 surface tests and refactoring of pure helpers per ADR-048 §1.
@@ -52,11 +52,27 @@ Kotlin; Python continues to expose module-level functions per
   migration vs native active-key rotation; `identity_create_link_attestation` —
   resolved 2026-04-26 by PR #1719). Inline `// SEMANTIC DIVERGENCE`
   comments at the WASM call sites.
+- **Exemption durable-provenance gate.** New invariant
+  `every_exemption_reason_cites_durable_provenance` requires every
+  per-bridge exemption in `scripts/bridge-aliases.json` to justify itself
+  with an ADR (`ADR-NNN`), spec section (`§N…`), or PRD story (`SCP-NNN`).
+  Issue/PR numbers are rejected (ephemeral; policy forbids issue refs in
+  tracked data). The gate immediately caught a factually wrong exemption:
+  `identity_migrate` was marked "not yet exported (known gap)" in NAPI, but
+  it IS exported as the `Identity#migrate` instance method — the alias was
+  simply never recorded. Wired the real `migrate` alias and removed the
+  false exemption. Two adversarial unit tests cover the detector.
 
 **Side fix:** `scripts/hooks/pretooluse-enforcement-files.sh` switched
 from suffix to exact-canonical-path matching anchored at the worktree
-root. Fixture copies of `bridge-aliases.json` no longer trigger
-false-positive blocks; symlink-bypass protection preserved.
+root, and the enforcement-file guard was extended to `Bash` tool calls:
+best-effort detection of write verbs (`tee`/`mv`/`cp`/`sed -i`/interpreter
+writes) and stdout redirections targeting a protected basename. Reads
+(`cat`/`grep`/`jq`/`ls`) are still allowed; CI remains the canonical gate.
+`check-pure-helpers.sh`, `pure-helpers-allowlist.txt`, and the hook script
+itself were registered in both the CLAUDE.md enforcement list and the
+hook's protected-paths set. Fixture copies of `bridge-aliases.json` no
+longer trigger false-positive blocks; symlink-bypass protection preserved.
 
 ## [Unreleased] - 2026-04-18
 
