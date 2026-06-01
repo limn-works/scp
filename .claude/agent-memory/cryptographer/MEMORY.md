@@ -125,6 +125,33 @@
 - Attestation renewal: mandatory re-verification before renewed_at update, SOUND
 - MessageType::as_discriminator_byte() exists but NOT used in compute_canonical_hash -- docstring misleading
 
+### SCP-1717 Pre-Rotation Custody (2026-05-10 round-10 final review — SOUND, no blocking findings)
+- Round-10 (commit 7ce74e7ca): Added 6 typed FFI error codes SCP-IDENT-1047..1052, one per PreRotationCustodyError variant. Diff confined to PyO3/NAPI/UniFFI From<IdentityError>; zero crypto substrate drift (git diff -- scp-identity scp-platform scp-ffi/wasm empty). Byte-equal const-string mapping across 3 bridges. 7 regression tests pin variants + fallback. WASM intentionally unchanged (own registry, IDENT_1002). LOW followups: parity codes in WASM custody paths; rustdoc warning to backend implementers re: not embedding key material in Storage/Unavailable/InvalidCallbackResponse strings.
+- Round-8 review history below:
+- Round-8 polish landed: Kotlin Identity.migrate deprecation level=ERROR (Identity.kt:299-308); bind_old_document_to_old_did's 5 error paths uniformly map to MigrationVerificationFailed (dht.rs:1919-1948); step-0 mismatch error carries 12-byte hex prefixes for did-derived + document-derived pubkeys (dht.rs:1940-1946)
+- CI clippy clean at full feature set (allow_in_memory_custody on all bridges + scp-core/scp-runtime testing)
+- Prior HIGH (verify_migration old_public_key→old_did binding via step 1b) addressed → bind_old_document_to_old_did is now an explicit Step 0 backstop closing the documented LOW from earlier rev. Caller contract explicit at dht.rs:2023-2036 (must use resolve_did / verify_and_deserialize / relay_resolve).
+- Prior LOW (PreRotationKeyEntry struct-level Zeroize derive) FIXED at testing/pre_rotation_custody.rs:40 + WASM mirror at wasm/identity.rs:441
+- rotated_at bounds at dht.rs:1809-1840: MAX_FUTURE_SKEW_SECS=300, MAX_PAST_WINDOW_SECS=5y, MIGRATION_EPOCH_FLOOR_UNIX_SECS=1_700_000_000 (hard floor closes saturating-clamp loophole on broken-clock verifiers)
+- check_rotated_at_window boundary walk: rotated_at=floor passes, floor-1 rejected, u64::MAX rejected (when now is real), now=0 → floor still rejects rotated_at<floor
+- Step ordering: probe→reveal→build proofs→generate-new-pre-rot→store-new→destroy-old/import-as-#0→build-doc→publish-NEW→publish-OLD-with-aKa
+- Step 0 probe (import_ed25519_signing_key + destroy_key) catches Unsupported pre-flight; FileKeyCustody dedup ensures probe doesn't append duplicate file entries (concurrent dedup test exists)
+- LOW (FIXED): probe seed now OsRng-derived (dht.rs:1258-1260) — collision probability ~2^-256 with any pre-existing entry. Was [0u8;32] in earlier rev.
+- LOW (FIXED 2026-05-03): retire_operational_keys_for_migration (document.rs:890-913) now uses exact-fragment match via rsplit('#').next(). Test at document.rs:2444 injects #secondary-active and verifies retention.
+- LOW (FIXED 2026-05-03): from_did Local-record preservation test landed at wasm/identity.rs:5442. Idempotent re-call preserves IdentityRecord::Local + custody_type + agent_signing_key_bytes.
+- LOW (open): WASM zbase32 parity test pinned to 3 vectors (wasm/identity.rs:5950) — replace with proptest over 1000+ random 32-byte inputs. OUT OF SCOPE per current review.
+- LOW (NEW 2026-05-03): verify_migration doesn't bind old_document to old_did (no internal check that old_document.id == old_did or that #0 VM derives old_did). Caller-supplied document allows STRONG-bypass attack: an attacker with the compromised #0 private key can supply a forged old_document with no PreRotationCommitment service, defeating the STRONG-when-committed enforcement at step 1c. Mitigated when caller uses resolve_did (which calls verify_self_certification). DOCUMENTATION GAP — caller contract not stated in rustdoc. Recommend: add `let expected_id_pk = extract_public_key(old_did)?; let doc_pk = decode_multibase_key(&old_document.verification_method_by_fragment("0")?.public_key_multibase)?; if doc_pk != expected_id_pk { return Err(...); }` inside verify_migration. Severity HIGH if any production caller skips resolution; MEDIUM with the documented contract.
+- MEDIUM open: CallbackKeyCustody.import_ed25519_signing_key returns Unsupported (production iOS/Android migrate fails fast at step 0 — no leak, but feature blocker for #1729)
+- MEDIUM open: callback substrate isolation incomplete (OsRng in bridge process holds bytes briefly co-resident with operational keys)
+- MEDIUM open: step-7 publish_document(new) failure leaves new identity uninstalled with consumed old pre-rotation key — function returns Err with no recovery handle
+- All 4 bridges have SHA-256(revealed_key)==commitment cross-bridge invariant test on REAL bridge output (UniFFI: 15384, NAPI: 1518, PyO3: 2150, WASM: 5072)
+- Reverse-parity test (WASM tests/native_emitted_rotation_event_json_matches_wasm_encoding): Value-equality + native-deserialize round-trip + byte-canonicalize compare — strong
+- WASM `pre_rotation_commitment` recomputed from revealed_key (= old pre-rot pub); verifier later checks against old_doc service entry — equivalent to native flow
+- ADR-046 byte parity preserved (seed[0..32]=identity, [32..64]=active, [64..96]=pre-rotation, [96..128]=agent)
+- zbase32 canonicality math: 32 bytes → 52 chars + 4 padding bits in last char → 16 alternates; encode-and-compare rejects all
+- ed25519_dalek::SigningKey 2.2.0 impls ZeroizeOnDrop — drops at line 1273 wipe internals
+- 268 scp-identity tests pass (1 #[ignore]); 96 scp-platform tests pass
+
 ### Bridge Relay Auth + DID Healing (PR #255, SCP-247/SCP-245)
 - Bridge auth: "SCP-BRIDGE-REGISTER-V1:" || routing_id[32] || be-u64(timestamp) = 63B fixed, SOUND
 - verify_strict() used, verification order: timestamp->sig->routing_id (fast-reject)
