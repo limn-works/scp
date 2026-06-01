@@ -12702,7 +12702,12 @@ impl Scp {
                     // `DidDht::new()` would surface
                     // "no signing function configured".
                     let dht = make_dht_with_signer(kc)?;
-                    let (new_identity, new_document, rotation_event, new_pre_rotation_handle) = dht
+                    let scp_identity::MigrationOutcome {
+                        new_identity,
+                        new_document,
+                        rotation_event,
+                        new_pre_rotation_handle,
+                    } = dht
                         .migrate_identity(
                             &old_identity,
                             &old_document,
@@ -12778,7 +12783,12 @@ impl Scp {
                     let rotated_at = scp_primitives::SystemClock.now_secs();
 
                     let dht = DidDht::new();
-                    let (new_identity, new_document, rotation_event, new_pre_rotation_handle) = dht
+                    let scp_identity::MigrationOutcome {
+                        new_identity,
+                        new_document,
+                        rotation_event,
+                        new_pre_rotation_handle,
+                    } = dht
                         .migrate_identity(
                             &old_identity,
                             &old_document,

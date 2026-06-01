@@ -48,9 +48,9 @@ pub use attestation::{
 };
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use dht::{
-    DidDht, InMemorySequenceStore, MigrationPartialState, PostResolveHook, SequenceStore,
-    decode_multibase_key, did_from_ed25519_public_key, extract_public_key, verify_bep44_signature,
-    verify_migration, verify_self_certification,
+    DidDht, InMemorySequenceStore, MigrationOutcome, MigrationPartialState, MigrationResumePhase,
+    PostResolveHook, SequenceStore, decode_multibase_key, did_from_ed25519_public_key,
+    extract_public_key, verify_bep44_signature, verify_migration, verify_self_certification,
 };
 // SigningKeyId re-exported from scp-primitives (see pub use above).
 pub use dht_client::{DhtClient, InMemoryDhtClient};
@@ -152,47 +152,6 @@ impl std::fmt::Debug for ScpIdentity {
             )
             .finish()
     }
-}
-
-/// Identifies which DHT publish step inside
-/// [`DidDht::migrate_identity`](crate::dht::DidDht::migrate_identity) failed,
-/// and therefore which step a resume attempt must re-run.
-///
-/// `migrate_identity` performs two DHT publishes:
-///
-/// - **Step 7** — publish the NEW DID document so verifiers following
-///   `alsoKnownAs[new_did]` always find a published successor. Failure here
-///   maps to [`MigrationResumePhase::PublishNew`]. Resume re-runs step 7,
-///   step 7b (destroy OLD operational keys), and step 8 (republish OLD
-///   document with `alsoKnownAs`).
-/// - **Step 8** — republish the OLD DID document with
-///   `alsoKnownAs = new_did` (with `#active`/`#agent` retired). Failure
-///   here maps to [`MigrationResumePhase::RepublishOldAlsoKnownAs`]. Resume
-///   re-runs only step 8 — the NEW document is already on the DHT, and
-///   OLD operational keys are already destroyed.
-///
-/// Carried inside [`IdentityError::MigrationPublishFailed`] alongside a
-/// [`MigrationPartialState`](crate::dht::MigrationPartialState) that holds
-/// the byte-identical artifacts the resume call must republish (spec
-/// §9.7.4.1, ADR-046 byte parity).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum MigrationResumePhase {
-    /// Step 7 — publish of the NEW DID document failed.
-    ///
-    /// At the moment of failure, the OLD pre-rotation handle is consumed
-    /// (step 5), the NEW pre-rotation handle is registered in cold custody
-    /// (step 4), the NEW `#0`/`#active` are present in operational custody
-    /// (steps 5/3), and the OLD operational keys are still intact. Resume
-    /// re-runs step 7 (publish NEW), step 7b (destroy OLD operational keys),
-    /// and step 8 (publish OLD with `alsoKnownAs`).
-    PublishNew,
-    /// Step 8 — republish of the OLD DID document with `alsoKnownAs` failed.
-    ///
-    /// At the moment of failure, the NEW DID document is already published
-    /// (step 7 succeeded), and the OLD `#active` / `#agent` keys are already
-    /// destroyed (step 7b ran). The OLD `#0` is intentionally retained so
-    /// step 8 can re-sign the republish. Resume re-runs only step 8.
-    RepublishOldAlsoKnownAs,
 }
 
 /// Errors produced by identity operations.
@@ -336,6 +295,59 @@ pub enum IdentityError {
         #[source]
         source: Box<Self>,
     },
+}
+
+impl IdentityError {
+    /// Borrows the partial state from a
+    /// [`IdentityError::MigrationPublishFailed`] variant. Returns
+    /// `None` for any other variant.
+    ///
+    /// Useful when a caller bubbled the error up through `?` and only
+    /// wants to peek at the recovery handle without destructuring the
+    /// `IdentityError` enum manually (for example, to log the in-flight
+    /// migration's old/new DID strings via
+    /// [`crate::dht::MigrationPartialState::old_did`] and
+    /// [`crate::dht::MigrationPartialState::new_did`]).
+    ///
+    /// For owning access — needed when calling
+    /// [`crate::dht::DidDht::resume_migration_publish`] — use
+    /// [`Self::into_migration_partial`] instead.
+    #[must_use]
+    pub fn as_migration_partial(&self) -> Option<&crate::dht::MigrationPartialState> {
+        match self {
+            Self::MigrationPublishFailed { partial, .. } => Some(partial),
+            _ => None,
+        }
+    }
+
+    /// Consumes this error, returning the owned partial state when the
+    /// variant is [`IdentityError::MigrationPublishFailed`]. Otherwise
+    /// returns the original error verbatim in the `Err` arm so the
+    /// caller can re-propagate it.
+    ///
+    /// This is the idiomatic shape for handing a recovery handle to
+    /// [`crate::dht::DidDht::resume_migration_publish`], which consumes
+    /// the partial state by value:
+    ///
+    /// ```ignore
+    /// match err.into_migration_partial() {
+    ///     Ok(partial) => dht.resume_migration_publish(partial, &custody).await?,
+    ///     Err(other) => return Err(other),
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(self)` if the variant is not
+    /// [`IdentityError::MigrationPublishFailed`] — the original error is
+    /// returned unchanged so callers can re-propagate without
+    /// allocating a fresh wrapper.
+    pub fn into_migration_partial(self) -> Result<crate::dht::MigrationPartialState, Self> {
+        match self {
+            Self::MigrationPublishFailed { partial, .. } => Ok(*partial),
+            other => Err(other),
+        }
+    }
 }
 
 /// Abstract trait for DID method implementations.
