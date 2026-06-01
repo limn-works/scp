@@ -1045,7 +1045,15 @@ async fn restore_respawns_ttl_timer() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
-        routing: crate::context::manager::ContextRouting::Broadcast,
+        // Encrypted-mode snapshot (`ContextParams::default()`) must carry
+        // Encrypted routing so the restore-path mode↔routing consistency
+        // check accepts it. Non-zero local pseudonym, empty registry — this
+        // restore test only exercises TTL-timer re-spawn, which is
+        // routing-agnostic.
+        routing: crate::context::manager::ContextRouting::Encrypted {
+            local_pseudonym: [7u8; 32],
+            pseudonym_registry: HashMap::new(),
+        },
     };
 
     persistence.persist_context("ttl-ctx", &snapshot).unwrap();
@@ -1140,7 +1148,14 @@ async fn restore_all_contexts_restores_persisted() {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,
-            routing: crate::context::manager::ContextRouting::Broadcast,
+            // Encrypted-mode snapshot (`ContextParams::default()`) must carry
+            // Encrypted routing so the restore-path mode↔routing consistency
+            // check accepts it. This test verifies that `restore_all_contexts`
+            // lists and restores each persisted context — routing-agnostic.
+            routing: crate::context::manager::ContextRouting::Encrypted {
+                local_pseudonym: [7u8; 32],
+                pseudonym_registry: HashMap::new(),
+            },
         };
         persistence.persist_context(ctx_name, &snapshot).unwrap();
     }
@@ -1607,7 +1622,13 @@ async fn restore_preserves_spending_nonce_tracker_across_restart() {
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
-        routing: crate::context::manager::ContextRouting::Broadcast,
+        // Snapshot is explicitly `mode = Encrypted`; routing must match so the
+        // restore-path consistency check accepts it. This test verifies the
+        // spending-nonce tracker survives a restart — routing-agnostic.
+        routing: crate::context::manager::ContextRouting::Encrypted {
+            local_pseudonym: [7u8; 32],
+            pseudonym_registry: HashMap::new(),
+        },
     };
 
     persistence
@@ -1745,7 +1766,15 @@ fn reconnect_test_snapshot(
         checkpoint_events_since: 0,
         checkpoint_last_time_secs: 0,
         generation: 0,
-        routing: crate::context::manager::ContextRouting::Broadcast,
+        // The helper builds an Encrypted-mode snapshot
+        // (`ContextParams::default()`), so routing must be Encrypted for the
+        // restore-path consistency check to accept it. The reconnect tests
+        // that consume this helper assert on `needs_reconnect` flagging and
+        // reconnection wiring, both routing-agnostic.
+        routing: crate::context::manager::ContextRouting::Encrypted {
+            local_pseudonym: [7u8; 32],
+            pseudonym_registry: HashMap::new(),
+        },
     }
 }
 
@@ -3563,6 +3592,14 @@ async fn restore_context_preserves_budget_tracker() {
     snapshot.membership = membership;
     snapshot.role_state = role_state;
     snapshot.budget_tracker = budget_tracker;
+    // `c3_test_snapshot` ships the stripped-public Broadcast routing marker, but
+    // these overrides keep `mode = Encrypted`. Pair it with Encrypted routing so
+    // the restore-path mode↔routing consistency check accepts the snapshot; this
+    // test verifies budget-grant preservation across restore, routing-agnostic.
+    snapshot.routing = crate::context::manager::ContextRouting::Encrypted {
+        local_pseudonym: [7u8; 32],
+        pseudonym_registry: HashMap::new(),
+    };
 
     persistence
         .persist_context("c3-restore-budget", &snapshot)
@@ -3649,6 +3686,15 @@ async fn restore_context_validates_consequence_rules() {
         threshold: 3,
         window: std::time::Duration::from_hours(1),
     });
+    // `c3_test_snapshot` ships the stripped-public Broadcast routing marker, but
+    // `params` keeps `mode = Encrypted`. Pair it with Encrypted routing so the
+    // snapshot clears the mode↔routing consistency check and reaches the
+    // consequence-rule validation this test actually exercises (which must
+    // still reject the config-inconsistent RevokeAccess rule below).
+    snapshot.routing = crate::context::manager::ContextRouting::Encrypted {
+        local_pseudonym: [7u8; 32],
+        pseudonym_registry: HashMap::new(),
+    };
 
     persistence
         .persist_context("c3-restore-bad-rules", &snapshot)
