@@ -115,7 +115,9 @@ check-no-kotlin-mutable-globals.sh,
 bindings/swift/.swiftlint.yml (no_static_var / no_static_lazy_var rules),
 check-bridge-symmetry.sh, bridge-aliases.json, check-call-invariants.py,
 call-invariants-baseline.json,
+check-pure-helpers.sh, pure-helpers-allowlist.txt,
 bridge_ratchet_baseline.json, ratchet/once-lock-count.json,
+pretooluse-enforcement-files.sh,
 CLAUDE.md (enforcement sections).
 If a check fails, fix the code. The only legitimate modifications are:
 - Adding NEW assertions/operations (expanding coverage)

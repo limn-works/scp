@@ -37,6 +37,9 @@ PROTECTED_REPO_RELATIVE_PATHS=(
     ".claude/settings.json"
     "scripts/check-bridge-symmetry.sh"
     "scripts/bridge-aliases.json"
+    "scripts/check-pure-helpers.sh"
+    "scripts/pure-helpers-allowlist.txt"
+    "scripts/hooks/pretooluse-enforcement-files.sh"
 )
 
 tool_json=$(cat)
@@ -49,9 +52,47 @@ tool_json=$(cat)
 # otherwise.
 tool_name=$(printf '%s' "$tool_json" | jq -r '.tool_name // ""')
 case "$tool_name" in
-    Edit|Write|MultiEdit) ;;
+    Edit|Write|MultiEdit|Bash) ;;
     *) exit 0 ;;
 esac
+
+# Bash commands: extract the `command` field and do a best-effort substring
+# search for any protected basename. This catches the obvious in-band write
+# patterns — `tee`, `mv`, `cat > file`, `sed -i`, `python3.12 -c '…write…'`,
+# direct stdout redirections — without trying to be a full shell parser.
+# Known limitation: variable substitution, command substitution, base64
+# encoding, indirect writes via intermediate scripts. Defense-in-depth, not
+# cryptographic enforcement: CI runs the canonical bridge-symmetry /
+# pure-helpers / fmt / clippy gates against any landed change, so a
+# malicious obfuscation that slips this check still has to face CI.
+if [[ "$tool_name" == "Bash" ]]; then
+    command_str=$(printf '%s' "$tool_json" | jq -r '.tool_input.command // ""')
+    [[ -z "$command_str" ]] && exit 0
+    # Match against the BASENAME of each protected path (not the full path)
+    # because Bash commands often refer to files relative to cwd / via $REPO
+    # / shell vars. Reuses the single PROTECTED_REPO_RELATIVE_PATHS defined
+    # above — do not redeclare it here.
+    for rel in "${PROTECTED_REPO_RELATIVE_PATHS[@]}"; do
+        basename="${rel##*/}"
+        if [[ "$command_str" == *"$basename"* ]]; then
+            # Allow READ-style operations (cat / less / head / tail / view
+            # / file / wc / grep without -i / sed without -i flag / etc.).
+            # The threat is WRITE — heuristically detect write verbs.
+            # POSIX `[[:space:]]` classes (not `[ \t]`, whose literal `t`
+            # would exclude any path component containing the letter t, e.g.
+            # `scripts/`). `[^[:space:]|]*` after the redirect absorbs a path
+            # prefix (e.g. `> scripts/bridge-aliases.json`) before the basename.
+            if echo "$command_str" | grep -qE '\b(tee|mv|cp|cat[^|]*>|sed[[:space:]]+-i|python3?(\.[0-9]+)?[[:space:]]+(-c[[:space:]]+|.*\.py)|bun|node)[[:space:]].*'"$basename" \
+               || echo "$command_str" | grep -qE '>>?[[:space:]]*[^[:space:]|]*'"$basename"; then
+                echo "enforcement file protected (Bash write): $basename" >&2
+                echo "Detected an apparent write/redirect to a protected" \
+                     "enforcement file via Bash. Use a dedicated PR." >&2
+                exit 2
+            fi
+        fi
+    done
+    exit 0
+fi
 
 paths=$(
     printf '%s' "$tool_json" \
