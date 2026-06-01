@@ -1751,6 +1751,13 @@ pub fn context_export(handle: &WasmContextHandle) -> Promise {
 /// context. The context becomes active and available for operations.
 ///
 /// Delegates to `WasmContextManager::import_context`.
+///
+/// Unlike the PyO3/NAPI/UniFFI bridges, this function takes no importer
+/// identity argument: the WASM bridge has no per-member pseudonym routing
+/// (§9.10.4) — ADR-034 keeps WASM on shared routing IDs and omits the
+/// pseudonym-derivation path entirely — so there is no importer pseudonym to
+/// derive on import. The absent importer parameter is a deliberate ADR-034
+/// design decision, not an omission.
 #[wasm_bindgen]
 pub fn context_import(data: Vec<u8>) -> Promise {
     future_to_promise(async move {
