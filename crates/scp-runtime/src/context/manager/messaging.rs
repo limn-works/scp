@@ -437,6 +437,24 @@ fn run_buffered_post_delivery(
     ctx.checkpoint_events_since += 1;
 }
 
+/// Classifies a send-path payload as a `PseudonymAnnouncement` (§9.10.4).
+///
+/// Announcements are the ONLY payload class permitted to use the shared
+/// `context_routing_id` as an addressee — they form the bootstrap channel
+/// that peers use to learn each other's pseudonyms before regular app data
+/// can fan out on pseudonym-only paths. Returns `true` only when the
+/// payload deserializes as a well-formed `PseudonymAnnouncement` struct AND
+/// carries the magic tag (`PSEUDONYM_ANNOUNCEMENT_TAG`, prefixed with `\0`
+/// to avoid collision with UTF-8 user content). False positives from
+/// adversarial payloads cannot escalate — the worst outcome is that a
+/// legitimate app message is routed to the shared RID, which is not a
+/// security issue (MLS still gates confidentiality) and is detected as a
+/// non-announcement on the receive path.
+fn is_pseudonym_announcement_payload(payload: &[u8]) -> bool {
+    rmp_serde::from_slice::<super::PseudonymAnnouncement>(payload)
+        .is_ok_and(|a| a.tag == super::PSEUDONYM_ANNOUNCEMENT_TAG)
+}
+
 #[allow(clippy::significant_drop_tightening)]
 impl ContextManager {
     /// Sends a message within a context.
@@ -620,30 +638,46 @@ impl ContextManager {
                 // routing IDs. A relay can correlate pseudonyms by observing identical blobs.
                 // Per-recipient re-encryption (different nonce per blob) would fix this but
                 // increases bandwidth by O(N). Acceptable until relay-blinding is implemented.
+                //
+                // Announcement bootstrap channel (§9.10.4): `PseudonymAnnouncement`
+                // payloads are the ONLY messages permitted to use the shared
+                // `context_routing_id` as an addressee. Every group member
+                // subscribes to the shared RID (for MLS management traffic),
+                // so announcements published there reach peers whose pseudonym
+                // we have not yet learned. App data continues to fan out to
+                // known peer pseudonyms only — the shared RID is never used
+                // for sensitive payloads.
+                let is_announcement = is_pseudonym_announcement_payload(payload);
+                let member_count = ctx.membership.count();
                 let routing_ids: Vec<[u8; 32]> = match &ctx.routing {
                     super::ContextRouting::Encrypted {
                         pseudonym_registry, ..
                     } => {
-                        // Defensive warn-log: an encrypted context with
-                        // multiple members but no peer pseudonyms means the
-                        // pseudonym announcement wiring is broken somewhere
-                        // upstream. We still attempt the (empty) fan-out —
-                        // returning an error would be worse than no-op, and
-                        // real production flows self-heal once announcements
-                        // are processed. (The task-level debug_assert! was
-                        // dropped because multi-member test harnesses set up
-                        // membership directly without running the full
-                        // announcement round-trip — a hard panic would break
-                        // every such test for no behavioral benefit.)
-                        if ctx.membership.count() > 1 && pseudonym_registry.is_empty() {
-                            tracing::warn!(
-                                context_id = %context_id,
-                                member_count = ctx.membership.count(),
-                                "encrypted send_message with empty pseudonym registry — \
-                                 peers have not announced routing IDs; message will reach nobody"
-                            );
+                        let mut ids: Vec<[u8; 32]> = pseudonym_registry.values().copied().collect();
+                        if is_announcement {
+                            // Bootstrap path: also address the shared RID so
+                            // peers who have not yet announced their pseudonym
+                            // still receive this announcement.
+                            ids.push(scp_protocol::context::context_routing_id(&context_id));
+                        } else if member_count > 1 && ids.is_empty() {
+                            // App-data send into an encrypted multi-member
+                            // context with an empty pseudonym registry would
+                            // produce zero sends and silently drop the
+                            // payload — the historic silent-Ok(()) behavior
+                            // that masked a bidirectional bootstrap deadlock.
+                            // Raise a typed error so callers can distinguish
+                            // "peers have not announced yet; retry later"
+                            // from a transport failure, and roll back the
+                            // economy ticket + sequence reservation via the
+                            // early-return path.
+                            super::economy::rollback_economy_ticket_inline(ctx, ticket);
+                            ctx.membership.rollback_sequence_number(sender_did);
+                            return Err(ContextError::PseudonymRegistryEmpty {
+                                context_id: context_id.clone(),
+                                member_count,
+                            });
                         }
-                        pseudonym_registry.values().copied().collect()
+                        ids
                     }
                     super::ContextRouting::Broadcast => {
                         // Unreachable: the broadcast_context.is_some() branch
