@@ -104,12 +104,19 @@ if [[ "$tool_name" == "Bash" ]]; then
             # (force-clobber `>|` / `>>|`) right after the operator, then
             # `[^[:space:]|]*` absorbs a path prefix (e.g.
             # `>| scripts/bridge-aliases.json`) before the basename.
-            # `sed[[:space:]]+(-i|--in-place)[^[:space:]]*` matches every
-            # in-place form: GNU `sed -i`, BSD/macOS suffix-attached `sed -i''`
-            # / `sed -i.bak` (idiomatic on darwin), and `sed --in-place[=.bak]`.
-            # `[^[:space:]]*` absorbs the optional suffix before the common
-            # `[[:space:]].*basename` tail.
-            if echo "$command_str" | grep -qE '\b(tee|mv|cp|cat[^|]*>|sed[[:space:]]+(-i|--in-place)[^[:space:]]*|python3?(\.[0-9]+)?[[:space:]]+-c)[[:space:]].*'"$basename" \
+            # sed in-place matcher: `(-[[:alpha:]]+[[:space:]]+)*` skips any
+            # leading separate flags (`sed -n -i …`, `sed -E -i …`), then
+            # `-[[:alpha:]]*i[[:alpha:]]*` matches `-i` standalone OR combined
+            # in a short cluster (`-ni`, `-in`) — in sed, a short-flag cluster
+            # containing `i` always means in-place — and `--in-place` matches
+            # the long form. `[^[:space:]]*` absorbs the optional suffix
+            # (`-i''`, `-i.bak`, `--in-place=.bak`) before the common
+            # `[[:space:]].*basename` tail. Covers GNU and BSD/macOS forms and
+            # reordered/combined flags. Residual best-effort gaps (e.g. `-i`
+            # placed AFTER the script, exotic obfuscation) fall to CI.
+            # POSIX `[[:space:]]` (not `[ \t]`, whose literal `t` would exclude
+            # path components containing the letter t, e.g. `scripts/`).
+            if echo "$command_str" | grep -qE '\b(tee|mv|cp|cat[^|]*>|sed[[:space:]]+(-[[:alpha:]]+[[:space:]]+)*(-[[:alpha:]]*i[[:alpha:]]*|--in-place)[^[:space:]]*|python3?(\.[0-9]+)?[[:space:]]+-c)[[:space:]].*'"$basename" \
                || echo "$command_str" | grep -qE '>>?\|?[[:space:]]*[^[:space:]|]*'"$basename"; then
                 echo "enforcement file protected (Bash write): $basename" >&2
                 echo "Detected an apparent write/redirect to a protected" \
