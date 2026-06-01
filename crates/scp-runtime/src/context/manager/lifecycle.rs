@@ -36,6 +36,74 @@ pub(super) fn build_routing_for_mode(
     }
 }
 
+/// Reconstructs a [`BroadcastContext`] for an imported Broadcast-mode context.
+///
+/// A [`crate::context::export_import::ContextExport`] carries only the
+/// [`ContextSnapshot`] (membership, roles, governance), the event log, and an
+/// opaque MLS blob. It does NOT carry the separately-persisted
+/// `BroadcastContextSnapshot` (subscribers / block lists / per-author key
+/// state), so those cannot be transferred across instances on import — the
+/// importer re-learns subscribers via re-subscription and re-establishes
+/// per-author block lists, exactly as a node with no persisted broadcast
+/// snapshot does on a cold restore.
+///
+/// What IS reconstructable from the import is the broadcast roster shape:
+/// the admission policy (derived from `template_id`, mirroring
+/// `create_context` / `init_broadcast_context`) and the author set (every
+/// member holding `MessagesWrite` in the imported `role_state`). Authors are
+/// re-registered with fresh per-author key state at epoch 0 — the importer
+/// owns its own broadcast keys; the exporter's are local-instance secrets
+/// with no meaning here (the same rationale that wipes the spending-nonce
+/// tracker and budget on import).
+///
+/// This restores the invariant the runtime relies on:
+/// `broadcast_context.is_some()` ⇔ `mode == Broadcast` ⇔ `routing ==
+/// Broadcast`. Without it, a Broadcast-mode import left `broadcast_context =
+/// None` while `routing = Broadcast`, sending `send_message` into the
+/// pseudonymous else-branch — a `debug_assert!` panic in debug/test and an
+/// empty fan-out (silent message loss) in release.
+fn reconstruct_broadcast_context_for_import(
+    context_id: &str,
+    params: &ContextParams,
+    membership: &MembershipState,
+    role_state: &ContextRoleState,
+) -> Result<Option<BroadcastContext>, ContextError> {
+    if params.mode != ContextMode::Broadcast {
+        return Ok(None);
+    }
+    // Mirrors `init_broadcast_context` / `create_context_with_governance`:
+    // gated template ⇒ Gated admission; everything else (public, paid, or
+    // unspecified) ⇒ Open.
+    let admission = match params.template_id {
+        Some(TemplateId::GatedBroadcast) => BroadcastAdmission::Gated,
+        _ => BroadcastAdmission::Open,
+    };
+    let mut bc =
+        BroadcastContext::new(context_id.to_owned(), &params.mode, admission).map_err(|e| {
+            ContextError::ImportRejected {
+                reason: e.to_string(),
+            }
+        })?;
+    // Re-register every member that holds messages:write as an author, with
+    // fresh key state at epoch 0. Sorted for deterministic reconstruction
+    // regardless of membership iteration order.
+    let mut author_dids: Vec<&DID> = membership
+        .members()
+        .map(|m| &m.did)
+        .filter(|did| role_state.member_has_capability(did.as_ref(), &Capability::MessagesWrite))
+        .collect();
+    author_dids.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    for did in author_dids {
+        // `add_author` only errors on a duplicate; the dedup above plus the
+        // membership invariant (one entry per DID) means this cannot collide.
+        bc.add_author(did.as_ref())
+            .map_err(|e| ContextError::ImportRejected {
+                reason: e.to_string(),
+            })?;
+    }
+    Ok(Some(bc))
+}
+
 /// Builds an [`IdentityDepthAssessment`] for a member in a context.
 ///
 /// Shared by `evaluate_sybil_resistance` (join path) and `check_proposer_eligibility`
@@ -1223,6 +1291,17 @@ impl ContextManager {
             "import",
         );
 
+        // §9.10.4 / §5.14: reconstruct broadcast roster shape from the import
+        // BEFORE moving membership/role_state into the struct, so the
+        // `broadcast_context.is_some()` ⇔ `routing == Broadcast` invariant
+        // holds. Encrypted imports keep `None`.
+        let imported_broadcast_context = reconstruct_broadcast_context_for_import(
+            &context_id,
+            &export.snapshot.context_params,
+            &export.snapshot.membership,
+            &export.snapshot.role_state,
+        )?;
+
         let per_context = PerContextState {
             generation: self
                 .next_generation
@@ -1231,7 +1310,7 @@ impl ContextManager {
             membership: export.snapshot.membership,
             role_state: export.snapshot.role_state,
             receive_buffer: ReceiveBuffer::new(),
-            broadcast_context: None,
+            broadcast_context: imported_broadcast_context,
             migration_state: None,
             governance: GovernanceState {
                 engine: governance_engine,

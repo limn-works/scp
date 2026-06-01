@@ -4908,6 +4908,107 @@ async fn import_context_rebuilds_encrypted_routing_from_caller_pseudonym() {
     }
 }
 
+/// §9.10.4 / §5.14: importing a Broadcast-mode export must reconstruct
+/// `broadcast_context` so the `broadcast_context.is_some()` ⇔ `routing ==
+/// Broadcast` invariant holds. Before the fix, `import_context` hardcoded
+/// `broadcast_context = None` while `build_routing_for_mode` set `routing =
+/// Broadcast`, sending `send_message` into the pseudonymous else-branch — a
+/// `debug_assert!` panic in debug/test and an empty fan-out in release.
+///
+/// This round-trips a real broadcast context through export → import on a
+/// fresh manager, then publishes a message and asserts it (a) does not panic,
+/// (b) succeeds, and (c) routes on the broadcast RID `SHA-256(context_id)`.
+#[tokio::test]
+async fn import_context_reconstructs_broadcast_context_and_sends() {
+    let ctx_id = "import-broadcast-roundtrip";
+    let author: DID = "did:key:author1".into();
+
+    let params = ContextParams {
+        mode: ContextMode::Broadcast,
+        memory_scope: scp_protocol::context::MemoryScope::Full,
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+            scp_protocol::context::params::Capability::new("role:assign"),
+        ],
+        ..ContextParams::default()
+    };
+
+    // Source manager: create a real broadcast context and export it.
+    let source = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let _src_handle = source
+        .create_context(ctx_id.into(), params.clone(), author.clone(), [0u8; 32])
+        .await
+        .unwrap();
+    let export = source.export_context(ctx_id, author.clone()).await.unwrap();
+    assert_eq!(
+        export.snapshot.context_params.mode,
+        ContextMode::Broadcast,
+        "export must carry Broadcast mode"
+    );
+
+    // Destination manager: import into a fresh slot, capturing the transport
+    // routing IDs so we can verify the broadcast fan-out address.
+    let dest_transport = MockTransport::connected();
+    let routing_ids = dest_transport.routing_ids_handle();
+    let dest = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(dest_transport),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+    let handle = dest.import_context(export, [0u8; 32]).await.unwrap();
+
+    // Invariant: broadcast_context.is_some() ⇔ routing == Broadcast.
+    {
+        let arc = dest.contexts.get(ctx_id).unwrap().value().clone();
+        let guard = arc.lock().await;
+        assert!(
+            guard.broadcast_context.is_some(),
+            "import must reconstruct broadcast_context for Broadcast mode"
+        );
+        assert!(
+            matches!(guard.routing, super::ContextRouting::Broadcast),
+            "Broadcast-mode import must carry Broadcast routing"
+        );
+        // The author must be re-registered so they can publish.
+        assert!(
+            guard
+                .broadcast_context
+                .as_ref()
+                .unwrap()
+                .is_author(author.as_ref()),
+            "reconstructed broadcast_context must re-register the author"
+        );
+    }
+
+    // Publish: must not panic on the debug_assert and must succeed.
+    let author_signing_key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    dest.send_message(
+        &handle,
+        &author,
+        b"hello after import",
+        Some(&author_signing_key),
+        None,
+        None,
+    )
+    .await
+    .expect("broadcast publish after import should succeed");
+
+    // The send must route on the broadcast RID, NOT a pseudonym/empty fan-out.
+    let broadcast_rid = scp_protocol::context::broadcast_routing_id(ctx_id);
+    let sent = routing_ids.lock().unwrap().clone();
+    assert!(
+        sent.contains(&broadcast_rid),
+        "broadcast publish must route on SHA-256(context_id); got {sent:?}"
+    );
+}
+
 /// §9.10.4 / FIX 4: `restore_context` must refuse to load a snapshot whose
 /// `context_params.mode` and `routing` variant disagree. A snapshot claiming
 /// `mode = Encrypted` with `routing = Broadcast` (or vice-versa) would
