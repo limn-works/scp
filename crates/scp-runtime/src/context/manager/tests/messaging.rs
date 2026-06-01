@@ -4702,6 +4702,122 @@ async fn send_message_encrypted_uses_pseudonym_fanout() {
     );
 }
 
+/// §9.10.4: an app-data send into a multi-member encrypted context whose
+/// pseudonym registry is empty must raise [`ContextError::PseudonymRegistryEmpty`]
+/// rather than silently fanning out to zero routing IDs (the historic
+/// silent-`Ok(())` behavior that masked a bidirectional bootstrap deadlock).
+///
+/// Also verifies the failure path rolls back the reserved sequence number so
+/// the next send does not skip a sequence value.
+#[tokio::test]
+async fn send_message_encrypted_empty_registry_raises_pseudonym_registry_empty() {
+    let transport = MockTransport::connected();
+    let routing_ids = transport.routing_ids_handle();
+
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(transport),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+
+    manager.register_local_did("did:key:alice".into()).await;
+
+    let handle = manager
+        .create_context(
+            "empty-reg-ctx".into(),
+            params,
+            "did:key:alice".into(),
+            [0u8; 32],
+        )
+        .await
+        .unwrap();
+
+    // Add Bob as a second member but DO NOT insert any pseudonym — the
+    // registry stays empty so the fan-out has zero pseudonym targets.
+    {
+        let arc = manager.get_context_arc("empty-reg-ctx").unwrap();
+        let mut guard = arc.lock().await;
+        let ctx = &mut *guard;
+        ctx.membership
+            .add_member("did:key:bob".into(), "member".into(), vec![]);
+        ctx.role_state.members.insert("did:key:bob".to_owned());
+        let bob_access_key =
+            scp_protocol::crypto::access_keys::generate_access_key("empty-reg-ctx", "did:key:bob");
+        ctx.access
+            .access_key_store
+            .set("empty-reg-ctx", "did:key:bob", bob_access_key);
+        // Sanity: confirm the registry is empty before the send.
+        match &ctx.routing {
+            super::super::ContextRouting::Encrypted {
+                pseudonym_registry, ..
+            } => assert!(
+                pseudonym_registry.is_empty(),
+                "registry must be empty for this test"
+            ),
+            super::super::ContextRouting::Broadcast => {
+                panic!("empty-reg-ctx must be encrypted")
+            }
+        }
+    }
+
+    let alice_did: DID = "did:key:alice".into();
+    let alice_sk = signing_key_for_did(&alice_did);
+
+    let result = manager
+        .send_message(
+            &handle,
+            &alice_did,
+            b"hello peers",
+            Some(&alice_sk),
+            None,
+            None,
+        )
+        .await;
+
+    match result {
+        Err(scp_protocol::context::ContextError::PseudonymRegistryEmpty {
+            context_id,
+            member_count,
+        }) => {
+            assert_eq!(context_id, "empty-reg-ctx");
+            assert_eq!(member_count, 2, "Alice + Bob = 2 members");
+        }
+        other => panic!("expected PseudonymRegistryEmpty, got: {other:?}"),
+    }
+
+    // No fan-out send should have reached the transport.
+    assert!(
+        routing_ids.lock().unwrap().is_empty(),
+        "empty-registry send must not emit any transport sends"
+    );
+
+    // The reserved sequence number must be rolled back: Alice's per-sender
+    // sequence is back to 0, so the next (successful) send reuses sequence 1.
+    {
+        let arc = manager.get_context_arc("empty-reg-ctx").unwrap();
+        let guard = arc.lock().await;
+        let alice_seq = guard
+            .membership
+            .members()
+            .find(|m| m.did.as_ref() == "did:key:alice")
+            .map(|m| m.sequence_number)
+            .expect("alice must be a member");
+        assert_eq!(
+            alice_seq, 0,
+            "sequence reservation must be rolled back on PseudonymRegistryEmpty"
+        );
+    }
+}
+
 /// Verifies that a forged `PseudonymAnnouncement` where `member_did` does not
 /// match the MLS-authenticated sender is rejected with `PermissionDenied`.
 #[tokio::test]
