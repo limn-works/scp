@@ -65,8 +65,8 @@ pub use hash::{
     cost_hash, description_hash, outlet_registration_v2_preimage, schema_hash, test_vectors_hash,
 };
 pub use lifecycle::{
-    DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, OutletCancel, OutletInvokedEvent, OutletRequest,
-    OutletStatus, Provenance, sha256_json,
+    AuditAnomaly, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, OutletCancel, OutletInvokedEvent,
+    OutletRequest, OutletStatus, Provenance, sha256_json,
 };
 pub use message_catalog::{
     CATALOG_MAX_ENTRIES, MessageTemplate, MessageTemplateError, TEMPLATE_MAX_BYTES,

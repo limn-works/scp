@@ -61,16 +61,18 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use scp_primitives::DID;
 use scp_protocol::context::outlets::OutletId;
 use scp_protocol::context::outlets::error_codes;
 use scp_protocol::context::outlets::stream::{
     ChunkPayload, OutletStreamCancel, OutletStreamChunk, OutletStreamCredit, RequestId,
-    TerminateReason, compute_caveats_binding, sign_chunk, verify_cancel_signature,
-    verify_chunk_signature,
+    TerminateReason, compute_cancel_sig_preimage, compute_caveats_binding,
+    compute_chunk_sig_preimage, verify_cancel_signature, verify_chunk_signature,
 };
 use scp_protocol::crypto::ucan::validate::RevocationChecker;
+
+use super::signer::{StreamSigner, StreamSignerError};
 use scp_protocol::economy::types::Amount;
 use scp_protocol::trust::caveats::InvocationCaveats;
 
@@ -139,6 +141,17 @@ pub enum OpenStreamRejection {
     /// Slug: `authorization.attenuation-violation`; code:
     /// `SCP-TOOL-6110` (the Authorization-class umbrella per §5.4.4).
     CaveatsBindingMismatch,
+    /// The node-level concurrent-pump ceiling
+    /// (`ContextManager::max_concurrent_outlet_stream_pumps`) was already
+    /// saturated when this open tried to acquire a pump permit (round 8).
+    /// Acquired AFTER all per-context admission / escrow / binding gates
+    /// pass, so a rejected open here does NOT consume a per-context
+    /// admission slot or an escrow reservation; the caller's prior gates
+    /// are rolled back before this rejection is returned. Slug:
+    /// `execution.stream-cap-exhausted`; code: `SCP-TOOL-6131`
+    /// (`CODE_EXECUTION_CREDIT`, the shared Execution resource-exhaustion
+    /// band per §5.4.5 round-8).
+    StreamCapExhausted,
 }
 
 impl OpenStreamRejection {
@@ -151,6 +164,7 @@ impl OpenStreamRejection {
             Self::EscrowOverflow => error_codes::SLUG_ECONOMIC_ESCROW_OVERFLOW,
             Self::InsufficientFunds => error_codes::SLUG_ECONOMIC_INSUFFICIENT_FUNDS,
             Self::CaveatsBindingMismatch => error_codes::SLUG_AUTHORIZATION_ATTENUATION_VIOLATION,
+            Self::StreamCapExhausted => error_codes::SLUG_EXECUTION_STREAM_CAP_EXHAUSTED,
         }
     }
 
@@ -162,6 +176,7 @@ impl OpenStreamRejection {
             Self::EstimateExceedsBound => error_codes::CODE_INPUT_VIOLATION,
             Self::EscrowOverflow | Self::InsufficientFunds => error_codes::CODE_ECONOMIC_FAULT,
             Self::CaveatsBindingMismatch => error_codes::CODE_AUTHORIZATION_DENIED,
+            Self::StreamCapExhausted => error_codes::CODE_EXECUTION_CREDIT,
         }
     }
 
@@ -225,23 +240,28 @@ pub struct OpenStreamParams {
     /// Invoker's Ed25519 verifying key. Pinned for the stream's
     /// lifetime; every grant signature verifies under this key.
     pub invoker_pk: VerifyingKey,
-    /// Operator's Ed25519 signing key. Used by the dispatch pump to
-    /// sign every chunk that crosses the outer wire boundary — both
+    /// Operator's streaming signer. Used by the dispatch pump to sign
+    /// every chunk that crosses the outer wire boundary — both
     /// executor-emitted chunks (renumbered under the pump's sequence)
     /// and framework-emitted terminal chunks (cancel-ack-timeout,
-    /// credit-stall, revoked-mid-stream). Pinned at acceptance.
+    /// credit-stall, revoked-mid-stream, context-closed-mid-stream).
+    /// Pinned at acceptance.
     ///
-    /// Non-optional: every accepted stream MUST have a signing key.
-    /// The §5.4.5 wire contract is that every chunk crossing the outer
+    /// Non-optional: every accepted stream MUST have a signer. The
+    /// §5.4.5 wire contract is that every chunk crossing the outer
     /// boundary carries a verifiable `SCP-OUTLET-CHUNK-SIG-V1:`
     /// signature; emitting an unsigned `[0u8; 64]` placeholder would
     /// silently corrupt the wire and let a receiver bill chunks under
-    /// a sig that no operator ever signed. Production native FFI
-    /// bridges always supplied `Some(...)`; tests construct a
-    /// throwaway `SigningKey` via `SigningKey::from_bytes(&[0u8; 32])`
-    /// or similar. WASM uses the invoker key (operator==invoker per
-    /// ADR-034, single-process bridge).
-    pub operator_signing_key: Arc<SigningKey>,
+    /// a sig that no operator ever signed.
+    ///
+    /// Round-8 (ADR-049): this is a [`StreamSigner`] trait object, not a
+    /// raw `Arc<SigningKey>`. Native FFI bridges supply a custody-backed
+    /// adapter so the operator private key never enters the runtime
+    /// address space (ADR-006); tests and WASM (operator==invoker per
+    /// ADR-034) supply an `InProcessStreamSigner`. Signing is `async` —
+    /// the pump composes the preimage synchronously and awaits the
+    /// signer for the signature.
+    pub operator_signer: Arc<dyn StreamSigner>,
     /// `ContextParams::stream_credit_stall_secs`.
     pub stream_credit_stall_secs: u32,
     /// `ContextParams::stream_cancel_ack_secs`.
@@ -313,7 +333,7 @@ impl core::fmt::Debug for OpenStreamParams {
             .field("credit_window", &self.credit_window)
             .field("caveats", &self.caveats)
             .field("invoker_pk", &self.invoker_pk)
-            .field("operator_signing_key", &"<Arc<SigningKey>>")
+            .field("operator_signer", &"<Arc<dyn StreamSigner>>")
             .field("stream_credit_stall_secs", &self.stream_credit_stall_secs)
             .field("stream_cancel_ack_secs", &self.stream_cancel_ack_secs)
             .field("stream_ucan_recheck_secs", &self.stream_ucan_recheck_secs)
@@ -368,13 +388,16 @@ pub(crate) struct SharedSessionState {
     /// value from caller input (a forged value enables zero-bill or
     /// over-bill of delivered chunks).
     pub next_emission_seq: u64,
-    /// Operator signing key pinned at acceptance. The pump uses this
-    /// to sign every chunk that crosses the outer wire boundary —
+    /// Operator streaming signer pinned at acceptance. The pump uses
+    /// this to sign every chunk that crosses the outer wire boundary —
     /// executor-emitted chunks (re-signed under the pump's renumbered
     /// sequence) and framework-emitted terminal chunks (cancel-ack-
-    /// timeout, credit-stall, revoked-mid-stream). Non-optional: see
-    /// [`OpenStreamParams::operator_signing_key`] for rationale.
-    pub operator_signing_key: Arc<SigningKey>,
+    /// timeout, credit-stall, revoked-mid-stream, context-closed-mid-
+    /// stream) — and to sign the runtime-derived `OutletStreamCancel`
+    /// in [`StreamSessionHandle::apply_outlet_cancel_signed`].
+    /// Non-optional: see [`OpenStreamParams::operator_signer`] for
+    /// rationale.
+    pub operator_signer: Arc<dyn StreamSigner>,
     /// Receiver-side termination request. When `Some`, the pump
     /// emits a synthetic `Error{terminal:true}` chunk under the
     /// pinned operator key on its next iteration and breaks the
@@ -405,6 +428,17 @@ pub(crate) struct SharedSessionState {
     /// the per-context parameter wins for streams opened against
     /// different contexts on the same node.
     pub stream_ucan_recheck_secs: u32,
+    /// Handle to the hosting context. The pump consults its lifecycle
+    /// [`ContextState`](crate::context::ContextState) in the same
+    /// re-check arm that drives revocation: when the context is no
+    /// longer `Active` (closed, evicted/left, expired, migrating,
+    /// tombstoned) the pump arms `pending_terminate` with
+    /// [`TerminateReason::ContextClosedMidStream`] — a Protocol-class
+    /// teardown, distinct from the Authorization-class
+    /// `RevokedMidStream` (§5.4.5 round-8 "Context teardown vs.
+    /// revocation"). The handle is a cheap `Arc`-backed clone whose
+    /// state reflects live transitions on the shared context.
+    pub context_handle: ContextHandle,
 }
 
 impl core::fmt::Debug for SharedSessionState {
@@ -419,11 +453,12 @@ impl core::fmt::Debug for SharedSessionState {
             .field("credit_stall_armed_at", &self.credit_stall_armed_at)
             .field("cancel_ack_seq", &self.cancel_ack_seq)
             .field("next_emission_seq", &self.next_emission_seq)
-            .field("operator_signing_key", &"<Arc<SigningKey>>")
+            .field("operator_signer", &"<Arc<dyn StreamSigner>>")
             .field("pending_terminate", &self.pending_terminate)
             .field("ucan_cid", &self.ucan_cid)
             .field("revocation_checker", &"<dyn RevocationChecker>")
             .field("stream_ucan_recheck_secs", &self.stream_ucan_recheck_secs)
+            .field("context_handle", &self.context_handle.context_id())
             .finish()
     }
 }
@@ -504,6 +539,26 @@ impl std::error::Error for TerminateError {}
 // ---------------------------------------------------------------------------
 // StreamSessionHandle — control surface
 // ---------------------------------------------------------------------------
+
+/// Caller-supplied stream identity for
+/// [`StreamSessionHandle::apply_outlet_cancel_signed`] (ADR-049 round 8).
+///
+/// Deliberately carries NO `next_seq` / cursor field: the runtime derives
+/// the cancel's `next_seq` from its own live emission cursor and signs it
+/// internally, so a bridge can never supply a forged cursor (§5.4.5). The
+/// `request_id` is taken from the pinned [`StreamSessionHandle::request_id`]
+/// — the bridge identifies the stream by handle, not by repeating the
+/// `request_id` here. The three fields below are cross-checked against the
+/// values pinned at stream open before the operator signer is wielded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelIdentity {
+    /// Hosting context id the caller claims this cancel targets.
+    pub context_id: String,
+    /// Outlet id the caller claims this cancel targets.
+    pub outlet_id: String,
+    /// 32-byte `caveats_binding` pinned at stream open.
+    pub caveats_binding: [u8; 32],
+}
 
 /// Handle returned by [`open_stream_session`]. Owns the chunk receiver
 /// and exposes the input methods that drive the §5.4.5 control plane:
@@ -672,39 +727,199 @@ impl StreamSessionHandle {
         // pump out of stall.
         guard.credit_stall_armed_at = None;
         drop(guard);
-        self.grant_wake.notify_waiters();
+        // Single-consumer pump: `notify_one` is correct (and sufficient).
+        // The pump is the sole waiter on `grant_wake`; `notify_waiters`
+        // would only wake the same single waiter, but `notify_one` also
+        // stores a permit if the pump is briefly between iterations — so a
+        // grant that lands while the pump is not parked on `notified()` is
+        // not lost (lost-wakeup closure, F3).
+        self.grant_wake.notify_one();
         Ok(new_total)
     }
 
-    /// Applies a signed `OutletStreamCancel` (round-7 cancel-auth).
-    /// Records `cancel_ack_seq = cancel.next_seq`, arms the
-    /// `stream_cancel_ack_secs` timer, and wakes the pump so the
-    /// executor can emit a terminal chunk within the window. Per
-    /// §5.4.5 the recorded `cancel_ack_seq` is the runtime's
-    /// next-to-emit cursor at the moment the cancel arrives.
+    /// Signs and applies an `OutletStreamCancel` atomically against the
+    /// runtime-derived next-to-emit cursor (ADR-049 round 8, N2).
     ///
-    /// Verifies the cancel's signature under the invoker's pinned
-    /// `invoker_pk` recorded by the `CreditTracker` at acceptance.
-    /// On signature-verification failure, returns
-    /// [`super::stream::CancelError::SignatureInvalid`]
-    /// and does NOT mutate stream state — neither the cancel-ack timer
-    /// arms nor `cancel_ack_seq` is recorded. This is the §5.4.5
-    /// `Authorization::AuthorizationFailed` path the spec round-7
-    /// cancel-auth tightening introduces.
+    /// This is the native-bridge contract: the bridge passes only the
+    /// caller's pinned identity ([`CancelIdentity`]); it NEVER carries a
+    /// `next_seq` (a caller-supplied cursor lets the caller forge
+    /// `cancel_ack_seq` — zero to nullify billing, `u64::MAX` to over-bill,
+    /// per §5.4.5). The runtime reads its own live cursor, signs the
+    /// `SCP-OUTLET-CANCEL-V1:` preimage over that cursor with the pinned
+    /// operator signer, then applies the resulting cancel.
     ///
-    /// On success, returns `Ok(Some(seq))` with the recorded
-    /// `cancel_ack_seq`. If the stream had already closed (terminal
-    /// chunk delivered), returns `Ok(None)` and the cancel is ignored
-    /// per §5.4.5 idempotency rule.
+    /// # Protocol
+    ///
+    /// 1. Lock, read `next_emission_seq` (the cursor to sign against), clone
+    ///    the pinned identity, snapshot `invoker_pk`. Drop the lock.
+    /// 2. Validate the caller's [`CancelIdentity`] matches the pinned
+    ///    `(context_id, outlet_id, caveats_binding)` triple — mismatch →
+    ///    [`super::stream::CancelError::SignatureInvalid`] (NO mutation).
+    /// 3. Build the `SCP-OUTLET-CANCEL-V1:` preimage over
+    ///    `(pinned ctx, pinned outlet, self.request_id, seq, pinned
+    ///    binding)` — NO lock held — and `await` the signer.
+    /// 4. Re-lock. If the cursor advanced (`next_emission_seq != seq`) and
+    ///    the bounded retry budget (cap 4) remains, loop back to step 1
+    ///    against the new cursor; on exhaustion →
+    ///    [`super::stream::CancelError::CursorAdvanced`] (retryable, NO
+    ///    mutation). Otherwise self-verify the signature under
+    ///    `invoker_pk`, record the cancel-ack at `seq`, arm the cancel-ack
+    ///    timer, and wake the pump.
+    ///
+    /// The `std::sync::Mutex` is NEVER held across the `.await` — the
+    /// signer call runs entirely off-lock.
+    ///
+    /// On success returns `Ok(Some(seq))` with the recorded
+    /// `cancel_ack_seq`.
     ///
     /// # Errors
     ///
-    /// Returns
-    /// [`super::stream::CancelError::SignatureInvalid`]
-    /// when the cancel's signature does not verify under the pinned
-    /// invoker key + the stream's pinned `(context_id, outlet_id,
-    /// caveats_binding)` triple.
-    pub fn apply_outlet_cancel(
+    /// - [`super::stream::CancelError::SignatureInvalid`] — the caller's
+    ///   identity did not match the pinned triple, or the runtime's own
+    ///   just-produced signature failed self-verification (an internal
+    ///   invariant violation). No stream state is mutated.
+    /// - [`super::stream::CancelError::CursorAdvanced`] — the cursor moved
+    ///   on every one of the bounded attempts. Retryable: the caller
+    ///   re-issues and the runtime re-reads the now-current cursor. No
+    ///   stream state is mutated.
+    /// - [`super::stream::CancelError::Signing`] — the [`StreamSigner`]
+    ///   failed to produce a signature.
+    pub async fn apply_outlet_cancel_signed(
+        &self,
+        signer: &dyn StreamSigner,
+        identity: &CancelIdentity,
+    ) -> Result<Option<u64>, super::stream::CancelError> {
+        /// Maximum number of cursor-advance retries before returning the
+        /// retryable [`CancelError::CursorAdvanced`]. A stream advances its
+        /// cursor at most once per emitted chunk; four attempts comfortably
+        /// covers the lock-free signing window under realistic emission
+        /// rates without unbounded spinning.
+        const MAX_CURSOR_RETRIES: u32 = 4;
+
+        let mut attempts: u32 = 0;
+        loop {
+            // ---- lock1: read cursor + pinned identity + invoker_pk. ----
+            let (seq, pinned, invoker_pk) = {
+                let guard = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    guard.next_emission_seq,
+                    guard.credit.identity().clone(),
+                    *guard.credit.invoker_pk(),
+                )
+            };
+
+            // ---- caller-identity validation (NO mutation on mismatch). --
+            // The bridge already authenticated the caller_did at its own
+            // boundary (§5.4.5 CRITICAL #1); this is the runtime-side
+            // defense-in-depth that the pinned stream identity matches the
+            // caller's claimed triple before the operator key is wielded.
+            if identity.context_id != pinned.context_id
+                || identity.outlet_id != pinned.outlet_id
+                || identity.caveats_binding != pinned.caveats_binding
+            {
+                return Err(super::stream::CancelError::SignatureInvalid);
+            }
+
+            // ---- build preimage + sign OFF-LOCK (no Mutex across await). -
+            let preimage = compute_cancel_sig_preimage(
+                &pinned.context_id,
+                &pinned.outlet_id,
+                &self.request_id,
+                seq,
+                &pinned.caveats_binding,
+            );
+            let sig = signer
+                .sign(&preimage)
+                .await
+                .map_err(super::stream::CancelError::Signing)?;
+            let cancel = OutletStreamCancel {
+                request_id: self.request_id,
+                next_seq: seq,
+                sig,
+            };
+
+            // ---- lock2: re-check cursor, self-verify, apply. ----
+            let now = Instant::now();
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.next_emission_seq != seq {
+                // The pump emitted a chunk between our off-lock signing and
+                // this re-lock; the cursor we signed is stale. Retry against
+                // the fresh cursor up to the bounded budget.
+                let current = guard.next_emission_seq;
+                drop(guard);
+                attempts = attempts.saturating_add(1);
+                if attempts < MAX_CURSOR_RETRIES {
+                    continue;
+                }
+                return Err(super::stream::CancelError::CursorAdvanced {
+                    signed: seq,
+                    current,
+                });
+            }
+            // Self-verify the signature we just produced under the pinned
+            // invoker key. A failure here is an internal invariant
+            // violation (signer produced a signature that does not verify
+            // for its own verifying key, or preimage drift) — fail closed
+            // as SignatureInvalid WITHOUT mutating stream state.
+            if !verify_cancel_signature(
+                &cancel,
+                &invoker_pk,
+                &pinned.context_id,
+                &pinned.outlet_id,
+                &pinned.caveats_binding,
+            ) {
+                return Err(super::stream::CancelError::SignatureInvalid);
+            }
+            guard.cancel_ack.record_cancel(seq, now);
+            let recorded = guard.cancel_ack.cancel_ack_seq();
+            guard.cancel_ack_armed = true;
+            guard.cancel_ack_seq = recorded;
+            drop(guard);
+            self.cancel_wake.notify_one();
+            return Ok(recorded);
+        }
+    }
+
+    /// Private verbatim-apply helper shared by the forwarding/replay
+    /// paths that already hold a fully-formed, signed [`OutletStreamCancel`]
+    /// (e.g. a cross-context forwarding hop replaying the originator's
+    /// signed cancel). Bridges do NOT call this — they route through
+    /// [`Self::apply_outlet_cancel_signed`], which derives `next_seq` from
+    /// the live cursor and signs internally.
+    ///
+    /// Verifies the cancel's signature under the pinned `invoker_pk` and
+    /// the stream's pinned `(context_id, outlet_id, caveats_binding)`
+    /// triple, AND cross-checks `cancel.next_seq` against the live cursor:
+    /// per §5.4.5 a runtime that records `cancel.next_seq` verbatim without
+    /// cross-checking its own cursor would absorb a forged cursor. A
+    /// `next_seq` that does not match the live cursor is rejected as
+    /// [`super::stream::CancelError::CursorAdvanced`] (NO mutation) rather
+    /// than absorbed.
+    ///
+    /// On signature-verification failure, returns
+    /// [`super::stream::CancelError::SignatureInvalid`] and does NOT mutate
+    /// stream state.
+    ///
+    /// # Errors
+    ///
+    /// - [`super::stream::CancelError::SignatureInvalid`] — signature does
+    ///   not verify under the pinned key + triple.
+    /// - [`super::stream::CancelError::CursorAdvanced`] — `cancel.next_seq`
+    ///   does not match the runtime's live next-to-emit cursor.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "verbatim-apply path is exercised by cross-context forwarding waves and tests; retained as the single verify+record primitive"
+        )
+    )]
+    pub(crate) fn apply_outlet_cancel_verbatim(
         &self,
         cancel: &OutletStreamCancel,
     ) -> Result<Option<u64>, super::stream::CancelError> {
@@ -715,6 +930,15 @@ impl StreamSessionHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let identity = guard.credit.identity().clone();
         let invoker_pk = *guard.credit.invoker_pk();
+        // §5.4.5: cross-check the forwarded cursor against the live cursor.
+        // A verbatim-apply path MUST NOT absorb a `next_seq` that disagrees
+        // with the runtime's own emission cursor.
+        if cancel.next_seq != guard.next_emission_seq {
+            return Err(super::stream::CancelError::CursorAdvanced {
+                signed: cancel.next_seq,
+                current: guard.next_emission_seq,
+            });
+        }
         // Verify under the pinned key + identity. Per §5.4.5, an
         // unsigned-or-tampered cancel is `Authorization::AuthorizationFailed`
         // and MUST NOT mutate stream state.
@@ -732,7 +956,7 @@ impl StreamSessionHandle {
         guard.cancel_ack_armed = true;
         guard.cancel_ack_seq = recorded;
         drop(guard);
-        self.cancel_wake.notify_waiters();
+        self.cancel_wake.notify_one();
         Ok(recorded)
     }
 
@@ -798,7 +1022,11 @@ impl StreamSessionHandle {
             message_override,
         });
         drop(guard);
-        self.terminate_wake.notify_waiters();
+        // Single-consumer pump: `notify_one` wakes the sole pump waiter
+        // and stores a permit if the pump is between iterations, so a
+        // terminate request that races the pump loop is observed on the
+        // next iteration rather than lost (F3 lost-wakeup closure).
+        self.terminate_wake.notify_one();
         Ok(())
     }
 }
@@ -961,6 +1189,7 @@ fn build_shared_state(
     params: &OpenStreamParams,
     escrow: StreamEscrow,
     admission: &Arc<Mutex<StreamAdmissionTracker>>,
+    context_handle: ContextHandle,
 ) -> Arc<Mutex<SharedSessionState>> {
     let credit = CreditTracker::new(
         params.credit_window,
@@ -983,11 +1212,12 @@ fn build_shared_state(
         credit_stall_armed_at: None,
         cancel_ack_seq: None,
         next_emission_seq: 0,
-        operator_signing_key: Arc::clone(&params.operator_signing_key),
+        operator_signer: Arc::clone(&params.operator_signer),
         pending_terminate: None,
         ucan_cid: params.ucan_cid.clone(),
         revocation_checker: Arc::clone(&params.revocation_checker),
         stream_ucan_recheck_secs: params.stream_ucan_recheck_secs,
+        context_handle,
     }))
 }
 
@@ -1037,10 +1267,18 @@ fn spawn_pump_task(
     stream_cancel_ack_secs: u32,
     request_id: RequestId,
     event_inputs: PumpEventEmissionInputs,
+    // §5.4.5 round-8 (F5): the node-level pump permit. Moved into the
+    // spawned task so it is released for the exact lifetime of the pump —
+    // it drops when the task body returns (normal/terminal/cancel-ack) or
+    // when the task panics and its stack unwinds.
+    pump_permit: tokio::sync::OwnedSemaphorePermit,
 ) {
     let stream_credit_stall = Duration::from_secs(u64::from(stream_credit_stall_secs));
     let stream_cancel_ack = Duration::from_secs(u64::from(stream_cancel_ack_secs));
     tokio::spawn(async move {
+        // Bind the permit for the whole task body so it drops on every
+        // exit path (return, terminal-break, or panic-unwind).
+        let _pump_permit = pump_permit;
         run_stream_pump_v2(
             state,
             grant_wake,
@@ -1095,6 +1333,13 @@ pub async fn open_stream_session<E>(
     invoked_event_sink: Option<Arc<dyn OutletInvokedEventSink>>,
     params: OpenStreamParams,
     admission: Arc<Mutex<StreamAdmissionTracker>>,
+    // §5.4.5 round-8 (F5): the per-instance node-level concurrent-pump
+    // semaphore. A permit is acquired AFTER all per-context gates pass
+    // (admission / estimate / escrow / binding) and moved into the spawned
+    // pump task so it drops exactly when the pump exits. Saturation
+    // hard-rejects with `OpenStreamRejection::StreamCapExhausted` and rolls
+    // back the admission counters this open consumed.
+    pump_semaphore: Arc<tokio::sync::Semaphore>,
 ) -> Result<StreamSessionHandle, OpenStreamRejection>
 where
     E: OutletExecutor + ?Sized + 'static,
@@ -1136,8 +1381,26 @@ where
         }
     };
 
-    // Step 4: tracker init.
-    let shared = build_shared_state(&params, escrow, &admission);
+    // Step 3.5 (§5.4.5 round-8, F5): acquire a node-level pump permit AFTER
+    // all per-context gates (admission / estimate / escrow) have passed.
+    // On saturation, roll back the admission counters this open consumed
+    // (a rejected open MUST NOT leave a per-context slot held) and reject
+    // with StreamCapExhausted. The permit is moved into the spawned pump
+    // task below so it is released for the exact lifetime of the pump —
+    // normal close, terminal, cancel-ack, or panic (the permit drops with
+    // the task's stack on unwind).
+    let pump_permit = match Arc::clone(&pump_semaphore).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_closed_or_no_permits) => {
+            release_admission(&admission, &params);
+            return Err(OpenStreamRejection::StreamCapExhausted);
+        }
+    };
+
+    // Step 4: tracker init. Snapshot a cheap (Arc-backed) clone of the
+    // context handle so the pump can consult live lifecycle state for
+    // the §5.4.5 round-8 context-teardown re-check.
+    let shared = build_shared_state(&params, escrow, &admission, context.clone());
     let grant_wake = Arc::new(Notify::new());
     let cancel_wake = Arc::new(Notify::new());
     let terminate_wake = Arc::new(Notify::new());
@@ -1182,13 +1445,13 @@ where
         misdeclaration_sink,
         handler_panic_sink,
         None,
-        // `invoke_outlet` accepts `Option<Arc<SigningKey>>` for the
-        // inner pump's signing path (legacy test callers may pass
-        // `None`); the dispatch path always has a real key, so wrap
+        // `invoke_outlet` accepts `Option<Arc<dyn StreamSigner>>` for
+        // the inner pump's signing path (legacy test callers may pass
+        // `None`); the dispatch path always has a real signer, so wrap
         // it in `Some` here. The outer pump path re-signs every chunk
         // under the renumbered outer sequence with the non-optional
-        // key in `SharedSessionState::operator_signing_key`.
-        Some(Arc::clone(&params.operator_signing_key)),
+        // signer in `SharedSessionState::operator_signer`.
+        Some(Arc::clone(&params.operator_signer)),
         params.identity.caveats_binding,
     )
     .await
@@ -1236,6 +1499,7 @@ where
             input_hash,
             start: pump_start,
         },
+        pump_permit,
     );
 
     Ok(StreamSessionHandle {
@@ -1262,9 +1526,10 @@ where
 /// each emission.
 #[derive(Clone)]
 struct PumpSigningContext {
-    /// Operator signing key. Pinned at acceptance; the pump never
-    /// emits an unsigned chunk.
-    operator_signing_key: Arc<SigningKey>,
+    /// Operator streaming signer. Pinned at acceptance; the pump never
+    /// emits an unsigned chunk. Round-8: a [`StreamSigner`] trait object
+    /// (custody-backed on native bridges), signed `async`.
+    operator_signer: Arc<dyn StreamSigner>,
     /// Hosting context id (committed into every preimage).
     context_id: String,
     /// Outlet id (committed into every preimage).
@@ -1286,14 +1551,18 @@ impl PumpSigningContext {
     /// the receiver-side §5.4.5 verifier rejects any chunk whose sig
     /// doesn't match the preimage, so the wire never carries a
     /// silently-corrupt all-zero placeholder.
-    fn sign_outer_chunk(
+    async fn sign_outer_chunk(
         &self,
         request_id: &RequestId,
         sequence: u64,
         payload: &scp_protocol::context::outlets::stream::ChunkPayload,
-    ) -> Result<[u8; 64], String> {
-        sign_chunk(
-            &self.operator_signing_key,
+    ) -> Result<[u8; 64], StreamSignerError> {
+        // Compose the §5.4.5 `SCP-OUTLET-CHUNK-SIG-V1:` preimage
+        // synchronously (pure SHA-256 over the length-prefixed fields),
+        // then await the signer for the 64-byte signature. The bytes
+        // signed are byte-identical to the round-7 `sign_chunk` path —
+        // only the signing mechanism is now custody-injectable.
+        let preimage = compute_chunk_sig_preimage(
             &self.context_id,
             &self.outlet_id,
             request_id,
@@ -1301,25 +1570,27 @@ impl PumpSigningContext {
             &self.caveats_binding,
             payload,
         )
+        .map_err(StreamSignerError::Jcs)?;
+        self.operator_signer.sign(&preimage).await
     }
 
     /// Builds a fully-formed signed [`OutletStreamChunk`] for the
     /// given `(sequence, payload)` pair.
     ///
-    /// Returns `None` only when [`Self::sign_outer_chunk`] fails JCS
-    /// canonicalization — a structural invariant violation in the
-    /// pump. On `None` the caller logs the error and breaks the
-    /// pump loop without emitting; this guarantees the test
-    /// invariant "no chunk emitted by the pump ever has
+    /// Returns `None` when [`Self::sign_outer_chunk`] fails — either JCS
+    /// canonicalization (a structural invariant violation in the pump) or
+    /// a signer-side custody failure. On `None` the caller logs the error
+    /// and breaks the pump loop without emitting; this guarantees the
+    /// test invariant "no chunk emitted by the pump ever has
     /// `sig == [0u8; 64]`" because we never construct an unsigned
     /// chunk on the failure path.
-    fn try_build_signed_chunk(
+    async fn try_build_signed_chunk(
         &self,
         request_id: RequestId,
         sequence: u64,
         payload: ChunkPayload,
     ) -> Option<OutletStreamChunk> {
-        match self.sign_outer_chunk(&request_id, sequence, &payload) {
+        match self.sign_outer_chunk(&request_id, sequence, &payload).await {
             Ok(sig) => Some(OutletStreamChunk {
                 request_id,
                 sequence,
@@ -1333,7 +1604,7 @@ impl PumpSigningContext {
                     context_id = %self.context_id,
                     sequence,
                     error = %e,
-                    "dispatch pump: chunk signing failed (JCS canonicalization) — \
+                    "dispatch pump: chunk signing failed — \
                      pump will break without emitting; downstream receiver sees stream end"
                 );
                 None
@@ -1386,6 +1657,91 @@ fn try_arm_revoked_mid_stream(
     true
 }
 
+/// Consults the hosting context's lifecycle state and, when the context
+/// is no longer `Active` (closed, evicted/left, expired, migrating,
+/// tombstoned), arms `pending_terminate` with
+/// [`TerminateReason::ContextClosedMidStream`] (§5.4.5 round-8 "Context
+/// teardown vs. revocation"). Returns `true` when the arming actually
+/// mutated state (so the caller knows to notify `terminate_wake`).
+/// Returns `false` when:
+///
+/// - the context is still `Active` (or `Creating`, which the pump treats
+///   as live — a stream cannot have opened against a non-Active context,
+///   so `Creating` is only observable as a transient and not a teardown),
+///   or
+/// - the context IS torn down but `pending_terminate` was already armed
+///   (idempotent — the prior arm wins; the pump emits exactly one
+///   synthetic terminal chunk).
+///
+/// **Precedence:** the pump calls this BEFORE
+/// [`try_arm_revoked_mid_stream`] in the same re-check tick, so context
+/// teardown (Protocol class) wins over revocation (Authorization class)
+/// when both are observable — the stream's substrate is already gone, so
+/// the Protocol-class teardown is the more proximate, accurate cause and
+/// recording a revocation would write a false audit signal.
+///
+/// `context_handle.state()` is `async`; the call runs in the pump's
+/// re-check select arm (already an async context) OUTSIDE the session
+/// mutex. On teardown we re-acquire the lock just long enough to mutate
+/// `pending_terminate`, matching the `try_arm_revoked_mid_stream` pattern.
+async fn try_arm_context_closed_mid_stream(
+    state: &Arc<Mutex<SharedSessionState>>,
+    context_handle: &ContextHandle,
+) -> bool {
+    use crate::context::ContextState;
+    let context_state = context_handle.state().await;
+    // `Active` and `Creating` are live; every other state is a teardown
+    // (Closing / Closed / Expired / MigratingOut / Tombstoned). Matching
+    // explicitly (rather than `!= Active`) means a future ContextState
+    // variant forces a compile error here rather than silently being
+    // treated as a teardown.
+    let torn_down = match context_state {
+        ContextState::Active | ContextState::Creating => false,
+        ContextState::Closing
+        | ContextState::Closed
+        | ContextState::Expired
+        | ContextState::MigratingOut
+        | ContextState::Tombstoned => true,
+    };
+    if !torn_down {
+        return false;
+    }
+    let mut guard = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.pending_terminate.is_some() {
+        return false;
+    }
+    guard.pending_terminate = Some(PendingTerminate {
+        reason: TerminateReason::ContextClosedMidStream,
+        message_override: None,
+    });
+    true
+}
+
+/// Runs one §5.4.5 round-8 re-check tick: consults context teardown FIRST
+/// (Protocol-class precedence), then — only if the context is still live —
+/// the UCAN revocation checker. When either arms `pending_terminate`, wakes
+/// the pump via `terminate_wake`.
+///
+/// The short-circuit `||` is load-bearing: `try_arm_context_closed_mid_stream`
+/// must run (and win) before the revocation probe, so a teardown is never
+/// recorded as a revocation. Factored out of the two pump `select!` arms so
+/// the parked / unparked paths share one implementation.
+async fn run_revocation_recheck_tick(
+    state: &Arc<Mutex<SharedSessionState>>,
+    context_handle: &ContextHandle,
+    revocation_checker: &(dyn RevocationChecker + Send + Sync),
+    ucan_cid: &str,
+    terminate_wake: &Notify,
+) {
+    let armed = try_arm_context_closed_mid_stream(state, context_handle).await
+        || try_arm_revoked_mid_stream(state, revocation_checker, ucan_cid);
+    if armed {
+        terminate_wake.notify_one();
+    }
+}
+
 /// Builds the synthetic terminal `Error{terminal:true}` payload from a
 /// pending-terminate request. The slug is committed verbatim as the
 /// chunk message prefix so the receiver records the canonical §5.4.4
@@ -1431,14 +1787,14 @@ async fn run_stream_pump_v2(
     // Both snapshots ride on the same Arc::clone — the trait object's
     // ref-count moves to the pump, the underlying checker stays shared
     // with the session state.
-    let (signing_ctx, revocation_checker, ucan_cid_for_recheck, recheck_secs) = {
+    let (signing_ctx, revocation_checker, ucan_cid_for_recheck, recheck_secs, context_handle) = {
         let guard = state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let identity = guard.credit.identity().clone();
         (
             PumpSigningContext {
-                operator_signing_key: Arc::clone(&guard.operator_signing_key),
+                operator_signer: Arc::clone(&guard.operator_signer),
                 context_id: identity.context_id,
                 outlet_id: identity.outlet_id,
                 caveats_binding: identity.caveats_binding,
@@ -1446,6 +1802,7 @@ async fn run_stream_pump_v2(
             Arc::clone(&guard.revocation_checker),
             guard.ucan_cid.clone(),
             guard.stream_ucan_recheck_secs,
+            guard.context_handle.clone(),
         )
     };
 
@@ -1466,15 +1823,17 @@ async fn run_stream_pump_v2(
         let period = Duration::from_secs(u64::from(recheck_secs.max(1)));
         let mut iv = tokio::time::interval(period);
         iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Drain the zeroth tick that `interval` emits immediately so
-        // the first real fire is at `now + recheck_secs`, not at `now`.
-        // A `now`-fire would race with the open path (a revocation
-        // that arrived after the open's UCAN-revocation step would
-        // immediately re-trip; that is correct behavior, but a
-        // `now`-fire on EVERY open would trip the test invariant that
-        // the terminal arrives WITHIN `2 * recheck_secs` after the
-        // revocation, not before).
-        iv.tick().await;
+        // F4 (round 8): we do NOT drain the zeroth tick. `interval`'s
+        // first `tick()` returns immediately, giving a prompt revocation/
+        // context-teardown re-check at the very start of the pump's life
+        // rather than only after a full `recheck_secs` delay — closing a
+        // window where a token revoked (or a context closed) just before
+        // the open completed would not be observed until one full period
+        // later. The eager `pending_terminate` check at the top of the
+        // loop still gates emission, and `try_arm_*` is a cheap no-op when
+        // the token is live and the context is open, so an immediate
+        // zeroth tick on a healthy stream costs only a revocation-list
+        // membership probe.
         iv
     };
 
@@ -1498,7 +1857,9 @@ async fn run_stream_pump_v2(
         };
         if let Some(pt) = pending {
             let payload = build_pending_terminate_payload(&pt);
-            let Some(chunk) = signing_ctx.try_build_signed_chunk(request_id, next_seq, payload)
+            let Some(chunk) = signing_ctx
+                .try_build_signed_chunk(request_id, next_seq, payload)
+                .await
             else {
                 // Signing failed: pump breaks without emitting.
                 // `try_build_signed_chunk` already logged the cause.
@@ -1552,8 +1913,9 @@ async fn run_stream_pump_v2(
                 biased;
                 () = cancel_timer_fut => {
                     let payload = CancelAckTracker::cancel_ack_timeout_payload();
-                    let Some(chunk) =
-                        signing_ctx.try_build_signed_chunk(request_id, next_seq, payload)
+                    let Some(chunk) = signing_ctx
+                        .try_build_signed_chunk(request_id, next_seq, payload)
+                        .await
                     else {
                         break;
                     };
@@ -1563,8 +1925,9 @@ async fn run_stream_pump_v2(
                 }
                 () = credit_timer_fut => {
                     let payload = CancelAckTracker::credit_stall_payload();
-                    let Some(chunk) =
-                        signing_ctx.try_build_signed_chunk(request_id, next_seq, payload)
+                    let Some(chunk) = signing_ctx
+                        .try_build_signed_chunk(request_id, next_seq, payload)
+                        .await
                     else {
                         break;
                     };
@@ -1587,14 +1950,23 @@ async fn run_stream_pump_v2(
                     continue;
                 }
                 _ = recheck_interval.tick() => {
-                    // §5.4.5 revocation re-check (runtime-authoritative).
-                    if try_arm_revoked_mid_stream(
+                    // §5.4.5 round-8 re-check (runtime-authoritative).
+                    // Context teardown takes PRECEDENCE over revocation:
+                    // if the hosting context is no longer Active the
+                    // stream's substrate is gone, so we arm the
+                    // Protocol-class ContextClosedMidStream and SKIP the
+                    // revocation probe entirely (recording a revocation
+                    // would write a false Authorization-class audit
+                    // signal). Only when the context is still live do we
+                    // consult the revocation checker.
+                    run_revocation_recheck_tick(
                         &state,
+                        &context_handle,
                         revocation_checker.as_ref(),
                         &ucan_cid_for_recheck,
-                    ) {
-                        terminate_wake.notify_waiters();
-                    }
+                        &terminate_wake,
+                    )
+                    .await;
                     continue;
                 }
             }
@@ -1603,8 +1975,9 @@ async fn run_stream_pump_v2(
                 biased;
                 () = cancel_timer_fut => {
                     let payload = CancelAckTracker::cancel_ack_timeout_payload();
-                    let Some(chunk) =
-                        signing_ctx.try_build_signed_chunk(request_id, next_seq, payload)
+                    let Some(chunk) = signing_ctx
+                        .try_build_signed_chunk(request_id, next_seq, payload)
+                        .await
                     else {
                         break;
                     };
@@ -1614,8 +1987,9 @@ async fn run_stream_pump_v2(
                 }
                 () = credit_timer_fut => {
                     let payload = CancelAckTracker::credit_stall_payload();
-                    let Some(chunk) =
-                        signing_ctx.try_build_signed_chunk(request_id, next_seq, payload)
+                    let Some(chunk) = signing_ctx
+                        .try_build_signed_chunk(request_id, next_seq, payload)
+                        .await
                     else {
                         break;
                     };
@@ -1636,14 +2010,23 @@ async fn run_stream_pump_v2(
                     continue;
                 }
                 _ = recheck_interval.tick() => {
-                    // §5.4.5 revocation re-check (runtime-authoritative).
-                    if try_arm_revoked_mid_stream(
+                    // §5.4.5 round-8 re-check (runtime-authoritative).
+                    // Context teardown takes PRECEDENCE over revocation:
+                    // if the hosting context is no longer Active the
+                    // stream's substrate is gone, so we arm the
+                    // Protocol-class ContextClosedMidStream and SKIP the
+                    // revocation probe entirely (recording a revocation
+                    // would write a false Authorization-class audit
+                    // signal). Only when the context is still live do we
+                    // consult the revocation checker.
+                    run_revocation_recheck_tick(
                         &state,
+                        &context_handle,
                         revocation_checker.as_ref(),
                         &ucan_cid_for_recheck,
-                    ) {
-                        terminate_wake.notify_waiters();
-                    }
+                        &terminate_wake,
+                    )
+                    .await;
                     continue;
                 }
                 next = inner_rx.recv() => next,
@@ -1694,8 +2077,9 @@ async fn run_stream_pump_v2(
                 // can verify each chunk against `chunk.sequence` as
                 // delivered. Without this, the inner sig is dead weight
                 // (verifies under a sequence the wire never carries).
-                let Some(final_chunk) =
-                    signing_ctx.try_build_signed_chunk(request_id, seq, chunk.payload.clone())
+                let Some(final_chunk) = signing_ctx
+                    .try_build_signed_chunk(request_id, seq, chunk.payload.clone())
+                    .await
                 else {
                     // Signing failed: do not advance `next_seq`, do not
                     // emit, break out. Receiver sees stream end without
@@ -1714,7 +2098,7 @@ async fn run_stream_pump_v2(
                 debug_assert!(
                     verify_chunk_signature(
                         &final_chunk,
-                        &signing_ctx.operator_signing_key.verifying_key(),
+                        signing_ctx.operator_signer.verifying_key(),
                         &signing_ctx.context_id,
                         &signing_ctx.outlet_id,
                         &signing_ctx.caveats_binding,
@@ -1806,29 +2190,66 @@ async fn run_stream_pump_v2(
     // event-log appender), and (ii) record exactly one event per
     // stream via the `OutletInvokedEventSink::record` trait method.
     if let Some(sink) = event_inputs.sink.as_ref() {
-        if let Err(verify_err) = verify_summary_chunks_billed(&summary) {
-            // Self-consistency drift between the pump's recorded
-            // `billed_count` and the manifest-derivable reference. This
-            // would otherwise be a wire-rejection at event-log insert
-            // time (§5.4.5). Drop the event rather than emit a bogus
-            // record — the SDK already received the chunks, so the
-            // audit log staying silent is preferable to recording a
-            // self-inconsistent event the verifier will reject.
+        // §5.4.5 round-8 (F2): on a self-consistency drift between the
+        // pump's running `billed_count` and the manifest-derived
+        // reference, DO NOT drop the event. The previous behaviour
+        // silently discarded the audit record, erasing the divergence.
+        // Instead we emit the event with `chunks_billed` set to the
+        // manifest-derived reference (the appender-accepted value — so
+        // the event passes the §5.4.5 wire-rejection rule at log-insert,
+        // verified by `verify_summary_chunks_billed` below) AND attach an
+        // `AuditAnomaly::ChunksBilledSelfMismatch` so the divergence is
+        // durably attributable. `build_streaming_outlet_event` already
+        // derives `chunks_billed` from the (cancel-ack-truncated) manifest
+        // — that is the reference value; we cross-check it here and only
+        // emit when it matches `reference_chunks_billed`.
+        let pump_recorded = summary.billed_count;
+        let manifest_reference = reference_chunks_billed(&summary.manifest, summary.cancel_ack_seq);
+        let audit_anomaly = if pump_recorded == manifest_reference {
+            None
+        } else {
+            tracing::warn!(
+                request_id = %hex::encode(request_id),
+                outlet_id = %event_inputs.outlet_id,
+                pump_recorded,
+                manifest_reference,
+                "OutletInvokedEvent chunks_billed self-mismatch — emitting event with \
+                 manifest-derived count and AuditAnomaly::ChunksBilledSelfMismatch"
+            );
+            Some(
+                scp_protocol::context::outlets::lifecycle::AuditAnomaly::ChunksBilledSelfMismatch {
+                    pump_recorded,
+                    manifest_reference,
+                },
+            )
+        };
+        let event = super::invoke::build_streaming_outlet_event(
+            request_id,
+            &event_inputs.outlet_id,
+            &event_inputs.invoker_did,
+            event_inputs.input_hash.clone(),
+            u64::try_from(event_inputs.start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            &summary.manifest,
+            audit_anomaly,
+        );
+        // The emitted event carries the manifest-derived `chunks_billed`,
+        // so it MUST pass the wire-rejection check the appender applies.
+        // If it does not, the manifest itself is malformed (not a
+        // pump-vs-manifest divergence) — drop and log rather than emit a
+        // record the appender will reject.
+        if let Err(verify_err) = verify_chunks_billed(
+            &summary.manifest,
+            event.chunks_billed,
+            summary.cancel_ack_seq,
+        ) {
             tracing::error!(
                 request_id = %hex::encode(request_id),
                 outlet_id = %event_inputs.outlet_id,
                 error = ?verify_err,
-                "OutletInvokedEvent dropped: chunks_billed mismatch against manifest"
+                "OutletInvokedEvent dropped: manifest-derived chunks_billed still fails \
+                 wire-rejection (malformed manifest, not a pump self-mismatch)"
             );
         } else {
-            let event = super::invoke::build_streaming_outlet_event(
-                request_id,
-                &event_inputs.outlet_id,
-                &event_inputs.invoker_did,
-                event_inputs.input_hash.clone(),
-                u64::try_from(event_inputs.start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                &summary.manifest,
-            );
             sink.record(event);
         }
         // Suppress `event_inputs.context_id` unused-warning until the
@@ -1916,16 +2337,27 @@ mod tests {
         revocation_checker: Arc<dyn RevocationChecker + Send + Sync>,
         stream_ucan_recheck_secs: u32,
     ) -> Arc<Mutex<SharedSessionState>> {
-        let signing = Arc::new(fixed_signing_key());
+        let key = fixed_signing_key();
+        let signer: Arc<dyn StreamSigner> =
+            Arc::new(super::super::signer::InProcessStreamSigner::new(key));
         let identity = super::super::stream::StreamIdentity {
             context_id: "ctx-test".to_owned(),
             outlet_id: "outlet-test".to_owned(),
             stream_epoch: 1,
             caveats_binding: [0xAB; 32],
         };
-        let credit = CreditTracker::new(32, signing.verifying_key(), identity);
+        let credit = CreditTracker::new(32, *signer.verifying_key(), identity);
         let cancel_ack = CancelAckTracker::new(5);
         let admission = Arc::new(Mutex::new(StreamAdmissionTracker::new()));
+        // A fresh context handle (in `Creating`) so the F6 round-8
+        // context-teardown re-check observes a live context by default —
+        // both `Creating` and `Active` are treated as live, so a default
+        // stream does not spuriously terminate. Tests that want to
+        // exercise teardown transition the handle to a non-Active state.
+        let context_handle = ContextHandle::new(
+            "ctx-test".to_owned(),
+            scp_protocol::context::ContextParams::default(),
+        );
         Arc::new(Mutex::new(SharedSessionState {
             credit,
             escrow: super::super::stream::StreamEscrow::zero_escrow(),
@@ -1940,11 +2372,12 @@ mod tests {
             credit_stall_armed_at: None,
             cancel_ack_seq: None,
             next_emission_seq: 0,
-            operator_signing_key: signing,
+            operator_signer: signer,
             pending_terminate: None,
             ucan_cid: "bafyrei-test".to_owned(),
             revocation_checker,
             stream_ucan_recheck_secs,
+            context_handle,
         }))
     }
 
@@ -2202,6 +2635,309 @@ mod tests {
                     "manifest chunk has all-zero sig for reason {reason:?}"
                 );
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-8 helpers
+    // -----------------------------------------------------------------------
+
+    /// Spawns the pump for a freshly-built test state and returns the
+    /// `(handle, outer_rx, summary_rx, pump_join)` quad. The handle shares
+    /// the same `state`/notifiers as the pump so control-plane calls
+    /// (`terminate_with_error`, `apply_outlet_cancel_signed`) reach it.
+    #[allow(clippy::type_complexity)]
+    fn spawn_test_pump(
+        state: Arc<Mutex<SharedSessionState>>,
+        request_id: RequestId,
+        recheck: Duration,
+    ) -> (
+        StreamSessionHandle,
+        mpsc::Receiver<OutletStreamChunk>,
+        tokio::sync::oneshot::Receiver<StreamCloseSummary>,
+        tokio::task::JoinHandle<()>,
+        mpsc::Sender<OutletStreamChunk>,
+    ) {
+        let grant_wake = Arc::new(Notify::new());
+        let cancel_wake = Arc::new(Notify::new());
+        let terminate_wake = Arc::new(Notify::new());
+        let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (outer_tx, outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
+        // Set the snapshot recheck cadence on the state so the pump's
+        // interval arm fires at the test-controlled period.
+        {
+            let mut g = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.stream_ucan_recheck_secs = u32::try_from(recheck.as_secs().max(1)).unwrap_or(1);
+        }
+        let pump_state = Arc::clone(&state);
+        let pump_grant = Arc::clone(&grant_wake);
+        let pump_cancel = Arc::clone(&cancel_wake);
+        let pump_terminate = Arc::clone(&terminate_wake);
+        let pump_join = tokio::spawn(async move {
+            run_stream_pump_v2(
+                pump_state,
+                pump_grant,
+                pump_cancel,
+                pump_terminate,
+                inner_rx,
+                outer_tx,
+                summary_tx,
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+                request_id,
+                PumpEventEmissionInputs {
+                    sink: None,
+                    context_id: "ctx-test".to_owned(),
+                    outlet_id: "outlet-test".to_owned(),
+                    invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),
+                    input_hash: "0".repeat(64),
+                    start: Instant::now(),
+                },
+            )
+            .await;
+        });
+        let handle = StreamSessionHandle {
+            receiver: None,
+            state,
+            grant_wake,
+            cancel_wake,
+            terminate_wake,
+            summary_rx: None,
+            request_id,
+        };
+        (handle, outer_rx, summary_rx, pump_join, inner_tx)
+    }
+
+    /// F3 lost-wakeup regression: a `terminate_with_error` that lands while
+    /// the pump is between iterations (the notification stores a `notify_one`
+    /// permit rather than waking an already-parked waiter) is still observed
+    /// on the next iteration — the synthetic terminal is emitted exactly once.
+    #[tokio::test]
+    async fn f3_notify_one_does_not_lose_terminate_wakeup() {
+        let state = build_test_state();
+        let request_id: RequestId = [0x10; 16];
+        let (handle, mut outer_rx, summary_rx, pump_join, _inner_tx) =
+            spawn_test_pump(state, request_id, Duration::from_secs(3_601));
+
+        // Fire terminate immediately — it may land before the pump first
+        // parks on `notified()`. With `notify_one` a permit is stored, so
+        // the next `terminate_wake.notified()` (or the eager top-of-loop
+        // check) observes it; the chunk must still arrive.
+        handle
+            .terminate_with_error(TerminateReason::RevokedMidStream, None)
+            .expect("terminate accepted");
+        let chunk = tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
+            .await
+            .expect("pump emits synthetic terminal within 2s")
+            .expect("chunk arrives");
+        assert!(chunk.payload.is_terminal());
+        pump_join.await.expect("pump settles");
+        let summary = summary_rx.await.expect("summary published");
+        assert_eq!(
+            summary.stream_chunk_count, 1,
+            "exactly one terminal emitted"
+        );
+    }
+
+    /// F6 (a): a context closed mid-stream terminates with
+    /// `protocol.context-closed-mid-stream` / `SCP-TOOL-6101` (Protocol
+    /// class), NOT `authorization.revoked-mid-stream`.
+    #[tokio::test]
+    async fn f6_context_closed_mid_stream_terminates_protocol_class() {
+        // Build a state whose context handle we can drive to a non-Active
+        // state, with a fast recheck cadence and a never-revokes checker.
+        let state = build_test_state_with_checker(
+            Arc::new(scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new()),
+            1,
+        );
+        // Drive the embedded context handle Creating -> Active -> Closing
+        // so the pump's teardown re-check observes a non-live context.
+        let ctx_handle = {
+            let g = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            g.context_handle.clone()
+        };
+        ctx_handle
+            .transition_to(&scp_protocol::context::ContextState::Active)
+            .await
+            .expect("Creating -> Active");
+        ctx_handle
+            .transition_to(&scp_protocol::context::ContextState::Closing)
+            .await
+            .expect("Active -> Closing");
+
+        let request_id: RequestId = [0x20; 16];
+        let (_handle, mut outer_rx, summary_rx, pump_join, _inner_tx) =
+            spawn_test_pump(state, request_id, Duration::from_secs(1));
+
+        // The pump's zeroth recheck tick (F4: no longer drained) observes
+        // the Closing context and arms ContextClosedMidStream.
+        let chunk = tokio::time::timeout(Duration::from_secs(3), outer_rx.recv())
+            .await
+            .expect("pump emits teardown terminal within recheck cadence")
+            .expect("chunk arrives");
+        let ChunkPayload::Error {
+            code,
+            message,
+            terminal,
+        } = chunk.payload
+        else {
+            unreachable!("expected terminal Error chunk");
+        };
+        assert!(terminal);
+        assert_eq!(
+            code,
+            scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION,
+            "context teardown must carry the Protocol-session code SCP-TOOL-6101, not the \
+             Authorization revoked code"
+        );
+        assert!(
+            message.starts_with(scp_protocol::context::outlets::error_codes::SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM),
+            "message must carry the context-closed-mid-stream slug, got: {message}"
+        );
+        pump_join.await.expect("pump settles");
+        let _ = summary_rx.await.expect("summary published");
+    }
+
+    /// F6 (b): a genuine UCAN revocation (context still live) still yields
+    /// `RevokedMidStream` (Authorization class) — teardown precedence does
+    /// not swallow real revocations.
+    #[tokio::test]
+    async fn f6_genuine_revocation_still_yields_revoked_mid_stream() {
+        let mut checker = scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new();
+        // build_test_state_with_checker pins `ucan_cid = "bafyrei-test"`.
+        checker.revoked.insert("bafyrei-test".to_owned());
+        let state = build_test_state_with_checker(Arc::new(checker), 1);
+        // Leave the context handle in `Creating` (live) so teardown does
+        // NOT fire — only revocation should.
+        let request_id: RequestId = [0x21; 16];
+        let (_handle, mut outer_rx, summary_rx, pump_join, _inner_tx) =
+            spawn_test_pump(state, request_id, Duration::from_secs(1));
+
+        let chunk = tokio::time::timeout(Duration::from_secs(3), outer_rx.recv())
+            .await
+            .expect("pump emits revocation terminal within recheck cadence")
+            .expect("chunk arrives");
+        let ChunkPayload::Error { code, message, .. } = chunk.payload else {
+            unreachable!("expected terminal Error chunk");
+        };
+        assert_eq!(
+            code,
+            TerminateReason::RevokedMidStream.code(),
+            "genuine revocation must carry the Authorization revoked code"
+        );
+        assert!(
+            message.starts_with(TerminateReason::RevokedMidStream.slug()),
+            "message must carry the revoked-mid-stream slug, got: {message}"
+        );
+        pump_join.await.expect("pump settles");
+        let _ = summary_rx.await.expect("summary published");
+    }
+
+    /// F4: with the zeroth-tick drain removed, the revocation re-check
+    /// arm fires promptly (the interval's first tick is immediate), so a
+    /// token revoked at open is observed and the stream terminates with
+    /// `RevokedMidStream` regardless of executor chunk timing. Uses paused
+    /// virtual time so the assertion does not depend on wall-clock.
+    #[tokio::test(start_paused = true)]
+    async fn f4_revocation_observed_promptly_via_undrained_zeroth_tick() {
+        let mut checker = scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new();
+        checker.revoked.insert("bafyrei-test".to_owned());
+        // recheck cadence of 5s; with the zeroth-tick NOT drained, the
+        // first tick is immediate so the terminal arrives at ~t=0, well
+        // before t=recheck_secs.
+        let state = build_test_state_with_checker(Arc::new(checker), 5);
+        let request_id: RequestId = [0x22; 16];
+        // The inner_tx is held (no executor chunks ever arrive) so the
+        // ONLY way the stream terminates is the revocation re-check —
+        // proving termination is independent of executor chunk timing.
+        let (_handle, mut outer_rx, summary_rx, pump_join, _inner_tx) =
+            spawn_test_pump(state, request_id, Duration::from_secs(5));
+
+        // Advance virtual time by less than one recheck period; the
+        // immediate zeroth tick should already have armed the terminal.
+        tokio::time::advance(Duration::from_millis(10)).await;
+        let chunk = tokio::time::timeout(Duration::from_secs(5), outer_rx.recv())
+            .await
+            .expect("revocation terminal arrives well before t=recheck_secs")
+            .expect("chunk arrives");
+        let ChunkPayload::Error { code, .. } = chunk.payload else {
+            unreachable!("expected terminal Error chunk");
+        };
+        assert_eq!(
+            code,
+            TerminateReason::RevokedMidStream.code(),
+            "prompt zeroth-tick re-check yields RevokedMidStream"
+        );
+        pump_join.await.expect("pump settles");
+        let _ = summary_rx.await.expect("summary published");
+    }
+
+    /// N2: `apply_outlet_cancel_signed` records the cancel-ack-seq at the
+    /// runtime's live cursor and the runtime signs internally (no caller
+    /// `next_seq`). A `CancelIdentity` that does not match the pinned triple
+    /// is rejected as `SignatureInvalid` WITHOUT mutating stream state.
+    #[tokio::test]
+    async fn n2_apply_outlet_cancel_signed_records_and_validates_identity() {
+        let state = build_test_state();
+        let request_id: RequestId = [0x30; 16];
+        let (handle, _outer_rx, _summary_rx, _pump_join, _inner_tx) =
+            spawn_test_pump(Arc::clone(&state), request_id, Duration::from_secs(3_601));
+
+        // Signer wrapping the same fixed key the fixture pinned as
+        // invoker_pk (build_test_state uses fixed_signing_key() for both).
+        let signer = super::super::signer::InProcessStreamSigner::new(fixed_signing_key());
+
+        // Identity mismatch (wrong outlet_id) → SignatureInvalid, no mutation.
+        let bad_id = CancelIdentity {
+            context_id: "ctx-test".to_owned(),
+            outlet_id: "WRONG".to_owned(),
+            caveats_binding: [0xAB; 32],
+        };
+        let bad = handle.apply_outlet_cancel_signed(&signer, &bad_id).await;
+        assert!(
+            matches!(
+                bad,
+                Err(super::super::stream::CancelError::SignatureInvalid)
+            ),
+            "identity mismatch must reject as SignatureInvalid, got {bad:?}"
+        );
+        {
+            let g = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !g.cancel_ack_armed,
+                "rejected cancel must NOT arm the timer"
+            );
+            assert_eq!(
+                g.cancel_ack_seq, None,
+                "rejected cancel must NOT record a seq"
+            );
+        }
+
+        // Correct identity → Ok, records the live cursor (0 here — no chunk
+        // emitted), arms the timer.
+        let good_id = CancelIdentity {
+            context_id: "ctx-test".to_owned(),
+            outlet_id: "outlet-test".to_owned(),
+            caveats_binding: [0xAB; 32],
+        };
+        let ok = handle
+            .apply_outlet_cancel_signed(&signer, &good_id)
+            .await
+            .expect("signed cancel accepted");
+        assert_eq!(ok, Some(0), "cancel-ack recorded at the live cursor (0)");
+        {
+            let g = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(g.cancel_ack_armed, "accepted cancel arms the timer");
+            assert_eq!(g.cancel_ack_seq, Some(0));
         }
     }
 }

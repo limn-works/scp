@@ -6715,6 +6715,9 @@ impl scp_mcp::server::ContextProvider for McpUniFfiBridgeProvider {
             chunks_billed: 1,
             stream_manifest_hash: [0u8; 32],
             stream_terminal_status: scp_core::context::outlets::stream::StreamTerminalStatus::Ok,
+            // Legacy two-chunk bridge path: no streaming pump, so no
+            // pump-vs-manifest self-mismatch is possible (§5.4.5 round-8).
+            audit_anomaly: None,
         };
 
         let payload_data = serde_json::to_vec(&tool_event).unwrap_or_default();

@@ -23,6 +23,7 @@ pub mod invoke;
 pub mod message_key;
 pub mod registration;
 pub mod session;
+pub mod signer;
 pub mod stream;
 
 // SCP-OUT-033 — re-export the streaming entry points so consumers can
@@ -31,3 +32,10 @@ pub use invoke::{
     invoke_outlet, invoke_outlet_aggregating, invoke_outlet_with_cancellation_aggregating,
     one_shot_to_stream,
 };
+
+// ADR-049 round 8 — re-export the streaming signer seam (and the in-process
+// test/WASM backing impl under `testing`) so dispatch + invoke + downstream
+// bridges share one abstraction over operator chunk/cancel signing.
+#[cfg(any(test, feature = "testing"))]
+pub use signer::InProcessStreamSigner;
+pub use signer::{StreamSigner, StreamSignerError};

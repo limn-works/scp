@@ -75,7 +75,8 @@ use crate::context::outlets::error_codes::{
     CODE_AUTHORIZATION_DENIED, CODE_EXECUTION_CANCEL_ACK_TIMEOUT, CODE_EXECUTION_CREDIT_STALL,
     CODE_PROTOCOL_SESSION, CODE_PROTOCOL_VIOLATION, SLUG_AUTHORIZATION_ATTENUATION_VIOLATION,
     SLUG_AUTHORIZATION_REVOKED_MID_STREAM, SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
-    SLUG_EXECUTION_CREDIT_STALL, SLUG_PROTOCOL_STREAM_ALREADY_OPEN, SLUG_PROTOCOL_UNKNOWN_SESSION,
+    SLUG_EXECUTION_CREDIT_STALL, SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+    SLUG_PROTOCOL_STREAM_ALREADY_OPEN, SLUG_PROTOCOL_UNKNOWN_SESSION,
 };
 use crate::context::outlets::errors::OutletErrorClass;
 use crate::context::outlets::{OutletId, OutletKind};
@@ -898,6 +899,17 @@ pub enum StreamTerminalStatus {
 /// - Credit-stall timer → [`CreditStall`] (slug `execution.credit-stall`,
 ///   code `SCP-TOOL-6133`). The credit window remained at zero past
 ///   `stream_credit_stall_secs` and no fresh grant arrived.
+/// - Context teardown (round 8) → [`ContextClosedMidStream`] (slug
+///   `protocol.context-closed-mid-stream`, code `SCP-TOOL-6101`,
+///   Protocol class). The hosting context was closed or the operator
+///   was evicted/left while the stream was active. Distinct from
+///   [`RevokedMidStream`] (Authorization class) — the invoker's UCAN
+///   was never revoked; the stream's substrate disappeared. Recording
+///   teardown as revocation would write a false audit signal and hand
+///   an operator a `DoS` lever (synthesizing a revocation-class
+///   behavioral record against an in-flight invoker). Context teardown
+///   takes precedence over revocation when both are observable in the
+///   same re-check tick (§5.4.5 "Context teardown vs. revocation").
 ///
 /// Any termination cause not in this set is not a legitimate framework
 /// close — it is either an executor-emitted terminal (which the executor
@@ -909,6 +921,7 @@ pub enum StreamTerminalStatus {
 /// [`RevokedMidStream`]: Self::RevokedMidStream
 /// [`CancelAckTimeout`]: Self::CancelAckTimeout
 /// [`CreditStall`]: Self::CreditStall
+/// [`ContextClosedMidStream`]: Self::ContextClosedMidStream
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TerminateReason {
     /// `authorization.revoked-mid-stream` / `SCP-TOOL-6110` — UCAN
@@ -925,6 +938,14 @@ pub enum TerminateReason {
     /// remained at zero past `stream_credit_stall_secs` and no fresh
     /// grant arrived. The framework forces the stream closed.
     CreditStall,
+    /// `protocol.context-closed-mid-stream` / `SCP-TOOL-6101`
+    /// (Protocol class) — the hosting context was closed or the
+    /// operator was evicted/left while the stream was active (round 8).
+    /// Distinct from [`Self::RevokedMidStream`]: the invoker's UCAN was
+    /// never revoked; the stream's substrate disappeared. Takes
+    /// precedence over revocation when both are observable in the same
+    /// re-check tick.
+    ContextClosedMidStream,
 }
 
 impl TerminateReason {
@@ -941,6 +962,7 @@ impl TerminateReason {
             Self::RevokedMidStream => SLUG_AUTHORIZATION_REVOKED_MID_STREAM,
             Self::CancelAckTimeout => SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
             Self::CreditStall => SLUG_EXECUTION_CREDIT_STALL,
+            Self::ContextClosedMidStream => SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
         }
     }
 
@@ -952,6 +974,7 @@ impl TerminateReason {
             Self::RevokedMidStream => CODE_AUTHORIZATION_DENIED,
             Self::CancelAckTimeout => CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
             Self::CreditStall => CODE_EXECUTION_CREDIT_STALL,
+            Self::ContextClosedMidStream => CODE_PROTOCOL_SESSION,
         }
     }
 
@@ -972,6 +995,7 @@ impl TerminateReason {
                 "executor failed to emit terminal chunk within stream_cancel_ack_secs"
             }
             Self::CreditStall => "credit window remained at zero past stream_credit_stall_secs",
+            Self::ContextClosedMidStream => "hosting context closed or operator evicted mid-stream",
         }
     }
 
@@ -988,6 +1012,7 @@ impl TerminateReason {
             SLUG_AUTHORIZATION_REVOKED_MID_STREAM => Some(Self::RevokedMidStream),
             SLUG_EXECUTION_CANCEL_ACK_TIMEOUT => Some(Self::CancelAckTimeout),
             SLUG_EXECUTION_CREDIT_STALL => Some(Self::CreditStall),
+            SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM => Some(Self::ContextClosedMidStream),
             _ => None,
         }
     }
@@ -2576,7 +2601,7 @@ mod tests {
     fn terminate_reason_slug_matches_5_4_4_catalog() {
         use crate::context::outlets::error_codes::{
             SLUG_AUTHORIZATION_REVOKED_MID_STREAM, SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
-            SLUG_EXECUTION_CREDIT_STALL,
+            SLUG_EXECUTION_CREDIT_STALL, SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
         };
         assert_eq!(
             TerminateReason::RevokedMidStream.slug(),
@@ -2590,6 +2615,10 @@ mod tests {
             TerminateReason::CreditStall.slug(),
             SLUG_EXECUTION_CREDIT_STALL
         );
+        assert_eq!(
+            TerminateReason::ContextClosedMidStream.slug(),
+            SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM
+        );
     }
 
     /// Each `TerminateReason` variant maps to the `SCP-TOOL-NNNN` code
@@ -2599,7 +2628,7 @@ mod tests {
     fn terminate_reason_code_matches_5_4_4_allocation() {
         use crate::context::outlets::error_codes::{
             CODE_AUTHORIZATION_DENIED, CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
-            CODE_EXECUTION_CREDIT_STALL,
+            CODE_EXECUTION_CREDIT_STALL, CODE_PROTOCOL_SESSION,
         };
         assert_eq!(
             TerminateReason::RevokedMidStream.code(),
@@ -2613,6 +2642,18 @@ mod tests {
             TerminateReason::CreditStall.code(),
             CODE_EXECUTION_CREDIT_STALL
         );
+        assert_eq!(
+            TerminateReason::ContextClosedMidStream.code(),
+            CODE_PROTOCOL_SESSION
+        );
+        // Round-8 invariant: context teardown is Protocol-class, NOT the
+        // Authorization-class revoked-mid-stream code. Conflating them
+        // would write a false revocation audit signal.
+        assert_ne!(
+            TerminateReason::ContextClosedMidStream.code(),
+            TerminateReason::RevokedMidStream.code(),
+            "context-closed-mid-stream must not share the Authorization code with revoked-mid-stream"
+        );
     }
 
     /// `from_slug` round-trips every variant. Unknown slugs return
@@ -2624,6 +2665,7 @@ mod tests {
             TerminateReason::RevokedMidStream,
             TerminateReason::CancelAckTimeout,
             TerminateReason::CreditStall,
+            TerminateReason::ContextClosedMidStream,
         ] {
             assert_eq!(TerminateReason::from_slug(r.slug()), Some(r));
         }
@@ -2646,6 +2688,7 @@ mod tests {
             TerminateReason::RevokedMidStream,
             TerminateReason::CancelAckTimeout,
             TerminateReason::CreditStall,
+            TerminateReason::ContextClosedMidStream,
         ] {
             let msg = r.default_message();
             assert!(!msg.is_empty(), "empty default message for {r:?}");

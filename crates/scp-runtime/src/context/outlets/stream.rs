@@ -127,34 +127,75 @@ pub const fn grant_error_to_slug(err: GrantError) -> &'static str {
     }
 }
 
-/// Reasons a streaming `OutletStreamCancel` may be rejected (§5.4.5
-/// round-7 cancel-auth tightening).
+/// Reasons a streaming `OutletStreamCancel` may be rejected.
 ///
-/// All variants map to `OutletErrorClass::Authorization::AuthorizationFailed`
-/// per the spec — the runtime collapses the granular reasons to the
-/// uniform authorization-denied slug so an unauthenticated cancel does
-/// not leak whether the failure was signature-invalid vs identity-
-/// mismatch vs unknown-stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// [`Self::SignatureInvalid`] maps to
+/// `OutletErrorClass::Authorization::AuthorizationFailed` per §5.4.5
+/// round-7 — the runtime collapses the granular reasons to the uniform
+/// authorization-denied slug so an unauthenticated cancel does not leak
+/// whether the failure was signature-invalid vs identity-mismatch vs
+/// unknown-stream.
+///
+/// [`Self::CursorAdvanced`] and [`Self::Signing`] are round-8 additions for
+/// the [`StreamSessionHandle::apply_outlet_cancel_signed`] atomic primitive
+/// (the runtime signs the cancel itself, deriving `next_seq` from the live
+/// cursor): `CursorAdvanced` is a **retryable** race signal (the cursor
+/// moved between the lock-free preimage build and the re-lock), `Signing`
+/// wraps a signer-side failure.
+///
+/// [`StreamSessionHandle::apply_outlet_cancel_signed`]:
+///   super::dispatch::StreamSessionHandle::apply_outlet_cancel_signed
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CancelError {
     /// Ed25519 signature verification failed under the pinned
-    /// `invoker_pk`. Maps to `authorization.denied`.
+    /// `invoker_pk`, or the caller identity did not match the pinned
+    /// `(context_id, outlet_id, caveats_binding)` triple. Maps to
+    /// `authorization.denied`. No stream state is mutated.
     SignatureInvalid,
+    /// The runtime's next-to-emit cursor advanced between reading it (to
+    /// build the cancel preimage off-lock) and re-acquiring the lock to
+    /// apply the cancel, and the bounded retry budget was exhausted.
+    /// **Retryable** — the bridge SHOULD re-issue the cancel, which
+    /// re-reads the now-current cursor. `signed` is the cursor the
+    /// exhausted attempt signed against; `current` is the live cursor
+    /// observed at the final re-lock.
+    CursorAdvanced {
+        /// The next-to-emit cursor the exhausted attempt signed against.
+        signed: u64,
+        /// The live next-to-emit cursor observed at the final re-lock.
+        current: u64,
+    },
+    /// The [`StreamSigner`] failed to produce the cancel signature.
+    /// Carries the signer error for diagnostics.
+    ///
+    /// [`StreamSigner`]: super::signer::StreamSigner
+    Signing(super::signer::StreamSignerError),
 }
 
 /// Routes a [`CancelError`] to its §5.4.4 slug.
 #[must_use]
-pub const fn cancel_error_to_slug(err: CancelError) -> &'static str {
+pub const fn cancel_error_to_slug(err: &CancelError) -> &'static str {
     match err {
-        CancelError::SignatureInvalid => error_codes::SLUG_AUTHORIZATION_DENIED,
+        // SignatureInvalid + an internal signing failure both collapse to
+        // the uniform authorization-denied slug on the wire so a cancel
+        // failure does not leak which internal stage failed. CursorAdvanced
+        // is a transport-class retryable race, mapped to the rate-limited
+        // slug (the bridge re-issues rather than surfacing a hard denial).
+        CancelError::SignatureInvalid | CancelError::Signing(_) => {
+            error_codes::SLUG_AUTHORIZATION_DENIED
+        }
+        CancelError::CursorAdvanced { .. } => error_codes::SLUG_TRANSPORT_RATE_LIMITED,
     }
 }
 
 /// Routes a [`CancelError`] to its §5.4.4 code.
 #[must_use]
-pub const fn cancel_error_to_code(err: CancelError) -> &'static str {
+pub const fn cancel_error_to_code(err: &CancelError) -> &'static str {
     match err {
-        CancelError::SignatureInvalid => error_codes::CODE_AUTHORIZATION_DENIED,
+        CancelError::SignatureInvalid | CancelError::Signing(_) => {
+            error_codes::CODE_AUTHORIZATION_DENIED
+        }
+        CancelError::CursorAdvanced { .. } => error_codes::CODE_TRANSPORT_FAULT,
     }
 }
 

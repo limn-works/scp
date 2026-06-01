@@ -1869,6 +1869,10 @@ pub struct ContextManagerBuilder {
     key_resolver: Option<KeyResolver>,
     clock: Option<Arc<dyn Clock>>,
     payment_adapter: Option<Arc<dyn crate::economy::adapter::PaymentAdapterDyn>>,
+    /// Node-level concurrent-pump ceiling (§5.4.5 round-8). `None` →
+    /// [`DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`]. Clamped into
+    /// `[MIN, MAX]` at build time.
+    max_concurrent_outlet_stream_pumps: Option<u32>,
 }
 
 impl ContextManagerBuilder {
@@ -1883,6 +1887,7 @@ impl ContextManagerBuilder {
             key_resolver: None,
             clock: None,
             payment_adapter: None,
+            max_concurrent_outlet_stream_pumps: None,
         }
     }
 
@@ -1937,6 +1942,21 @@ impl ContextManagerBuilder {
     #[must_use]
     pub fn clock(mut self, clock: Arc<dyn Clock>) -> Self {
         self.clock = Some(clock);
+        self
+    }
+
+    /// Sets the node-level concurrent-pump ceiling
+    /// (`max_concurrent_outlet_stream_pumps`, §5.4.5 round-8).
+    ///
+    /// If not called, defaults to
+    /// [`DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`] (4096). The value is
+    /// clamped into the inclusive range
+    /// [`MIN_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`] ..=
+    /// [`MAX_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`] at build time, so a
+    /// degenerate `0` cannot deadlock all streaming.
+    #[must_use]
+    pub const fn max_concurrent_outlet_stream_pumps(mut self, max: u32) -> Self {
+        self.max_concurrent_outlet_stream_pumps = Some(max);
         self
     }
 
@@ -2014,6 +2034,12 @@ impl ContextManagerBuilder {
         };
         manager.clock = clock;
         manager.payment_adapter = self.payment_adapter;
+        // §5.4.5 round-8: size the per-instance node-level pump ceiling
+        // from the builder (clamped into range). Default when unset.
+        manager.outlet_stream_pump_semaphore = build_outlet_stream_pump_semaphore(
+            self.max_concurrent_outlet_stream_pumps
+                .unwrap_or(DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS),
+        );
         Ok(manager)
     }
 }
@@ -2143,6 +2169,51 @@ pub struct ContextManager {
     ///
     /// Created via [`with_event_channel`](Self::with_event_channel).
     event_tx: Option<tokio::sync::broadcast::Sender<(String, ContextEvent)>>,
+    /// Per-instance node-level ceiling on the total number of concurrently
+    /// running outlet-stream pumps across all contexts hosted on this
+    /// `ContextManager` (§5.4.5 round-8 "Node-level concurrent-pump
+    /// ceiling"). Distinct from the three per-context `OutletStreamOpen`
+    /// admission caps: this bounds the runtime's aggregate task/memory
+    /// footprint regardless of per-context configuration.
+    ///
+    /// Per-INSTANCE state (ADR-048) — a `tokio::sync::Semaphore` owned by
+    /// this manager, NOT a process-global static (a global would be caught
+    /// by `check-no-mutable-globals`). A pump permit is acquired AFTER all
+    /// per-context gates pass at `open_outlet_stream` and held for the
+    /// exact lifetime of the pump task (released on normal close, terminal,
+    /// cancel-ack, or panic). Saturation hard-rejects the open with
+    /// [`OpenStreamRejection::StreamCapExhausted`](crate::context::outlets::dispatch::OpenStreamRejection::StreamCapExhausted).
+    ///
+    /// Sized at construction from `max_concurrent_outlet_stream_pumps`
+    /// (default [`DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`], clamped into
+    /// the inclusive range [`MIN_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`] ..=
+    /// [`MAX_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`]).
+    outlet_stream_pump_semaphore: Arc<tokio::sync::Semaphore>,
+}
+
+/// Default node-level concurrent-pump ceiling
+/// (`max_concurrent_outlet_stream_pumps`), §5.4.5 round-8.
+pub const DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS: u32 = 4096;
+
+/// Minimum configurable node-level concurrent-pump ceiling. A value of 0
+/// would deadlock all streaming, so the floor is 1.
+pub const MIN_MAX_CONCURRENT_OUTLET_STREAM_PUMPS: u32 = 1;
+
+/// Maximum configurable node-level concurrent-pump ceiling.
+///
+/// `tokio::sync::Semaphore` caps permits at `Semaphore::MAX_PERMITS`
+/// (`usize::MAX >> 3`); 65536 is a generous practical upper bound well
+/// under that limit.
+pub const MAX_MAX_CONCURRENT_OUTLET_STREAM_PUMPS: u32 = 65_536;
+
+/// Clamps a requested `max_concurrent_outlet_stream_pumps` into the
+/// `[MIN, MAX]` range and constructs the backing semaphore.
+fn build_outlet_stream_pump_semaphore(requested: u32) -> Arc<tokio::sync::Semaphore> {
+    let clamped = requested.clamp(
+        MIN_MAX_CONCURRENT_OUTLET_STREAM_PUMPS,
+        MAX_MAX_CONCURRENT_OUTLET_STREAM_PUMPS,
+    );
+    Arc::new(tokio::sync::Semaphore::new(clamped as usize))
 }
 
 // Nursery lint — false-positives on async functions holding tokio::sync::MutexGuard
@@ -2181,6 +2252,9 @@ impl ContextManager {
             task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
             next_generation: std::sync::atomic::AtomicU64::new(1),
             event_tx: None,
+            outlet_stream_pump_semaphore: build_outlet_stream_pump_semaphore(
+                DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS,
+            ),
         }
     }
 
@@ -2220,6 +2294,9 @@ impl ContextManager {
             task_set: Arc::new(tokio::sync::Mutex::new(tokio::task::JoinSet::new())),
             next_generation: std::sync::atomic::AtomicU64::new(1),
             event_tx: None,
+            outlet_stream_pump_semaphore: build_outlet_stream_pump_semaphore(
+                DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS,
+            ),
         }
     }
 

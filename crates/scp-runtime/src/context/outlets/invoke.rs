@@ -1969,7 +1969,7 @@ fn placeholder_data_provenance(context_id: &str) -> scp_protocol::provenance::Da
 /// chunk is later forwarded by the dispatch pump
 /// ([`crate::context::outlets::dispatch::run_stream_pump_v2`]) the
 /// outer pump re-signs under the renumbered outer sequence.
-fn wrap_chunk(
+async fn wrap_chunk(
     signing_ctx: &InnerPumpSigningContext,
     request_id: RequestId,
     sequence: &mut u64,
@@ -1977,7 +1977,9 @@ fn wrap_chunk(
 ) -> OutletStreamChunk {
     let seq = *sequence;
     *sequence = sequence.saturating_add(1);
-    let sig = signing_ctx.sign_inner_chunk(&request_id, seq, &payload);
+    let sig = signing_ctx
+        .sign_inner_chunk(&request_id, seq, &payload)
+        .await;
     OutletStreamChunk {
         request_id,
         sequence: seq,
@@ -1995,10 +1997,12 @@ fn wrap_chunk(
 /// pump (`dispatch.rs`, owns admission + credit + cancel-ack).
 #[derive(Clone)]
 pub(crate) struct InnerPumpSigningContext {
-    /// Operator signing key. `None` for legacy / test callers that did
-    /// not wire a key — `wrap_chunk` falls back to the all-zero
+    /// Operator streaming signer. `None` for legacy / test callers that
+    /// did not wire a signer — `wrap_chunk` falls back to the all-zero
     /// placeholder + a `tracing::error!` log so the gap is visible.
-    pub(crate) operator_signing_key: Option<std::sync::Arc<ed25519_dalek::SigningKey>>,
+    /// Round-8: a [`StreamSigner`](super::signer::StreamSigner) trait
+    /// object, signed `async`.
+    pub(crate) operator_signer: Option<std::sync::Arc<dyn super::signer::StreamSigner>>,
     /// Hosting context id (committed into the preimage).
     pub(crate) context_id: String,
     /// Outlet id (committed into the preimage).
@@ -2011,25 +2015,26 @@ impl InnerPumpSigningContext {
     /// Signs a `(request_id, sequence, payload)` triple under the
     /// pinned `(context_id, outlet_id, caveats_binding)`. Returns the
     /// 64-byte signature, or the all-zero placeholder + a
-    /// `tracing::error!` log when the key is `None` / when JCS fails.
-    fn sign_inner_chunk(
+    /// `tracing::error!` log when the signer is `None` / when JCS or the
+    /// signer fails. Round-8: composes the preimage synchronously, then
+    /// awaits the signer.
+    async fn sign_inner_chunk(
         &self,
         request_id: &RequestId,
         sequence: u64,
         payload: &ChunkPayload,
     ) -> [u8; 64] {
-        let Some(key) = self.operator_signing_key.as_ref() else {
+        let Some(signer) = self.operator_signer.as_ref() else {
             tracing::error!(
                 request_id = %hex::encode(request_id),
                 outlet_id = %self.outlet_id,
                 context_id = %self.context_id,
                 sequence,
-                "invoke pump: operator_signing_key is None — emitting unsigned chunk (legacy/test path)"
+                "invoke pump: operator_signer is None — emitting unsigned chunk (legacy/test path)"
             );
             return [0u8; 64];
         };
-        match scp_protocol::context::outlets::stream::sign_chunk(
-            key,
+        let preimage = match scp_protocol::context::outlets::stream::compute_chunk_sig_preimage(
             &self.context_id,
             &self.outlet_id,
             request_id,
@@ -2037,6 +2042,20 @@ impl InnerPumpSigningContext {
             &self.caveats_binding,
             payload,
         ) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(
+                    request_id = %hex::encode(request_id),
+                    outlet_id = %self.outlet_id,
+                    context_id = %self.context_id,
+                    sequence,
+                    error = %e,
+                    "invoke pump: failed to compute chunk preimage — emitting unsigned placeholder"
+                );
+                return [0u8; 64];
+            }
+        };
+        match signer.sign(&preimage).await {
             Ok(sig) => sig,
             Err(e) => {
                 tracing::error!(
@@ -2045,7 +2064,7 @@ impl InnerPumpSigningContext {
                     context_id = %self.context_id,
                     sequence,
                     error = %e,
-                    "invoke pump: failed to sign chunk — emitting unsigned placeholder"
+                    "invoke pump: signer failed to sign chunk — emitting unsigned placeholder"
                 );
                 [0u8; 64]
             }
@@ -2114,11 +2133,13 @@ pub async fn invoke_outlet<E>(
     misdeclaration_sink: Option<std::sync::Arc<dyn QueryMisdeclarationSink>>,
     handler_panic_sink: Option<std::sync::Arc<dyn HandlerPanicSink>>,
     invoked_event_sink: Option<std::sync::Arc<dyn OutletInvokedEventSink>>,
-    // Operator signing key used to sign every chunk under §5.4.5
+    // Operator streaming signer used to sign every chunk under §5.4.5
     // `SCP-OUTLET-CHUNK-SIG-V1:`. `None` is reserved for legacy / test
-    // callers; production native paths always supply `Some`. See
+    // callers; production native paths always supply `Some`. Round-8: a
+    // `StreamSigner` trait object so the inner pump signs through the same
+    // custody-injectable seam as the dispatch pump. See
     // `InnerPumpSigningContext` for the fallback behaviour.
-    operator_signing_key: Option<std::sync::Arc<ed25519_dalek::SigningKey>>,
+    operator_signer: Option<std::sync::Arc<dyn super::signer::StreamSigner>>,
     // 32-byte `caveats_binding` pinned at acceptance — committed into
     // the per-chunk-signature preimage. `[0u8; 32]` for legacy / test
     // callers; production paths supply the real binding.
@@ -2182,7 +2203,7 @@ where
     let timeout_duration = Duration::from_millis(u64::from(effective_timeout));
 
     let signing_ctx = InnerPumpSigningContext {
-        operator_signing_key,
+        operator_signer,
         context_id: context_id_owned.clone(),
         outlet_id: outlet_id_owned.clone(),
         caveats_binding,
@@ -2353,7 +2374,7 @@ where
     // where the executor finished simultaneously with the deadline.
     if !pump_outcome.timed_out {
         while let Ok(payload) = payload_rx.try_recv() {
-            let chunk = wrap_chunk(&signing_ctx, request_id, &mut sequence, payload);
+            let chunk = wrap_chunk(&signing_ctx, request_id, &mut sequence, payload).await;
             emitted_chunks.push(chunk.clone());
             if chunk_tx.send(chunk).await.is_err() {
                 // Receiver dropped during late drain; same rationale
@@ -2375,7 +2396,8 @@ where
         handler_panic_sink: handler_panic_sink.as_deref(),
     });
 
-    let terminal_chunk = wrap_chunk(&signing_ctx, request_id, &mut sequence, terminal_payload);
+    let terminal_chunk =
+        wrap_chunk(&signing_ctx, request_id, &mut sequence, terminal_payload).await;
     emitted_chunks.push(terminal_chunk.clone());
     let delivered = chunk_tx.send(terminal_chunk).await.is_ok();
 
@@ -2395,6 +2417,10 @@ where
             input_hash,
             elapsed_ms(start),
             &emitted_chunks,
+            // Inner invoke pump has no separate running tally to diverge
+            // from — the manifest IS the tally — so no anomaly is possible
+            // here.
+            None,
         );
         sink.record(event);
     }
@@ -2439,6 +2465,14 @@ pub(crate) fn build_streaming_outlet_event(
     input_hash: String,
     execution_time_ms: u64,
     chunks: &[OutletStreamChunk],
+    // §5.4.5 round-8 (F2): set when the dispatch pump detected a divergence
+    // between its own running `chunks_billed` tally and the manifest-derived
+    // reference. The event carries the manifest-derived value (computed
+    // below from `chunks`) regardless; this marker records the divergence so
+    // it is durably attributable in the audit log instead of dropping the
+    // event. `None` on the happy path and for the inner-invoke pump (which
+    // does not maintain a separate running tally to diverge from).
+    audit_anomaly: Option<scp_protocol::context::outlets::lifecycle::AuditAnomaly>,
 ) -> OutletInvokedEvent {
     use scp_protocol::context::outlets::stream::{
         ChunkPayload, StreamTerminalStatus, compute_chunk_manifest_root,
@@ -2498,6 +2532,7 @@ pub(crate) fn build_streaming_outlet_event(
         chunks_billed,
         stream_manifest_hash,
         stream_terminal_status: terminal_status,
+        audit_anomaly,
     }
 }
 
@@ -2541,7 +2576,8 @@ where
             next_payload = payload_rx.recv() => {
                 match next_payload {
                     Some(payload) => {
-                        let chunk = wrap_chunk(signing_ctx, request_id, sequence, payload);
+                        let chunk =
+                            wrap_chunk(signing_ctx, request_id, sequence, payload).await;
                         recorded_chunks.push(chunk.clone());
                         if chunk_tx.send(chunk).await.is_err() {
                             chunk_tx_alive = false;
@@ -3316,6 +3352,9 @@ pub(crate) fn build_outlet_event(
         chunks_billed,
         stream_manifest_hash,
         stream_terminal_status: scp_protocol::context::outlets::stream::StreamTerminalStatus::Ok,
+        // Aggregating (non-streaming) path: the manifest IS the tally,
+        // so no pump-vs-manifest divergence is possible.
+        audit_anomaly: None,
     }
 }
 
@@ -6730,6 +6769,7 @@ mod tests {
             chunks_billed: 2,
             stream_manifest_hash: compute_chunk_manifest_root(&chunks).unwrap(),
             stream_terminal_status: StreamTerminalStatus::Cancelled,
+            audit_anomaly: None,
         };
 
         assert_eq!(
@@ -6833,6 +6873,14 @@ mod tests {
         }
     }
 
+    /// Helper: a generous node-level pump semaphore for tests that are
+    /// not exercising the §5.4.5 round-8 cap-exhaustion path. 64 permits
+    /// is well above any per-test concurrency so these fixtures never hit
+    /// `StreamCapExhausted`.
+    fn out034_pump_semaphore() -> StdArc<tokio::sync::Semaphore> {
+        StdArc::new(tokio::sync::Semaphore::new(64))
+    }
+
     /// Helper: build a fresh OUT-034 stream identity for tests.
     ///
     /// Returns a `[0xAB; 32]` sentinel binding paired with an EMPTY
@@ -6882,12 +6930,15 @@ mod tests {
             credit_window,
             caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
             invoker_pk: verifying_key,
-            // OUT-034 unit-test fixtures: every stream needs an
-            // operator key (Option<_> was deleted to close the
-            // all-zero-sig placeholder hole). These fixtures exercise
-            // admission/escrow/credit accounting only — they do not
-            // verify the signature, so any throwaway key works.
-            operator_signing_key: StdArc::new(ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32])),
+            // OUT-034 unit-test fixtures: every stream needs an operator
+            // signer (Option<_> was deleted to close the all-zero-sig
+            // placeholder hole). Round-8: a `StreamSigner` trait object.
+            // These fixtures exercise admission/escrow/credit accounting
+            // only — they do not verify the chunk signature, so any
+            // throwaway key works.
+            operator_signer: StdArc::new(super::super::signer::InProcessStreamSigner::new(
+                ed25519_dalek::SigningKey::from_bytes(&[0xA1; 32]),
+            )),
             stream_credit_stall_secs: 1,
             stream_cancel_ack_secs: 1,
             // §5.4.5 HIGH-wave-2 (Fix B) — runtime-authoritative
@@ -6965,6 +7016,7 @@ mod tests {
             None,
             params,
             StdArc::clone(&admission),
+            out034_pump_semaphore(),
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -7067,6 +7119,7 @@ mod tests {
             None,
             params,
             StdArc::clone(&admission),
+            out034_pump_semaphore(),
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -7088,33 +7141,30 @@ mod tests {
         // seq=4 so chunks 0..=4 (5 chunks) are billable but seq 5,6,7
         // are above the ceiling.
         let _ = received_count;
-        // Round-7 cancel-auth: build a signed `OutletStreamCancel`
-        // under the same invoker key the test pinned at
-        // `out034_open_params`. The runtime verifies under the
-        // pinned `(context_id, outlet_id, caveats_binding)`.
+        // Round-8 N2: cancel through the atomic signed primitive. The
+        // runtime derives `next_seq` from its OWN live emission cursor
+        // (never a caller value) and signs the `SCP-OUTLET-CANCEL-V1:`
+        // preimage with the invoker signer — which the test wraps around
+        // the same `signing` key pinned as `invoker_pk` at open, so the
+        // runtime's self-verification under `invoker_pk` succeeds. The
+        // recorded cancel-ack-seq is whatever the live cursor is at the
+        // moment of the cancel (>= the 4 chunks the receiver drained; the
+        // pump may have forwarded more into the bounded channel buffer).
         let test_identity = out034_identity(&outlet_id_owned);
-        let cancel_sig = scp_protocol::context::outlets::stream::sign_cancel(
-            &signing,
-            &scp_protocol::context::outlets::stream::CancelSigningInputs {
-                context_id: &test_identity.context_id,
-                outlet_id: &test_identity.outlet_id,
-                request_id: handle.request_id(),
-                next_seq: 4,
-                caveats_binding: &test_identity.caveats_binding,
-            },
-        );
-        let cancel = scp_protocol::context::outlets::stream::OutletStreamCancel {
-            request_id: *handle.request_id(),
-            next_seq: 4,
-            sig: cancel_sig,
+        let cancel_signer = super::super::signer::InProcessStreamSigner::new(signing.clone());
+        let cancel_id = super::super::dispatch::CancelIdentity {
+            context_id: test_identity.context_id.clone(),
+            outlet_id: test_identity.outlet_id.clone(),
+            caveats_binding: test_identity.caveats_binding,
         };
         let recorded_seq = handle
-            .apply_outlet_cancel(&cancel)
-            .expect("signed cancel verifies under pinned invoker key");
-        assert_eq!(
-            recorded_seq,
-            Some(4),
-            "cancel-ack-seq recorded at next-to-emit cursor"
+            .apply_outlet_cancel_signed(&cancel_signer, &cancel_id)
+            .await
+            .expect("runtime-signed cancel verifies under pinned invoker key");
+        let recorded = recorded_seq.expect("cancel recorded a cancel-ack-seq");
+        assert!(
+            recorded >= 4,
+            "cancel-ack-seq recorded at the live next-to-emit cursor (>= 4 drained), got {recorded}"
         );
 
         // Drain remaining chunks until the stream closes.
@@ -7221,6 +7271,7 @@ mod tests {
             None,
             params,
             StdArc::clone(&admission),
+            out034_pump_semaphore(),
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -7344,6 +7395,7 @@ mod tests {
             Some(StdArc::clone(&event_sink) as StdArc<dyn super::OutletInvokedEventSink>),
             params,
             StdArc::clone(&admission),
+            out034_pump_semaphore(),
         )
         .await
         .expect("open should succeed");
@@ -7423,7 +7475,13 @@ mod tests {
             credit_window,
             caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
             invoker_pk: operator_signing_key.verifying_key(),
-            operator_signing_key: StdArc::clone(&operator_signing_key),
+            // Round-8: wrap the test signing key in an in-process signer.
+            // operator == invoker in these fixtures (invoker_pk above is
+            // this same key's verifying key), so a cancel signed with the
+            // same key verifies under the pinned invoker_pk.
+            operator_signer: StdArc::new(super::super::signer::InProcessStreamSigner::new(
+                (*operator_signing_key).clone(),
+            )),
             stream_credit_stall_secs: 1,
             stream_cancel_ack_secs: 1,
             stream_ucan_recheck_secs: 60,
@@ -7499,6 +7557,7 @@ mod tests {
             None,
             params,
             StdArc::clone(&admission),
+            out034_pump_semaphore(),
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -7615,32 +7674,28 @@ mod tests {
             None,
             params,
             StdArc::clone(&admission),
+            out034_pump_semaphore(),
         )
         .await
         .expect("OUT-034 open should succeed");
 
         // Receive the first Data chunk so the request_id is fresh, then
-        // deliver a signed cancel that arms the cancel-ack timer.
+        // deliver a cancel via the round-8 N2 atomic signed primitive (the
+        // runtime derives next_seq from its live cursor and signs with the
+        // invoker signer wrapping the same key pinned as invoker_pk). This
+        // arms the cancel-ack timer.
         let mut rx = handle.receiver().expect("receiver");
         let first_chunk = rx.recv().await.expect("first data chunk");
-        let cancel_sig = scp_protocol::context::outlets::stream::sign_cancel(
-            &signing,
-            &scp_protocol::context::outlets::stream::CancelSigningInputs {
-                context_id: &identity.context_id,
-                outlet_id: &identity.outlet_id,
-                request_id: handle.request_id(),
-                next_seq: 1,
-                caveats_binding: &identity.caveats_binding,
-            },
-        );
-        let cancel = scp_protocol::context::outlets::stream::OutletStreamCancel {
-            request_id: *handle.request_id(),
-            next_seq: 1,
-            sig: cancel_sig,
+        let cancel_signer = super::super::signer::InProcessStreamSigner::new((*signing).clone());
+        let cancel_id = super::super::dispatch::CancelIdentity {
+            context_id: identity.context_id.clone(),
+            outlet_id: identity.outlet_id.clone(),
+            caveats_binding: identity.caveats_binding,
         };
         handle
-            .apply_outlet_cancel(&cancel)
-            .expect("signed cancel accepted");
+            .apply_outlet_cancel_signed(&cancel_signer, &cancel_id)
+            .await
+            .expect("runtime-signed cancel accepted");
 
         // Drain remaining chunks. The slow executor never emits a
         // terminal — the cancel-ack timer fires at +1s and the pump
@@ -7716,7 +7771,11 @@ mod tests {
             None,
             None,
             None,
-            Some(StdArc::clone(&signing)),
+            Some(
+                StdArc::new(super::super::signer::InProcessStreamSigner::new(
+                    (*signing).clone(),
+                )) as StdArc<dyn super::super::signer::StreamSigner>,
+            ),
             caveats_binding,
         )
         .await
@@ -7813,10 +7872,20 @@ mod tests {
             None,
             params,
             StdArc::clone(&admission),
+            out034_pump_semaphore(),
         )
         .await
         .expect("OUT-034 open should succeed");
 
+        // The cancel is applied via the verbatim-apply primitive
+        // (`apply_outlet_cancel_verbatim`) which both verifies the
+        // signature AND cross-checks `next_seq` against the live cursor
+        // (§5.4.5 round-8: a verbatim path MUST NOT absorb a forged
+        // cursor). The cancel is applied before the executor emits any
+        // chunk (it sleeps 50ms), so the live cursor is `0`; we therefore
+        // sign at `next_seq = 0` so the cursor cross-check passes and the
+        // SIGNATURE is the gate under test.
+        //
         // Build a cancel signed under the WRONG key — runtime MUST reject.
         let attacker = ed25519_dalek::SigningKey::from_bytes(&[0xFF; 32]);
         let identity = out034_identity(&outlet_id_owned);
@@ -7826,16 +7895,16 @@ mod tests {
                 context_id: &identity.context_id,
                 outlet_id: &identity.outlet_id,
                 request_id: handle.request_id(),
-                next_seq: 1,
+                next_seq: 0,
                 caveats_binding: &identity.caveats_binding,
             },
         );
         let bad_cancel = scp_protocol::context::outlets::stream::OutletStreamCancel {
             request_id: *handle.request_id(),
-            next_seq: 1,
+            next_seq: 0,
             sig: bad_sig,
         };
-        let result = handle.apply_outlet_cancel(&bad_cancel);
+        let result = handle.apply_outlet_cancel_verbatim(&bad_cancel);
         assert!(
             matches!(
                 result,
@@ -7844,26 +7913,26 @@ mod tests {
             "wrong-key cancel must be rejected as SignatureInvalid, got {result:?}"
         );
 
-        // Now build a valid cancel — runtime MUST accept.
+        // Now build a valid cancel at the live cursor — runtime MUST accept.
         let good_sig = scp_protocol::context::outlets::stream::sign_cancel(
             &signing,
             &scp_protocol::context::outlets::stream::CancelSigningInputs {
                 context_id: &identity.context_id,
                 outlet_id: &identity.outlet_id,
                 request_id: handle.request_id(),
-                next_seq: 1,
+                next_seq: 0,
                 caveats_binding: &identity.caveats_binding,
             },
         );
         let good_cancel = scp_protocol::context::outlets::stream::OutletStreamCancel {
             request_id: *handle.request_id(),
-            next_seq: 1,
+            next_seq: 0,
             sig: good_sig,
         };
-        let result_ok = handle.apply_outlet_cancel(&good_cancel);
+        let result_ok = handle.apply_outlet_cancel_verbatim(&good_cancel);
         assert!(
-            matches!(result_ok, Ok(Some(1))),
-            "well-signed cancel must be accepted, got {result_ok:?}"
+            matches!(result_ok, Ok(Some(0))),
+            "well-signed cancel at the live cursor must be accepted, got {result_ok:?}"
         );
     }
 
@@ -7929,6 +7998,7 @@ mod tests {
             None,
             params,
             StdArc::clone(&admission),
+            out034_pump_semaphore(),
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -7954,47 +8024,62 @@ mod tests {
         // the preimage from the pinned identity + the wire struct)
         // sees a mismatch.
 
+        // The executor sleeps 100ms before emitting, so the live cursor
+        // is `0` throughout this test. The verbatim-apply primitive
+        // cross-checks `next_seq` against that cursor BEFORE verifying the
+        // signature (§5.4.5 round-8), so every signature-tampering case
+        // below signs at `next_seq = 0` to pass the cursor cross-check and
+        // isolate the SIGNATURE as the rejecting gate. The dedicated
+        // next_seq case asserts the cursor cross-check itself.
+
         // Tamper request_id: sign for one rid, send for a different rid.
         let other_rid: [u8; 16] = [0x99; 16];
         let sig_other_rid = make_sig(
             &identity.context_id,
             &identity.outlet_id,
             &other_rid,
-            1,
+            0,
             &identity.caveats_binding,
         );
         let cancel_tampered_rid = scp_protocol::context::outlets::stream::OutletStreamCancel {
             request_id, // <-- the actual stream's request_id, NOT what was signed
-            next_seq: 1,
+            next_seq: 0,
             sig: sig_other_rid,
         };
         assert!(
             matches!(
-                handle.apply_outlet_cancel(&cancel_tampered_rid),
+                handle.apply_outlet_cancel_verbatim(&cancel_tampered_rid),
                 Err(super::super::stream::CancelError::SignatureInvalid)
             ),
             "tampered request_id must be rejected"
         );
 
-        // Tamper next_seq: sign for next=1, send for next=2.
-        let sig_next1 = make_sig(
+        // Tamper next_seq: a cancel whose `next_seq` disagrees with the
+        // live cursor (0) is rejected as the retryable CursorAdvanced —
+        // the verbatim path MUST NOT absorb a forged cursor (§5.4.5
+        // round-8). Sign for next=2 so the signature itself is valid for
+        // the carried struct; the cursor cross-check is the rejecting gate.
+        let sig_next2 = make_sig(
             &identity.context_id,
             &identity.outlet_id,
             &request_id,
-            1,
+            2,
             &identity.caveats_binding,
         );
         let cancel_tampered_next = scp_protocol::context::outlets::stream::OutletStreamCancel {
             request_id,
             next_seq: 2,
-            sig: sig_next1,
+            sig: sig_next2,
         };
         assert!(
             matches!(
-                handle.apply_outlet_cancel(&cancel_tampered_next),
-                Err(super::super::stream::CancelError::SignatureInvalid)
+                handle.apply_outlet_cancel_verbatim(&cancel_tampered_next),
+                Err(super::super::stream::CancelError::CursorAdvanced {
+                    signed: 2,
+                    current: 0
+                })
             ),
-            "tampered next_seq must be rejected"
+            "a next_seq disagreeing with the live cursor must be rejected as CursorAdvanced"
         );
 
         // Tamper context_id: sign for "OTHER", runtime rebuilds with
@@ -8003,17 +8088,17 @@ mod tests {
             "OTHER",
             &identity.outlet_id,
             &request_id,
-            3,
+            0,
             &identity.caveats_binding,
         );
         let cancel_tampered_ctx = scp_protocol::context::outlets::stream::OutletStreamCancel {
             request_id,
-            next_seq: 3,
+            next_seq: 0,
             sig: sig_other_ctx,
         };
         assert!(
             matches!(
-                handle.apply_outlet_cancel(&cancel_tampered_ctx),
+                handle.apply_outlet_cancel_verbatim(&cancel_tampered_ctx),
                 Err(super::super::stream::CancelError::SignatureInvalid)
             ),
             "tampered context_id must be rejected"
@@ -8024,17 +8109,17 @@ mod tests {
             &identity.context_id,
             "OTHER",
             &request_id,
-            4,
+            0,
             &identity.caveats_binding,
         );
         let cancel_tampered_outlet = scp_protocol::context::outlets::stream::OutletStreamCancel {
             request_id,
-            next_seq: 4,
+            next_seq: 0,
             sig: sig_other_outlet,
         };
         assert!(
             matches!(
-                handle.apply_outlet_cancel(&cancel_tampered_outlet),
+                handle.apply_outlet_cancel_verbatim(&cancel_tampered_outlet),
                 Err(super::super::stream::CancelError::SignatureInvalid)
             ),
             "tampered outlet_id must be rejected"
@@ -8047,38 +8132,39 @@ mod tests {
             &identity.context_id,
             &identity.outlet_id,
             &request_id,
-            5,
+            0,
             &other_cb,
         );
         let cancel_tampered_cb = scp_protocol::context::outlets::stream::OutletStreamCancel {
             request_id,
-            next_seq: 5,
+            next_seq: 0,
             sig: sig_other_cb,
         };
         assert!(
             matches!(
-                handle.apply_outlet_cancel(&cancel_tampered_cb),
+                handle.apply_outlet_cancel_verbatim(&cancel_tampered_cb),
                 Err(super::super::stream::CancelError::SignatureInvalid)
             ),
             "tampered caveats_binding must be rejected"
         );
 
-        // Finally, an honest cancel signed correctly is accepted.
+        // Finally, an honest cancel signed correctly at the live cursor
+        // is accepted.
         let good_sig = make_sig(
             &identity.context_id,
             &identity.outlet_id,
             &request_id,
-            6,
+            0,
             &identity.caveats_binding,
         );
         let good = scp_protocol::context::outlets::stream::OutletStreamCancel {
             request_id,
-            next_seq: 6,
+            next_seq: 0,
             sig: good_sig,
         };
         assert!(
-            matches!(handle.apply_outlet_cancel(&good), Ok(Some(6))),
-            "honest cancel accepted at next_seq=6"
+            matches!(handle.apply_outlet_cancel_verbatim(&good), Ok(Some(0))),
+            "honest cancel at the live cursor accepted"
         );
     }
 
@@ -8180,7 +8266,7 @@ mod tests {
             credit_window: 16,
             caveats,
             invoker_pk: signing.verifying_key(),
-            operator_signing_key: StdArc::new(signing),
+            operator_signer: StdArc::new(super::super::signer::InProcessStreamSigner::new(signing)),
             stream_credit_stall_secs: 1,
             stream_cancel_ack_secs: 1,
             stream_ucan_recheck_secs: 60,
@@ -8205,6 +8291,7 @@ mod tests {
             None,
             params,
             StdArc::clone(&admission),
+            out034_pump_semaphore(),
         )
         .await;
         let Err(rejection) = result else {
@@ -8360,7 +8447,7 @@ mod tests {
             credit_window: 16,
             caveats,
             invoker_pk: signing.verifying_key(),
-            operator_signing_key: StdArc::new(signing),
+            operator_signer: StdArc::new(super::super::signer::InProcessStreamSigner::new(signing)),
             stream_credit_stall_secs: 3600,
             stream_cancel_ack_secs: 3600,
             // Drive the recheck arm with a short cadence so virtual-time
@@ -8388,6 +8475,7 @@ mod tests {
             None,
             params,
             StdArc::clone(&admission),
+            out034_pump_semaphore(),
         )
         .await
         .expect("open succeeds with matching binding");
@@ -8435,6 +8523,306 @@ mod tests {
         assert!(
             message.starts_with(&format!("{expected_slug}: ")),
             "terminal message must start with the canonical slug prefix; got {message}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-8 F2 — chunks_billed self-mismatch is emitted (not dropped) with
+    // the manifest-derived count + an AuditAnomaly, and passes append.
+    // -----------------------------------------------------------------------
+
+    /// F2: `build_streaming_outlet_event` carries the
+    /// `AuditAnomaly::ChunksBilledSelfMismatch` when supplied, sets
+    /// `chunks_billed` to the manifest-derived reference, and the resulting
+    /// event passes `verify_chunks_billed` (so the appender accepts it) —
+    /// i.e. the divergence is recorded, not silently dropped.
+    #[tokio::test]
+    async fn f2_chunks_billed_self_mismatch_event_is_emitted_and_appendable() {
+        use super::super::stream::verify_chunks_billed;
+        use scp_protocol::context::outlets::lifecycle::AuditAnomaly;
+        use scp_protocol::context::outlets::stream::{ChunkPayload, OutletStreamChunk};
+
+        // A 2-Data + End manifest → manifest-derived chunks_billed = 2.
+        let request_id: RequestId = [0x40; 16];
+        let mk = |seq: u64, payload: ChunkPayload| OutletStreamChunk {
+            request_id,
+            sequence: seq,
+            payload,
+            sig: [0u8; 64],
+        };
+        let manifest = vec![
+            mk(
+                0,
+                ChunkPayload::Data {
+                    value: serde_json::json!({"i": 0}),
+                },
+            ),
+            mk(
+                1,
+                ChunkPayload::Data {
+                    value: serde_json::json!({"i": 1}),
+                },
+            ),
+            mk(
+                2,
+                ChunkPayload::End {
+                    aggregate: serde_json::Value::Null,
+                    provenance: super::placeholder_data_provenance("ctx"),
+                    execution_time_ms: 1,
+                },
+            ),
+        ];
+        // Pump's running tally claims 5 (the divergence we are recording).
+        let pump_recorded: u32 = 5;
+        let manifest_reference = super::super::dispatch::reference_chunks_billed(&manifest, None);
+        assert_eq!(
+            manifest_reference, 2,
+            "manifest-derived reference = 2 Data chunks"
+        );
+        assert_ne!(
+            pump_recorded, manifest_reference,
+            "this test models a divergence"
+        );
+
+        let event = super::build_streaming_outlet_event(
+            request_id,
+            &"calculator".to_owned(),
+            &DID::from("did:dht:z6MkInvoker"),
+            "ab".to_owned(),
+            7,
+            &manifest,
+            Some(AuditAnomaly::ChunksBilledSelfMismatch {
+                pump_recorded,
+                manifest_reference,
+            }),
+        );
+
+        // The event IS emitted with the manifest-derived count + the anomaly.
+        assert_eq!(
+            event.chunks_billed, manifest_reference,
+            "chunks_billed = manifest reference (appender-accepted value)"
+        );
+        assert_eq!(
+            event.audit_anomaly,
+            Some(AuditAnomaly::ChunksBilledSelfMismatch {
+                pump_recorded,
+                manifest_reference,
+            }),
+            "the divergence is recorded on the event, not dropped"
+        );
+        // It passes the §5.4.5 wire-rejection rule the appender applies.
+        verify_chunks_billed(&manifest, event.chunks_billed, None)
+            .expect("manifest-derived chunks_billed passes append-time verification");
+    }
+
+    // -----------------------------------------------------------------------
+    // Round-8 F5 — node-level concurrent-pump ceiling.
+    // -----------------------------------------------------------------------
+
+    /// F5: with a node-level ceiling of N, the (N+1)th concurrent open is
+    /// hard-rejected with `StreamCapExhausted`; after a held stream
+    /// completes (its pump exits and releases the permit), a new open
+    /// succeeds.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // narrative cap-exhaust/recover lifecycle
+    async fn f5_node_level_pump_ceiling_rejects_then_recovers() {
+        // All executors are declared up-front (items before statements).
+        // An executor that holds the pump open until told to finish via a
+        // shared notify, so we can deterministically keep a permit occupied.
+        struct HeldExecutor {
+            release: StdArc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for HeldExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                let _ = tx
+                    .send(ChunkPayload::Data {
+                        value: serde_json::json!({"x": 1}),
+                    })
+                    .await;
+                self.release.notified().await;
+                let _ = tx
+                    .send(ChunkPayload::End {
+                        aggregate: serde_json::Value::Null,
+                        provenance: super::placeholder_data_provenance("ctx"),
+                        execution_time_ms: 1,
+                    })
+                    .await;
+                Ok(())
+            }
+        }
+        // A quick executor that emits only a terminal End and exits, so its
+        // pump returns promptly and releases the permit.
+        struct QuickEndExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for QuickEndExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                let _ = tx
+                    .send(ChunkPayload::End {
+                        aggregate: serde_json::Value::Null,
+                        provenance: super::placeholder_data_provenance("ctx"),
+                        execution_time_ms: 1,
+                    })
+                    .await;
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+
+        // Ceiling of exactly 1 pump.
+        let semaphore = StdArc::new(tokio::sync::Semaphore::new(1));
+
+        let release_a = StdArc::new(tokio::sync::Notify::new());
+        let admission_a = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+        let params_a = out034_open_params(
+            &outlet_id_owned,
+            creator_did,
+            scp_protocol::economy::types::Amount::new(0),
+            scp_protocol::economy::types::Amount::new(0),
+            Some(8),
+            32,
+            ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]).verifying_key(),
+        );
+        let executor_a: StdArc<dyn super::OutletExecutor> = StdArc::new(HeldExecutor {
+            release: StdArc::clone(&release_a),
+        });
+        let mut handle_a = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor_a,
+            None,
+            None,
+            None,
+            params_a,
+            StdArc::clone(&admission_a),
+            StdArc::clone(&semaphore),
+        )
+        .await
+        .expect("first open acquires the only permit");
+        let mut rx_a = handle_a.receiver().expect("receiver A");
+        // Drain the first Data chunk so the pump is live and holding the permit.
+        let _ = rx_a.recv().await.expect("A first data chunk");
+
+        // Second concurrent open MUST be rejected — the permit is held.
+        let admission_b = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+        let params_b = out034_open_params(
+            &outlet_id_owned,
+            creator_did,
+            scp_protocol::economy::types::Amount::new(0),
+            scp_protocol::economy::types::Amount::new(0),
+            Some(8),
+            32,
+            ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]).verifying_key(),
+        );
+        let executor_b: StdArc<dyn super::OutletExecutor> = StdArc::new(QuickEndExecutor);
+        let rejected = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor_b,
+            None,
+            None,
+            None,
+            params_b,
+            StdArc::clone(&admission_b),
+            StdArc::clone(&semaphore),
+        )
+        .await;
+        // `StreamSessionHandle` is not Debug, so reduce to is_ok + the err
+        // for the assertion message.
+        let rejected_is_ok = rejected.is_ok();
+        assert!(
+            matches!(
+                rejected,
+                Err(super::super::dispatch::OpenStreamRejection::StreamCapExhausted)
+            ),
+            "(N+1)th open must be rejected with StreamCapExhausted; was_ok={rejected_is_ok}, \
+             err={:?}",
+            rejected.as_ref().err()
+        );
+
+        // Release stream A; drain to completion so its pump exits and the
+        // permit is freed.
+        release_a.notify_one();
+        while rx_a.recv().await.is_some() {}
+        drop(handle_a);
+        // Give the pump task a moment to settle and drop its permit.
+        for _ in 0..100u32 {
+            if semaphore.available_permits() >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            semaphore.available_permits() >= 1,
+            "permit must be released after the held stream's pump exits"
+        );
+
+        // A fresh open now succeeds (permit available again).
+        let admission_c = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+        let params_c = out034_open_params(
+            &outlet_id_owned,
+            creator_did,
+            scp_protocol::economy::types::Amount::new(0),
+            scp_protocol::economy::types::Amount::new(0),
+            Some(8),
+            32,
+            ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]).verifying_key(),
+        );
+        let executor_c: StdArc<dyn super::OutletExecutor> = StdArc::new(QuickEndExecutor);
+        let handle_c = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor_c,
+            None,
+            None,
+            None,
+            params_c,
+            StdArc::clone(&admission_c),
+            StdArc::clone(&semaphore),
+        )
+        .await;
+        // StreamSessionHandle does not implement Debug; map the error to
+        // its rejection for an informative assertion message.
+        assert!(
+            handle_c.is_ok(),
+            "after the held stream completes, a new open succeeds; rejection: {:?}",
+            handle_c.as_ref().err()
         );
     }
 }

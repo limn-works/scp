@@ -365,6 +365,58 @@ pub fn validate_outlet_id(outlet_id: &str) -> Result<(), ValidationError> {
 }
 
 // ---------------------------------------------------------------------------
+// Streaming request_id (hex) validation
+// ---------------------------------------------------------------------------
+
+/// Length of a streaming `request_id` rendered as lowercase hex: the
+/// §5.4.5 `request_id` is a 16-byte `UUIDv7`, so its hex form is exactly
+/// 32 characters.
+pub const REQUEST_ID_HEX_LEN: usize = 32;
+
+/// Validates a streaming `request_id` in its lowercase-hex wire form (§5.4.5).
+///
+/// The `request_id` is a 16-byte `UUIDv7`; bridges that expose the streaming
+/// control plane (`outlet_stream_grant_credit`, `outlet_stream_cancel`,
+/// `outlet_stream_terminate`) carry it across the FFI boundary as a
+/// 32-character lowercase hex string, then decode it to `[u8; 16]` before
+/// handing it to the runtime.
+///
+/// Validation enforces, in order:
+/// - exactly [`REQUEST_ID_HEX_LEN`] (32) characters — so the decoded byte
+///   width is exactly 16, never short/long,
+/// - every character is a lowercase hex digit (`[0-9a-f]`) — uppercase is
+///   rejected so the wire form is canonical and a single byte sequence
+///   maps to a single string (no case-folding ambiguity at the bridge),
+/// - no control characters (implied by the hex-class check, but checked
+///   explicitly first for a clear, actionable message consistent with the
+///   other validators).
+///
+/// # Errors
+///
+/// Returns [`ValidationError`] if the string is not exactly 32 characters,
+/// contains a control character, or contains any character outside
+/// `[0-9a-f]` (including uppercase hex, whitespace, or punctuation).
+pub fn validate_request_id_hex(s: &str) -> Result<(), ValidationError> {
+    reject_control_chars(s, "request_id")?;
+    if s.len() != REQUEST_ID_HEX_LEN {
+        return Err(ValidationError::new(format!(
+            "request_id must be exactly {REQUEST_ID_HEX_LEN} lowercase hex characters \
+             (16-byte UUIDv7); got {len} characters",
+            len = s.len()
+        )));
+    }
+    if !s
+        .bytes()
+        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(ValidationError::new(format!(
+            "request_id contains invalid characters: expected lowercase hex [0-9a-f], got {s:?}"
+        )));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Capability URI validation
 // ---------------------------------------------------------------------------
 
@@ -1549,5 +1601,60 @@ mod tests {
         };
         let err = validate_governance_action_strings(&action).unwrap_err();
         assert!(err.message.contains("HTML-special character"));
+    }
+
+    // -- request_id hex (§5.4.5 streaming control plane) --
+
+    #[test]
+    fn request_id_hex_accepts_32_lowercase_hex() {
+        // 16-byte UUIDv7 rendered lowercase hex == 32 chars.
+        assert!(validate_request_id_hex(&"0".repeat(REQUEST_ID_HEX_LEN)).is_ok());
+        assert!(validate_request_id_hex("0123456789abcdef0123456789abcdef").is_ok());
+        // every lowercase hex digit appears.
+        assert!(validate_request_id_hex("0123456789abcdefabcdef0123456789").is_ok());
+    }
+
+    #[test]
+    fn request_id_hex_rejects_uppercase() {
+        // Canonical wire form is lowercase; uppercase hex must fail so a
+        // byte sequence maps to a single string.
+        let err = validate_request_id_hex("0123456789ABCDEF0123456789abcdef").unwrap_err();
+        assert!(err.message.contains("invalid characters"));
+    }
+
+    #[test]
+    fn request_id_hex_rejects_31_chars() {
+        let err = validate_request_id_hex(&"a".repeat(31)).unwrap_err();
+        assert!(err.message.contains("exactly 32"));
+    }
+
+    #[test]
+    fn request_id_hex_rejects_33_chars() {
+        let err = validate_request_id_hex(&"a".repeat(33)).unwrap_err();
+        assert!(err.message.contains("exactly 32"));
+    }
+
+    #[test]
+    fn request_id_hex_rejects_non_hex() {
+        // 'g' is outside [0-9a-f]; right length, wrong alphabet.
+        let mut s = "a".repeat(31);
+        s.push('g');
+        let err = validate_request_id_hex(&s).unwrap_err();
+        assert!(err.message.contains("invalid characters"));
+    }
+
+    #[test]
+    fn request_id_hex_rejects_control_char() {
+        // 32 chars including a NUL — control-char check fires first.
+        let mut s = "a".repeat(31);
+        s.push('\0');
+        let err = validate_request_id_hex(&s).unwrap_err();
+        assert!(err.message.contains("control character"));
+    }
+
+    #[test]
+    fn request_id_hex_rejects_empty() {
+        let err = validate_request_id_hex("").unwrap_err();
+        assert!(err.message.contains("exactly 32"));
     }
 }

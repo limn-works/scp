@@ -23,13 +23,13 @@
 //! | Code | Class | Default slug | Slugs covered (§5.4.4 + round-4/5/6) |
 //! |------|-------|--------------|--------------------------------------|
 //! | [`CODE_PROTOCOL_VIOLATION`] (`SCP-TOOL-6100`) | `Protocol` | `protocol.violation` | `query-cost-violation`, `query-violation`, `kind-mismatch`, `amplification-violation`, `structural-floor-violation`, `schema-immutability-violation`, `query-misdeclaration`, `protocol.catalog-rotation-too-frequent`, `protocol.stream-already-open`, `protocol.violation` |
-//! | [`CODE_PROTOCOL_SESSION`] (`SCP-TOOL-6101`) | `Protocol` | `protocol.session-id-conflict` | `protocol.session-id-conflict`, `protocol.malformed-session-id`, `protocol.unknown-session` |
+//! | [`CODE_PROTOCOL_SESSION`] (`SCP-TOOL-6101`) | `Protocol` | `protocol.session-id-conflict` | `protocol.session-id-conflict`, `protocol.malformed-session-id`, `protocol.unknown-session`, `protocol.context-closed-mid-stream` |
 //! | [`CODE_AUTHORIZATION_DENIED`] (`SCP-TOOL-6110`) | `Authorization` | `authorization.denied` | `authorization.denied` (oracle-collapse target), `authorization.expired`, `authorization.revoked`, `authorization.missing`, `authorization.attenuation-violation`, `authorization.mint-limit-exceeded`, `authorization.time-box-violation`, `authorization.rate-exceeded`, `authorization.cumulative-exceeded`, `authorization.adapter-not-allowed`, `authorization.revoked-mid-stream`, `authorization.credit-stream-mismatch`, `authorization.ikm-signature-invalid`, `authorization.credit-replay` |
 //! | [`CODE_AUTHORIZATION_ATTENUATION`] (`SCP-TOOL-6114`) | `Authorization` | `attenuation.mask-width-violation` | `attenuation.caveat-mint-limit-exceeded`, `attenuation.hours-of-day-high-bits-set`, `attenuation.days-of-week-high-bit-set`, `attenuation.origin-kind-stem-mismatch`, `attenuation.origin-kind-mixed-stem-root`, `attenuation.origin-kind-unspecified`, `attenuation.mask-width-violation` |
 //! | [`CODE_AUTHORIZATION_SALT_ROTATION`] (`SCP-TOOL-6115`) | `Authorization` | `authorization.salt-rotation-unjustified` | `authorization.salt-rotation-unjustified` |
 //! | [`CODE_INPUT_VIOLATION`] (`SCP-TOOL-6120`) | `Input` | `input.schema-violation` | `input.schema-violation`, `input.too-large`, `input.not-serializable`, `input.estimate-exceeds-bound` |
 //! | [`CODE_EXECUTION_FAULT`] (`SCP-TOOL-6130`) | `Execution` | `execution.handler-panic` | `execution.handler-panic`, `execution.timeout`, `execution.non-deterministic` |
-//! | [`CODE_EXECUTION_CREDIT`] (`SCP-TOOL-6131`) | `Execution` | `execution.credit-exhausted` | `execution.credit-exhausted`, `execution.stream-gap` |
+//! | [`CODE_EXECUTION_CREDIT`] (`SCP-TOOL-6131`) | `Execution` | `execution.credit-exhausted` | `execution.credit-exhausted`, `execution.stream-gap`, `execution.stream-cap-exhausted` |
 //! | [`CODE_EXECUTION_CREDIT_STALL`] (`SCP-TOOL-6133`) | `Execution` | `execution.credit-stall` | `execution.credit-stall` |
 //! | [`CODE_EXECUTION_CANCEL_ACK_TIMEOUT`] (`SCP-TOOL-6135`) | `Execution` | `execution.cancel-ack-timeout` | `execution.cancel-ack-timeout` |
 //! | [`CODE_OUTPUT_VIOLATION`] (`SCP-TOOL-6140`) | `Output` | `output.schema-violation` | `output.schema-violation`, `output.too-large`, `output.not-serializable` |
@@ -83,8 +83,10 @@ pub const CODE_PROTOCOL_VIOLATION: &str = "SCP-TOOL-6100"; // SCP-CODE-OK: §5.4
 /// `SCP-TOOL-6101` — Protocol-class session-id format and uniqueness.
 ///
 /// Default slug `protocol.session-id-conflict`. Slugs:
-/// `protocol.session-id-conflict`, `protocol.malformed-session-id`.
-/// See §6.2.1.1(a) (round-5 `UUIDv7`) and §5.4.4.
+/// `protocol.session-id-conflict`, `protocol.malformed-session-id`,
+/// `protocol.unknown-session`, `protocol.context-closed-mid-stream`
+/// (round-8 context teardown mid-stream). See §6.2.1.1(a) (round-5
+/// `UUIDv7`) and §5.4.4.
 pub const CODE_PROTOCOL_SESSION: &str = "SCP-TOOL-6101"; // SCP-CODE-OK: §5.4.4 registry constant (Protocol class)
 
 /// `SCP-TOOL-6110` — Authorization-class denial (UCAN, caveat, capability).
@@ -136,7 +138,8 @@ pub const CODE_EXECUTION_FAULT: &str = "SCP-TOOL-6130"; // SCP-CODE-OK: §5.4.4 
 ///
 /// Distinct from the catch-all execution fault. Default slug
 /// `execution.credit-exhausted`. Slugs: `execution.credit-exhausted`,
-/// `execution.stream-gap`. See §5.4.4 + §5.4.5 streaming.
+/// `execution.stream-gap`, `execution.stream-cap-exhausted` (round-8
+/// node-level concurrent-pump ceiling). See §5.4.4 + §5.4.5 streaming.
 pub const CODE_EXECUTION_CREDIT: &str = "SCP-TOOL-6131"; // SCP-CODE-OK: §5.4.4 registry constant (Execution credit class)
 
 /// `SCP-TOOL-6133` — Execution-class credit-stall (round-4 split).
@@ -251,6 +254,14 @@ pub const SLUG_PROTOCOL_MALFORMED_SESSION_ID: &str = "protocol.malformed-session
 /// Slug `protocol.unknown-session` — §6.2.1.1(a) `OutletStreamOpen.session_id`
 /// references an unknown or expired session.
 pub const SLUG_PROTOCOL_UNKNOWN_SESSION: &str = "protocol.unknown-session";
+/// Slug `protocol.context-closed-mid-stream` — round-8 context teardown.
+///
+/// Context evict/leave race during an active stream. Shares
+/// [`CODE_PROTOCOL_SESSION`] (`SCP-TOOL-6101`) with the other
+/// Protocol-session conditions; carries the Protocol class (NOT
+/// Authorization) so a context teardown is never recorded as a UCAN
+/// revocation. See §5.4.5 "Context teardown vs. revocation (round 8)".
+pub const SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM: &str = "protocol.context-closed-mid-stream";
 
 // --- Authorization class --------------------------------------------------
 
@@ -333,6 +344,15 @@ pub const SLUG_EXECUTION_CREDIT_EXHAUSTED: &str = "execution.credit-exhausted";
 pub const SLUG_EXECUTION_CREDIT_STALL: &str = "execution.credit-stall";
 /// Slug `execution.stream-gap`.
 pub const SLUG_EXECUTION_STREAM_GAP: &str = "execution.stream-gap";
+/// Slug `execution.stream-cap-exhausted` — round-8 pump ceiling.
+///
+/// Node-level concurrent-pump ceiling. Shares [`CODE_EXECUTION_CREDIT`]
+/// (`SCP-TOOL-6131`) with the other Execution-class resource-exhaustion
+/// conditions; emitted at `OutletStreamOpen` acceptance when the
+/// per-instance pump ceiling (`max_concurrent_outlet_stream_pumps`) is
+/// already saturated. See §5.4.5 "Node-level concurrent-pump ceiling
+/// (round 8)".
+pub const SLUG_EXECUTION_STREAM_CAP_EXHAUSTED: &str = "execution.stream-cap-exhausted";
 /// Slug `execution.cancel-ack-timeout` — round-4 cancel-ack timer.
 pub const SLUG_EXECUTION_CANCEL_ACK_TIMEOUT: &str = "execution.cancel-ack-timeout";
 
@@ -573,7 +593,8 @@ pub fn slug_to_class(slug: &str) -> Option<OutletErrorClass> {
         | SLUG_PROTOCOL_STREAM_ALREADY_OPEN
         | SLUG_PROTOCOL_SESSION_ID_CONFLICT
         | SLUG_PROTOCOL_MALFORMED_SESSION_ID
-        | SLUG_PROTOCOL_UNKNOWN_SESSION => Some(OutletErrorClass::Protocol),
+        | SLUG_PROTOCOL_UNKNOWN_SESSION
+        | SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM => Some(OutletErrorClass::Protocol),
 
         // Authorization class — code 6110 (general denial) AND code 6114
         // (attenuation sub-class) AND code 6115 (salt-rotation) all map to
@@ -616,6 +637,7 @@ pub fn slug_to_class(slug: &str) -> Option<OutletErrorClass> {
         | SLUG_EXECUTION_CREDIT_EXHAUSTED
         | SLUG_EXECUTION_CREDIT_STALL
         | SLUG_EXECUTION_STREAM_GAP
+        | SLUG_EXECUTION_STREAM_CAP_EXHAUSTED
         | SLUG_EXECUTION_CANCEL_ACK_TIMEOUT => Some(OutletErrorClass::Execution),
 
         // Output class
@@ -881,6 +903,8 @@ mod tests {
             "attenuation.origin-kind-stem-mismatch",
             "attenuation.origin-kind-unspecified",
             "attenuation.mask-width-violation",
+            "execution.stream-cap-exhausted",
+            "protocol.context-closed-mid-stream",
         ];
         for slug in positives {
             validate_slug(slug).unwrap_or_else(|e| panic!("expected valid slug {slug}: {e:?}"));
@@ -1050,6 +1074,51 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Round-8 ACs — new slugs share existing code bands (no new codes).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn round_8_slugs_resolve_to_correct_class_and_code() {
+        // (slug, expected_class, expected_code). Both slugs are
+        // sound-by-addition refinements that share an existing code band.
+        let cases: [(&str, OutletErrorClass, &str); 2] = [
+            (
+                SLUG_EXECUTION_STREAM_CAP_EXHAUSTED,
+                OutletErrorClass::Execution,
+                CODE_EXECUTION_CREDIT,
+            ),
+            (
+                SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+                OutletErrorClass::Protocol,
+                CODE_PROTOCOL_SESSION,
+            ),
+        ];
+        for (slug, expected_class, expected_code) in cases {
+            assert_eq!(
+                slug_to_class(slug),
+                Some(expected_class),
+                "round-8 slug {slug} did not map to {expected_class:?}"
+            );
+            assert_eq!(
+                error_code_to_class(expected_code),
+                Some(expected_class),
+                "round-8 code {expected_code} did not map to {expected_class:?}"
+            );
+            // Both slugs pass the §5.4.4 regex.
+            validate_slug(slug)
+                .unwrap_or_else(|e| panic!("round-8 slug {slug} fails regex: {e:?}"));
+        }
+        // The two new slugs explicitly do NOT collapse onto the
+        // Authorization-class `authorization.revoked-mid-stream` band —
+        // teardown is Protocol, cap-exhaustion is Execution.
+        assert_ne!(
+            slug_to_class(SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM),
+            slug_to_class(SLUG_AUTHORIZATION_REVOKED_MID_STREAM),
+            "context-closed-mid-stream must NOT share the Authorization class with revoked-mid-stream"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // Slug count — the §5.4.4 round-5 taxonomy registers ≥ 40 slugs.
     // -----------------------------------------------------------------------
 
@@ -1076,6 +1145,7 @@ mod tests {
             SLUG_PROTOCOL_SESSION_ID_CONFLICT,
             SLUG_PROTOCOL_MALFORMED_SESSION_ID,
             SLUG_PROTOCOL_UNKNOWN_SESSION,
+            SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
             // Authorization (15)
             SLUG_AUTHORIZATION_DENIED,
             SLUG_AUTHORIZATION_EXPIRED,
@@ -1112,6 +1182,7 @@ mod tests {
             SLUG_EXECUTION_CREDIT_EXHAUSTED,
             SLUG_EXECUTION_CREDIT_STALL,
             SLUG_EXECUTION_STREAM_GAP,
+            SLUG_EXECUTION_STREAM_CAP_EXHAUSTED,
             SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
             // Output (3)
             SLUG_OUTPUT_SCHEMA_VIOLATION,

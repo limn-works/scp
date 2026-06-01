@@ -1734,6 +1734,10 @@ impl ContextManager {
             invoked_event_sink,
             params,
             admission,
+            // §5.4.5 round-8 (F5): the per-instance node-level pump
+            // ceiling. `open_stream_session` acquires a permit after its
+            // per-context gates pass and moves it into the pump task.
+            std::sync::Arc::clone(&self.outlet_stream_pump_semaphore),
         )
         .await
     }
@@ -3862,6 +3866,9 @@ fn build_amplification_rejection_event(
         stream_terminal_status: scp_protocol::context::outlets::stream::StreamTerminalStatus::Error(
             scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_VIOLATION.to_owned(),
         ),
+        // Synthesized structural-rejection event — no stream pump ran, so
+        // there is no pump-vs-manifest divergence.
+        audit_anomaly: None,
     }
 }
 
@@ -5491,6 +5498,11 @@ fn build_completion(
         chunks_billed,
         stream_manifest_hash: manifest,
         stream_terminal_status: stream_terminal_status.clone(),
+        // Cross-context completion event mirrors the originating stream's
+        // recorded counts; the F2 self-mismatch detection (if any) is
+        // attached to the source-side dispatch pump's event, not these
+        // mirrored cross-context records.
+        audit_anomaly: None,
     };
     let target_event = OutletInvokedEvent {
         request_id: request_id_str,
@@ -5505,6 +5517,7 @@ fn build_completion(
         chunks_billed,
         stream_manifest_hash: manifest,
         stream_terminal_status,
+        audit_anomaly: None,
     };
     CrossContextStreamCompletion {
         source_event,

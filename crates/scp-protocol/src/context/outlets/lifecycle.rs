@@ -171,6 +171,43 @@ pub struct OutletCancel {
 // OutletInvokedEvent (event log integration)
 // ---------------------------------------------------------------------------
 
+/// Audit anomaly on an [`OutletInvokedEvent`] (§5.4.5 round-8).
+///
+/// Attached when the runtime detects an internal self-inconsistency it
+/// nonetheless records rather than drops (the chunks-billed self-mismatch
+/// handling).
+///
+/// Closed set. The only current member records a divergence between the
+/// pump's own running `chunks_billed` tally and the manifest-derivable
+/// reference. Per §5.4.5 the *recorded* `chunks_billed` value MUST equal
+/// the manifest reference (the appender rejects a mismatch at log-insert
+/// time); rather than drop the event when the pump's running tally
+/// diverges, the runtime emits the event with the **manifest-derived**
+/// (appender-accepted) value AND this anomaly marker so the divergence is
+/// durably attributable in the audit log instead of silently discarded.
+///
+/// Forward-compatible: this enum is additive on the event and carries
+/// `#[serde(skip_serializing_if)]` at the field, so an older reader that
+/// does not understand a future variant still parses the surrounding
+/// event (the field is `Option`, defaulting to `None`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuditAnomaly {
+    /// The dispatch pump's running `chunks_billed` tally
+    /// (`pump_recorded`) diverged from the value derivable from the
+    /// committed chunk manifest (`manifest_reference`). The event is
+    /// emitted with `chunks_billed == manifest_reference` (so it passes
+    /// the §5.4.5 wire-rejection rule at log-insert) and this anomaly
+    /// records the divergence for audit.
+    ChunksBilledSelfMismatch {
+        /// The pump's own running tally at settlement (the value that
+        /// would have been recorded before round-8).
+        pump_recorded: u32,
+        /// The manifest-derived reference count actually recorded in
+        /// `chunks_billed` (the appender-accepted value).
+        manifest_reference: u32,
+    },
+}
+
 /// Event payload for a `OutletInvoked` event in the context event log.
 ///
 /// Records outlet invocation metadata without full input/output (which may
@@ -260,6 +297,14 @@ pub struct OutletInvokedEvent {
     /// error-with-code (§5.4.5 event-log shape).
     #[serde(default = "default_stream_terminal_status")]
     pub stream_terminal_status: StreamTerminalStatus,
+    /// Audit anomaly attached when the runtime recorded the event with
+    /// the manifest-derived `chunks_billed` after detecting a divergence
+    /// from the pump's running tally (§5.4.5 round-8). `None` on the
+    /// happy path. Additive + `skip_serializing_if` so older readers
+    /// parse the event unchanged and the wire stays forward-compatible
+    /// (no `deny_unknown_fields` on this event).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audit_anomaly: Option<AuditAnomaly>,
 }
 
 /// Default for [`OutletInvokedEvent::stream_terminal_status`]; required
@@ -458,6 +503,7 @@ mod tests {
             chunks_billed: 1,
             stream_manifest_hash: [0xABu8; 32],
             stream_terminal_status: StreamTerminalStatus::Ok,
+            audit_anomaly: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: OutletInvokedEvent = serde_json::from_str(&json).unwrap();
@@ -471,6 +517,62 @@ mod tests {
             deserialized.stream_terminal_status,
             StreamTerminalStatus::Ok
         );
+        // Happy path: anomaly absent, and absent from the serialized
+        // form (skip_serializing_if) so the wire is unchanged.
+        assert_eq!(deserialized.audit_anomaly, None);
+        assert!(
+            !json.contains("audit_anomaly"),
+            "audit_anomaly: None must be omitted from the wire form: {json}"
+        );
+    }
+
+    /// Round-8: an event carrying a `ChunksBilledSelfMismatch` anomaly
+    /// round-trips, and the field is forward-compatible — an older
+    /// reader (modeled by a value missing the field) defaults to `None`
+    /// rather than failing (no `deny_unknown_fields` on this event).
+    #[test]
+    fn outlet_invoked_event_audit_anomaly_roundtrips_and_is_forward_compatible() {
+        let event = OutletInvokedEvent {
+            request_id: "req-anom".to_owned(),
+            outlet_id: "tool-anom".to_owned(),
+            invoker_did: "did:dht:z6MkInvoker".into(),
+            status: OutletStatus::Success,
+            execution_time_ms: 7,
+            input_hash: "ab".to_owned(),
+            output_hash: None,
+            cost: None,
+            stream_chunk_count: 3,
+            chunks_billed: 2,
+            stream_manifest_hash: [0u8; 32],
+            stream_terminal_status: StreamTerminalStatus::Ok,
+            audit_anomaly: Some(AuditAnomaly::ChunksBilledSelfMismatch {
+                pump_recorded: 5,
+                manifest_reference: 2,
+            }),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("audit_anomaly"));
+        let parsed: OutletInvokedEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            parsed.audit_anomaly,
+            Some(AuditAnomaly::ChunksBilledSelfMismatch {
+                pump_recorded: 5,
+                manifest_reference: 2,
+            })
+        );
+        // Forward-compat: an event-shaped object with extra unknown keys
+        // and no audit_anomaly key still parses (additive field).
+        let with_unknown = serde_json::json!({
+            "request_id": "req-x",
+            "outlet_id": "tool-x",
+            "invoker_did": "did:dht:z6MkInvoker",
+            "status": "Success",
+            "execution_time_ms": 1,
+            "input_hash": "00",
+            "future_unknown_field": {"nested": true},
+        });
+        let parsed2: OutletInvokedEvent = serde_json::from_value(with_unknown).unwrap();
+        assert_eq!(parsed2.audit_anomaly, None);
     }
 
     /// Legacy events serialized BEFORE SCP-OUT-035 omit the four new
