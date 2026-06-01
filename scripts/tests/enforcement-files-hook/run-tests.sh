@@ -60,6 +60,10 @@ check() {
 
 bash_payload() { printf '{"tool_name":"Bash","tool_input":{"command":%s}}' "$(json_str "$1")"; }
 edit_payload() { printf '{"tool_name":"%s","tool_input":{"file_path":%s}}' "$1" "$(json_str "$2")"; }
+# MultiEdit carries no top-level file_path — the hook extracts edits[].file_path.
+multiedit_payload() {
+    printf '{"tool_name":"MultiEdit","tool_input":{"edits":[{"file_path":%s}]}}' "$(json_str "$1")"
+}
 # Minimal JSON string encoder (handles the quotes/backslashes our payloads use).
 json_str() { printf '%s' "$1" | python3.12 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
 
@@ -99,6 +103,8 @@ check 2 "Edit protected"        "$(edit_payload Edit "$PROTECTED_ABS")"
 check 2 "Write protected hook"  "$(edit_payload Write "$PROTECTED_HOOK_ABS")"
 check 0 "Edit non-protected"    "$(edit_payload Edit "$UNPROTECTED_ABS")"
 check 0 "Edit fixture copy"     "$(edit_payload Edit "$FIXTURE_ABS")"
+check 2 "MultiEdit protected"   "$(multiedit_payload "$PROTECTED_ABS")"
+check 0 "MultiEdit non-protected" "$(multiedit_payload "$UNPROTECTED_ABS")"
 
 echo "== Fail-closed =="
 check 2 "malformed JSON"        'not json {{{'
