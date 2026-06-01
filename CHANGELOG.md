@@ -27,14 +27,16 @@ Kotlin; Python continues to expose module-level functions per
   `every_alias_resolves_to_a_real_fn_or_exemption` test in
   `crates/scp-testing/tests/integration/ffi_conformance.rs` were
   tightened. New fixture `bad-alias-undecorated-fn/`.
-- **Empty arrays for exempt bridges (#27).** 25 placeholder cells in
-  `scripts/bridge-aliases.json` (24 wasm + 1 napi) replaced with `[]`.
-  New invariant `every_bridge_alias_array_is_non_empty_or_exempt`.
+- **Empty arrays for exempt bridges (#27).** 24 placeholder cells in
+  `scripts/bridge-aliases.json` (all wasm) replaced with `[]`. New invariant
+  `every_bridge_alias_array_is_non_empty_or_exempt`. (A 25th placeholder, the
+  napi `identity_migrate` cell, was instead wired to its real export — see the
+  exemption durable-provenance bullet below.)
 - **ADR-048 §1 pure-helpers mechanization (#28).** New syn-based gate
   `pure_helpers_stay_free_fns_at_ffi_layer` flags methods with a `self`
   receiver that never use it inside FFI-decorated impl blocks. Macro
   bodies are walked via `proc-macro2` so `format!("{}", self.field)` is
-  correctly recognized as bound. 22 pre-existing violations cleaned up:
+  correctly recognized as bound. 19 pre-existing violations cleaned up:
   - 1 NAPI: `NapiScp::check_scoped_capability` → module-level free fn.
   - 8 PyO3: `scpid_challenge`, `identity_verify_device_attestation`,
     `verify_identity_link_attestation`, and 5 provenance helpers moved
@@ -47,11 +49,15 @@ Kotlin; Python continues to expose module-level functions per
     `verify_participation_requirements` moved from
     `#[uniffi::export] impl Scp { ... }` to free fns.
 - **ADR-048 §7b cross-bridge semantic divergence registry (#29).**
-  Documents canonical operations where bridges diverge in semantics
-  despite sharing the same name (`identity_rotate_key` — WASM DID
-  migration vs native active-key rotation; `identity_create_link_attestation` —
-  resolved 2026-04-26 by PR #1719). Inline `// SEMANTIC DIVERGENCE`
-  comments at the WASM call sites.
+  Documents canonical operations where bridge implementations diverged in
+  semantics despite sharing the same name, and the evidence required to retire
+  an entry. Both current entries are RESOLVED (retained one release cycle to
+  flag the behavioral shift to consumers): `identity_create_link_attestation`
+  (WASM aligned to `#active` signing per spec §3.5.2) and `identity_rotate_key`
+  (WASM aligned to native active-key rotation by a later upstream change;
+  DID-migration semantics now live in WASM's separate `identity_migrate`
+  export). A single inline `// SEMANTIC DIVERGENCE` comment remains at the WASM
+  attestation call site for its retention window.
 - **Exemption durable-provenance gate.** New invariant
   `every_exemption_reason_cites_durable_provenance` requires every
   per-bridge exemption in `scripts/bridge-aliases.json` to justify itself

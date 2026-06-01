@@ -224,7 +224,7 @@ The registry is intentionally narrow: it lists operations where the *behavior* d
 
 - **`identity_create_link_attestation`.** RESOLVED 2026-04-26 by PR [#1719](https://github.com/limn-works/scp/pull/1719). WASM previously signed link attestations with the identity key (`#0`) per a fabricated comment that did not match spec §3.5.2's wire-format requirement that issuer signatures use the `#active` or `#agent` key. WASM was aligned to `#active` so the canonical signing-key choice matches every other bridge. Note retained for one release cycle to flag the semantic shift to consumers verifying signatures with the old key — after one release the entry should be removed.
 
-When a cross-bridge audit, symmetry script, or capability-matrix consistency check flags a cross-bridge mismatch involving an operation listed here, this registry is the reference. Reading the inline `// SEMANTIC DIVERGENCE: see ADR-048 §7b cross-bridge semantic divergence registry` comments in WASM source is the in-source path to this section.
+When a cross-bridge audit, symmetry script, or capability-matrix consistency check flags a cross-bridge mismatch involving an operation listed here, this registry is the reference. Where a resolved entry retains an inline `// SEMANTIC DIVERGENCE: see ADR-048 §7b cross-bridge semantic divergence registry` comment in WASM source during its one-release retention window, reading that comment is the in-source path to this section.
 
 ## Consequences
 

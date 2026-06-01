@@ -641,7 +641,7 @@ fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyErro
 ///
 /// Raises `IdentityError` if base64 decoding fails.
 ///
-/// See §9.3, issue #362.
+/// See §9.3.
 #[cfg(feature = "allow_in_memory_custody")]
 #[pyfunction]
 pub fn identity_verify_device_attestation(
@@ -1593,7 +1593,7 @@ impl crate::scp::PyScp {
     /// Raises `IdentityError` if the identity is not in the registry or
     /// attestation fails.
     ///
-    /// See §9.3, issue #362.
+    /// See §9.3.
     #[cfg(feature = "allow_in_memory_custody")]
     pub fn identity_attest_device(&self, py: Python<'_>, identity_did: &str) -> PyResult<String> {
         let bi_arc = Arc::clone(&self.inner);
