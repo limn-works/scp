@@ -828,4 +828,5 @@ mod context_error_code_tests {
             ScpPyError::ContextError { code, .. } => assert_eq!(code, codes::CTX_2094),
             other => panic!("expected ContextError variant, got {other:?}"),
         }
+    }
 }

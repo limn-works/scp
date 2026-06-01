@@ -1778,7 +1778,28 @@ impl crate::scp::PyScp {
                 })?;
                 Ok(bytes)
             })
-            .map_err(|e| PyRuntimeError::new_err(format!("pseudonym derivation failed: {e}")))?
+            .map_err(|e| {
+                // A registry miss surfaces `with_identity`'s generic
+                // SCP-IDENT-1001; remap it to the canonical "missing key
+                // material" code (SCP-IDENT-1054) so a caller switching on
+                // `.code` gets the same code for the same failure as the
+                // NAPI/UniFFI bridges. Errors raised inside the closure already
+                // carry specific derivation codes and pass through unchanged.
+                let mapped = match e {
+                    crate::error::ScpPyError::IdentityError { message, code }
+                        if code == codes::IDENT_1001 =>
+                    {
+                        crate::error::ScpPyError::identity_with_code(
+                            format!(
+                                "{message} — cannot derive pseudonym without retained key material"
+                            ),
+                            codes::IDENT_1054,
+                        )
+                    }
+                    other => other,
+                };
+                PyErr::from(mapped)
+            })?
         };
 
         // Build scp-core ContextParams from the parsed PyContextParams.
@@ -1793,17 +1814,20 @@ impl crate::scp::PyScp {
             let creator_did_for_register = scp_identity::DID(identity_did.to_owned());
             rt.block_on(async move {
                 mgr.create_context(ctx_id, core_params, creator_did_owned, local_pseudonym)
-                    .await
-                    .map_err(|e| scp_core::context::ContextError::CreationFailed(e.to_string()))?;
+                    .await?;
                 // Register the creator's DID as a local DID for defense-in-depth,
                 // matching NAPI's behavior.
                 mgr.register_local_did(creator_did_for_register).await;
-                Ok::<(), scp_core::context::ContextError>(())
+                Ok::<(), scp_core::context::builder::ContextCreationError>(())
             })
             .map_err(|e| {
                 // Clean up FFI state on ContextManager failure.
                 crate::runtime::remove_context(bi, &context_id);
-                PyRuntimeError::new_err(format!("ContextManager create_context failed: {e}"))
+                // Route the typed `ContextCreationError` through the canonical
+                // converter so creation failures reach Python as a typed
+                // `ScpContextError` carrying `.code` rather than a generic
+                // `RuntimeError` string. Mirrors NAPI/UniFFI.
+                PyErr::from(crate::error::ScpPyError::from(e))
             })?;
         }
 
@@ -1991,7 +2015,27 @@ impl crate::scp::PyScp {
                     Ok(bytes)
                 })
                 .map_err(|e| {
-                    PyRuntimeError::new_err(format!("pseudonym derivation failed: {e}"))
+                    // A registry miss surfaces `with_identity`'s generic
+                    // SCP-IDENT-1001; remap it to the canonical "missing key
+                    // material" code (SCP-IDENT-1054) so a caller switching on
+                    // `.code` gets the same code for the same failure as the
+                    // NAPI/UniFFI bridges. Errors raised inside the closure
+                    // already carry specific derivation codes and pass through.
+                    let mapped = match e {
+                        crate::error::ScpPyError::IdentityError { message, code }
+                            if code == codes::IDENT_1001 =>
+                        {
+                            crate::error::ScpPyError::identity_with_code(
+                                format!(
+                                    "{message} — cannot derive pseudonym without retained key \
+                                     material"
+                                ),
+                                codes::IDENT_1054,
+                            )
+                        }
+                        other => other,
+                    };
+                    PyErr::from(mapped)
                 })?
             };
 
@@ -2018,9 +2062,11 @@ impl crate::scp::PyScp {
                 )
                 .await
             })
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("ContextManager join_context failed: {e}"))
-            })?;
+            // Route the typed `ContextError` through the canonical converter so
+            // typed join-time envelopes reach Python as a `ScpContextError`
+            // carrying `.code` rather than a generic `RuntimeError` string.
+            // Mirrors the NAPI/UniFFI cross-bridge error contract.
+            .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
 
             // §9.10.4: Send pseudonym announcement to inform existing members.
             // Broadcast contexts have no per-member pseudonyms; skip.
@@ -2103,9 +2149,11 @@ impl crate::scp::PyScp {
                 mgr.leave_context(&temp_handle, &member_did, &member_did)
                     .await
             })
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("ContextManager leave_context failed: {e}"))
-            })?;
+            // Route the typed `ContextError` through the canonical converter so
+            // typed leave-time envelopes reach Python as a `ScpContextError`
+            // carrying `.code` rather than a generic `RuntimeError` string.
+            // Mirrors the NAPI/UniFFI cross-bridge error contract.
+            .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
 
             // Also update FFI bridge state's role_state.
             let _ = crate::runtime::with_ffi_state(bi, &context_id, |st| {
@@ -2298,9 +2346,13 @@ impl crate::scp::PyScp {
                 )
                 .await
             })
-            .map_err(|e| {
-                PyRuntimeError::new_err(format!("ContextManager send_message failed: {e}"))
-            })?;
+            // Route the typed `ContextError` through the canonical converter so
+            // §9.10.4 codes (SCP-CTX-2093 PseudonymRegistryEmpty / SCP-CTX-2094
+            // NotPseudonymousContext) and every other typed envelope reach Python
+            // as a `ScpContextError` carrying `.code`, instead of being flattened
+            // into a generic `RuntimeError` string. Mirrors the NAPI/UniFFI
+            // cross-bridge error contract.
+            .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
         }
 
         // Bridge: drain events from ContextManager's receive buffer and deliver
@@ -2529,11 +2581,38 @@ impl crate::scp::PyScp {
                     })?;
                     Ok(bytes)
                 })
-                .map_err(|e| PyRuntimeError::new_err(format!("pseudonym derivation failed: {e}")))?
+                .map_err(|e| {
+                // A registry miss surfaces `with_identity`'s generic
+                // SCP-IDENT-1001; remap it to the canonical "missing key
+                // material" code (SCP-IDENT-1054) so a caller switching on
+                // `.code` gets the same code for the same failure as the
+                // NAPI/UniFFI bridges. Errors raised inside the closure already
+                // carry specific derivation codes and pass through unchanged.
+                let mapped = match e {
+                    crate::error::ScpPyError::IdentityError { message, code }
+                        if code == codes::IDENT_1001 =>
+                    {
+                        crate::error::ScpPyError::identity_with_code(
+                            format!(
+                                "{message} — cannot derive pseudonym without retained key material"
+                            ),
+                            codes::IDENT_1054,
+                        )
+                    }
+                    other => other,
+                };
+                PyErr::from(mapped)
+            })?
             };
 
+        // Route the typed `ContextError` through the canonical converter so
+        // import-time typed envelopes (e.g. SCP-CTX-2091 snapshot floor
+        // regression, SCP-CTX-2092 import rejection, and the §9.10.4 pseudonym
+        // codes) reach Python as a `ScpContextError` carrying `.code` rather
+        // than a generic `RuntimeError` string. Mirrors the NAPI/UniFFI
+        // cross-bridge error contract.
         rt.block_on(mgr.import_context(export, local_pseudonym))
-            .map_err(|e| PyRuntimeError::new_err(format!("context import failed: {e}")))?;
+            .map_err(|e| PyErr::from(crate::error::ScpPyError::from(e)))?;
 
         // §9.10.4: Emit a PseudonymAnnouncement so peers learn this importer's
         // per-context routing ID. Encrypted contexts only — broadcast contexts
