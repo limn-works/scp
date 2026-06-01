@@ -4477,3 +4477,224 @@ impl super::ContextPersistence for SharedMockPersistence {
         self.0.list_persisted_contexts()
     }
 }
+
+/// Builds a minimal `InnerEnvelope` for delivering an announcement payload in
+/// the bootstrap-handshake test. `MockCrypto` does not perform real MLS
+/// sealing, so the announcement is fed directly into the post-decrypt path.
+fn handshake_inner_envelope(
+    context_id: &str,
+    sender_did: &str,
+    seq: u64,
+) -> scp_protocol::envelope::inner::InnerEnvelope {
+    use scp_protocol::envelope::inner::{InnerEnvelope, MessageType};
+    use std::collections::HashMap;
+    InnerEnvelope {
+        version: scp_protocol::envelope::inner::SCP_INNER_ENVELOPE_VERSION,
+        context_id: context_id.to_owned(),
+        sender_did: sender_did.to_owned(),
+        epoch: 0,
+        generation: 0,
+        sequence: seq,
+        timestamp: 0,
+        message_type: MessageType::Content,
+        payload_hash: [0u8; 32],
+        payload: vec![],
+        provenance: None,
+        provenance_hash: [0u8; 32],
+        signing_key_id: scp_primitives::SigningKeyId::Active,
+        signature: [0u8; 64],
+        extensions: HashMap::new(),
+    }
+}
+
+/// Adds `peer_did` as a member of `context_id` on `manager` with a fresh
+/// access key and the `member` role (which carries `messages:write`).
+async fn add_peer_member(manager: &ContextManager, context_id: &str, peer_did: &str) {
+    let arc = manager.get_context_arc(context_id).unwrap();
+    let mut guard = arc.lock().await;
+    let ctx = &mut *guard;
+    ctx.membership
+        .add_member(peer_did.into(), "member".into(), vec![]);
+    ctx.role_state.members.insert(peer_did.to_owned());
+    let _ = scp_protocol::context::roles::system_assign_role(
+        &mut ctx.role_state,
+        &DID::from(peer_did),
+        "member",
+        &scp_primitives::SystemClock,
+    );
+    let access_key = scp_protocol::crypto::access_keys::generate_access_key(context_id, peer_did);
+    ctx.access
+        .access_key_store
+        .set(context_id, peer_did, access_key);
+}
+
+/// Returns the peer pseudonyms currently in `manager`'s registry for the
+/// given context, keyed by DID.
+async fn registry_snapshot(
+    manager: &ContextManager,
+    context_id: &str,
+) -> std::collections::HashMap<String, [u8; 32]> {
+    let arc = manager.get_context_arc(context_id).unwrap();
+    let guard = arc.lock().await;
+    match &guard.routing {
+        super::ContextRouting::Encrypted {
+            pseudonym_registry, ..
+        } => pseudonym_registry
+            .iter()
+            .map(|(did, p)| (did.as_ref().to_owned(), *p))
+            .collect(),
+        super::ContextRouting::Broadcast => {
+            panic!("{context_id} must be encrypted")
+        }
+    }
+}
+
+/// Builds one node of the bootstrap-handshake test: a `ContextManager` whose
+/// local DID is `local_did`, an encrypted context `context_id` with the local
+/// `pseudonym`, and `peer_did` added as a member. Returns the manager, the
+/// context handle, and the transport's routing-IDs capture handle.
+async fn setup_handshake_node(
+    local_did: &str,
+    peer_did: &str,
+    context_id: &str,
+    pseudonym: [u8; 32],
+) -> (
+    ContextManager,
+    ContextHandle,
+    Arc<std::sync::Mutex<Vec<[u8; 32]>>>,
+) {
+    let transport = MockTransport::connected();
+    let routing_ids = transport.routing_ids_handle();
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(transport),
+        Box::new(MockEventLog::default()),
+        mock_key_resolver(),
+    );
+    let params = ContextParams {
+        ceiling: vec![
+            scp_protocol::context::params::Capability::new("messages:read"),
+            scp_protocol::context::params::Capability::new("messages:write"),
+        ],
+        ..ContextParams::default()
+    };
+    manager.register_local_did(local_did.into()).await;
+    let handle = manager
+        .create_context(context_id.into(), params, local_did.into(), pseudonym)
+        .await
+        .unwrap();
+    add_peer_member(&manager, context_id, peer_did).await;
+    (manager, handle, routing_ids)
+}
+
+/// Serializes a `PseudonymAnnouncement` payload for the given member + pseudonym.
+fn announcement_payload(member_did: &str, pseudonym: [u8; 32]) -> Vec<u8> {
+    use super::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
+    rmp_serde::to_vec_named(&PseudonymAnnouncement {
+        tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+        member_did: member_did.to_owned(),
+        pseudonym,
+    })
+    .unwrap()
+}
+
+/// §9.10.4 two-member encrypted bootstrap handshake. Alice and Bob each run
+/// their own `ContextManager` for the same encrypted context. Both start with
+/// an empty pseudonym registry. Bob announces his pseudonym → Alice learns it.
+/// Alice announces back → Bob learns hers. After convergence, Alice's app-data
+/// send fans out to Bob's pseudonym only, with no `PseudonymRegistryEmpty`
+/// error.
+///
+/// `MockCrypto` does not perform real MLS sealing, so the announcement
+/// payloads are delivered into each node's post-decrypt delivery path
+/// (`deliver_message_and_drain_buffered`) rather than through a real relay
+/// round-trip. The registry-convergence and fan-out invariants are identical.
+#[tokio::test]
+async fn two_member_encrypted_bootstrap_handshake_registries_converge() {
+    const CTX: &str = "handshake-ctx";
+    const ALICE: &str = "did:key:alice";
+    const BOB: &str = "did:key:bob";
+    let alice_pseudonym = [0xA1u8; 32];
+    let bob_pseudonym = [0xB0u8; 32];
+
+    let (alice_mgr, alice_handle, alice_routing_ids) =
+        setup_handshake_node(ALICE, BOB, CTX, alice_pseudonym).await;
+    let (bob_mgr, _bob_handle, _bob_routing_ids) =
+        setup_handshake_node(BOB, ALICE, CTX, bob_pseudonym).await;
+
+    // Precondition: both registries empty.
+    assert!(registry_snapshot(&alice_mgr, CTX).await.is_empty());
+    assert!(registry_snapshot(&bob_mgr, CTX).await.is_empty());
+
+    let ctx_bytes = scp_protocol::context::context_id_bytes(CTX);
+
+    // 1. Bob announces his pseudonym; Alice processes it.
+    let consumed = alice_mgr
+        .deliver_message_and_drain_buffered(
+            CTX,
+            &ctx_bytes,
+            BOB,
+            &handshake_inner_envelope(CTX, BOB, 1),
+            &announcement_payload(BOB, bob_pseudonym),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(
+        consumed,
+        "announcement must be consumed, not forwarded as a message"
+    );
+
+    let alice_registry = registry_snapshot(&alice_mgr, CTX).await;
+    assert_eq!(
+        alice_registry.get(BOB),
+        Some(&bob_pseudonym),
+        "Alice's registry must contain Bob's pseudonym after his announcement"
+    );
+
+    // 2. Alice announces back; Bob processes it.
+    bob_mgr
+        .deliver_message_and_drain_buffered(
+            CTX,
+            &ctx_bytes,
+            ALICE,
+            &handshake_inner_envelope(CTX, ALICE, 1),
+            &announcement_payload(ALICE, alice_pseudonym),
+            false,
+        )
+        .await
+        .unwrap();
+
+    let bob_registry = registry_snapshot(&bob_mgr, CTX).await;
+    assert_eq!(
+        bob_registry.get(ALICE),
+        Some(&alice_pseudonym),
+        "Bob's registry must contain Alice's pseudonym after her announcement"
+    );
+
+    // 3. Alice's app-data send now fans out to Bob's pseudonym only — no error.
+    let alice_did: DID = ALICE.into();
+    let alice_sk = signing_key_for_did(&alice_did);
+    alice_mgr
+        .send_message(
+            &alice_handle,
+            &alice_did,
+            b"hello bob",
+            Some(&alice_sk),
+            None,
+            None,
+        )
+        .await
+        .expect("app-data send must succeed after handshake convergence");
+
+    let sent = alice_routing_ids.lock().unwrap();
+    assert!(
+        sent.contains(&bob_pseudonym),
+        "app-data send must fan out to Bob's learned pseudonym"
+    );
+    let shared_rid = scp_protocol::context::context_routing_id(CTX);
+    assert!(
+        !sent.contains(&shared_rid),
+        "app-data send must NOT address the shared routing ID (§9.10.4)"
+    );
+}
