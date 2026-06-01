@@ -4818,3 +4818,43 @@ async fn restore_context_rejects_mode_routing_variant_mismatch() {
         other => panic!("expected PersistenceFailed on mode/routing mismatch, got: {other:?}"),
     }
 }
+
+/// `persist_degraded_snapshot` must NOT write a snapshot when there is no
+/// prior persisted snapshot to anchor `context_params.mode`. Writing one
+/// would pick a mode out of thin air and produce a shape-inconsistent
+/// record. The no-prior-snapshot path is a deliberate no-op (a `warn!` is
+/// emitted and the SDK re-joins via the Welcome path on next restart).
+#[tokio::test]
+async fn persist_degraded_snapshot_no_ops_without_prior_snapshot() {
+    use super::ContextPersistence as _;
+
+    let persistence = Arc::new(MockContextPersistence::default());
+    let manager = ContextManager::with_persistence(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        Box::new(SharedMockPersistence(Arc::clone(&persistence))),
+        noop_key_resolver(),
+    );
+
+    // No context created, no snapshot ever persisted for this ID.
+    assert!(
+        persistence.load_context("no-prior-ctx").unwrap().is_none(),
+        "precondition: no prior snapshot"
+    );
+
+    manager.persist_degraded_snapshot("no-prior-ctx");
+
+    // The persistence layer must have received NO write for this context.
+    assert!(
+        persistence.load_context("no-prior-ctx").unwrap().is_none(),
+        "degraded flush with no prior snapshot must not write anything"
+    );
+    assert!(
+        !persistence
+            .list_persisted_contexts()
+            .unwrap()
+            .contains(&"no-prior-ctx".to_owned()),
+        "no-prior-snapshot context must not appear in the persistence layer"
+    );
+}
