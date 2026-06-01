@@ -769,13 +769,13 @@ export class SCP {
     return new Uint8Array(raw);
   }
 
-  async contextImport(data: Uint8Array | readonly number[]): Promise<string> {
+  async contextImport(data: Uint8Array | readonly number[], importer: Identity): Promise<string> {
     const dataArray = ArrayBuffer.isView(data)
       ? Array.from(data as Uint8Array)
       : (data as readonly number[]);
-    return await (this.#native.contextImport as (d: readonly number[]) => Promise<string>)(
-      dataArray,
-    );
+    return await (
+      this.#native.contextImport as (d: readonly number[], id: unknown) => Promise<string>
+    )(dataArray, importer._rawHandle);
   }
 
   contextSetEconomicPolicy(handle: unknown, policyJson: string): void {

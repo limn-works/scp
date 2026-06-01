@@ -236,7 +236,7 @@ export interface Bridge {
 
   // Context export/import
   contextExport(handle: BridgeContextHandle): Promise<Uint8Array>;
-  contextImport(data: Uint8Array): Promise<string>;
+  contextImport(data: Uint8Array, importerIdentity: BridgeIdentityHandle): Promise<string>;
 
   // Drain events
   contextDrainEvents(handle: BridgeContextHandle): Promise<readonly string[]>;

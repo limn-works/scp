@@ -1523,14 +1523,15 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       // allows reimport.
       await napi.contextClose(ctx, identity.did);
 
-      const importedContextId = await napi.contextImport(data);
+      const importedContextId = await napi.contextImport(data, identity);
       expect(typeof importedContextId).toBe("string");
       expect(importedContextId.length).toBeGreaterThan(0);
     });
 
     test("import rejects invalid data", async () => {
       const invalidData = new Uint8Array([0, 1, 2, 3]);
-      await expect(napi.contextImport(invalidData)).rejects.toThrow();
+      const identity = await napi.identityCreate("in_memory");
+      await expect(napi.contextImport(invalidData, identity)).rejects.toThrow();
     });
   });
 

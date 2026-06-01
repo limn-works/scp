@@ -1758,12 +1758,13 @@ describeNapi(`SCP class real NAPI integration [${napiSkipReason}]`, () => {
       // Close the context first so import_context's TOCTOU gate (see
       // #1479) treats the existing entry as terminal and allows reimport.
       await scp.contextClose(ctx._rawHandle, identity.did);
-      const importedId = await scp.contextImport(data);
+      const importedId = await scp.contextImport(data, identity);
       expect(importedId.length).toBeGreaterThan(0);
     });
 
     it("scp.contextImport rejects malformed data", async () => {
-      await expect(scp.contextImport(new Uint8Array([0, 1, 2, 3]))).rejects.toThrow();
+      const identity = await scp.identityCreate("in_memory");
+      await expect(scp.contextImport(new Uint8Array([0, 1, 2, 3]), identity)).rejects.toThrow();
     });
   });
 

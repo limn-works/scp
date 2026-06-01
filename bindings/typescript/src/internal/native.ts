@@ -741,10 +741,12 @@ export function createNativeBridge(scp: SCP): Bridge {
       return new Uint8Array(data);
     },
 
-    async contextImport(data: Uint8Array): Promise<string> {
+    async contextImport(data: Uint8Array, importerIdentity: BridgeIdentityHandle): Promise<string> {
       // NAPI Vec<u8> maps to number[] in JS, not Uint8Array.
       const dataArray = Array.from(data) as unknown as number[];
-      return await (native.contextImport as (d: number[]) => Promise<string>)(dataArray);
+      return await (
+        native.contextImport as (d: number[], id: BridgeIdentityHandle) => Promise<string>
+      )(dataArray, importerIdentity);
     },
 
     // Drain events

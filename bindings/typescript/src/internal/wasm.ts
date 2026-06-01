@@ -1180,9 +1180,17 @@ export function createWasmBridge(): Bridge {
       return await wasm.context_export(handle);
     },
 
-    async contextImport(data: Uint8Array): Promise<string> {
+    async contextImport(
+      data: Uint8Array,
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      _importerIdentity: BridgeIdentityHandle,
+    ): Promise<string> {
+      // WASM bridge does not carry per-context pseudonym state (ADR-034
+      // keeps WASM pseudonym-agnostic — see crates/scp-ffi/wasm/CLAUDE.md).
+      // The importer identity is required by the unified Bridge interface
+      // so the NAPI / PyO3 / UniFFI paths can derive the importer's
+      // pseudonym (§9.10.4); WASM ignores it.
       const wasm = getWasm();
-      // WASM import takes Uint8Array directly — no base64 conversion needed.
       return await wasm.context_import(data);
     },
 
