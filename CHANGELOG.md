@@ -62,23 +62,29 @@ Kotlin; Python continues to expose module-level functions per
   `every_exemption_reason_cites_durable_provenance` requires every
   per-bridge exemption in `scripts/bridge-aliases.json` to justify itself
   with an ADR (`ADR-NNN`), spec section (`§N…`), or PRD story (`SCP-NNN`).
-  Issue/PR numbers are rejected (ephemeral; policy forbids issue refs in
-  tracked data). The gate immediately caught a factually wrong exemption:
-  `identity_migrate` was marked "not yet exported (known gap)" in NAPI, but
-  it IS exported as the `Identity#migrate` instance method — the alias was
-  simply never recorded. Wired the real `migrate` alias and removed the
-  false exemption. Two adversarial unit tests cover the detector.
+  Cited ADRs and SCP stories are existence-verified against `.docs/adrs/`
+  and `.docs/prds/` (a fabricated `ADR-999`/`SCP-9999` is rejected, not just
+  hand-waves); `§` sections remain shape-only. Issue/PR numbers are rejected
+  (ephemeral; policy forbids issue refs in tracked data). The gate
+  immediately caught a factually wrong exemption: `identity_migrate` was
+  marked "not yet exported (known gap)" in NAPI, but it IS exported as the
+  `Identity#migrate` instance method — the alias was simply never recorded.
+  Wired the real `migrate` alias and removed the false exemption.
 
 **Side fix:** `scripts/hooks/pretooluse-enforcement-files.sh` switched
 from suffix to exact-canonical-path matching anchored at the worktree
 root, and the enforcement-file guard was extended to `Bash` tool calls:
-best-effort detection of write verbs (`tee`/`mv`/`cp`/`sed -i`/interpreter
-writes) and stdout redirections targeting a protected basename. Reads
-(`cat`/`grep`/`jq`/`ls`) are still allowed; CI remains the canonical gate.
-`check-pure-helpers.sh`, `pure-helpers-allowlist.txt`, and the hook script
-itself were registered in both the CLAUDE.md enforcement list and the
-hook's protected-paths set. Fixture copies of `bridge-aliases.json` no
-longer trigger false-positive blocks; symlink-bypass protection preserved.
+best-effort detection of write verbs (`tee`/`mv`/`cp`/`sed` in-place in all
+GNU/BSD flag orderings/`python -c`) and stdout redirections (including `>|`
+force-clobber) targeting a protected basename. Reads
+(`cat`/`grep`/`jq`/`sed -n`/`node x.js file`/`python validate.py file`) are
+still allowed; CI remains the canonical gate. `check-pure-helpers.sh`,
+`pure-helpers-allowlist.txt`, and the hook script itself were registered in
+both the CLAUDE.md enforcement list and the hook's protected-paths set.
+Fixture copies of `bridge-aliases.json` no longer trigger false-positive
+blocks; symlink-bypass protection preserved. A regression matrix at
+`scripts/tests/enforcement-files-hook/run-tests.sh` locks the block/allow
+behavior and runs in CI.
 
 ## [Unreleased] - 2026-04-18
 

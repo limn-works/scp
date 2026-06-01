@@ -115,12 +115,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
       - name: Run bridge-symmetry CI check
         run: bash scripts/check-bridge-symmetry.sh
       - name: Run bridge-symmetry fixture tests
         run: bash scripts/tests/bridge-symmetry/run-tests.sh
+      - name: Run enforcement-file hook tests
+        run: bash scripts/tests/enforcement-files-hook/run-tests.sh
 
   # ── SDK coverage ─────────────────────────────────────────────────────
   sdk-coverage:
