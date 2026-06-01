@@ -375,23 +375,20 @@ fn strip_snapshot_for_public(snapshot: &ContextSnapshot) -> ContextSnapshot {
         // public observer. Always zero in public scope.
         generation: 0,
         // §9.10.4: pseudonym state is local-instance routing state and has
-        // no meaning to a public observer. Strip the local pseudonym + peer
-        // registry but keep the variant matching the declared context mode
-        // so a stripped snapshot's shape stays self-consistent. `routing` is
-        // never consulted on `import_context` (which rebuilds it from the
-        // importer's own caller-supplied pseudonym), so the zero pseudonym
-        // inside `Encrypted` is a harmless placeholder.
-        routing: match snapshot.context_params.mode {
-            scp_protocol::context::params::ContextMode::Broadcast => {
-                crate::context::manager::ContextRouting::Broadcast
-            }
-            scp_protocol::context::params::ContextMode::Encrypted => {
-                crate::context::manager::ContextRouting::Encrypted {
-                    local_pseudonym: [0u8; 32],
-                    pseudonym_registry: HashMap::new(),
-                }
-            }
-        },
+        // no meaning to a public observer. A stripped public snapshot
+        // deliberately carries NO per-member pseudonym information — not
+        // even a zero placeholder — because the `Encrypted { local_pseudonym:
+        // [0u8; 32], .. }` shape would be a lie (it looks like a valid
+        // encrypted-context routing record to readers) and a trap for future
+        // refactors that grow to trust the `routing` field on the import
+        // path. Emit `ContextRouting::Broadcast` regardless of the declared
+        // context mode: the `context_import` path does not read `routing`
+        // from the snapshot for encrypted contexts (it rebuilds via
+        // `build_routing_for_mode(mode, caller_supplied_pseudonym)`), so
+        // the chosen variant here is purely a "no routing info carried"
+        // marker. The mode itself (authoritative) stays in
+        // `snapshot.context_params.mode`.
+        routing: crate::context::manager::ContextRouting::Broadcast,
     }
 }
 
