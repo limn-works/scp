@@ -2391,7 +2391,7 @@ impl ContextManager {
         // If so, preserve it — the prior state is authoritative and
         // 250ms of contention is a lock-contention signal, not a
         // context-state signal.
-        match persistence.load_context(context_id) {
+        let prior_mode = match persistence.load_context(context_id) {
             Ok(Some(existing)) if !existing.needs_reconnect => {
                 tracing::debug!(
                     context_id = %context_id,
@@ -2400,27 +2400,49 @@ impl ContextManager {
                 );
                 return;
             }
-            Ok(_) => {
-                // No snapshot, or existing snapshot already marked
-                // degraded — overwrite is safe and necessary.
+            Ok(Some(existing)) => {
+                // Existing snapshot already marked degraded — overwrite is
+                // safe. Carry forward the prior mode so the new degraded
+                // snapshot's `context_params.mode` stays consistent with
+                // whatever it was before (prevents mode flip-flopping across
+                // successive degraded writes).
+                Some(existing.context_params.mode)
+            }
+            Ok(None) => {
+                // No prior persisted snapshot for this context. The mode is
+                // unknowable from off-lock state. Refuse to flush — writing
+                // a degraded snapshot now would pick a mode out of thin air
+                // (previously `Encrypted` via `ContextParams::default()`,
+                // which then got paired with `ContextRouting::Broadcast` by
+                // the old code for a shape-inconsistent record that
+                // `restore_context` would accept verbatim). A no-op on the
+                // no-prior-snapshot path is strictly safer — on next
+                // restart, the absent entry causes the SDK to re-join
+                // through the normal Welcome path, exactly as intended.
+                tracing::warn!(
+                    context_id = %context_id,
+                    "skipping degraded snapshot write — no prior snapshot to anchor \
+                     context_params.mode and the lock is held; reconnection will \
+                     happen via re-join on next restart"
+                );
+                return;
             }
             Err(e) => {
-                // Load failed — log and proceed with degraded write as
-                // a best-effort attempt. Refusing to write here would
-                // leave `restore_context` with no reconnect signal.
+                // Load failed — we can't confirm prior mode. Same as
+                // `Ok(None)`: refuse to write, because guessing a mode here
+                // would produce a shape-inconsistent snapshot that
+                // `restore_context` would silently accept.
                 tracing::warn!(
                     context_id = %context_id,
                     error = %e,
-                    "failed to load existing snapshot before degraded write; \
-                     proceeding with degraded snapshot"
+                    "skipping degraded snapshot write — cannot determine prior mode \
+                     and the lock is held"
                 );
+                return;
             }
-        }
-        // Try to pull the context's current params and membership from
-        // the contexts map without locking the mutex (we already know
-        // the lock is held). Fall back to minimal fields if the context
-        // has been removed concurrently.
-        let snapshot = Self::build_degraded_snapshot(context_id);
+        };
+        let mode = prior_mode.unwrap_or(ContextMode::Encrypted);
+        let snapshot = Self::build_degraded_snapshot(context_id, mode);
         if let Err(e) = persistence.persist_context(context_id, &snapshot) {
             crate::metrics::record_persistence_failure();
             tracing::warn!(
@@ -2437,13 +2459,30 @@ impl ContextManager {
         }
     }
 
-    /// Builds a minimal `ContextSnapshot` marked for reconnection.
+    /// Builds a minimal `ContextSnapshot` marked for reconnection, using the
+    /// caller-supplied mode to keep `context_params.mode` and `routing`
+    /// consistent.
     ///
     /// The payload is intentionally empty beyond the `context_id` and
-    /// `needs_reconnect = true` flag — the restore path re-derives the
-    /// rest from the reconnection pipeline. Uses `Default` values for
-    /// every field that is not observable externally.
-    fn build_degraded_snapshot(context_id: &str) -> ContextSnapshot {
+    /// `needs_reconnect = true` flag — the restore path re-derives the rest
+    /// from the reconnection pipeline. Uses `Default` values for every field
+    /// that is not observable externally.
+    ///
+    /// Historically this function called `ContextParams::default()` (which
+    /// sets `mode = Encrypted`) but unconditionally wrote `routing:
+    /// Broadcast` regardless — producing a shape-inconsistent snapshot that
+    /// `restore_context` would then re-materialize as `PerContextState` with
+    /// `mode = Encrypted` AND `routing = Broadcast`. That shape is a lie:
+    /// every encrypted-path invariant (pseudonym fan-out, announcement
+    /// delivery) assumes `routing = Encrypted {..}`. Now the mode is passed
+    /// in explicitly and `build_routing_for_mode` builds a matching routing
+    /// variant. For the encrypted branch the resulting `routing` carries
+    /// `local_pseudonym: [0u8; 32]` and an empty registry, but this is
+    /// gated by `needs_reconnect = true` which forces the SDK to re-run the
+    /// reconnection pipeline (which re-derives the pseudonym and re-learns
+    /// peers' pseudonyms via the announcement protocol) BEFORE any
+    /// encrypted app-data send.
+    fn build_degraded_snapshot(context_id: &str, mode: ContextMode) -> ContextSnapshot {
         let role_state = scp_protocol::context::roles::ContextRoleState {
             context_id: context_id.to_owned(),
             creator_did: String::new(),
@@ -2456,10 +2495,14 @@ impl ContextManager {
             member_capabilities: std::collections::HashMap::new(),
             suspended_capabilities: std::collections::HashMap::new(),
         };
+        let context_params = ContextParams {
+            mode,
+            ..ContextParams::default()
+        };
         ContextSnapshot {
             context_id: context_id.to_owned(),
             state: ContextState::Active,
-            context_params: ContextParams::default(),
+            context_params,
             membership: MembershipState::new(),
             role_state,
             executed_proposals: std::collections::HashSet::new(),
@@ -2500,12 +2543,15 @@ impl ContextManager {
             checkpoint_events_since: 0,
             checkpoint_last_time_secs: 0,
             generation: 0,
-            // §9.10.4: the `ContextSnapshot::default()` fixture is used only by
-            // tests that exercise broadcast-only or pseudonym-agnostic paths.
-            // Broadcast is the correct default because it carries no pseudonym
-            // state and is therefore the only zero-argument variant that is
-            // never wrong-shaped for the code path under test.
-            routing: ContextRouting::Broadcast,
+            // §9.10.4 + §5.14: routing variant mirrors the declared mode.
+            // For `Encrypted`, the pseudonym is a zero placeholder — this is
+            // SAFE only because `needs_reconnect = true` forces the
+            // reconnection pipeline to re-derive the real pseudonym and
+            // re-learn peers before any app-data send (see
+            // `messaging::send_message` which bails with
+            // `PseudonymRegistryEmpty` on a multi-member send with empty
+            // registry).
+            routing: crate::context::manager::lifecycle::build_routing_for_mode(mode, [0u8; 32]),
         }
     }
 

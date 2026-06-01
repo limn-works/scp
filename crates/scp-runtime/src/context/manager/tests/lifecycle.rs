@@ -4327,7 +4327,10 @@ async fn persist_degraded_snapshot_overwrites_prior_degraded_snapshot() {
     // because a prior entry exists.
     {
         use super::ContextPersistence as _;
-        let mut seeded = super::ContextManager::build_degraded_snapshot("regression-ctx");
+        let mut seeded = super::ContextManager::build_degraded_snapshot(
+            "regression-ctx",
+            scp_protocol::context::ContextMode::Encrypted,
+        );
         seeded.needs_reconnect = true;
         persistence
             .persist_context("regression-ctx", &seeded)
