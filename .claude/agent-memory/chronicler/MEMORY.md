@@ -51,3 +51,8 @@
 ## Cross-Bridge Matrix Batch 2 (PR #1703, 2026-04-25)
 - Branch `cross-bridge/1543-batch2-ratchet-promotion`. Added 6 ops (4 WASM-exempt per ADR-034). 5 new include_str! + 7 category coverage tests gated on per-bridge exemptions. Promoted 33 ops to wasm_required:true (96 of 134 total). All reviews CLEAN.
 - Batch 3 next: ~60 real impl gaps in UniFFI economy/provenance/discovery/petnames/handle/scope/media + canonical reconciliation for 14 bare-verb vs noun-verb divergences.
+
+## SCP-1717 Pre-Rotation Key Retention (2026-04-27)
+- See [project_scp_1717_pre_rotation_retention.md](project_scp_1717_pre_rotation_retention.md) -- pre_rotation_key now retained on ScpIdentity; spec §9.7.4.1 #3/#5f and §9.12 cold-storage drift unresolved; ADR-003 phase-1.md struct text stale; CLAUDE.md Integration checklist owes item 6 for behavioral cross-bridge crypto invariants.
+- Lesson at `.docs/lessons/behavioral-invariant-must-be-asserted-on-every-bridge.md` -- matrix-name parity is necessary but not sufficient; every bridge emitting a wire artifact must assert the cryptographic invariant on emitted bytes (SHA-256(revealed) == commitment recomputation per spec §3.7).
+- Lesson at `.docs/lessons/hash-commitment-preimage-lifetime.md` -- generalizes pre-rotation key bug to all hash-then-reveal commitments (KeyPackage, sender key, MLS leaf); preimage must persist from t=commit to t=reveal on every reachable code path.
