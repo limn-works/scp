@@ -35,6 +35,7 @@ use scp_platform::traits::KeyCustody;
 use scp_primitives::Clock;
 use tokio::sync::mpsc;
 
+use scp_ffi_common::error_codes as codes;
 use scp_ffi_common::html_escape_event_string;
 
 use crate::validate;
@@ -1738,32 +1739,47 @@ impl crate::scp::PyScp {
 
         // Delegate context creation to the shared ContextManager for lifecycle tracking.
         // §9.10.4: Derive pseudonym BEFORE context creation so it can be passed
-        // to the ContextManager for per-member routing. Custody / derivation
-        // failure is a hard error for encrypted contexts — we do NOT silently
-        // fall back to a zero pseudonym or the shared routing ID. Broadcast
-        // contexts don't use per-member pseudonyms (spec §5.14) but we still
-        // derive one here; the runtime ignores it for that mode.
-        let local_pseudonym: [u8; 32] = crate::runtime::with_identity(bi, identity_did, |entry| {
-            let rt = crate::runtime().map_err(|e| {
-                crate::error::ScpPyError::identity(format!("runtime not available: {e}"))
-            })?;
-            let pseudonym = rt.block_on(async {
-                entry
-                    .custody
-                    .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
-                    .await
-            });
-            let pk = pseudonym
-                .map_err(|e| {
-                    crate::error::ScpPyError::identity(format!("pseudonym derivation failed: {e}"))
-                })?
-                .public_key;
-            let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
-                crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
-            })?;
-            Ok(bytes)
-        })
-        .map_err(|e| PyRuntimeError::new_err(format!("pseudonym derivation failed: {e}")))?;
+        // to the ContextManager for per-member routing. Broadcast contexts have
+        // NO per-member pseudonym (spec §5.14): the runtime builds
+        // `ContextRouting::Broadcast` and ignores this argument, so we skip
+        // derivation entirely — deriving would force a custody requirement with
+        // no cryptographic basis, denying broadcast creation when custody is
+        // absent. Encrypted / pseudonymous contexts require a real pseudonym:
+        // custody / derivation failure there is a hard error, no silent fallback.
+        let local_pseudonym: [u8; 32] = if parsed.mode == "broadcast" {
+            [0u8; 32]
+        } else {
+            crate::runtime::with_identity(bi, identity_did, |entry| {
+                let rt = crate::runtime().map_err(|e| {
+                    crate::error::ScpPyError::identity_with_code(
+                        format!("runtime not available: {e}"),
+                        codes::IDENT_1055,
+                    )
+                })?;
+                let pseudonym = rt.block_on(async {
+                    entry
+                        .custody
+                        .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
+                        .await
+                });
+                let pk = pseudonym
+                    .map_err(|e| {
+                        crate::error::ScpPyError::identity_with_code(
+                            format!("pseudonym derivation failed: {e}"),
+                            codes::IDENT_1055,
+                        )
+                    })?
+                    .public_key;
+                let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
+                    crate::error::ScpPyError::identity_with_code(
+                        "pseudonym public key must be 32 bytes",
+                        codes::IDENT_1057,
+                    )
+                })?;
+                Ok(bytes)
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("pseudonym derivation failed: {e}")))?
+        };
 
         // Build scp-core ContextParams from the parsed PyContextParams.
         {
@@ -1936,12 +1952,21 @@ impl crate::scp::PyScp {
             };
 
             // §9.10.4: Derive pseudonym for the joining member so it can be
-            // stored in PerContextState and announced to other members. Hard
-            // error on custody/derivation failure — no silent fallback.
-            let local_pseudonym: [u8; 32] =
+            // stored in PerContextState and announced to other members.
+            // Broadcast contexts have NO per-member pseudonym (spec §5.14):
+            // the runtime builds `ContextRouting::Broadcast` and ignores this
+            // argument, so we skip derivation entirely. Encrypted /
+            // pseudonymous contexts require a real pseudonym: custody /
+            // derivation failure there is a hard error, no silent fallback.
+            let local_pseudonym: [u8; 32] = if handle.params.mode == "broadcast" {
+                [0u8; 32]
+            } else {
                 crate::runtime::with_identity(bi, identity_did, |entry| {
                     let rt = crate::runtime().map_err(|e| {
-                        crate::error::ScpPyError::identity(format!("runtime init failed: {e}"))
+                        crate::error::ScpPyError::identity_with_code(
+                            format!("runtime init failed: {e}"),
+                            codes::IDENT_1055,
+                        )
                     })?;
                     let pseudonym = rt.block_on(async {
                         entry
@@ -1951,19 +1976,24 @@ impl crate::scp::PyScp {
                     });
                     let pk = pseudonym
                         .map_err(|e| {
-                            crate::error::ScpPyError::identity(format!(
-                                "pseudonym derivation failed: {e}"
-                            ))
+                            crate::error::ScpPyError::identity_with_code(
+                                format!("pseudonym derivation failed: {e}"),
+                                codes::IDENT_1055,
+                            )
                         })?
                         .public_key;
                     let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
-                        crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
+                        crate::error::ScpPyError::identity_with_code(
+                            "pseudonym public key must be 32 bytes",
+                            codes::IDENT_1057,
+                        )
                     })?;
                     Ok(bytes)
                 })
                 .map_err(|e| {
                     PyRuntimeError::new_err(format!("pseudonym derivation failed: {e}"))
-                })?;
+                })?
+            };
 
             // Look up the ContextHandle from a completed create_context call.
             // The ContextManager stores PerContextState keyed by context_id.
@@ -2458,32 +2488,49 @@ impl crate::scp::PyScp {
         let mgr = mgr.clone();
 
         // §9.10.4: Derive the importer's OWN per-context pseudonym before the
-        // runtime import. Hard error on custody/derivation failure for encrypted
-        // contexts — no silent zero-pseudonym fallback (that would reintroduce
-        // the zero-pseudonym / membership-enumeration attack). Broadcast
-        // contexts don't use per-member pseudonyms; the runtime's
-        // `build_routing_for_mode` ignores the value for that mode.
-        let local_pseudonym: [u8; 32] = crate::runtime::with_identity(bi, importer_did, |entry| {
-            let rt = crate::runtime().map_err(|e| {
-                crate::error::ScpPyError::identity(format!("runtime not available: {e}"))
-            })?;
-            let pseudonym = rt.block_on(async {
-                entry
-                    .custody
-                    .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
-                    .await
-            });
-            let pk = pseudonym
-                .map_err(|e| {
-                    crate::error::ScpPyError::identity(format!("pseudonym derivation failed: {e}"))
-                })?
-                .public_key;
-            let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
-                crate::error::ScpPyError::identity("pseudonym public key must be 32 bytes")
-            })?;
-            Ok(bytes)
-        })
-        .map_err(|e| PyRuntimeError::new_err(format!("pseudonym derivation failed: {e}")))?;
+        // runtime import. Broadcast contexts have NO per-member pseudonym (spec
+        // §5.14): the runtime builds `ContextRouting::Broadcast` and ignores
+        // this argument, so we skip derivation entirely — deriving would force
+        // a custody requirement with no cryptographic basis, denying broadcast
+        // imports when custody is absent. Encrypted / pseudonymous imports
+        // require a real pseudonym: custody / derivation failure there is a hard
+        // error, no silent zero-pseudonym fallback (would reintroduce the
+        // membership-enumeration attack vector).
+        let local_pseudonym: [u8; 32] =
+            if matches!(mode, scp_core::context::params::ContextMode::Broadcast) {
+                [0u8; 32]
+            } else {
+                crate::runtime::with_identity(bi, importer_did, |entry| {
+                    let rt = crate::runtime().map_err(|e| {
+                        crate::error::ScpPyError::identity_with_code(
+                            format!("runtime not available: {e}"),
+                            codes::IDENT_1055,
+                        )
+                    })?;
+                    let pseudonym = rt.block_on(async {
+                        entry
+                            .custody
+                            .derive_pseudonym(&entry.identity.identity_key, context_id.as_bytes())
+                            .await
+                    });
+                    let pk = pseudonym
+                        .map_err(|e| {
+                            crate::error::ScpPyError::identity_with_code(
+                                format!("pseudonym derivation failed: {e}"),
+                                codes::IDENT_1055,
+                            )
+                        })?
+                        .public_key;
+                    let bytes: [u8; 32] = pk.as_bytes().try_into().map_err(|_| {
+                        crate::error::ScpPyError::identity_with_code(
+                            "pseudonym public key must be 32 bytes",
+                            codes::IDENT_1057,
+                        )
+                    })?;
+                    Ok(bytes)
+                })
+                .map_err(|e| PyRuntimeError::new_err(format!("pseudonym derivation failed: {e}")))?
+            };
 
         rt.block_on(mgr.import_context(export, local_pseudonym))
             .map_err(|e| PyRuntimeError::new_err(format!("context import failed: {e}")))?;

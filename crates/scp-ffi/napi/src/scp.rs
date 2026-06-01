@@ -2485,9 +2485,16 @@ impl Scp {
     }
 
     /// Per-instance equivalent of the free-function `context_import`.
+    ///
+    /// The `importer` identity is required so the importer's own per-context
+    /// pseudonym (§9.10.4) can be derived from their custody-held identity key.
     #[napi(js_name = "contextImport")]
-    pub async fn context_import(&self, data: Vec<u8>) -> napi::Result<String> {
-        crate::context::context_import_on(&self.inner, data).await
+    pub async fn context_import(
+        &self,
+        data: Vec<u8>,
+        importer: &NapiIdentity,
+    ) -> napi::Result<String> {
+        crate::context::context_import_on(&self.inner, data, importer).await
     }
 
     /// Per-instance equivalent of the free-function `context_set_economic_policy`.
