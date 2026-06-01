@@ -820,6 +820,54 @@ mod tests {
         assert_eq!(export.snapshot.membership.count(), 0);
     }
 
+    /// §9.10.4: stripping an encrypted-mode snapshot for public export must
+    /// emit `ContextRouting::Broadcast` — NOT a zero-pseudonym
+    /// `Encrypted { local_pseudonym: [0u8; 32], .. }` record. The
+    /// authoritative `context_params.mode` stays `Encrypted`; the `routing`
+    /// field is a "no routing info carried" marker because the import path
+    /// rebuilds routing from `(mode, caller-supplied pseudonym)` and never
+    /// trusts the snapshot's `routing` for encrypted contexts.
+    #[test]
+    fn strip_snapshot_for_public_emits_broadcast_variant_for_encrypted_mode() {
+        use scp_protocol::context::params::ContextMode;
+
+        // Build an encrypted-mode snapshot carrying a REAL pseudonym so we
+        // can prove stripping does not leak or zero-placeholder it.
+        let mut snapshot = test_snapshot("ctx-strip-encrypted");
+        assert_eq!(
+            snapshot.context_params.mode,
+            ContextMode::Encrypted,
+            "default ContextParams must be Encrypted mode for this test"
+        );
+        let real_pseudonym = [0x5Au8; 32];
+        snapshot.routing = crate::context::manager::ContextRouting::Encrypted {
+            local_pseudonym: real_pseudonym,
+            pseudonym_registry: HashMap::new(),
+        };
+
+        let stripped = strip_snapshot_for_public(&snapshot);
+
+        // Routing must be the Broadcast marker, never zero-pseudonym Encrypted.
+        match stripped.routing {
+            crate::context::manager::ContextRouting::Broadcast => {}
+            crate::context::manager::ContextRouting::Encrypted {
+                local_pseudonym, ..
+            } => {
+                panic!(
+                    "stripped public snapshot must use Broadcast routing marker, \
+                     got Encrypted with pseudonym {local_pseudonym:?}"
+                )
+            }
+        }
+
+        // The authoritative mode is preserved — the context is still encrypted.
+        assert_eq!(
+            stripped.context_params.mode,
+            ContextMode::Encrypted,
+            "stripping must not change context_params.mode"
+        );
+    }
+
     #[test]
     fn full_export_includes_all_data() {
         let ctx_id_bytes = scp_protocol::context::context_id_bytes("ctx-full-1");

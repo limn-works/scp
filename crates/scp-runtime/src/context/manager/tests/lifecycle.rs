@@ -4698,3 +4698,69 @@ async fn two_member_encrypted_bootstrap_handshake_registries_converge() {
         "app-data send must NOT address the shared routing ID (§9.10.4)"
     );
 }
+
+// -----------------------------------------------------------------------
+// §9.10.4: stripped-public snapshot import round-trip + restore consistency
+// + degraded-snapshot no-op
+// -----------------------------------------------------------------------
+
+/// §9.10.4: importing a snapshot shaped like a stripped public export
+/// (`context_params.mode = Encrypted`, `routing = Broadcast`) must rebuild
+/// the routing from the caller-supplied pseudonym, NOT from the snapshot's
+/// `routing` field. The imported context must carry
+/// `ContextRouting::Encrypted { local_pseudonym: <caller-supplied>, registry: empty }`.
+///
+/// This is the import half of the export/strip/import round-trip: the strip
+/// step (tested in `export_import.rs`) emits a `Broadcast` routing marker for
+/// an encrypted context; the import step must NOT trust that marker and must
+/// instead derive routing from `(mode, caller pseudonym)`.
+#[tokio::test]
+async fn import_context_rebuilds_encrypted_routing_from_caller_pseudonym() {
+    // `c3_test_snapshot` uses `ContextParams::default()` (Encrypted mode) but
+    // sets `routing = Broadcast` — exactly the stripped-public shape.
+    let snapshot = c3_test_snapshot("import-pseudonym-ctx");
+    assert_eq!(
+        snapshot.context_params.mode,
+        scp_protocol::context::ContextMode::Encrypted,
+        "fixture must be encrypted mode"
+    );
+    assert!(
+        matches!(snapshot.routing, super::ContextRouting::Broadcast),
+        "fixture must carry the stripped-public Broadcast routing marker"
+    );
+
+    let manager = c3_manager();
+    let export = c3_export_from_snapshot(snapshot);
+
+    let caller_pseudonym = [0xC7u8; 32];
+    let _handle = manager
+        .import_context(export, caller_pseudonym)
+        .await
+        .unwrap();
+
+    let arc = manager
+        .contexts
+        .get("import-pseudonym-ctx")
+        .unwrap()
+        .value()
+        .clone();
+    let guard = arc.lock().await;
+    match &guard.routing {
+        super::ContextRouting::Encrypted {
+            local_pseudonym,
+            pseudonym_registry,
+        } => {
+            assert_eq!(
+                *local_pseudonym, caller_pseudonym,
+                "imported routing must use the caller-supplied pseudonym"
+            );
+            assert!(
+                pseudonym_registry.is_empty(),
+                "imported pseudonym registry must start empty"
+            );
+        }
+        super::ContextRouting::Broadcast => {
+            panic!("import of an encrypted-mode snapshot must yield Encrypted routing")
+        }
+    }
+}
