@@ -9065,7 +9065,7 @@ async fn test_remaining_members_unaffected_after_removal() {
         let arc = manager.get_context_arc("remain2-ctx").unwrap();
         let mut guard = arc.lock().await;
         let ctx = &mut *guard;
-        if let crate::context::manager::ContextRouting::Encrypted {
+        if let crate::context::manager::ContextRouting::Pseudonymous {
             pseudonym_registry, ..
         } = &mut ctx.routing
         {
@@ -15013,7 +15013,7 @@ async fn h17_setup_alice_and_bob(
             .access_key_store
             .set(context_id, bob_did_str, bob_access_key.clone());
         // §9.10.4: inject Bob's pseudonym so Alice's fan-out targets it.
-        if let super::super::ContextRouting::Encrypted {
+        if let super::super::ContextRouting::Pseudonymous {
             pseudonym_registry, ..
         } = &mut ctx.routing
         {

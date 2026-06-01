@@ -331,13 +331,23 @@ fn deliver_plaintext_or_announcement(
             return None; // Drop forged announcement, don't deliver as message
         }
         let did = DID(announcement.member_did.clone());
+        // §9.10.4: reject reserved pseudonym VALUES before touching the
+        // registry. A member announcing the zero sentinel, the shared
+        // bootstrap RID, or the broadcast RID for their own DID would redirect
+        // every honest sender's app-data fan-out, defeating unlinkability or
+        // leaking ciphertext onto the shared channel.
+        if is_reserved_pseudonym(&announcement.pseudonym, context_id) {
+            tracing::warn!(
+                context_id,
+                sender_did,
+                "pseudonym announcement uses a reserved routing ID — dropping"
+            );
+            return None;
+        }
         // §9.10.4: announcements only meaningful for encrypted contexts.
         // Broadcast contexts should never receive a pseudonym announcement;
         // if one arrives we drop it without updating state.
-        if let super::ContextRouting::Encrypted {
-            pseudonym_registry, ..
-        } = &mut ctx.routing
-        {
+        if let Some(pseudonym_registry) = ctx.routing.peer_registry_mut() {
             pseudonym_registry.insert(did.clone(), announcement.pseudonym);
         } else {
             tracing::warn!(
@@ -453,6 +463,32 @@ fn run_buffered_post_delivery(
 fn is_pseudonym_announcement_payload(payload: &[u8]) -> bool {
     rmp_serde::from_slice::<super::PseudonymAnnouncement>(payload)
         .is_ok_and(|a| a.tag == super::PSEUDONYM_ANNOUNCEMENT_TAG)
+}
+
+/// Returns `true` if `pseudonym` is a reserved routing ID that a member is
+/// not permitted to announce as their own (§9.10.4).
+///
+/// A pseudonym registry maps each member's DID to the routing ID that honest
+/// senders fan their app-data ciphertext out to. If a member could announce a
+/// reserved value for their own DID, they could redirect every honest sender's
+/// app-data:
+///
+/// - `[0u8; 32]` — the zero/degraded-snapshot sentinel; announcing it would
+///   poison peers with a routing ID that maps to nothing meaningful.
+/// - `context_routing_id(context_id)` — the shared bootstrap RID; announcing
+///   it would push sensitive app-data ciphertext onto the shared channel,
+///   defeating the unlinkability property the pseudonym scheme exists to
+///   provide.
+/// - `broadcast_routing_id(context_id)` — the derivable `SHA-256(context_id)`
+///   broadcast RID; same leak vector as above.
+///
+/// Honest pseudonyms are `SHA-256` of a context keypair public key and will
+/// collide with these reserved values only with negligible probability, so
+/// rejecting them costs nothing for legitimate members.
+fn is_reserved_pseudonym(pseudonym: &[u8; 32], context_id: &str) -> bool {
+    *pseudonym == [0u8; 32]
+        || *pseudonym == scp_protocol::context::context_routing_id(context_id)
+        || *pseudonym == scp_protocol::context::broadcast_routing_id(context_id)
 }
 
 #[allow(clippy::significant_drop_tightening)]
@@ -641,49 +677,63 @@ impl ContextManager {
                 //
                 // Announcement bootstrap channel (§9.10.4): `PseudonymAnnouncement`
                 // payloads are the ONLY messages permitted to use the shared
-                // `context_routing_id` as an addressee. Every group member
-                // subscribes to the shared RID (for MLS management traffic),
-                // so announcements published there reach peers whose pseudonym
-                // we have not yet learned. App data continues to fan out to
-                // known peer pseudonyms only — the shared RID is never used
-                // for sensitive payloads.
+                // `context_routing_id` as an addressee, and they go there
+                // EXCLUSIVELY — never to the union with peer pseudonyms. Every
+                // group member subscribes to the shared RID (for MLS management
+                // traffic), so a single publish to the shared RID reaches every
+                // current subscriber regardless of whether we have learned their
+                // pseudonym. Sending the same MLS ciphertext to both the shared
+                // RID and each peer pseudonym would let a relay that can derive
+                // `context_routing_id` see the identical blob at both, positively
+                // linking those pseudonyms to the context. App data continues to
+                // fan out to known peer pseudonyms only — the shared RID is never
+                // used for sensitive payloads.
+                // Invariant: this branch is the `else` of
+                // `broadcast_context.is_some()`, so the routing must be
+                // pseudonymous. Assert it so a future refactor that lets a
+                // broadcast context reach here fails loudly in debug builds
+                // rather than silently fanning out to an empty peer registry.
+                debug_assert!(
+                    !ctx.routing.is_broadcast(),
+                    "send fan-out reached the pseudonymous branch with broadcast routing"
+                );
                 let is_announcement = is_pseudonym_announcement_payload(payload);
                 let member_count = ctx.membership.count();
-                let routing_ids: Vec<[u8; 32]> = match &ctx.routing {
-                    super::ContextRouting::Encrypted {
-                        pseudonym_registry, ..
-                    } => {
-                        let mut ids: Vec<[u8; 32]> = pseudonym_registry.values().copied().collect();
-                        if is_announcement {
-                            // Bootstrap path: also address the shared RID so
-                            // peers who have not yet announced their pseudonym
-                            // still receive this announcement.
-                            ids.push(scp_protocol::context::context_routing_id(&context_id));
-                        } else if member_count > 1 && ids.is_empty() {
-                            // App-data send into an encrypted multi-member
-                            // context with an empty pseudonym registry would
-                            // produce zero sends and silently drop the
-                            // payload — the historic silent-Ok(()) behavior
-                            // that masked a bidirectional bootstrap deadlock.
-                            // Raise a typed error so callers can distinguish
-                            // "peers have not announced yet; retry later"
-                            // from a transport failure, and roll back the
-                            // economy ticket + sequence reservation via the
-                            // early-return path.
-                            super::economy::rollback_economy_ticket_inline(ctx, ticket);
-                            ctx.membership.rollback_sequence_number(sender_did);
-                            return Err(ContextError::PseudonymRegistryEmpty {
-                                context_id: context_id.clone(),
-                                member_count,
-                            });
-                        }
-                        ids
+                // This branch is reached only for pseudonymous (encrypted)
+                // contexts — broadcast is handled in the `broadcast_context`
+                // arm above. Read the peer registry directly via the accessor;
+                // a `None` here would be a broadcast context, which is
+                // unreachable, so treat it as an empty registry.
+                let routing_ids: Vec<[u8; 32]> = if is_announcement {
+                    // Bootstrap path: address the shared RID ONLY. Do not
+                    // union with peer pseudonyms — see comment above for the
+                    // relay-linkability rationale.
+                    vec![scp_protocol::context::context_routing_id(&context_id)]
+                } else {
+                    let peer_pseudonyms: Vec<[u8; 32]> = ctx
+                        .routing
+                        .peer_registry()
+                        .map(|reg| reg.values().copied().collect())
+                        .unwrap_or_default();
+                    if member_count > 1 && peer_pseudonyms.is_empty() {
+                        // App-data send into an encrypted multi-member
+                        // context with an empty pseudonym registry would
+                        // produce zero sends and silently drop the
+                        // payload — the historic silent-Ok(()) behavior
+                        // that masked a bidirectional bootstrap deadlock.
+                        // Raise a typed error so callers can distinguish
+                        // "peers have not announced yet; retry later"
+                        // from a transport failure, and roll back the
+                        // economy ticket + sequence reservation via the
+                        // early-return path.
+                        super::economy::rollback_economy_ticket_inline(ctx, ticket);
+                        ctx.membership.rollback_sequence_number(sender_did);
+                        return Err(ContextError::PseudonymRegistryEmpty {
+                            context_id: context_id.clone(),
+                            member_count,
+                        });
                     }
-                    super::ContextRouting::Broadcast => {
-                        // Unreachable: the broadcast_context.is_some() branch
-                        // above owns this case and builds a shared-RID vec.
-                        Vec::new()
-                    }
+                    peer_pseudonyms
                 };
                 (
                     None,
@@ -1486,14 +1536,27 @@ impl ContextManager {
                     announcement.member_did
                 )));
             }
+            // §9.10.4: reject reserved pseudonym VALUES before touching the
+            // registry. Announcing the zero sentinel, the shared bootstrap
+            // RID, or the broadcast RID for one's own DID would redirect every
+            // honest sender's app-data fan-out, defeating unlinkability or
+            // leaking ciphertext onto the shared channel. Drop without updating
+            // state — the registry is left unchanged.
+            if is_reserved_pseudonym(&announcement.pseudonym, context_id) {
+                tracing::warn!(
+                    context_id,
+                    sender_did,
+                    "pseudonym announcement uses a reserved routing ID — rejecting"
+                );
+                return Err(ContextError::PermissionDenied(
+                    "pseudonym announcement uses a reserved routing ID".into(),
+                ));
+            }
             let announced_did = DID(announcement.member_did.clone());
             // §9.10.4: registry updates are meaningful only for encrypted
             // contexts. Broadcast contexts should never carry pseudonym
             // announcements; reject as a spec-level violation.
-            if let super::ContextRouting::Encrypted {
-                pseudonym_registry, ..
-            } = &mut ctx.routing
-            {
+            if let Some(pseudonym_registry) = ctx.routing.peer_registry_mut() {
                 pseudonym_registry.insert(announced_did.clone(), announcement.pseudonym);
             } else {
                 return Err(ContextError::PermissionDenied(

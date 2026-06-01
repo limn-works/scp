@@ -2941,10 +2941,7 @@ impl ContextManager {
             // §9.10.4: remove the member's pseudonym routing ID so future
             // fan-outs do not send messages to a stale routing ID. No-op on
             // broadcast contexts.
-            if let super::ContextRouting::Encrypted {
-                pseudonym_registry, ..
-            } = &mut ctx.routing
-            {
+            if let Some(pseudonym_registry) = ctx.routing.peer_registry_mut() {
                 pseudonym_registry.remove(did);
             }
 

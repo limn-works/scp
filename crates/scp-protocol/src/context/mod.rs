@@ -455,6 +455,22 @@ pub enum ContextError {
         /// Current member count at rejection time.
         member_count: usize,
     },
+
+    /// A per-member pseudonym was requested for a context that does not use
+    /// pseudonymous routing (a broadcast context, §5.14). Broadcast contexts
+    /// route on the derivable shared `SHA-256(context_id)` RID and carry no
+    /// per-member pseudonym state, so there is nothing to return.
+    ///
+    /// Callers that want to handle both routing strategies should check the
+    /// context mode first. Mapped to `SCP-CTX-2094` in FFI bridge translators.
+    #[error(
+        "SCP-CTX-2094: context '{context_id}' is not a pseudonymous context — \
+             broadcast contexts have no per-member pseudonym"
+    )]
+    NotPseudonymousContext {
+        /// The affected context ID.
+        context_id: String,
+    },
 }
 
 // ---------------------------------------------------------------------------

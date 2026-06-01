@@ -56,23 +56,21 @@ impl ContextManager {
     /// # Errors
     ///
     /// Returns [`ContextError::ContextNotRegistered`] if the context is not
-    /// registered. Returns [`ContextError::MembershipFailed`] if the context
-    /// is a broadcast context — broadcast contexts do not use per-member
-    /// pseudonyms (spec §5.14). Callers that want to handle both modes
-    /// should check the context mode first.
+    /// registered. Returns [`ContextError::NotPseudonymousContext`] if the
+    /// context is a broadcast context — broadcast contexts do not use
+    /// per-member pseudonyms (spec §5.14). Callers that want to handle both
+    /// modes should check the context mode first.
     pub async fn local_pseudonym(&self, context_id: &str) -> Result<[u8; 32], ContextError> {
         let ctx_arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
         let guard = ctx_arc.lock().await;
-        match &guard.routing {
-            super::ContextRouting::Encrypted {
-                local_pseudonym, ..
-            } => Ok(*local_pseudonym),
-            super::ContextRouting::Broadcast => Err(ContextError::MembershipFailed(format!(
-                "context '{context_id}' is a broadcast context and has no per-member pseudonym"
-            ))),
-        }
+        guard
+            .routing
+            .local_pseudonym()
+            .ok_or_else(|| ContextError::NotPseudonymousContext {
+                context_id: context_id.to_owned(),
+            })
     }
 
     /// Returns the broadcast key and epoch for a locally controlled author

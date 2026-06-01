@@ -840,7 +840,7 @@ mod tests {
             "default ContextParams must be Encrypted mode for this test"
         );
         let real_pseudonym = [0x5Au8; 32];
-        snapshot.routing = crate::context::manager::ContextRouting::Encrypted {
+        snapshot.routing = crate::context::manager::ContextRouting::Pseudonymous {
             local_pseudonym: real_pseudonym,
             pseudonym_registry: HashMap::new(),
         };
@@ -850,7 +850,7 @@ mod tests {
         // Routing must be the Broadcast marker, never zero-pseudonym Encrypted.
         match stripped.routing {
             crate::context::manager::ContextRouting::Broadcast => {}
-            crate::context::manager::ContextRouting::Encrypted {
+            crate::context::manager::ContextRouting::Pseudonymous {
                 local_pseudonym, ..
             } => {
                 panic!(

@@ -29,7 +29,7 @@ pub(super) fn build_routing_for_mode(
 ) -> ContextRouting {
     match mode {
         ContextMode::Broadcast => ContextRouting::Broadcast,
-        ContextMode::Encrypted => ContextRouting::Encrypted {
+        ContextMode::Encrypted => ContextRouting::Pseudonymous {
             local_pseudonym,
             pseudonym_registry: HashMap::new(),
         },
@@ -409,7 +409,7 @@ impl ContextManager {
         // always consistent by construction; the check is still cheap and
         // runs uniformly.
         match (ctx_snapshot.context_params.mode, &ctx_snapshot.routing) {
-            (ContextMode::Encrypted, ContextRouting::Encrypted { .. })
+            (ContextMode::Encrypted, ContextRouting::Pseudonymous { .. })
             | (ContextMode::Broadcast, ContextRouting::Broadcast) => {}
             (mode, routing) => {
                 return Err(ContextError::PersistenceFailed(format!(
@@ -2152,13 +2152,7 @@ impl ContextManager {
         if let Ok(ctx_arc) = self.get_context_arc(&context_id) {
             let mut guard = ctx_arc.lock().await;
             let ctx = &mut *guard;
-            if let ContextRouting::Encrypted {
-                local_pseudonym: stored,
-                ..
-            } = &mut ctx.routing
-            {
-                *stored = local_pseudonym;
-            }
+            ctx.routing.set_local_pseudonym(local_pseudonym);
         }
 
         // Phase 5: Capture the escrow hold after all mutations succeeded.
@@ -2224,16 +2218,34 @@ impl ContextManager {
                 return;
             };
             let guard = ctx_arc.lock().await;
-            match &guard.routing {
-                ContextRouting::Encrypted {
-                    local_pseudonym, ..
-                } => Some(*local_pseudonym),
-                ContextRouting::Broadcast => None,
+            // §9.10.4: never announce a pseudonym that has not been re-derived
+            // after a degraded restore. A degraded snapshot carries
+            // `local_pseudonym = [0u8; 32]` gated by `needs_reconnect = true`;
+            // announcing it here would publish the zero sentinel and poison
+            // peers' registries before the SDK re-derives the real pseudonym
+            // on reconnection. Skip until re-derivation has occurred.
+            let pseudonym = guard.routing.local_pseudonym();
+            if guard.epoch.needs_reconnect {
+                tracing::warn!(
+                    context_id = %context_id,
+                    "skipping pseudonym announcement — context needs reconnect; \
+                     pseudonym must be re-derived before announcing"
+                );
+                return;
             }
+            pseudonym
         };
         let Some(pseudonym) = pseudonym else {
             return;
         };
+        if pseudonym == [0u8; 32] {
+            tracing::warn!(
+                context_id = %context_id,
+                "skipping pseudonym announcement — local pseudonym is the zero \
+                 sentinel; it must be re-derived before announcing"
+            );
+            return;
+        }
         let announcement = super::PseudonymAnnouncement {
             tag: super::PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
             member_did: sender_did.as_ref().to_owned(),
@@ -2253,7 +2265,9 @@ impl ContextManager {
             tracing::warn!(
                 context_id = %context_id,
                 error = %e,
-                "failed to send pseudonym announcement — other members will use shared routing"
+                "failed to send pseudonym announcement — peers will not learn this \
+                 member's pseudonym until a later announcement succeeds; app-data \
+                 sends to this member are deferred until then"
             );
         }
     }
@@ -2518,10 +2532,7 @@ impl ContextManager {
 
             // §9.10.4: remove the departing member's pseudonym routing ID
             // from the registry. No-op on broadcast contexts.
-            if let ContextRouting::Encrypted {
-                pseudonym_registry, ..
-            } = &mut ctx.routing
-            {
+            if let Some(pseudonym_registry) = ctx.routing.peer_registry_mut() {
                 pseudonym_registry.remove(member_did);
             }
 

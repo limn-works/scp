@@ -487,7 +487,7 @@ async fn concurrent_joins_and_sends_do_not_corrupt_state() {
         let arc = manager.get_context_arc("conc-ctx").unwrap();
         let mut guard = arc.lock().await;
         let ctx = &mut *guard;
-        if let crate::context::manager::ContextRouting::Encrypted {
+        if let crate::context::manager::ContextRouting::Pseudonymous {
             pseudonym_registry, ..
         } = &mut ctx.routing
         {
@@ -1071,7 +1071,7 @@ async fn restore_respawns_ttl_timer() {
         // check accepts it. Non-zero local pseudonym, empty registry — this
         // restore test only exercises TTL-timer re-spawn, which is
         // routing-agnostic.
-        routing: crate::context::manager::ContextRouting::Encrypted {
+        routing: crate::context::manager::ContextRouting::Pseudonymous {
             local_pseudonym: [7u8; 32],
             pseudonym_registry: HashMap::new(),
         },
@@ -1173,7 +1173,7 @@ async fn restore_all_contexts_restores_persisted() {
             // Encrypted routing so the restore-path mode↔routing consistency
             // check accepts it. This test verifies that `restore_all_contexts`
             // lists and restores each persisted context — routing-agnostic.
-            routing: crate::context::manager::ContextRouting::Encrypted {
+            routing: crate::context::manager::ContextRouting::Pseudonymous {
                 local_pseudonym: [7u8; 32],
                 pseudonym_registry: HashMap::new(),
             },
@@ -1646,7 +1646,7 @@ async fn restore_preserves_spending_nonce_tracker_across_restart() {
         // Snapshot is explicitly `mode = Encrypted`; routing must match so the
         // restore-path consistency check accepts it. This test verifies the
         // spending-nonce tracker survives a restart — routing-agnostic.
-        routing: crate::context::manager::ContextRouting::Encrypted {
+        routing: crate::context::manager::ContextRouting::Pseudonymous {
             local_pseudonym: [7u8; 32],
             pseudonym_registry: HashMap::new(),
         },
@@ -1792,7 +1792,7 @@ fn reconnect_test_snapshot(
         // restore-path consistency check to accept it. The reconnect tests
         // that consume this helper assert on `needs_reconnect` flagging and
         // reconnection wiring, both routing-agnostic.
-        routing: crate::context::manager::ContextRouting::Encrypted {
+        routing: crate::context::manager::ContextRouting::Pseudonymous {
             local_pseudonym: [7u8; 32],
             pseudonym_registry: HashMap::new(),
         },
@@ -3617,7 +3617,7 @@ async fn restore_context_preserves_budget_tracker() {
     // these overrides keep `mode = Encrypted`. Pair it with Encrypted routing so
     // the restore-path mode↔routing consistency check accepts the snapshot; this
     // test verifies budget-grant preservation across restore, routing-agnostic.
-    snapshot.routing = crate::context::manager::ContextRouting::Encrypted {
+    snapshot.routing = crate::context::manager::ContextRouting::Pseudonymous {
         local_pseudonym: [7u8; 32],
         pseudonym_registry: HashMap::new(),
     };
@@ -3712,7 +3712,7 @@ async fn restore_context_validates_consequence_rules() {
     // snapshot clears the mode↔routing consistency check and reaches the
     // consequence-rule validation this test actually exercises (which must
     // still reject the config-inconsistent RevokeAccess rule below).
-    snapshot.routing = crate::context::manager::ContextRouting::Encrypted {
+    snapshot.routing = crate::context::manager::ContextRouting::Pseudonymous {
         local_pseudonym: [7u8; 32],
         pseudonym_registry: HashMap::new(),
     };
@@ -4626,7 +4626,7 @@ async fn registry_snapshot(
     let arc = manager.get_context_arc(context_id).unwrap();
     let guard = arc.lock().await;
     match &guard.routing {
-        super::ContextRouting::Encrypted {
+        super::ContextRouting::Pseudonymous {
             pseudonym_registry, ..
         } => pseudonym_registry
             .iter()
@@ -4788,6 +4788,60 @@ async fn two_member_encrypted_bootstrap_handshake_registries_converge() {
     );
 }
 
+/// FIX 3 (§9.10.4): `send_pseudonym_announcement` must NOT publish when the
+/// local pseudonym is the zero sentinel (a degraded restore carries
+/// `local_pseudonym = [0u8; 32]`). Announcing the zero value would poison
+/// peers' registries before the SDK re-derives the real pseudonym.
+#[tokio::test]
+async fn send_pseudonym_announcement_skips_zero_pseudonym() {
+    const CTX: &str = "zero-pseudonym-ctx";
+    const ALICE: &str = "did:key:alice";
+    const BOB: &str = "did:key:bob";
+
+    // Create with the zero pseudonym (mirrors a degraded restore).
+    let (mgr, handle, routing_ids) = setup_handshake_node(ALICE, BOB, CTX, [0u8; 32]).await;
+
+    let alice_did: DID = ALICE.into();
+    let alice_sk = signing_key_for_did(&alice_did);
+    mgr.send_pseudonym_announcement(&handle, &alice_did, &alice_sk)
+        .await;
+
+    let sent = routing_ids.lock().unwrap();
+    assert!(
+        sent.is_empty(),
+        "no announcement may be sent when the local pseudonym is the zero sentinel, got {sent:?}"
+    );
+}
+
+/// FIX 3 (§9.10.4): `send_pseudonym_announcement` must NOT publish when the
+/// context is flagged `needs_reconnect`, even if a (stale) pseudonym is set —
+/// re-derivation must complete first.
+#[tokio::test]
+async fn send_pseudonym_announcement_skips_when_needs_reconnect() {
+    const CTX: &str = "needs-reconnect-pseudonym-ctx";
+    const ALICE: &str = "did:key:alice";
+    const BOB: &str = "did:key:bob";
+
+    // Create with a real pseudonym, then flag the context needs_reconnect.
+    let (mgr, handle, routing_ids) = setup_handshake_node(ALICE, BOB, CTX, [0xA1u8; 32]).await;
+    {
+        let arc = mgr.get_context_arc(CTX).unwrap();
+        let mut guard = arc.lock().await;
+        guard.epoch.needs_reconnect = true;
+    }
+
+    let alice_did: DID = ALICE.into();
+    let alice_sk = signing_key_for_did(&alice_did);
+    mgr.send_pseudonym_announcement(&handle, &alice_did, &alice_sk)
+        .await;
+
+    let sent = routing_ids.lock().unwrap();
+    assert!(
+        sent.is_empty(),
+        "no announcement may be sent while the context needs reconnect, got {sent:?}"
+    );
+}
+
 // -----------------------------------------------------------------------
 // §9.10.4: stripped-public snapshot import round-trip + restore consistency
 // + degraded-snapshot no-op
@@ -4797,7 +4851,7 @@ async fn two_member_encrypted_bootstrap_handshake_registries_converge() {
 /// (`context_params.mode = Encrypted`, `routing = Broadcast`) must rebuild
 /// the routing from the caller-supplied pseudonym, NOT from the snapshot's
 /// `routing` field. The imported context must carry
-/// `ContextRouting::Encrypted { local_pseudonym: <caller-supplied>, registry: empty }`.
+/// `ContextRouting::Pseudonymous { local_pseudonym: <caller-supplied>, registry: empty }`.
 ///
 /// This is the import half of the export/strip/import round-trip: the strip
 /// step (tested in `export_import.rs`) emits a `Broadcast` routing marker for
@@ -4835,7 +4889,7 @@ async fn import_context_rebuilds_encrypted_routing_from_caller_pseudonym() {
         .clone();
     let guard = arc.lock().await;
     match &guard.routing {
-        super::ContextRouting::Encrypted {
+        super::ContextRouting::Pseudonymous {
             local_pseudonym,
             pseudonym_registry,
         } => {

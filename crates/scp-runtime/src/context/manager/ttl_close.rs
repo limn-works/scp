@@ -126,10 +126,7 @@ impl ContextManager {
                 // learned ephemeral state. The local pseudonym stays in the
                 // Encrypted variant because the variant shape is fixed at
                 // construction; post-close nothing reads it.
-                if let super::ContextRouting::Encrypted {
-                    pseudonym_registry, ..
-                } = &mut ctx.routing
-                {
+                if let Some(pseudonym_registry) = ctx.routing.peer_registry_mut() {
                     pseudonym_registry.clear();
                 }
 

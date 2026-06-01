@@ -811,7 +811,7 @@ pub struct ContextSnapshot {
     pub generation: u64,
     /// Per-context routing strategy (§9.10.4, §5.14).
     ///
-    /// [`ContextRouting::Encrypted`] carries the member's pre-derived
+    /// [`ContextRouting::Pseudonymous`] carries the member's pre-derived
     /// pseudonym and a registry of peer pseudonyms. [`ContextRouting::Broadcast`]
     /// uses the shared `SHA-256(context_id)` routing ID and carries no
     /// pseudonym state. Constructors build the correct variant from
@@ -1173,7 +1173,7 @@ pub enum ContextRouting {
     ///
     /// `DID` is `#[serde(transparent)]` over `String`, so the serialized wire
     /// format for `pseudonym_registry` is a plain string-keyed map.
-    Encrypted {
+    Pseudonymous {
         /// This member's pseudonym-derived routing ID.
         #[serde(with = "serde_bytes")]
         local_pseudonym: [u8; 32],
@@ -1181,8 +1181,62 @@ pub enum ContextRouting {
         pseudonym_registry: HashMap<DID, [u8; 32]>,
     },
     /// Broadcast context. Uses `SHA-256(context_id)` as the shared routing ID
-    /// per spec §5.14; no pseudonym state is retained.
+    /// per spec §5.14; no pseudonym state is retained. Note that broadcast
+    /// contexts are still MLS-encrypted at the content layer — this enum
+    /// splits on the *routing strategy* (per-member pseudonyms vs. a shared
+    /// derivable RID), not on whether encryption is in use.
     Broadcast,
+}
+
+impl ContextRouting {
+    /// Returns the local member's pseudonym routing ID for a pseudonymous
+    /// (encrypted) context, or `None` for a broadcast context.
+    pub(super) const fn local_pseudonym(&self) -> Option<[u8; 32]> {
+        match self {
+            Self::Pseudonymous {
+                local_pseudonym, ..
+            } => Some(*local_pseudonym),
+            Self::Broadcast => None,
+        }
+    }
+
+    /// Returns a read-only view of the peer pseudonym registry for a
+    /// pseudonymous (encrypted) context, or `None` for a broadcast context.
+    pub(super) const fn peer_registry(&self) -> Option<&HashMap<DID, [u8; 32]>> {
+        match self {
+            Self::Pseudonymous {
+                pseudonym_registry, ..
+            } => Some(pseudonym_registry),
+            Self::Broadcast => None,
+        }
+    }
+
+    /// Returns a mutable view of the peer pseudonym registry for a
+    /// pseudonymous (encrypted) context, or `None` for a broadcast context.
+    pub(super) const fn peer_registry_mut(&mut self) -> Option<&mut HashMap<DID, [u8; 32]>> {
+        match self {
+            Self::Pseudonymous {
+                pseudonym_registry, ..
+            } => Some(pseudonym_registry),
+            Self::Broadcast => None,
+        }
+    }
+
+    /// Returns `true` if this is a broadcast-routed context.
+    pub(super) const fn is_broadcast(&self) -> bool {
+        matches!(self, Self::Broadcast)
+    }
+
+    /// Sets the local member's pseudonym. No-op on a broadcast context, which
+    /// carries no pseudonym state.
+    pub(super) const fn set_local_pseudonym(&mut self, p: [u8; 32]) {
+        if let Self::Pseudonymous {
+            local_pseudonym, ..
+        } = self
+        {
+            *local_pseudonym = p;
+        }
+    }
 }
 
 /// Internal state tracked by the manager for each context.

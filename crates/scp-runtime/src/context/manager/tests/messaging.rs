@@ -174,7 +174,7 @@ async fn send_message_transport_failure_no_phantom_event() {
         ctx.access
             .access_key_store
             .set("test-ctx-fail", "did:key:peer", peer_key);
-        if let super::super::ContextRouting::Encrypted {
+        if let super::super::ContextRouting::Pseudonymous {
             pseudonym_registry, ..
         } = &mut ctx.routing
         {
@@ -434,7 +434,7 @@ async fn setup_two_member_verified_context() -> (
         // fan-out has a routing ID to target. In production this is populated
         // via PseudonymAnnouncement MLS messages; here we short-circuit the
         // round-trip.
-        if let super::super::ContextRouting::Encrypted {
+        if let super::super::ContextRouting::Pseudonymous {
             pseudonym_registry, ..
         } = &mut ctx.routing
         {
@@ -1397,7 +1397,7 @@ async fn send_message_produces_valid_outer_envelope() {
         ctx.access
             .access_key_store
             .set("envelope-test-ctx", "did:key:peer", peer_key);
-        if let super::super::ContextRouting::Encrypted {
+        if let super::super::ContextRouting::Pseudonymous {
             pseudonym_registry, ..
         } = &mut ctx.routing
         {
@@ -3785,7 +3785,7 @@ async fn setup_two_member_context_with(
         // §9.10.4: inject Bob's pseudonym into the registry so send_message's
         // fan-out has a routing ID to target. In production this is populated
         // via PseudonymAnnouncement MLS messages.
-        if let super::super::ContextRouting::Encrypted {
+        if let super::super::ContextRouting::Pseudonymous {
             pseudonym_registry, ..
         } = &mut ctx.routing
         {
@@ -4509,7 +4509,7 @@ async fn tool_invoke_happy_path_with_valid_spending_ucan() {
 // ---------------------------------------------------------------------------
 
 /// Verifies that creating an encrypted context stores the caller-supplied
-/// pseudonym in the context's `ContextRouting::Encrypted` variant.
+/// pseudonym in the context's `ContextRouting::Pseudonymous` variant.
 #[tokio::test]
 async fn create_context_with_pseudonym_stores_in_state() {
     let manager = ContextManager::new(
@@ -4568,8 +4568,8 @@ async fn local_pseudonym_errors_on_broadcast_context() {
 
     let result = manager.local_pseudonym("broadcast-no-pseudonym-ctx").await;
     assert!(
-        matches!(result, Err(ContextError::MembershipFailed(_))),
-        "broadcast contexts have no pseudonym; expected MembershipFailed, got {result:?}"
+        matches!(result, Err(ContextError::NotPseudonymousContext { .. })),
+        "broadcast contexts have no pseudonym; expected NotPseudonymousContext, got {result:?}"
     );
 }
 
@@ -4660,7 +4660,7 @@ async fn send_message_encrypted_uses_pseudonym_fanout() {
             .set("fanout-ctx", "did:key:bob", bob_access_key);
 
         // Insert a pseudonym for Bob into the registry.
-        if let super::super::ContextRouting::Encrypted {
+        if let super::super::ContextRouting::Pseudonymous {
             pseudonym_registry, ..
         } = &mut ctx.routing
         {
@@ -4757,7 +4757,7 @@ async fn send_message_encrypted_empty_registry_raises_pseudonym_registry_empty()
             .set("empty-reg-ctx", "did:key:bob", bob_access_key);
         // Sanity: confirm the registry is empty before the send.
         match &ctx.routing {
-            super::super::ContextRouting::Encrypted {
+            super::super::ContextRouting::Pseudonymous {
                 pseudonym_registry, ..
             } => assert!(
                 pseudonym_registry.is_empty(),
@@ -4857,7 +4857,10 @@ async fn send_message_announcement_uses_bootstrap_channel_with_empty_registry() 
         .await
         .unwrap();
 
-    // Add Bob as a second member; registry stays empty (no pseudonyms known).
+    // Add Bob as a second member AND seed his pseudonym in the registry. This
+    // lets us prove FIX 1: an announcement goes to the shared RID ONLY, never
+    // the union with known peer pseudonyms.
+    let bob_pseudonym = [0xB0u8; 32];
     {
         let arc = manager.get_context_arc("bootstrap-ctx").unwrap();
         let mut guard = arc.lock().await;
@@ -4870,6 +4873,10 @@ async fn send_message_announcement_uses_bootstrap_channel_with_empty_registry() 
         ctx.access
             .access_key_store
             .set("bootstrap-ctx", "did:key:bob", bob_access_key);
+        ctx.routing
+            .peer_registry_mut()
+            .expect("encrypted context has a peer registry")
+            .insert("did:key:bob".into(), bob_pseudonym);
     }
 
     // Alice announces her own pseudonym via the bootstrap channel.
@@ -4888,13 +4895,25 @@ async fn send_message_announcement_uses_bootstrap_channel_with_empty_registry() 
         .await
         .expect("announcement send must succeed via bootstrap channel");
 
-    // The send must address the shared context routing ID so peers whose
-    // pseudonym we have not yet learned still receive the announcement.
+    // FIX 1: the announcement must address the shared context routing ID
+    // EXCLUSIVELY — never the union with known peer pseudonyms. Sending the
+    // same MLS blob to both the shared RID and Bob's pseudonym would let a
+    // relay that derives context_routing_id link Bob's pseudonym to the
+    // context.
     let sent_rids = routing_ids.lock().unwrap();
     let shared_rid = scp_protocol::context::context_routing_id("bootstrap-ctx");
     assert!(
         sent_rids.contains(&shared_rid),
         "announcement must address the shared context routing ID (bootstrap channel)"
+    );
+    assert!(
+        !sent_rids.contains(&bob_pseudonym),
+        "announcement must NOT also be sent to peer pseudonyms — shared RID only"
+    );
+    assert_eq!(
+        sent_rids.iter().filter(|r| **r == shared_rid).count(),
+        sent_rids.len(),
+        "announcement send must contain ONLY the shared RID, got {sent_rids:?}"
     );
 }
 
@@ -4987,7 +5006,7 @@ async fn forged_pseudonym_announcement_rejected() {
         let arc = manager.get_context_arc("forge-ctx").unwrap();
         let guard = arc.lock().await;
         match &guard.routing {
-            super::super::ContextRouting::Encrypted {
+            super::super::ContextRouting::Pseudonymous {
                 pseudonym_registry, ..
             } => assert!(
                 !pseudonym_registry.contains_key("did:key:alice"),
@@ -4996,6 +5015,104 @@ async fn forged_pseudonym_announcement_rejected() {
             super::super::ContextRouting::Broadcast => {
                 panic!("forge-ctx was created encrypted; routing variant mismatch")
             }
+        }
+    }
+}
+
+/// FIX 2 (§9.10.4): a member announcing a RESERVED pseudonym value for their
+/// own DID must be rejected at ingest, and the registry must stay unchanged.
+/// Reserved values are the zero sentinel, the shared `context_routing_id`, and
+/// the `broadcast_routing_id`. Announcing one would let the member redirect
+/// every honest sender's app-data fan-out onto a leaky or meaningless RID.
+#[tokio::test]
+async fn reserved_pseudonym_announcement_rejected() {
+    use super::super::{PSEUDONYM_ANNOUNCEMENT_TAG, PseudonymAnnouncement};
+
+    const CTX: &str = "reserved-pseudonym-ctx";
+
+    let reserved_values: [[u8; 32]; 3] = [
+        [0u8; 32],
+        scp_protocol::context::context_routing_id(CTX),
+        scp_protocol::context::broadcast_routing_id(CTX),
+    ];
+
+    for reserved in reserved_values {
+        let manager = ContextManager::new(
+            Box::new(MockCrypto::default()),
+            Box::new(MockTransport::connected()),
+            Box::new(MockEventLog::default()),
+            noop_key_resolver(),
+        );
+
+        manager.register_local_did("did:key:alice".into()).await;
+
+        let _handle = manager
+            .create_context(
+                CTX.into(),
+                governance_params(),
+                "did:key:alice".into(),
+                [0u8; 32],
+            )
+            .await
+            .unwrap();
+
+        // Add Bob as a member who will (maliciously) announce a reserved value.
+        {
+            let arc = manager.get_context_arc(CTX).unwrap();
+            let mut guard = arc.lock().await;
+            let ctx = &mut *guard;
+            ctx.membership
+                .add_member("did:key:bob".into(), "member".into(), vec![]);
+            ctx.role_state.members.insert("did:key:bob".to_owned());
+            let bob_did: DID = "did:key:bob".into();
+            let _ = scp_protocol::context::roles::system_assign_role(
+                &mut ctx.role_state,
+                &bob_did,
+                "member",
+                &scp_primitives::SystemClock,
+            );
+        }
+
+        let announcement = PseudonymAnnouncement {
+            tag: PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+            member_did: "did:key:bob".to_owned(),
+            pseudonym: reserved,
+        };
+        let payload = rmp_serde::to_vec_named(&announcement).unwrap();
+        let context_id_bytes = scp_protocol::context::context_id_bytes(CTX);
+        let inner = minimal_inner_envelope(CTX, "did:key:bob", 1);
+
+        let result = manager
+            .deliver_message_and_drain_buffered(
+                CTX,
+                &context_id_bytes,
+                "did:key:bob",
+                &inner,
+                &payload,
+                false,
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(scp_protocol::context::ContextError::PermissionDenied(_))
+            ),
+            "reserved pseudonym {reserved:?} must be rejected, got {result:?}"
+        );
+
+        // Registry must be unchanged — Bob's reserved value was not inserted.
+        {
+            let arc = manager.get_context_arc(CTX).unwrap();
+            let guard = arc.lock().await;
+            let registry = guard
+                .routing
+                .peer_registry()
+                .expect("encrypted context has a peer registry");
+            assert!(
+                !registry.contains_key("did:key:bob"),
+                "reserved pseudonym {reserved:?} must not be stored in the registry"
+            );
         }
     }
 }
