@@ -4164,16 +4164,38 @@ async fn flush_all_contexts_persists_degraded_snapshot_for_locked_context() {
         .unwrap();
 
     // `create_context` -> `finalize_create` -> `persist_context_and_broadcast`
-    // writes a good (non-degraded) snapshot synchronously. The bug-catcher
-    // PR 2 preservation guard (commit `11a884968`) correctly refuses to
-    // clobber that good snapshot with a degraded one under transient
-    // contention. To exercise the raw "no prior snapshot → degraded write
-    // fires" path (the original AC3 bug 1 scenario), clear the mock's
-    // persisted state before inducing contention. This simulates a context
-    // whose prior snapshot was never persisted (or was evicted), which is
-    // the only scenario where the degraded marker is load-bearing for
-    // `restore_context` to find the reconnect signal.
-    shared_persistence.contexts.lock().unwrap().clear();
+    // writes a good (non-degraded) snapshot synchronously. The preservation
+    // guard correctly refuses to clobber that good snapshot with a degraded
+    // one under transient contention. To exercise the legitimate
+    // "carry-forward degraded write fires" path, replace the good snapshot
+    // with a prior DEGRADED snapshot before inducing contention.
+    //
+    // The degraded-flush path no-ops when there is NO prior snapshot (the mode
+    // would be unknowable, so it refuses to write a shape-inconsistent record).
+    // A prior degraded snapshot both (a) anchors `context_params.mode` for the
+    // carry-forward write and (b) is the only scenario where the degraded
+    // marker is load-bearing for `restore_context` to find the reconnect
+    // signal. This mirrors `persist_degraded_snapshot_overwrites_prior_degraded_snapshot`.
+    {
+        use super::ContextPersistence as _;
+        let mut seeded = super::ContextManager::build_degraded_snapshot(
+            "locked-ctx",
+            scp_protocol::context::ContextMode::Encrypted,
+        );
+        seeded.needs_reconnect = true;
+        // Distinguishing marker: a non-empty crypto blob. The degraded-flush
+        // write produces an EMPTY crypto state, so the post-flush assertion
+        // `mls_crypto_state.is_empty()` only holds if the flush actually
+        // overwrote this seed — proving the carry-forward degraded write fired
+        // rather than the seed merely surviving.
+        seeded.mls_crypto_state = vec![0xAB, 0xCD];
+        let mut map = shared_persistence.contexts.lock().unwrap();
+        map.clear();
+        drop(map);
+        shared_persistence
+            .persist_context("locked-ctx", &seeded)
+            .unwrap();
+    }
 
     // Acquire the per-context lock and hold it across the flush. The flush's
     // per-context lock-acquisition budget is 250ms; we hold the lock for
