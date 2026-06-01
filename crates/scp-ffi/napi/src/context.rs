@@ -199,6 +199,20 @@ impl NapiContextHandle {
         self.mode.clone()
     }
 
+    /// Returns `true` if this handle's stored mode is broadcast.
+    ///
+    /// The stored `mode` string can arrive in either casing — the TS SDK sends
+    /// Titlecase (`"Broadcast"`), while the common parser
+    /// (`scp_ffi_common::context_params`) and other callers accept lowercase
+    /// (`"broadcast"`). Comparing case-insensitively here keeps broadcast
+    /// detection consistent across `context_create`, `context_join`,
+    /// `context_subscribe`, and the pseudonym-announcement paths so a broadcast
+    /// context is never misrouted into the encrypted pseudonym-derivation path
+    /// (which hard-errors `SCP-IDENT-1052` in non-custody builds).
+    fn is_broadcast(&self) -> bool {
+        self.mode.eq_ignore_ascii_case("broadcast")
+    }
+
     /// Returns the capability ceiling for this context.
     #[napi(getter)]
     #[must_use]
@@ -582,6 +596,19 @@ pub(crate) async fn context_create_on(
             })
         })?;
 
+    // Determine broadcast mode from the AUTHORITATIVE parsed `ContextMode`
+    // enum rather than a case-sensitive comparison on the raw `mode_str`. The
+    // TS SDK sends Titlecase (`"Broadcast"`) and the common parser also accepts
+    // lowercase, so a substring/case-sensitive `mode_str == "broadcast"` check
+    // would misclassify a `"Broadcast"` context as encrypted, route it into the
+    // pseudonym-derivation path, and hard-error `SCP-IDENT-1052` in non-custody
+    // builds — denying broadcast creation. Matching the parsed enum closes that
+    // casing split (mirrors the `context_import` path).
+    let is_broadcast = matches!(
+        context_params.mode,
+        scp_core::context::params::ContextMode::Broadcast
+    );
+
     // Initialize the ContextManager if not already done (first context_create call).
     // Passes the creator DID to MlsCryptoProvider for real MLS encryption (#1294).
     crate::runtime::init_context_manager(bi, &creator_did);
@@ -594,7 +621,7 @@ pub(crate) async fn context_create_on(
     // requirement with no cryptographic basis, denying broadcast creation when
     // custody is absent. Encrypted/pseudonymous contexts require a real
     // pseudonym — derivation failure there is a hard error, no silent fallback.
-    let local_pseudonym = if mode_str == "broadcast" {
+    let local_pseudonym = if is_broadcast {
         [0u8; 32]
     } else {
         derive_context_pseudonym(identity, &context_id).await?
@@ -620,7 +647,7 @@ pub(crate) async fn context_create_on(
     // contexts this is a no-op (no recipients), but on restored/imported
     // contexts with existing members the announcement is needed. Skipped for
     // broadcast contexts — spec §5.14 uses a shared routing ID.
-    if mode_str != "broadcast" {
+    if !is_broadcast {
         #[cfg(feature = "allow_in_memory_custody")]
         {
             let custody_and_key = crate::runtime::with_identity(bi, &creator_did, |e| {
@@ -729,7 +756,7 @@ pub(crate) async fn context_join_on(
     // Encrypted/pseudonymous joins require a real pseudonym: derivation failure
     // there is a hard error, no silent fallback.
     let context_id = handle.context_id.clone();
-    let is_broadcast = handle.mode() == "Broadcast";
+    let is_broadcast = handle.is_broadcast();
     let local_pseudonym: [u8; 32] = if is_broadcast {
         [0u8; 32]
     } else {
@@ -784,7 +811,7 @@ pub(crate) async fn context_join_on(
 
     // §9.10.4: Send pseudonym announcement to inform existing members.
     // Broadcast contexts have no per-member pseudonyms; skip.
-    if handle.mode != "broadcast" {
+    if !handle.is_broadcast() {
         #[cfg(feature = "allow_in_memory_custody")]
         {
             // Extract custody + key handle from registry (sync), then export
@@ -1120,7 +1147,7 @@ pub(crate) async fn context_subscribe_on(
     let bridge_cancel = bi_core.cancel_token();
 
     let context_id = handle.context_id.clone();
-    let is_broadcast = handle.mode() == "Broadcast";
+    let is_broadcast = handle.is_broadcast();
     // §9.10.4 / §5.14: choose the correct shared routing ID based on context
     // mode. Broadcast contexts use `broadcast_routing_id` = SHA-256(context_id)
     // (plain hash, matching the send path in messaging.rs). Encrypted contexts
