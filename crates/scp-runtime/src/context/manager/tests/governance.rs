@@ -9055,6 +9055,27 @@ async fn test_remaining_members_unaffected_after_removal() {
             .unwrap();
     }
 
+    // Populate the pseudonym registry for the joined members, mimicking the
+    // `PseudonymAnnouncement` exchange that normally runs after a join. Without
+    // this, an encrypted multi-member `send_message` correctly returns
+    // `PseudonymRegistryEmpty` (no peer pseudonym to fan out to). The test's
+    // point is that a *remaining* member can still send after a removal, so the
+    // registry must hold real pseudonyms for the surviving fan-out path to run.
+    {
+        let arc = manager.get_context_arc("remain2-ctx").unwrap();
+        let mut guard = arc.lock().await;
+        let ctx = &mut *guard;
+        if let crate::context::manager::ContextRouting::Encrypted {
+            pseudonym_registry, ..
+        } = &mut ctx.routing
+        {
+            pseudonym_registry.insert(alice.clone(), [0xA1u8; 32]);
+            pseudonym_registry.insert(bob.clone(), [0xB0u8; 32]);
+        } else {
+            panic!("encrypted context must use Encrypted routing");
+        }
+    }
+
     // Remove Bob.
     let action = scp_protocol::context::governance::GovernanceAction::RemoveMember {
         did: bob.clone(),

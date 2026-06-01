@@ -476,6 +476,27 @@ async fn concurrent_joins_and_sends_do_not_corrupt_state() {
 
     let handle = std::sync::Arc::new(handle);
 
+    // Seed the pseudonym registry with one known peer before the sends race
+    // against the joins, mimicking a `PseudonymAnnouncement` having already
+    // landed. An encrypted multi-member send into an empty registry correctly
+    // returns `PseudonymRegistryEmpty`; this test is about concurrency-safety
+    // of the contexts map under interleaved joins and sends, not the
+    // bootstrap-deadlock path, so the registry must stay non-empty for the
+    // real fan-out to run while members are being added concurrently.
+    {
+        let arc = manager.get_context_arc("conc-ctx").unwrap();
+        let mut guard = arc.lock().await;
+        let ctx = &mut *guard;
+        if let crate::context::manager::ContextRouting::Encrypted {
+            pseudonym_registry, ..
+        } = &mut ctx.routing
+        {
+            pseudonym_registry.insert("did:key:member-0".into(), [0x10u8; 32]);
+        } else {
+            panic!("encrypted context must use Encrypted routing");
+        }
+    }
+
     // Spawn 10 concurrent join tasks.
     let mut join_handles = Vec::new();
     for i in 0..10u32 {
