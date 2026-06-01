@@ -1020,55 +1020,64 @@ fn cites_durable_provenance(reason: &str) -> bool {
     has_numbered("ADR-") || has_numbered("SCP-") || has_numbered("§")
 }
 
-/// Extracts every `ADR-NNN` token cited in `text` (the digit run after each
-/// `ADR-`). Maximal digit run, so `ADR-034` yields `ADR-034`, never the
-/// prefix `ADR-03`.
-fn cited_adrs(text: &str) -> Vec<String> {
+/// Extracts every `{prefix}NNN` token cited in `text` (maximal digit run after
+/// each `prefix`). `cited_tokens("per ADR-034", "ADR-")` yields `["ADR-034"]`,
+/// never the prefix `ADR-03` — the maximal run is what makes the existence
+/// check reject a fabricated `ADR-3` that happens to be a prefix of a real
+/// `ADR-34`. `prefix` is ASCII here (`ADR-` / `SCP-`), so `i + prefix.len()`
+/// lands on a char boundary and the slice is safe.
+fn cited_tokens(text: &str, prefix: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for (i, _) in text.match_indices("ADR-") {
-        let digits: String = text[i + "ADR-".len()..]
+    for (i, _) in text.match_indices(prefix) {
+        let digits: String = text[i + prefix.len()..]
             .chars()
             .take_while(char::is_ascii_digit)
             .collect();
         if !digits.is_empty() {
-            out.push(format!("ADR-{digits}"));
+            out.push(format!("{prefix}{digits}"));
         }
     }
     out
 }
 
-/// The set of ADR tokens that actually EXIST in the repo, read once from
-/// `.docs/adrs/`. ADRs are filed both as standalone `ADR-NNN-*.md` files and
-/// as headings inside `phase-N.md`, so the reliable existence signal is the
-/// set of `ADR-NNN` tokens appearing anywhere in the corpus. Used to turn the
-/// exemption gate from "cites something ADR-shaped" into "cites a real ADR" —
-/// a fabricated `ADR-999` no longer satisfies the gate. (Spec `§` sections and
-/// `SCP-NNN` stories are accepted on shape alone: spec section numbers are not
-/// single-token-greppable against one file, and PRD stories are scattered
-/// across `.docs/prds/`; the ADR check covers the dominant provenance form
-/// used by every current exemption.)
+/// The set of `{prefix}NNN` tokens that actually EXIST under `rel_dir`, read
+/// once. ADRs are filed both as standalone `ADR-NNN-*.md` and as headings
+/// inside `phase-N.md`; PRD stories are scattered across `.docs/prds/*.json` —
+/// in both cases the reliable existence signal is the set of tokens appearing
+/// anywhere in the corpus. This turns the exemption gate from "cites something
+/// ADR-/SCP-shaped" into "cites a REAL artifact": a fabricated `ADR-999` /
+/// `SCP-9999` no longer satisfies the gate.
+fn prefixed_tokens_under(rel_dir: &str, prefix: &str) -> BTreeSet<String> {
+    let dir = workspace_root().join(rel_dir);
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    let mut set = BTreeSet::new();
+    for entry in entries {
+        let path = entry.expect("doc dir entry").path();
+        if path.is_file() {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            set.extend(cited_tokens(&text, prefix));
+        }
+    }
+    assert!(
+        !set.is_empty(),
+        "no {prefix}NNN tokens found under {} — the provenance existence \
+         check cannot function; has the directory moved?",
+        dir.display()
+    );
+    set
+}
+
+/// `ADR-NNN` tokens that exist under `.docs/adrs/`.
 fn adrs_in_repo() -> &'static BTreeSet<String> {
     static CELL: OnceLock<BTreeSet<String>> = OnceLock::new();
-    CELL.get_or_init(|| {
-        let dir = workspace_root().join(".docs/adrs");
-        let entries = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
-        let mut set = BTreeSet::new();
-        for entry in entries {
-            let path = entry.expect("adr dir entry").path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                let text = std::fs::read_to_string(&path).unwrap_or_default();
-                set.extend(cited_adrs(&text));
-            }
-        }
-        assert!(
-            !set.is_empty(),
-            "no ADR tokens found under {} — the provenance existence check \
-             cannot function; has the ADR directory moved?",
-            dir.display()
-        );
-        set
-    })
+    CELL.get_or_init(|| prefixed_tokens_under(".docs/adrs", "ADR-"))
+}
+
+/// `SCP-NNN` PRD-story tokens that exist under `.docs/prds/`.
+fn scp_stories_in_repo() -> &'static BTreeSet<String> {
+    static CELL: OnceLock<BTreeSet<String>> = OnceLock::new();
+    CELL.get_or_init(|| prefixed_tokens_under(".docs/prds", "SCP-"))
 }
 
 /// Every per-bridge exemption MUST justify itself by citing a durable
@@ -1096,18 +1105,35 @@ fn every_exemption_reason_cites_durable_provenance() {
                 ));
                 continue;
             }
-            // Shape is necessary but not sufficient: a cited ADR must EXIST.
-            // This rejects a fabricated `ADR-999` reason that would otherwise
-            // pass the shape check and silently substantiate a bogus exemption.
-            let fabricated: Vec<String> = cited_adrs(&entry.reason)
+            // Shape is necessary but not sufficient: a cited ADR or SCP story
+            // must EXIST. This rejects a fabricated `ADR-999` / `SCP-9999`
+            // reason that would otherwise pass the shape check and silently
+            // substantiate a bogus exemption forever. Both `.docs/adrs/` and
+            // `.docs/prds/` are token-greppable, so both synonyms are closed.
+            // Spec `§` sections remain shape-only — section numbers like
+            // `§9.16` are not a single greppable token against the multi-file
+            // spec — but a reason citing only a bare `§` cannot lean on the
+            // ADR/SCP synonyms to dodge existence verification.
+            let fabricated_adrs: Vec<String> = cited_tokens(&entry.reason, "ADR-")
                 .into_iter()
-                .filter(|adr| !adrs_in_repo().contains(adr))
+                .filter(|t| !adrs_in_repo().contains(t))
                 .collect();
-            if !fabricated.is_empty() {
+            let fabricated_stories: Vec<String> = cited_tokens(&entry.reason, "SCP-")
+                .into_iter()
+                .filter(|t| !scp_stories_in_repo().contains(t))
+                .collect();
+            if !fabricated_adrs.is_empty() {
                 offenders.push(format!(
                     "{bridge}/{}: reason {:?} cites non-existent ADR(s) {:?} \
                      (no matching file/heading under .docs/adrs/)",
-                    entry.canonical, entry.reason, fabricated
+                    entry.canonical, entry.reason, fabricated_adrs
+                ));
+            }
+            if !fabricated_stories.is_empty() {
+                offenders.push(format!(
+                    "{bridge}/{}: reason {:?} cites non-existent PRD story(s) \
+                     {:?} (no matching SCP-NNN under .docs/prds/)",
+                    entry.canonical, entry.reason, fabricated_stories
                 ));
             }
         }
@@ -1116,7 +1142,7 @@ fn every_exemption_reason_cites_durable_provenance() {
         offenders.is_empty(),
         "bridge-aliases.json exemption(s) lack durable provenance \
          (cite a REAL ADR-NNN, spec §section, or SCP-NNN story — not an issue \
-         number, not a hand-wave, not a fabricated ADR): {offenders:#?}"
+         number, not a hand-wave, not a fabricated ADR/story): {offenders:#?}"
     );
 }
 
@@ -1146,26 +1172,40 @@ fn provenance_detector_rejects_hand_waves_and_issue_refs() {
 }
 
 #[test]
-fn cited_adrs_extracts_maximal_digit_runs() {
-    assert_eq!(cited_adrs("per ADR-034 and ADR-3"), ["ADR-034", "ADR-3"]);
-    assert_eq!(cited_adrs("no adr here"), Vec::<String>::new());
-    // `ADR-` with no trailing digit yields nothing.
-    assert_eq!(cited_adrs("an ADR- without a number"), Vec::<String>::new());
+fn cited_tokens_extracts_maximal_digit_runs() {
+    assert_eq!(
+        cited_tokens("per ADR-034 and ADR-3", "ADR-"),
+        ["ADR-034", "ADR-3"]
+    );
+    assert_eq!(cited_tokens("tracked by SCP-214", "SCP-"), ["SCP-214"]);
+    assert_eq!(cited_tokens("no token here", "ADR-"), Vec::<String>::new());
+    // Prefix with no trailing digit yields nothing.
+    assert_eq!(
+        cited_tokens("an ADR- without a number", "ADR-"),
+        Vec::<String>::new()
+    );
 }
 
-/// The existence check backing the exemption gate: a real ADR is present in
-/// the corpus; a fabricated one is not. This is what makes the gate reject a
-/// shape-valid-but-bogus reason like "WASM gap, see ADR-999".
+/// The existence check backing the exemption gate: a real artifact is present
+/// in its corpus; a fabricated one is not. This is what makes the gate reject
+/// shape-valid-but-bogus reasons like "WASM gap, see ADR-999" / "see SCP-9999".
 #[test]
-fn provenance_existence_distinguishes_real_from_fabricated_adr() {
+fn provenance_existence_distinguishes_real_from_fabricated() {
     let adrs = adrs_in_repo();
     // ADR-048 is this very document; ADR-034 governs WASM constraints and is
     // cited by every current wasm exemption — both must be present.
     assert!(adrs.contains("ADR-048"), "ADR-048 should exist in corpus");
     assert!(adrs.contains("ADR-034"), "ADR-034 should exist in corpus");
     // A fabricated ADR must NOT be present (the prefix `ADR-9` of a real ADR
-    // must not produce a false positive either).
+    // must not produce a false positive either — maximal-run extraction).
     assert!(!adrs.contains("ADR-999"), "ADR-999 must not exist");
+
+    let stories = scp_stories_in_repo();
+    assert!(
+        stories.contains("SCP-214"),
+        "SCP-214 should exist in corpus"
+    );
+    assert!(!stories.contains("SCP-9999"), "SCP-9999 must not exist");
 }
 
 /// WASM bridge has intentionally fewer operations per ADR-034.
@@ -2645,75 +2685,101 @@ fn scan_pure_helpers() -> Vec<PureHelperViolation> {
                 .unwrap_or(&file_path)
                 .to_string_lossy()
                 .replace('\\', "/");
-            for item in &parsed.items {
-                if let syn::Item::Impl(item_impl) = item {
-                    if attrs_contain_cfg_test(&item_impl.attrs) {
-                        continue;
-                    }
-                    // Trait impls (`impl Trait for Type`) are out of scope:
-                    // the trait dictates the signature, not the FFI author.
-                    // `Drop::drop(&mut self)`, `Display::fmt(&self, …)`,
-                    // and the bridge-adapter traits (`BridgeDidResolver`,
-                    // `BridgeNonceTracker`, `ContextProvider`, …) all
-                    // require `self`-shaped methods even when the impl body
-                    // delegates to a free fn. ADR-048 §1 is about INHERENT
-                    // impls that the binding tooling actually exports as
-                    // methods on the language-level SCP class — those are
-                    // what the test catches when an author binds a pure
-                    // validator to the receiver.
-                    if item_impl.trait_.is_some() {
-                        continue;
-                    }
-                    // §1 applies to methods the FFI binding tooling actually
-                    // EXPORTS. A method is exported when the impl block carries
-                    // the macro (`#[pymethods]` / `#[napi]` / `#[uniffi::export]`
-                    // / `#[wasm_bindgen]` — the dominant pattern) OR the method
-                    // itself carries it (rare but legal — e.g. an individual
-                    // `#[uniffi::export]` / `#[napi]` method inside an
-                    // otherwise-undecorated impl). A method in a FULLY
-                    // undecorated impl produces no export, so "should this be a
-                    // free fn?" is internal coding style, not an enforcement
-                    // matter — real instance: `impl WasmContextManager { ... }`
-                    // hosts internal helpers called from `#[wasm_bindgen] pub fn
-                    // context_*` free fns, not exposed as JS methods. This
-                    // mirrors the strict alias scanner's `visit_impl_item_fn`
-                    // exactly (block-decorated OR fn-decorated), closing the
-                    // gap where a pure `&self` helper decorated per-method in an
-                    // undecorated impl would evade the gate while still counting
-                    // as an export.
-                    let impl_decorated = attrs_have_impl_block_ffi_export(&item_impl.attrs);
-                    for impl_item in &item_impl.items {
-                        let syn::ImplItem::Fn(method) = impl_item else {
-                            continue;
-                        };
-                        if attrs_contain_cfg_test(&method.attrs) {
-                            continue;
-                        }
-                        let fn_decorated = attrs_have_free_fn_ffi_export(&method.attrs);
-                        if !impl_decorated && !fn_decorated {
-                            continue;
-                        }
-                        if !impl_method_has_self_receiver(method) {
-                            continue;
-                        }
-                        if method_uses_self_outside_receiver(method) {
-                            continue;
-                        }
-                        let name = method.sig.ident.to_string();
-                        let key = format!("{rel}::{name}");
-                        if allowlist.contains(&key) {
-                            continue;
-                        }
-                        violations.push(PureHelperViolation {
-                            file_rel: rel.clone(),
-                            method_name: name,
-                        });
-                    }
-                }
-            }
+            scan_items_for_pure_helpers(&parsed.items, &rel, &allowlist, &mut violations);
         }
     }
     violations
+}
+
+/// Recursive worker for [`scan_pure_helpers`]. Flags pure-helper §1 violations
+/// in FFI-exported inherent impls and DESCENDS INTO inline `mod { … }` blocks,
+/// so a decorated impl nested in a module is not missed. The module recursion
+/// matches the strict alias scanner's `visit_item_mod`, keeping the two
+/// scanners' reachability identical.
+fn scan_items_for_pure_helpers(
+    items: &[syn::Item],
+    rel: &str,
+    allowlist: &HashSet<String>,
+    out: &mut Vec<PureHelperViolation>,
+) {
+    for item in items {
+        match item {
+            // Recurse into inline modules (skipping `#[cfg(test)] mod`). The
+            // alias scanner descends here too; not doing so would let a
+            // decorated impl inside `mod foo { … }` evade the §1 gate.
+            syn::Item::Mod(item_mod) => {
+                if attrs_contain_cfg_test(&item_mod.attrs) {
+                    continue;
+                }
+                if let Some((_, inner)) = &item_mod.content {
+                    scan_items_for_pure_helpers(inner, rel, allowlist, out);
+                }
+            }
+            syn::Item::Impl(item_impl) => {
+                if attrs_contain_cfg_test(&item_impl.attrs) {
+                    continue;
+                }
+                // Trait impls (`impl Trait for Type`) are out of scope: the
+                // trait dictates the signature, not the FFI author.
+                // `Drop::drop(&mut self)`, `Display::fmt(&self, …)`, and the
+                // bridge-adapter traits (`BridgeDidResolver`,
+                // `BridgeNonceTracker`, `ContextProvider`, …) all require
+                // `self`-shaped methods even when the impl body delegates to a
+                // free fn. ADR-048 §1 is about INHERENT impls that the binding
+                // tooling actually exports as methods on the language-level SCP
+                // class — those are what the test catches when an author binds
+                // a pure validator to the receiver.
+                if item_impl.trait_.is_some() {
+                    continue;
+                }
+                // §1 applies to methods the FFI binding tooling actually
+                // EXPORTS. A method is exported when the impl block carries the
+                // macro (`#[pymethods]` / `#[napi]` / `#[uniffi::export]` /
+                // `#[wasm_bindgen]` — the dominant pattern) OR the method itself
+                // carries it (rare but legal — e.g. an individual
+                // `#[uniffi::export]` / `#[napi]` method inside an
+                // otherwise-undecorated impl). A method in a FULLY undecorated
+                // impl produces no export, so "should this be a free fn?" is
+                // internal coding style, not an enforcement matter — real
+                // instance: `impl WasmContextManager { ... }` hosts internal
+                // helpers called from `#[wasm_bindgen] pub fn context_*` free
+                // fns, not exposed as JS methods. This mirrors the strict alias
+                // scanner's `visit_impl_item_fn` exactly (block-decorated OR
+                // fn-decorated), closing the gap where a pure `&self` helper
+                // decorated per-method in an undecorated impl would evade the
+                // gate while still counting as an export.
+                let impl_decorated = attrs_have_impl_block_ffi_export(&item_impl.attrs);
+                for impl_item in &item_impl.items {
+                    let syn::ImplItem::Fn(method) = impl_item else {
+                        continue;
+                    };
+                    if attrs_contain_cfg_test(&method.attrs) {
+                        continue;
+                    }
+                    let fn_decorated = attrs_have_free_fn_ffi_export(&method.attrs);
+                    if !impl_decorated && !fn_decorated {
+                        continue;
+                    }
+                    if !impl_method_has_self_receiver(method) {
+                        continue;
+                    }
+                    if method_uses_self_outside_receiver(method) {
+                        continue;
+                    }
+                    let name = method.sig.ident.to_string();
+                    let key = format!("{rel}::{name}");
+                    if allowlist.contains(&key) {
+                        continue;
+                    }
+                    out.push(PureHelperViolation {
+                        file_rel: rel.to_owned(),
+                        method_name: name,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[test]
@@ -2840,21 +2906,50 @@ fn pure_helpers_scanner_descends_into_per_method_decorated_undecorated_impl() {
             _ => None,
         })
         .unwrap();
-    // The impl block is undecorated, but the method carries `#[uniffi::export]`.
+    // The scanner's in-scope gate is `impl_decorated || fn_decorated`. Here the
+    // block is UNDECORATED, so the `fn_decorated` operand is the one that must
+    // carry the method into §1 scope — that is the gap this closes.
     assert!(
         !attrs_have_impl_block_ffi_export(&item_impl.attrs),
-        "impl block must be undecorated for this test"
+        "impl block must be undecorated for this test to exercise the gap"
     );
-    let impl_decorated = attrs_have_impl_block_ffi_export(&item_impl.attrs);
-    let fn_decorated = attrs_have_free_fn_ffi_export(&method.attrs);
     assert!(
-        impl_decorated || fn_decorated,
+        attrs_have_free_fn_ffi_export(&method.attrs),
         "per-method FFI decoration must bring the method into §1 scope even \
-         when the impl block is undecorated (the gate the scanner applies)"
+         when the impl block is undecorated"
     );
     // And it is a genuine pure-helper violation that must be flagged.
     assert!(impl_method_has_self_receiver(method));
     assert!(!method_uses_self_outside_receiver(method));
+}
+
+/// The pure-helpers scanner must DESCEND into inline `mod { … }` blocks, just
+/// like the strict alias scanner's `visit_item_mod`. A pure `&self` helper in a
+/// decorated impl nested in a module would otherwise evade §1 while still being
+/// an export. Drives `scan_items_for_pure_helpers` directly on parsed source.
+#[test]
+fn pure_helpers_scanner_recurses_into_inline_modules() {
+    let src = "
+        mod inner {
+            struct Scp;
+            #[uniffi::export]
+            impl Scp {
+                pub fn pure_validator(&self, input: &str) -> bool {
+                    !input.is_empty()
+                }
+            }
+        }
+    ";
+    let parsed = syn::parse_file(src).unwrap();
+    let allowlist: HashSet<String> = HashSet::new();
+    let mut out: Vec<PureHelperViolation> = Vec::new();
+    scan_items_for_pure_helpers(&parsed.items, "test.rs", &allowlist, &mut out);
+    assert_eq!(
+        out.len(),
+        1,
+        "a decorated impl nested in `mod` must be scanned (module recursion)"
+    );
+    assert_eq!(out[0].method_name, "pure_validator");
 }
 
 /// Locks the false-positive guards from ADR-048 §1: methods that use
