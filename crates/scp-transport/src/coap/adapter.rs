@@ -505,7 +505,7 @@ impl TransportAdapter for CoapAdapter {
                                     Ok(event) => Some((event, obs_state)),
                                     Err(terminated_event) => {
                                         obs_state.terminated = true;
-                                        Some((terminated_event, obs_state))
+                                        Some((*terminated_event, obs_state))
                                     }
                                 }
                             }
@@ -691,17 +691,22 @@ struct ObserveState {
 ///
 /// Validates the packet is an Observe notification with matching token and
 /// correct content format, then extracts the envelope from the payload.
+///
+/// The `Ok` variant carries the next event to yield; the `Err` variant
+/// signals that the Observe stream has terminated and carries the terminal
+/// event. The error payload is boxed because [`TransportEvent`] is large and
+/// the `Err` path is the uncommon case (clippy `result_large_err`).
 fn process_observe_notification(
     packet: &Packet,
     expected_token: &[u8],
-) -> Result<TransportEvent, TransportEvent> {
+) -> Result<TransportEvent, Box<TransportEvent>> {
     // Check if this is an Observe notification
     if !CoapResponseParser::is_observe_notification(packet) {
-        return Err(TransportEvent::Terminated {
+        return Err(Box::new(TransportEvent::Terminated {
             reason: "CoAP Observe: server stopped notifying \
                      (section 10.16.2 point 2)"
                 .to_string(),
-        });
+        }));
     }
 
     // Verify token matches

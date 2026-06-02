@@ -94,7 +94,7 @@ impl Default for UdpDtlsListenerConfig {
             bind_addr: SocketAddr::from(([0, 0, 0, 0], 9443)),
             max_sessions: 256,
             max_sessions_per_ip: 10,
-            session_timeout: Duration::from_secs(300),
+            session_timeout: Duration::from_mins(5),
             rate_limit_per_ip: 50,
             recv_buffer_size: 65535,
             cleanup_interval: Duration::from_secs(30),
@@ -726,18 +726,17 @@ async fn per_client_recv_loop<S: BlobStorage + 'static>(
         // Deserialize the client message.
         // `ClientMessage::from_bytes` rejects payloads exceeding `MAX_MESSAGE_SIZE`
         // before invoking the MessagePack deserializer, preventing allocation bombs.
-        let client_msg: ClientMessage = match ClientMessage::from_bytes(&datagram) {
-            Ok(msg) => msg,
-            Err(_) => {
-                debug!(remote = %remote_addr, "failed to deserialize UDP datagram");
-                let err = RelayMessage::Err {
-                    ref_id: None,
-                    code: 400,
-                    msg: "malformed request".to_owned(),
-                };
-                send_dtls_response(&sessions, &remote_addr, &err).await;
-                continue;
-            }
+        let client_msg: ClientMessage = if let Ok(msg) = ClientMessage::from_bytes(&datagram) {
+            msg
+        } else {
+            debug!(remote = %remote_addr, "failed to deserialize UDP datagram");
+            let err = RelayMessage::Err {
+                ref_id: None,
+                code: 400,
+                msg: "malformed request".to_owned(),
+            };
+            send_dtls_response(&sessions, &remote_addr, &err).await;
+            continue;
         };
 
         // Validate the message.
@@ -1199,7 +1198,7 @@ mod tests {
         let listener_config = UdpDtlsListenerConfig {
             bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
             max_sessions: 10,
-            session_timeout: Duration::from_secs(60),
+            session_timeout: Duration::from_mins(1),
             rate_limit_per_ip: 100,
             cleanup_interval: Duration::from_millis(100),
             ..UdpDtlsListenerConfig::default()
@@ -1242,7 +1241,7 @@ mod tests {
             let client_ctx = build_test_client_ctx();
             match AsyncDtlsSession::connect(client_ctx, server_addr).await {
                 Ok(session) => return session,
-                Err(e) if attempt < 2 => {
+                Err(_e) if attempt < 2 => {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
                 Err(e) => panic!("DTLS handshake failed after 3 attempts: {e}"),
@@ -1279,7 +1278,7 @@ mod tests {
         let config = UdpDtlsListenerConfig::default();
         assert_eq!(config.max_sessions, 256);
         assert_eq!(config.max_sessions_per_ip, 10);
-        assert_eq!(config.session_timeout, Duration::from_secs(300));
+        assert_eq!(config.session_timeout, Duration::from_mins(5));
         assert_eq!(config.rate_limit_per_ip, 50);
         assert_eq!(config.recv_buffer_size, 65535);
         assert_eq!(config.cleanup_interval, Duration::from_secs(30));
