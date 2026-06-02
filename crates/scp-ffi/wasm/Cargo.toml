@@ -87,6 +87,9 @@ scp-identity = { path = "../../scp-identity", version = "=0.1.0-beta.1" }
 # Host-only: encoder-parity tests pin the WASM-local `zbase32_encode`
 # helper against the canonical `z-base-32` crate the native bridges use.
 z-base-32 = { workspace = true }
+# Property-based testing for the zbase32 encoder-parity sweep
+# (1024 random 32-byte inputs per run). Host-only.
+proptest = "1"
 
 [profile.release]
 opt-level = "s"
