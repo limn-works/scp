@@ -784,7 +784,6 @@ pub fn verify_interface_rotation(
     trigger_removal_did: &DID,
     removal_event_id: &[u8; 32],
 ) -> Result<(), RotationVerifyError> {
-    use ed25519_dalek::Verifier;
     if sig.len() != ed25519_dalek::SIGNATURE_LENGTH {
         return Err(RotationVerifyError::InvalidLength {
             expected: ed25519_dalek::SIGNATURE_LENGTH,
@@ -803,11 +802,11 @@ pub fn verify_interface_rotation(
         trigger_removal_did,
         removal_event_id,
     );
-    verifying_key.verify(&preimage, &signature).map_err(|e| {
-        RotationVerifyError::VerificationFailed {
+    verifying_key
+        .verify_strict(&preimage, &signature)
+        .map_err(|e| RotationVerifyError::VerificationFailed {
             reason: e.to_string(),
-        }
-    })
+        })
 }
 
 /// Failure modes for [`verify_interface_rotation`].
@@ -4520,5 +4519,92 @@ mod tests {
             decoded.capability_holder_set, expected_sorted,
             "round-tripped capability_holder_set must equal the lexicographically sorted input"
         );
+    }
+
+    /// A signature produced by [`sign_interface_rotation`] verifies under
+    /// [`verify_interface_rotation`] — the strict verifier accepts the
+    /// canonical, signer-produced signature (no malleability introduced).
+    #[test]
+    fn interface_rotation_roundtrip_strict_verify_accepts() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let verifying_key = signer.verifying_key();
+        let interface_id = [0x11; 32];
+        let context_local_id: ContextId = "ctx-local".to_owned();
+        let context_peer_id: ContextId = "ctx-peer".to_owned();
+        let epoch_local = 7u64;
+        let new_ikm_local = [0x22; 32];
+        let trigger_removal_did = DID("did:dht:zEVICTED".to_owned());
+        let removal_event_id = [0x33; 32];
+
+        let sig = sign_interface_rotation(
+            &signer,
+            &interface_id,
+            &context_local_id,
+            &context_peer_id,
+            epoch_local,
+            &new_ikm_local,
+            &trigger_removal_did,
+            &removal_event_id,
+        );
+
+        verify_interface_rotation(
+            &verifying_key,
+            &sig,
+            &interface_id,
+            &context_local_id,
+            &context_peer_id,
+            epoch_local,
+            &new_ikm_local,
+            &trigger_removal_did,
+            &removal_event_id,
+        )
+        .expect("a valid signer-produced rotation signature must verify under verify_strict");
+    }
+
+    /// `verify_interface_rotation` rejects a signature whose committed
+    /// `new_ikm_local` differs from the verifier's expectation — the
+    /// preimage commits the 32 bytes of new key material, so any drift
+    /// fails verification.
+    #[test]
+    fn interface_rotation_tampered_ikm_rejected() {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let verifying_key = signer.verifying_key();
+        let interface_id = [0x11; 32];
+        let context_local_id: ContextId = "ctx-local".to_owned();
+        let context_peer_id: ContextId = "ctx-peer".to_owned();
+        let epoch_local = 7u64;
+        let new_ikm_local = [0x22; 32];
+        let trigger_removal_did = DID("did:dht:zEVICTED".to_owned());
+        let removal_event_id = [0x33; 32];
+
+        let sig = sign_interface_rotation(
+            &signer,
+            &interface_id,
+            &context_local_id,
+            &context_peer_id,
+            epoch_local,
+            &new_ikm_local,
+            &trigger_removal_did,
+            &removal_event_id,
+        );
+
+        // Verify with a different new_ikm_local than was signed.
+        let tampered_ikm = [0x99; 32];
+        let err = verify_interface_rotation(
+            &verifying_key,
+            &sig,
+            &interface_id,
+            &context_local_id,
+            &context_peer_id,
+            epoch_local,
+            &tampered_ikm,
+            &trigger_removal_did,
+            &removal_event_id,
+        )
+        .expect_err("a signature over different key material must not verify");
+        assert!(matches!(
+            err,
+            RotationVerifyError::VerificationFailed { .. }
+        ));
     }
 }

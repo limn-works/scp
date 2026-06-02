@@ -417,7 +417,7 @@ OutletError {
 | `transport.concurrent-streams-per-outlet` | `SCP-TOOL-6160` | Transport | §5.4.5 per-outlet cap |
 | `execution.cancel-ack-timeout` | `SCP-TOOL-6135` | Execution | §5.4.5 cancel-ack timer (round 4) |
 
-**Slug allocations added in round 8.** The following slugs are registered within the existing class ranges (no new codes — slugs differentiate conditions under a shared code). Both are sound-by-addition refinements: a new slug under an existing code band, paired with a new closed-enum `TerminateReason` variant and a per-instance node-level pump ceiling. No ratchet movement.
+**Slug allocations added in round 8.** The following slugs are registered within the existing class ranges (no new codes — slugs differentiate conditions under a shared code). All three are sound-by-addition refinements: a new slug under an existing code band, paired with a new closed-enum `TerminateReason` variant and a per-instance node-level pump ceiling. No ratchet movement.
 
 | Slug | Code | Class | Source |
 |------|------|-------|--------|
