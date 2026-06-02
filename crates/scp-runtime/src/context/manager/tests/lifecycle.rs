@@ -5102,3 +5102,88 @@ async fn persist_degraded_snapshot_no_ops_without_prior_snapshot() {
         "no-prior-snapshot context must not appear in the persistence layer"
     );
 }
+
+// -----------------------------------------------------------------------
+// Generation-check regression: relock after remove+recreate
+// -----------------------------------------------------------------------
+
+/// Regression for the `join_context` Phase 4.5 confused-deputy bug.
+///
+/// Phase 4.5 stores the joiner's local pseudonym by reacquiring the
+/// per-context lock via `relock_context(&ctx_gen)`. If a concurrent
+/// remove+recreate of the same `context_id` lands in the Phase 4 -> 4.5
+/// window, the generation captured earlier no longer matches the live
+/// context. The generation check MUST reject the stale token so the
+/// pseudonym is never written into the WRONG (recreated) generation —
+/// which would corrupt the recreated context's routing state.
+///
+/// A fully deterministic test of the in-flight `join_context` race is not
+/// feasible (`join_context` is a single async fn with no injection point to
+/// force a remove+recreate mid-body). This exercises the load-bearing
+/// invariant directly: the same `relock_context(&old_gen)` call that
+/// Phase 4.5 now uses must error on a generation mismatch and must not
+/// touch the recreated context's routing.
+#[tokio::test]
+async fn relock_with_stale_generation_rejects_and_preserves_recreated_routing() {
+    let manager = ContextManager::new(
+        Box::new(MockCrypto::default()),
+        Box::new(MockTransport::connected()),
+        Box::new(MockEventLog::default()),
+        noop_key_resolver(),
+    );
+
+    // Create the original (encrypted) context with a distinctive pseudonym
+    // and capture its generation token, mirroring the `ctx_gen` captured
+    // early in `join_context`. `create_context` (not `create_context_bare`)
+    // registers the slot in the manager's contexts map.
+    manager
+        .create_context(
+            "gen-race-ctx".to_owned(),
+            ContextParams::default(),
+            DID::from("did:key:test-creator-orig"),
+            [0xAB; 32],
+        )
+        .await
+        .unwrap();
+    let stale_gen = {
+        let (_guard, token) = manager.lock_context("gen-race-ctx").await.unwrap();
+        token
+    };
+
+    // Simulate the concurrent remove+recreate that lands in the Phase 4 ->
+    // 4.5 window: same `context_id`, fresh generation, fresh routing state
+    // with an all-zero pseudonym (no join has run against it yet).
+    let _ = manager.remove_context("gen-race-ctx");
+    manager
+        .create_context(
+            "gen-race-ctx".to_owned(),
+            ContextParams::default(),
+            DID::from("did:key:test-creator-new"),
+            [0u8; 32],
+        )
+        .await
+        .unwrap();
+
+    // The relock that Phase 4.5 performs must reject the stale token.
+    match manager.relock_context(&stale_gen).await {
+        Err(ContextError::PermissionDenied(_)) => {}
+        Err(other) => panic!("expected PermissionDenied on stale relock, got {other:?}"),
+        Ok(_) => panic!("stale-generation relock must be rejected, but it succeeded"),
+    }
+
+    // The recreated context's routing must be untouched: a fresh encrypted
+    // context starts pseudonymous with an all-zero local pseudonym (no join
+    // has run against the recreated generation yet). A confused-deputy write
+    // would have stamped the original joiner's pseudonym here.
+    let arc = manager.get_context_arc("gen-race-ctx").unwrap();
+    let guard = arc.lock().await;
+    assert!(
+        !guard.routing.is_broadcast(),
+        "recreated encrypted context must be pseudonymous"
+    );
+    assert_eq!(
+        guard.routing.local_pseudonym(),
+        Some([0u8; 32]),
+        "recreated context routing must be pristine — no stale pseudonym written"
+    );
+}

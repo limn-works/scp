@@ -2228,10 +2228,23 @@ impl ContextManager {
         // storing it here makes it available for subsequent send_message
         // fan-out (§9.10.4). Broadcast contexts do not use pseudonyms, so
         // this is a no-op when routing is `Broadcast`.
-        if let Ok(ctx_arc) = self.get_context_arc(&context_id) {
-            let mut guard = ctx_arc.lock().await;
+        //
+        // Reacquire via `relock_context` (not a bare `get_context_arc` +
+        // `lock`) so the generation check fires: a concurrent
+        // remove+recreate of the same `context_id` in the Phase 4→4.5 window
+        // would otherwise let this write the joiner's pseudonym into the
+        // WRONG (recreated) context generation — a confused-deputy
+        // routing-state corruption. On generation mismatch this write is
+        // skipped (matching the leave-flow checkpoint pattern below); the
+        // recreated context's own join sets its joiner pseudonym.
+        if let Ok(mut guard) = self.relock_context(&ctx_gen).await {
             let ctx = &mut *guard;
             ctx.routing.set_local_pseudonym(local_pseudonym);
+        } else {
+            tracing::warn!(
+                context_id = %context_id,
+                "join_context: generation mismatch — joiner pseudonym not stored"
+            );
         }
 
         // Phase 5: Capture the escrow hold after all mutations succeeded.
