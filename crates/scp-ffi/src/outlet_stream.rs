@@ -78,6 +78,13 @@ impl scp_runtime::context::outlets::invoke::StreamSettlementSink for PyStreamSet
                     settlement.billed_count,
                     settlement.request_id,
                     &settlement.outlet_id,
+                    // §5.4.5 MED-HIGH — forward the open-time economic policy
+                    // snapshot the runtime captured into the StreamSettlement.
+                    // When the hosting context is torn down mid-stream the
+                    // live policy is gone; this snapshot lets settlement still
+                    // capture the §19.15.5 PaymentReceipt for rendered service
+                    // (H8). `None` for zero-cost / Query streams.
+                    settlement.economic_policy_snapshot,
                 )
                 .await
             {
@@ -135,6 +142,94 @@ fn bridge_stream_escrow_refund_sink(
     handle: tokio::runtime::Handle,
 ) -> Arc<dyn scp_runtime::context::outlets::dispatch::StreamEscrowRefundSink> {
     Arc::new(PyStreamEscrowRefundSink { manager, handle })
+}
+
+// ---------------------------------------------------------------------------
+// Grant top-up reverse guard (LOW-b)
+// ---------------------------------------------------------------------------
+
+/// Drop-guard for the §5.4.5 credit-grant escrow top-up (LOW-b remediation).
+///
+/// [`py_outlet_stream_grant_credit`] DEBITS a per-grant top-up of
+/// `cost_per_chunk × grant` against the invoker's `MemberBudgetTracker` (via
+/// [`scp_core::context::ContextManager::outlet_stream_reserve_grant`]) BEFORE
+/// it calls [`scp_runtime::context::outlets::dispatch::StreamSessionHandle::apply_credit_grant`].
+/// Between those two points the code locks the session handle, runs
+/// `apply_credit_grant`, and — on a runtime rejection — issues an explicit
+/// async reverse. If a PANIC unwinds anywhere in that window (a poisoned
+/// handle lock taken under `catch`, an allocation failure, a bug in the
+/// runtime apply path), the debited top-up would be STRANDED: the invoker is
+/// charged for billable chunks the rejected/never-applied grant never
+/// authorized.
+///
+/// This guard mirrors the open-path
+/// [`StreamEscrowTicket`](scp_runtime::context::outlets::dispatch::StreamEscrowTicket)
+/// discipline: it is `#[must_use]`, and its `Drop` reverses the debited
+/// top-up (fire-and-forget `Handle::spawn` of the async
+/// [`scp_core::context::ContextManager::outlet_stream_reverse_spend`] via the
+/// shared [`StreamEscrowRefundSink`]) UNLESS it has been disarmed. The happy
+/// path calls [`Self::disarm`] once the apply result is observed — from that
+/// point ownership of the top-up is settled (the stream's close-time
+/// settlement refunds the unspent portion on `Ok`, and the explicit
+/// rejection-reverse already ran on `Err`), so the guard must NOT also
+/// reverse. A zero-amount guard (Query / zero-cost stream) is a no-op on both
+/// `disarm` and `Drop`. `outlet_stream_reverse_spend` saturates at zero, so a
+/// double-reverse (guard fires after the explicit reverse already ran) is a
+/// safe no-op even on a defensive path.
+#[must_use = "a GrantTopUpReverseGuard must be disarmed after the grant apply result is handled, or dropped to reverse the debited top-up"]
+struct GrantTopUpReverseGuard {
+    sink: Arc<dyn scp_runtime::context::outlets::dispatch::StreamEscrowRefundSink>,
+    context_id: String,
+    member_did: scp_primitives::DID,
+    reserved_top_up: scp_protocol::economy::types::Amount,
+    disarmed: bool,
+}
+
+impl GrantTopUpReverseGuard {
+    /// Builds a guard for a `reserved_top_up` already debited for `member_did`
+    /// in `context_id`. The `sink` performs the async reversal on Drop when
+    /// the guard is not disarmed.
+    fn new(
+        sink: Arc<dyn scp_runtime::context::outlets::dispatch::StreamEscrowRefundSink>,
+        context_id: String,
+        member_did: scp_primitives::DID,
+        reserved_top_up: scp_protocol::economy::types::Amount,
+    ) -> Self {
+        Self {
+            sink,
+            context_id,
+            member_did,
+            reserved_top_up,
+            disarmed: false,
+        }
+    }
+
+    /// Marks the top-up as accounted for (success path consumed it, or the
+    /// explicit rejection-reverse already ran). Call exactly once after the
+    /// `apply_credit_grant` result is handled so the `Drop` guard does NOT
+    /// re-reverse.
+    const fn disarm(&mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for GrantTopUpReverseGuard {
+    fn drop(&mut self) {
+        if !self.disarmed && self.reserved_top_up.value() > 0 {
+            // The grant path unwound (panic) between the manager debit and
+            // the disarm point. Reverse the debited top-up so the §5.4.5
+            // atomicity invariant holds even on the unwind path — mirrors the
+            // open-path StreamEscrowTicket rollback discipline.
+            tracing::warn!(
+                context_id = %self.context_id,
+                member_did = %self.member_did,
+                reserved_top_up = self.reserved_top_up.value(),
+                "GrantTopUpReverseGuard dropped un-disarmed — reversing debited credit-grant top-up"
+            );
+            self.sink
+                .refund(&self.context_id, &self.member_did, self.reserved_top_up);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -915,6 +1010,18 @@ pub fn py_outlet_invoke_stream(
                 settlement_sink,
                 params,
                 admission,
+                // §7.3.8 caveat post-input check (crypto-MED). The non-streaming
+                // `py_outlet_invoke` path passes `None` for `caveat_enforcement`
+                // (PyO3 has no per-context caveat counter store wired), so the
+                // manager's `build_post_input_hook` produces no hook there. The
+                // streaming open path mirrors that: there is no public seam for
+                // the bridge to construct the §7.3.8 hook (the builder lives in
+                // the manager and consumes a counter store the bridge does not
+                // own), so this passes `None` to match the non-streaming PyO3
+                // surface. Wiring a real hook requires a core change to expose
+                // the builder / accept a `CaveatEnforcement` here — out of scope
+                // for the bridge-only Phase-2 patch.
+                None,
             )
             .await
     });
@@ -1086,6 +1193,17 @@ fn build_open_stream_params(
         ucan_cid,
         request_id,
         revocation_checker,
+        // §5.4.5 MED-HIGH — the economic policy snapshotted at acceptance so
+        // close-time settlement can capture the §19.15.5 PaymentReceipt for
+        // rendered service even if the hosting context is torn down mid-stream
+        // (H8). The bridge has no public accessor for a context's live
+        // `economic_policy` (it is owned by the manager under the per-context
+        // lock), so we pass `None` here and let `open_outlet_stream` snapshot
+        // the LIVE policy under the same lock it already takes — the
+        // manager-internal snapshot fills this field when it is `None`
+        // (caller-supplied wins otherwise). `None` also covers the legitimate
+        // zero-cost / Query case where the context has no economic policy.
+        economic_policy_snapshot: None,
     }
 }
 
@@ -1187,10 +1305,27 @@ pub fn py_outlet_stream_grant_credit(
         })
         .map_err(|e| ScpPyError::context(format!("credit grant escrow reservation failed: {e}")))?;
 
+    // LOW-b: arm a Drop-guard over the just-debited top-up so a PANIC anywhere
+    // between this point and the apply-result handling below reverses the
+    // debit instead of stranding it (mirrors the open-path StreamEscrowTicket
+    // discipline). The happy path and the explicit rejection-reverse both
+    // disarm the guard so it never double-reverses; `outlet_stream_reverse_spend`
+    // saturates at zero anyway, so a defensive double-fire is a safe no-op.
+    let mut top_up_guard = GrantTopUpReverseGuard::new(
+        bridge_stream_escrow_refund_sink(Arc::clone(manager), rt.handle().clone()),
+        entry.context_id.clone(),
+        invoker_did_typed.clone(),
+        reserved_top_up,
+    );
+
     // Apply the grant with the already-debited top-up. If the runtime
     // rejects the grant (signature / replay) AFTER a successful reserve,
     // reverse the debit so the §5.4.5 atomicity invariant holds: a rejected
-    // grant authorizes no billable chunks and strands no escrow.
+    // grant authorizes no billable chunks and strands no escrow. The new
+    // §5.4.4:426 `GrantError::StreamClosed` (grant after `pump_exited`) lands
+    // in the same `Err` arm — `apply_credit_grant` returns it BEFORE touching
+    // the credit counter or escrow ledger, so the explicit reverse below
+    // refunds the top-up and the net budget impact is zero.
     let apply_result = {
         let handle_guard = entry
             .handle
@@ -1199,7 +1334,13 @@ pub fn py_outlet_stream_grant_credit(
         handle_guard.apply_credit_grant(&credit, reserved_top_up)
     };
     match apply_result {
-        Ok(new_total) => Ok(new_total),
+        Ok(new_total) => {
+            // The grant landed: the top-up is now part of the stream's escrow
+            // ledger and the close-time settlement owns its unspent-portion
+            // refund. Disarm so the guard does NOT reverse a live grant.
+            top_up_guard.disarm();
+            Ok(new_total)
+        }
         Err(grant_err) => {
             if reserved_top_up.value() > 0 {
                 rt.block_on(async {
@@ -1212,7 +1353,27 @@ pub fn py_outlet_stream_grant_credit(
                         .await;
                 });
             }
-            Err(ScpPyError::context(format!("credit grant rejected: {grant_err:?}")).into())
+            // The explicit reverse above already refunded the debit; disarm so
+            // the Drop-guard does not fire a redundant second reverse.
+            top_up_guard.disarm();
+            // Route the granular GrantError to its §5.4.4 slug + code (mirroring
+            // the cancel path's `cancel_error_to_slug` / `_to_code` routing).
+            // The new §5.4.4:426 `GrantError::StreamClosed` (grant after the
+            // pump exited) maps to slug `protocol.stream-already-closed` / code
+            // `SCP-TOOL-6101` (Protocol-class session-lifecycle), NOT the
+            // Authorization-class band — the caller's grant right was never
+            // withdrawn; the stream substrate is simply gone. Emitting a typed
+            // `ContextError` with the routed code lets the SDK branch on `.code`
+            // rather than string-matching the message.
+            Err(ScpPyError::ContextError {
+                message: format!(
+                    "credit grant rejected ({})",
+                    scp_runtime::context::outlets::stream::grant_error_to_slug(grant_err)
+                ),
+                code: scp_runtime::context::outlets::stream::grant_error_to_code(grant_err)
+                    .to_owned(),
+            }
+            .into())
         }
     }
 }
@@ -1387,6 +1548,17 @@ pub fn py_outlet_stream_cancel(request_id_hex: &str, caller_did: &str) -> PyResu
 /// - `authorization.revoked-mid-stream` (`RevokedMidStream`)
 /// - `execution.cancel-ack-timeout` (`CancelAckTimeout`)
 /// - `execution.credit-stall` (`CreditStall`)
+/// - `execution.credit-exhausted` (`CreditExhausted`, `SCP-TOOL-6131`) —
+///   the §5.4.5 cumulative `min(credit_window, max_calls)` billable ceiling
+///   was reached; the pump force-terminates the stream.
+/// - `protocol.context-closed-mid-stream` (`ContextClosedMidStream`)
+///
+/// The bridge accepts exactly the slugs
+/// [`TerminateReason::from_slug`](scp_protocol::context::outlets::stream::TerminateReason::from_slug)
+/// recognizes — the list above mirrors that closed set verbatim. The
+/// runtime owns whether a given reason is caller-initiated vs.
+/// framework-only; the bridge surfaces every closed-set slug so an SDK
+/// recheck loop can re-issue the runtime's own termination cause idempotently.
 ///
 /// Unknown slugs are rejected with a `ValidationError` — the bridge
 /// fails closed so attacker-controlled slug strings cannot enter the
@@ -1423,7 +1595,8 @@ pub fn py_outlet_stream_terminate(
             message: format!(
                 "unknown TerminateReason slug {reason:?}; expected one of \
                  'authorization.revoked-mid-stream', 'execution.cancel-ack-timeout', \
-                 'execution.credit-stall' (§5.4.4 closed set)"
+                 'execution.credit-stall', 'execution.credit-exhausted', \
+                 'protocol.context-closed-mid-stream' (§5.4.4 closed set)"
             ),
             code: scp_protocol::context::outlets::error_codes::CODE_INPUT_VIOLATION.to_owned(),
         })?;
@@ -2209,6 +2382,154 @@ mod tests {
         assert!(
             !err_str.contains(sentinel),
             "chunk-JSON validation error must NOT echo input bytes: {err_str}"
+        );
+    }
+
+    /// HIGH-1 — the bridge routes a `GrantError::StreamClosed` (grant after
+    /// the pump exited) to the §5.4.4 Protocol-class session-lifecycle code
+    /// `SCP-TOOL-6101` and slug `protocol.stream-already-closed`, NOT the
+    /// Authorization band. This pins the exact `(slug, code)` pair the grant
+    /// path's `Err` arm now emits via `grant_error_to_slug` /
+    /// `grant_error_to_code` — the same routing the runtime's
+    /// `apply_credit_grant` returns when `pump_exited` is set BEFORE any
+    /// signature / replay / escrow mutation (so a post-terminal grant leaves
+    /// the credit counter and escrow ledger untouched and the bridge reverses
+    /// the reserved top-up for net-zero budget impact).
+    #[test]
+    fn grant_after_close_routes_stream_already_closed_6101() {
+        use scp_runtime::context::outlets::stream::{
+            GrantError, grant_error_to_code, grant_error_to_slug,
+        };
+        let code = grant_error_to_code(GrantError::StreamClosed);
+        let slug = grant_error_to_slug(GrantError::StreamClosed);
+        assert_eq!(
+            code,
+            scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION,
+            "StreamClosed must map to the Protocol-class session code (SCP-TOOL-6101)"
+        );
+        assert_eq!(
+            code, "SCP-TOOL-6101",
+            "StreamClosed code is the §5.4.4 6101 band verbatim"
+        );
+        assert_eq!(
+            slug,
+            scp_protocol::context::outlets::error_codes::SLUG_PROTOCOL_STREAM_ALREADY_CLOSED,
+            "StreamClosed must map to the stream-already-closed slug"
+        );
+        // The bridge's Err arm builds exactly this ContextError shape; assert
+        // the surfaced message names the slug and the code is the 6101 band so
+        // the SDK can branch on `.code` rather than string-matching.
+        let bridge_err = ScpPyError::ContextError {
+            message: format!("credit grant rejected ({slug})"),
+            code: code.to_owned(),
+        };
+        let err_str = format!("{}", PyErr::from(bridge_err));
+        assert!(
+            err_str.contains("protocol.stream-already-closed"),
+            "bridge grant-rejection message must name the slug: {err_str}"
+        );
+    }
+
+    /// LOW-b — a [`GrantTopUpReverseGuard`] dropped WITHOUT being disarmed
+    /// reverses the debited top-up exactly once (the panic / early-return
+    /// path), and a guard that IS disarmed reverses nothing (the happy /
+    /// explicit-reverse path). A zero-amount guard is a no-op regardless of
+    /// disarm. Exercises the Drop discipline in isolation with a recording
+    /// sink — no live pump required.
+    #[test]
+    fn grant_top_up_guard_reverses_on_drop_unless_disarmed() {
+        use scp_protocol::economy::types::Amount;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// Recording sink: sums every reversed amount so the test can assert
+        /// how many units the guard refunded across its lifetime.
+        struct RecordingRefundSink {
+            reversed_total: Arc<AtomicU64>,
+            calls: Arc<AtomicU64>,
+        }
+        impl scp_runtime::context::outlets::dispatch::StreamEscrowRefundSink for RecordingRefundSink {
+            fn refund(&self, _context_id: &str, _member_did: &scp_primitives::DID, amount: Amount) {
+                self.reversed_total
+                    .fetch_add(amount.value(), Ordering::SeqCst);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let did: scp_primitives::DID = "did:dht:z6MkInvoker".to_owned().into();
+
+        // Case 1: un-disarmed drop reverses the full top-up exactly once.
+        let reversed = Arc::new(AtomicU64::new(0));
+        let calls = Arc::new(AtomicU64::new(0));
+        {
+            let _guard = GrantTopUpReverseGuard::new(
+                Arc::new(RecordingRefundSink {
+                    reversed_total: Arc::clone(&reversed),
+                    calls: Arc::clone(&calls),
+                }),
+                "ctx-low-b".to_owned(),
+                did.clone(),
+                Amount::new(42),
+            );
+            // No disarm — simulates a panic / early-return between reserve and
+            // the apply-result handling.
+        }
+        assert_eq!(
+            reversed.load(Ordering::SeqCst),
+            42,
+            "un-disarmed guard must reverse the full debited top-up"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "un-disarmed guard reverses exactly once"
+        );
+
+        // Case 2: disarmed drop reverses nothing (happy path / explicit reverse
+        // already ran).
+        let reversed2 = Arc::new(AtomicU64::new(0));
+        let calls2 = Arc::new(AtomicU64::new(0));
+        {
+            let mut guard = GrantTopUpReverseGuard::new(
+                Arc::new(RecordingRefundSink {
+                    reversed_total: Arc::clone(&reversed2),
+                    calls: Arc::clone(&calls2),
+                }),
+                "ctx-low-b".to_owned(),
+                did.clone(),
+                Amount::new(42),
+            );
+            guard.disarm();
+        }
+        assert_eq!(
+            reversed2.load(Ordering::SeqCst),
+            0,
+            "disarmed guard must NOT reverse — settlement / explicit reverse owns the top-up"
+        );
+        assert_eq!(
+            calls2.load(Ordering::SeqCst),
+            0,
+            "disarmed guard makes no refund call"
+        );
+
+        // Case 3: zero-amount guard is a no-op even un-disarmed (Query /
+        // zero-cost stream — the manager debited nothing).
+        let reversed3 = Arc::new(AtomicU64::new(0));
+        let calls3 = Arc::new(AtomicU64::new(0));
+        {
+            let _guard = GrantTopUpReverseGuard::new(
+                Arc::new(RecordingRefundSink {
+                    reversed_total: Arc::clone(&reversed3),
+                    calls: Arc::clone(&calls3),
+                }),
+                "ctx-low-b".to_owned(),
+                did,
+                Amount::new(0),
+            );
+        }
+        assert_eq!(
+            calls3.load(Ordering::SeqCst),
+            0,
+            "zero-amount guard never refunds"
         );
     }
 }

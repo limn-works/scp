@@ -701,7 +701,15 @@ impl ContextProvider for FfiBridgeProvider {
                     clock_skew_tolerance_secs:
                         scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
                     clock: &scp_primitives::SystemClock,
-                    caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
+                    // §5.4.5 HIGH-3 — the MCP capability-validation site is an
+                    // outlet-invocation site (it calls
+                    // `validate_outlet_invocation_ucan`), so it resolves
+                    // effective caveats from each token's `nb` field for §7.3.8
+                    // Step 7b (narrow) + Step 11b (time-box) over the proof
+                    // chain, matching the `validate_outlet_ucan` site in
+                    // `outlets.rs`. The generic `py_ucan_validate` (ucan.rs) and
+                    // broadcast paths remain on `NoCaveatResolver`.
+                    caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
                 };
 
                 scp_core::context::outlets::validate_outlet_invocation_ucan(

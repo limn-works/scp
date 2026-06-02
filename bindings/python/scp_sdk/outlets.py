@@ -298,6 +298,22 @@ def _translate_bridge_error(exc: Exception) -> Exception:
     """Translate a ``_scp_core`` bridge exception to an SDK exception."""
     sdk_cls = BRIDGE_ERROR_MAP.get(type(exc).__name__, ContextError)
     message = str(exc)
+    # §5.4.4:426 — the runtime-authoritative grant-after-close rejection
+    # surfaces as a bridge ``ContextError`` carrying code ``SCP-TOOL-6101`` /
+    # slug ``protocol.stream-already-closed`` (the bridge's
+    # ``grant_error_to_code(StreamClosed)`` routing). The control-plane
+    # methods proactively raise :class:`StreamAlreadyClosed` from the SDK's
+    # locally-tracked ``_terminated`` flag, but the runtime is the
+    # authoritative locus: a grant that races the pump's terminal exit (SDK
+    # has not yet observed the terminal chunk, so ``_terminated`` is still
+    # ``False``) reaches the runtime and is rejected with the 6101 code.
+    # Map that authoritative rejection onto the same typed
+    # :class:`StreamAlreadyClosed` so callers catch the lifecycle violation
+    # uniformly regardless of which side observed the close first. Matching on
+    # both the code and the slug is robust to the bridge's ``Display`` shape
+    # (``[SCP-TOOL-6101] context error: ... (protocol.stream-already-closed)``).
+    if "SCP-TOOL-6101" in message or "protocol.stream-already-closed" in message:
+        return StreamAlreadyClosed(message)
     # Pre-OUT-031: ``OutletError`` was a concrete class; the bridge mapped
     # ``ToolError`` and ``OutletError`` here. Post-OUT-031 ``OutletError`` is
     # abstract and the map points at ``OutletProtocolError``. Walk the issubclass

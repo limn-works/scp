@@ -287,21 +287,61 @@ class TestInvocationHandleControlPlane:
     async def test_cancel_unknown_request_raises(self, bridge: Any) -> None:
         q: asyncio.Queue[Any] = asyncio.Queue()
         # 32 hex chars (decodes to 16 bytes) but doesn't match any
-        # registered stream.
-        handle = InvocationHandle(q, request_id="ff" * 16)
+        # registered stream. A pinned invoker_did is required so the call
+        # reaches the bridge's unknown-session path instead of short-
+        # circuiting at the SDK's no-invoker degenerate-handle guard. The
+        # round-8 `cancel` derives `next_seq` from the runtime cursor and
+        # takes no arguments.
+        handle = InvocationHandle(q, request_id="ff" * 16, invoker_did=_DUMMY_DID)
         with pytest.raises(Exception) as exc_info:
-            await handle.cancel(0)
+            await handle.cancel()
         msg = str(exc_info.value).lower()
         assert "not found" in msg or "unknown-session" in msg
 
     @pytest.mark.asyncio
     async def test_grant_credit_unknown_request_raises(self, bridge: Any) -> None:
         q: asyncio.Queue[Any] = asyncio.Queue()
-        handle = InvocationHandle(q, request_id="ee" * 16)
+        # A pinned invoker_did is required so the call reaches the bridge's
+        # unknown-session path rather than the SDK's no-invoker guard.
+        handle = InvocationHandle(q, request_id="ee" * 16, invoker_did=_DUMMY_DID)
         with pytest.raises(Exception) as exc_info:
             await handle.grant_credit(Credit(5))
         msg = str(exc_info.value).lower()
         assert "not found" in msg or "unknown-session" in msg
+
+    def test_translate_bridge_error_routes_6101_to_stream_already_closed(self) -> None:
+        # §5.4.4:426 — the runtime-authoritative grant-after-close rejection
+        # surfaces from the bridge as a ContextError carrying code
+        # SCP-TOOL-6101 / slug protocol.stream-already-closed (the bridge's
+        # grant_error_to_code(StreamClosed) routing). `_translate_bridge_error`
+        # MUST map that authoritative rejection onto the typed
+        # StreamAlreadyClosed so a grant that races the pump's terminal exit
+        # (SDK has not yet observed the terminal chunk) is caught uniformly.
+        class _FakeBridgeContextError(Exception):
+            pass
+
+        _FakeBridgeContextError.__name__ = "ContextError"
+        err = _FakeBridgeContextError(
+            "[SCP-TOOL-6101] context error: credit grant rejected (protocol.stream-already-closed)"
+        )
+        translated = outlets_mod._translate_bridge_error(err)
+        assert isinstance(translated, StreamAlreadyClosed), (
+            f"6101 bridge error must translate to StreamAlreadyClosed, got "
+            f"{type(translated).__name__}"
+        )
+        assert translated.code == "SCP-TOOL-6101"
+
+    def test_translate_bridge_error_6101_by_slug_only(self) -> None:
+        # Robustness: the mapping also fires on the slug substring so a
+        # future Display shape that omits the bracketed code still routes
+        # correctly.
+        class _FakeBridgeContextError(Exception):
+            pass
+
+        _FakeBridgeContextError.__name__ = "ContextError"
+        err = _FakeBridgeContextError("credit grant rejected (protocol.stream-already-closed)")
+        translated = outlets_mod._translate_bridge_error(err)
+        assert isinstance(translated, StreamAlreadyClosed)
 
 
 # ---------------------------------------------------------------------------

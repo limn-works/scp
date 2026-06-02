@@ -460,7 +460,15 @@ pub(crate) fn validate_outlet_ucan(
             clock_skew_tolerance_secs:
                 scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
-            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
+            // §5.4.5 HIGH-3 — the outlet-invocation validation site resolves
+            // effective caveats from each token's `nb` field so §7.3.8 Step 7b
+            // (per-edge narrow) and Step 11b (time-box) run over the proof
+            // chain's VALIDATED-NARROWED caveat set, not an unverified leaf
+            // assertion. `NoCaveatResolver` (the prior value) returned `None`
+            // for every token, so narrowing committed to nothing. The generic
+            // `py_ucan_validate` site (ucan.rs) and the broadcast paths stay on
+            // `NoCaveatResolver` — they are not outlet-invocation sites.
+            caveat_resolver: &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
         };
 
         scp_core::context::outlets::validate_outlet_invocation_ucan(
