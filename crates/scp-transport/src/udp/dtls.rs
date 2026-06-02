@@ -75,6 +75,29 @@ impl DtlsStream {
     /// Returns [`TransportError::ConnectionFailed`] if the socket cannot be
     /// bound/connected or the DTLS handshake fails.
     pub fn connect(ssl_ctx: &SslContext, relay_addr: SocketAddr) -> Result<Self, TransportError> {
+        Self::connect_with_timeout(ssl_ctx, relay_addr, DTLS_RECV_TIMEOUT)
+    }
+
+    /// Performs a client-side DTLS handshake with an explicit per-recv read
+    /// timeout.
+    ///
+    /// Identical to [`DtlsStream::connect`] but allows the caller to choose the
+    /// blocking UDP socket read timeout instead of the default
+    /// [`DTLS_RECV_TIMEOUT`]. Production code uses [`DtlsStream::connect`]
+    /// (10 s). A shorter timeout is only appropriate for environments — such as
+    /// loopback tests with many concurrent listeners — where a misrouted
+    /// handshake datagram should fail fast and be retried rather than block the
+    /// full 10 s. See `create_dtls_client` in `udp/listener.rs`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ConnectionFailed`] if the socket cannot be
+    /// bound/connected or the DTLS handshake fails.
+    pub fn connect_with_timeout(
+        ssl_ctx: &SslContext,
+        relay_addr: SocketAddr,
+        recv_timeout: Duration,
+    ) -> Result<Self, TransportError> {
         let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| {
             TransportError::ConnectionFailed(format!("failed to bind UDP socket: {e}"))
         })?;
@@ -86,11 +109,9 @@ impl DtlsStream {
         })?;
 
         // Set a read timeout to prevent blocking forever during handshake.
-        socket
-            .set_read_timeout(Some(DTLS_RECV_TIMEOUT))
-            .map_err(|e| {
-                TransportError::ConnectionFailed(format!("failed to set read timeout: {e}"))
-            })?;
+        socket.set_read_timeout(Some(recv_timeout)).map_err(|e| {
+            TransportError::ConnectionFailed(format!("failed to set read timeout: {e}"))
+        })?;
 
         let connected = ConnectedUdpSocket(socket);
 
@@ -196,6 +217,34 @@ impl AsyncDtlsSession {
             .map_err(|e| {
                 TransportError::ConnectionFailed(format!("DTLS handshake task panicked: {e}"))
             })??;
+
+        Ok(Self {
+            inner: Arc::new(Mutex::new(stream)),
+        })
+    }
+
+    /// Performs an async client-side DTLS handshake with an explicit per-recv
+    /// read timeout.
+    ///
+    /// See [`DtlsStream::connect_with_timeout`] for the timeout semantics.
+    /// Production code uses [`AsyncDtlsSession::connect`]; this variant exists
+    /// for loopback test clients that need a short, fail-fast handshake timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ConnectionFailed`] if the handshake fails.
+    pub async fn connect_with_timeout(
+        ssl_ctx: SslContext,
+        relay_addr: SocketAddr,
+        recv_timeout: Duration,
+    ) -> Result<Self, TransportError> {
+        let stream = tokio::task::spawn_blocking(move || {
+            DtlsStream::connect_with_timeout(&ssl_ctx, relay_addr, recv_timeout)
+        })
+        .await
+        .map_err(|e| {
+            TransportError::ConnectionFailed(format!("DTLS handshake task panicked: {e}"))
+        })??;
 
         Ok(Self {
             inner: Arc::new(Mutex::new(stream)),

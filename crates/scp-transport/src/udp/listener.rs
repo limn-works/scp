@@ -1230,24 +1230,88 @@ mod tests {
         builder.build()
     }
 
+    /// Per-attempt DTLS handshake read timeout for the test client.
+    ///
+    /// Production clients use [`AsyncDtlsSession::connect`] with a 10 s read
+    /// timeout (`DTLS_RECV_TIMEOUT`) — generous for high-latency constrained
+    /// links. Loopback tests are the opposite regime and need a shorter,
+    /// fail-fast timeout, but it cannot be made arbitrarily short.
+    ///
+    /// The listener deliberately discards the first `ClientHello` (consumed on
+    /// the main socket) and relies on the client's DTLS retransmission to drive
+    /// the handshake on the per-client connected socket. OpenSSL's blocking
+    /// DTLS handshake only retransmits *after* a blocking `recv` returns: with a
+    /// plain `UdpSocket` it cannot fire its retransmission timer mid-`recv`, so
+    /// the client's first `recv` necessarily blocks for the **full** read
+    /// timeout before the retransmission is sent and the server responds. The
+    /// read timeout is therefore a hard floor on handshake latency, and it MUST
+    /// exceed OpenSSL's ~1 s DTLS1.2 initial retransmission interval — set it
+    /// below that and the `recv` times out and OpenSSL aborts the handshake with
+    /// "a nonblocking read call would have blocked" before any retransmission
+    /// happens, so *every* attempt fails (verified empirically: 400 ms fails
+    /// every time; 1.05 s succeeds in ~1.05 s; 1.5 s succeeds in ~1.5 s).
+    ///
+    /// 1.5 s keeps a comfortable margin over the ~1 s floor to absorb scheduling
+    /// jitter under heavy CI parallelism, while bounding the cost of a misrouted
+    /// attempt (one that blocks the full timeout, then fails) so the retry below
+    /// can land on the correct socket within a couple of seconds instead of the
+    /// ~150 s a single 10 s-timeout attempt could compound to. The production
+    /// timeout is unchanged.
+    const TEST_DTLS_RECV_TIMEOUT: Duration = Duration::from_millis(1500);
+
+    /// Hard ceiling on a single handshake attempt.
+    ///
+    /// `TEST_DTLS_RECV_TIMEOUT` bounds an individual blocking `recv`, but a
+    /// misrouted handshake may chain several reads via OpenSSL's DTLS
+    /// retransmission timer. This wall-clock ceiling (comfortably above the
+    /// `TEST_DTLS_RECV_TIMEOUT` floor) lets the retry loop abandon a stuck
+    /// attempt and move on. The orphaned `spawn_blocking` thread cannot be
+    /// cancelled and finishes on its own read timeout; we simply stop awaiting
+    /// it.
+    const TEST_DTLS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
+
+    /// Number of handshake attempts before giving up.
+    ///
+    /// Eight attempts with capped exponential backoff tolerate repeated
+    /// reuseport misrouting under the heavy parallelism of the full CI test run
+    /// (the workspace suite plus the transport suite at high thread counts),
+    /// where the loopback routing race is far more frequent than in isolation.
+    const TEST_DTLS_MAX_ATTEMPTS: u32 = 8;
+
     /// Helper: create a DTLS client connected to the given server address.
     ///
-    /// Retries up to 3 times to handle kernel UDP routing races on localhost
-    /// when multiple tests run concurrently with `SO_REUSEPORT` sockets.
-    /// The DTLS retransmission from the client may land on the wrong socket
-    /// on the first attempt — a short delay and retry resolves this.
+    /// Retries the full handshake to absorb kernel UDP routing races on
+    /// localhost: when many test listeners run concurrently, the `SO_REUSEPORT`
+    /// reuseport group that the listener uses for per-client DTLS multiplexing
+    /// can deliver a retransmitted `ClientHello` to the wrong socket. Each
+    /// attempt uses a short read timeout (`TEST_DTLS_RECV_TIMEOUT`) and a hard
+    /// wall-clock ceiling (`TEST_DTLS_ATTEMPT_TIMEOUT`) so a misrouted attempt
+    /// fails fast and is retried, rather than blocking on the production 10 s
+    /// timeout. Backoff is capped exponential to avoid hammering the listener.
     async fn create_dtls_client(server_addr: SocketAddr) -> AsyncDtlsSession {
-        for attempt in 0..3u32 {
+        let mut last_err: Option<String> = None;
+        for attempt in 0..TEST_DTLS_MAX_ATTEMPTS {
             let client_ctx = build_test_client_ctx();
-            match AsyncDtlsSession::connect(client_ctx, server_addr).await {
-                Ok(session) => return session,
-                Err(_e) if attempt < 2 => {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(e) => panic!("DTLS handshake failed after 3 attempts: {e}"),
+            let handshake = AsyncDtlsSession::connect_with_timeout(
+                client_ctx,
+                server_addr,
+                TEST_DTLS_RECV_TIMEOUT,
+            );
+            match tokio::time::timeout(TEST_DTLS_ATTEMPT_TIMEOUT, handshake).await {
+                Ok(Ok(session)) => return session,
+                Ok(Err(e)) => last_err = Some(e.to_string()),
+                Err(_) => last_err = Some("handshake attempt exceeded ceiling".to_string()),
+            }
+            if attempt + 1 < TEST_DTLS_MAX_ATTEMPTS {
+                // Capped exponential backoff: 50, 100, 200, 400, 800, 800, ...
+                let backoff = Duration::from_millis(50u64 << attempt.min(4));
+                tokio::time::sleep(backoff).await;
             }
         }
-        unreachable!()
+        panic!(
+            "DTLS handshake failed after {TEST_DTLS_MAX_ATTEMPTS} attempts: {}",
+            last_err.unwrap_or_else(|| "unknown error".to_string())
+        )
     }
 
     /// Helper: send a `ClientMessage` and receive the response via DTLS.
