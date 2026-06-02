@@ -129,6 +129,31 @@ impl ProtocolRepoVariant {
             }
         }
     }
+
+    /// Builds the §7.3.8 caveat counter store backed by this repository,
+    /// type-erased as `Arc<dyn CaveatCounterApi>`.
+    ///
+    /// Shares the SAME `Arc<ProtocolRepository<_>>` that backs the Merkle
+    /// event log + trust aggregation, so caveat-counter records land in the
+    /// same encrypted backend (in-memory or `SQLCipher`). `clock` MUST be the
+    /// manager's clock so the `rate_window` sliding-window scan agrees with
+    /// the manager's `now_secs`.
+    #[must_use]
+    pub fn caveat_counter_store(
+        &self,
+        clock: Arc<dyn scp_primitives::Clock>,
+    ) -> Arc<dyn scp_core::trust::CaveatCounterApi> {
+        match self {
+            Self::InMemory(repo) => Arc::new(scp_core::trust::CaveatCounterStore::new(
+                Arc::clone(repo),
+                clock,
+            )) as Arc<dyn scp_core::trust::CaveatCounterApi>,
+            Self::Sqlite(repo) => Arc::new(scp_core::trust::CaveatCounterStore::new(
+                Arc::clone(repo),
+                clock,
+            )) as Arc<dyn scp_core::trust::CaveatCounterApi>,
+        }
+    }
 }
 
 /// NAPI-specific concrete bridge instance.
@@ -981,13 +1006,16 @@ pub fn init_context_manager(local_did: &str) {
         build_event_log_provider().0
     });
     let persistence = persistence_box_for_init(bi);
-    let cm_arc = Arc::new(ContextManager::with_persistence(
-        crypto,
-        transport,
-        event_log,
-        persistence,
-        not_configured_key_resolver(),
-    ));
+    let cm_arc = finalize_manager(
+        ContextManager::with_persistence(
+            crypto,
+            transport,
+            event_log,
+            persistence,
+            not_configured_key_resolver(),
+        ),
+        bi,
+    );
 
     bi.core.set_context_manager(cm_arc);
 }
@@ -1005,6 +1033,22 @@ fn persistence_box_for_init(bi: &NapiBridgeInstance) -> Box<dyn ContextPersisten
     } else {
         Box::new(NapiBridgePersistence::new())
     }
+}
+
+/// Attaches the §7.3.8 caveat counter store to a freshly-built manager,
+/// sourced from the bridge instance's retained protocol repository, then
+/// wraps the manager in `Arc`.
+///
+/// Built from the SAME `ProtocolRepoVariant` that backs the event log + trust
+/// aggregation, so counter records share the configured backend. Uses
+/// [`scp_primitives::SystemClock`] — the clock the
+/// [`ContextManager::with_persistence`] constructor defaults to — so the
+/// `rate_window` scan agrees with the manager's `now_secs`. Without this the
+/// manager would fail closed on every counter-bearing caveat at stream open.
+fn finalize_manager(mut manager: ContextManager, bi: &NapiBridgeInstance) -> Arc<ContextManager> {
+    let clock: Arc<dyn scp_primitives::Clock> = Arc::new(scp_primitives::SystemClock);
+    manager.set_caveat_counter_store(bi.protocol_repository.caveat_counter_store(clock));
+    Arc::new(manager)
 }
 
 /// Initializes the global [`ContextManager`] with [`LocalTransportProvider`].

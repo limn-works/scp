@@ -417,6 +417,41 @@ impl InvocationCaveats {
         count
     }
 
+    /// Returns `true` when at least one populated field requires the durable
+    /// per-`(context_id, ucan_cid, kind)` counter CAS to enforce: `max_calls`
+    /// (absolute invocation cap), `amount_max_cumulative` (cumulative spend
+    /// cap), or `rate_window` (sliding-window rate cap).
+    ///
+    /// The other §7.3.8 fields (`amount_max_per_call`, `allowed_adapters`,
+    /// `allowed_target_dids`, `input_schema`, and the time-box / origin
+    /// fields) are stateless local checks that need no counter store.
+    ///
+    /// Callers that cannot reach a counter store (e.g. a runtime built
+    /// without a concrete storage backend) MUST treat a `true` result as
+    /// fail-closed — a counter cap that cannot be enforced must reject, not
+    /// silently pass.
+    #[must_use]
+    pub const fn has_counter_bearing_caveat(&self) -> bool {
+        self.max_calls.is_some()
+            || self.amount_max_cumulative.is_some()
+            || self.rate_window.is_some()
+    }
+
+    /// Returns `true` when at least one field is populated that the §7.3.8
+    /// post-input gate enforces at invocation time — i.e. anything that makes
+    /// the runtime build a post-input hook. Excludes the time-box fields
+    /// (`valid_from` / `valid_until` / `hours_of_day` / `days_of_week`) and
+    /// `origin_kind`, which are enforced upstream during UCAN validation, not
+    /// in the post-input hook.
+    #[must_use]
+    pub const fn requires_post_input_check(&self) -> bool {
+        self.amount_max_per_call.is_some()
+            || self.input_schema.is_some()
+            || self.allowed_adapters.is_some()
+            || self.allowed_target_dids.is_some()
+            || self.has_counter_bearing_caveat()
+    }
+
     /// Validates and constructs an [`InvocationCaveats`] enforcing the
     /// §7.3.8 mint-limits table:
     ///

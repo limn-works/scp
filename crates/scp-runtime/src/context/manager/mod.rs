@@ -1873,6 +1873,19 @@ pub struct ContextManagerBuilder {
     /// [`DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`]. Clamped into
     /// `[MIN, MAX]` at build time.
     max_concurrent_outlet_stream_pumps: Option<u32>,
+    /// Factory that builds the §7.3.8 caveat counter store from the same
+    /// repository `.storage()` wired into persistence. Stored as a
+    /// `FnOnce(clock)` because the final clock is only known at
+    /// [`build`](Self::build) time — invoking the factory there guarantees
+    /// the counter store and the rest of the manager share one clock. `None`
+    /// when `.storage()` was not called.
+    /// `Send` is required so the builder stays `Send` (the `ContextManager`
+    /// is shared `Send + Sync` across the async runtime, and tests hold the
+    /// builder across `.await`); the captured repository `Arc` is already
+    /// `Send + Sync`.
+    #[allow(clippy::type_complexity)]
+    caveat_counter_store_factory:
+        Option<Box<dyn FnOnce(Arc<dyn Clock>) -> Arc<dyn crate::trust::CaveatCounterApi> + Send>>,
 }
 
 impl ContextManagerBuilder {
@@ -1888,6 +1901,7 @@ impl ContextManagerBuilder {
             clock: None,
             payment_adapter: None,
             max_concurrent_outlet_stream_pumps: None,
+            caveat_counter_store_factory: None,
         }
     }
 
@@ -1987,6 +2001,18 @@ impl ContextManagerBuilder {
         let persistence = Box::new(crate::store::context::ProtocolRepositoryContextBridge::new(
             store.clone(),
         ));
+        // §7.3.8 caveat counter store shares the SAME repository as
+        // persistence + event log so counter records land in the same
+        // encrypted backend. The clock is only finalized in `build()`, so
+        // capture the repository in a factory invoked there with the final
+        // clock — keeping the counter store and the rest of the manager on
+        // one clock (critical: `rate_window` sliding-window scans MUST agree
+        // with the manager's `now_secs`).
+        let counter_repo = store.clone();
+        self.caveat_counter_store_factory = Some(Box::new(move |clock: Arc<dyn Clock>| {
+            Arc::new(crate::trust::CaveatCounterStore::new(counter_repo, clock))
+                as Arc<dyn crate::trust::CaveatCounterApi>
+        }));
         let event_log_persistence =
             crate::store::context::ProtocolRepositoryEventLogBridge::new(store);
         let event_log = Box::new(super::providers::MerkleEventLogProvider::with_persistence(
@@ -2034,6 +2060,14 @@ impl ContextManagerBuilder {
         };
         manager.clock = clock;
         manager.payment_adapter = self.payment_adapter;
+        // §7.3.8: build the caveat counter store with the FINAL clock so the
+        // sliding-window `rate_window` scan agrees with the manager's clock.
+        // Only present when `.storage()` was called (the factory captured the
+        // repository); the raw constructors leave it `None` (fail-closed on
+        // counter caveats).
+        if let Some(factory) = self.caveat_counter_store_factory {
+            manager.caveat_counter_store = Some(factory(manager.clock.clone()));
+        }
         // §5.4.5 round-8: size the per-instance node-level pump ceiling
         // from the builder (clamped into range). Default when unset.
         manager.outlet_stream_pump_semaphore = build_outlet_stream_pump_semaphore(
@@ -2189,6 +2223,28 @@ pub struct ContextManager {
     /// the inclusive range [`MIN_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`] ..=
     /// [`MAX_MAX_CONCURRENT_OUTLET_STREAM_PUMPS`]).
     outlet_stream_pump_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Durable per-`(context_id, ucan_cid, caveat_kind)` counter store used
+    /// for §7.3.8 invocation-caveat CAS enforcement (`max_calls`,
+    /// `amount_max_cumulative`, `rate_window`).
+    ///
+    /// Type-erased as `Arc<dyn CaveatCounterApi>` so the manager API does not
+    /// carry the storage generic. Wired by
+    /// [`ContextManagerBuilder::storage`](ContextManagerBuilder::storage)
+    /// from the SAME [`ProtocolRepository`](crate::store::ProtocolRepository)
+    /// that backs context / event-log persistence, so the counter records
+    /// share the storage backend (and its encryption) with the rest of the
+    /// manager's durable state.
+    ///
+    /// `None` only for the raw [`new`](Self::new) /
+    /// [`with_persistence`](Self::with_persistence) constructors that are not
+    /// given a concrete `Storage` (legacy / test harnesses). When `None`,
+    /// [`open_outlet_stream`](Self::open_outlet_stream) still runs the
+    /// synchronous §7.3.8 local checks (`input_schema`, `amount_max_per_call`,
+    /// `allowed_adapters`, `allowed_target_dids`) but FAILS CLOSED on any
+    /// counter-bearing caveat (`max_calls`, `amount_max_cumulative`,
+    /// `rate_window`) rather than silently skipping the CAS — a counter cap a
+    /// runtime cannot enforce must reject, not pass.
+    caveat_counter_store: Option<Arc<dyn crate::trust::CaveatCounterApi>>,
 }
 
 /// Default node-level concurrent-pump ceiling
@@ -2255,6 +2311,7 @@ impl ContextManager {
             outlet_stream_pump_semaphore: build_outlet_stream_pump_semaphore(
                 DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS,
             ),
+            caveat_counter_store: None,
         }
     }
 
@@ -2297,6 +2354,7 @@ impl ContextManager {
             outlet_stream_pump_semaphore: build_outlet_stream_pump_semaphore(
                 DEFAULT_MAX_CONCURRENT_OUTLET_STREAM_PUMPS,
             ),
+            caveat_counter_store: None,
         }
     }
 
@@ -2617,6 +2675,41 @@ impl ContextManager {
         let (tx, _rx) = tokio::sync::broadcast::channel(clamped);
         self.event_tx = Some(tx);
         self
+    }
+
+    /// Attaches the durable §7.3.8 caveat counter store used by
+    /// [`open_outlet_stream`](Self::open_outlet_stream) (and the
+    /// non-streaming invoke path) to enforce the counter-bearing invocation
+    /// caveats (`max_calls`, `amount_max_cumulative`, `rate_window`) via the
+    /// atomic CAS in
+    /// [`CaveatCounterStore`](crate::trust::CaveatCounterStore).
+    ///
+    /// Construct the store from the SAME
+    /// [`ProtocolRepository`](crate::store::ProtocolRepository) that backs the
+    /// manager's context / event-log persistence so the counter records share
+    /// the storage backend (and its encryption). Bridges that build the
+    /// manager through the raw [`with_persistence`](Self::with_persistence)
+    /// constructor MUST call this with a store built from their retained
+    /// repository — otherwise the manager fails closed on every
+    /// counter-bearing caveat at stream open. The
+    /// [`builder`](Self::builder)'s [`.storage()`](ContextManagerBuilder::storage)
+    /// wires it automatically.
+    pub fn set_caveat_counter_store(
+        &mut self,
+        store: Arc<dyn crate::trust::CaveatCounterApi>,
+    ) -> &mut Self {
+        self.caveat_counter_store = Some(store);
+        self
+    }
+
+    /// Returns the configured §7.3.8 caveat counter store, if any.
+    ///
+    /// `None` indicates the manager was built without a concrete storage
+    /// backend (legacy / test harness). Callers that need counter CAS must
+    /// treat `None` as fail-closed for any counter-bearing caveat — never as
+    /// "skip enforcement".
+    pub(crate) fn caveat_counter_store(&self) -> Option<&Arc<dyn crate::trust::CaveatCounterApi>> {
+        self.caveat_counter_store.as_ref()
     }
 
     /// Returns a new [`tokio::sync::broadcast::Receiver`] for the event

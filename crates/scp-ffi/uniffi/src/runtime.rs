@@ -137,6 +137,31 @@ impl ProtocolRepoVariant {
             }
         }
     }
+
+    /// Builds the §7.3.8 caveat counter store backed by this repository,
+    /// type-erased as `Arc<dyn CaveatCounterApi>`.
+    ///
+    /// Shares the SAME `Arc<ProtocolRepository<_>>` that backs the Merkle
+    /// event log + trust aggregation, so caveat-counter records land in the
+    /// same encrypted backend (encrypted in-memory or `SQLCipher`). `clock`
+    /// MUST be the manager's clock so the `rate_window` sliding-window scan
+    /// agrees with the manager's `now_secs`.
+    #[must_use]
+    pub fn caveat_counter_store(
+        &self,
+        clock: Arc<dyn scp_primitives::Clock>,
+    ) -> Arc<dyn scp_core::trust::CaveatCounterApi> {
+        match self {
+            Self::InMemory(repo) => Arc::new(scp_core::trust::CaveatCounterStore::new(
+                Arc::clone(repo),
+                clock,
+            )) as Arc<dyn scp_core::trust::CaveatCounterApi>,
+            Self::Sqlite(repo) => Arc::new(scp_core::trust::CaveatCounterStore::new(
+                Arc::clone(repo),
+                clock,
+            )) as Arc<dyn scp_core::trust::CaveatCounterApi>,
+        }
+    }
 }
 
 /// `UniFFI`-specific concrete bridge instance.
@@ -989,27 +1014,34 @@ impl scp_core::context::manager::ContextPersistence for ArcContextPersistence {
 /// [`scp_ffi_common::bridge_instance::CoreFields::persistence_arc_clone`]
 /// so the manager and the bridge mirror share the same backend — a
 /// single `SQLite` connection, not two.
+///
+/// When `caveat_counter_store` is `Some`, it is attached via
+/// [`ContextManager::set_caveat_counter_store`] BEFORE the manager is wrapped
+/// in `Arc` (the setter needs `&mut self`), so the §7.3.8 counter-bearing
+/// invocation caveats (`max_calls`, `amount_max_cumulative`, `rate_window`)
+/// are enforced via the durable CAS at outlet-stream open. Mirrors the
+/// `PyO3` (`build_context_manager`) and `NAPI` (`finalize_manager`) bridges.
 fn build_context_manager(
     crypto: Box<dyn ContextCryptoProvider>,
     transport: Box<dyn scp_core::context::builder::ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Arc<dyn scp_core::context::manager::ContextPersistence + Send + Sync>>,
+    caveat_counter_store: Option<Arc<dyn scp_core::trust::CaveatCounterApi>>,
 ) -> Arc<ContextManager> {
-    match persistence {
-        Some(shared) => Arc::new(ContextManager::with_persistence(
+    let mut manager = match persistence {
+        Some(shared) => ContextManager::with_persistence(
             crypto,
             transport,
             event_log,
             Box::new(ArcContextPersistence::new(shared)),
             not_configured_key_resolver(),
-        )),
-        None => Arc::new(ContextManager::new(
-            crypto,
-            transport,
-            event_log,
-            not_configured_key_resolver(),
-        )),
+        ),
+        None => ContextManager::new(crypto, transport, event_log, not_configured_key_resolver()),
+    };
+    if let Some(store) = caveat_counter_store {
+        manager.set_caveat_counter_store(store);
     }
+    Arc::new(manager)
 }
 
 /// Builds an event log provider that reuses the already-registered
@@ -1102,11 +1134,20 @@ pub fn init_context_manager_with_did(local_did: &str) {
         build_event_log_provider().0
     });
     let persistence = bi.core.persistence_arc_clone();
+    // §7.3.8 crypto-MED — build the caveat counter store from the SAME
+    // `ProtocolRepoVariant` that backs persistence + the event log, using
+    // `SystemClock` (the clock the `ContextManager` constructors default to)
+    // so the `rate_window` sliding-window scan agrees with the manager's
+    // `now_secs`. Without this the manager fails closed on every
+    // counter-bearing caveat at outlet-stream open.
+    let counter_clock: Arc<dyn scp_primitives::Clock> = Arc::new(scp_primitives::SystemClock);
+    let caveat_counter_store = Some(bi.protocol_repository.caveat_counter_store(counter_clock));
     let cm_arc = build_context_manager(
         crypto,
         Box::new(scp_core::context::NotConfiguredTransportProvider),
         event_log,
         persistence,
+        caveat_counter_store,
     );
 
     bi.core.set_context_manager(cm_arc);
@@ -1148,7 +1189,18 @@ pub fn init_context_manager_with_relay_transport(
         build_event_log_provider().0
     });
     let persistence = bi.core.persistence_arc_clone();
-    let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
+    // §7.3.8 crypto-MED — see `init_context_manager_with_did`: build the
+    // caveat counter store from the same repository on the manager's clock so
+    // counter-bearing caveats are enforced (not failed closed) at stream open.
+    let counter_clock: Arc<dyn scp_primitives::Clock> = Arc::new(scp_primitives::SystemClock);
+    let caveat_counter_store = Some(bi.protocol_repository.caveat_counter_store(counter_clock));
+    let cm_arc = build_context_manager(
+        crypto,
+        transport,
+        event_log,
+        persistence,
+        caveat_counter_store,
+    );
 
     bi.core.set_context_manager(cm_arc);
 }

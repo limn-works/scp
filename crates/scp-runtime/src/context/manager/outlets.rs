@@ -1709,14 +1709,6 @@ impl ContextManager {
         admission: std::sync::Arc<
             std::sync::Mutex<crate::context::outlets::stream::StreamAdmissionTracker>,
         >,
-        // §7.3.8 caveat post-input check (crypto-MED). Built the same way
-        // the non-streaming `invoke` path builds it (see
-        // `build_post_input_hook`) and run ONCE at open by
-        // `open_stream_session` before the pump spawns — the stream
-        // validates its input once (§5.4.5). `None` disables the §7.3.8
-        // gate (legacy / test paths; Phase-2 bridge call sites pass the
-        // built hook here, mirroring the non-streaming invoke).
-        caveat_post_input_check: Option<crate::context::outlets::invoke::CaveatPostInputCheck<'_>>,
     ) -> Result<
         crate::context::outlets::dispatch::StreamSessionHandle,
         crate::context::outlets::dispatch::OpenStreamRejection,
@@ -1748,6 +1740,27 @@ impl ContextManager {
             }
             guard.handle.clone()
         };
+
+        // §7.3.8 crypto-MED — build the post-input caveat hook ENTIRELY in the
+        // runtime so every bridge enforces identically. The hook borrows the
+        // VALIDATED-NARROWED effective caveats (`params.caveats`, the leaf
+        // UCAN `nb` after the §7.3.8 narrow) and the opening UCAN's CID
+        // (`params.ucan_cid`) only for construction — `build_post_input_hook`
+        // captures everything by value, so the returned closure outlives this
+        // borrow and `params` moves freely into `open_stream_session` below.
+        // `cost_per_chunk` is the per-invocation pricing unit the
+        // `amount_max_per_call` check gates against. Fails closed when a
+        // counter-bearing cap cannot be enforced (no counter store).
+        let now_secs = self.clock.now_secs();
+        let caveat_post_input_check = build_stream_post_input_hook(
+            context_id,
+            invoker_did,
+            now_secs,
+            &params.caveats,
+            params.cost_per_chunk,
+            &params.ucan_cid,
+            self.caveat_counter_store(),
+        )?;
 
         crate::context::outlets::dispatch::open_stream_session(
             &handle_snapshot,
@@ -2336,9 +2349,6 @@ impl ContextManager {
         admission: std::sync::Arc<
             std::sync::Mutex<crate::context::outlets::stream::StreamAdmissionTracker>,
         >,
-        // §7.3.8 caveat post-input check (crypto-MED) — forwarded to
-        // `open_outlet_stream`, which runs it once at open.
-        caveat_post_input_check: Option<crate::context::outlets::invoke::CaveatPostInputCheck<'_>>,
     ) -> Result<
         crate::context::outlets::dispatch::StreamSessionHandle,
         crate::context::outlets::dispatch::OpenStreamRejection,
@@ -2346,6 +2356,10 @@ impl ContextManager {
     where
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
     {
+        // §7.3.8 caveat enforcement (crypto-MED) is built INTERNALLY by
+        // `open_outlet_stream` from `params` + the manager's counter store —
+        // this re-export forwards verbatim so the §5.4 lifecycle surface stays
+        // uniform.
         self.open_outlet_stream(
             context_id,
             registry,
@@ -2361,7 +2375,6 @@ impl ContextManager {
             settlement_sink,
             params,
             admission,
-            caveat_post_input_check,
         )
         .await
     }
@@ -3365,6 +3378,130 @@ fn build_post_input_hook<'a>(
             })
         });
     Some(hook)
+}
+
+/// Builds the §7.3.8 post-input caveat hook for a streaming open, ENTIRELY
+/// inside the runtime, from the streaming context's own inputs — so every
+/// bridge gets identical, complete enforcement without supplying any hook.
+///
+/// A stream validates its input ONCE at open (§5.4.5), so this hook is run
+/// exactly once by `open_stream_session` before the pump spawns. It composes
+/// the SAME enforcement the non-streaming `invoke_outlet_with_economy` path
+/// runs via [`build_post_input_hook`]:
+///
+/// - synchronous local checks — `input_schema` conformance,
+///   `amount_max_per_call` (gated against `cost_per_chunk`, the §19.5
+///   per-invocation pricing unit), `allowed_adapters`, `allowed_target_dids`;
+/// - the durable counter CAS — `max_calls`, `amount_max_cumulative`,
+///   `rate_window` — keyed on `(context_id, ucan_cid, kind)`. The stream-open
+///   counts as ONE invocation against these counters. This is a DISTINCT
+///   dimension from HIGH-2's `CreditTracker` cumulative billable-CHUNK ceiling
+///   (also derived from `max_calls`): the counter increments by 1 per open;
+///   the credit tracker increments per billed chunk. Both bounds coexist by
+///   design and do not double-charge.
+///
+/// `negotiated_adapter` and `target_did` are `None` — the streaming open
+/// surface (parity with `outlet_invoke`) negotiates neither a payment adapter
+/// nor a cross-context target DID.
+///
+/// Returns:
+/// - `Ok(None)` when the effective caveat set has no §7.3.8 post-input
+///   constraint (the open bypasses the gate, exactly as
+///   [`build_post_input_hook`] returns `None`);
+/// - `Ok(Some(hook))` when a hook is built (counter CAS included iff a counter
+///   store is configured AND counter-bearing caveats are present);
+/// - `Err(OpenStreamRejection::CaveatPostInputViolation)` — FAIL CLOSED — when
+///   the effective caveats carry a counter-bearing cap (`max_calls` /
+///   `amount_max_cumulative` / `rate_window`) but the manager has NO counter
+///   store. A cap the runtime cannot enforce MUST reject the open, never pass.
+fn build_stream_post_input_hook(
+    context_id: &str,
+    invoker_did: &DID,
+    now_secs: u64,
+    caveats: &scp_protocol::trust::caveats::InvocationCaveats,
+    cost_per_chunk: scp_protocol::economy::types::Amount,
+    ucan_cid: &str,
+    counter_store: Option<&Arc<dyn crate::trust::CaveatCounterApi>>,
+) -> Result<
+    Option<crate::context::outlets::invoke::CaveatPostInputCheck<'static>>,
+    crate::context::outlets::dispatch::OpenStreamRejection,
+> {
+    use scp_protocol::context::outlets::error_codes;
+
+    // No §7.3.8 post-input constraint → no hook (parity with
+    // `build_post_input_hook` returning `None`).
+    if !caveats.requires_post_input_check() {
+        return Ok(None);
+    }
+
+    if let Some(store) = counter_store {
+        // Full hook: synchronous local checks + counter CAS, built by the
+        // SAME private composer the non-streaming path uses. Streaming
+        // never enables OUT-022 layer composition at open (no
+        // OutboundPolicy / SpendingCapability negotiated here), so the
+        // OUT-021 counter branch inside the composed hook owns the CAS.
+        let enforcement = CaveatEnforcement {
+            caveats,
+            counter_store: Arc::clone(store),
+            ucan_cid,
+            negotiated_adapter: None,
+            target_did: None,
+            estimated_cost: cost_per_chunk,
+        };
+        return Ok(build_post_input_hook(
+            context_id,
+            invoker_did,
+            now_secs,
+            Some(enforcement),
+            None,
+            None,
+        ));
+    }
+
+    // No counter store. A counter-bearing cap CANNOT be enforced — fail
+    // closed rather than silently skip the CAS.
+    if caveats.has_counter_bearing_caveat() {
+        return Err(
+            crate::context::outlets::dispatch::OpenStreamRejection::CaveatPostInputViolation {
+                slug: error_codes::SLUG_AUTHORIZATION_DENIED,
+            },
+        );
+    }
+    // Only stateless local checks remain (`input_schema`,
+    // `amount_max_per_call`, `allowed_adapters`, `allowed_target_dids`) —
+    // they need no counter store, so run them directly. This is the legacy /
+    // test path (manager built without a concrete storage backend);
+    // production bridges always supply a counter store, so they take the
+    // `Some` branch above.
+    let caveats_owned = caveats.clone();
+    let hook: crate::context::outlets::invoke::CaveatPostInputCheck<'static> = Box::new(
+        move |input: &serde_json::Value| {
+            let caveats = caveats_owned.clone();
+            let input = input.clone();
+            Box::pin(async move {
+                caveats
+                    .check_invocation_local(&input, cost_per_chunk, None, None)
+                    .map_err(|err| {
+                        use scp_protocol::trust::caveats::CheckInvocationError;
+                        let message = err.to_string();
+                        match err {
+                            CheckInvocationError::InputSchemaViolation { .. } => {
+                                crate::context::outlets::invoke::InvocationError::InputValidationFailed {
+                                    message,
+                                }
+                            }
+                            other => {
+                                crate::context::outlets::invoke::InvocationError::CaveatViolation {
+                                    slug: other.slug(),
+                                    message,
+                                }
+                            }
+                        }
+                    })
+            })
+        },
+    );
+    Ok(Some(hook))
 }
 
 /// Captures the SCP-OUT-021 hook fields by value so the returned closure is
@@ -9347,5 +9484,508 @@ mod outlet_error_mapping_tests {
         .expect("registry constants are valid");
         let ctx_err: ContextError = envelope.into();
         assert!(matches!(ctx_err, ContextError::OutletInvocation(_)));
+    }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::similar_names,
+    clippy::uninlined_format_args
+)]
+mod stream_caveat_post_input_tests {
+    //! crypto-MED (R3) — the §7.3.8 post-input caveat hook for outlet-stream
+    //! open is now built ENTIRELY in the runtime by
+    //! [`build_stream_post_input_hook`], the SAME composition the
+    //! non-streaming [`build_post_input_hook`] runs. These tests pin that the
+    //! FULL hook is enforced through the runtime path — independent of any
+    //! FFI bridge — covering each §7.3.8 dimension the spec table defines:
+    //!
+    //! * `input_schema` conformance (synchronous local check),
+    //! * `amount_max_per_call` vs `cost_per_chunk` (synchronous local check),
+    //! * `allowed_target_dids` mismatch (synchronous local check),
+    //! * `amount_max_cumulative` projected-escrow CAS (durable counter),
+    //! * `rate_window` sliding-window CAS (durable counter),
+    //! * `max_calls` invocation CAS (durable counter) — AND the proof that
+    //!   the invocation counter is a DISTINCT dimension from HIGH-2's
+    //!   per-chunk `CreditTracker` ceiling, so the two bounds coexist without
+    //!   double-charging.
+    //!
+    //! The hook is run once per stream open (§5.4.5 "the stream validates its
+    //! input once"); each test invokes the built closure exactly as
+    //! `open_stream_session` does.
+    //!
+    //! Spec source: `.docs/specs/07-trust-validation-and-capabilities.md`
+    //! §7.3.8.
+
+    use super::*;
+    use scp_platform::testing::InMemoryStorage;
+    use scp_primitives::TestClock;
+    use scp_protocol::economy::types::Amount;
+    use scp_protocol::trust::caveats::{InvocationCaveats, RateWindow};
+
+    const TEST_CTX: &str = "ctx-stream-caveat";
+    const TEST_CID: &str = "bafytestucancid";
+
+    /// Build a concrete counter store over fresh in-memory storage with a
+    /// deterministic clock pinned at `now`.
+    fn make_store(now: u64) -> Arc<crate::trust::CaveatCounterStore<InMemoryStorage>> {
+        let repo = Arc::new(crate::store::ProtocolRepository::new_for_testing(
+            InMemoryStorage::new(),
+        ));
+        let clock: Arc<dyn scp_primitives::Clock> = Arc::new(TestClock::new(now));
+        Arc::new(crate::trust::CaveatCounterStore::new(repo, clock))
+    }
+
+    /// Type-erase a concrete store to the trait object the builder accepts.
+    fn erase(
+        store: &Arc<crate::trust::CaveatCounterStore<InMemoryStorage>>,
+    ) -> Arc<dyn crate::trust::CaveatCounterApi> {
+        Arc::clone(store) as Arc<dyn crate::trust::CaveatCounterApi>
+    }
+
+    fn invoker() -> DID {
+        "did:key:z6MkInvoker".into()
+    }
+
+    /// Runs the built hook once over the given input, returning the result the
+    /// dispatch pump would observe at stream open. The hook is a `FnOnce`
+    /// (run exactly once per open, §5.4.5), so it is consumed by value.
+    async fn run_hook(
+        hook: crate::context::outlets::invoke::CaveatPostInputCheck<'static>,
+        input: serde_json::Value,
+    ) -> Result<(), crate::context::outlets::invoke::InvocationError> {
+        hook(&input).await
+    }
+
+    /// Unwraps `Ok(Some(hook))`, panicking with `label` otherwise. The hook
+    /// type is not `Debug`, so this avoids `.expect()` on the `Option`.
+    fn expect_hook(
+        built: Result<
+            Option<crate::context::outlets::invoke::CaveatPostInputCheck<'static>>,
+            crate::context::outlets::dispatch::OpenStreamRejection,
+        >,
+        label: &str,
+    ) -> crate::context::outlets::invoke::CaveatPostInputCheck<'static> {
+        match built {
+            Ok(Some(hook)) => hook,
+            Ok(None) => panic!("{label}: expected Some(hook), got Ok(None)"),
+            Err(rej) => panic!("{label}: expected Some(hook), got Err({rej:?})"),
+        }
+    }
+
+    /// No §7.3.8 post-input constraint → no hook (parity with the
+    /// non-streaming `build_post_input_hook` returning `None`).
+    #[tokio::test]
+    async fn empty_caveats_yield_no_hook() {
+        let store = make_store(1_000);
+        let built = build_stream_post_input_hook(
+            TEST_CTX,
+            &invoker(),
+            1_000,
+            &InvocationCaveats::empty(),
+            Amount::new(5),
+            TEST_CID,
+            Some(&erase(&store)),
+        )
+        .expect("empty caveats must not fail closed");
+        assert!(built.is_none(), "caveat-free leaf must bypass the gate");
+    }
+
+    /// `input_schema` violation rejects at open.
+    #[tokio::test]
+    async fn input_schema_violation_rejects() {
+        let store = make_store(1_000);
+        let mut caveats = InvocationCaveats::empty();
+        caveats.input_schema = Some(serde_json::json!({
+            "type": "object",
+            "properties": { "amount": { "type": "number" } },
+            "required": ["amount"],
+        }));
+        let hook = expect_hook(
+            build_stream_post_input_hook(
+                TEST_CTX,
+                &invoker(),
+                1_000,
+                &caveats,
+                Amount::new(1),
+                TEST_CID,
+                Some(&erase(&store)),
+            ),
+            "schema caveat",
+        );
+
+        // Missing the required `amount` field → schema violation. The runtime
+        // composer routes every `check_invocation_local` failure (including
+        // `input_schema`) through `CaveatViolation` carrying the rule's slug;
+        // `open_stream_session` then maps the `input.schema-violation` slug to
+        // the §5.4.4 input-violation envelope. Assert the slug so the test
+        // pins the precise §7.3.8 → §5.4.4 routing the bridges relied on.
+        let err = run_hook(hook, serde_json::json!({ "other": true }))
+            .await
+            .expect_err("schema-violating input must reject at open");
+        match err {
+            crate::context::outlets::invoke::InvocationError::CaveatViolation { slug, .. } => {
+                assert_eq!(
+                    slug, "input.schema-violation",
+                    "schema violation must carry the input.schema-violation slug"
+                );
+            }
+            other => panic!("schema violation must be a CaveatViolation, got {other:?}"),
+        }
+
+        // Conforming input passes (rebuild — the hook is FnOnce).
+        let hook_ok = expect_hook(
+            build_stream_post_input_hook(
+                TEST_CTX,
+                &invoker(),
+                1_000,
+                &caveats,
+                Amount::new(1),
+                TEST_CID,
+                Some(&erase(&make_store(1_000))),
+            ),
+            "schema caveat (conforming)",
+        );
+        run_hook(hook_ok, serde_json::json!({ "amount": 3 }))
+            .await
+            .expect("schema-conforming input must pass");
+    }
+
+    /// `amount_max_per_call` < `cost_per_chunk` rejects at open; a cost at the
+    /// cap passes (the §19.5 per-invocation pricing unit).
+    #[tokio::test]
+    async fn amount_max_per_call_below_cost_per_chunk_rejects() {
+        let store = make_store(1_000);
+        let mut caveats = InvocationCaveats::empty();
+        caveats.amount_max_per_call = Some(Amount::new(5));
+
+        // cost_per_chunk = 9 > cap 5 → reject.
+        let hook = expect_hook(
+            build_stream_post_input_hook(
+                TEST_CTX,
+                &invoker(),
+                1_000,
+                &caveats,
+                Amount::new(9),
+                TEST_CID,
+                Some(&erase(&store)),
+            ),
+            "amount_max_per_call",
+        );
+        let err = run_hook(hook, serde_json::json!({}))
+            .await
+            .expect_err("cost above amount_max_per_call must reject");
+        assert!(
+            matches!(
+                err,
+                crate::context::outlets::invoke::InvocationError::CaveatViolation { .. }
+            ),
+            "amount_max_per_call rejection is a CaveatViolation, got {err:?}"
+        );
+
+        // cost_per_chunk = 5 == cap 5 → pass (fresh store, no cumulative state).
+        let store_ok = make_store(1_000);
+        let hook_ok = expect_hook(
+            build_stream_post_input_hook(
+                TEST_CTX,
+                &invoker(),
+                1_000,
+                &caveats,
+                Amount::new(5),
+                TEST_CID,
+                Some(&erase(&store_ok)),
+            ),
+            "amount_max_per_call (at cap)",
+        );
+        run_hook(hook_ok, serde_json::json!({}))
+            .await
+            .expect("cost at the cap must pass");
+    }
+
+    /// `allowed_target_dids` set but no target DID negotiated on the
+    /// single-context streaming surface → fail-closed reject (the streaming
+    /// open passes `target_did: None`, the §7.3.8-correct behaviour).
+    #[tokio::test]
+    async fn allowed_target_dids_mismatch_rejects() {
+        let store = make_store(1_000);
+        let mut caveats = InvocationCaveats::empty();
+        caveats.allowed_target_dids = Some(vec!["did:key:z6MkAllowedTarget".into()]);
+        let hook = expect_hook(
+            build_stream_post_input_hook(
+                TEST_CTX,
+                &invoker(),
+                1_000,
+                &caveats,
+                Amount::new(1),
+                TEST_CID,
+                Some(&erase(&store)),
+            ),
+            "allowed_target_dids",
+        );
+        let err = run_hook(hook, serde_json::json!({}))
+            .await
+            .expect_err("a target-DID restriction with no negotiated target must fail closed");
+        assert!(
+            matches!(
+                err,
+                crate::context::outlets::invoke::InvocationError::CaveatViolation { .. }
+            ),
+            "allowed_target_dids rejection is a CaveatViolation, got {err:?}"
+        );
+    }
+
+    /// `amount_max_cumulative` projected escrow: an open whose `cost_per_chunk`
+    /// alone exceeds the remaining cumulative ceiling rejects at open via the
+    /// durable counter CAS.
+    #[tokio::test]
+    async fn amount_max_cumulative_below_projected_escrow_rejects() {
+        let store = make_store(1_000);
+        let mut caveats = InvocationCaveats::empty();
+        // Cumulative cap of 10; this open's cost is 12 → CAS rejects.
+        caveats.amount_max_cumulative = Some(Amount::new(10));
+        let hook = expect_hook(
+            build_stream_post_input_hook(
+                TEST_CTX,
+                &invoker(),
+                1_000,
+                &caveats,
+                Amount::new(12),
+                TEST_CID,
+                Some(&erase(&store)),
+            ),
+            "amount_max_cumulative",
+        );
+        let err = run_hook(hook, serde_json::json!({}))
+            .await
+            .expect_err("projected cumulative spend above the ceiling must reject at open");
+        assert!(
+            matches!(
+                err,
+                crate::context::outlets::invoke::InvocationError::CaveatViolation { .. }
+            ),
+            "amount_max_cumulative rejection is a CaveatViolation, got {err:?}"
+        );
+    }
+
+    /// `rate_window` exhausted: a window of `max = 1` admits the first open and
+    /// rejects the second within the same window via the durable counter CAS.
+    #[tokio::test]
+    async fn rate_window_exhausted_rejects() {
+        let store = make_store(1_000);
+        let mut caveats = InvocationCaveats::empty();
+        caveats.rate_window = Some(RateWindow {
+            max: 1,
+            window_secs: 60,
+        });
+
+        // First open within the window — admitted.
+        let hook1 = expect_hook(
+            build_stream_post_input_hook(
+                TEST_CTX,
+                &invoker(),
+                1_000,
+                &caveats,
+                Amount::new(1),
+                TEST_CID,
+                Some(&erase(&store)),
+            ),
+            "rate_window (first)",
+        );
+        run_hook(hook1, serde_json::json!({}))
+            .await
+            .expect("first open within rate window must be admitted");
+
+        // Second open within the same window — rejected (shared store/CID).
+        let hook2 = expect_hook(
+            build_stream_post_input_hook(
+                TEST_CTX,
+                &invoker(),
+                1_010,
+                &caveats,
+                Amount::new(1),
+                TEST_CID,
+                Some(&erase(&store)),
+            ),
+            "rate_window (second)",
+        );
+        let err = run_hook(hook2, serde_json::json!({}))
+            .await
+            .expect_err("second open within an exhausted rate window must reject");
+        assert!(
+            matches!(
+                err,
+                crate::context::outlets::invoke::InvocationError::CaveatViolation { .. }
+            ),
+            "rate_window rejection is a CaveatViolation, got {err:?}"
+        );
+    }
+
+    /// Fail-closed: a counter-bearing cap with NO counter store rejects the
+    /// open (a cap the runtime cannot enforce must never silently pass).
+    #[tokio::test]
+    async fn counter_bearing_caveat_without_store_fails_closed() {
+        let mut caveats = InvocationCaveats::empty();
+        caveats.max_calls = Some(5);
+        let built = build_stream_post_input_hook(
+            TEST_CTX,
+            &invoker(),
+            1_000,
+            &caveats,
+            Amount::new(1),
+            TEST_CID,
+            None,
+        );
+        match built {
+            Err(
+                crate::context::outlets::dispatch::OpenStreamRejection::CaveatPostInputViolation {
+                    ..
+                },
+            ) => {}
+            Err(other) => panic!("expected CaveatPostInputViolation, got Err({other:?})"),
+            Ok(_) => panic!("a counter-bearing cap with no store must fail closed, got Ok(..)"),
+        }
+    }
+
+    /// Stateless-only caveats with NO counter store still build a working
+    /// hook (no CAS needed) — the legacy / test path.
+    #[tokio::test]
+    async fn stateless_caveats_without_store_still_enforce() {
+        let mut caveats = InvocationCaveats::empty();
+        caveats.amount_max_per_call = Some(Amount::new(5));
+        let hook = expect_hook(
+            build_stream_post_input_hook(
+                TEST_CTX,
+                &invoker(),
+                1_000,
+                &caveats,
+                Amount::new(9),
+                TEST_CID,
+                None,
+            ),
+            "stateless amount_max_per_call (no store)",
+        );
+        let err = run_hook(hook, serde_json::json!({}))
+            .await
+            .expect_err("cost above amount_max_per_call must reject even without a store");
+        assert!(
+            matches!(
+                err,
+                crate::context::outlets::invoke::InvocationError::CaveatViolation { .. }
+            ),
+            "stateless rejection is a CaveatViolation, got {err:?}"
+        );
+    }
+
+    /// crypto-MED — the §7.3.8 `max_calls` INVOCATION counter and HIGH-2's
+    /// per-CHUNK `CreditTracker` ceiling are DISTINCT dimensions; running both
+    /// is correct, not double-charging.
+    ///
+    /// This test proves the invocation counter increments by exactly ONE per
+    /// stream open (the invocation dimension), regardless of how many billable
+    /// chunks the stream later emits (HIGH-2's separate per-chunk dimension).
+    /// A second open under the same `(context_id, ucan_cid)` increments the
+    /// invocation counter to 2 — so a `max_calls = 1` cap admits the first
+    /// open and rejects the second, independent of chunk count.
+    #[tokio::test]
+    async fn max_calls_counts_invocations_not_chunks_no_double_charge() {
+        let store = make_store(1_000);
+        let mut caveats = InvocationCaveats::empty();
+        caveats.max_calls = Some(2);
+
+        // First open: invocation counter 0 → 1.
+        let hook1 = expect_hook(
+            build_stream_post_input_hook(
+                TEST_CTX,
+                &invoker(),
+                1_000,
+                &caveats,
+                Amount::new(7), // cost_per_chunk is irrelevant to the max_calls dim
+                TEST_CID,
+                Some(&erase(&store)),
+            ),
+            "max_calls (first)",
+        );
+        run_hook(hook1, serde_json::json!({}))
+            .await
+            .expect("first open admitted under max_calls=2");
+
+        // The invocation counter incremented by exactly 1 — NOT by the number
+        // of chunks the stream would bill (HIGH-2's separate ceiling).
+        let counters = store
+            .load_counters(TEST_CTX, TEST_CID)
+            .await
+            .expect("counter load succeeds")
+            .expect("a record exists after the first open");
+        assert_eq!(
+            counters.max_calls_used, 1,
+            "a stream open must count as exactly ONE invocation against max_calls, \
+             distinct from HIGH-2's per-chunk CreditTracker ceiling"
+        );
+
+        // Second open: invocation counter 1 → 2 (still within cap of 2).
+        let hook2 = expect_hook(
+            build_stream_post_input_hook(
+                TEST_CTX,
+                &invoker(),
+                1_010,
+                &caveats,
+                Amount::new(7),
+                TEST_CID,
+                Some(&erase(&store)),
+            ),
+            "max_calls (second)",
+        );
+        run_hook(hook2, serde_json::json!({}))
+            .await
+            .expect("second open admitted at the cap boundary");
+        let counters = store
+            .load_counters(TEST_CTX, TEST_CID)
+            .await
+            .expect("load")
+            .expect("record");
+        assert_eq!(counters.max_calls_used, 2, "second open increments to 2");
+
+        // Third open: invocation counter would be 3 > cap 2 → reject. Proves
+        // the invocation dimension is the bound being enforced here.
+        let hook3 = expect_hook(
+            build_stream_post_input_hook(
+                TEST_CTX,
+                &invoker(),
+                1_020,
+                &caveats,
+                Amount::new(7),
+                TEST_CID,
+                Some(&erase(&store)),
+            ),
+            "max_calls (third)",
+        );
+        let err = run_hook(hook3, serde_json::json!({}))
+            .await
+            .expect_err("third open exceeds max_calls=2");
+        assert!(
+            matches!(
+                err,
+                crate::context::outlets::invoke::InvocationError::CaveatViolation { .. }
+            ),
+            "max_calls exhaustion is a CaveatViolation, got {err:?}"
+        );
+
+        // The AmountCumulative dimension was never touched by these opens (no
+        // amount_max_cumulative cap set), confirming the max_calls invocation
+        // counter and any chunk-derived ceiling are independent dimensions —
+        // running both does not double-charge a single dimension.
+        let counters = store
+            .load_counters(TEST_CTX, TEST_CID)
+            .await
+            .expect("load")
+            .expect("record");
+        assert_eq!(
+            counters.amount_cumulative_used, 0,
+            "no amount_max_cumulative cap → that dimension stays untouched, \
+             proving per-dimension isolation (no cross-dimension double-charge)"
+        );
     }
 }

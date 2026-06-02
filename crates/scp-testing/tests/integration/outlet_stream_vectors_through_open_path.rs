@@ -778,7 +778,6 @@ async fn drive_vector(vector: &StreamVector) -> Vec<OutletStreamChunk> {
             None,
             build_open_stream_params(&vector.open),
             admission,
-            None,
         )
         .await
         .expect("vector replay: open_outlet_stream must succeed for fixture-backed vectors");

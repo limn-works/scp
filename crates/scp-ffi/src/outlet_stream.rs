@@ -1010,18 +1010,6 @@ pub fn py_outlet_invoke_stream(
                 settlement_sink,
                 params,
                 admission,
-                // §7.3.8 caveat post-input check (crypto-MED). The non-streaming
-                // `py_outlet_invoke` path passes `None` for `caveat_enforcement`
-                // (PyO3 has no per-context caveat counter store wired), so the
-                // manager's `build_post_input_hook` produces no hook there. The
-                // streaming open path mirrors that: there is no public seam for
-                // the bridge to construct the §7.3.8 hook (the builder lives in
-                // the manager and consumes a counter store the bridge does not
-                // own), so this passes `None` to match the non-streaming PyO3
-                // surface. Wiring a real hook requires a core change to expose
-                // the builder / accept a `CaveatEnforcement` here — out of scope
-                // for the bridge-only Phase-2 patch.
-                None,
             )
             .await
     });

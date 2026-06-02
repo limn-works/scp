@@ -106,6 +106,13 @@ pub mod context {
 pub mod trust {
     pub use scp_protocol::trust::*;
     pub use scp_runtime::trust::ProtocolRepositoryTrustBridge;
+    // §7.3.8 invocation-caveat counter CAS — the durable per-`(context_id,
+    // ucan_cid, kind)` store the FFI bridges wire into the `ContextManager`
+    // so outlet-stream open enforces `max_calls` / `amount_max_cumulative` /
+    // `rate_window` identically to the non-streaming invoke path.
+    pub use scp_runtime::trust::{
+        CaveatCounterApi, CaveatCounterStore, CaveatCounters, CounterError, CounterExhausted,
+    };
     // Re-export all submodule types at this level for backward compatibility.
     pub use scp_protocol::trust::admission::{
         AdmissionError, CapabilityRequirement, VerificationLevel, check_capability_requirements,

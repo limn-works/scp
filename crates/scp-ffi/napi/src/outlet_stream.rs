@@ -985,26 +985,14 @@ pub async fn context_outlet_invoke_stream(
         reserved_escrow,
     );
 
-    // §7.3.8 / crypto-MED (R3) — build the post-input caveat check ONCE at
-    // open (the stream validates its input a single time, §5.4.5). The hook
-    // mirrors the synchronous OUT-021 local-check branch of the runtime's
-    // `build_post_input_hook`: it runs `check_invocation_local` over the
-    // VALIDATED-NARROWED effective caveat set (the leaf UCAN `nb` after the
-    // §7.3.8 Step 7b/11b narrow that `TokenNbCaveatResolver` drives in the
-    // UCAN pipeline above) — `input_schema` conformance + `amount_max_per_call`
-    // (gated against the per-Data-chunk cost, the §19.5 per-invocation pricing
-    // unit) + `allowed_adapters` / `allowed_target_dids`. The three
-    // counter-bearing caveats (`max_calls`, `amount_max_cumulative`,
-    // `rate_window`) require a `CaveatCounterStore` CAS that this bridge does
-    // not own; for streaming, the `max_calls` ceiling is already enforced by
-    // the runtime's `enforce_estimated_chunk_count_bound` over the same
-    // `effective_caveats` pinned in the `caveats_binding`, and the runtime
-    // runs the hook once before the pump spawns. A `None` hook (caveat-free
-    // leaf) bypasses the gate exactly as the runtime's `build_post_input_hook`
-    // returns `None` when no enforcement applies.
-    let caveat_post_input_check =
-        build_stream_post_input_check(effective_caveats.clone(), cost_per_chunk);
-
+    // §7.3.8 / crypto-MED (R3) — the post-input caveat hook is now built
+    // ENTIRELY inside the runtime by `ContextManager::open_outlet_stream`
+    // from `params` (the VALIDATED-NARROWED `effective_caveats` + the pinned
+    // `cost_per_chunk` + `ucan_cid`) and the manager's own counter store, so
+    // every bridge enforces the full §7.3.8 gate identically — including the
+    // counter CAS for `max_calls` / `amount_max_cumulative` / `rate_window`
+    // that this bridge cannot construct on its own. The bridge supplies no
+    // hook.
     let params = build_open_stream_params(
         context_id.clone(),
         outlet_id.clone(),
@@ -1063,7 +1051,6 @@ pub async fn context_outlet_invoke_stream(
             settlement_sink,
             params,
             admission,
-            caveat_post_input_check,
         )
         .await;
     let mut runtime_handle = match open_result {
@@ -1210,64 +1197,6 @@ fn build_open_stream_params(
         // would substitute stale data for the manager's live read.
         economic_policy_snapshot: None,
     }
-}
-
-/// Builds the §7.3.8 post-input caveat check for an outlet stream open
-/// (crypto-MED, R3).
-///
-/// Returns a [`scp_runtime::context::outlets::invoke::CaveatPostInputCheck`]
-/// closure over the VALIDATED-NARROWED effective caveat set (the leaf UCAN
-/// `nb` after the §7.3.8 Step 7b/11b narrow). The closure runs the
-/// synchronous local checks of
-/// [`scp_protocol::trust::caveats::InvocationCaveats::check_invocation_local`]
-/// — `input_schema` conformance, `amount_max_per_call` (gated against
-/// `cost_per_chunk`, the §19.5 per-invocation pricing unit), `allowed_adapters`,
-/// and `allowed_target_dids` — exactly mirroring the synchronous OUT-021
-/// branch of the runtime's `build_post_input_hook`. The `ContextManager`
-/// runs this hook ONCE, before the dispatch pump spawns (§5.4.5 "the stream
-/// validates its input once").
-///
-/// Returns `None` when none of the four locally-enforceable caveat fields is
-/// set, so a caveat-free (or counter-only) leaf bypasses the gate — matching
-/// `build_post_input_hook`, which returns `None` when no enforcement applies.
-/// The three counter-bearing caveats (`max_calls`, `amount_max_cumulative`,
-/// `rate_window`) need a `CaveatCounterStore` CAS the bridge does not hold;
-/// for streams the `max_calls` ceiling is enforced by the runtime's
-/// `enforce_estimated_chunk_count_bound` over the same `effective_caveats`
-/// pinned into the `caveats_binding`.
-///
-/// The negotiated payment adapter and cross-context target DID are `None` on
-/// the native single-context streaming path: a leaf that restricts to
-/// specific adapters / target DIDs with neither selected is rejected by
-/// `check_invocation_local`, which is the §7.3.8-correct fail-closed
-/// behaviour.
-fn build_stream_post_input_check(
-    effective_caveats: InvocationCaveats,
-    cost_per_chunk: scp_protocol::economy::types::Amount,
-) -> Option<scp_runtime::context::outlets::invoke::CaveatPostInputCheck<'static>> {
-    let has_local_caveat = effective_caveats.input_schema.is_some()
-        || effective_caveats.amount_max_per_call.is_some()
-        || effective_caveats.allowed_adapters.is_some()
-        || effective_caveats.allowed_target_dids.is_some();
-    if !has_local_caveat {
-        return None;
-    }
-    let hook: scp_runtime::context::outlets::invoke::CaveatPostInputCheck<'static> =
-        Box::new(move |input: &Value| {
-            let input = input.clone();
-            let caveats = effective_caveats.clone();
-            Box::pin(async move {
-                caveats
-                    .check_invocation_local(&input, cost_per_chunk, None, None)
-                    .map_err(|err| {
-                        scp_runtime::context::outlets::invoke::InvocationError::CaveatViolation {
-                            slug: err.slug(),
-                            message: err.to_string(),
-                        }
-                    })
-            })
-        });
-    Some(hook)
 }
 
 /// Inserts an entry into the per-bridge stream registry, keyed by the
@@ -2274,67 +2203,6 @@ mod tests {
             grant_error_to_code(GrantError::InsufficientFunds),
             grant_error_to_code(GrantError::StreamClosed),
             "insufficient-funds (Economic) and StreamClosed (Protocol) are distinct classes",
-        );
-    }
-
-    /// crypto-MED (R3) — `build_stream_post_input_check` returns `None` for a
-    /// caveat-free (or counter-only) leaf so the §7.3.8 gate is bypassed
-    /// exactly as the runtime's `build_post_input_hook` returns `None` when
-    /// no local enforcement applies. A leaf carrying only a counter caveat
-    /// (`max_calls`) — whose CAS the bridge does not own — also yields `None`
-    /// (the runtime enforces that ceiling via
-    /// `enforce_estimated_chunk_count_bound`).
-    #[test]
-    fn post_input_check_none_when_no_local_caveats() {
-        let cost = scp_protocol::economy::types::Amount::new(5);
-        // Empty caveat set → no hook.
-        assert!(
-            build_stream_post_input_check(InvocationCaveats::empty(), cost).is_none(),
-            "empty caveats must bypass the post-input gate",
-        );
-        // Counter-only caveat (max_calls) → still no local hook.
-        let mut counter_only = InvocationCaveats::empty();
-        counter_only.max_calls = Some(10);
-        assert!(
-            build_stream_post_input_check(counter_only, cost).is_none(),
-            "counter-only caveats must bypass the local post-input gate",
-        );
-    }
-
-    /// crypto-MED (R3) — `build_stream_post_input_check` builds a hook for a
-    /// leaf with an `amount_max_per_call` caveat, and the hook REJECTS an
-    /// open whose per-Data-chunk cost exceeds that cap (the §19.5 per-call
-    /// ceiling) — surfaced as `InvocationError::CaveatViolation`. A cost at
-    /// or below the cap passes.
-    #[tokio::test]
-    async fn post_input_check_enforces_amount_max_per_call() {
-        // Cap of 5; per-chunk cost of 9 must be rejected.
-        let mut caveats = InvocationCaveats::empty();
-        caveats.amount_max_per_call = Some(scp_protocol::economy::types::Amount::new(5));
-        let hook = build_stream_post_input_check(
-            caveats.clone(),
-            scp_protocol::economy::types::Amount::new(9),
-        )
-        .expect("amount_max_per_call must build a hook");
-        let input = serde_json::json!({});
-        let err = hook(&input)
-            .await
-            .expect_err("cost above amount_max_per_call must reject");
-        assert!(
-            matches!(
-                err,
-                scp_runtime::context::outlets::invoke::InvocationError::CaveatViolation { .. }
-            ),
-            "rejection must be a CaveatViolation, got {err:?}",
-        );
-
-        // Cost at the cap passes.
-        let hook_ok =
-            build_stream_post_input_check(caveats, scp_protocol::economy::types::Amount::new(5))
-                .expect("hook builds");
-        assert!(
-            hook_ok(&input).await.is_ok(),
-            "cost at the cap must pass the post-input gate",
         );
     }
 

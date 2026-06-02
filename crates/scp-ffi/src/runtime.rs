@@ -271,6 +271,33 @@ impl StorageProvider {
         let storage = SqliteStorage::new(path, key)?;
         Ok(Self::Sqlite(Arc::new(storage)))
     }
+
+    /// Builds the §7.3.8 caveat counter store backed by this provider's
+    /// storage, type-erased as `Arc<dyn CaveatCounterApi>`.
+    ///
+    /// Shares the same underlying storage `Arc` as
+    /// [`build_persistence_provider`] so caveat-counter records, context
+    /// snapshots, and event-log entries all land in one encrypted backend.
+    /// `clock` MUST be the manager's clock so the `rate_window` sliding-window
+    /// scan agrees with the manager's `now_secs`.
+    #[must_use]
+    pub fn caveat_counter_store(
+        &self,
+        clock: Arc<dyn scp_primitives::Clock>,
+    ) -> Arc<dyn scp_core::trust::CaveatCounterApi> {
+        match self {
+            Self::InMemoryEncrypted(storage) => {
+                let repo = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+                Arc::new(scp_core::trust::CaveatCounterStore::new(repo, clock))
+                    as Arc<dyn scp_core::trust::CaveatCounterApi>
+            }
+            Self::Sqlite(storage) => {
+                let repo = Arc::new(ProtocolRepository::new(Arc::clone(storage)));
+                Arc::new(scp_core::trust::CaveatCounterStore::new(repo, clock))
+                    as Arc<dyn scp_core::trust::CaveatCounterApi>
+            }
+        }
+    }
 }
 
 impl Storage for StorageProvider {
@@ -957,11 +984,13 @@ pub fn init_context_manager(local_did: &str) {
     let did = local_did.to_owned();
     let crypto = Box::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(did));
     let persistence = build_persistence_provider();
+    let caveat_counter_store = build_caveat_counter_store();
     let cm_arc = build_context_manager(
         crypto,
         Box::new(NotConfiguredTransportProvider),
         Box::new(NoOpEventLogProvider),
         persistence,
+        caveat_counter_store,
     );
 
     bi.core.set_context_manager(cm_arc);
@@ -1008,7 +1037,14 @@ pub fn init_context_manager_with(
         return;
     }
     let persistence = persistence.or_else(build_persistence_provider);
-    let cm_arc = build_context_manager(crypto, transport, event_log, persistence);
+    let caveat_counter_store = build_caveat_counter_store();
+    let cm_arc = build_context_manager(
+        crypto,
+        transport,
+        event_log,
+        persistence,
+        caveat_counter_store,
+    );
     bi.core.set_context_manager(cm_arc);
 }
 
@@ -1032,11 +1068,13 @@ pub fn init_context_manager_for_test() {
         return;
     }
     let persistence = build_persistence_provider();
+    let caveat_counter_store = build_caveat_counter_store();
     let cm_arc = build_context_manager(
         Box::new(NoOpCryptoProvider),
         Box::new(scp_core::context::LocalTransportProvider),
         Box::new(NoOpEventLogProvider),
         persistence,
+        caveat_counter_store,
     );
 
     bi.core.set_context_manager(cm_arc);
@@ -1078,6 +1116,23 @@ fn build_persistence_provider() -> Option<Box<dyn ContextPersistence>> {
             Box::new(ProtocolRepositoryContextBridge::new(repo)) as Box<dyn ContextPersistence>
         }
     })
+}
+
+/// Builds the §7.3.8 caveat counter store from the default bridge instance's
+/// storage provider, if storage has been initialized.
+///
+/// Shares the underlying storage `Arc` with [`build_persistence_provider`] so
+/// counter records co-locate with context / event-log state. Uses
+/// [`scp_primitives::SystemClock`] — the same clock the
+/// [`ContextManager`] constructors default to — so the `rate_window` scan
+/// agrees with the manager's `now_secs`. Returns `None` before
+/// [`init_storage`] runs; the manager then fails closed on counter-bearing
+/// caveats at stream open rather than silently skipping the CAS.
+fn build_caveat_counter_store() -> Option<Arc<dyn scp_core::trust::CaveatCounterApi>> {
+    let bi = DEFAULT_BRIDGE_INSTANCE.get()?;
+    let provider = bi.storage_provider()?;
+    let clock: Arc<dyn scp_primitives::Clock> = Arc::new(scp_primitives::SystemClock);
+    Some(provider.caveat_counter_store(clock))
 }
 
 /// Adapter that lets a shared `Arc<dyn ContextPersistence + Send + Sync>`
@@ -1151,27 +1206,33 @@ impl ContextPersistence for ArcContextPersistence {
 }
 
 /// Constructs a `ContextManager` with or without persistence.
+///
+/// When `caveat_counter_store` is `Some`, it is attached so the §7.3.8
+/// counter-bearing invocation caveats (`max_calls`, `amount_max_cumulative`,
+/// `rate_window`) are enforced via the durable CAS at outlet-stream open. It
+/// is set BEFORE the manager is wrapped in `Arc` because
+/// [`ContextManager::set_caveat_counter_store`] needs `&mut self`.
 fn build_context_manager(
     crypto: Box<dyn ContextCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Option<Box<dyn ContextPersistence>>,
+    caveat_counter_store: Option<Arc<dyn scp_core::trust::CaveatCounterApi>>,
 ) -> Arc<ContextManager> {
-    match persistence {
-        Some(p) => Arc::new(ContextManager::with_persistence(
+    let mut manager = match persistence {
+        Some(p) => ContextManager::with_persistence(
             crypto,
             transport,
             event_log,
             p,
             not_configured_key_resolver(),
-        )),
-        None => Arc::new(ContextManager::new(
-            crypto,
-            transport,
-            event_log,
-            not_configured_key_resolver(),
-        )),
+        ),
+        None => ContextManager::new(crypto, transport, event_log, not_configured_key_resolver()),
+    };
+    if let Some(store) = caveat_counter_store {
+        manager.set_caveat_counter_store(store);
     }
+    Arc::new(manager)
 }
 
 // ---------------------------------------------------------------------------
@@ -2571,11 +2632,13 @@ mod tests {
         // tests. `CoreFields` is imported at module top via `use
         // scp_ffi_common::bridge_instance::CoreFields`.
         let persistence = build_persistence_provider();
+        let caveat_counter_store = build_caveat_counter_store();
         let cm = build_context_manager(
             Box::new(NoOpCryptoProvider),
             Box::new(scp_core::context::LocalTransportProvider),
             Box::new(NoOpEventLogProvider),
             persistence,
+            caveat_counter_store,
         );
         let bi = CoreFields::with_context_manager(cm);
 

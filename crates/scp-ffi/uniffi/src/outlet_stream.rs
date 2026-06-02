@@ -1263,51 +1263,14 @@ async fn open_stream_internal(
         reserved_escrow,
     );
 
-    // §7.3.8 / §5.4.5 crypto-MED — build the post-input caveat hook from the
-    // VALIDATED-NARROWED effective caveats (the leaf UCAN `nb`, already
-    // resolved above). The stream validates its input ONCE at open (§5.4.5),
-    // so the runtime runs this hook exactly once before the pump spawns. It
-    // mirrors the synchronous local half of the non-streaming invoke's §7.3.8
-    // gate (`check_invocation_local`: `input_schema` / `amount_max_per_call`
-    // / `allowed_adapters` / `allowed_target_dids`). The UniFFI invocation
-    // surface does not negotiate a payment adapter or a cross-context target
-    // DID (parity with `outlet_invoke`, which passes neither), so both are
-    // `None`; `cost_per_chunk` is the per-invocation estimate the
-    // `amount_max_per_call` cap checks against. The hook returns
-    // `InvocationError` shaped so `open_stream_session` maps each failure to
-    // the precise §5.4.4 slug (schema → `input.schema-violation`; every other
-    // caveat rule → its `CheckInvocationError::slug()`), routing identically
-    // to the non-streaming caveat path. `effective_caveats` is cloned for the
-    // hook; the original moves into `build_open_stream_params`.
-    let caveats_for_hook = effective_caveats.clone();
-    let caveat_post_input_check: Option<
-        scp_runtime::context::outlets::invoke::CaveatPostInputCheck<'_>,
-    > = Some(Box::new(move |input: &Value| {
-        let caveats = caveats_for_hook.clone();
-        let input = input.clone();
-        Box::pin(async move {
-            caveats
-                .check_invocation_local(&input, cost_per_chunk, None, None)
-                .map_err(|err| {
-                    use scp_protocol::trust::caveats::CheckInvocationError;
-                    let message = err.to_string();
-                    match err {
-                        CheckInvocationError::InputSchemaViolation { .. } => {
-                            scp_runtime::context::outlets::invoke::InvocationError::InputValidationFailed {
-                                message,
-                            }
-                        }
-                        other => {
-                            scp_runtime::context::outlets::invoke::InvocationError::CaveatViolation {
-                                slug: other.slug(),
-                                message,
-                            }
-                        }
-                    }
-                })
-        })
-    }));
-
+    // §7.3.8 / §5.4.5 crypto-MED — the post-input caveat hook is built
+    // ENTIRELY inside the runtime by `ContextManager::open_outlet_stream`
+    // from `params` (the VALIDATED-NARROWED `effective_caveats` + the pinned
+    // `cost_per_chunk` + `ucan_cid`) and the manager's own counter store, so
+    // every bridge enforces the full §7.3.8 gate identically — including the
+    // counter CAS for `max_calls` / `amount_max_cumulative` / `rate_window`
+    // that this bridge cannot construct on its own. The bridge supplies no
+    // hook.
     let params = build_open_stream_params(
         handle.context_id.clone(),
         outlet_id.to_owned(),
@@ -1361,9 +1324,6 @@ async fn open_stream_internal(
             settlement_sink,
             params,
             admission,
-            // §7.3.8 / §5.4.5 crypto-MED — run the post-input caveat hook
-            // once at open before the pump spawns.
-            caveat_post_input_check,
         )
         .await;
     let mut runtime_handle = match open_result {
