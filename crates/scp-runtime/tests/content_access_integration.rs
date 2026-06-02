@@ -887,6 +887,20 @@ async fn tier3_governance_revoke_write_access_broadcast() {
         "WriteAccessRestored event should be emitted for Author"
     );
 
+    // Seed the pseudonym registry for the members, mimicking the
+    // `PseudonymAnnouncement` exchange that normally runs after a join.
+    // Without a peer pseudonym, an encrypted multi-member `send_message`
+    // correctly returns `PseudonymRegistryEmpty` (§9.10.4); the write-access
+    // gate runs first, so the earlier `is_err()` (PermissionDenied) assertion
+    // still fires for the right reason. Here, after restoration, the registry
+    // must hold real pseudonyms so the fan-out path runs.
+    manager
+        .seed_pseudonym_for_test(ctx_id, alice(), [0xA1u8; 32])
+        .await;
+    manager
+        .seed_pseudonym_for_test(ctx_id, author_did(), [0xA0u8; 32])
+        .await;
+
     // Author can send again.
     let send_result = manager
         .send_message(
@@ -1593,6 +1607,20 @@ async fn governance_tier_stacking_via_context_manager() {
     };
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
+
+    // Seed the pseudonym registry for the members, mimicking the
+    // `PseudonymAnnouncement` exchange that normally runs after a join. An
+    // encrypted multi-member `send_message` into an empty registry correctly
+    // returns `PseudonymRegistryEmpty` (§9.10.4); the write-access gate runs
+    // first, so the earlier write-revocation `is_err()` assertions still fire
+    // for the right reason. After both tiers are reversed, the registry must
+    // hold real pseudonyms so the fan-out path runs.
+    manager
+        .seed_pseudonym_for_test(ctx_id, alice(), [0xA1u8; 32])
+        .await;
+    manager
+        .seed_pseudonym_for_test(ctx_id, dave(), [0xD0u8; 32])
+        .await;
 
     // Dave CAN write now (both tiers reversed).
     let send3 = manager
