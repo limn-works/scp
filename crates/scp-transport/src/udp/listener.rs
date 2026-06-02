@@ -728,8 +728,8 @@ async fn per_client_recv_loop<S: BlobStorage + 'static>(
         // before invoking the MessagePack deserializer, preventing allocation bombs.
         let client_msg: ClientMessage = match ClientMessage::from_bytes(&datagram) {
             Ok(msg) => msg,
-            Err(e) => {
-                debug!(remote = %remote_addr, error = %e, "failed to deserialize UDP datagram");
+            Err(_) => {
+                debug!(remote = %remote_addr, "failed to deserialize UDP datagram");
                 let err = RelayMessage::Err {
                     ref_id: None,
                     code: 400,
