@@ -494,10 +494,16 @@ pub async fn outlet_invoke(
         &identity_did,
         &ucan_token,
         &proof_resolver,
-        // Non-streaming invoke: post-input caveat enforcement runs in the
-        // `ContextManager` economy pipeline, so validation stays caveat-free
-        // here (preserves prior behaviour; HIGH-3 R3).
-        &scp_core::crypto::ucan::validate::NoCaveatResolver,
+        // §5.4.5 / §7.3.8 (R4): the non-streaming outlet invoke is an
+        // outlet-invocation site, so it resolves effective caveats from each
+        // token's signed `nb` field. This makes §7.3.8 Step 7b (per-edge
+        // caveat narrow over the whole chain) and Step 11b (time-box) run
+        // over the VALIDATED-NARROWED caveat set — matching the PyO3 and
+        // UniFFI non-streaming outlet sites, which already use
+        // `TokenNbCaveatResolver`. The streaming outlet path passes the same
+        // resolver (R3); only the generic `ucan_validate` site stays on
+        // `NoCaveatResolver`.
+        &scp_core::crypto::ucan::validate::TokenNbCaveatResolver,
     )
     .map_err(napi::Error::from)?;
 

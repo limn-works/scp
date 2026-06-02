@@ -2325,11 +2325,13 @@ impl ContextManager {
                 "payment capture failed after successful join: {e}"
             );
             // H19: append durable audit record to event log + receive buffer.
+            // R4 M2: persist a coarse reason code (the raw `e` is already in
+            // the operator log above), not the free-form message.
             self.record_payment_capture_failure(
                 context_id,
                 "join_context",
                 member_did,
-                &e.to_string(),
+                super::classify_adapter_message(&e.to_string()),
                 deducted_cost,
             )
             .await;

@@ -9,7 +9,16 @@
 //! `_runtime_tests` feature gate. Moved here as proper integration tests
 //! where scp-runtime is available.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    // The depth-3 real-minted regression spins up several (custody, key, did,
+    // pk) identities whose names necessarily rhyme (root/mid/leaf/final), and
+    // is a single linear setup-then-assert flow.
+    clippy::similar_names,
+    clippy::too_many_lines
+)]
 
 use std::collections::HashSet;
 
@@ -1854,5 +1863,190 @@ async fn validate_ucan_scoped_ucan_cannot_be_exercised_by_wrong_key() {
     assert!(
         matches!(result, Err(UcanError::SignatureInvalid)),
         "scoped UCAN exercised by wrong key must fail: {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// R4 — interior-edge attenuation: real-minted regression
+//
+// The CRITICAL R4 fix runs Step 7 (capability subset) + Step 7b (caveat
+// narrow) at EVERY edge of the delegation chain, including interior edges
+// (mid -> root), not only leaf -> direct-parent (§5.4.5 / §7.3.8). This test
+// proves the fix does NOT regress an honestly-minted chain: an HONESTLY
+// narrowed depth-3 chain (root -> mid -> leaf, each delegation tightening the
+// caveats via the mint-side narrow) MUST still PASS when validated with the
+// production `TokenNbCaveatResolver` and a real proof resolver. If the
+// per-edge enforcement were too strict it would reject this legitimate chain.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn validate_ucan_real_minted_depth3_narrowed_chain_passes_with_token_nb_resolver() {
+    use scp_protocol::context::outlets::OutletKind;
+    use scp_protocol::crypto::ucan::validate::TokenNbCaveatResolver;
+    use scp_protocol::economy::types::Amount;
+    use scp_protocol::trust::caveats::InvocationCaveats;
+
+    // root -> mid identities (further hops set up below).
+    let (custody_root, key_root, root_did, pk_root) = setup_identity().await;
+    let (custody_mid, key_mid, mid_did, pk_mid) = setup_identity().await;
+
+    let caps = vec!["outlet_call:assistant".to_owned()];
+    let cap_uri = "scp:ctx:ctx-r4/outlet_call:assistant".to_owned();
+
+    // Root caveats: a generous-but-bounded Action grant. origin_kind = Action
+    // is compatible with the outlet_call stem (root may carry None, but an
+    // explicit value is also accepted).
+    let root_caveats = InvocationCaveats {
+        amount_max_per_call: Some(Amount::new(500)),
+        amount_max_cumulative: Some(Amount::new(5000)),
+        max_calls: Some(100),
+        origin_kind: Some(OutletKind::Action),
+        ..InvocationCaveats::empty()
+    };
+
+    let root_token = mint_ucan(
+        &MintParams {
+            issuer_did: &root_did,
+            issuer_key: &key_root,
+            audience_did: &mid_did,
+            context_id: "ctx-r4",
+            capabilities: &caps,
+            lifetime_secs: 3600,
+            not_before: None,
+            proofs: vec![],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+            caveats: Some(root_caveats),
+        },
+        &custody_root,
+        &scp_primitives::SystemClock,
+    )
+    .await
+    .unwrap();
+    let root_cid = compute_cid(&root_token);
+
+    // The depth-3 chain is root -> mid -> leaf. `root_token` is held by the
+    // mid identity (its audience). mid delegates to a leaf-delegator
+    // identity, which in turn delegates to the final presenting agent. Each
+    // hop narrows every bound below its parent (honest attenuation), and
+    // origin_kind is materialized explicitly on every non-root (rule 4).
+    let (custody_leaf_delegator, key_leaf_delegator, leaf_delegator_did, pk_leaf_delegator) =
+        setup_identity().await;
+    let (_custody_final, _key_final, final_agent_did, _pk_final) = setup_identity().await;
+
+    // mid narrows root: 500 -> 200, 5000 -> 2000, 100 -> 50.
+    let mid_token = scp_runtime::crypto::ucan::mint::delegate_ucan(
+        &DelegateParams {
+            parent_token: &root_token,
+            delegator_did: &mid_did,
+            delegator_key: &key_mid,
+            delegatee_did: &leaf_delegator_did,
+            attenuated_capabilities: &[Attenuation {
+                with: cap_uri.clone(),
+                can: "*".to_owned(),
+            }],
+            lifetime_secs: 1800,
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+            caveats: Some(InvocationCaveats {
+                amount_max_per_call: Some(Amount::new(200)),
+                amount_max_cumulative: Some(Amount::new(2000)),
+                max_calls: Some(50),
+                origin_kind: Some(OutletKind::Action),
+                ..InvocationCaveats::empty()
+            }),
+        },
+        &custody_mid,
+        &scp_primitives::SystemClock,
+    )
+    .await
+    .unwrap();
+    let mid_cid = compute_cid(&mid_token);
+
+    // leaf narrows mid further: 200 -> 100, 2000 -> 1000, 50 -> 10.
+    //
+    // We mint the leaf via `mint_ucan` with `proofs: vec![mid_cid]` rather
+    // than `delegate_ucan`. `delegate_ucan` FLATTENS the proof chain
+    // (`leaf.prf = mid.prf + [mid_cid]` = `[root_cid, mid_cid]`), and the
+    // chain walk treats every `prf` entry as a DIRECT parent and checks
+    // `parent.aud == token.iss` for each — which holds for the direct parent
+    // (mid) but not for the flattened grandparent (root). Minting with a
+    // single direct-parent proof produces the canonical non-flattened
+    // structure the walk follows recursively (leaf -> mid -> root). The leaf
+    // caveats are already narrowed relative to mid by construction.
+    let leaf_token = mint_ucan(
+        &MintParams {
+            issuer_did: &leaf_delegator_did,
+            issuer_key: &key_leaf_delegator,
+            audience_did: &final_agent_did,
+            context_id: "ctx-r4",
+            capabilities: &caps,
+            lifetime_secs: 900,
+            not_before: None,
+            proofs: vec![mid_cid.clone()],
+            facts: None,
+            key_scope: None,
+            signing_key_id: None,
+            ceiling: None,
+            caveats: Some(InvocationCaveats {
+                amount_max_per_call: Some(Amount::new(100)),
+                amount_max_cumulative: Some(Amount::new(1000)),
+                max_calls: Some(10),
+                origin_kind: Some(OutletKind::Action),
+                ..InvocationCaveats::empty()
+            }),
+        },
+        &custody_leaf_delegator,
+        &scp_primitives::SystemClock,
+    )
+    .await
+    .unwrap();
+
+    // DID resolver knows every signer's public key.
+    let resolver = InMemoryDidResolver {
+        keys: [
+            (root_did.clone(), pk_root),
+            (mid_did.clone(), pk_mid),
+            (leaf_delegator_did.clone(), pk_leaf_delegator),
+        ]
+        .into_iter()
+        .collect(),
+        kid_keys: std::collections::HashMap::new(),
+    };
+
+    // Proof resolver carries the full chain (mid + root).
+    let proof_resolver = InMemoryProofResolver {
+        proofs: std::collections::HashMap::from([(mid_cid, mid_token), (root_cid, root_token)]),
+    };
+
+    let mut nonce_tracker = InMemoryNonceTracker::new();
+    let revocation_checker = InMemoryRevocationChecker::new();
+    let ceiling = default_ceiling();
+    let required_cap = CapabilityUri::new("ctx-r4", "outlet_call", "assistant");
+
+    // Validate the leaf with the PRODUCTION TokenNbCaveatResolver so the
+    // per-edge Step 7b caveat narrow runs at EVERY edge of the chain.
+    let mut ctx = ValidationContext {
+        did_resolver: &resolver,
+        nonce_tracker: &mut nonce_tracker,
+        revocation_checker: &revocation_checker,
+        proof_resolver: &proof_resolver,
+        ceiling: &ceiling,
+        context_creator_did: &root_did,
+        presenting_agent_did: &final_agent_did,
+        clock_skew_tolerance_secs: DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
+        clock: &SYSTEM_CLOCK,
+        caveat_resolver: &TokenNbCaveatResolver,
+    };
+
+    let result = validate_ucan(&leaf_token, &required_cap, &mut ctx);
+    assert!(
+        result.is_ok(),
+        "an honestly-minted, correctly-narrowed depth-3 chain must PASS \
+         interior-edge attenuation under TokenNbCaveatResolver (R4 must not \
+         regress legitimate chains): {result:?}"
     );
 }

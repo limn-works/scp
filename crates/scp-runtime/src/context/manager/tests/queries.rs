@@ -1219,6 +1219,7 @@ async fn outlet_stream_paid_decrements_budget_by_billed_at_close() {
             *uuid::Uuid::now_v7().as_bytes(),
             &scp_protocol::context::outlets::OutletId::from("outlet-x"),
             None,
+            crate::context::outlets::dispatch::CounterReserveSettlement::zero(),
         )
         .await
         .expect("settle must succeed");
@@ -1264,6 +1265,7 @@ async fn outlet_stream_refunds_unspent_escrow() {
             *uuid::Uuid::now_v7().as_bytes(),
             &scp_protocol::context::outlets::OutletId::from("outlet-y"),
             None,
+            crate::context::outlets::dispatch::CounterReserveSettlement::zero(),
         )
         .await
         .unwrap();
@@ -1297,6 +1299,7 @@ async fn outlet_stream_refunds_unspent_escrow() {
             *uuid::Uuid::now_v7().as_bytes(),
             &scp_protocol::context::outlets::OutletId::from("outlet-y"),
             None,
+            crate::context::outlets::dispatch::CounterReserveSettlement::zero(),
         )
         .await
         .unwrap();
@@ -1536,6 +1539,7 @@ async fn outlet_stream_settle_captures_receipt_after_context_evicted() {
             *uuid::Uuid::now_v7().as_bytes(),
             &scp_protocol::context::outlets::OutletId::from("outlet-evicted"),
             Some(snapshot),
+            crate::context::outlets::dispatch::CounterReserveSettlement::zero(),
         )
         .await
         .expect("settle MUST NOT return ContextNotRegistered when the context is gone");
@@ -1568,6 +1572,7 @@ async fn outlet_stream_settle_records_durable_capture_failure_after_evict() {
             *uuid::Uuid::now_v7().as_bytes(),
             &scp_protocol::context::outlets::OutletId::from("outlet-fail"),
             Some(snapshot),
+            crate::context::outlets::dispatch::CounterReserveSettlement::zero(),
         )
         .await
         .expect("capture failure MUST surface as Ok(None), never an error");
@@ -1609,6 +1614,7 @@ async fn outlet_stream_settle_no_snapshot_no_context_is_graceful_noop() {
             *uuid::Uuid::now_v7().as_bytes(),
             &scp_protocol::context::outlets::OutletId::from("outlet-nosnap"),
             None,
+            crate::context::outlets::dispatch::CounterReserveSettlement::zero(),
         )
         .await
         .expect("absent context + absent snapshot MUST NOT error");

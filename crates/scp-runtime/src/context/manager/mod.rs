@@ -3114,13 +3114,17 @@ impl ContextManager {
         context_id: &str,
         action: &str,
         actor_did: &DID,
-        error_msg: &str,
+        // R4 M2: a COARSE enumerated reason, not the raw adapter error string.
+        // The durable event-log payload records this stable code (ADR-049 §4);
+        // the free-form adapter message stays in the operator `tracing` log at
+        // the call site, never in the cross-implementation event log.
+        reason: scp_protocol::context::membership::PaymentCaptureFailureReason,
         cost: Option<scp_protocol::economy::types::Amount>,
     ) {
         let context_id_bytes = context_id_to_bytes(context_id);
         let payload = serde_json::json!({
             "action": action,
-            "error": error_msg,
+            "reason": reason.as_str(),
             "cost": cost.map(scp_protocol::economy::types::Amount::value),
         });
         if let Err(log_err) = self.event_log.append_context_event_with_payload(
@@ -3140,11 +3144,68 @@ impl ContextManager {
             let event = ContextEvent::PaymentCaptureFailed {
                 action: action.to_owned(),
                 actor_did: actor_did.clone(),
-                error: error_msg.to_owned(),
+                reason,
                 cost: cost.map(scp_protocol::economy::types::Amount::value),
             };
             ctx.emit_event(event, context_id, self.event_tx.as_ref());
         }
+    }
+}
+
+/// R4 M2 — maps a [`PaymentError`](crate::economy::adapter::PaymentError) to
+/// the coarse [`PaymentCaptureFailureReason`] persisted in the event log.
+///
+/// The mapping is intentionally lossy: it buckets the adapter's full error
+/// taxonomy into the classes a reconciliation workflow acts on. The raw
+/// `PaymentError` `Display` string remains available for operator `tracing`
+/// logs at the call site — only the coarse code is durable.
+pub(crate) fn payment_error_to_capture_reason(
+    err: &crate::economy::adapter::PaymentError,
+) -> scp_protocol::context::membership::PaymentCaptureFailureReason {
+    use crate::economy::adapter::PaymentError;
+    use scp_protocol::context::membership::PaymentCaptureFailureReason as R;
+    match err {
+        PaymentError::InsufficientBalance { .. } => R::InsufficientFunds,
+        // Explicit rail rejections: the charge was understood and refused.
+        PaymentError::AuthorizationExpired { .. }
+        | PaymentError::AlreadyCaptured { .. }
+        | PaymentError::AlreadyVoided { .. }
+        | PaymentError::UnsupportedCurrency(_) => R::AdapterDeclined,
+        // No reachable adapter for the payer/payee pair.
+        PaymentError::NoCompatiblePaymentAdapter => R::AdapterUnavailable,
+        // Passthrough adapter errors: classify by the message when it clearly
+        // names a timeout / unavailability, else treat as a decline (the rail
+        // responded with an error). Receipt-integrity failures are internal.
+        PaymentError::AdapterError(msg) => classify_adapter_message(msg),
+        PaymentError::InvalidReceipt(_) => R::Internal,
+    }
+}
+
+/// R4 M2 — classifies a free-form error message into a coarse capture-failure
+/// reason. Used for adapter passthrough strings and for [`ContextError`]
+/// callers (`complete_paid_action`) whose structured payment cause has already
+/// been flattened to a message. Conservative: an unrecognized message maps to
+/// [`PaymentCaptureFailureReason::AdapterDeclined`] (the rail responded with an
+/// error) rather than `Internal`, since these paths fire only after an adapter
+/// call returned an error.
+pub(crate) fn classify_adapter_message(
+    msg: &str,
+) -> scp_protocol::context::membership::PaymentCaptureFailureReason {
+    use scp_protocol::context::membership::PaymentCaptureFailureReason as R;
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("timeout") || lower.contains("timed out") {
+        R::AdapterTimeout
+    } else if lower.contains("unavailable")
+        || lower.contains("unreachable")
+        || lower.contains("connection")
+        || lower.contains("network")
+        || lower.contains("no compatible")
+    {
+        R::AdapterUnavailable
+    } else if lower.contains("insufficient") {
+        R::InsufficientFunds
+    } else {
+        R::AdapterDeclined
     }
 }
 

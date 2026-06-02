@@ -1275,6 +1275,227 @@ fn release_admission(admission: &Arc<Mutex<StreamAdmissionTracker>>, params: &Op
     );
 }
 
+/// The durable counter reservation a streaming open commits at the FINAL
+/// open-time gate.
+///
+/// R4 HIGH-1 / HIGH-2 — committed after the pump permit is acquired AND
+/// `invoke_outlet` returns `Ok`, not in the early synchronous hook.
+///
+/// HIGH-2: the durable `CaveatCounterStore` CAS used to commit inside the
+/// open-time hook (before pump-permit acquisition + executor launch). A
+/// rejected open that failed LATER (`StreamCapExhausted` at the pump permit,
+/// or an `invoke_outlet` error) never reverted that commit, so each rejected
+/// open permanently burned `max_calls` / `rate_window` / `amount_cumulative`
+/// capacity — a `DoS` where saturating the node pump ceiling could exhaust a
+/// victim's authorization. The fix moves the CAS to the last gate: it commits
+/// ONLY when the open will actually succeed, so a `StreamCapExhausted` /
+/// `invoke_outlet` failure leaves the counters untouched.
+///
+/// HIGH-1: the cumulative-value cap was charged ONCE per open at
+/// `cost_per_chunk`, but a stream emits up to `min(credit_window, max_calls)`
+/// billable chunks — so the cap was evaded `N`×. The fix RESERVES the full
+/// `cost_per_chunk × estimated_chunk_count` against the
+/// [`CaveatKind::AmountCumulative`] counter at this gate (the same
+/// `estimated_chunk_count` the open already bounds at
+/// [`enforce_estimated_chunk_count_bound`]); close-time settlement releases
+/// the unspent `(reserved − billed) × cost_per_chunk` via
+/// [`crate::trust::CaveatCounterApi::release`].
+pub struct StreamCounterReservation {
+    /// The durable per-(context, ucan) caveat counter store.
+    pub counter_store: Arc<dyn crate::trust::CaveatCounterApi>,
+    /// The VALIDATED-NARROWED effective caveats (the same set bound at open).
+    /// Only the counter-bearing fields (`max_calls`, `amount_max_cumulative`,
+    /// `rate_window`) are consulted here.
+    pub caveats: scp_protocol::trust::caveats::InvocationCaveats,
+}
+
+/// Outcome of committing the durable counter reservation at the final gate.
+struct CounterCommitOutcome {
+    /// The cumulative amount RESERVED against the `AmountCumulative` counter
+    /// (`cost_per_chunk × reserved_chunks`). Recorded so close-time
+    /// settlement can release the unspent portion. `0` when the cap is absent
+    /// or the reserve arithmetic overflowed (fail open — see below).
+    amount_cumulative_reserved: u64,
+    /// The chunk count the cumulative reserve was computed over (the same
+    /// `estimated_chunk_count` the open bounded). Recorded for settlement
+    /// reconciliation (`unspent = (reserved_chunks − billed) × cost_per_chunk`).
+    reserved_chunks: u32,
+}
+
+/// Commits the durable counter CAS for a streaming open at the FINAL gate.
+///
+/// Order is fixed `max_calls → amount_max_cumulative → rate_window` so the
+/// rejection slug stays deterministic when more than one counter caveat would
+/// fail — mirroring the non-streaming `build_post_input_hook` OUT-021 branch.
+///
+/// On the FIRST genuinely-exhausted counter this returns the precise
+/// `OpenStreamRejection::CaveatPostInputViolation { slug }`. Any counters
+/// already incremented earlier in the same call are rolled back via
+/// [`crate::trust::CaveatCounterApi::release`] so a partial commit never
+/// leaves capacity stranded (e.g. `max_calls` committed, then
+/// `amount_cumulative` exhausted → release the `max_calls` increment).
+///
+/// HIGH-1 reserve: the `AmountCumulative` charge is
+/// `cost_per_chunk × estimated_chunk_count`, computed with
+/// [`u64::checked_mul`] — on overflow the reserve FAILS OPEN (skips the
+/// cumulative CAS) rather than rejecting a legitimate open, matching the
+/// open's other saturating/fail-open arithmetic.
+async fn commit_counter_reservation(
+    reservation: &StreamCounterReservation,
+    context_id: &str,
+    ucan_cid: &str,
+    cost_per_chunk: Amount,
+    estimated_chunk_count: u32,
+) -> Result<CounterCommitOutcome, OpenStreamRejection> {
+    use scp_protocol::trust::CaveatKind;
+
+    let store = reservation.counter_store.as_ref();
+    let caveats = &reservation.caveats;
+    let mut max_calls_committed = false;
+    let mut amount_cumulative_reserved: u64 = 0;
+
+    // 1. max_calls — one invocation (the open) per counter increment.
+    if let Some(max) = caveats.max_calls
+        && let Err(err) = store
+            .check_and_increment(context_id, ucan_cid, CaveatKind::MaxCalls, 1, max, 0)
+            .await
+    {
+        return Err(counter_error_to_open_rejection(&err));
+    }
+    if caveats.max_calls.is_some() {
+        max_calls_committed = true;
+    }
+
+    // 2. amount_max_cumulative — RESERVE the full estimated spend
+    //    (cost_per_chunk × estimated_chunk_count). Fail OPEN on overflow
+    //    (the `checked_mul` returning `None` skips the cumulative CAS).
+    if let Some(max) = caveats.amount_max_cumulative
+        && let Some(reserve) = cost_per_chunk
+            .value()
+            .checked_mul(u64::from(estimated_chunk_count))
+    {
+        if let Err(err) = store
+            .check_and_increment(
+                context_id,
+                ucan_cid,
+                CaveatKind::AmountCumulative,
+                reserve,
+                max.value(),
+                0,
+            )
+            .await
+        {
+            // Roll back the max_calls increment so the rejected open
+            // leaves NO counter consumed.
+            if max_calls_committed {
+                let _ = store
+                    .release(context_id, ucan_cid, CaveatKind::MaxCalls, 1)
+                    .await;
+            }
+            return Err(counter_error_to_open_rejection(&err));
+        }
+        amount_cumulative_reserved = reserve;
+    }
+
+    // 3. rate_window — admission by count within the sliding window.
+    if let Some(window) = caveats.rate_window
+        && let Err(err) = store
+            .check_and_increment(
+                context_id,
+                ucan_cid,
+                CaveatKind::RateWindow,
+                0,
+                u64::from(window.max),
+                window.window_secs,
+            )
+            .await
+    {
+        // Roll back the earlier increments (max_calls + cumulative reserve)
+        // so the rejected open leaves NO counter consumed.
+        if max_calls_committed {
+            let _ = store
+                .release(context_id, ucan_cid, CaveatKind::MaxCalls, 1)
+                .await;
+        }
+        if amount_cumulative_reserved > 0 {
+            let _ = store
+                .release(
+                    context_id,
+                    ucan_cid,
+                    CaveatKind::AmountCumulative,
+                    amount_cumulative_reserved,
+                )
+                .await;
+        }
+        return Err(counter_error_to_open_rejection(&err));
+    }
+
+    Ok(CounterCommitOutcome {
+        amount_cumulative_reserved,
+        reserved_chunks: estimated_chunk_count,
+    })
+}
+
+/// Test-only re-export of [`commit_counter_reservation`].
+///
+/// Lets the `stream_caveat_post_input_tests` in the manager module drive the
+/// final-gate CAS exactly as `open_stream_session`'s Step 5.5 does, without
+/// standing up a full stream open.
+///
+/// # Errors
+///
+/// Returns [`OpenStreamRejection::CaveatPostInputViolation`] when a
+/// counter-bearing caveat is exhausted, mirroring the production gate.
+#[cfg(test)]
+pub async fn commit_counter_reservation_for_test(
+    reservation: &StreamCounterReservation,
+    context_id: &str,
+    ucan_cid: &str,
+    cost_per_chunk: Amount,
+    estimated_chunk_count: u32,
+) -> Result<(u64, u32), OpenStreamRejection> {
+    let outcome = commit_counter_reservation(
+        reservation,
+        context_id,
+        ucan_cid,
+        cost_per_chunk,
+        estimated_chunk_count,
+    )
+    .await?;
+    Ok((outcome.amount_cumulative_reserved, outcome.reserved_chunks))
+}
+
+/// Maps a durable-counter [`CounterError`](crate::trust::CounterError) into the
+/// open-time [`OpenStreamRejection::CaveatPostInputViolation`] carrying the
+/// precise §7.3.8 slug, so a final-gate counter exhaustion routes identically
+/// to the early-hook caveat rejections.
+const fn counter_error_to_open_rejection(err: &crate::trust::CounterError) -> OpenStreamRejection {
+    use scp_protocol::context::outlets::error_codes;
+
+    // Slug choices MIRROR the non-streaming
+    // `caveat_counter_error_to_invocation_error` mapping verbatim so the two
+    // open paths route identically: MaxCalls -> `authorization.denied`,
+    // AmountCumulative -> `authorization.cumulative-exceeded`, RateWindow ->
+    // `authorization.rate-exceeded`.
+    let slug = match err {
+        crate::trust::CounterError::Exhausted(exhausted) => match exhausted {
+            crate::trust::CounterExhausted::MaxCalls { .. } => {
+                error_codes::SLUG_AUTHORIZATION_DENIED
+            }
+            crate::trust::CounterExhausted::AmountCumulative { .. } => {
+                error_codes::SLUG_AUTHORIZATION_CUMULATIVE_EXCEEDED
+            }
+            crate::trust::CounterExhausted::RateWindow { .. } => {
+                error_codes::SLUG_AUTHORIZATION_RATE_EXCEEDED
+            }
+        },
+        // A storage failure cannot enforce the cap — fail closed as an
+        // authorization denial rather than silently admit.
+        crate::trust::CounterError::Store(_) => error_codes::SLUG_AUTHORIZATION_DENIED,
+    };
+    OpenStreamRejection::CaveatPostInputViolation { slug }
+}
+
 /// §5.4.5 binding-pinning gate: recomputes the `caveats_binding` from
 /// the runtime-trusted inputs in [`OpenStreamParams`] and rejects the
 /// open when the SDK-supplied `params.identity.caveats_binding` does
@@ -1464,6 +1685,51 @@ pub(crate) struct PumpEventEmissionInputs {
     /// settlement survives a mid-stream context teardown. `None` for
     /// zero-cost / Query / legacy callers.
     pub economic_policy_snapshot: Option<super::invoke::EconomicPolicySnapshot>,
+    /// R4 HIGH-1 — the open-time cumulative-counter reserve, carried into the
+    /// [`StreamSettlement`] so close-time settlement releases the unspent
+    /// portion back to the durable counter.
+    pub counter_reserve: CounterReserveSettlement,
+}
+
+/// The open-time cumulative-counter reservation the close-time settlement
+/// uses to release the unspent reserve (R4 HIGH-1).
+///
+/// Carries the data needed to give back the UNSPENT portion of a stream's
+/// reserved [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind)
+/// charge at settlement.
+///
+/// At the open-time final gate the runtime reserves
+/// `cost_per_chunk × reserved_chunks` against the cumulative counter
+/// ([`commit_counter_reservation`]). At close the stream billed only
+/// `billed_count` chunks, so `(reserved_chunks − billed_count) ×
+/// cost_per_chunk` (clamped to `amount_cumulative_reserved`) is given back to
+/// the counter — the cap ends up debited by exactly the billed spend.
+#[derive(Debug, Clone)]
+pub struct CounterReserveSettlement {
+    /// The cumulative amount reserved at open (`0` when no cap / no store /
+    /// reserve overflow).
+    pub amount_cumulative_reserved: u64,
+    /// Chunk count the reserve was computed over (the open's bounded
+    /// `estimated_chunk_count`).
+    pub reserved_chunks: u32,
+    /// Opening UCAN CID — the cumulative counter's key.
+    pub ucan_cid: String,
+    /// Per-billable-chunk cost — the unit the release multiplies by.
+    pub cost_per_chunk: Amount,
+}
+
+impl CounterReserveSettlement {
+    /// A reserve that releases nothing — for zero-cost / Query streams and
+    /// legacy / test callers with no durable counter reservation.
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self {
+            amount_cumulative_reserved: 0,
+            reserved_chunks: 0,
+            ucan_cid: String::new(),
+            cost_per_chunk: Amount::new(0),
+        }
+    }
 }
 
 /// §5.4.5 LOW (stranded-hold guard) — a `Drop`-time safety net that runs
@@ -1506,6 +1772,9 @@ struct PumpEscrowGuard {
     request_id: RequestId,
     outlet_id: OutletId,
     economic_policy_snapshot: Option<super::invoke::EconomicPolicySnapshot>,
+    /// R4 HIGH-1 — the open-time cumulative-counter reserve, so the panic-path
+    /// settlement also releases the unspent reserve back to the counter.
+    counter_reserve: CounterReserveSettlement,
     /// `true` once the normal settlement block has run. When set, `Drop` is
     /// a no-op (the escrow was already settled exactly once).
     settled: bool,
@@ -1546,6 +1815,13 @@ impl Drop for PumpEscrowGuard {
                 request_id: self.request_id,
                 outlet_id: self.outlet_id.clone(),
                 economic_policy_snapshot: self.economic_policy_snapshot.clone(),
+                // R4 HIGH-1 — release the unspent cumulative reserve on the
+                // panic path too (billed_count is whatever the escrow ledger
+                // recorded before the unwind).
+                amount_cumulative_reserved: self.counter_reserve.amount_cumulative_reserved,
+                reserved_chunks: self.counter_reserve.reserved_chunks,
+                ucan_cid: self.counter_reserve.ucan_cid.clone(),
+                cost_per_chunk: self.counter_reserve.cost_per_chunk,
             }
         };
         if let Some(sink) = self.settlement_sink.as_ref() {
@@ -1689,6 +1965,17 @@ pub async fn open_stream_session<E>(
     // with `OpenStreamRejection::CaveatPostInputViolation` carrying the
     // precise slug.
     caveat_post_input_check: Option<super::invoke::CaveatPostInputCheck<'_>>,
+    // R4 HIGH-1 / HIGH-2: the durable counter reservation, committed at the
+    // FINAL open-time gate (after pump-permit acquisition AND `invoke_outlet`
+    // returns `Ok`) rather than in the early `caveat_post_input_check` hook.
+    // `None` for callers without a counter store (legacy / test paths, and
+    // any open whose effective caveats carry no counter-bearing cap). When
+    // `Some`, `commit_counter_reservation` performs the `max_calls` /
+    // `amount_max_cumulative` (RESERVED at `cost_per_chunk × est_chunks`) /
+    // `rate_window` CAS and returns the reserved cumulative amount for the
+    // close-time release. A failure here rolls back admission + drops the
+    // pump permit so no capacity is stranded by a rejected open.
+    counter_reservation: Option<StreamCounterReservation>,
 ) -> Result<StreamSessionHandle, OpenStreamRejection>
 where
     E: OutletExecutor + ?Sized + 'static,
@@ -1851,6 +2138,53 @@ where
         }
     })?;
 
+    // Step 5.5 (R4 HIGH-1 / HIGH-2): commit the durable counter CAS HERE —
+    // the LAST open-time gate, after the pump permit was acquired AND
+    // `invoke_outlet` returned `Ok`. Committing earlier (in the synchronous
+    // `caveat_post_input_check` hook) burned `max_calls` / `amount_cumulative`
+    // / `rate_window` capacity on opens that then failed at the pump-permit
+    // (`StreamCapExhausted`) or executor-launch gate, with no compensating
+    // revert — a DoS vector. By the time we reach here both later gates have
+    // already passed, so a successful CAS commits exactly once for an open
+    // that WILL run; a genuine counter exhaustion at this gate rolls back
+    // admission and drops the pump permit (returning early drops the owned
+    // `pump_permit` before it is moved into the pump task), leaving the node
+    // ceiling slot free. HIGH-1: the cumulative reserve is
+    // `cost_per_chunk × estimated_chunk_count`, returned here so the pump's
+    // settlement can release the unspent portion at close.
+    let counter_commit = match counter_reservation.as_ref() {
+        Some(reservation) => commit_counter_reservation(
+            reservation,
+            context.context_id(),
+            &params.ucan_cid,
+            params.cost_per_chunk,
+            estimated_chunk_count,
+        )
+        .await
+        .inspect_err(|_rejection| {
+            // CAS genuinely exhausted (or storage failed): roll back the
+            // admission slot this open consumed and let `pump_permit` drop
+            // here (it has not yet been moved into the pump task), freeing
+            // the node-level concurrent-pump slot.
+            release_admission(&admission, &params);
+        })?,
+        None => CounterCommitOutcome {
+            amount_cumulative_reserved: 0,
+            reserved_chunks: estimated_chunk_count,
+        },
+    };
+
+    // R4 HIGH-1 — bundle the open-time cumulative reserve so the pump's
+    // close-time settlement can release the unspent portion back to the
+    // durable counter. Captured before `params` fields are consumed by the
+    // spawn below.
+    let counter_reserve = CounterReserveSettlement {
+        amount_cumulative_reserved: counter_commit.amount_cumulative_reserved,
+        reserved_chunks: counter_commit.reserved_chunks,
+        ucan_cid: params.ucan_cid.clone(),
+        cost_per_chunk: params.cost_per_chunk,
+    };
+
     // §5.4.5 binding-pinning: the runtime uses the SDK-supplied
     // `request_id` (the same value the SDK committed to in the
     // `caveats_binding` preimage) rather than generating a fresh one.
@@ -1884,6 +2218,7 @@ where
             input_hash,
             start: pump_start,
             economic_policy_snapshot,
+            counter_reserve,
         },
         pump_permit,
     );
@@ -2177,6 +2512,7 @@ async fn run_stream_pump_v2(
         request_id,
         outlet_id: event_inputs.outlet_id.clone(),
         economic_policy_snapshot: event_inputs.economic_policy_snapshot.clone(),
+        counter_reserve: event_inputs.counter_reserve.clone(),
         settled: false,
     };
 
@@ -2733,6 +3069,13 @@ async fn run_stream_pump_v2(
             // §5.4.5 MED-HIGH — carry the open-time economic snapshot so
             // settlement survives a mid-stream context teardown.
             economic_policy_snapshot: event_inputs.economic_policy_snapshot.clone(),
+            // R4 HIGH-1 — carry the open-time cumulative reserve so the
+            // manager releases the unspent `(reserved − billed) × cost`
+            // portion back to the durable counter at close.
+            amount_cumulative_reserved: event_inputs.counter_reserve.amount_cumulative_reserved,
+            reserved_chunks: event_inputs.counter_reserve.reserved_chunks,
+            ucan_cid: event_inputs.counter_reserve.ucan_cid.clone(),
+            cost_per_chunk: event_inputs.counter_reserve.cost_per_chunk,
         });
     }
 
@@ -3066,6 +3409,7 @@ mod tests {
                 input_hash: "0".repeat(64),
                 start: Instant::now(),
                 economic_policy_snapshot: None,
+                counter_reserve: CounterReserveSettlement::zero(),
             },
             permit,
         );
@@ -3168,6 +3512,7 @@ mod tests {
                     input_hash: "0".repeat(64),
                     start: Instant::now(),
                     economic_policy_snapshot: None,
+                    counter_reserve: CounterReserveSettlement::zero(),
                 },
             )
             .await;
@@ -3293,6 +3638,7 @@ mod tests {
                     input_hash: "0".repeat(64),
                     start: Instant::now(),
                     economic_policy_snapshot: None,
+                    counter_reserve: CounterReserveSettlement::zero(),
                 },
             )
             .await;
@@ -3411,6 +3757,7 @@ mod tests {
                         input_hash: "0".repeat(64),
                         start: Instant::now(),
                         economic_policy_snapshot: None,
+                        counter_reserve: CounterReserveSettlement::zero(),
                     },
                 )
                 .await;
@@ -3530,6 +3877,7 @@ mod tests {
                     input_hash: "0".repeat(64),
                     start: Instant::now(),
                     economic_policy_snapshot: None,
+                    counter_reserve: CounterReserveSettlement::zero(),
                 },
             )
             .await;

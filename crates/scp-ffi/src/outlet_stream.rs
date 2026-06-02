@@ -85,6 +85,14 @@ impl scp_runtime::context::outlets::invoke::StreamSettlementSink for PyStreamSet
                     // capture the §19.15.5 PaymentReceipt for rendered service
                     // (H8). `None` for zero-cost / Query streams.
                     settlement.economic_policy_snapshot,
+                    // R4 HIGH-1 — forward the open-time cumulative-counter
+                    // reserve so settlement releases the unspent portion.
+                    scp_runtime::context::outlets::dispatch::CounterReserveSettlement {
+                        amount_cumulative_reserved: settlement.amount_cumulative_reserved,
+                        reserved_chunks: settlement.reserved_chunks,
+                        ucan_cid: settlement.ucan_cid,
+                        cost_per_chunk: settlement.cost_per_chunk,
+                    },
                 )
                 .await
             {

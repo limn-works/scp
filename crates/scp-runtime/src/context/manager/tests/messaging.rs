@@ -3544,8 +3544,8 @@ async fn restored_velocity_tracker_uses_60_second_window() {
 // =======================================================================
 
 /// H19-S1: When `capture_send_payment` fails, a `PaymentCaptureFailed`
-/// entry is appended to the event log with `action = "send_message"` and
-/// the error string. The event log is the durable audit trail.
+/// entry is appended to the event log with `action = "send_message"` and a
+/// coarse reason code (R4 M2). The event log is the durable audit trail.
 #[tokio::test]
 async fn capture_send_payment_failure_appends_event_log_entry() {
     let (manager, handle, event_log) =
@@ -3596,9 +3596,25 @@ async fn capture_send_payment_failure_appends_event_log_entry() {
         Some("send_message"),
         "payload action must be 'send_message'"
     );
+    // R4 M2: the durable payload records the COARSE reason code, never the
+    // raw adapter error string.
+    let reason = payload["reason"]
+        .as_str()
+        .expect("payload must include the coarse reason code");
     assert!(
-        payload["error"].as_str().is_some(),
-        "payload must include an error string"
+        matches!(
+            reason,
+            "adapter_declined"
+                | "insufficient_funds"
+                | "adapter_timeout"
+                | "adapter_unavailable"
+                | "internal"
+        ),
+        "reason must be one of the enumerated capture-failure codes, got {reason:?}"
+    );
+    assert!(
+        payload.get("error").is_none(),
+        "payload must NOT include a raw error string (R4 M2 — reason code only)"
     );
 }
 

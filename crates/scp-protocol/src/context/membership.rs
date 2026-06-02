@@ -241,6 +241,62 @@ impl std::fmt::Debug for RedactedBytes {
 }
 
 // ---------------------------------------------------------------------------
+// PaymentCaptureFailureReason
+// ---------------------------------------------------------------------------
+
+/// Coarse, enumerated reason a payment capture failed (R4 M2).
+///
+/// The durable [`ContextEvent::PaymentCaptureFailed`] event-log payload
+/// records this enumerated reason instead of the raw payment-adapter error
+/// string. Per ADR-049 §4 (structured codes, not lossy strings), a stable
+/// coarse code is what SDK consumers and reconciliation tooling key on; the
+/// free-form adapter message is operator log detail, not durable protocol
+/// state, and embedding it leaks adapter-internal phrasing into the
+/// cross-implementation event log.
+///
+/// The variants are deliberately coarse — they classify the failure into the
+/// buckets a reconciliation workflow acts on, not the adapter's full error
+/// taxonomy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaymentCaptureFailureReason {
+    /// The payment rail explicitly declined the charge (e.g. card declined,
+    /// authorization rejected, already-captured / already-voided).
+    AdapterDeclined,
+    /// The payer lacked sufficient funds / balance for the charge.
+    InsufficientFunds,
+    /// The adapter call timed out before the rail responded.
+    AdapterTimeout,
+    /// The adapter or its upstream rail was unreachable / unavailable
+    /// (network failure, no compatible adapter, service down).
+    AdapterUnavailable,
+    /// An internal error not attributable to the external rail (receipt
+    /// verification failure, serialization, invariant violation).
+    Internal,
+}
+
+impl PaymentCaptureFailureReason {
+    /// Returns the stable `snake_case` wire string for the reason — the value
+    /// persisted in the event-log payload and surfaced to SDK consumers.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AdapterDeclined => "adapter_declined",
+            Self::InsufficientFunds => "insufficient_funds",
+            Self::AdapterTimeout => "adapter_timeout",
+            Self::AdapterUnavailable => "adapter_unavailable",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+impl std::fmt::Display for PaymentCaptureFailureReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // ContextEvent
 // ---------------------------------------------------------------------------
 
@@ -708,8 +764,11 @@ pub enum ContextEvent {
         action: String,
         /// The DID of the actor whose payment capture failed.
         actor_did: DID,
-        /// Human-readable description of the adapter error.
-        error: String,
+        /// Coarse, enumerated reason the capture failed (R4 M2). The raw
+        /// adapter error string is NOT persisted — it is operator log detail,
+        /// not durable protocol state (ADR-049 §4). SDK consumers and
+        /// reconciliation tooling key on this stable code.
+        reason: PaymentCaptureFailureReason,
         /// The amount that was deducted from the budget but not captured,
         /// if known. `None` when no cost was charged (free context).
         cost: Option<u64>,

@@ -92,6 +92,13 @@ const RUNTIME_OUTLET_ERRORS_SRC: &str =
 const RUNTIME_OUTLETS_MANAGER_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/manager/outlets.rs");
 
+// R4 interior-edge attenuation source — the UCAN chain walk MUST enforce
+// Step 7 (capability subset) + Step 7b (caveat narrow) at EVERY edge of the
+// delegation chain, not just leaf -> direct-parent (§5.4.5 / §7.3.8). The
+// assertion below pins the per-edge call inside the recursive walk.
+const PROTOCOL_UCAN_VALIDATE_SRC: &str =
+    include_str!("../../../../crates/scp-protocol/src/crypto/ucan/validate.rs");
+
 // E1 streaming-settlement source — the dispatch pump's settlement block
 // fires the `StreamSettlementSink` exactly once at terminal chunk.
 const RUNTIME_DISPATCH_SRC: &str =
@@ -770,6 +777,116 @@ fn dispatch_with_economy_passes_caveat_enforcement() {
          `caveat_enforcement` to the underlying aggregating dispatcher \
          (SCP-OUT-021 remediation — streaming surface MUST enforce \
          caveats on parity with the single-shot path)"
+    );
+}
+
+// R4 — interior-edge attenuation. The UCAN chain walk MUST run the per-edge
+// Step 7 (capability subset) + Step 7b (caveat narrow) check at EVERY edge of
+// the delegation chain, not only leaf -> direct-parent (§5.4.5 / §7.3.8
+// interior-edge clarification). Before the fix, `validate_ucan` ran a single
+// leaf-only `verify_attenuation` pass and `verify_chain_recursive` walked the
+// interior edges WITHOUT any attenuation check — so a mid-chain token could
+// widen a capability or relax a caveat that a more-distant ancestor bound and
+// still validate. This assertion pins the remediation: the recursive walk's
+// body MUST call `verify_edge_attenuation` so attenuation is enforced at every
+// edge it traverses. A future refactor that drops this call re-opens the
+// interior-edge-widening gap and is caught structurally at CI time.
+#[test]
+fn ucan_chain_walk_enforces_attenuation_at_every_edge() {
+    assert!(
+        fn_body_contains(
+            PROTOCOL_UCAN_VALIDATE_SRC,
+            "verify_chain_recursive",
+            "verify_edge_attenuation(",
+        ),
+        "verify_chain_recursive must call verify_edge_attenuation at every \
+         delegation edge so Step 7 (capability subset) + Step 7b (caveat \
+         narrow) run on interior edges (parent -> grandparent ...), not only \
+         leaf -> direct-parent (§5.4.5 / §7.3.8 R4 remediation). Dropping this \
+         call re-opens the interior-edge-widening gap."
+    );
+    // And the chain walk MUST thread the caveat resolver through so Step 7b
+    // (caveat narrow) can run at interior edges — pin the parameter name on
+    // both the entry point and the recursive helper.
+    assert!(
+        fn_body_contains(
+            PROTOCOL_UCAN_VALIDATE_SRC,
+            "verify_delegation_chain",
+            "caveat_resolver",
+        ),
+        "verify_delegation_chain must thread `caveat_resolver` into the chain \
+         walk so per-edge Step 7b caveat narrowing runs at every edge (R4)"
+    );
+}
+
+// R4 HIGH-2 — the durable counter CAS MUST commit at the LAST open-time gate:
+// after the node-level pump permit is acquired (`try_acquire_owned`) AND after
+// `invoke_outlet` returns. Committing earlier (in the synchronous post-input
+// hook) burned `max_calls` / `amount_cumulative` / `rate_window` capacity on
+// opens that then failed at the pump-permit (`StreamCapExhausted`) or
+// executor-launch gate with no compensating revert — a DoS where saturating
+// the node pump ceiling exhausts a victim's authorization. This assertion pins
+// the ordering: `commit_counter_reservation` is called in `open_stream_session`
+// strictly AFTER both `try_acquire_owned` (pump permit) and `invoke_outlet`.
+#[test]
+fn open_stream_commits_counter_cas_after_pump_permit_and_invoke() {
+    let body = extract_fn_body(RUNTIME_DISPATCH_SRC, "open_stream_session")
+        .expect("open_stream_session body must exist in dispatch.rs");
+    let permit_pos = body
+        .find("try_acquire_owned")
+        .expect("open_stream_session must acquire the pump permit via try_acquire_owned");
+    let invoke_pos = body
+        .find("invoke_outlet(")
+        .expect("open_stream_session must launch the executor via invoke_outlet");
+    let cas_pos = body.find("commit_counter_reservation(").expect(
+        "open_stream_session must commit the durable counter CAS via \
+         commit_counter_reservation (R4 HIGH-2)",
+    );
+    assert!(
+        cas_pos > permit_pos,
+        "the durable counter CAS (commit_counter_reservation) MUST run AFTER \
+         the pump-permit acquisition so a StreamCapExhausted rejection burns no \
+         counter capacity (R4 HIGH-2)"
+    );
+    assert!(
+        cas_pos > invoke_pos,
+        "the durable counter CAS (commit_counter_reservation) MUST run AFTER \
+         invoke_outlet returns Ok so an executor-launch failure burns no \
+         counter capacity (R4 HIGH-2)"
+    );
+}
+
+// R4 HIGH-1 — close-time settlement MUST release the unspent cumulative
+// reserve. `outlet_stream_settle` reserves `cost_per_chunk × estimated_chunks`
+// at open but bills only `billed_count`; the unspent portion is returned to
+// the durable `AmountCumulative` counter via `CaveatCounterApi::release`. This
+// assertion pins the release call in the settlement method.
+#[test]
+fn outlet_stream_settle_releases_unspent_cumulative_reserve() {
+    const RUNTIME_OUTLETS_MANAGER_FULL: &str =
+        include_str!("../../../../crates/scp-runtime/src/context/manager/outlets.rs");
+    // The settlement entry point delegates the reconciliation to the
+    // dedicated helper...
+    assert!(
+        fn_body_contains(
+            RUNTIME_OUTLETS_MANAGER_FULL,
+            "outlet_stream_settle",
+            "release_unspent_cumulative_reserve("
+        ),
+        "outlet_stream_settle must invoke release_unspent_cumulative_reserve at \
+         close (R4 HIGH-1)"
+    );
+    // ...and the helper releases the unspent reserve back to the durable
+    // counter via CaveatCounterApi::release.
+    assert!(
+        fn_body_contains(
+            RUNTIME_OUTLETS_MANAGER_FULL,
+            "release_unspent_cumulative_reserve",
+            ".release("
+        ),
+        "release_unspent_cumulative_reserve must call CaveatCounterApi::release \
+         to return the unspent `(reserved − billed) × cost` to the durable \
+         AmountCumulative counter (R4 HIGH-1)"
     );
 }
 
@@ -2164,6 +2281,7 @@ async fn streaming_settlement_moves_budget_via_in_memory_sink() {
                         s.request_id,
                         &s.outlet_id,
                         s.economic_policy_snapshot,
+                        scp_runtime::context::outlets::dispatch::CounterReserveSettlement::zero(),
                     )
                     .await;
             });
@@ -2189,6 +2307,11 @@ async fn streaming_settlement_moves_budget_via_in_memory_sink() {
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         outlet_id: scp_protocol::context::outlets::OutletId::from("outlet-z"),
         economic_policy_snapshot: None,
+        // R4 HIGH-1 — no cumulative reserve in this E1 settlement-wiring test.
+        amount_cumulative_reserved: 0,
+        reserved_chunks: 0,
+        ucan_cid: String::new(),
+        cost_per_chunk: scp_protocol::economy::types::Amount::new(0),
     });
     assert!(
         fired.load(std::sync::atomic::Ordering::SeqCst),

@@ -3009,7 +3009,7 @@ async fn capture_join_payment_failure_appends_event_log_entry() {
             "h19-join-ctx",
             "join_context",
             &DID::from("did:key:joiner"),
-            "simulated capture failure",
+            scp_protocol::context::membership::PaymentCaptureFailureReason::AdapterDeclined,
             Some(scp_protocol::economy::types::Amount::new(1)),
         )
         .await;
@@ -3041,9 +3041,16 @@ async fn capture_join_payment_failure_appends_event_log_entry() {
         Some("join_context"),
         "payload action must be 'join_context'"
     );
+    // R4 M2: the durable payload records the COARSE reason code, never the
+    // raw adapter error string.
+    assert_eq!(
+        payload["reason"].as_str(),
+        Some("adapter_declined"),
+        "payload must include the coarse reason code, not a raw error string"
+    );
     assert!(
-        payload["error"].as_str().is_some(),
-        "payload must include an error string"
+        payload.get("error").is_none(),
+        "payload must NOT include a raw error string (R4 M2 — reason code only)"
     );
     assert_eq!(
         payload["cost"].as_u64(),
@@ -3065,7 +3072,7 @@ async fn capture_join_payment_failure_pushes_receive_buffer_event() {
             "test-ctx",
             "join_context",
             &DID::from("did:key:joiner"),
-            "simulated capture failure",
+            scp_protocol::context::membership::PaymentCaptureFailureReason::AdapterDeclined,
             Some(scp_protocol::economy::types::Amount::new(5)),
         )
         .await;
@@ -3089,6 +3096,78 @@ async fn capture_join_payment_failure_pushes_receive_buffer_event() {
         found,
         "PaymentCaptureFailed event must be in receive buffer; events: {events:?}"
     );
+}
+
+/// R4 M2 — `payment_error_to_capture_reason` buckets the adapter error
+/// taxonomy into the coarse reason codes, and `classify_adapter_message`
+/// classifies free-form messages from the `ContextError` callers.
+#[test]
+fn payment_capture_reason_mapping_is_coarse_and_stable() {
+    use crate::context::manager::{classify_adapter_message, payment_error_to_capture_reason};
+    use crate::economy::adapter::PaymentError;
+    use scp_protocol::context::membership::PaymentCaptureFailureReason as R;
+    use scp_protocol::economy::types::Amount;
+
+    assert_eq!(
+        payment_error_to_capture_reason(&PaymentError::InsufficientBalance {
+            available: Amount::new(1),
+            requested: Amount::new(9),
+        }),
+        R::InsufficientFunds
+    );
+    assert_eq!(
+        payment_error_to_capture_reason(&PaymentError::AlreadyCaptured { auth_id: [0u8; 32] }),
+        R::AdapterDeclined
+    );
+    assert_eq!(
+        payment_error_to_capture_reason(&PaymentError::NoCompatiblePaymentAdapter),
+        R::AdapterUnavailable
+    );
+    assert_eq!(
+        payment_error_to_capture_reason(&PaymentError::InvalidReceipt("bad proof".into())),
+        R::Internal
+    );
+    // AdapterError passthrough classifies by message content.
+    assert_eq!(
+        payment_error_to_capture_reason(&PaymentError::AdapterError(
+            "rail request timed out".into()
+        )),
+        R::AdapterTimeout
+    );
+    assert_eq!(
+        payment_error_to_capture_reason(&PaymentError::AdapterError("network unreachable".into())),
+        R::AdapterUnavailable
+    );
+    assert_eq!(
+        payment_error_to_capture_reason(&PaymentError::AdapterError("card declined".into())),
+        R::AdapterDeclined
+    );
+
+    // Free-form ContextError-flattened messages.
+    assert_eq!(
+        classify_adapter_message("connection refused"),
+        R::AdapterUnavailable
+    );
+    assert_eq!(
+        classify_adapter_message("operation timeout"),
+        R::AdapterTimeout
+    );
+    assert_eq!(
+        classify_adapter_message("insufficient balance"),
+        R::InsufficientFunds
+    );
+    // Unknown → conservative AdapterDeclined (the rail responded with an error).
+    assert_eq!(
+        classify_adapter_message("some opaque rail error"),
+        R::AdapterDeclined
+    );
+
+    // The wire string is stable snake_case.
+    assert_eq!(R::AdapterDeclined.as_str(), "adapter_declined");
+    assert_eq!(R::InsufficientFunds.as_str(), "insufficient_funds");
+    assert_eq!(R::AdapterTimeout.as_str(), "adapter_timeout");
+    assert_eq!(R::AdapterUnavailable.as_str(), "adapter_unavailable");
+    assert_eq!(R::Internal.as_str(), "internal");
 }
 
 // -----------------------------------------------------------------------

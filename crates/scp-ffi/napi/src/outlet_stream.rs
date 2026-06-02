@@ -199,6 +199,14 @@ impl scp_runtime::context::outlets::invoke::StreamSettlementSink for NapiStreamS
                     // torn down mid-stream (H8). `None` for zero-cost / Query
                     // streams.
                     settlement.economic_policy_snapshot.clone(),
+                    // R4 HIGH-1 — forward the open-time cumulative-counter
+                    // reserve so settlement releases the unspent portion.
+                    scp_runtime::context::outlets::dispatch::CounterReserveSettlement {
+                        amount_cumulative_reserved: settlement.amount_cumulative_reserved,
+                        reserved_chunks: settlement.reserved_chunks,
+                        ucan_cid: settlement.ucan_cid.clone(),
+                        cost_per_chunk: settlement.cost_per_chunk,
+                    },
                 )
                 .await
             {

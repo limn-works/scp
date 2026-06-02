@@ -1067,11 +1067,17 @@ where
     // revocation, key scope, and aud/iss linkage. The returned root
     // issuer is then bound to the actor — sub-delegation cannot smuggle
     // in a different root.
+    // Spending UCANs are economic self-delegations, not outlet-invocation
+    // tokens, so they carry no §7.3.8 invocation caveats — the per-edge
+    // Step 7 capability-subset check (active for every resolver) is the
+    // attenuation guard that matters here, and Step 7b (caveat narrow) is a
+    // no-op under `NoCaveatResolver`.
     let root_issuer = super::validate::verify_delegation_chain(
         token,
         did_resolver,
         proof_resolver,
         revocation_checker,
+        &super::validate::NoCaveatResolver,
         clock_skew_tolerance_secs,
         clock,
     )?;

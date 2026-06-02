@@ -318,6 +318,84 @@ impl<S: Storage> CaveatCounterStore<S> {
         Ok(())
     }
 
+    /// Releases (decrements) a previously-reserved counter amount.
+    ///
+    /// SCP R4 HIGH-1: a streaming open RESERVES the full
+    /// `cost_per_chunk × estimated_chunk_count` against the
+    /// [`CaveatKind::AmountCumulative`] counter at open time (so a stream
+    /// cannot evade the cumulative value cap by billing N chunks under a
+    /// single per-open charge). At close-time settlement the unspent portion
+    /// — `(reserved_chunks − actual_billed) × cost_per_chunk` — is returned
+    /// to the counter via this method, mirroring how the escrow ledger
+    /// refunds its unspent hold. The two dimensions are distinct (escrow is a
+    /// per-member budget HOLD; this is the per-delegation cumulative caveat
+    /// COUNTER), so releasing here does not double-count with the escrow
+    /// refund.
+    ///
+    /// `amount` is interpreted per-kind:
+    ///
+    /// - [`CaveatKind::AmountCumulative`]: subtracted from
+    ///   `amount_cumulative_used` (saturating at `0`).
+    /// - [`CaveatKind::MaxCalls`]: subtracts whole invocations from
+    ///   `max_calls_used` (saturating at `0`).
+    /// - [`CaveatKind::RateWindow`]: a no-op — sliding-window timestamps age
+    ///   out by time, not by release, so there is nothing to give back.
+    ///
+    /// Idempotent against under-flow: a release larger than the recorded
+    /// usage clamps the counter to `0` rather than wrapping. A release for a
+    /// UCAN with no persisted record is a no-op success.
+    ///
+    /// # Errors
+    ///
+    /// - [`CounterError::Store`]: the underlying storage read/write failed;
+    ///   the persisted counter is unchanged.
+    pub async fn release(
+        &self,
+        context_id: &str,
+        ucan_cid: &str,
+        kind: CaveatKind,
+        amount: u64,
+    ) -> Result<(), CounterError> {
+        // Sanitize key components up front (same contract as
+        // `check_and_increment`) so a malformed caller cannot poison the lock
+        // map.
+        crate::store::caveat_counters::caveat_counters_key(context_id, ucan_cid)?;
+        // A zero release (e.g. the stream billed exactly its reserve) is a
+        // no-op — skip the load/store round-trip and the lock acquisition.
+        if amount == 0 {
+            return Ok(());
+        }
+        let lock = self.lock_for(context_id, ucan_cid);
+        let _guard = lock.lock().await;
+
+        // No record means nothing was ever reserved — releasing is a no-op.
+        let Some(mut record): Option<CaveatCounters> = self
+            .repository
+            .load_caveat_counters(context_id, ucan_cid)
+            .await?
+        else {
+            return Ok(());
+        };
+
+        match kind {
+            CaveatKind::AmountCumulative => {
+                record.amount_cumulative_used =
+                    record.amount_cumulative_used.saturating_sub(amount);
+            }
+            CaveatKind::MaxCalls => {
+                record.max_calls_used = record.max_calls_used.saturating_sub(amount);
+            }
+            // Rate-window entries age out by wall-clock time; there is no
+            // reserved quantity to give back on a release.
+            CaveatKind::RateWindow => return Ok(()),
+        }
+
+        self.repository
+            .store_caveat_counters(context_id, ucan_cid, &record)
+            .await?;
+        Ok(())
+    }
+
     /// Reads the persisted [`CaveatCounters`] record for diagnostics or
     /// migration.
     ///
@@ -406,6 +484,18 @@ pub trait CaveatCounterApi: Send + Sync {
         cap: u64,
         window_secs: u32,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CounterError>> + Send + 'a>>;
+
+    /// See [`CaveatCounterStore::release`].
+    ///
+    /// SCP R4 HIGH-1: returns the unspent portion of a stream's open-time
+    /// reservation to the counter at close-time settlement.
+    fn release<'a>(
+        &'a self,
+        context_id: &'a str,
+        ucan_cid: &'a str,
+        kind: scp_protocol::trust::CaveatKind,
+        amount: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CounterError>> + Send + 'a>>;
 }
 
 impl<S: Storage + 'static> CaveatCounterApi for CaveatCounterStore<S> {
@@ -423,6 +513,17 @@ impl<S: Storage + 'static> CaveatCounterApi for CaveatCounterStore<S> {
             self.check_and_increment(context_id, ucan_cid, kind, amount, cap, window_secs)
                 .await
         })
+    }
+
+    fn release<'a>(
+        &'a self,
+        context_id: &'a str,
+        ucan_cid: &'a str,
+        kind: scp_protocol::trust::CaveatKind,
+        amount: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CounterError>> + Send + 'a>>
+    {
+        Box::pin(async move { self.release(context_id, ucan_cid, kind, amount).await })
     }
 }
 

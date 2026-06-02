@@ -772,7 +772,7 @@ RateWindow {
 
 **Absent field = unconstrained.** An `Option::None` field means "parent's setting applies." Attenuation narrows by transitioning absent → present or by tightening a present bound. Widening is rejected.
 
-**Attenuation (`narrow`).** At each delegation step, the child's caveat set is validated against the parent's. The child is admissible iff, for every field:
+**Attenuation (`narrow`).** At each delegation step, the child's caveat set is validated against the parent's. **"Each delegation step" means every parent→child edge of the delegation chain — not only the leaf→direct-parent edge, but every interior edge (parent→grandparent, grandparent→great-grandparent, and so on up to the root).** The chain walk validates the capability-subset check and the caveat narrowing rules at every edge it traverses (§5.4.5), so an interior token cannot widen a capability or relax a caveat that a more-distant ancestor bound. This is per-edge enforcement, not a fold: each edge is checked independently against its own parent, and the absent-field rule above still governs each edge (a child token that carries no `nb` at all resolves to `None`, that edge's caveat narrow is skipped, and the more-distant ancestor's bound stands unchanged; a child that presents `nb` re-materializing a field the parent set must narrow it, never widen or remove it). The child is admissible iff, for every field:
 
 - `amount_max_per_call`, `amount_max_cumulative`, `max_calls`, `rate_window.max`: child value MUST be `<=` parent value (or child MAY introduce a bound where parent had none).
 - `valid_from`: child MUST be `>=` parent.

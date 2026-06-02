@@ -592,6 +592,31 @@ pub struct StreamSettlement {
     /// zero-cost / Query streams and legacy/test callers without an
     /// economic policy at open.
     pub economic_policy_snapshot: Option<EconomicPolicySnapshot>,
+    /// R4 HIGH-1 — the cumulative amount RESERVED against the
+    /// [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind)
+    /// counter at the open-time final gate
+    /// (`cost_per_chunk × reserved_chunks`). `0` when the cap is absent, the
+    /// reserve overflowed (fail-open), or no counter store was wired. Close-
+    /// time settlement releases the UNSPENT portion of this reserve —
+    /// `(reserved_chunks − billed_count) × cost_per_chunk`, clamped to this
+    /// reserved amount — back to the counter via
+    /// [`crate::trust::CaveatCounterApi::release`], so the cumulative cap is
+    /// debited by exactly the billed spend rather than the full reservation.
+    pub amount_cumulative_reserved: u64,
+    /// R4 HIGH-1 — the chunk count the cumulative reserve was computed over
+    /// (the open's bounded `estimated_chunk_count`). The settlement
+    /// reconciliation computes `unspent = (reserved_chunks − billed_count)`.
+    pub reserved_chunks: u32,
+    /// R4 HIGH-1 — the opening UCAN CID, the key the
+    /// [`CaveatKind::AmountCumulative`](scp_protocol::trust::CaveatKind)
+    /// counter is stored under. Needed so the close-time release targets the
+    /// same counter the open-time reserve incremented. Empty for legacy / test
+    /// callers with no durable counter reservation.
+    pub ucan_cid: String,
+    /// R4 HIGH-1 — the per-billable-chunk cost, the unit the cumulative
+    /// release multiplies the unspent chunk count by. `Amount::new(0)` for
+    /// zero-cost / Query streams (release is then a no-op).
+    pub cost_per_chunk: scp_protocol::economy::types::Amount,
 }
 
 /// §5.4.5 MED-HIGH — economic state snapshotted at `OutletStreamOpen`
@@ -7161,6 +7186,7 @@ mod tests {
             StdArc::clone(&admission),
             out034_pump_semaphore(),
             None,
+            None,
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -7265,6 +7291,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
             None,
         )
         .await
@@ -7420,6 +7447,7 @@ mod tests {
             StdArc::clone(&admission),
             out034_pump_semaphore(),
             None,
+            None,
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -7545,6 +7573,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
             None,
         )
         .await
@@ -7716,6 +7745,7 @@ mod tests {
             StdArc::clone(&admission),
             out034_pump_semaphore(),
             None,
+            None,
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -7834,6 +7864,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
             None,
         )
         .await
@@ -8035,6 +8066,7 @@ mod tests {
             StdArc::clone(&admission),
             out034_pump_semaphore(),
             None,
+            None,
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -8162,6 +8194,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
             None,
         )
         .await
@@ -8461,6 +8494,7 @@ mod tests {
             StdArc::clone(&admission),
             out034_pump_semaphore(),
             None,
+            None,
         )
         .await;
         let Err(rejection) = result else {
@@ -8615,6 +8649,7 @@ mod tests {
             StdArc::clone(&admission),
             out034_pump_semaphore(),
             Some(hook),
+            None,
         )
         .await;
 
@@ -8957,6 +8992,7 @@ mod tests {
             StdArc::clone(&admission),
             out034_pump_semaphore(),
             None,
+            None,
         )
         .await
         .expect("open succeeds with matching binding");
@@ -9201,6 +9237,7 @@ mod tests {
             StdArc::clone(&admission_a),
             StdArc::clone(&semaphore),
             None,
+            None,
         )
         .await
         .expect("first open acquires the only permit");
@@ -9238,6 +9275,7 @@ mod tests {
             params_b,
             StdArc::clone(&admission_b),
             StdArc::clone(&semaphore),
+            None,
             None,
         )
         .await;
@@ -9301,6 +9339,7 @@ mod tests {
             params_c,
             StdArc::clone(&admission_c),
             StdArc::clone(&semaphore),
+            None,
             None,
         )
         .await;

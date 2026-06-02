@@ -699,14 +699,22 @@ where
     // Step 2: Signature verification.
     verify_signature(token, ctx.did_resolver)?;
 
-    // Step 3: Chain verification (delegation proofs).
-    // Verifies signatures, expiry, revocation, and aud/iss linkage on all
-    // parent tokens. Returns the root issuer DID.
+    // Step 3 (+ Step 7/7b at every edge): Chain verification.
+    // Verifies signatures, expiry, revocation, aud/iss linkage AND the
+    // per-edge attenuation check (capability subset + caveat narrow) on
+    // EVERY edge of the chain — leaf -> direct-parent AND every interior
+    // edge (§5.4.5). Returns the root issuer DID. The chain walk is now the
+    // sole owner of Step 7/7b; the previously-separate leaf-only
+    // `verify_attenuation` call below has been removed (the leaf edge is
+    // simply the first loop iteration). `narrow()` is a pure validator, so
+    // even a double-run would be idempotent, but we drop the redundant
+    // re-check.
     let root_issuer = verify_delegation_chain(
         token,
         ctx.did_resolver,
         ctx.proof_resolver,
         ctx.revocation_checker,
+        ctx.caveat_resolver,
         ctx.clock_skew_tolerance_secs,
         ctx.clock,
     )?;
@@ -753,17 +761,16 @@ where
     // (DID document modifications, pre-rotation, identity migration).
     enforce_ucan_category_a(token, &granted_caps)?;
 
-    // Step 7 + 7b: Attenuation — verify delegations narrow or preserve.
-    // For root tokens (empty prf), Step 7 is a no-op; Step 7b (caveat
-    // narrow) is also a no-op for roots because there is no parent
-    // delegation to compare against.
-    //
-    // SCP-OUT-021: Step 7b extends the existing capability-subset check
-    // with a per-field caveat narrow. The resolver decides which tokens
-    // carry caveats; tokens with no caveats fall back to Step 7 alone.
-    if !token.payload.prf.is_empty() {
-        verify_attenuation(token, ctx.proof_resolver, ctx.caveat_resolver)?;
-    }
+    // Step 7 + 7b: Attenuation is now enforced at EVERY edge inside the
+    // Step 3 chain walk (`verify_delegation_chain` ->
+    // `verify_chain_recursive` -> `verify_edge_attenuation`), per §5.4.5.
+    // The leaf -> direct-parent edge is the first walk iteration, and the
+    // interior edges (parent -> grandparent, ...) are covered by the
+    // recursion. The previously-separate leaf-only `verify_attenuation`
+    // call here has been removed so the walk is the single owner of all
+    // edges — closing the interior-edge-widening gap where a mid-chain
+    // token could widen a capability or relax a caveat that an ancestor
+    // bound.
 
     // Step 8: Ceiling — verify capability is within context ceiling.
     verify_ceiling_compliance(std::slice::from_ref(required_capability), ctx.ceiling)?;
@@ -1057,6 +1064,7 @@ pub(super) fn verify_delegation_chain(
     did_resolver: &impl DidResolver,
     proof_resolver: &impl ProofResolver,
     revocation_checker: &impl RevocationChecker,
+    caveat_resolver: &dyn CaveatResolver,
     clock_skew_tolerance_secs: u64,
     clock: &dyn Clock,
 ) -> Result<String, UcanError> {
@@ -1071,6 +1079,7 @@ pub(super) fn verify_delegation_chain(
         did_resolver,
         proof_resolver,
         revocation_checker,
+        caveat_resolver,
         0,
         &mut seen_issuers,
         clock_skew_tolerance_secs,
@@ -1096,6 +1105,7 @@ fn verify_chain_recursive(
     did_resolver: &impl DidResolver,
     proof_resolver: &impl ProofResolver,
     revocation_checker: &impl RevocationChecker,
+    caveat_resolver: &dyn CaveatResolver,
     depth: usize,
     seen_issuers: &mut HashSet<String>,
     clock_skew_tolerance_secs: u64,
@@ -1135,6 +1145,20 @@ fn verify_chain_recursive(
             )));
         }
 
+        // Step 7 + 7b at THIS edge (§5.4.5). The chain walk is the single
+        // owner of attenuation enforcement across the whole chain: the
+        // first iteration (depth 0) covers the leaf -> direct-parent edge,
+        // and every deeper recursion covers an interior edge
+        // (parent -> grandparent, ...). Without this, an interior token
+        // could widen a capability or relax a caveat that a more-distant
+        // ancestor bound and still pass — because the standalone
+        // leaf-only attenuation pass never inspected interior edges.
+        // Capability subset here composes with the Step 8 ceiling check in
+        // `validate_ucan` under logical AND (§7.3.8 "additive deny-surface")
+        // — they never reject the same legitimate token, so this adds no
+        // false rejection of an honestly-minted chain.
+        verify_edge_attenuation(token, &parent, caveat_resolver)?;
+
         // Steps 5a/5b: Validate key scope on parent token (ADR-039, SCP-AB-013).
         // An attacker could craft a parent with iss==aud and no key_scope that
         // would pass chain checks if only the presented token were validated.
@@ -1167,6 +1191,7 @@ fn verify_chain_recursive(
             did_resolver,
             proof_resolver,
             revocation_checker,
+            caveat_resolver,
             depth + 1,
             seen_issuers,
             clock_skew_tolerance_secs,
@@ -1215,62 +1240,105 @@ fn verify_chain_recursive(
 /// capabilities (Step 7) and
 /// [`UcanError::CaveatAttenuationViolation`] if a child violates a
 /// caveat narrowing rule at any field (Step 7b).
+///
+/// Test-only: the production validation path enforces Step 7/7b at every
+/// edge inside the chain walk ([`verify_edge_attenuation`] called from
+/// [`verify_chain_recursive`]). This thin wrapper is retained so the
+/// existing single-edge unit tests can drive one `(child, parent)` edge in
+/// isolation; it is not on any production path.
+#[cfg(test)]
 fn verify_attenuation(
     token: &UcanToken,
     proof_resolver: &impl ProofResolver,
     caveat_resolver: &dyn CaveatResolver,
 ) -> Result<(), UcanError> {
-    // SCP-OUT-021 Step 7b: pre-resolve the child's caveats once outside
-    // the parent loop. The narrow rule is applied at every parent edge so
-    // we need the same child snapshot for each comparison.
-    let child_caveats = caveat_resolver.resolve_caveats(token);
-
+    // Thin wrapper: apply the per-edge Step 7 + 7b check at each direct
+    // parent edge of `token`. The interior edges of the chain (parent ->
+    // grandparent, ...) are checked by the chain walk
+    // (`verify_chain_recursive`), which calls `verify_edge_attenuation`
+    // for every (child, parent) pair it traverses (§5.4.5). This wrapper
+    // exists so single-edge unit tests can exercise one (child, parent)
+    // edge in isolation without driving the full chain walk.
     for proof_cid in &token.payload.prf {
         let parent = proof_resolver.resolve_proof(proof_cid)?;
+        verify_edge_attenuation(token, &parent, caveat_resolver)?;
+    }
+    Ok(())
+}
 
-        // Parse parent capabilities.
-        // SECURITY: fail-closed — any unparseable parent attestation URI rejects the chain.
-        let parent_caps: Vec<CapabilityUri> = parent
-            .payload
-            .att
-            .iter()
-            .map(|att| {
-                att.with.parse::<CapabilityUri>().map_err(|_| {
-                    UcanError::MalformedToken(format!(
-                        "unparseable capability URI in parent attestation: {}",
-                        att.with
-                    ))
-                })
+/// Step 7 + 7b for a single delegation edge `(child, parent)`.
+///
+/// This is the per-edge body shared by the leaf-edge wrapper
+/// [`verify_attenuation`] and the interior-edge walk in
+/// [`verify_chain_recursive`]. Running it at EVERY edge (not just
+/// leaf -> direct-parent) is the §7.3.8 / §5.4.5 invariant: an interior
+/// token cannot widen a capability or relax a caveat that a more-distant
+/// ancestor bound.
+///
+/// **Step 7 (capability subset).** Every `child` capability MUST be
+/// granted by some `parent` capability (`parent.matches(child)`).
+///
+/// **Step 7b (caveat narrow).** When the resolver returns `Some(_)` for
+/// BOTH `parent` and `child`, the function calls
+/// `parent_caveats.narrow(&child_caveats)`. Any
+/// [`AttenuationViolation`](crate::trust::caveats::AttenuationViolation)
+/// is wrapped into [`UcanError::CaveatAttenuationViolation`]. When either
+/// side resolves to `None`, only Step 7 runs at that edge — preserving the
+/// documented [`CaveatResolver`] `None`-handling contract (a token with no
+/// `nb` skips its own caveat narrow and the ancestor's bound stands).
+///
+/// # Errors
+///
+/// Returns [`UcanError::AttenuationViolation`] if the child widens a
+/// capability (Step 7) and [`UcanError::CaveatAttenuationViolation`] if the
+/// child violates a caveat narrowing rule at any field (Step 7b).
+fn verify_edge_attenuation(
+    child: &UcanToken,
+    parent: &UcanToken,
+    caveat_resolver: &dyn CaveatResolver,
+) -> Result<(), UcanError> {
+    // Parse parent capabilities.
+    // SECURITY: fail-closed — any unparseable parent attestation URI rejects the chain.
+    let parent_caps: Vec<CapabilityUri> = parent
+        .payload
+        .att
+        .iter()
+        .map(|att| {
+            att.with.parse::<CapabilityUri>().map_err(|_| {
+                UcanError::MalformedToken(format!(
+                    "unparseable capability URI in parent attestation: {}",
+                    att.with
+                ))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
-        // Step 7: Verify every child capability is granted by a parent capability.
-        for child_att in &token.payload.att {
-            let child_cap: CapabilityUri = child_att
-                .with
-                .parse()
-                .map_err(|e: UcanError| UcanError::AttenuationViolation(e.to_string()))?;
+    // Step 7: Verify every child capability is granted by a parent capability.
+    for child_att in &child.payload.att {
+        let child_cap: CapabilityUri = child_att
+            .with
+            .parse()
+            .map_err(|e: UcanError| UcanError::AttenuationViolation(e.to_string()))?;
 
-            let granted = parent_caps.iter().any(|p| p.matches(&child_cap));
-            if !granted {
-                return Err(UcanError::AttenuationViolation(format!(
-                    "child capability '{}' not granted by parent",
-                    child_att.with
-                )));
-            }
+        let granted = parent_caps.iter().any(|p| p.matches(&child_cap));
+        if !granted {
+            return Err(UcanError::AttenuationViolation(format!(
+                "child capability '{}' not granted by parent",
+                child_att.with
+            )));
         }
+    }
 
-        // SCP-OUT-021 Step 7b: caveat narrow at this parent edge. Run
-        // only when both parent and child carry caveats — see
-        // [`CaveatResolver`] module docs for the `None`-handling
-        // contract.
-        if let (Some(parent_caveats), Some(child_caveats)) =
-            (caveat_resolver.resolve_caveats(&parent), &child_caveats)
-        {
-            parent_caveats
-                .narrow(child_caveats)
-                .map_err(UcanError::CaveatAttenuationViolation)?;
-        }
+    // SCP-OUT-021 Step 7b: caveat narrow at this edge. Run only when both
+    // parent and child carry caveats — see [`CaveatResolver`] module docs
+    // for the `None`-handling contract.
+    if let (Some(parent_caveats), Some(child_caveats)) = (
+        caveat_resolver.resolve_caveats(parent),
+        caveat_resolver.resolve_caveats(child),
+    ) {
+        parent_caveats
+            .narrow(&child_caveats)
+            .map_err(UcanError::CaveatAttenuationViolation)?;
     }
     Ok(())
 }
@@ -1368,7 +1436,11 @@ mod tests {
     use super::*;
     use crate::crypto::ucan::{Attenuation, UcanHeader, UcanPayload, UcanToken};
     use crate::economy::types::Amount;
-    use crate::trust::caveats::{AttenuationViolation, InvocationCaveats};
+    use crate::trust::caveats::{
+        AttenuationViolation, CaveatField, DaysOfWeekMask, HoursOfDayMask, InvocationCaveats,
+        RateWindow,
+    };
+    use scp_primitives::DID;
 
     /// Builds a synthetic token with the given encoded string, attestation
     /// URIs, and proofs. The signature is empty — these tests exercise
@@ -1469,7 +1541,7 @@ mod tests {
         let clock = scp_primitives::TestClock::new(now_at_hour_12);
 
         // Allow only hour 13 (bit 13 set) — bit 12 is clear.
-        let mask = crate::trust::caveats::HoursOfDayMask::from_bits(1u32 << 13).unwrap();
+        let mask = HoursOfDayMask::from_bits(1u32 << 13).unwrap();
         let caveats = InvocationCaveats {
             hours_of_day: Some(mask),
             ..InvocationCaveats::empty()
@@ -1491,7 +1563,7 @@ mod tests {
         let clock = scp_primitives::TestClock::new(now_at_hour_12);
 
         // Allow hour 12.
-        let mask = crate::trust::caveats::HoursOfDayMask::from_bits(1u32 << 12).unwrap();
+        let mask = HoursOfDayMask::from_bits(1u32 << 12).unwrap();
         let caveats = InvocationCaveats {
             hours_of_day: Some(mask),
             ..InvocationCaveats::empty()
@@ -1537,7 +1609,7 @@ mod tests {
         // 1970-01-01 was a Thursday (weekday 4 with Sun=0).
         let clock = scp_primitives::TestClock::new(0);
         // Allow only Sunday (bit 0).
-        let mask = crate::trust::caveats::DaysOfWeekMask::from_bits(0b0000_0001).unwrap();
+        let mask = DaysOfWeekMask::from_bits(0b0000_0001).unwrap();
         let caveats = InvocationCaveats {
             days_of_week: Some(mask),
             ..InvocationCaveats::empty()
@@ -1740,5 +1812,549 @@ mod tests {
             }
             other => panic!("expected CaveatTimeBoxViolation, got {other:?}"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // CRITICAL (R4): per-edge Step 7 + 7b at EVERY chain edge, driven through
+    // the full delegation-chain walk (verify_delegation_chain ->
+    // verify_chain_recursive -> verify_edge_attenuation). These exercise the
+    // INTERIOR edge (mid -> root) that the previous leaf-only attenuation
+    // pass never inspected (§5.4.5 / §7.3.8 interior-edge clarification).
+    //
+    // The chain is depth-3: leaf.prf = [mid], mid.prf = [root]. Tokens are
+    // real-signed so they survive `verify_signature` inside the walk; the
+    // INTERIOR widen is placed at mid (vs root) so that ONLY the interior
+    // edge can catch it — the leaf -> mid edge is correctly narrowed.
+    // -----------------------------------------------------------------------
+
+    /// Test clock anchor — tokens expire shortly after this instant so they
+    /// pass `verify_expiry` (exp > now AND exp <= now + 24h).
+    const CHAIN_NOW: u64 = 1_700_000_000;
+
+    /// A signed depth-3 chain fixture. Holds the leaf token, the proof
+    /// resolver (mid + root), the DID resolver (each issuer's verifying key),
+    /// and a revocation checker.
+    struct SignedChain {
+        leaf: UcanToken,
+        proof_resolver: InMemoryProofResolver,
+        did_resolver: InMemoryDidResolver,
+        revocation_checker: InMemoryRevocationChecker,
+    }
+
+    /// Drives the fixture's leaf through the full delegation-chain walk with
+    /// the given caveat resolver and the [`CHAIN_NOW`]-anchored clock.
+    fn run_chain(chain: &SignedChain, resolver: &dyn CaveatResolver) -> Result<String, UcanError> {
+        let clock = scp_primitives::TestClock::new(CHAIN_NOW);
+        verify_delegation_chain(
+            &chain.leaf,
+            &chain.did_resolver,
+            &chain.proof_resolver,
+            &chain.revocation_checker,
+            resolver,
+            0,
+            &clock,
+        )
+    }
+
+    /// Builds and signs one token. `iss`/`aud` set the linkage; `nb` carries
+    /// the caveats; `caps` the attestation URIs; `proofs` the encoded parent
+    /// strings. The signature covers `encoded[..last_dot]`, matching
+    /// `verify_signature`'s signing-input extraction. Returns the token plus
+    /// its 32-byte verifying key so callers can register it in the resolver.
+    fn signed_token(
+        iss: &str,
+        aud: &str,
+        encoded_id: &str,
+        caps: &[&str],
+        proofs: &[&str],
+        nb: Option<InvocationCaveats>,
+    ) -> (UcanToken, [u8; 32]) {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        // Deterministic keypair seeded from the encoded id so re-runs are
+        // stable. The seed content is irrelevant to the attenuation logic.
+        let mut seed = [0u8; 32];
+        for (i, b) in encoded_id.bytes().enumerate().take(32) {
+            seed[i] = b;
+        }
+        let signing_key = SigningKey::from_bytes(&seed);
+        let verifying_key = signing_key.verifying_key().to_bytes();
+
+        // signing_input is everything before the final '.'. We give each
+        // token a unique signing input keyed on its id so signatures do not
+        // collide across tokens.
+        let signing_input = format!("hdr.{encoded_id}");
+        let signature = signing_key
+            .sign(signing_input.as_bytes())
+            .to_bytes()
+            .to_vec();
+        // Encoded form: "<signing_input>.<placeholder-sig-segment>". The sig
+        // segment content is unused by verify_signature (it reads the parsed
+        // `signature` field); only the split position matters.
+        let encoded = format!("{signing_input}.sig");
+
+        let token = UcanToken {
+            header: UcanHeader::new(),
+            payload: UcanPayload {
+                iss: iss.to_owned(),
+                aud: aud.to_owned(),
+                exp: CHAIN_NOW + 1_000,
+                nbf: None,
+                nnc: "0-00000000000000000000000000000000".to_owned(),
+                att: caps
+                    .iter()
+                    .map(|s| Attenuation {
+                        with: (*s).to_owned(),
+                        can: "*".to_owned(),
+                    })
+                    .collect(),
+                prf: proofs.iter().map(|s| (*s).to_owned()).collect(),
+                fct: None,
+                nb,
+            },
+            signature,
+            encoded,
+        };
+        (token, verifying_key)
+    }
+
+    /// Assembles a depth-3 signed chain root -> mid -> leaf with the given
+    /// per-token caveats and capability sets. `leaf.prf = [mid]`,
+    /// `mid.prf = [root]`, `root.prf = []`.
+    fn build_depth3(
+        root_caps: &[&str],
+        mid_caps: &[&str],
+        leaf_caps: &[&str],
+        root_nb: Option<InvocationCaveats>,
+        mid_nb: Option<InvocationCaveats>,
+        leaf_nb: Option<InvocationCaveats>,
+    ) -> SignedChain {
+        const ROOT_DID: &str = "did:example:root";
+        const MID_DID: &str = "did:example:mid";
+        const LEAF_DID: &str = "did:example:leaf";
+
+        let (root, root_pk) = signed_token(ROOT_DID, MID_DID, "ROOT", root_caps, &[], root_nb);
+        // A proof CID in `prf` must equal the parent token's `encoded`
+        // string (that is the key `InMemoryProofResolver` looks up); for the
+        // `signed_token` helper the encoded form is "hdr.<id>.sig".
+        let (mid, mid_pk) = signed_token(
+            MID_DID,
+            LEAF_DID,
+            "MID",
+            mid_caps,
+            &["hdr.ROOT.sig"],
+            mid_nb,
+        );
+        // The leaf's audience is the presenting agent; for chain-walk tests
+        // its exact value is irrelevant (validate_ucan checks aud, the walk
+        // does not), so we use a distinct agent DID.
+        let (leaf, leaf_pk) = signed_token(
+            LEAF_DID,
+            "did:example:agent",
+            "LEAF",
+            leaf_caps,
+            &["hdr.MID.sig"],
+            leaf_nb,
+        );
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        proof_resolver.proofs.insert(mid.encoded.clone(), mid);
+        proof_resolver.proofs.insert(root.encoded.clone(), root);
+
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(ROOT_DID.to_owned(), root_pk);
+        keys.insert(MID_DID.to_owned(), mid_pk);
+        keys.insert(LEAF_DID.to_owned(), leaf_pk);
+
+        SignedChain {
+            leaf,
+            proof_resolver,
+            did_resolver: InMemoryDidResolver::from_keys(keys),
+            revocation_checker: InMemoryRevocationChecker::default(),
+        }
+    }
+
+    /// Shorthand: a fully-populated Action caveat set so each field starts
+    /// from a concrete bound that the matrix can widen at the interior edge.
+    /// One parameter per §7.3.8 caveat field — a test fixture builder, not a
+    /// production API, so the per-field arity is intentional.
+    #[allow(clippy::too_many_arguments)]
+    fn action_caveats(
+        amount_per_call: u64,
+        amount_cumulative: u64,
+        max_calls: u64,
+        rate_max: u32,
+        window_secs: u32,
+        hours_bits: u32,
+        days_bits: u8,
+        valid_until: u64,
+        adapters: &[&str],
+        target_dids: &[&str],
+        schema_max: f64,
+    ) -> InvocationCaveats {
+        InvocationCaveats {
+            amount_max_per_call: Some(Amount::new(amount_per_call)),
+            amount_max_cumulative: Some(Amount::new(amount_cumulative)),
+            valid_from: None,
+            valid_until: Some(valid_until),
+            hours_of_day: Some(HoursOfDayMask::from_bits(hours_bits).unwrap()),
+            days_of_week: Some(DaysOfWeekMask::from_bits(days_bits).unwrap()),
+            max_calls: Some(max_calls),
+            rate_window: Some(RateWindow {
+                max: rate_max,
+                window_secs,
+            }),
+            input_schema: Some(serde_json::json!({ "maximum": schema_max })),
+            allowed_adapters: Some(adapters.iter().map(|s| (*s).to_owned()).collect()),
+            allowed_target_dids: Some(target_dids.iter().map(|s| DID((*s).to_owned())).collect()),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+        }
+    }
+
+    const CAP: &str = "scp:ctx:abc/outlet_call:assistant";
+
+    /// Interior-edge reject case driver: root sets a tight bound, leaf
+    /// narrows correctly relative to mid, but MID widens relative to root.
+    /// The leaf -> mid edge passes; ONLY the interior mid -> root edge can
+    /// reject. Confirms the walk inspects interior edges.
+    fn assert_interior_reject(
+        root_nb: InvocationCaveats,
+        mid_nb: InvocationCaveats,
+        leaf_nb: InvocationCaveats,
+    ) -> AttenuationViolation {
+        let chain = build_depth3(
+            &[CAP],
+            &[CAP],
+            &[CAP],
+            Some(root_nb),
+            Some(mid_nb),
+            Some(leaf_nb),
+        );
+        let err =
+            run_chain(&chain, &TokenNbCaveatResolver).expect_err("interior-edge widen must reject");
+        match err {
+            UcanError::CaveatAttenuationViolation(v) => v,
+            UcanError::AttenuationViolation(_) => {
+                panic!("expected caveat violation, got capability violation: {err:?}")
+            }
+            other => panic!("expected CaveatAttenuationViolation, got {other:?}"),
+        }
+    }
+
+    /// (1) Capability widened at the interior edge (in-ceiling) must reject.
+    /// mid grants a broader stem than root delegated.
+    #[test]
+    fn interior_edge_rejects_widened_capability() {
+        // root delegates only outlet_call:assistant; mid widens to the
+        // wildcard outlet_call:* (broader — not granted by root).
+        let chain = build_depth3(
+            &[CAP],
+            &["scp:ctx:abc/outlet_call:*"],
+            &["scp:ctx:abc/outlet_call:*"],
+            None,
+            None,
+            None,
+        );
+        let err = run_chain(&chain, &TokenNbCaveatResolver)
+            .expect_err("interior capability widen must reject");
+        match err {
+            UcanError::AttenuationViolation(msg) => {
+                assert!(msg.contains("not granted by parent"), "msg: {msg}");
+            }
+            other => panic!("expected AttenuationViolation, got {other:?}"),
+        }
+    }
+
+    /// (2) max_calls widened 10 -> 100 at the interior edge.
+    #[test]
+    fn interior_edge_rejects_widened_max_calls() {
+        let root = InvocationCaveats {
+            max_calls: Some(10),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let mid = InvocationCaveats {
+            max_calls: Some(100),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let leaf = InvocationCaveats {
+            max_calls: Some(100),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        match assert_interior_reject(root, mid, leaf) {
+            AttenuationViolation::U64Widened {
+                field: CaveatField::MaxCalls,
+                ..
+            } => {}
+            other => panic!("expected U64Widened(MaxCalls), got {other:?}"),
+        }
+    }
+
+    /// (3) amount_max_cumulative widened 100 -> 1000 at the interior edge.
+    #[test]
+    fn interior_edge_rejects_widened_amount_cumulative() {
+        let root = InvocationCaveats {
+            amount_max_cumulative: Some(Amount::new(100)),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let mid = InvocationCaveats {
+            amount_max_cumulative: Some(Amount::new(1000)),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let leaf = mid.clone();
+        match assert_interior_reject(root, mid, leaf) {
+            AttenuationViolation::AmountWidened {
+                field: CaveatField::AmountMaxCumulative,
+                ..
+            } => {}
+            other => panic!("expected AmountWidened(AmountMaxCumulative), got {other:?}"),
+        }
+    }
+
+    /// (4) amount_max_per_call widened 50 -> 500 at the interior edge.
+    #[test]
+    fn interior_edge_rejects_widened_amount_per_call() {
+        let root = InvocationCaveats {
+            amount_max_per_call: Some(Amount::new(50)),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let mid = InvocationCaveats {
+            amount_max_per_call: Some(Amount::new(500)),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let leaf = mid.clone();
+        match assert_interior_reject(root, mid, leaf) {
+            AttenuationViolation::AmountWidened {
+                field: CaveatField::AmountMaxPerCall,
+                ..
+            } => {}
+            other => panic!("expected AmountWidened(AmountMaxPerCall), got {other:?}"),
+        }
+    }
+
+    /// (5) rate_window widened (both max and window_secs) at the interior edge.
+    #[test]
+    fn interior_edge_rejects_widened_rate_window() {
+        let root = InvocationCaveats {
+            rate_window: Some(RateWindow {
+                max: 5,
+                window_secs: 60,
+            }),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let mid = InvocationCaveats {
+            rate_window: Some(RateWindow {
+                max: 50,
+                window_secs: 600,
+            }),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let leaf = mid.clone();
+        match assert_interior_reject(root, mid, leaf) {
+            AttenuationViolation::RateWindowMaxWidened { .. }
+            | AttenuationViolation::RateWindowSecsWidened { .. } => {}
+            other => panic!("expected RateWindow*Widened, got {other:?}"),
+        }
+    }
+
+    /// (6) allowed_target_dids superset at the interior edge.
+    #[test]
+    fn interior_edge_rejects_target_dids_superset() {
+        let root = InvocationCaveats {
+            allowed_target_dids: Some(vec![DID("did:dht:zA".to_owned())]),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let mid = InvocationCaveats {
+            allowed_target_dids: Some(vec![
+                DID("did:dht:zA".to_owned()),
+                DID("did:dht:zB".to_owned()),
+            ]),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let leaf = mid.clone();
+        match assert_interior_reject(root, mid, leaf) {
+            AttenuationViolation::AllowedTargetDidsNotSubset { .. } => {}
+            other => panic!("expected AllowedTargetDidsNotSubset, got {other:?}"),
+        }
+    }
+
+    /// (7) allowed_adapters superset at the interior edge.
+    #[test]
+    fn interior_edge_rejects_adapters_superset() {
+        let root = InvocationCaveats {
+            allowed_adapters: Some(vec!["stripe".to_owned()]),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let mid = InvocationCaveats {
+            allowed_adapters: Some(vec!["stripe".to_owned(), "paypal".to_owned()]),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let leaf = mid.clone();
+        match assert_interior_reject(root, mid, leaf) {
+            AttenuationViolation::AllowedAdaptersNotSubset { .. } => {}
+            other => panic!("expected AllowedAdaptersNotSubset, got {other:?}"),
+        }
+    }
+
+    /// (8) input_schema `maximum` widened at the interior edge.
+    #[test]
+    fn interior_edge_rejects_schema_maximum_widened() {
+        let root = InvocationCaveats {
+            input_schema: Some(serde_json::json!({ "maximum": 10.0 })),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let mid = InvocationCaveats {
+            input_schema: Some(serde_json::json!({ "maximum": 1000.0 })),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let leaf = mid.clone();
+        match assert_interior_reject(root, mid, leaf) {
+            AttenuationViolation::MaximumWidened { .. } => {}
+            other => panic!("expected MaximumWidened, got {other:?}"),
+        }
+    }
+
+    /// (9) time-box widened: valid_until later AND hours_of_day superset at
+    /// the interior edge.
+    #[test]
+    fn interior_edge_rejects_time_box_widened() {
+        let root = InvocationCaveats {
+            valid_until: Some(CHAIN_NOW + 100),
+            hours_of_day: Some(HoursOfDayMask::from_bits(0b0000_1100).unwrap()),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let mid = InvocationCaveats {
+            // valid_until later (widens) + hours superset.
+            valid_until: Some(CHAIN_NOW + 100_000),
+            hours_of_day: Some(HoursOfDayMask::from_bits(0b0011_1100).unwrap()),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let leaf = mid.clone();
+        match assert_interior_reject(root, mid, leaf) {
+            AttenuationViolation::U64Widened {
+                field: CaveatField::ValidUntil,
+                ..
+            }
+            | AttenuationViolation::HoursOfDayNotSubset { .. } => {}
+            other => panic!("expected ValidUntil/HoursOfDay widen, got {other:?}"),
+        }
+    }
+
+    /// (10) FieldRemoved at the interior edge: root set max_calls, mid
+    /// PRESENTS an nb that omits max_calls (resolves to None for that field
+    /// while the token still carries an nb) — removing a parent's bound.
+    #[test]
+    fn interior_edge_rejects_field_removed() {
+        let root = InvocationCaveats {
+            max_calls: Some(10),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        // mid presents an nb (origin_kind set) but DROPS max_calls -> None.
+        let mid = InvocationCaveats {
+            max_calls: None,
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let leaf = mid.clone();
+        match assert_interior_reject(root, mid, leaf) {
+            AttenuationViolation::FieldRemoved {
+                field: CaveatField::MaxCalls,
+            } => {}
+            other => panic!("expected FieldRemoved(MaxCalls), got {other:?}"),
+        }
+    }
+
+    /// (11) Correctly-narrowed depth-3 (every field narrowed root -> mid ->
+    /// leaf) must PASS through the full walk.
+    #[test]
+    fn depth3_correctly_narrowed_passes() {
+        let root = action_caveats(
+            500,
+            1000,
+            100,
+            50,
+            600,
+            0b1111_1111,
+            0b0111_1111,
+            CHAIN_NOW + 100_000,
+            &["stripe", "paypal"],
+            &["did:dht:zA", "did:dht:zB"],
+            1000.0,
+        );
+        // mid tightens every field.
+        let mid = action_caveats(
+            300,
+            800,
+            50,
+            30,
+            300,
+            0b0111_1111,
+            0b0011_1111,
+            CHAIN_NOW + 50_000,
+            &["stripe", "paypal"],
+            &["did:dht:zA", "did:dht:zB"],
+            800.0,
+        );
+        // leaf tightens further.
+        let leaf = action_caveats(
+            100,
+            500,
+            10,
+            10,
+            120,
+            0b0011_1100,
+            0b0001_1110,
+            CHAIN_NOW + 10_000,
+            &["stripe"],
+            &["did:dht:zA"],
+            500.0,
+        );
+        let chain = build_depth3(&[CAP], &[CAP], &[CAP], Some(root), Some(mid), Some(leaf));
+        run_chain(&chain, &TokenNbCaveatResolver)
+            .expect("a correctly-narrowed depth-3 chain must pass at every edge");
+    }
+
+    /// (12) mid omits its `nb` entirely (inherit-on-absent at the interior
+    /// edge): the mid -> root caveat narrow is skipped, root's bound stands,
+    /// and a leaf that narrows relative to root still passes.
+    #[test]
+    fn depth3_interior_absent_nb_inherits_and_passes() {
+        let root = InvocationCaveats {
+            max_calls: Some(100),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        // mid carries NO nb -> resolver returns None for mid. Both edges
+        // that touch mid (leaf->mid and mid->root) skip their caveat narrow
+        // because narrow runs only when BOTH sides resolve to Some. This is
+        // the documented inherit-on-absent contract at token granularity:
+        // a token with no nb breaks the caveat chain for the edges adjacent
+        // to it, and the more-distant ancestor's bound stands. The chain
+        // must still PASS — absence is not a violation.
+        let leaf = InvocationCaveats {
+            max_calls: Some(10),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let chain = build_depth3(&[CAP], &[CAP], &[CAP], Some(root), None, Some(leaf));
+        run_chain(&chain, &TokenNbCaveatResolver)
+            .expect("interior absent-nb inherits parent bound; narrowed leaf passes");
     }
 }
