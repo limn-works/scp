@@ -47,18 +47,30 @@ fn setup() {
     runtime::init_supervisor_for_test();
 }
 
-/// Creates a tokio runtime for async operations in tests.
+/// Returns the shared, process-lifetime tokio runtime for async operations in tests.
 ///
 /// Uses a multi-thread runtime because the context-creating codepath reaches
 /// `tokio::task::block_in_place`, which panics on a current-thread runtime.
 /// Interim per generic-moseying-lightning §484 until Phase 3's `block_in_place`
 /// elimination; remove (revert to `new_current_thread`) when persistence is async.
-fn test_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap()
+///
+/// SHARED + PERSISTENT (not a fresh runtime per call): mirrors production's
+/// global runtime (`crate::runtime()` / `RUNTIME` in `scp-ffi/src/lib.rs`).
+/// The actor-per-context bootstrap spawns each context's actor task with a bare
+/// `tokio::spawn` on the ambient runtime. A per-call runtime would be dropped
+/// when the create-call returns, aborting the actor task and closing its mailbox,
+/// so later mailbox-routed queries (`is_member`/`member_count`/`member_role`)
+/// would hit a closed channel and return `None`. A single long-lived runtime
+/// keeps the actor alive across create + query, matching production semantics.
+fn test_runtime() -> &'static tokio::runtime::Runtime {
+    static RT: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    })
 }
 
 /// Generates a random hex context ID (16 bytes = 32 hex chars).
