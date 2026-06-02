@@ -409,9 +409,10 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
      rotation_event, new pre-rotation handle, old identity, old
      document) needed by `DidDht::resume_migration_publish` to
      finish the migration without re-deriving keys or re-signing
-     proofs. Byte parity of the carried `pre_rotation_proof` is the
-     governing invariant (ADR-046). Surfaced via spec §9.7.4.1
-     "Partial-publish recovery"; structured FFI plumbing of the
+     proofs. Spec §9.7.4.1 "Partial-publish recovery" governs the
+     byte-parity invariant of the carried `pre_rotation_proof`;
+     ADR-046 governs the sibling cross-bridge byte-parity (seed-window
+     order, ephemeral RNG). Structured FFI plumbing of the
      `MigrationPartialState` handle is delivered in subsequent PRs
      per ADR-048 §7 per-SDK idiom.
 
