@@ -459,7 +459,7 @@ salt = SHA-256("SCP-SQLCIPHER-KEY-V1")     // fixed salt, 32 bytes
 info = "scp-sqlcipher:" || did             // DID as UTF-8 bytes — binds key to specific identity
 prk  = HKDF-Extract(salt, ikm)            // 32 bytes
 okm  = HKDF-Expand(prk, info, 32)         // 32 bytes — SQLCipher PRAGMA key
-derived_key = hex_encode(okm)             // 64 hex characters for PRAGMA key
+derived_key = hex_encode(okm)             // 64 hex characters, passed via raw-key syntax (x'..')
 ```
 
 The `ikm` is the raw private key bytes of the `#0` Identity Key, retrieved from platform key custody (iOS Keychain, Android Keystore, macOS Keychain, or OS keyring). The HKDF domain separation (`"SCP-SQLCIPHER-KEY-V1"`) ensures the derived key is distinct from any signing key, preventing cross-protocol attacks. The DID in the `info` parameter binds the database to a specific identity — databases for different identities on the same device use different encryption keys.
@@ -481,7 +481,7 @@ p_cost     = 1                                 // parallelism = 1
 output_len = 32                                // 32-byte derived key
 input      = passphrase (UTF-8 bytes)
 salt       = per-database 16-byte salt         // see Salt Persistence below
-derived_key = hex_encode(argon2id(...))        // 64 hex characters for PRAGMA key
+derived_key = hex_encode(argon2id(...))        // 64 hex characters, passed via raw-key syntax (x'..')
 ```
 
 A single Argon2id parameterization across the entire codebase is REQUIRED. The passphrase-mode SQLCipher key derivation and the `FileKeyCustody` passphrase-to-wrapping-key derivation MUST share one parameter source; implementations MUST NOT define a second, divergent Argon2id parameter set. The derived 32-byte key feeds the same SQLCipher PRAGMA-key path as raw-key mode (identical `cipher_page_size`, `kdf_iter`, HMAC, and KDF PRAGMAs below).
@@ -508,9 +508,16 @@ Only the first-initialization case — no `scp.db` and no `scp.salt` — generat
 **SQLCipher configuration:**
 
 ```rust
-// Applied on connection open
+// Applied on connection open.
+// `derived_key` is the 64-hex-character encoding of the 32-byte derived key
+// (raw-key or passphrase mode). It MUST be supplied using SQLCipher's raw-key
+// syntax `x'<derived_key>'` (note: `x'..'` inside the SQL string literal), which
+// tells SQLCipher to interpret the value as raw key bytes. Plain-quote syntax
+// (`'<derived_key>'`) would instead treat the 64 hex characters as a passphrase
+// and PBKDF2-stretch them — a redundant second KDF over already-derived key
+// material. Raw-key syntax avoids that double-KDF.
 conn.execute_batch("
-    PRAGMA key = '<derived_key>';
+    PRAGMA key = \"x'<derived_key>'\";
     PRAGMA cipher_page_size = 4096;
     PRAGMA kdf_iter = 256000;
     PRAGMA cipher_hmac_algorithm = HMAC_SHA512;
