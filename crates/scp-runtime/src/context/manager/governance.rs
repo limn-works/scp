@@ -3136,7 +3136,9 @@ impl ContextManager {
     /// structural cost floor). A Query outlet declaring a positive cost
     /// (or a `cost_formula`) is rejected with
     /// [`ContextError::PermissionDenied`] carrying error code
-    /// `SCP-TOOL-6102`, and no event is emitted.
+    /// `SCP-TOOL-6100` (the registry maps the `query-cost-violation` slug to
+    /// `CODE_PROTOCOL_VIOLATION`; the registry is truth), and no event is
+    /// emitted.
     #[allow(clippy::too_many_lines)] // SCP-OUT-041c added the dwell-time check + SCP-OUT-041a added the message-key pinning; the registration lifecycle is intentionally one cohesive function.
     pub(super) async fn execute_register_outlet(
         &self,

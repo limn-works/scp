@@ -1158,3 +1158,279 @@ async fn prove_event_inclusion_unknown_context() {
         ContextError::ContextNotRegistered(_)
     ));
 }
+
+// -----------------------------------------------------------------------
+// §5.4.5 streaming-escrow reserve / settle tests (E1 / E2 remediation)
+//
+// These exercise the runtime's authoritative budget movement directly:
+// `outlet_stream_reserve_escrow` DEBITS the open-time hold, the
+// `outlet_stream_settle` path refunds the unspent portion so net spent ==
+// billed, and two concurrent reserves cannot over-commit a single budget.
+// -----------------------------------------------------------------------
+
+/// Grants `amount` of budget to `did` in the test context.
+async fn grant_stream_budget(manager: &ContextManager, context_id: &str, did: &DID, amount: u64) {
+    let arc = manager.get_context_arc(context_id).unwrap();
+    let mut g = arc.lock().await;
+    g.governance
+        .budget_tracker
+        .grant(did, scp_protocol::economy::types::Amount::new(amount));
+}
+
+/// Reads the cumulative `total_spent` for `did` in the test context.
+async fn stream_total_spent(manager: &ContextManager, context_id: &str, did: &DID) -> u64 {
+    let arc = manager.get_context_arc(context_id).unwrap();
+    let g = arc.lock().await;
+    g.governance.budget_tracker.total_spent(did).value()
+}
+
+/// (a) A paid stream decrements the budget by exactly the billed amount at
+/// close — the E1 regression guard (the pre-remediation code never debited,
+/// so `total_spent` stayed 0).
+#[tokio::test]
+async fn outlet_stream_paid_decrements_budget_by_billed_at_close() {
+    let (manager, _handle) = setup_active_context().await;
+    let invoker: DID = "did:key:creator".into();
+    grant_stream_budget(&manager, "test-ctx", &invoker, 1_000).await;
+
+    // Reserve the open-time hold: cost_per_chunk = 10, estimate = 5 → hold 50.
+    let reservation = manager
+        .outlet_stream_reserve_escrow(
+            "test-ctx",
+            &invoker,
+            scp_protocol::economy::types::Amount::new(10),
+            5,
+            None,
+        )
+        .await
+        .expect("reserve must succeed within budget");
+    assert_eq!(reservation.reserved.value(), 50, "hold == cost × estimate");
+    // The hold is debited NOW.
+    assert_eq!(stream_total_spent(&manager, "test-ctx", &invoker).await, 50);
+
+    // Close: billed 3 chunks (30), refund 20.
+    manager
+        .outlet_stream_settle(
+            "test-ctx",
+            &invoker,
+            scp_protocol::economy::types::Amount::new(30),
+            scp_protocol::economy::types::Amount::new(20),
+            3,
+            *uuid::Uuid::now_v7().as_bytes(),
+            &scp_protocol::context::outlets::OutletId::from("outlet-x"),
+        )
+        .await
+        .expect("settle must succeed");
+
+    // Net spent == billed (50 debited − 20 refunded == 30).
+    assert_eq!(
+        stream_total_spent(&manager, "test-ctx", &invoker).await,
+        30,
+        "net spent must equal the billed amount after refund"
+    );
+}
+
+/// (b) Refund of unspent escrow: after a partial-consumption close the budget
+/// reflects only the billed portion; a terminal error before any Data chunk
+/// refunds the full hold (net spent 0).
+#[tokio::test]
+async fn outlet_stream_refunds_unspent_escrow() {
+    let (manager, _handle) = setup_active_context().await;
+    let invoker: DID = "did:key:creator".into();
+    grant_stream_budget(&manager, "test-ctx", &invoker, 1_000).await;
+
+    // Stream 1: hold B-worth (cost 4 × estimate 10 = 40), bill 6 chunks (24),
+    // refund 16 → net spent 24.
+    let r1 = manager
+        .outlet_stream_reserve_escrow(
+            "test-ctx",
+            &invoker,
+            scp_protocol::economy::types::Amount::new(4),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r1.reserved.value(), 40);
+    assert_eq!(stream_total_spent(&manager, "test-ctx", &invoker).await, 40);
+    manager
+        .outlet_stream_settle(
+            "test-ctx",
+            &invoker,
+            scp_protocol::economy::types::Amount::new(24),
+            scp_protocol::economy::types::Amount::new(16),
+            6,
+            *uuid::Uuid::now_v7().as_bytes(),
+            &scp_protocol::context::outlets::OutletId::from("outlet-y"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stream_total_spent(&manager, "test-ctx", &invoker).await,
+        24,
+        "after partial-consumption close, spent == billed (B − refund)"
+    );
+
+    // Stream 2: terminal error before any Data chunk → full refund. Hold 40,
+    // billed 0, refund 40 → net spent unchanged (still 24 from stream 1).
+    let r2 = manager
+        .outlet_stream_reserve_escrow(
+            "test-ctx",
+            &invoker,
+            scp_protocol::economy::types::Amount::new(4),
+            10,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(r2.reserved.value(), 40);
+    assert_eq!(stream_total_spent(&manager, "test-ctx", &invoker).await, 64);
+    manager
+        .outlet_stream_settle(
+            "test-ctx",
+            &invoker,
+            scp_protocol::economy::types::Amount::new(0),
+            scp_protocol::economy::types::Amount::new(40),
+            0,
+            *uuid::Uuid::now_v7().as_bytes(),
+            &scp_protocol::context::outlets::OutletId::from("outlet-y"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        stream_total_spent(&manager, "test-ctx", &invoker).await,
+        24,
+        "terminal-error-before-Data refunds the full hold (net spent unchanged)"
+    );
+}
+
+/// (c) Two concurrent opens cannot over-commit: with `2R > B ≥ R`, exactly one
+/// reserve succeeds and the other is rejected with `EscrowInsufficientFunds`;
+/// `total_spent` never exceeds `B`.
+#[tokio::test]
+async fn outlet_stream_concurrent_opens_cannot_over_commit() {
+    let (manager, _handle) = setup_active_context().await;
+    let invoker: DID = "did:key:creator".into();
+    // B = 60; each reserve R = cost 10 × estimate 5 = 50. 2R = 100 > 60 ≥ 50.
+    grant_stream_budget(&manager, "test-ctx", &invoker, 60).await;
+
+    let m = std::sync::Arc::new(manager);
+    let inv = invoker.clone();
+    let m1 = std::sync::Arc::clone(&m);
+    let inv1 = inv.clone();
+    let m2 = std::sync::Arc::clone(&m);
+    let inv2 = inv.clone();
+    let t1 = tokio::spawn(async move {
+        m1.outlet_stream_reserve_escrow(
+            "test-ctx",
+            &inv1,
+            scp_protocol::economy::types::Amount::new(10),
+            5,
+            None,
+        )
+        .await
+    });
+    let t2 = tokio::spawn(async move {
+        m2.outlet_stream_reserve_escrow(
+            "test-ctx",
+            &inv2,
+            scp_protocol::economy::types::Amount::new(10),
+            5,
+            None,
+        )
+        .await
+    });
+    let (r1, r2) = (t1.await.unwrap(), t2.await.unwrap());
+
+    let successes = usize::from(r1.is_ok()) + usize::from(r2.is_ok());
+    let insufficient = [&r1, &r2]
+        .iter()
+        .filter(|r| matches!(r, Err(ContextError::EscrowInsufficientFunds(_))))
+        .count();
+    assert_eq!(successes, 1, "exactly one concurrent reserve may succeed");
+    assert_eq!(insufficient, 1, "the loser must be EscrowInsufficientFunds");
+    assert!(
+        stream_total_spent(&m, "test-ctx", &invoker).await <= 60,
+        "total_spent must never exceed the budget B"
+    );
+}
+
+/// (d) `max_calls` bounds the estimate: a declared estimate above the caveat
+/// ceiling is rejected by `enforce_estimated_chunk_count_bound`, and the
+/// reserve over the coerced estimate never holds more than `cost × max_calls`.
+#[tokio::test]
+async fn outlet_stream_max_calls_bounds_estimate_and_escrow() {
+    use crate::context::outlets::stream::{
+        OpenError, coerce_estimated_chunk_count, enforce_estimated_chunk_count_bound,
+    };
+    let mut caveats = scp_protocol::trust::caveats::InvocationCaveats::empty();
+    caveats.max_calls = Some(4);
+
+    // estimate 5 > max_calls 4 → EstimateExceedsBound (credit_window large).
+    assert_eq!(
+        enforce_estimated_chunk_count_bound(5, 32, &caveats),
+        Err(OpenError::EstimateExceedsBound),
+        "estimate above max_calls must be rejected"
+    );
+    // estimate 4 ≤ min(credit_window, max_calls) → accepted.
+    assert!(enforce_estimated_chunk_count_bound(4, 32, &caveats).is_ok());
+
+    // The coerced estimate (no declared → falls back to max_calls) bounds the
+    // hold to cost × max_calls.
+    let (manager, _handle) = setup_active_context().await;
+    let invoker: DID = "did:key:creator".into();
+    grant_stream_budget(&manager, "test-ctx", &invoker, 1_000).await;
+    let coerced = coerce_estimated_chunk_count(None, &caveats);
+    assert_eq!(coerced, 4, "no declared estimate coerces to max_calls");
+    let reservation = manager
+        .outlet_stream_reserve_escrow(
+            "test-ctx",
+            &invoker,
+            scp_protocol::economy::types::Amount::new(7),
+            coerced,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reservation.reserved.value(),
+        28,
+        "escrow hold ≤ cost × max_calls (7 × 4)"
+    );
+}
+
+/// (e) The `caveats_binding` is computed over the REAL effective caveat set:
+/// the binding over a non-empty set differs from the binding over an empty
+/// set, so a stream that narrowed to `{max_calls: 4}` cannot reuse a binding
+/// computed over `{}`. This is the E3 invariant the runtime's open-time
+/// recompute enforces.
+#[test]
+fn caveats_binding_commits_to_real_effective_set() {
+    use scp_protocol::context::outlets::stream::compute_caveats_binding;
+    let request_id = [7u8; 16];
+    let ucan_cid = b"bafy-test-cid";
+    let invoker_did = "did:key:invoker";
+    let estimate = 4u32;
+
+    let empty = scp_protocol::trust::caveats::InvocationCaveats::empty();
+    let mut narrowed = scp_protocol::trust::caveats::InvocationCaveats::empty();
+    narrowed.max_calls = Some(4);
+
+    let empty_jcs = empty.to_canonical_json_bytes().unwrap();
+    let narrowed_jcs = narrowed.to_canonical_json_bytes().unwrap();
+
+    let binding_empty =
+        compute_caveats_binding(ucan_cid, &request_id, invoker_did, estimate, &empty_jcs);
+    let binding_narrowed =
+        compute_caveats_binding(ucan_cid, &request_id, invoker_did, estimate, &narrowed_jcs);
+
+    assert_ne!(
+        binding_empty, binding_narrowed,
+        "binding over the real effective caveat set must differ from the empty-set binding"
+    );
+    // Determinism: recomputing over the same set yields the same binding (the
+    // runtime's open-time recompute must match the SDK's value byte-for-byte).
+    let binding_narrowed_again =
+        compute_caveats_binding(ucan_cid, &request_id, invoker_did, estimate, &narrowed_jcs);
+    assert_eq!(binding_narrowed, binding_narrowed_again);
+}

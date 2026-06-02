@@ -351,6 +351,8 @@ fn build_open_stream_params(invoker_signing: &SigningKey) -> OpenStreamParams {
         origin_invoker_did: TEST_INVOKER_DID.to_owned(),
         cost_per_chunk: scp_protocol::economy::types::Amount::new(0),
         available_balance: scp_protocol::economy::types::Amount::new(u64::MAX),
+        // E2: zero-cost stream — the manager debits nothing.
+        reserved_escrow: scp_protocol::economy::types::Amount::new(0),
         // Estimate must satisfy §5.4.5 estimate-bound predicate
         // (estimate <= min(credit_window, caveats.max_calls)). The
         // empty caveats imply no max_calls cap, so estimate <=
@@ -432,6 +434,7 @@ async fn signed_credit_grant_verifies_through_apply_credit_grant() {
             &invoker_typed,
             Some(60_000),
             executor,
+            None,
             None,
             None,
             None,
@@ -528,6 +531,7 @@ async fn tampered_credit_grant_rejected_with_signature_invalid() {
             None,
             None,
             None,
+            None,
             build_open_stream_params(&invoker_signing),
             admission,
         )
@@ -598,6 +602,7 @@ async fn credit_grant_with_wrong_caveats_binding_rejected() {
             &invoker_typed,
             Some(60_000),
             executor,
+            None,
             None,
             None,
             None,

@@ -168,6 +168,94 @@ impl scp_runtime::context::outlets::signer::StreamSigner for CustodyStreamSigner
 }
 
 // ---------------------------------------------------------------------------
+// E1/E2 economic settlement + escrow-refund sinks
+// ---------------------------------------------------------------------------
+
+/// Production [`scp_runtime::context::outlets::invoke::StreamSettlementSink`]
+/// for the `NAPI` bridge (E1). The dispatch pump fires `settle` from its
+/// spawned tokio task, so the impl `Handle::spawn`s the async
+/// `ContextManager::outlet_stream_settle` (it MUST NOT block).
+struct NapiStreamSettlementSink {
+    manager: Arc<scp_core::context::ContextManager>,
+    handle: tokio::runtime::Handle,
+}
+
+impl scp_runtime::context::outlets::invoke::StreamSettlementSink for NapiStreamSettlementSink {
+    fn settle(&self, settlement: scp_runtime::context::outlets::invoke::StreamSettlement) {
+        let manager = Arc::clone(&self.manager);
+        self.handle.spawn(async move {
+            if let Err(e) = manager
+                .outlet_stream_settle(
+                    &settlement.context_id,
+                    &settlement.invoker_did,
+                    settlement.billed_amount,
+                    settlement.refund_amount,
+                    settlement.billed_count,
+                    settlement.request_id,
+                    &settlement.outlet_id,
+                )
+                .await
+            {
+                tracing::warn!(
+                    context_id = %settlement.context_id,
+                    "outlet stream settlement failed: {e}"
+                );
+            }
+        });
+    }
+}
+
+/// Production [`scp_runtime::context::outlets::dispatch::StreamEscrowRefundSink`]
+/// for the `NAPI` bridge (E2). Refunds a debited open-time hold when the
+/// open-path ticket drops unconsumed.
+struct NapiStreamEscrowRefundSink {
+    manager: Arc<scp_core::context::ContextManager>,
+    handle: tokio::runtime::Handle,
+}
+
+impl scp_runtime::context::outlets::dispatch::StreamEscrowRefundSink
+    for NapiStreamEscrowRefundSink
+{
+    fn refund(
+        &self,
+        context_id: &str,
+        member_did: &scp_primitives::DID,
+        amount: scp_protocol::economy::types::Amount,
+    ) {
+        let manager = Arc::clone(&self.manager);
+        let context_id = context_id.to_owned();
+        let member_did = member_did.clone();
+        self.handle.spawn(async move {
+            manager
+                .outlet_stream_reverse_spend(&context_id, &member_did, amount)
+                .await;
+        });
+    }
+}
+
+/// Builds the production settlement sink (E1). Called from the async open
+/// path where the manager is already resolved and a tokio runtime context
+/// is active (so [`tokio::runtime::Handle::current`] is valid).
+fn bridge_stream_settlement_sink()
+-> napi::Result<Arc<dyn scp_runtime::context::outlets::invoke::StreamSettlementSink>> {
+    let manager = Arc::clone(crate::runtime::context_manager()?);
+    Ok(Arc::new(NapiStreamSettlementSink {
+        manager,
+        handle: tokio::runtime::Handle::current(),
+    }))
+}
+
+/// Builds the production escrow-refund sink (E2).
+fn bridge_stream_escrow_refund_sink()
+-> napi::Result<Arc<dyn scp_runtime::context::outlets::dispatch::StreamEscrowRefundSink>> {
+    let manager = Arc::clone(crate::runtime::context_manager()?);
+    Ok(Arc::new(NapiStreamEscrowRefundSink {
+        manager,
+        handle: tokio::runtime::Handle::current(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Stream registry
 // ---------------------------------------------------------------------------
 
@@ -238,6 +326,13 @@ pub(crate) struct StreamRegistryEntry {
     /// escrow top-up re-derives the available balance as
     /// `min(MemberBudgetTracker::remaining, max_per_action)`.
     pub spending_max_per_action: Option<scp_protocol::economy::types::Amount>,
+    /// The outlet's per-Data-chunk cost pinned at open (E2). `Amount(0)`
+    /// for Query / zero-cost outlets. Each `outlet_stream_grant_credit`
+    /// reserves (DEBITS) a per-grant top-up of `cost_per_chunk × grant`
+    /// against the invoker's budget via
+    /// [`scp_core::context::ContextManager::outlet_stream_reserve_grant`]
+    /// before applying the grant.
+    pub cost_per_chunk: scp_protocol::economy::types::Amount,
 }
 
 impl Drop for StreamRegistryEntry {
@@ -794,23 +889,7 @@ pub async fn context_outlet_invoke_stream(
             ))
         }
     };
-    // `available_balance` = member's remaining budget (re-read live) ∧ the
-    // spending UCAN's per-action ceiling. The runtime is the authoritative
-    // AND-composition locus (mirrors `invoke_outlet_with_economy`).
     let invoker_did_typed_for_balance: scp_primitives::DID = identity_did.clone().into();
-    let available_balance = crate::runtime::context_manager()?
-        .outlet_stream_member_balance(
-            &context_id,
-            &invoker_did_typed_for_balance,
-            spending_max_per_action,
-        )
-        .await
-        .map_err(|e| {
-            napi::Error::from(ScpNapiError::Context {
-                message: format!("stream balance lookup failed: {e}"),
-                code: codes::CTX_2000.to_owned(),
-            })
-        })?;
 
     let operator_signer: Arc<dyn scp_runtime::context::outlets::signer::StreamSigner> =
         Arc::new(CustodyStreamSigner::new(
@@ -848,6 +927,51 @@ pub async fn context_outlet_invoke_stream(
         BridgeStreamRevocationChecker::for_context(&context_id).map_err(napi::Error::from)?,
     );
 
+    // E3 — the leaf UCAN's `nb` (post-narrowing) IS the effective caveat
+    // set the runtime must bind the stream to. The previous code threaded
+    // `InvocationCaveats::empty()`, so the binding committed to nothing and
+    // `max_calls` never bounded the estimate. Extract the real set here.
+    let effective_caveats = ucan_token_parsed
+        .payload
+        .nb
+        .clone()
+        .unwrap_or_else(InvocationCaveats::empty);
+
+    // E2 — reserve (DEBIT) the §5.4.5 open-time escrow HOLD atomically
+    // against the invoker's MemberBudgetTracker, REPLACING the prior
+    // read-only balance query. Mirror the runtime's estimate coercion over
+    // the real effective caveats so the debited hold equals
+    // `cost_per_chunk × estimated`.
+    let coerced_estimate = scp_runtime::context::outlets::stream::coerce_estimated_chunk_count(
+        estimated_chunk_count,
+        &effective_caveats,
+    );
+    let escrow_reservation = crate::runtime::context_manager()?
+        .outlet_stream_reserve_escrow(
+            &context_id,
+            &invoker_did_typed_for_balance,
+            cost_per_chunk,
+            coerced_estimate,
+            spending_max_per_action,
+        )
+        .await
+        .map_err(|e| {
+            napi::Error::from(ScpNapiError::Context {
+                message: format!("stream escrow reservation failed: {e}"),
+                code: codes::CTX_2000.to_owned(),
+            })
+        })?;
+    let reserved_escrow = escrow_reservation.reserved;
+    // E2 refund guard: the hold is debited NOW; an early-return before the
+    // pump spawns drops this ticket → refund via Handle::spawn of the async
+    // reverse_spend. Consumed only on the Ok open path below.
+    let escrow_ticket = scp_runtime::context::outlets::dispatch::StreamEscrowTicket::new(
+        bridge_stream_escrow_refund_sink()?,
+        context_id.clone(),
+        invoker_did_typed_for_balance.clone(),
+        reserved_escrow,
+    );
+
     let params = build_open_stream_params(
         context_id.clone(),
         outlet_id.clone(),
@@ -859,7 +983,8 @@ pub async fn context_outlet_invoke_stream(
         invoker_verifying_key,
         operator_signer,
         cost_per_chunk,
-        available_balance,
+        reserved_escrow,
+        effective_caveats,
         ucan_cid_for_binding,
         request_id,
         revocation_checker,
@@ -881,7 +1006,15 @@ pub async fn context_outlet_invoke_stream(
     let outlet_id_typed = scp_core::context::outlets::OutletId::from(outlet_id.as_str());
     let manager = crate::runtime::context_manager()?;
 
-    let mut runtime_handle = manager
+    // E1 — close-time settlement sink (refund unspent escrow + §19.15.5
+    // PaymentReceipt). Fired once by the dispatch pump at terminal chunk;
+    // it `Handle::spawn`s the async `outlet_stream_settle` (it runs on the
+    // pump task and MUST NOT block).
+    let settlement_sink: Option<
+        Arc<dyn scp_runtime::context::outlets::invoke::StreamSettlementSink>,
+    > = Some(bridge_stream_settlement_sink()?);
+
+    let open_result = manager
         .open_outlet_stream(
             &context_id,
             &registry_snapshot,
@@ -894,20 +1027,33 @@ pub async fn context_outlet_invoke_stream(
             None,
             None,
             None,
+            settlement_sink,
             params,
             admission,
         )
-        .await
-        .map_err(|rejection| {
-            napi::Error::from(ScpNapiError::Context {
+        .await;
+    let mut runtime_handle = match open_result {
+        Ok(handle) => {
+            // E2: pump spawned Ok — the close-time settlement now owns the
+            // refund of the unspent hold; consume the open-path ticket.
+            escrow_ticket.consume();
+            handle
+        }
+        Err(rejection) => {
+            // E2: any open-time rejection drops `escrow_ticket` → refund of
+            // the debited hold (independent of the runtime's admission
+            // rollback; both roll back on the same path).
+            drop(escrow_ticket);
+            return Err(napi::Error::from(ScpNapiError::Context {
                 message: format!(
                     "stream open rejected: {} ({})",
                     rejection.slug(),
                     rejection.error_code()
                 ),
                 code: rejection.error_code().to_owned(),
-            })
-        })?;
+            }));
+        }
+    };
 
     let receiver = runtime_handle.receiver().ok_or_else(|| {
         napi::Error::from(ScpNapiError::Context {
@@ -931,6 +1077,7 @@ pub async fn context_outlet_invoke_stream(
         invoker_did: identity_did.clone(),
         request_id,
         spending_max_per_action,
+        cost_per_chunk,
     })?;
 
     Ok(NapiOutletInvocationStream {
@@ -963,7 +1110,8 @@ fn build_open_stream_params(
     invoker_pk: ed25519_dalek::VerifyingKey,
     operator_signer: std::sync::Arc<dyn scp_runtime::context::outlets::signer::StreamSigner>,
     cost_per_chunk: scp_protocol::economy::types::Amount,
-    available_balance: scp_protocol::economy::types::Amount,
+    reserved_escrow: scp_protocol::economy::types::Amount,
+    effective_caveats: InvocationCaveats,
     ucan_cid: String,
     request_id: scp_protocol::context::outlets::stream::RequestId,
     revocation_checker: std::sync::Arc<
@@ -987,10 +1135,14 @@ fn build_open_stream_params(
         invoker_did: invoker_did.clone(),
         origin_invoker_did: invoker_did,
         cost_per_chunk,
-        available_balance,
+        // E2: legacy/test field carries the manager-debited hold (not a
+        // sentinel); the production gate is `reserved_escrow`.
+        available_balance: reserved_escrow,
+        reserved_escrow,
         declared_estimated_chunk_count: estimated_chunk_count,
         credit_window: credit_window_value,
-        caveats: InvocationCaveats::empty(),
+        // E3: the REAL post-narrowing effective caveat set (leaf UCAN `nb`).
+        caveats: effective_caveats,
         invoker_pk,
         // Native FFI bridges: invoker == operator in the local
         // single-context streaming path. See PyO3 bridge for full
@@ -1089,37 +1241,51 @@ pub async fn outlet_stream_grant_credit(
 
     let credit = sign_credit_grant(&entry, grant, next_seq).await?;
 
-    // §5.4.5 credit-grant escrow top-up (N3): re-read the invoker's live
-    // budget (∧ the pinned spending-UCAN `max_per_action`) at grant time so
-    // the per-grant escrow top-up of `cost_per_chunk × grant` gates against
-    // funds the member holds RIGHT NOW. For zero-cost / Query streams the
-    // runtime computes a zero top-up regardless, so this balance is not
-    // consulted.
+    // §5.4.5 credit-grant escrow top-up (E2): reserve (DEBIT) the per-grant
+    // top-up of `cost_per_chunk × grant` against the invoker's live budget
+    // (∧ the pinned spending-UCAN `max_per_action`) BEFORE applying the
+    // grant. REPLACES the prior read-only balance query. The manager gates
+    // overflow / insufficient-funds atomically under the context lock. For
+    // zero-cost / Query streams it debits nothing and returns `Amount(0)`.
     let invoker_did_typed: scp_primitives::DID = entry.invoker_did.clone().into();
-    let available_balance = crate::runtime::context_manager()?
-        .outlet_stream_member_balance(
+    let manager = crate::runtime::context_manager()?;
+    let reserved_top_up = manager
+        .outlet_stream_reserve_grant(
             &entry.context_id,
             &invoker_did_typed,
+            entry.cost_per_chunk,
+            grant,
             entry.spending_max_per_action,
         )
         .await
         .map_err(|e| {
             napi::Error::from(ScpNapiError::Context {
-                message: format!("stream balance lookup failed: {e}"),
+                message: format!("credit grant escrow reservation failed: {e}"),
                 code: codes::CTX_2000.to_owned(),
             })
         })?;
 
-    let new_total = entry
-        .handle
-        .apply_credit_grant(&credit, available_balance)
-        .map_err(|grant_err| {
-            napi::Error::from(ScpNapiError::Context {
+    // Apply with the already-debited top-up. On runtime rejection
+    // (signature / replay) AFTER a successful reserve, reverse the debit so
+    // the §5.4.5 atomicity invariant holds.
+    match entry.handle.apply_credit_grant(&credit, reserved_top_up) {
+        Ok(new_total) => Ok(new_total),
+        Err(grant_err) => {
+            if reserved_top_up.value() > 0 {
+                manager
+                    .outlet_stream_reverse_spend(
+                        &entry.context_id,
+                        &invoker_did_typed,
+                        reserved_top_up,
+                    )
+                    .await;
+            }
+            Err(napi::Error::from(ScpNapiError::Context {
                 message: format!("credit grant rejected: {grant_err:?}"),
                 code: codes::CTX_2000.to_owned(),
-            })
-        })?;
-    Ok(new_total)
+            }))
+        }
+    }
 }
 
 /// Constructs and signs an [`OutletStreamCredit`] for `entry`.

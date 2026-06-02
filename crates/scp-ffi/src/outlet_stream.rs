@@ -49,6 +49,95 @@ use crate::error::ScpPyError;
 use crate::validate;
 
 // ---------------------------------------------------------------------------
+// E1/E2 economic settlement + escrow-refund sinks
+// ---------------------------------------------------------------------------
+
+/// Production [`scp_runtime::context::outlets::invoke::StreamSettlementSink`]
+/// for the `PyO3` bridge (E1). Holds the shared `ContextManager` and a tokio
+/// runtime [`Handle`](tokio::runtime::Handle).
+///
+/// The dispatch pump fires `settle` from inside its spawned tokio task, so
+/// the impl MUST NOT `block_on` — it `Handle::spawn`s the async
+/// `ContextManager::outlet_stream_settle` (refund unspent escrow + issue the
+/// §19.15.5 `PaymentReceipt`) onto the runtime and returns immediately.
+struct PyStreamSettlementSink {
+    manager: Arc<scp_core::context::ContextManager>,
+    handle: tokio::runtime::Handle,
+}
+
+impl scp_runtime::context::outlets::invoke::StreamSettlementSink for PyStreamSettlementSink {
+    fn settle(&self, settlement: scp_runtime::context::outlets::invoke::StreamSettlement) {
+        let manager = Arc::clone(&self.manager);
+        self.handle.spawn(async move {
+            if let Err(e) = manager
+                .outlet_stream_settle(
+                    &settlement.context_id,
+                    &settlement.invoker_did,
+                    settlement.billed_amount,
+                    settlement.refund_amount,
+                    settlement.billed_count,
+                    settlement.request_id,
+                    &settlement.outlet_id,
+                )
+                .await
+            {
+                tracing::warn!(
+                    context_id = %settlement.context_id,
+                    "outlet stream settlement failed: {e}"
+                );
+            }
+        });
+    }
+}
+
+/// Production [`scp_runtime::context::outlets::dispatch::StreamEscrowRefundSink`]
+/// for the `PyO3` bridge (E2). Refunds a debited open-time escrow hold when the
+/// open-path [`StreamEscrowTicket`](scp_runtime::context::outlets::dispatch::StreamEscrowTicket)
+/// drops unconsumed (the pump never spawned). Fire-and-forget
+/// `Handle::spawn` of the async `outlet_stream_reverse_spend`.
+struct PyStreamEscrowRefundSink {
+    manager: Arc<scp_core::context::ContextManager>,
+    handle: tokio::runtime::Handle,
+}
+
+impl scp_runtime::context::outlets::dispatch::StreamEscrowRefundSink for PyStreamEscrowRefundSink {
+    fn refund(
+        &self,
+        context_id: &str,
+        member_did: &scp_primitives::DID,
+        amount: scp_protocol::economy::types::Amount,
+    ) {
+        let manager = Arc::clone(&self.manager);
+        let context_id = context_id.to_owned();
+        let member_did = member_did.clone();
+        self.handle.spawn(async move {
+            manager
+                .outlet_stream_reverse_spend(&context_id, &member_did, amount)
+                .await;
+        });
+    }
+}
+
+/// Builds the production settlement sink (E1). The caller passes the
+/// already-resolved manager + runtime handle (no fallible global lookup —
+/// the open path has both in scope).
+fn bridge_stream_settlement_sink(
+    manager: Arc<scp_core::context::ContextManager>,
+    handle: tokio::runtime::Handle,
+) -> Arc<dyn scp_runtime::context::outlets::invoke::StreamSettlementSink> {
+    Arc::new(PyStreamSettlementSink { manager, handle })
+}
+
+/// Builds the production escrow-refund sink (E2) for the open-path
+/// [`StreamEscrowTicket`](scp_runtime::context::outlets::dispatch::StreamEscrowTicket).
+fn bridge_stream_escrow_refund_sink(
+    manager: Arc<scp_core::context::ContextManager>,
+    handle: tokio::runtime::Handle,
+) -> Arc<dyn scp_runtime::context::outlets::dispatch::StreamEscrowRefundSink> {
+    Arc::new(PyStreamEscrowRefundSink { manager, handle })
+}
+
+// ---------------------------------------------------------------------------
 // Per-stream revocation checker
 // ---------------------------------------------------------------------------
 
@@ -266,6 +355,13 @@ pub(crate) struct StreamRegistryEntry {
     /// `min(MemberBudgetTracker::remaining, max_per_action)` so a grant
     /// can never escrow more than the spending capability authorizes.
     pub spending_max_per_action: Option<scp_protocol::economy::types::Amount>,
+    /// The outlet's per-Data-chunk cost pinned at open (E2). `Amount(0)`
+    /// for Query / zero-cost outlets. Each `outlet_stream_grant_credit`
+    /// reserves (DEBITS) a per-grant top-up of `cost_per_chunk × grant`
+    /// against the invoker's budget via
+    /// [`scp_core::context::ContextManager::outlet_stream_reserve_grant`]
+    /// before applying the grant, mirroring the open-time hold.
+    pub cost_per_chunk: scp_protocol::economy::types::Amount,
 }
 
 impl Drop for StreamRegistryEntry {
@@ -674,29 +770,6 @@ pub fn py_outlet_invoke_stream(
         }
     };
     let invoker_did_typed_for_balance: scp_primitives::DID = identity_did_owned.clone().into();
-    let manager_for_balance = crate::runtime::context_manager()?;
-    let rt_for_balance = crate::runtime()?;
-    // `available_balance` = member's remaining budget (re-read live) ∧ the
-    // spending UCAN's per-action ceiling. The runtime is the authoritative
-    // AND-composition locus (mirrors `invoke_outlet_with_economy`).
-    let available_balance = rt_for_balance
-        .block_on(async {
-            manager_for_balance
-                .outlet_stream_member_balance(
-                    &ctx_id_owned,
-                    &invoker_did_typed_for_balance,
-                    spending_max_per_action,
-                )
-                .await
-        })
-        .map_err(|e| ScpPyError::context(format!("stream balance lookup failed: {e}")))?;
-
-    let operator_signer: Arc<dyn scp_runtime::context::outlets::signer::StreamSigner> =
-        Arc::new(CustodyStreamSigner::new(
-            Arc::clone(&custody),
-            invoker_key_handle,
-            invoker_verifying_key,
-        ));
 
     // §5.4.5 HIGH-wave-2 Fix A — supply the runtime with the inputs it
     // needs to recompute the `caveats_binding`. The bridge already
@@ -711,6 +784,66 @@ pub fn py_outlet_invoke_stream(
     let ucan_token_parsed = scp_protocol::crypto::ucan::validate::parse_ucan(ucan_token)
         .map_err(|_e| ScpPyError::ucan("failed to parse ucan_token for cid"))?;
     let ucan_cid_for_binding = scp_runtime::crypto::ucan::mint::compute_cid(&ucan_token_parsed);
+
+    // E3 — the leaf UCAN's `nb` (post-narrowing) IS the effective caveat
+    // set the runtime must bind the stream to. The previous code threaded
+    // `InvocationCaveats::empty()`, so `verify_caveats_binding_at_open`
+    // recomputed over an empty set (binding commits to nothing) and
+    // `coerce_estimated_chunk_count` never saw the real `max_calls` ceiling.
+    // Extract the real set here; the SDK supplies the `caveats_binding`
+    // computed over the SAME effective set (both RFC8785 JCS omit-none).
+    let effective_caveats = ucan_token_parsed
+        .payload
+        .nb
+        .unwrap_or_else(InvocationCaveats::empty);
+
+    // E2 — reserve (DEBIT) the §5.4.5 open-time escrow HOLD atomically
+    // against the invoker's MemberBudgetTracker. This REPLACES the prior
+    // read-only `outlet_stream_member_balance` query that let concurrent
+    // opens over-commit the budget. The estimate is coerced + bounded by
+    // the runtime at open; we mirror the coercion here (over the real
+    // effective caveats) so the debited hold equals `cost_per_chunk ×
+    // estimated` — the same value `reserve_escrow` computes dispatch-side.
+    let coerced_estimate = scp_runtime::context::outlets::stream::coerce_estimated_chunk_count(
+        estimated_chunk_count,
+        &effective_caveats,
+    );
+    let manager_for_balance = crate::runtime::context_manager()?;
+    let rt_for_balance = crate::runtime()?;
+    let escrow_reservation = rt_for_balance
+        .block_on(async {
+            manager_for_balance
+                .outlet_stream_reserve_escrow(
+                    &ctx_id_owned,
+                    &invoker_did_typed_for_balance,
+                    cost_per_chunk,
+                    coerced_estimate,
+                    spending_max_per_action,
+                )
+                .await
+        })
+        .map_err(|e| ScpPyError::context(format!("stream escrow reservation failed: {e}")))?;
+    let reserved_escrow = escrow_reservation.reserved;
+    // E2 refund guard: the hold is debited NOW; if any step between here
+    // and a successful pump spawn early-returns, this ticket's Drop refunds
+    // the hold via the bridge's StreamEscrowRefundSink (Handle::spawn of
+    // the async reverse_spend). Consumed only on the Ok path below.
+    let escrow_ticket = scp_runtime::context::outlets::dispatch::StreamEscrowTicket::new(
+        bridge_stream_escrow_refund_sink(
+            Arc::clone(manager_for_balance),
+            rt_for_balance.handle().clone(),
+        ),
+        ctx_id_owned.clone(),
+        invoker_did_typed_for_balance,
+        reserved_escrow,
+    );
+
+    let operator_signer: Arc<dyn scp_runtime::context::outlets::signer::StreamSigner> =
+        Arc::new(CustodyStreamSigner::new(
+            Arc::clone(&custody),
+            invoker_key_handle,
+            invoker_verifying_key,
+        ));
     let request_id: scp_protocol::context::outlets::stream::RequestId =
         *uuid::Uuid::now_v7().as_bytes();
     // §5.4.5 HIGH-wave-2 Fix B — runtime-authoritative revocation
@@ -733,7 +866,8 @@ pub fn py_outlet_invoke_stream(
         invoker_verifying_key,
         operator_signer,
         cost_per_chunk,
-        available_balance,
+        reserved_escrow,
+        effective_caveats,
         ucan_cid_for_binding,
         request_id,
         revocation_checker,
@@ -752,33 +886,60 @@ pub fn py_outlet_invoke_stream(
     let manager = crate::runtime::context_manager()?;
     let rt = crate::runtime()?;
 
-    let mut handle = rt
-        .block_on(async {
-            manager
-                .open_outlet_stream(
-                    &ctx_id_owned,
-                    &registry_snapshot,
-                    &role_state,
-                    &outlet_id_typed,
-                    input_json,
-                    &invoker_did_typed,
-                    None,
-                    executor,
-                    None,
-                    None,
-                    None,
-                    params,
-                    admission,
-                )
-                .await
-        })
-        .map_err(|rejection| {
-            ScpPyError::context(format!(
+    // E1 — the close-time settlement sink: refunds unspent escrow, issues
+    // the §19.15.5 PaymentReceipt, and is fired ONCE by the dispatch pump at
+    // terminal chunk. Production impl holds the ContextManager + a tokio
+    // Handle and `Handle::spawn`s `outlet_stream_settle` (it runs on the
+    // pump task and MUST NOT block_on).
+    let settlement_sink: Option<
+        Arc<dyn scp_runtime::context::outlets::invoke::StreamSettlementSink>,
+    > = Some(bridge_stream_settlement_sink(
+        Arc::clone(manager),
+        rt.handle().clone(),
+    ));
+
+    let open_result = rt.block_on(async {
+        manager
+            .open_outlet_stream(
+                &ctx_id_owned,
+                &registry_snapshot,
+                &role_state,
+                &outlet_id_typed,
+                input_json,
+                &invoker_did_typed,
+                None,
+                executor,
+                None,
+                None,
+                None,
+                settlement_sink,
+                params,
+                admission,
+            )
+            .await
+    });
+    let mut handle = match open_result {
+        Ok(handle) => {
+            // E2: the pump spawned Ok — the close-time settlement now owns
+            // the refund of the unspent hold, so the open-path guard must
+            // NOT also refund. Consume the ticket.
+            escrow_ticket.consume();
+            handle
+        }
+        Err(rejection) => {
+            // E2: any open-time rejection (admission / estimate / escrow /
+            // binding / pump-cap) drops `escrow_ticket` here → refund of the
+            // debited hold. INDEPENDENT of the runtime's own admission
+            // rollback (both roll back on the same path).
+            drop(escrow_ticket);
+            return Err(ScpPyError::context(format!(
                 "stream open rejected: {} ({})",
                 rejection.slug(),
                 rejection.error_code()
             ))
-        })?;
+            .into());
+        }
+    };
 
     let receiver = handle
         .receiver()
@@ -799,6 +960,7 @@ pub fn py_outlet_invoke_stream(
         invoker_did: identity_did_owned,
         request_id,
         spending_max_per_action,
+        cost_per_chunk,
     })?;
 
     Ok(PyOutletInvocationStream {
@@ -854,7 +1016,8 @@ fn build_open_stream_params(
     invoker_pk: ed25519_dalek::VerifyingKey,
     operator_signer: std::sync::Arc<dyn scp_runtime::context::outlets::signer::StreamSigner>,
     cost_per_chunk: scp_protocol::economy::types::Amount,
-    available_balance: scp_protocol::economy::types::Amount,
+    reserved_escrow: scp_protocol::economy::types::Amount,
+    effective_caveats: InvocationCaveats,
     ucan_cid: String,
     request_id: scp_protocol::context::outlets::stream::RequestId,
     revocation_checker: std::sync::Arc<
@@ -878,10 +1041,19 @@ fn build_open_stream_params(
         invoker_did: invoker_did.clone(),
         origin_invoker_did: invoker_did,
         cost_per_chunk,
-        available_balance,
+        // E2: legacy/test field — the production gate is `reserved_escrow`
+        // (the manager-debited hold). Carry the debited amount here too so
+        // any code that still reads `available_balance` sees a consistent,
+        // non-sentinel value rather than a `u64::MAX` placeholder.
+        available_balance: reserved_escrow,
+        reserved_escrow,
         declared_estimated_chunk_count: estimated_chunk_count,
         credit_window: credit_window_value,
-        caveats: InvocationCaveats::empty(),
+        // E3: the REAL post-narrowing effective caveat set (leaf UCAN `nb`).
+        // The runtime recomputes `caveats_binding` over this set (matching
+        // the SDK's `compute_caveats_binding`) and reads `max_calls` from it
+        // to bound `estimated_chunk_count`.
+        caveats: effective_caveats,
         invoker_pk,
         // Native FFI bridges run the executor in-process — the
         // "operator" (chunk signer) and the "invoker" (UCAN holder)
@@ -990,40 +1162,59 @@ pub fn py_outlet_stream_grant_credit(
 
     let credit = sign_credit_grant(&entry, grant, next_seq)?;
 
-    // §5.4.5 credit-grant escrow top-up (N3): re-read the invoker's live
-    // budget (∧ the pinned spending-UCAN `max_per_action`) at grant time so
-    // the per-grant escrow top-up of `cost_per_chunk × grant` gates against
-    // funds the member actually holds RIGHT NOW. Re-reading (rather than
-    // caching the open-time balance) closes the window where budget granted
-    // then spent between open and this grant would otherwise escrow against
-    // stale funds. For zero-cost / Query streams the runtime computes a
-    // zero top-up regardless, so this balance is not consulted.
-    let available_balance = {
-        let manager = crate::runtime::context_manager()?;
-        let rt = crate::runtime()?;
-        let invoker_did_typed: scp_primitives::DID = entry.invoker_did.clone().into();
-        rt.block_on(async {
+    // §5.4.5 credit-grant escrow top-up (E2): reserve (DEBIT) the per-grant
+    // top-up of `cost_per_chunk × grant` against the invoker's live budget
+    // (∧ the pinned spending-UCAN `max_per_action`) BEFORE applying the
+    // grant. The manager re-reads the live budget under the context lock and
+    // gates overflow / insufficient-funds atomically — this REPLACES the
+    // prior read-only `outlet_stream_member_balance` query that let
+    // concurrent grants over-commit. For zero-cost / Query streams the
+    // manager debits nothing and returns `Amount(0)`.
+    let manager = crate::runtime::context_manager()?;
+    let rt = crate::runtime()?;
+    let invoker_did_typed: scp_primitives::DID = entry.invoker_did.clone().into();
+    let reserved_top_up = rt
+        .block_on(async {
             manager
-                .outlet_stream_member_balance(
+                .outlet_stream_reserve_grant(
                     &entry.context_id,
                     &invoker_did_typed,
+                    entry.cost_per_chunk,
+                    grant,
                     entry.spending_max_per_action,
                 )
                 .await
         })
-        .map_err(|e| ScpPyError::context(format!("stream balance lookup failed: {e}")))?
-    };
+        .map_err(|e| ScpPyError::context(format!("credit grant escrow reservation failed: {e}")))?;
 
-    let handle_guard = entry
-        .handle
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let new_total = handle_guard
-        .apply_credit_grant(&credit, available_balance)
-        .map_err(|grant_err| {
-            ScpPyError::context(format!("credit grant rejected: {grant_err:?}"))
-        })?;
-    Ok(new_total)
+    // Apply the grant with the already-debited top-up. If the runtime
+    // rejects the grant (signature / replay) AFTER a successful reserve,
+    // reverse the debit so the §5.4.5 atomicity invariant holds: a rejected
+    // grant authorizes no billable chunks and strands no escrow.
+    let apply_result = {
+        let handle_guard = entry
+            .handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        handle_guard.apply_credit_grant(&credit, reserved_top_up)
+    };
+    match apply_result {
+        Ok(new_total) => Ok(new_total),
+        Err(grant_err) => {
+            if reserved_top_up.value() > 0 {
+                rt.block_on(async {
+                    manager
+                        .outlet_stream_reverse_spend(
+                            &entry.context_id,
+                            &invoker_did_typed,
+                            reserved_top_up,
+                        )
+                        .await;
+                });
+            }
+            Err(ScpPyError::context(format!("credit grant rejected: {grant_err:?}")).into())
+        }
+    }
 }
 
 /// Constructs and signs an [`OutletStreamCredit`] for `entry`.

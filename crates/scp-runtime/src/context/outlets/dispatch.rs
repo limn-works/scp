@@ -82,18 +82,135 @@ use crate::context::ContextHandle;
 
 use super::invoke::{
     HandlerPanicSink, InvocationError, OutletExecutor, OutletInvokedEventSink,
-    QueryMisdeclarationSink, StreamGateOutcome, accrue_data_chunk_if_billable,
-    apply_stream_chunk_gate, invoke_outlet, release_stream_admission,
+    QueryMisdeclarationSink, StreamGateOutcome, StreamSettlement, StreamSettlementSink,
+    accrue_data_chunk_if_billable, apply_stream_chunk_gate, invoke_outlet,
+    release_stream_admission,
 };
 use super::stream::{
-    AdmissionCaps, AdmissionOutcome, CancelAckTracker, CreditTracker, EscrowError, GrantError,
-    OpenError, StreamAdmissionTracker, StreamEscrow, StreamIdentity, admission_outcome_to_slug,
+    AdmissionCaps, AdmissionOutcome, CancelAckTracker, CreditTracker, GrantError, OpenError,
+    StreamAdmissionTracker, StreamEscrow, StreamIdentity, admission_outcome_to_slug,
     coerce_estimated_chunk_count, compute_chunks_billed_ref, enforce_estimated_chunk_count_bound,
     open_error_to_slug, verify_chunks_billed,
 };
 
 use scp_protocol::context::outlets::registry::OutletRegistry;
 use scp_protocol::context::roles::ContextRoleState;
+
+// ---------------------------------------------------------------------------
+// Open-path escrow refund guard (E2 remediation)
+// ---------------------------------------------------------------------------
+
+/// Reverses a §5.4.5 streaming escrow hold or top-up that was DEBITED.
+///
+/// This is the runtime-side seam the [`StreamEscrowTicket`] Drop-guard fires
+/// through to refund a hold that was debited against the invoker's
+/// `MemberBudgetTracker` but never settled.
+///
+/// `reverse_spend` is async (it takes the per-context lock), and a `Drop`
+/// impl cannot `.await`, so the production sink the native bridges supply
+/// holds a [`tokio::runtime::Handle`] and `Handle::spawn`s the async
+/// `ContextManager::outlet_stream_reverse_spend`. The trait is the seam
+/// that lets `dispatch.rs` (below the `ContextManager` in the dependency
+/// graph) refund a hold without depending on the manager type.
+///
+/// Implementations MUST be cheap and non-blocking — `refund` runs from a
+/// `Drop`, possibly on the open path's thread.
+pub trait StreamEscrowRefundSink: Send + Sync {
+    /// Refunds `amount` to `member_did`'s budget in `context_id` — a
+    /// best-effort, fire-and-forget reversal. Saturates at zero on the
+    /// budget tracker, so a double-refund (Drop after an explicit reverse)
+    /// is a safe no-op.
+    fn refund(&self, context_id: &str, member_did: &DID, amount: Amount);
+}
+
+/// Refund guard for the §5.4.5 open-time escrow HOLD (E2 remediation).
+///
+/// The native bridges debit the open-time hold against the invoker's
+/// `MemberBudgetTracker` via
+/// [`crate::context::manager::ContextManager::outlet_stream_reserve_escrow`]
+/// BEFORE the stream pump is spawned. Between that debit and a successful
+/// spawn there are several fallible steps (admission gate, estimate
+/// bound, pump-permit acquisition, `invoke_outlet` launch) — any of which
+/// can early-return. Without a guard, the debited hold would be stranded:
+/// the invoker is charged the full estimate with no refund path.
+///
+/// This ticket mirrors the [`crate::context::manager::economy`]
+/// `EconomyTicket` Drop-guard discipline: it is `#[must_use]`, and its
+/// `Drop` impl refunds the hold (via [`StreamEscrowRefundSink::refund`])
+/// when the ticket was NOT consumed. The pump-spawn path calls
+/// [`Self::consume`] exactly once the pump is spawned `Ok` — from that
+/// point the close-time settlement (`outlet_stream_settle`) owns the
+/// refund of the unspent portion, so the open-path guard must NOT also
+/// refund. Every early-return between reserve and spawn drops the ticket
+/// → refund. This is INDEPENDENT of `release_admission` (both roll back
+/// on the same error paths).
+///
+/// A zero-amount ticket (Query / zero-cost stream, where the manager
+/// performed no debit) is a no-op on both `consume` and `Drop`.
+#[must_use = "a StreamEscrowTicket must be consumed once the pump spawns Ok, or dropped to refund the debited hold"]
+pub struct StreamEscrowTicket {
+    sink: Arc<dyn StreamEscrowRefundSink>,
+    context_id: String,
+    member_did: DID,
+    reserved: Amount,
+    consumed: bool,
+}
+
+impl StreamEscrowTicket {
+    /// Creates a ticket guarding a `reserved` hold already debited for
+    /// `member_did` in `context_id`. The `sink` performs the async
+    /// reversal on Drop when the ticket is not consumed.
+    pub fn new(
+        sink: Arc<dyn StreamEscrowRefundSink>,
+        context_id: String,
+        member_did: DID,
+        reserved: Amount,
+    ) -> Self {
+        Self {
+            sink,
+            context_id,
+            member_did,
+            reserved,
+            consumed: false,
+        }
+    }
+
+    /// Marks the hold as handed off to the stream's close-time settlement.
+    /// Call exactly once when the pump has spawned `Ok` — the
+    /// `outlet_stream_settle` path now owns the unspent-portion refund, so
+    /// the Drop-guard must NOT also refund.
+    pub fn consume(mut self) {
+        self.consumed = true;
+    }
+
+    /// Read-only accessor for the guarded hold amount (test introspection).
+    #[must_use]
+    pub const fn reserved(&self) -> Amount {
+        self.reserved
+    }
+}
+
+impl Drop for StreamEscrowTicket {
+    fn drop(&mut self) {
+        if !self.consumed && self.reserved.value() > 0 {
+            // The pump never spawned (or an early-return fired between the
+            // manager debit and the spawn). Refund the full hold via the
+            // sink — mirrors the EconomyTicket rollback discipline. The
+            // debug-assert surfaces an un-consumed non-zero ticket loudly
+            // in tests so a future error branch that forgets to consume on
+            // the success path fails CI rather than silently refunding a
+            // live stream's escrow.
+            tracing::warn!(
+                context_id = %self.context_id,
+                member_did = %self.member_did,
+                reserved = self.reserved.value(),
+                "StreamEscrowTicket dropped unconsumed — refunding debited open-time escrow hold"
+            );
+            self.sink
+                .refund(&self.context_id, &self.member_did, self.reserved);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Open-time rejection types
@@ -222,10 +339,23 @@ pub struct OpenStreamParams {
     /// Per-Data-chunk cost. `Amount::new(0)` for Query and zero-cost
     /// outlets (escrow becomes the §5.4.5 zero-escrow shape).
     pub cost_per_chunk: Amount,
-    /// Invoker's available balance at open. Compared against the
-    /// reservation in `StreamEscrow::reserve_at_open` and against
-    /// every per-grant top-up.
+    /// Invoker's available balance at open. Retained for the legacy /
+    /// test open paths that still gate via
+    /// [`crate::context::outlets::stream::StreamEscrow::reserve_at_open`].
+    /// The production native-bridge path no longer consults this — the
+    /// manager debits the hold under its own lock and passes the result
+    /// in `reserved_escrow` (E2 remediation).
     pub available_balance: Amount,
+    /// The open-time escrow hold the caller has ALREADY reserved (DEBITED)
+    /// against the invoker's `MemberBudgetTracker` via
+    /// [`crate::context::manager::ContextManager::outlet_stream_reserve_escrow`]
+    /// (E2 remediation). `reserve_escrow` builds the
+    /// [`crate::context::outlets::stream::StreamEscrow`] directly from this
+    /// value (`reserved == reserved_escrow`, `billed == 0`) — the
+    /// `InsufficientFunds` / `Overflow` balance decision lives entirely in the
+    /// manager (the only lock holder), so the dispatch path no longer
+    /// re-decides balance. `Amount::new(0)` for Query / zero-cost streams.
+    pub reserved_escrow: Amount,
     /// Optional explicit `estimated_chunk_count` from the
     /// `OutletStreamOpen`. `None` falls back to
     /// `coerce_estimated_chunk_count` per §5.4.5:422-432.
@@ -326,6 +456,7 @@ impl core::fmt::Debug for OpenStreamParams {
             .field("origin_invoker_did", &self.origin_invoker_did)
             .field("cost_per_chunk", &self.cost_per_chunk)
             .field("available_balance", &self.available_balance)
+            .field("reserved_escrow", &self.reserved_escrow)
             .field(
                 "declared_estimated_chunk_count",
                 &self.declared_estimated_chunk_count,
@@ -683,9 +814,24 @@ impl StreamSessionHandle {
     ///
     /// Per §5.4.5: verifies the Ed25519 signature under the pinned
     /// identity, rejects replays / regressions, and on acceptance
-    /// (i) increments the credit counter and (ii) tops up the escrow
-    /// ledger by `cost_per_chunk * grant`. Either failure leaves the
-    /// counter unchanged — §5.4.5 atomicity invariant.
+    /// (i) increments the credit counter and (ii) extends the escrow
+    /// ledger by `reserved_top_up`. A signature / replay failure leaves
+    /// both the counter and the escrow unchanged — §5.4.5 atomicity
+    /// invariant.
+    ///
+    /// `reserved_top_up` is the `cost_per_chunk × grant` amount the caller
+    /// (the FFI bridge) has ALREADY reserved (DEBITED) against the
+    /// invoker's `MemberBudgetTracker` via
+    /// [`crate::context::manager::ContextManager::outlet_stream_reserve_grant`]
+    /// BEFORE invoking this method (E2 remediation). The
+    /// `InsufficientFunds` / `Overflow` decision therefore lives entirely in
+    /// the manager — the only lock holder. If THIS method rejects the
+    /// grant (signature / replay) after the caller already reserved, the
+    /// caller MUST reverse the debit via
+    /// [`crate::context::manager::ContextManager::outlet_stream_reverse_spend`]
+    /// — the §5.4.5 atomicity invariant is upheld jointly by the
+    /// (manager debit) → (handle apply) → (manager reverse on apply-reject)
+    /// sequence.
     ///
     /// Wakes the pump via the grant notifier so a stalled executor can
     /// resume immediately.
@@ -693,46 +839,28 @@ impl StreamSessionHandle {
     /// # Errors
     ///
     /// Returns the `(slug, code)` pair for the rejection. The §5.4.5
-    /// slugs are routed via [`grant_error_to_slug`].
+    /// slugs are routed via [`grant_error_to_slug`]. A returned error
+    /// means NO escrow extension happened — the caller reverses its
+    /// reserved top-up.
     pub fn apply_credit_grant(
         &self,
         credit: &OutletStreamCredit,
-        available_balance: Amount,
+        reserved_top_up: Amount,
     ) -> Result<u32, GrantError> {
         let mut guard = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let identity_clone = guard.credit.identity().clone();
+        // Signature / replay verification FIRST. On rejection we return
+        // before touching escrow — the caller reverses the top-up it
+        // reserved against the budget tracker.
         let new_total = guard.credit.grant_with_identity(credit, &identity_clone)?;
-        // Top up escrow on accepted grant. Failure here MUST roll back
-        // the credit counter so the §5.4.5 atomicity invariant holds:
-        // a grant that fails escrow does not authorize further billable
-        // chunks. We hold the lock across both calls so the window
-        // cannot interleave a pump consume.
-        if let Err(escrow_err) = guard
-            .escrow
-            .top_up_for_grant(credit.grant, available_balance)
-        {
-            // Roll back the credit counter by consuming the grant's
-            // worth back out via `try_consume`. `try_consume` is the
-            // only primitive-exposed mutator that decrements
-            // `remaining`; calling it `grant` times returns the
-            // counter to its pre-grant value. (Any consumption that
-            // does NOT have credit available will return
-            // `OutOfCredit::Exhausted` — which on rollback is a
-            // signal we have already drained. The primitive is
-            // saturating, so we cannot underflow.)
-            for _ in 0..credit.grant {
-                if guard.credit.try_consume().is_err() {
-                    break;
-                }
-            }
-            return Err(match escrow_err {
-                EscrowError::Overflow => GrantError::EscrowOverflow,
-                EscrowError::InsufficientFunds => GrantError::InsufficientFunds,
-            });
-        }
+        // The top-up was already gated AND debited by the manager under
+        // the context lock; record it on the ledger so the per-chunk
+        // accrual and close-time refund see the extended ceiling. This
+        // cannot fail (no balance re-check, saturating add).
+        guard.escrow.apply_reserved_top_up(reserved_top_up);
         // Cancel any armed credit-stall timer — a valid grant lifts the
         // pump out of stall.
         guard.credit_stall_armed_at = None;
@@ -1179,25 +1307,22 @@ fn verify_caveats_binding_at_open(params: &OpenStreamParams) -> Result<(), OpenS
     Ok(())
 }
 
-/// Reserves the §5.4.5 open-time escrow. Returns `zero_escrow` for
-/// Query / zero-cost outlets and the bounded reservation for Action
-/// outlets with non-zero cost.
-fn reserve_escrow(
-    params: &OpenStreamParams,
-    estimated_chunk_count: u32,
-) -> Result<StreamEscrow, OpenStreamRejection> {
+/// Builds the §5.4.5 open-time [`StreamEscrow`] ledger from the hold the
+/// caller has ALREADY reserved (DEBITED) against the invoker's
+/// `MemberBudgetTracker` (E2 remediation).
+///
+/// The `InsufficientFunds` / `Overflow` balance decision moved entirely into
+/// [`crate::context::manager::ContextManager::outlet_stream_reserve_escrow`]
+/// — the only lock holder — so this is now infallible: it records the
+/// pinned `cost_per_chunk` (for per-grant top-ups and per-chunk accrual)
+/// and the manager-debited `reserved_escrow`. For Query / zero-cost
+/// outlets the manager returns `reserved == 0` and this builds the
+/// zero-escrow shape.
+const fn reserve_escrow(params: &OpenStreamParams) -> StreamEscrow {
     if params.cost_per_chunk.value() == 0 {
-        return Ok(StreamEscrow::zero_escrow());
+        return StreamEscrow::zero_escrow();
     }
-    StreamEscrow::reserve_at_open(
-        params.cost_per_chunk,
-        estimated_chunk_count,
-        params.available_balance,
-    )
-    .map_err(|escrow_err| match escrow_err {
-        EscrowError::Overflow => OpenStreamRejection::EscrowOverflow,
-        EscrowError::InsufficientFunds => OpenStreamRejection::InsufficientFunds,
-    })
+    StreamEscrow::from_reserved(params.cost_per_chunk, params.reserved_escrow)
 }
 
 /// Builds the shared per-stream state mutex. Owns the four trackers,
@@ -1252,6 +1377,13 @@ pub(crate) struct PumpEventEmissionInputs {
     /// at terminal-chunk emission. `None` disables emission entirely
     /// (legacy callers that do not append events to the log).
     pub sink: Option<Arc<dyn OutletInvokedEventSink>>,
+    /// Sink that performs the §5.4.5 close-time economic settlement
+    /// exactly once at terminal-chunk emission (E1 remediation): refund
+    /// the unspent escrow, issue the §19.15.5 `PaymentReceipt`, and append
+    /// the close event. Fired under the same `pump_exited` gate as the
+    /// event sink so it cannot double-settle. `None` disables settlement
+    /// (legacy / test callers without a `ContextManager` handle).
+    pub settlement_sink: Option<Arc<dyn StreamSettlementSink>>,
     /// Hosting context id — committed into the event's request-id
     /// hex preimage and to the SDK-facing audit log.
     pub context_id: String,
@@ -1349,6 +1481,11 @@ pub async fn open_stream_session<E>(
     misdeclaration_sink: Option<Arc<dyn QueryMisdeclarationSink>>,
     handler_panic_sink: Option<Arc<dyn HandlerPanicSink>>,
     invoked_event_sink: Option<Arc<dyn OutletInvokedEventSink>>,
+    // §5.4.5 close-time economic settlement (E1). Fired once at terminal
+    // chunk to refund unspent escrow + issue the §19.15.5 PaymentReceipt +
+    // append the close event. `None` for legacy / test callers without a
+    // `ContextManager` handle.
+    settlement_sink: Option<Arc<dyn StreamSettlementSink>>,
     params: OpenStreamParams,
     admission: Arc<Mutex<StreamAdmissionTracker>>,
     // §5.4.5 round-8 (F5): the per-instance node-level concurrent-pump
@@ -1390,14 +1527,11 @@ where
         });
     }
 
-    // Step 3: escrow reservation.
-    let escrow = match reserve_escrow(&params, estimated_chunk_count) {
-        Ok(e) => e,
-        Err(rejection) => {
-            release_admission(&admission, &params);
-            return Err(rejection);
-        }
-    };
+    // Step 3: escrow ledger from the manager-debited hold (E2). The
+    // InsufficientFunds / Overflow decision already happened in the
+    // manager's `outlet_stream_reserve_escrow` under the context lock —
+    // this just records the debited `reserved_escrow` on the ledger.
+    let escrow = reserve_escrow(&params);
 
     // Step 3.5 (§5.4.5 round-8, F5): acquire a node-level pump permit AFTER
     // all per-context gates (admission / estimate / escrow) have passed.
@@ -1511,6 +1645,7 @@ where
         request_id,
         PumpEventEmissionInputs {
             sink: invoked_event_sink,
+            settlement_sink,
             context_id: event_context_id,
             outlet_id: event_outlet_id,
             invoker_did: event_invoker_did,
@@ -2276,15 +2411,40 @@ async fn run_stream_pump_v2(
         } else {
             sink.record(event);
         }
-        // Suppress `event_inputs.context_id` unused-warning until the
-        // event payload extends to include it (currently the
-        // `OutletInvokedEvent` keys only on outlet/invoker/request_id;
-        // context-id is implicit in the event-log namespace per
-        // §5.14.10).
-        let _ = &event_inputs.context_id;
     }
 
-    // Publish the close summary AFTER the event sink. Tests and
+    // §5.4.5 close-time economic settlement (E1). Fire the settlement sink
+    // EXACTLY ONCE, AFTER event emission. The `pump_exited` flag set in the
+    // settlement block above gates double-settlement: this code path runs
+    // only when the pump loop has broken (terminal chunk, channel close, or
+    // forced terminate), and the pump body runs once per spawn.
+    //
+    // `reserved == billed_amount + refund_amount` (the total hold the
+    // manager debited at open + grants); the sink refunds `refund_amount`
+    // so net spent == `billed_amount`, issues the §19.15.5 PaymentReceipt
+    // for `billed_amount`, and appends the close event. For a zero-cost /
+    // Query stream all three amounts are zero and the sink's refund + receipt
+    // are no-ops.
+    if let Some(settlement_sink) = event_inputs.settlement_sink.as_ref() {
+        let reserved = scp_protocol::economy::types::Amount::new(
+            summary
+                .billed_amount
+                .value()
+                .saturating_add(summary.refund_amount.value()),
+        );
+        settlement_sink.settle(StreamSettlement {
+            context_id: event_inputs.context_id.clone(),
+            invoker_did: event_inputs.invoker_did.clone(),
+            reserved,
+            billed_amount: summary.billed_amount,
+            refund_amount: summary.refund_amount,
+            billed_count: summary.billed_count,
+            request_id,
+            outlet_id: event_inputs.outlet_id.clone(),
+        });
+    }
+
+    // Publish the close summary AFTER the event sink + settlement. Tests and
     // economy-layer integrations consume `(billed_amount,
     // refund_amount, billed_count)` here — values the
     // `OutletInvokedEvent` does not carry (per §19.15.5
@@ -2439,6 +2599,7 @@ mod tests {
                 request_id,
                 PumpEventEmissionInputs {
                     sink: None,
+                    settlement_sink: None,
                     context_id: "ctx-test".to_owned(),
                     outlet_id: "outlet-test".to_owned(),
                     invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),
@@ -2562,6 +2723,7 @@ mod tests {
                 request_id,
                 PumpEventEmissionInputs {
                     sink: None,
+                    settlement_sink: None,
                     context_id: "ctx-test".to_owned(),
                     outlet_id: "outlet-test".to_owned(),
                     invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),
@@ -2678,6 +2840,7 @@ mod tests {
                     request_id,
                     PumpEventEmissionInputs {
                         sink: None,
+                        settlement_sink: None,
                         context_id: "ctx-test".to_owned(),
                         outlet_id: "outlet-test".to_owned(),
                         invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),
@@ -2795,6 +2958,7 @@ mod tests {
                 request_id,
                 PumpEventEmissionInputs {
                     sink: None,
+                    settlement_sink: None,
                     context_id: "ctx-test".to_owned(),
                     outlet_id: "outlet-test".to_owned(),
                     invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),

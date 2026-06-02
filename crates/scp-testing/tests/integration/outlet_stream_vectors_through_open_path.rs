@@ -641,6 +641,16 @@ fn build_open_stream_params(open: &OpenSpec) -> OpenStreamParams {
         origin_invoker_did: open.invoker_did.clone(),
         cost_per_chunk: scp_protocol::economy::types::Amount::new(open.cost_per_chunk),
         available_balance: scp_protocol::economy::types::Amount::new(open.available_balance),
+        // E2: mirror the manager-debited open-time hold for these
+        // through-open-path vectors (`cost_per_chunk × estimated`). The
+        // escrow ledger is built from `reserved_escrow` (no balance re-check
+        // dispatch-side); saturates to `available_balance` on an arithmetic
+        // edge.
+        reserved_escrow: scp_protocol::economy::types::Amount::new(
+            open.cost_per_chunk
+                .checked_mul(u64::from(open.estimated_chunk_count))
+                .unwrap_or(open.available_balance),
+        ),
         declared_estimated_chunk_count: Some(open.estimated_chunk_count),
         credit_window: open.credit_window,
         caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
@@ -761,6 +771,7 @@ async fn drive_vector(vector: &StreamVector) -> Vec<OutletStreamChunk> {
             &invoker_typed,
             Some(vector.open.timeout_ms),
             executor,
+            None,
             None,
             None,
             None,

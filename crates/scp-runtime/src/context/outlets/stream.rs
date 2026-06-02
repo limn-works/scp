@@ -627,6 +627,31 @@ impl StreamEscrow {
         })
     }
 
+    /// Constructs the escrow ledger from a hold that has ALREADY been
+    /// reserved (DEBITED) against the invoker's `MemberBudgetTracker` by
+    /// [`crate::context::manager::ContextManager::outlet_stream_reserve_escrow`].
+    ///
+    /// This is the production constructor (E2 remediation). The
+    /// InsufficientFunds / Overflow balance decision now lives entirely in
+    /// the manager — the only lock holder — so the dispatch path no longer
+    /// re-checks balance: it simply records the `reserved` hold the manager
+    /// debited and the `cost_per_chunk` needed for per-grant top-ups and
+    /// per-chunk accrual. `reserved == Amount(0)` for Query / zero-cost
+    /// streams (where the manager performed no debit).
+    ///
+    /// [`Self::reserve_at_open`] is retained for the existing unit tests
+    /// that exercise the pure check-and-reserve arithmetic in isolation,
+    /// but it is NO LONGER the production gate.
+    #[must_use]
+    pub const fn from_reserved(cost_per_chunk: Amount, reserved: Amount) -> Self {
+        Self {
+            cost_per_chunk,
+            reserved,
+            billed: Amount(0),
+            billed_count: 0,
+        }
+    }
+
     /// Constructs a zero-escrow tracker for Query outlets and
     /// zero-cost Action outlets. `accrue_one_chunk` is a no-op on a
     /// zero-cost stream; `settle_at_close` returns `(0, 0)`.
@@ -679,6 +704,20 @@ impl StreamEscrow {
         }
         self.reserved = self.reserved.saturating_add(top_up);
         Ok(())
+    }
+
+    /// Extends the escrow ceiling by a top-up that has ALREADY been
+    /// reserved (DEBITED) against the invoker's `MemberBudgetTracker` by
+    /// [`crate::context::manager::ContextManager::outlet_stream_reserve_grant`].
+    ///
+    /// This is the production per-grant path (E2 remediation): the
+    /// overflow / insufficient-funds decision happened in the manager
+    /// under the context lock, so this method neither re-multiplies nor
+    /// re-checks balance — it records the already-debited `top_up`.
+    /// `saturating_add` guards the (manager-already-rejected) overflow
+    /// edge defensively. A zero `top_up` (zero-cost stream) is a no-op.
+    pub const fn apply_reserved_top_up(&mut self, top_up: Amount) {
+        self.reserved = self.reserved.saturating_add(top_up);
     }
 
     /// Accrues `cost_per_chunk` for one billable Data chunk delivered

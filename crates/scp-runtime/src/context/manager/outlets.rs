@@ -1698,6 +1698,13 @@ impl ContextManager {
         invoked_event_sink: Option<
             std::sync::Arc<dyn crate::context::outlets::invoke::OutletInvokedEventSink>,
         >,
+        // §5.4.5 close-time economic settlement (E1). Fired once at terminal
+        // chunk to refund unspent escrow, issue the §19.15.5 PaymentReceipt,
+        // and append the close event. `None` for callers that have already
+        // settled out-of-band or do not bill (legacy / test paths).
+        settlement_sink: Option<
+            std::sync::Arc<dyn crate::context::outlets::invoke::StreamSettlementSink>,
+        >,
         params: crate::context::outlets::dispatch::OpenStreamParams,
         admission: std::sync::Arc<
             std::sync::Mutex<crate::context::outlets::stream::StreamAdmissionTracker>,
@@ -1732,6 +1739,7 @@ impl ContextManager {
             misdeclaration_sink,
             handler_panic_sink,
             invoked_event_sink,
+            settlement_sink,
             params,
             admission,
             // §5.4.5 round-8 (F5): the per-instance node-level pump
@@ -1740,6 +1748,152 @@ impl ContextManager {
             std::sync::Arc::clone(&self.outlet_stream_pump_semaphore),
         )
         .await
+    }
+
+    /// §5.4.5 close-time economic settlement of a streaming-native
+    /// invocation (E1 remediation).
+    ///
+    /// Called once at terminal-chunk delivery (via the
+    /// [`crate::context::outlets::invoke::StreamSettlementSink`] the dispatch
+    /// pump fires). The open-time escrow HOLD plus every per-grant top-up
+    /// were already DEBITED against the invoker's `MemberBudgetTracker`
+    /// (E2). This method reconciles the hold against actual consumption:
+    ///
+    /// 1. Under the context lock, `reverse_spend(invoker, refund_amount)` —
+    ///    the unspent portion is credited back so net spent ==
+    ///    `billed_amount`. A full refund (`billed_amount == 0`) returns the
+    ///    entire hold.
+    /// 2. If a payment adapter AND an economic policy are configured AND
+    ///    `billed_amount > 0`, capture a §19.15.5 `PaymentReceipt` for the
+    ///    EXACT billed amount via the same `authorize → capture` adapter
+    ///    sequence the non-streaming path uses. On capture failure, append a
+    ///    `PaymentCaptureFailed` event to the log (mirroring
+    ///    [`Self::record_payment_capture_failure`]) and DO NOT reverse the
+    ///    billed amount — service was rendered (H8). If no adapter/policy is
+    ///    configured the receipt is skipped exactly as the non-streaming
+    ///    path skips it.
+    ///
+    /// The stream-close `OutletInvokedEvent` is emitted separately by the
+    /// dispatch pump via the `OutletInvokedEventSink`; this method owns only
+    /// the economic reconciliation (refund + receipt), matching the
+    /// non-streaming split where `invoke_outlet_with_economy` returns the
+    /// receipt and emits the invocation event independently.
+    ///
+    /// Returns the captured `PaymentReceipt` (if any) so the bridge can
+    /// surface it on the close summary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] only when the context
+    /// is gone (in which case the budget tracker was torn down with it and
+    /// the refund is moot). Payment-capture failures are recorded to the
+    /// event log and surfaced as `Ok(None)` — they MUST NOT strand the
+    /// refund, which already happened.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn outlet_stream_settle(
+        &self,
+        context_id: &str,
+        invoker_did: &DID,
+        billed_amount: Amount,
+        refund_amount: Amount,
+        billed_count: u32,
+        request_id: scp_protocol::context::outlets::stream::RequestId,
+        outlet_id: &OutletId,
+    ) -> Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError> {
+        // Step 1: refund the unspent escrow under the context lock, and
+        // snapshot the economic policy needed for the capture so the adapter
+        // call (which must not hold the lock) sees a consistent view. The
+        // hold was debited at open + grants; reversing the refund leaves net
+        // spent == billed_amount.
+        let economic_policy = {
+            let arc = self
+                .get_context_arc(context_id)
+                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+            let mut guard = arc.lock().await;
+            let ctx = &mut *guard;
+            if refund_amount.value() > 0 {
+                ctx.governance
+                    .budget_tracker
+                    .reverse_spend(invoker_did, refund_amount);
+            }
+            let policy = ctx.governance.economic_policy.clone();
+            drop(guard);
+            policy
+        };
+
+        // Step 2: capture the §19.15.5 PaymentReceipt for the EXACT billed
+        // amount — off-lock (adapter calls must not hold the per-context
+        // mutex, mirroring the non-streaming Phase 3b discipline). Skip
+        // entirely when nothing was billed or no adapter/policy is
+        // configured (the legitimate zero-cost / no-payment-rail default).
+        let (Some(adapter), Some(policy)) =
+            (self.payment_adapter.as_ref(), economic_policy.as_ref())
+        else {
+            return Ok(None);
+        };
+        if billed_amount.value() == 0 {
+            return Ok(None);
+        }
+        // The streaming billed amount (`cost_per_chunk × billed_count`) is
+        // the authoritative figure — NOT a fresh policy evaluation. Authorize
+        // and capture that exact amount so the receipt reflects what the
+        // invoker actually consumed.
+        let metadata = crate::economy::adapter::PaymentMetadata {
+            action_type: scp_protocol::economy::types::PaidActionType::OutletCall,
+            context_id: Some(context_id.to_owned()),
+            idempotency_key: request_id,
+        };
+        let auth = match adapter
+            .authorize_dyn(
+                invoker_did,
+                &policy.payee,
+                billed_amount,
+                policy.cost_schedule.currency,
+                metadata,
+            )
+            .await
+        {
+            Ok(auth) => auth,
+            Err(e) => {
+                self.record_payment_capture_failure(
+                    context_id,
+                    "outlet_stream",
+                    invoker_did,
+                    &format!("authorize failed at stream settlement: {e}"),
+                    Some(billed_amount),
+                )
+                .await;
+                return Ok(None);
+            }
+        };
+        match adapter.capture_dyn(&auth).await {
+            Ok(receipt) => {
+                tracing::debug!(
+                    request_id = %hex::encode(request_id),
+                    outlet_id = %outlet_id,
+                    billed = billed_amount.value(),
+                    billed_count,
+                    receipt_id = %hex::encode(receipt.receipt_id),
+                    "outlet stream settlement captured PaymentReceipt"
+                );
+                Ok(Some(receipt))
+            }
+            Err(e) => {
+                // Capture failed after service was rendered (H8): the
+                // billed amount is NOT reversed — only the unspent refund
+                // (already applied above) is returned. Record the failure
+                // for the audit trail, mirroring the non-streaming path.
+                self.record_payment_capture_failure(
+                    context_id,
+                    "outlet_stream",
+                    invoker_did,
+                    &format!("capture failed at stream settlement: {e}"),
+                    Some(billed_amount),
+                )
+                .await;
+                Ok(None)
+            }
+        }
     }
 
     /// SCP-OUT-036 — opens a §6.2.0.5 cross-context outlet stream from the
@@ -2126,6 +2280,9 @@ impl ContextManager {
         invoked_event_sink: Option<
             std::sync::Arc<dyn crate::context::outlets::invoke::OutletInvokedEventSink>,
         >,
+        settlement_sink: Option<
+            std::sync::Arc<dyn crate::context::outlets::invoke::StreamSettlementSink>,
+        >,
         params: crate::context::outlets::dispatch::OpenStreamParams,
         admission: std::sync::Arc<
             std::sync::Mutex<crate::context::outlets::stream::StreamAdmissionTracker>,
@@ -2149,6 +2306,7 @@ impl ContextManager {
             misdeclaration_sink,
             handler_panic_sink,
             invoked_event_sink,
+            settlement_sink,
             params,
             admission,
         )

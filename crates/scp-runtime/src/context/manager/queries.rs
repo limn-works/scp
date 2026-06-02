@@ -10,6 +10,33 @@ use super::{
 /// are drained when this limit is exceeded to prevent unbounded growth.
 const MAX_RETAINED_CHECKPOINTS: usize = 100;
 
+/// Outcome of a §5.4.5 streaming-escrow reservation
+/// ([`ContextManager::outlet_stream_reserve_escrow`]).
+///
+/// The reservation has ALREADY been DEBITED against the invoker's
+/// [`scp_protocol::economy::budget::MemberBudgetTracker`] under the
+/// context lock by the time this value is returned — `reserved` is the
+/// hold amount the caller MUST eventually settle (refund the unspent
+/// portion at stream close, bill the consumed portion). A
+/// `reserved == Amount(0)` reservation (Query / zero-cost outlet) records
+/// no debit and requires no refund.
+///
+/// `#[must_use]` because dropping the reservation without threading
+/// `reserved` into the stream's `StreamEscrow` (and ultimately the
+/// close-time settlement) would silently strand the debited hold — the
+/// invoker would be charged the full estimate with no refund path. The
+/// open-path `StreamEscrowTicket` Drop-guard is the mechanical backstop
+/// that reverses the hold if the pump never spawns.
+#[must_use = "the escrow hold is already debited — thread `reserved` into the stream's StreamEscrow or it will be stranded"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EscrowReservation {
+    /// The amount debited from the invoker's budget as the open-time
+    /// upper-bound hold (`cost_per_chunk × estimated_chunk_count`,
+    /// AND-folded against `max_per_action` per §19.5). `Amount(0)` for
+    /// Query / zero-cost streams.
+    pub reserved: scp_protocol::economy::types::Amount,
+}
+
 #[allow(clippy::significant_drop_tightening)]
 impl ContextManager {
     /// Registers a DID as controlled by the local node/SDK.
@@ -558,59 +585,213 @@ impl ContextManager {
         ctx.governance.budget_tracker.remaining(member_did)
     }
 
-    /// Returns the spendable balance the streaming-escrow path should reserve
-    /// against for `member_did`, AND-composed with an optional spending-UCAN
-    /// `max_per_action` ceiling (§19.5).
+    /// Returns the cumulative `total_spent` for a member in a context.
     ///
-    /// This is the production accessor the native FFI streaming bridges call
-    /// to fill [`crate::context::outlets::dispatch::OpenStreamParams::available_balance`]
-    /// at open and to re-derive the per-grant escrow ceiling at each
-    /// `apply_credit_grant`. It is the streaming analogue of the
-    /// `SpendingCapability ∧ MemberBudgetTracker` AND-fold that
-    /// [`Self::invoke_outlet_with_economy`] runs for the non-streaming path
-    /// (§19.5): the escrow may only reserve against funds the member
-    /// actually has AND that the presented spending UCAN authorizes per
-    /// action.
+    /// Test-only accessor for asserting that the §5.4.5 streaming-escrow
+    /// reserve / settle path moves the `MemberBudgetTracker` net spend by
+    /// exactly the billed amount (E1 / E2 remediation). Returns zero if the
+    /// context is unknown.
+    #[cfg(feature = "testing")]
+    pub async fn total_spent_for_test(
+        &self,
+        context_id: &str,
+        member_did: &scp_identity::DID,
+    ) -> scp_protocol::economy::types::Amount {
+        let Ok(arc) = self.get_context_arc(context_id) else {
+            return scp_protocol::economy::types::Amount::new(0);
+        };
+        let ctx = arc.lock().await;
+        ctx.governance.budget_tracker.total_spent(member_did)
+    }
+
+    /// Atomically reserves (DEBITS) the §5.4.5 open-time streaming escrow
+    /// hold for `member_did` against the context's
+    /// [`scp_protocol::economy::budget::MemberBudgetTracker`].
     ///
-    /// - When `max_per_action` is `None` (free / zero-cost / no-spending
-    ///   case — the legitimate default for Query and zero-cost outlets), the
-    ///   result is the raw
-    ///   [`scp_protocol::economy::budget::MemberBudgetTracker::remaining`].
-    /// - When `max_per_action` is `Some`, the result is
-    ///   `min(remaining, max_per_action)` so a grant can never escrow more
-    ///   than the spending capability authorizes for a single action.
+    /// This is the authoritative balance gate for streaming-native
+    /// invocation. It REPLACES the prior read-only `member_balance`
+    /// accessor: the prior accessor only *read* `remaining`, so two
+    /// concurrent opens each read the same balance and each independently
+    /// passed the dispatch-side `reserve_at_open` check — both succeeded
+    /// and the budget was silently over-committed. This method closes that
+    /// race by performing the check-and-debit in a SINGLE critical section
+    /// under the context lock: the second concurrent open observes the
+    /// already-debited balance and is rejected with
+    /// [`ContextError::EscrowInsufficientFunds`].
     ///
-    /// The bridge parses the presented spending UCAN once at open (surfacing
-    /// a malformed token there via
-    /// [`scp_protocol::crypto::ucan::spending::SpendingCapability::from_ucan_token`])
-    /// and passes the extracted `max_per_action` here. Re-reading the budget
-    /// at grant time (rather than caching the open-time balance) closes the
-    /// window where budget granted-then-spent between open and a later grant
-    /// would otherwise let the per-grant top-up escrow against stale funds.
+    /// Under one `arc.lock().await`:
+    /// 1. `remaining = budget_tracker.remaining(member)`.
+    /// 2. `effective_remaining = min(remaining, max_per_action)` when a
+    ///    spending UCAN was presented (§19.5 AND-composition); else
+    ///    `remaining`.
+    /// 3. `reserved = cost_per_chunk.checked_mul(estimated_chunk_count)` —
+    ///    overflow → [`ContextError::EscrowOverflow`].
+    /// 4. `reserved > effective_remaining` → [`ContextError::EscrowInsufficientFunds`].
+    /// 5. Otherwise `budget_tracker.record_spend(member, reserved)?` — the
+    ///    hold is DEBITED now, atomically with the check.
+    ///
+    /// `cost_per_chunk == 0` (Query / zero-cost outlet) short-circuits to
+    /// `reserved = Amount(0)` and skips the debit entirely.
+    ///
+    /// The unspent portion of the hold is refunded at stream close via
+    /// [`Self::outlet_stream_settle`]; the dispatch-side `StreamEscrowTicket`
+    /// Drop-guard reverses the full hold if the pump never spawns.
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::ContextNotRegistered`] if the context is
-    /// unknown.
-    pub async fn outlet_stream_member_balance(
+    /// - [`ContextError::ContextNotRegistered`] — unknown context.
+    /// - [`ContextError::EscrowOverflow`] — `cost × count` overflowed.
+    /// - [`ContextError::EscrowInsufficientFunds`] — effective remaining
+    ///   below the reservation (also surfaces a `record_spend` rejection
+    ///   from a concurrent debit that drained the budget after the local
+    ///   comparison but before the spend, since the spend is checked
+    ///   under the same lock).
+    pub async fn outlet_stream_reserve_escrow(
         &self,
         context_id: &str,
         member_did: &DID,
+        cost_per_chunk: scp_protocol::economy::types::Amount,
+        estimated_chunk_count: u32,
         max_per_action: Option<scp_protocol::economy::types::Amount>,
-    ) -> Result<scp_protocol::economy::types::Amount, ContextError> {
+    ) -> Result<EscrowReservation, ContextError> {
+        use scp_protocol::economy::types::Amount;
+        // Zero-cost / Query: no debit, no balance consultation.
+        if cost_per_chunk.value() == 0 {
+            return Ok(EscrowReservation {
+                reserved: Amount::new(0),
+            });
+        }
+        let reserved = cost_per_chunk
+            .checked_mul(u64::from(estimated_chunk_count))
+            .ok_or_else(|| {
+                ContextError::EscrowOverflow(format!(
+                    "cost_per_chunk {} × estimated_chunk_count {estimated_chunk_count}",
+                    cost_per_chunk.value()
+                ))
+            })?;
         let arc = self
             .get_context_arc(context_id)
             .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
-        let remaining = {
-            let ctx = arc.lock().await;
-            ctx.governance.budget_tracker.remaining(member_did)
+        // Single critical section: read remaining, AND-fold the §19.5
+        // per-action ceiling, gate, and DEBIT the hold — all under one
+        // lock so two concurrent opens cannot both reserve against the
+        // same balance.
+        let mut ctx = arc.lock().await;
+        let remaining = ctx.governance.budget_tracker.remaining(member_did);
+        let effective_remaining = max_per_action.map_or(remaining, |cap| {
+            Amount::new(remaining.value().min(cap.value()))
+        });
+        if reserved.value() > effective_remaining.value() {
+            return Err(ContextError::EscrowInsufficientFunds(format!(
+                "reserved {} > effective remaining {} for {member_did}",
+                reserved.value(),
+                effective_remaining.value()
+            )));
+        }
+        ctx.governance
+            .budget_tracker
+            .record_spend(member_did, reserved)
+            .map_err(|e| ContextError::EscrowInsufficientFunds(format!("{e}")))?;
+        Ok(EscrowReservation { reserved })
+    }
+
+    /// Atomically reserves (DEBITS) the §5.4.5 per-grant streaming escrow
+    /// top-up for `member_did` against the context's budget tracker.
+    ///
+    /// Mirror of [`Self::outlet_stream_reserve_escrow`] for the
+    /// `OutletStreamCredit` top-up path (§5.4.5 "Credit-grant escrow
+    /// top-up"): `top_up = cost_per_chunk × grant` via `checked_mul`, gated
+    /// against the member's live remaining budget AND-folded with
+    /// `max_per_action`, then DEBITED under the context lock. Re-reading
+    /// the budget at grant time (rather than caching the open-time balance)
+    /// closes the window where budget granted-then-spent between open and a
+    /// later grant would otherwise top up against stale funds.
+    ///
+    /// Returns the debited `top_up` `Amount`. The bridge calls this BEFORE
+    /// [`crate::context::outlets::dispatch::StreamSessionHandle::apply_credit_grant`];
+    /// if `apply_credit_grant` rejects the grant AFTER a successful reserve
+    /// (signature / replay), the bridge MUST reverse the debit via
+    /// [`Self::outlet_stream_reverse_spend`].
+    ///
+    /// `cost_per_chunk == 0` short-circuits to `Amount(0)` with no debit.
+    ///
+    /// # Errors
+    ///
+    /// - [`ContextError::ContextNotRegistered`] — unknown context.
+    /// - [`ContextError::EscrowOverflow`] — `cost × grant` overflowed.
+    /// - [`ContextError::EscrowInsufficientFunds`] — effective remaining
+    ///   below the top-up.
+    pub async fn outlet_stream_reserve_grant(
+        &self,
+        context_id: &str,
+        member_did: &DID,
+        cost_per_chunk: scp_protocol::economy::types::Amount,
+        grant: u32,
+        max_per_action: Option<scp_protocol::economy::types::Amount>,
+    ) -> Result<scp_protocol::economy::types::Amount, ContextError> {
+        use scp_protocol::economy::types::Amount;
+        if cost_per_chunk.value() == 0 {
+            return Ok(Amount::new(0));
+        }
+        let top_up = cost_per_chunk
+            .checked_mul(u64::from(grant))
+            .ok_or_else(|| {
+                ContextError::EscrowOverflow(format!(
+                    "cost_per_chunk {} × grant {grant}",
+                    cost_per_chunk.value()
+                ))
+            })?;
+        let arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let mut ctx = arc.lock().await;
+        let remaining = ctx.governance.budget_tracker.remaining(member_did);
+        let effective_remaining = max_per_action.map_or(remaining, |cap| {
+            Amount::new(remaining.value().min(cap.value()))
+        });
+        if top_up.value() > effective_remaining.value() {
+            return Err(ContextError::EscrowInsufficientFunds(format!(
+                "top_up {} > effective remaining {} for {member_did}",
+                top_up.value(),
+                effective_remaining.value()
+            )));
+        }
+        ctx.governance
+            .budget_tracker
+            .record_spend(member_did, top_up)
+            .map_err(|e| ContextError::EscrowInsufficientFunds(format!("{e}")))?;
+        Ok(top_up)
+    }
+
+    /// Reverses (refunds) a previously-debited streaming escrow hold or
+    /// top-up against the context's budget tracker.
+    ///
+    /// Used by the streaming bridges to roll back a per-grant top-up when
+    /// [`crate::context::outlets::dispatch::StreamSessionHandle::apply_credit_grant`]
+    /// rejects a grant AFTER [`Self::outlet_stream_reserve_grant`] already
+    /// debited the top-up (signature / replay rejection), and by
+    /// [`Self::outlet_stream_settle`] to refund the unspent portion of the
+    /// open-time hold at stream close. `reverse_spend` saturates at zero,
+    /// so a double-refund is a safe no-op on the underflow portion.
+    ///
+    /// A no-op when the context is no longer registered (the budget tracker
+    /// was torn down with the context).
+    pub async fn outlet_stream_reverse_spend(
+        &self,
+        context_id: &str,
+        member_did: &DID,
+        amount: scp_protocol::economy::types::Amount,
+    ) {
+        if amount.value() == 0 {
+            return;
+        }
+        let Ok(arc) = self.get_context_arc(context_id) else {
+            return;
         };
-        // §19.5 AND-composition: the escrow ceiling is the minimum of the
-        // member's remaining budget and the spending capability's per-action
-        // limit (when a spending UCAN was presented).
-        Ok(max_per_action.map_or(remaining, |cap| {
-            scp_protocol::economy::types::Amount::new(remaining.0.min(cap.0))
-        }))
+        let mut ctx = arc.lock().await;
+        ctx.governance
+            .budget_tracker
+            .reverse_spend(member_did, amount);
     }
 
     /// Returns the per-DID velocity (number of recent paid actions) for

@@ -589,9 +589,19 @@ async fn invoke_outlet_with_economy_rejects_insufficient_budget() {
 
     let err = result.expect_err("expected budget-exceeded rejection");
     let msg = format!("{err}");
+    // SCP-OUT-027 re-routes the budget rejection through the §5.4.4 typed
+    // Economic envelope: code `SCP-TOOL-6150`, slug `economic.budget-exceeded`
+    // (the registry maps `economic.budget-exceeded` → `CODE_ECONOMIC_FAULT`).
+    // The pre-OUT-027 free-form `SCP-ECON-12010 / "budget exceeded"` form is
+    // still accepted for any path that has not yet migrated to the typed
+    // envelope.
     assert!(
-        msg.contains("SCP-ECON-12010") || msg.contains("budget exceeded"),
-        "expected SCP-ECON-12010 budget-exceeded error, got: {msg}"
+        msg.contains("SCP-TOOL-6150")
+            || msg.contains("economic.budget-exceeded")
+            || msg.contains("SCP-ECON-12010")
+            || msg.contains("budget exceeded"),
+        "expected a budget-exceeded rejection (typed SCP-TOOL-6150 \
+         economic.budget-exceeded or legacy SCP-ECON-12010), got: {msg}"
     );
 
     // Velocity tracker must have been rolled back. The new test-only

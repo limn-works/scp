@@ -137,7 +137,9 @@ pub enum InvocationError {
     /// re-check inside `ContextManager::execute_register_outlet`. This story
     /// emits the existing [`InvocationError`] taxonomy; the typed
     /// `OutletErrorClass::Protocol::QueryCostViolation` lands with
-    /// SCP-OUT-036/038. Error code: `SCP-TOOL-6102`.
+    /// SCP-OUT-036/038. Error code: `SCP-TOOL-6100` (the registry maps the
+    /// `query-cost-violation` slug to `CODE_PROTOCOL_VIOLATION`; the
+    /// registry is truth).
     #[error("Query outlet cost violation (§5.4.2): {reason}")]
     OutletQueryCostViolation {
         /// Human-readable reason — which sub-rule was violated.
@@ -148,8 +150,9 @@ pub enum InvocationError {
     /// (or otherwise tripped the [`ReadOnlyInvocation`] deny-list), per spec
     /// §5.4.2 "`ReadOnlyInvocation` guard at invocation" (SCP-OUT-013).
     ///
-    /// Maps to `OutletErrorClass::Protocol::QueryViolation` (SCP-TOOL-6103,
-    /// slug `protocol.query-violation`) and triggers an
+    /// Maps to `OutletErrorClass::Protocol::QueryViolation` (SCP-TOOL-6100,
+    /// slug `query-violation` — the registry maps it to
+    /// `CODE_PROTOCOL_VIOLATION`; the registry is truth) and triggers an
     /// `OutletVerifiedEvent { integrity_ok: false, reason:
     /// QueryMisdeclaration }` operator-attributable signal per §5.4.2
     /// "Misdeclaration signal".
@@ -540,6 +543,67 @@ pub trait OutletInvokedEventSink: Send + Sync {
     /// outlet stream, after the terminal chunk has been delivered to
     /// the chunk receiver.
     fn record(&self, event: OutletInvokedEvent);
+}
+
+/// The §5.4.5 close-time economic settlement of a streaming-native
+/// invocation (E1 remediation).
+///
+/// The open-time escrow HOLD was DEBITED against the invoker's
+/// `MemberBudgetTracker` at acceptance (and topped up per accepted credit
+/// grant). At terminal-chunk delivery the runtime knows the exact billed
+/// amount and the unspent refund:
+///
+/// - `reserved == billed_amount + refund_amount` — the total hold debited.
+/// - `billed_amount` — `cost_per_chunk × billable Data chunks at/below the
+///   cancel-ack sequence`. This is the amount the invoker actually pays.
+/// - `refund_amount` — the unspent portion, refunded to the invoker via
+///   `MemberBudgetTracker::reverse_spend` so net spent == `billed_amount`.
+///
+/// A stream that terminates with `Error { terminal: true }` before any
+/// Data chunk yields `billed_amount == 0` and a full refund.
+#[derive(Debug, Clone)]
+pub struct StreamSettlement {
+    /// Hosting context id — the lock the refund + receipt take.
+    pub context_id: String,
+    /// The §5.4.5 `invoker_did` whose budget was held and is now settled.
+    pub invoker_did: DID,
+    /// Total escrow debited at open + grants (`billed + refund`). Recorded
+    /// for audit / receipt provenance.
+    pub reserved: scp_protocol::economy::types::Amount,
+    /// Amount the invoker is billed (net spent after refund).
+    pub billed_amount: scp_protocol::economy::types::Amount,
+    /// Unspent escrow refunded to the invoker (`reserved - billed`).
+    pub refund_amount: scp_protocol::economy::types::Amount,
+    /// Count of billable Data chunks (the §5.4.5 `chunks_billed`).
+    pub billed_count: u32,
+    /// Stream `request_id` — receipt + event-log provenance.
+    pub request_id: RequestId,
+    /// Outlet id — receipt + event-log provenance.
+    pub outlet_id: OutletId,
+}
+
+/// Sink fired once at the close of each streaming-native outlet invocation.
+///
+/// Performs the §5.4.5 economic settlement (E1 remediation): refund the
+/// unspent escrow, issue a §19.15.5 `PaymentReceipt` for the billed amount,
+/// and append the close event to the event log.
+///
+/// The dispatch pump fires this from inside its spawned `tokio` task at the
+/// settlement block (gated by the `pump_exited` flag so it fires at most
+/// once). Because it runs ON the pump's tokio task, the implementation MUST
+/// NOT `block_on` — the production native-bridge impls hold a
+/// [`tokio::runtime::Handle`] and `Handle::spawn` the async
+/// `ContextManager::outlet_stream_settle`. The trait is `Send + Sync` so it
+/// can be shared into the spawned pump task without an extra mutex.
+///
+/// `None` (no sink wired) disables settlement — the legacy / test open
+/// paths that do not thread a `ContextManager` handle. The escrow ledger's
+/// `(billed, refund)` are still surfaced via the `StreamCloseSummary` for
+/// those callers.
+pub trait StreamSettlementSink: Send + Sync {
+    /// Settles the stream's economics exactly once. MUST NOT block — spawn
+    /// the async settlement onto a runtime handle.
+    fn settle(&self, settlement: StreamSettlement);
 }
 
 /// In-memory [`OutletInvokedEventSink`] backed by a `Mutex<Vec<_>>`.
@@ -6926,6 +6990,15 @@ mod tests {
             origin_invoker_did: invoker_did.to_owned(),
             cost_per_chunk,
             available_balance,
+            // E2: the open-time hold the manager would have debited. For
+            // these fixtures (no real ContextManager) we mirror the
+            // production arithmetic `cost_per_chunk × estimated` so the
+            // escrow ledger's per-chunk accrual + close-time refund behave
+            // exactly as in production. Saturates to `available_balance`
+            // on an arithmetic edge so the fixture never panics.
+            reserved_escrow: cost_per_chunk
+                .checked_mul(u64::from(declared_estimated.unwrap_or(credit_window)))
+                .unwrap_or(available_balance),
             declared_estimated_chunk_count: declared_estimated,
             credit_window,
             caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
@@ -7011,6 +7084,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             executor,
+            None,
             None,
             None,
             None,
@@ -7114,6 +7188,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             executor,
+            None,
             None,
             None,
             None,
@@ -7269,6 +7344,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
@@ -7393,6 +7469,7 @@ mod tests {
             None,
             None,
             Some(StdArc::clone(&event_sink) as StdArc<dyn super::OutletInvokedEventSink>),
+            None,
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
@@ -7471,6 +7548,11 @@ mod tests {
             origin_invoker_did: invoker_did.to_owned(),
             cost_per_chunk,
             available_balance,
+            // E2: mirror the manager-debited open-time hold
+            // (`cost_per_chunk × estimated`). See `out034_open_params`.
+            reserved_escrow: cost_per_chunk
+                .checked_mul(u64::from(declared_estimated.unwrap_or(credit_window)))
+                .unwrap_or(available_balance),
             declared_estimated_chunk_count: declared_estimated,
             credit_window,
             caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
@@ -7552,6 +7634,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             executor,
+            None,
             None,
             None,
             None,
@@ -7669,6 +7752,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             executor,
+            None,
             None,
             None,
             None,
@@ -7870,6 +7954,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
@@ -7993,6 +8078,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             executor,
+            None,
             None,
             None,
             None,
@@ -8262,6 +8348,8 @@ mod tests {
             origin_invoker_did: creator_did.to_owned(),
             cost_per_chunk: scp_protocol::economy::types::Amount::new(0),
             available_balance: scp_protocol::economy::types::Amount::new(u64::MAX),
+            // E2: zero-cost stream — the manager would debit nothing.
+            reserved_escrow: scp_protocol::economy::types::Amount::new(0),
             declared_estimated_chunk_count: None,
             credit_window: 16,
             caveats,
@@ -8286,6 +8374,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             executor,
+            None,
             None,
             None,
             None,
@@ -8443,6 +8532,8 @@ mod tests {
             origin_invoker_did: creator_did.to_owned(),
             cost_per_chunk: scp_protocol::economy::types::Amount::new(0),
             available_balance: scp_protocol::economy::types::Amount::new(u64::MAX),
+            // E2: zero-cost stream — the manager would debit nothing.
+            reserved_escrow: scp_protocol::economy::types::Amount::new(0),
             declared_estimated_chunk_count: Some(declared_estimated),
             credit_window: 16,
             caveats,
@@ -8470,6 +8561,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             executor,
+            None,
             None,
             None,
             None,
@@ -8715,6 +8807,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             params_a,
             StdArc::clone(&admission_a),
             StdArc::clone(&semaphore),
@@ -8748,6 +8841,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             executor_b,
+            None,
             None,
             None,
             None,
@@ -8809,6 +8903,7 @@ mod tests {
             &DID::from(creator_did),
             None,
             executor_c,
+            None,
             None,
             None,
             None,

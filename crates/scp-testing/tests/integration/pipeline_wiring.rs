@@ -92,6 +92,11 @@ const RUNTIME_OUTLET_ERRORS_SRC: &str =
 const RUNTIME_OUTLETS_MANAGER_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/context/manager/outlets.rs");
 
+// E1 streaming-settlement source — the dispatch pump's settlement block
+// fires the `StreamSettlementSink` exactly once at terminal chunk.
+const RUNTIME_DISPATCH_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/outlets/dispatch.rs");
+
 // =========================================================================
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
@@ -181,7 +186,19 @@ const RUNTIME_OUTLETS_MANAGER_SRC: &str =
 // `OutletError::from_invocation_error_template`, the receiver-side
 // `verify_outlet_error`, and the runtime caveat-violation envelope
 // dispatcher. One `#[test]` item, +1 to the active count.
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 67;
+//
+// Raised 67 -> 68 by the E1/E2 outlet-streaming economy remediation: adds
+// `streaming_settlement_fires_sink` pinning the dispatch pump's settlement
+// block to call `settlement_sink.settle(` so the §5.4.5 close-time
+// settlement (refund unspent escrow + §19.15.5 PaymentReceipt) actually
+// runs for real streams. Prior to this, paid streams never charged — the
+// pump computed `(billed, refund)` into the close summary but never moved
+// the budget. The companion `#[tokio::test]`
+// `streaming_settlement_moves_budget_via_in_memory_sink` (not counted by
+// the `#[test]`-line ratchet) drives a real in-memory `StreamSettlementSink`
+// end-to-end and asserts the `MemberBudgetTracker` net spend equals the
+// billed amount. One `#[test]` item, +1 to the active count.
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 68;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -1919,6 +1936,278 @@ fn b3_webhook_dispatch_wired() {
     assert!(
         webhook_src.contains("validate_webhook_url"),
         "webhook module must include SSRF validation"
+    );
+}
+
+// ===========================================================================
+// E1 — streaming settlement fires the sink (close-time budget movement)
+// ===========================================================================
+
+/// Structural guard: the dispatch pump's settlement block MUST call
+/// `settlement_sink.settle(` so the §5.4.5 close-time settlement (refund
+/// unspent escrow + §19.15.5 PaymentReceipt) runs for real streams. Prior to
+/// the E1 remediation the pump computed `(billed, refund)` into the close
+/// summary but never moved the budget — paid streams never charged.
+#[test]
+fn streaming_settlement_fires_sink() {
+    let body = extract_fn_body(RUNTIME_DISPATCH_SRC, "run_stream_pump_v2")
+        .expect("run_stream_pump_v2 body must exist in dispatch.rs");
+    assert!(
+        body.contains("settlement_sink.settle("),
+        "run_stream_pump_v2 settlement block must fire settlement_sink.settle(...) \
+         so the §5.4.5 close-time refund + PaymentReceipt runs (E1)"
+    );
+}
+
+/// Real end-to-end assertion: drives a REAL in-memory `StreamSettlementSink`
+/// against a live `ContextManager` and proves the `MemberBudgetTracker` net
+/// spend equals the billed amount after the settlement runs. This is the
+/// non-dead-`let _` companion to `streaming_settlement_fires_sink`: it
+/// exercises the actual sink → `outlet_stream_settle` → budget-tracker path.
+#[tokio::test]
+#[allow(clippy::too_many_lines, clippy::items_after_statements)]
+async fn streaming_settlement_moves_budget_via_in_memory_sink() {
+    use scp_core::context::builder::{
+        ContextCreationError, ContextCryptoProvider, ContextEventLogProvider,
+        ContextTransportProvider,
+    };
+    use scp_core::context::governance::KeyResolver;
+    use scp_core::context::manager::ContextManager;
+    use scp_core::context::params::ContextParams;
+    use scp_core::context::{AddMemberOutput, ContextError, RemoveMemberOutput};
+    use scp_identity::DID;
+    use scp_runtime::context::outlets::invoke::{StreamSettlement, StreamSettlementSink};
+    use std::sync::Arc;
+
+    // -- Minimal mock providers (no real crypto / transport / event log) --
+    struct MockCrypto;
+    impl ContextCryptoProvider for MockCrypto {
+        fn validate_creator_identity(&self) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn create_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn generate_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn init_broadcast_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn destroy_mls_group(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn destroy_sender_key(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn validate_key_package(
+            &self,
+            _owner_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+        fn add_member(
+            &self,
+            _ctx_id: &[u8; 32],
+            _member_did: &str,
+            _key_package_bytes: Option<&[u8]>,
+        ) -> Result<AddMemberOutput, ContextError> {
+            Ok(AddMemberOutput::default())
+        }
+        fn remove_member(
+            &self,
+            _ctx_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<RemoveMemberOutput, ContextError> {
+            Ok(RemoveMemberOutput::default())
+        }
+        fn distribute_sender_key(
+            &self,
+            _ctx_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+        fn remove_member_sender_key(
+            &self,
+            _ctx_id: &[u8; 32],
+            _member_did: &str,
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+        fn seal(
+            &self,
+            _context_id: &[u8; 32],
+            inner: &scp_core::envelope::inner::InnerEnvelope,
+            _routing_id: &[u8],
+            _blob_ttl: u32,
+        ) -> Result<Vec<u8>, ContextError> {
+            rmp_serde::to_vec_named(inner)
+                .map_err(|e| ContextError::CryptoFailed(format!("mock seal: {e}")))
+        }
+        fn open(
+            &self,
+            _context_id: &[u8; 32],
+            outer_bytes: &[u8],
+        ) -> Result<scp_core::context::builder::OpenResult, ContextError> {
+            let inner: scp_core::envelope::inner::InnerEnvelope =
+                rmp_serde::from_slice(outer_bytes)
+                    .map_err(|e| ContextError::CryptoFailed(format!("mock open: {e}")))?;
+            let sender_did = inner.sender_did.clone();
+            Ok(scp_core::context::builder::OpenResult::Application(
+                Box::new(scp_core::context::builder::OpenedEnvelope { inner, sender_did }),
+            ))
+        }
+    }
+    struct MockTransport;
+    impl ContextTransportProvider for MockTransport {
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn publish_context(
+            &self,
+            _id: &[u8; 32],
+            _params: &ContextParams,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn delete_published(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn send_message(
+            &self,
+            _ctx_id: &[u8; 32],
+            _encrypted_payload: &[u8],
+        ) -> Result<(), ContextError> {
+            Ok(())
+        }
+    }
+    struct MockEventLog;
+    impl ContextEventLogProvider for MockEventLog {
+        fn init_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn append_event(
+            &self,
+            _id: &[u8; 32],
+            _event: &str,
+            _actor_did: &str,
+            _payload: Option<&serde_json::Value>,
+        ) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+        fn destroy_event_log(&self, _id: &[u8; 32]) -> Result<(), ContextCreationError> {
+            Ok(())
+        }
+    }
+    let key_resolver: KeyResolver = Arc::new(|_did: &DID| None);
+
+    let manager = Arc::new(ContextManager::new(
+        Box::new(MockCrypto),
+        Box::new(MockTransport),
+        Box::new(MockEventLog),
+        key_resolver,
+    ));
+    let ctx_id = "settlement-sink-test";
+    let creator: DID = "did:key:creator".into();
+    manager
+        .create_context(
+            ctx_id.into(),
+            ContextParams::default(),
+            creator.as_ref().into(),
+            None,
+        )
+        .await
+        .expect("create_context");
+
+    // Grant budget and reserve (DEBIT) the open-time hold: cost 10 × 5 = 50.
+    manager
+        .grant_budget_for_test(
+            ctx_id,
+            &creator,
+            scp_protocol::economy::types::Amount::new(1_000),
+        )
+        .await;
+    let reservation = manager
+        .outlet_stream_reserve_escrow(
+            ctx_id,
+            &creator,
+            scp_protocol::economy::types::Amount::new(10),
+            5,
+            None,
+        )
+        .await
+        .expect("reserve");
+    assert_eq!(reservation.reserved.value(), 50);
+
+    // A REAL in-memory settlement sink: mirrors the production native-bridge
+    // sink (Handle::spawn of the async `outlet_stream_settle`). It records
+    // that it fired and drives the real budget-moving manager method.
+    struct InMemorySettlementSink {
+        manager: Arc<ContextManager>,
+        handle: tokio::runtime::Handle,
+        fired: Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl StreamSettlementSink for InMemorySettlementSink {
+        fn settle(&self, s: StreamSettlement) {
+            self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+            let manager = Arc::clone(&self.manager);
+            self.handle.spawn(async move {
+                let _ = manager
+                    .outlet_stream_settle(
+                        &s.context_id,
+                        &s.invoker_did,
+                        s.billed_amount,
+                        s.refund_amount,
+                        s.billed_count,
+                        s.request_id,
+                        &s.outlet_id,
+                    )
+                    .await;
+            });
+        }
+    }
+    let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sink: Arc<dyn StreamSettlementSink> = Arc::new(InMemorySettlementSink {
+        manager: Arc::clone(&manager),
+        handle: tokio::runtime::Handle::current(),
+        fired: Arc::clone(&fired),
+    });
+
+    // Fire the sink with a settlement that bills 3 of the 5 reserved chunks
+    // (billed 30, refund 20) — exactly what the dispatch pump produces at a
+    // partial-consumption close.
+    sink.settle(StreamSettlement {
+        context_id: ctx_id.to_owned(),
+        invoker_did: creator.clone(),
+        reserved: scp_protocol::economy::types::Amount::new(50),
+        billed_amount: scp_protocol::economy::types::Amount::new(30),
+        refund_amount: scp_protocol::economy::types::Amount::new(20),
+        billed_count: 3,
+        request_id: *uuid::Uuid::now_v7().as_bytes(),
+        outlet_id: scp_protocol::context::outlets::OutletId::from("outlet-z"),
+    });
+    assert!(
+        fired.load(std::sync::atomic::Ordering::SeqCst),
+        "in-memory settlement sink must fire"
+    );
+
+    // The spawned settlement is async; poll the budget until the refund lands
+    // (net spent must drop from 50 to 30). Bounded wait so a regression that
+    // never refunds fails the test rather than hanging.
+    let mut net_spent = u64::MAX;
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+        net_spent = manager.total_spent_for_test(ctx_id, &creator).await.value();
+        if net_spent == 30 {
+            break;
+        }
+    }
+    assert_eq!(
+        net_spent, 30,
+        "after settlement the MemberBudgetTracker net spend must equal the \
+         billed amount (50 reserved − 20 refunded == 30 billed)"
     );
 }
 

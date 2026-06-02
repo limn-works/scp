@@ -1357,8 +1357,12 @@ fn native_stream_bridges_route_cancel_through_signed_primitive() {
 
 /// N3 — the §19 economy sentinels are gone: no `u64::MAX` available-balance
 /// and no `Amount::new(0)` literal threaded as `cost_per_chunk` in the open
-/// path. The real values come from `registration.cost` and the runtime
-/// `outlet_stream_member_balance` query.
+/// path. The real escrow HOLD is reserved (and DEBITED) against the runtime's
+/// `MemberBudgetTracker` via `outlet_stream_reserve_escrow` at open and
+/// `outlet_stream_reserve_grant` at each credit grant (E2 remediation: the
+/// prior read-only `outlet_stream_member_balance` accessor only *read*
+/// `remaining`, so concurrent opens over-committed the budget; the reserve
+/// methods check-and-debit atomically under one context lock).
 #[test]
 fn native_stream_bridges_have_no_economy_sentinels() {
     for (bridge, src) in native_stream_sources() {
@@ -1368,9 +1372,15 @@ fn native_stream_bridges_have_no_economy_sentinels() {
              available-balance sentinel (N3) — wire MemberBudgetTracker"
         );
         assert!(
-            src.contains("outlet_stream_member_balance"),
-            "{bridge} outlet_stream.rs must query the real member balance \
-             via outlet_stream_member_balance (N3)"
+            src.contains("outlet_stream_reserve_escrow"),
+            "{bridge} outlet_stream.rs must reserve (and DEBIT) the real open-time \
+             escrow hold via outlet_stream_reserve_escrow (E2) — not a read-only \
+             balance query that lets concurrent opens over-commit"
+        );
+        assert!(
+            src.contains("outlet_stream_reserve_grant"),
+            "{bridge} outlet_stream.rs must reserve (and DEBIT) the per-grant \
+             escrow top-up via outlet_stream_reserve_grant before apply_credit_grant (E2)"
         );
     }
 }

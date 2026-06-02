@@ -460,6 +460,36 @@ pub enum ContextError {
     /// scope.
     #[error("{0}")]
     OutletInvocation(Box<OutletError>),
+
+    /// A §5.4.5 streaming-escrow reservation (open-time hold or per-grant
+    /// top-up) was rejected because the invoker's available budget — the
+    /// `MemberBudgetTracker` remaining, AND-composed with any spending-UCAN
+    /// `max_per_action` ceiling (§19.5) — is below the requested escrow.
+    ///
+    /// The reservation is the authoritative balance gate for streaming:
+    /// the hold is DEBITED on `MemberBudgetTracker` under the context lock
+    /// at the moment of acceptance, so two concurrent opens cannot both
+    /// reserve against the same balance. The unspent portion is refunded
+    /// at stream close (`outlet_stream_settle`).
+    ///
+    /// Maps to `OutletErrorClass::Economic::InsufficientFunds`
+    /// (`economic.insufficient-funds`, `SCP-TOOL-6150`) in the §5.4.4
+    /// outlet envelope and surfaces through the streaming bridges as
+    /// `OpenStreamRejection::InsufficientFunds`. Canonical code
+    /// `SCP-ECON-12012`.
+    #[error("SCP-ECON-12012: streaming escrow reservation insufficient funds: {0}")]
+    EscrowInsufficientFunds(String),
+
+    /// A §5.4.5 streaming-escrow reservation overflowed the `Amount`
+    /// (`u64`) field when computing `cost_per_chunk × count` via
+    /// `checked_mul`.
+    ///
+    /// Maps to `OutletErrorClass::Economic::EscrowOverflow`
+    /// (`economic.escrow-overflow`, `SCP-TOOL-6150`) and surfaces through
+    /// the streaming bridges as `OpenStreamRejection::EscrowOverflow`.
+    /// Canonical code `SCP-ECON-12013`.
+    #[error("SCP-ECON-12013: streaming escrow reservation overflow: {0}")]
+    EscrowOverflow(String),
 }
 
 impl From<OutletError> for ContextError {
