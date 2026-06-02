@@ -2583,9 +2583,23 @@ impl Drop for TransportManager {
 /// The bridge instance is captured as a [`std::sync::Weak`], not an `Arc`.
 /// Holding an `Arc<UniffiBridgeInstance>` here would keep the instance
 /// alive forever because this task is spawned on the shared tokio runtime
-/// (`tokio::spawn(...)`) and is NOT enrolled in the per-instance
+/// (`crate::runtime().spawn(...)`) and is NOT enrolled in the per-instance
 /// [`JoinSet`](scp_ffi_common::bridge_instance::CoreFields::task_handle)
 /// that `emergency_cancel_tasks` aborts.
+///
+/// # Runtime context (must spawn on the shared runtime handle)
+///
+/// This is spawned via `crate::runtime().spawn(...)` — the shared
+/// `&'static tokio::runtime::Runtime` handle — NOT a bare
+/// `tokio::spawn(...)`. The sole sync caller, `TransportManager::add_relay`,
+/// is a sync `#[uniffi::export]` method, which `UniFFI` runs on the foreign
+/// caller thread with NO ambient tokio runtime entered. After
+/// `add_relay`'s internal `runtime().block_on(...)` returns, the runtime
+/// context is gone, so a bare `tokio::spawn(...)` would panic ("there is no
+/// reactor running"). Spawning through the runtime handle works regardless
+/// of ambient context. This mirrors the `PyO3` reference bridge's
+/// `spawn_suppression_scoring_task` (`crates/scp-ffi/src/transport.rs`),
+/// which uses `rt.spawn(...)` for the same reason.
 ///
 /// Without a `Weak`, dropping the last `Arc<UniffiBridgeInstance>` from
 /// the caller side would not actually drop the instance: the task body
@@ -2605,7 +2619,10 @@ fn spawn_suppression_scoring_task(
     mut rx: tokio::sync::mpsc::Receiver<scp_transport::heartbeat::SuppressionSuspected>,
     relay_url: String,
 ) {
-    tokio::spawn(async move {
+    // Spawn on the shared runtime handle, not a bare `tokio::spawn`: the sync
+    // `TransportManager::add_relay` caller runs outside any tokio runtime
+    // context (see this fn's doc comment), so a bare spawn would panic.
+    crate::runtime().spawn(async move {
         loop {
             let suppression = tokio::select! {
                 () = cancel_token.cancelled() => {
@@ -16150,21 +16167,24 @@ mod tests {
             .expect("initial selector-routed connect must succeed");
         assert_eq!(handle.adapter_count(), 1);
 
-        // `add_relay` is a sync method that uses `runtime().block_on` for the
-        // connect and then `tokio::spawn`s its suppression-scoring task — the
-        // spawn needs an ambient reactor (in production the UniFFI dispatcher
-        // provides one). Run it inside `spawn_blocking` so the internal
-        // `block_on` is permitted (it runs on a blocking worker of the same
-        // runtime) and the suppression task's `tokio::spawn` sees the runtime
-        // context. This does not change what is under test: the connect still
-        // routes through the instance selector and falls open to WS.
+        // Invoke `add_relay` exactly as production does: it is a SYNC
+        // `#[uniffi::export]` method, which UniFFI runs on the foreign caller
+        // thread with NO ambient tokio runtime entered. Call it from a plain
+        // `std::thread` that never enters/spawns on a runtime, so this test
+        // genuinely exercises the sync production path. `add_relay` drives its
+        // own connect via the bridge's static `runtime().block_on(...)` and
+        // then spawns the suppression-scoring task on that same runtime handle.
+        //
+        // This is the regression guard for the suppression task's spawn: if it
+        // reverts to a bare `tokio::spawn(...)`, that spawn runs after
+        // `block_on` returns (when the runtime context is gone) and panics
+        // ("there is no reactor running"), failing this test. The prior
+        // `spawn_blocking` wrapper hid that panic by providing a runtime
+        // context the real sync export never has.
         let add_handle = Arc::clone(&handle);
-        let count = runtime()
-            .block_on(async move {
-                tokio::task::spawn_blocking(move || add_handle.add_relay(relay_url))
-                    .await
-                    .expect("spawn_blocking join must succeed")
-            })
+        let count = std::thread::spawn(move || add_handle.add_relay(relay_url))
+            .join()
+            .expect("add_relay thread must not panic — a panic here means the suppression task spawned without a runtime context")
             .expect("selector-routed add_relay to a no-QUIC relay must succeed via WS fallback");
         assert_eq!(
             count, 2,
