@@ -845,6 +845,36 @@ pub(crate) struct WasmOutletStreamSession {
     /// running executor, so credit exhaustion closes the stream
     /// instead of stalling.
     pub remaining_credit: u32,
+    /// §5.4.5:758 HARD cumulative billable-chunk ceiling pinned at open.
+    /// `Some(cap)` caps the *cumulative* number of billable `Data` chunks
+    /// the stream may ever emit (the WASM mirror of the runtime
+    /// `CreditTracker::max_billable`); `None` means unbounded (no declared
+    /// ceiling). Distinct from [`Self::remaining_credit`]: the credit
+    /// window is a *transient* per-grant budget that fresh
+    /// `outlet_stream_grant_credit` calls replenish, whereas this is a
+    /// HARD upper bound that NO number of grants can raise — once
+    /// [`Self::billed_emitted`] reaches it, `outlet_stream_next` closes the
+    /// stream with `execution.credit-exhausted` (`SCP-TOOL-6131`)
+    /// "regardless of executor behavior" (§5.4.5).
+    ///
+    /// WASM limitation (honest): the WASM bridge does NOT parse the UCAN
+    /// `nb` caveats to recover a VALIDATED-NARROWED `max_calls` (no
+    /// out-of-process operator / runtime `CreditTracker` per ADR-034). The
+    /// ceiling is sourced from the SDK-declared `estimated_chunk_count` at
+    /// open — the same value the SDK commits into the `caveats_binding`
+    /// preimage — used consistently as the cumulative billable cap. On the
+    /// native bridges the runtime coerces `max_calls` from the validated
+    /// caveats and takes `min(credit_window, max_calls)`; WASM treats the
+    /// declared estimate as the authoritative ceiling.
+    pub max_calls: Option<u32>,
+    /// Count of billable `Data` chunks emitted so far. Compared against
+    /// [`Self::max_calls`] by `outlet_stream_next` BEFORE popping a
+    /// billable `Data` chunk to enforce the §5.4.5:758 cumulative ceiling.
+    /// `Progress` chunks consume credit-window headroom but are NEVER
+    /// billed, so they do NOT advance this counter (matching the runtime's
+    /// `is_billable_chunk` / `record_billed_emission` semantics — only
+    /// `Data` chunks count toward `max_calls`).
+    pub billed_emitted: u32,
     /// Pinned invoker DID. The control-plane bridge functions
     /// (`outlet_stream_grant_credit`, `outlet_stream_cancel`,
     /// `outlet_stream_terminate`) verify `caller_did` matches this
@@ -1003,6 +1033,14 @@ pub struct OpenOutletStreamParams<'a> {
     /// session — no secret key is threaded through this params struct or
     /// retained on the session.
     pub credit_window: u32,
+    /// §5.4.5:758 HARD cumulative billable-chunk ceiling — `Some(cap)`
+    /// pins the maximum number of billable `Data` chunks the stream may
+    /// EVER emit (no number of credit grants can raise it); `None` means
+    /// unbounded. Sourced from the SDK-declared `estimated_chunk_count`
+    /// (the WASM bridge does not parse the UCAN `nb` caveats to recover a
+    /// VALIDATED-NARROWED `max_calls` per ADR-034 — see
+    /// [`WasmOutletStreamSession::max_calls`] for the honest limitation).
+    pub max_calls: Option<u32>,
 }
 
 /// Inputs passed to [`build_stream_chunks`]. Bundled to stay under the
@@ -2711,6 +2749,7 @@ impl WasmContextManager {
             caveats_binding,
             stream_epoch,
             credit_window,
+            max_calls,
         } = params;
 
         // CRITICAL #4: per-context admission gate. The tracker
@@ -2767,6 +2806,7 @@ impl WasmContextManager {
             caveats_binding,
             stream_epoch,
             credit_window,
+            max_calls,
         })
         .inspect_err(|_| {
             Self::release_admission_slot(
@@ -2805,6 +2845,7 @@ impl WasmContextManager {
             caveats_binding,
             stream_epoch,
             credit_window,
+            max_calls,
         } = params;
 
         let ctx = self.require_active_context_mut(context_id)?;
@@ -2935,6 +2976,11 @@ impl WasmContextManager {
                 // chunks (Data + Progress). End/Error are terminal and
                 // do NOT consume credit.
                 remaining_credit: credit_window,
+                // §5.4.5:758 cumulative billable ceiling pinned at open
+                // from the SDK-declared estimate (WASM does not parse the
+                // UCAN `nb` caveats — see `WasmOutletStreamSession::max_calls`).
+                max_calls,
+                billed_emitted: 0,
                 invoker_did: identity_did.to_owned(),
                 emitted_count: 0,
                 admission_released: false,
@@ -3124,6 +3170,53 @@ impl WasmContextManager {
             chunk.payload,
             ChunkPayload::Data { .. } | ChunkPayload::Progress { .. }
         );
+        // §5.4.5:758 the cumulative `max_calls` ceiling counts ONLY
+        // billable `Data` chunks — `Progress` chunks consume credit-window
+        // headroom (handled by `is_billable` below) but are NEVER billed,
+        // so they do not count toward `max_calls` (matching the runtime's
+        // `is_billable_chunk` predicate, which is `Data`-only).
+        let is_data = matches!(chunk.payload, ChunkPayload::Data { .. });
+
+        // §5.4.5:758 HARD cumulative billable ceiling. Checked BEFORE the
+        // credit-window gate (and before consuming any credit) so a stream
+        // that has already emitted `max_calls` billable `Data` chunks
+        // forwards no further billable chunk "regardless of executor
+        // behavior" — additional credit grants cannot raise this cap (the
+        // WASM mirror of `CreditTracker::cumulative_ceiling_reached`). On
+        // exhaustion the bridge replaces the would-be billable chunk with a
+        // synthetic terminal Error (`execution.credit-exhausted` /
+        // `SCP-TOOL-6131`) and closes the stream — the same lazy-generator
+        // pattern as the credit-window gate below.
+        if is_data
+            && session
+                .max_calls
+                .is_some_and(|cap| session.billed_emitted >= cap)
+        {
+            let sequence = Self::next_emission_sequence(session);
+            debug_assert_eq!(
+                sequence, chunk.sequence,
+                "credit-exhausted (max_calls) synthetic terminal sequence must equal \
+                 the suppressed billable chunk's sequence on the well-formed path"
+            );
+            let error_payload = ChunkPayload::Error {
+                code: CODE_EXECUTION_CREDIT.to_owned(),
+                message: format!(
+                    "{SLUG_EXECUTION_CREDIT_EXHAUSTED}: cumulative billable-chunk \
+                     ceiling reached (max_calls)"
+                ),
+                terminal: true,
+            };
+            // SCP-OUT-037 W1: sign on-demand under a transient key.
+            let synthetic = Self::sign_synthetic_terminal(session, sequence, error_payload)?;
+            session.terminated = true;
+            // Cumulative-ceiling closure is a hard stop — drop the
+            // suppressed billable chunk and any queued tail.
+            session.chunks.clear();
+            session.emitted_count = session.emitted_count.saturating_add(1);
+            // W3: release the admission slot on terminal observation.
+            Self::release_admission_once(&mut self.outlet_stream_admission, session);
+            return Some(synthetic);
+        }
 
         // §5.4.5 credit-based backpressure: every Data/Progress chunk
         // consumes one credit. Terminal chunks (End / terminal Error)
@@ -3169,6 +3262,17 @@ impl WasmContextManager {
                 return Some(synthetic);
             }
             session.remaining_credit = session.remaining_credit.saturating_sub(1);
+        }
+
+        // §5.4.5:758 advance the cumulative billable counter once a
+        // billable `Data` chunk has passed BOTH the cumulative-ceiling gate
+        // (above) and the credit-window gate, so it is now committed to
+        // forward. `Progress` chunks consume credit but are never billed,
+        // so they do not advance this counter (the WASM mirror of
+        // `CreditTracker::record_billed_emission`). Saturating so the
+        // counter never wraps.
+        if is_data {
+            session.billed_emitted = session.billed_emitted.saturating_add(1);
         }
 
         if is_terminal {
@@ -3319,6 +3423,32 @@ impl WasmContextManager {
                 message: "caller is not the pinned invoker for this stream (authorization.denied)"
                     .to_owned(),
                 code: codes::PERM_3001.to_owned(),
+            });
+        }
+
+        // HIGH-1 (R3): reject a grant on an already-closed stream — mirrors
+        // the `outlet_stream_cancel` idempotency guard and the native
+        // bridges' rejection of a credit grant against a terminated /
+        // cancelled session. A grant arriving after the stream closed is a
+        // protocol error, NOT a false success: returning the running total
+        // would imply the credit was applied when the stream can emit no
+        // further billable chunk. The WASM bridge carries no economy /
+        // escrow (operator == invoker per ADR-034), so there is no fund
+        // loss — but the false-success surface diverged from the native
+        // bridges and is closed here. Checked AFTER the composite-key
+        // lookup + invoker check (so an unknown session or wrong caller
+        // still surfaces the more specific 6101 / 3001 error) and BEFORE
+        // `monotonic_seq` is bumped (so a rejected grant never perturbs the
+        // strict-monotonic sequence).
+        if session.terminated || session.cancelled {
+            return Err(ScpWasmError::Context {
+                // ADR-049 §4: input-free static message — never echo the
+                // caller-supplied `request_id_hex` / `context_id` back. The
+                // `SCP-TOOL-6101` code + `protocol.stream-already-closed`
+                // slug carry the machine signal, matching the native
+                // bridges' rejection of a grant on a closed stream.
+                message: "stream already closed (protocol.stream-already-closed)".to_owned(),
+                code: CODE_PROTOCOL_SESSION.to_owned(),
             });
         }
 
@@ -7733,6 +7863,11 @@ mod tests {
             cancelled: false,
             total_credit: 0,
             remaining_credit,
+            // Tests that need a cumulative ceiling set `max_calls` on the
+            // returned session directly; the default helper leaves it
+            // unbounded so the existing credit-window tests are unaffected.
+            max_calls: None,
+            billed_emitted: 0,
             invoker_did: invoker_did.clone(),
             emitted_count: 0,
             admission_released: false,
@@ -9864,6 +9999,336 @@ mod tests {
         assert_eq!(session.total_credit, 5);
     }
 
+    /// HIGH-1 (R3) — a credit grant against an already-closed (terminated)
+    /// stream MUST be REJECTED with `protocol.stream-already-closed`
+    /// (`SCP-TOOL-6101`), NOT silently succeed. This mirrors
+    /// `outlet_stream_cancel`'s idempotency guard and the native bridges'
+    /// rejection of a grant on a closed session. A false success would
+    /// imply the credit was applied when the stream can emit no further
+    /// billable chunk.
+    #[test]
+    fn wasm_outlet_stream_grant_on_terminated_session_rejected() {
+        let mut mgr = WasmContextManager::new();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x43; 32]);
+        let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+        let request_id_hex = hex::encode(request_id);
+
+        let (mut session, invoker_did) = make_test_session(
+            &signing,
+            "ctx",
+            "outlet",
+            [0u8; 32],
+            request_id,
+            VecDeque::new(),
+            0,
+        );
+        // Drive the session to a terminal state, as a drained / terminal
+        // pull would.
+        session.terminated = true;
+        insert_test_session(&mut mgr, "ctx", &request_id_hex, session);
+
+        let err = mgr
+            .outlet_stream_grant_credit("ctx", &request_id_hex, &invoker_did, 5)
+            .expect_err("grant on a terminated stream MUST be rejected, not a false success");
+        match err {
+            ScpWasmError::Context { code, message } => {
+                assert_eq!(
+                    code,
+                    scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION,
+                    "closed-stream rejection carries SCP-TOOL-6101"
+                );
+                assert!(
+                    message.contains("protocol.stream-already-closed"),
+                    "rejection carries the protocol.stream-already-closed slug, got: {message}"
+                );
+            }
+            other => panic!("expected Context error, got {other:?}"),
+        }
+
+        // The rejected grant MUST NOT perturb session credit state.
+        let session = mgr
+            .outlet_streams
+            .get(&("ctx".to_owned(), request_id_hex.clone()))
+            .expect("session present");
+        assert_eq!(
+            session.total_credit, 0,
+            "rejected grant must not bump total_credit"
+        );
+        assert_eq!(
+            session.monotonic_seq, 0,
+            "rejected grant must not bump monotonic_seq"
+        );
+    }
+
+    /// HIGH-1 (R3) — same rejection applies to a `cancelled` (but not yet
+    /// drained) stream: a grant arriving after cancel is closed-stream and
+    /// MUST be rejected with `protocol.stream-already-closed`.
+    #[test]
+    fn wasm_outlet_stream_grant_on_cancelled_session_rejected() {
+        let mut mgr = WasmContextManager::new();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x44; 32]);
+        let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+        let request_id_hex = hex::encode(request_id);
+
+        let (mut session, invoker_did) = make_test_session(
+            &signing,
+            "ctx",
+            "outlet",
+            [0u8; 32],
+            request_id,
+            VecDeque::new(),
+            0,
+        );
+        session.cancelled = true;
+        insert_test_session(&mut mgr, "ctx", &request_id_hex, session);
+
+        let err = mgr
+            .outlet_stream_grant_credit("ctx", &request_id_hex, &invoker_did, 3)
+            .expect_err("grant on a cancelled stream MUST be rejected");
+        match err {
+            ScpWasmError::Context { code, message } => {
+                assert_eq!(
+                    code,
+                    scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION
+                );
+                assert!(message.contains("protocol.stream-already-closed"));
+            }
+            other => panic!("expected Context error, got {other:?}"),
+        }
+    }
+
+    /// HIGH-2 (R3) — the cumulative `max_calls` ceiling caps the total
+    /// number of billable `Data` chunks the stream may EVER emit. With
+    /// `max_calls = N` and a generous credit window, exactly N billable
+    /// chunks pass, then the next billable `Data` pull synthesises a
+    /// terminal `Error` with slug `execution.credit-exhausted`
+    /// (`SCP-TOOL-6131`). The cap is independent of the credit window —
+    /// the window here is wide enough that the credit-window gate never
+    /// fires; only the cumulative `max_calls` ceiling closes the stream.
+    #[test]
+    fn wasm_outlet_stream_next_enforces_max_calls_ceiling() {
+        use scp_protocol::context::outlets::stream::{ChunkPayload, sign_chunk};
+
+        // Pre-materialise 5 Data chunks. With max_calls = 2 only the first
+        // two pass; the third billable pull closes the stream.
+        const MAX_CALLS: u32 = 2;
+
+        let mut mgr = WasmContextManager::new();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x77; 32]);
+        let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+        let request_id_hex = hex::encode(request_id);
+        let caveats_binding = [0x99u8; 32];
+
+        let make_chunk = |seq: u64| {
+            let payload = ChunkPayload::Data {
+                value: serde_json::json!({"n": seq}),
+            };
+            let sig = sign_chunk(
+                &signing,
+                "ctx",
+                "outlet",
+                &request_id,
+                seq,
+                &caveats_binding,
+                &payload,
+            )
+            .expect("sign chunk");
+            scp_protocol::context::outlets::stream::OutletStreamChunk {
+                request_id,
+                sequence: seq,
+                payload,
+                sig,
+            }
+        };
+        let mut chunks: VecDeque<scp_protocol::context::outlets::stream::OutletStreamChunk> =
+            VecDeque::new();
+        for seq in 0..5 {
+            chunks.push_back(make_chunk(seq));
+        }
+
+        // Credit window of 100 — far wider than max_calls, so ONLY the
+        // cumulative ceiling can close the stream.
+        let (mut session, _invoker_did) = make_test_session(
+            &signing,
+            "ctx",
+            "outlet",
+            caveats_binding,
+            request_id,
+            chunks,
+            100,
+        );
+        session.max_calls = Some(MAX_CALLS);
+        insert_test_session(&mut mgr, "ctx", &request_id_hex, session);
+
+        // Exactly MAX_CALLS billable Data chunks pass through.
+        for expected_seq in 0..u64::from(MAX_CALLS) {
+            let c = mgr
+                .outlet_stream_next("ctx", &request_id_hex)
+                .expect("billable chunk within max_calls");
+            assert!(
+                matches!(c.payload, ChunkPayload::Data { .. }),
+                "chunk {expected_seq} should be Data"
+            );
+            assert_eq!(c.sequence, expected_seq);
+        }
+
+        // The (MAX_CALLS+1)-th billable pull synthesises the terminal
+        // credit-exhausted Error — the cumulative ceiling closes the
+        // stream regardless of remaining credit window.
+        let terminal = mgr
+            .outlet_stream_next("ctx", &request_id_hex)
+            .expect("synthetic terminal after cumulative ceiling reached");
+        match terminal.payload {
+            ChunkPayload::Error {
+                code,
+                terminal,
+                message,
+            } => {
+                assert!(terminal, "ceiling terminal MUST be terminal");
+                assert_eq!(
+                    code,
+                    scp_protocol::context::outlets::error_codes::CODE_EXECUTION_CREDIT,
+                    "cumulative-ceiling terminal carries SCP-TOOL-6131"
+                );
+                assert!(
+                    message.contains(
+                        scp_protocol::context::outlets::error_codes::SLUG_EXECUTION_CREDIT_EXHAUSTED
+                    ),
+                    "terminal carries the execution.credit-exhausted slug, got: {message}"
+                );
+            }
+            other => panic!("expected terminal Error, got {other:?}"),
+        }
+        assert_eq!(
+            terminal.sequence,
+            u64::from(MAX_CALLS),
+            "ceiling terminal lands at the suppressed chunk's sequence"
+        );
+
+        // Session billed exactly MAX_CALLS and is terminated; the next
+        // pull drains to None.
+        {
+            let s = mgr
+                .outlet_streams
+                .get(&("ctx".to_owned(), request_id_hex.clone()))
+                .expect("present until next-pull eviction");
+            assert_eq!(s.billed_emitted, MAX_CALLS, "billed exactly max_calls");
+            assert!(s.terminated, "ceiling closure flips terminated");
+        }
+        assert!(
+            mgr.outlet_stream_next("ctx", &request_id_hex).is_none(),
+            "queue cleared + evicted after the ceiling terminal"
+        );
+    }
+
+    /// HIGH-2 (R3) — `Progress` chunks consume credit-window headroom but
+    /// are NEVER billed, so they do NOT count toward the `max_calls`
+    /// cumulative ceiling (matching the runtime's `Data`-only
+    /// `is_billable_chunk` predicate). A stream of `Progress` chunks under
+    /// a `max_calls` cap is unaffected by the cap.
+    #[test]
+    fn wasm_outlet_stream_progress_does_not_count_toward_max_calls() {
+        use scp_protocol::context::outlets::stream::{ChunkPayload, sign_chunk};
+
+        let mut mgr = WasmContextManager::new();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x78; 32]);
+        let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+        let request_id_hex = hex::encode(request_id);
+        let caveats_binding = [0x88u8; 32];
+
+        let make_chunk = |seq: u64, payload: ChunkPayload| {
+            let sig = sign_chunk(
+                &signing,
+                "ctx",
+                "outlet",
+                &request_id,
+                seq,
+                &caveats_binding,
+                &payload,
+            )
+            .expect("sign chunk");
+            scp_protocol::context::outlets::stream::OutletStreamChunk {
+                request_id,
+                sequence: seq,
+                payload,
+                sig,
+            }
+        };
+        let mut chunks: VecDeque<scp_protocol::context::outlets::stream::OutletStreamChunk> =
+            VecDeque::new();
+        // Three Progress chunks then a terminal End. max_calls = 1 would
+        // close on the second BILLABLE Data chunk — but Progress is never
+        // billable, so all three pass and End closes cleanly.
+        chunks.push_back(make_chunk(
+            0,
+            ChunkPayload::Progress {
+                pct: 10,
+                note: None,
+            },
+        ));
+        chunks.push_back(make_chunk(
+            1,
+            ChunkPayload::Progress {
+                pct: 20,
+                note: None,
+            },
+        ));
+        chunks.push_back(make_chunk(
+            2,
+            ChunkPayload::Progress {
+                pct: 30,
+                note: None,
+            },
+        ));
+        chunks.push_back(make_chunk(
+            3,
+            ChunkPayload::End {
+                aggregate: serde_json::json!({"done": true}),
+                provenance: super::build_minimal_stream_end_provenance("ctx"),
+                execution_time_ms: 0,
+            },
+        ));
+
+        let (mut session, _invoker_did) = make_test_session(
+            &signing,
+            "ctx",
+            "outlet",
+            caveats_binding,
+            request_id,
+            chunks,
+            100,
+        );
+        session.max_calls = Some(1);
+        insert_test_session(&mut mgr, "ctx", &request_id_hex, session);
+
+        // All three Progress chunks pass despite max_calls = 1.
+        for expected_seq in 0..3 {
+            let c = mgr
+                .outlet_stream_next("ctx", &request_id_hex)
+                .expect("progress chunk not gated by max_calls");
+            assert!(
+                matches!(c.payload, ChunkPayload::Progress { .. }),
+                "chunk {expected_seq} should be Progress"
+            );
+        }
+        // The terminal End passes cleanly — never reached the ceiling.
+        let end = mgr
+            .outlet_stream_next("ctx", &request_id_hex)
+            .expect("terminal End");
+        assert!(
+            matches!(end.payload, ChunkPayload::End { .. }),
+            "terminal is a clean End, not a credit-exhausted Error"
+        );
+        let s = mgr
+            .outlet_streams
+            .get(&("ctx".to_owned(), request_id_hex.clone()))
+            .expect("present");
+        assert_eq!(
+            s.billed_emitted, 0,
+            "Progress chunks never advance billed_emitted"
+        );
+    }
+
     /// Test (SCP-OUT-037 critical fix #5) — `request_id` generated by
     /// `open_outlet_stream` is a `UUIDv7`. The version nibble of the 7th
     /// byte (`bytes[6] & 0xF0`) MUST equal `0x70` per RFC 9562 §5.7.
@@ -10010,7 +10475,10 @@ mod tests {
     /// SCP-OUT-037 W1: the signing key is NOT a param — the open path
     /// signs on-demand via `with_signing_key(identity_did)`, so the
     /// caller MUST have registered `identity_did`'s key first.
-    #[allow(clippy::needless_pass_by_value)]
+    // One-to-one constructor for the `OpenOutletStreamParams` FFI params
+    // struct — the arg count mirrors the struct fields (the same reason
+    // `too_many_arguments` is tolerated on the FFI param-bundle sites).
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
     fn open_params_for<'a>(
         context_id: &'a str,
         outlet_id: &'a str,
@@ -10019,6 +10487,7 @@ mod tests {
         caveats_binding: [u8; 32],
         stream_epoch: u64,
         credit_window: u32,
+        max_calls: Option<u32>,
     ) -> super::OpenOutletStreamParams<'a> {
         super::OpenOutletStreamParams {
             context_id,
@@ -10028,6 +10497,7 @@ mod tests {
             caveats_binding,
             stream_epoch,
             credit_window,
+            max_calls,
         }
     }
 
@@ -10073,6 +10543,7 @@ mod tests {
             caveats_binding,
             0,
             credit_window,
+            None,
         );
         let request_id_hex = mgr
             .open_outlet_stream(params)
@@ -10277,6 +10748,7 @@ mod tests {
             caveats_binding,
             0,
             32,
+            None,
         );
         let request_id_hex = mgr
             .open_outlet_stream(params)
@@ -10453,6 +10925,7 @@ mod tests {
             caveats_binding,
             0,
             0,
+            None,
         );
         let request_id_hex = mgr
             .open_outlet_stream(params)
@@ -11042,6 +11515,7 @@ mod tests {
             [0x11u8; 32],
             0,
             32,
+            None,
         );
         let err = mgr
             .open_outlet_stream(bad_params)
@@ -11082,6 +11556,7 @@ mod tests {
             [0x22u8; 32],
             0,
             32,
+            None,
         );
         let request_id_hex = mgr
             .open_outlet_stream(good_params)
