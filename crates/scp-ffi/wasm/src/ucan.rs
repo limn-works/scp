@@ -316,12 +316,24 @@ impl WasmUcanToken {
 /// 2. **BUILD** — Create trait impls (DID resolver, nonce tracker, etc.).
 /// 3. **CALL** — Call `validate_ucan()` from scp-protocol.
 /// 4. **WRITEBACK** — Record the validated nonce in the manager.
+///
+/// `caveat_resolver` is threaded as a PARAMETER (HIGH-3 / R3): this shared
+/// helper MUST NOT hardcode it, because BOTH the generic `ucan_validate`
+/// entry point AND the outlet-stream-open path funnel through here. The
+/// outlet caller passes `&TokenNbCaveatResolver` (opting Step 7b caveat
+/// attenuation + Step 11b time-box into the validation, reading each
+/// token's signed `nb`); the generic caller passes `&NoCaveatResolver`
+/// (preserving caveat-free behaviour — every token resolves to `None`, so
+/// Steps 7b/11b are skipped). Hardcoding either resolver here would either
+/// regress the generic path (false caveat rejections) or silently disable
+/// outlet caveat narrowing.
 fn run_validate_ucan(
     context_id: &str,
     token: &UcanToken,
     required_capability: &CapabilityUri,
     expected_aud_did: &str,
     proof_tokens: Option<&[String]>,
+    caveat_resolver: &dyn scp_protocol::crypto::ucan::validate::CaveatResolver,
 ) -> Result<(), String> {
     // 1. EXTRACT state from WasmContextManager.
     let (ceiling, creator_did, revoked_cids) =
@@ -371,7 +383,13 @@ fn run_validate_ucan(
         clock_skew_tolerance_secs:
             scp_protocol::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
         clock: &clock,
-        caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
+        // HIGH-3 (R3): the caveat resolver is threaded as a PARAMETER, never
+        // hardcoded in this shared helper. The outlet-open caller passes
+        // `&TokenNbCaveatResolver` so Step 7b (per-edge caveat narrow) and
+        // Step 11b (leaf time-box) run over the proof chain at open; the
+        // generic `ucan_validate` caller passes `&NoCaveatResolver`, keeping
+        // its behaviour unchanged.
+        caveat_resolver,
     };
 
     validate_ucan(token, required_capability, &mut ctx).map_err(|e| e.to_string())?;
@@ -452,12 +470,16 @@ pub fn ucan_validate(
             .into_js()
         })?;
 
+        // HIGH-3 (R3): the GENERIC validation entry point stays on
+        // `NoCaveatResolver` — UNCHANGED behaviour. Only the outlet-open
+        // path (`validate_outlet_ucan_wasm`) opts into caveat narrowing.
         run_validate_ucan(
             &context_id,
             &parsed,
             &required_capability,
             &expected_aud_did,
             proof_tokens.as_deref(),
+            &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
         )
         .map_err(|e| {
             ScpWasmError::Permission {
@@ -593,12 +615,20 @@ pub fn validate_outlet_ucan_wasm(
         .parse()
         .map_err(|e: UcanError| format!("invalid capability URI: {e}"))?;
 
+    // HIGH-3 (R3): the OUTLET-open path passes `TokenNbCaveatResolver` so
+    // Step 7b (per-edge caveat narrow) and Step 11b (leaf time-box) run at
+    // open over the proof chain — each token's signed `nb` is read as its
+    // VALIDATED-NARROWED caveat set, so a leaf `nb` WIDER than a proof
+    // caveat is rejected here (the §5.4.5 "effective_caveats MUST be the
+    // VALIDATED-NARROWED set" invariant). The generic `ucan_validate` path
+    // stays on `NoCaveatResolver` — only this surface opts in.
     run_validate_ucan(
         context_id,
         &parsed,
         &required_capability,
         identity_did,
         None,
+        &scp_protocol::crypto::ucan::validate::TokenNbCaveatResolver,
     )
 }
 
@@ -1096,6 +1126,7 @@ mod tests {
 
     /// Helper: run the full scp-protocol validation pipeline with pre-extracted
     /// state (for tests that don't have a `WasmContextManager`).
+    #[allow(clippy::too_many_arguments)]
     fn validate_with_extracted_state(
         token: &UcanToken,
         capability: &str,
@@ -1104,6 +1135,7 @@ mod tests {
         creator_did: &str,
         revoked_cids: &HashSet<String>,
         proof_tokens: Option<&[String]>,
+        caveat_resolver: &dyn scp_protocol::crypto::ucan::validate::CaveatResolver,
     ) -> Result<(), String> {
         let effective_ceiling = if ceiling.is_empty() {
             default_ceiling().to_ucan_string_set()
@@ -1141,7 +1173,11 @@ mod tests {
             clock_skew_tolerance_secs:
                 scp_protocol::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &clock,
-            caveat_resolver: &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
+            // HIGH-3 (R3): threaded as a parameter so a test can prove the
+            // resolver swap (TokenNbCaveatResolver vs NoCaveatResolver)
+            // changes the outcome — the same wiring the production
+            // `run_validate_ucan` uses.
+            caveat_resolver,
         };
 
         validate_ucan(token, &required_capability, &mut ctx).map_err(|e| e.to_string())
@@ -1183,6 +1219,10 @@ mod tests {
             &did,
             &HashSet::new(),
             None,
+            // Existing tests assert pre-caveat pipeline behaviour — keep
+            // them on NoCaveatResolver (HIGH-3 leaves the generic path
+            // unchanged).
+            &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
         );
 
         assert!(
@@ -1232,6 +1272,10 @@ mod tests {
             &did,
             &HashSet::new(),
             None,
+            // Existing tests assert pre-caveat pipeline behaviour — keep
+            // them on NoCaveatResolver (HIGH-3 leaves the generic path
+            // unchanged).
+            &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
         );
 
         // The pipeline should fail at step 9 (nonce format), NOT at step 6b.
@@ -1289,6 +1333,10 @@ mod tests {
             &did,
             &HashSet::new(),
             None,
+            // Existing tests assert pre-caveat pipeline behaviour — keep
+            // them on NoCaveatResolver (HIGH-3 leaves the generic path
+            // unchanged).
+            &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
         );
 
         assert!(result.is_err(), "pipeline should fail at nonce validation");
@@ -1344,6 +1392,10 @@ mod tests {
             &did,
             &HashSet::new(),
             None,
+            // Existing tests assert pre-caveat pipeline behaviour — keep
+            // them on NoCaveatResolver (HIGH-3 leaves the generic path
+            // unchanged).
+            &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
         );
 
         assert!(result.is_err(), "tampered signature must be rejected");
@@ -1395,6 +1447,7 @@ mod tests {
                 &did,
                 &HashSet::new(),
                 None,
+                &scp_protocol::crypto::ucan::validate::NoCaveatResolver,
             );
 
             assert!(
@@ -1407,5 +1460,165 @@ mod tests {
                 "expected Category A violation for '{resource}', got: {err}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // HIGH-3 (R3) — caveat resolver threading
+    //
+    // The shared `run_validate_ucan` helper threads `caveat_resolver` as a
+    // PARAMETER: the OUTLET-open caller (`validate_outlet_ucan_wasm`) passes
+    // `TokenNbCaveatResolver` (Step 7b caveat narrow + Step 11b time-box run
+    // over the proof chain at open), while the GENERIC `ucan_validate`
+    // caller passes `NoCaveatResolver` (UNCHANGED — caveats ignored). These
+    // tests prove the swap changes the outcome, using the same test-helper
+    // pipeline (`validate_with_extracted_state`, now resolver-parameterised)
+    // so the resolver choice is the ONLY variable.
+    // -----------------------------------------------------------------------
+
+    /// Builds an `InvocationCaveats` carrying only a `max_calls` ceiling and
+    /// the matching `origin_kind` the narrow rule requires (a `None`
+    /// `origin_kind` on the child is itself a violation, so every caveat
+    /// here pins `Query`). Used to construct a parent/child pair whose ONLY
+    /// narrow-relevant difference is `max_calls`.
+    fn caveats_with_max_calls(max_calls: u64) -> scp_protocol::trust::caveats::InvocationCaveats {
+        scp_protocol::trust::caveats::InvocationCaveats {
+            origin_kind: Some(scp_protocol::context::outlets::OutletKind::Query),
+            max_calls: Some(max_calls),
+            ..scp_protocol::trust::caveats::InvocationCaveats::empty()
+        }
+    }
+
+    /// HIGH-3 (R3) — a leaf token whose `nb` caveat WIDENS a parent proof's
+    /// caveat (`max_calls` child > parent) is REJECTED at Step 7b when the
+    /// OUTLET resolver (`TokenNbCaveatResolver`) is used, but the SAME chain
+    /// passes Step 7b when the GENERIC resolver (`NoCaveatResolver`) is used
+    /// — proving (a) the outlet path runs caveat narrowing and (b) the
+    /// generic path's behaviour is unchanged (caveats ignored).
+    #[test]
+    fn high3_wide_nb_leaf_rejected_under_token_nb_resolver_only() {
+        use scp_protocol::crypto::ucan::validate::{NoCaveatResolver, TokenNbCaveatResolver};
+
+        crate::identity::test_helpers::cleanup_identity_registry();
+        // Two distinct identities — a creator (root issuer) and a leaf
+        // delegate. A single self-delegated DID would trip the circular-
+        // delegation guard (Step 3), so the chain MUST have distinct issuers.
+        let (creator_did, _creator_id_key, creator_agent_key) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+        let (leaf_did, _leaf_id_key, leaf_agent_key) =
+            crate::identity::test_helpers::register_identity_with_agent_key();
+
+        let context_id = "test-ctx-high3-caveat";
+        // Category B capability so the #agent key passes the Step 6b
+        // Category A gate and the pipeline reaches Step 7 (attenuation).
+        let cap = format!("scp:ctx:{context_id}/messages:write");
+
+        // Parent (root) token: issued by creator → leaf. Caveat ceiling
+        // max_calls = 10. key_scope #agent (matches the #agent kid).
+        let parent_payload = UcanPayload {
+            iss: creator_did.clone(),
+            aud: leaf_did.clone(),
+            // Within the §9.14 24h ceiling so Step 11 (exp <= now + 24h) on
+            // the parent during chain verification passes — a far-future exp
+            // would be rejected at Step 3 before reaching the Step 7b narrow.
+            exp: crate::time::now_secs() + 3600,
+            nbf: None,
+            nnc: "parent-nonce".to_owned(),
+            att: vec![Attenuation {
+                with: cap.clone(),
+                can: "write".to_owned(),
+            }],
+            prf: vec![],
+            fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+            nb: Some(caveats_with_max_calls(10)),
+        };
+        let parent_jwt = build_signed_ucan(
+            &UcanHeader::with_kid("#agent".to_owned()),
+            &parent_payload,
+            &creator_agent_key,
+        );
+        let parent_cid = compute_proof_cid(&parent_jwt);
+
+        // Child (leaf) token: issued by leaf → leaf (presenting agent).
+        // Caveat WIDENS max_calls to 100 (> parent 10). prf references the
+        // parent so Step 3 chain verification + Step 4 root-issuer
+        // (creator == context creator) succeed and the pipeline reaches the
+        // Step 7b caveat narrow.
+        let child_payload = UcanPayload {
+            iss: leaf_did.clone(),
+            aud: leaf_did.clone(),
+            exp: crate::time::now_secs() + 3600,
+            nbf: None,
+            nnc: "child-nonce".to_owned(),
+            att: vec![Attenuation {
+                with: cap.clone(),
+                can: "write".to_owned(),
+            }],
+            prf: vec![parent_cid],
+            fct: Some(serde_json::json!({"scp_key_scope": "#agent"})),
+            nb: Some(caveats_with_max_calls(100)),
+        };
+        let child_jwt = build_signed_ucan(
+            &UcanHeader::with_kid("#agent".to_owned()),
+            &child_payload,
+            &leaf_agent_key,
+        );
+        let child = parse_ucan(&child_jwt).expect("child JWT parses");
+
+        let ceiling: HashSet<String> = std::iter::once("messages:write".to_owned()).collect();
+        let proofs = [parent_jwt];
+
+        // OUTLET path resolver: caveat narrow runs → wide-nb leaf REJECTED
+        // at Step 7b with a caveat-attenuation error.
+        let outlet_result = validate_with_extracted_state(
+            &child,
+            &cap,
+            &leaf_did,
+            &ceiling,
+            &creator_did,
+            &HashSet::new(),
+            Some(&proofs),
+            &TokenNbCaveatResolver,
+        );
+        let outlet_err = outlet_result.expect_err(
+            "wide-nb leaf MUST be rejected under TokenNbCaveatResolver (Step 7b narrow runs)",
+        );
+        let outlet_err_lc = outlet_err.to_lowercase();
+        assert!(
+            outlet_err_lc.contains("caveat") || outlet_err_lc.contains("attenuation"),
+            "outlet rejection must be a caveat/attenuation violation, got: {outlet_err}"
+        );
+
+        // GENERIC path resolver: caveats ignored → Step 7b is a no-op for
+        // the caveat narrow, so the chain does NOT fail on the caveat. It
+        // proceeds past Step 7b (failing later, at nonce — Step 9 — since
+        // these test nonces are not freshness-formatted). The key guarantee:
+        // the GENERIC path NEVER raises the caveat-widening error.
+        let generic_result = validate_with_extracted_state(
+            &child,
+            &cap,
+            &leaf_did,
+            &ceiling,
+            &creator_did,
+            &HashSet::new(),
+            Some(&proofs),
+            &NoCaveatResolver,
+        );
+        let generic_err = generic_result
+            .expect_err("test nonces are not freshness-valid, so the generic path still errors");
+        let generic_err_lc = generic_err.to_lowercase();
+        assert!(
+            !generic_err_lc.contains("caveat"),
+            "generic path (NoCaveatResolver) MUST NOT raise a caveat violation — it ignores nb; \
+             got: {generic_err}"
+        );
+        // Positive confirmation the generic path got PAST Step 7b (caveat
+        // narrow) to a later step — the failure is the nonce check, not the
+        // caveat. This proves the resolver swap is the only behavioural
+        // difference between the two paths.
+        assert!(
+            generic_err_lc.contains("nonce"),
+            "generic path should reach Step 9 (nonce) after skipping the caveat narrow, got: \
+             {generic_err}"
+        );
     }
 }

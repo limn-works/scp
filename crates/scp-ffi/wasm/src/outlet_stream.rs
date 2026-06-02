@@ -384,7 +384,7 @@ pub fn outlet_invoke_stream(
     stream_epoch: f64,
     _proof_tokens: Option<Vec<JsValue>>,
     credit_window: Option<u32>,
-    _estimated_chunk_count: Option<u32>,
+    estimated_chunk_count: Option<u32>,
 ) -> Promise {
     // Mirror `outlet_invoke`'s fail-closed gate — the WASM bridge
     // cannot enforce paid-context billing on the streaming path either.
@@ -475,6 +475,18 @@ pub fn outlet_invoke_stream(
         let effective_credit_window =
             credit_window.unwrap_or(scp_protocol::context::outlets::stream::DEFAULT_CREDIT_WINDOW);
 
+        // §5.4.5:758 cumulative billable-chunk ceiling (HIGH-2 / R3). The
+        // WASM bridge does NOT parse the UCAN `nb` caveats to recover a
+        // VALIDATED-NARROWED `max_calls` (no out-of-process operator /
+        // runtime `CreditTracker` per ADR-034 — honest limitation). It
+        // sources the ceiling from the SDK-declared `estimated_chunk_count`
+        // — the same value the SDK commits into the `caveats_binding`
+        // preimage via `compute_caveats_binding` — and pins it as the HARD
+        // cumulative cap on billable `Data` chunks. `None` (no declared
+        // estimate) means unbounded, matching the runtime's
+        // `max_billable = None` (no `max_calls` caveat) semantics.
+        let max_calls = estimated_chunk_count;
+
         let request_id_hex = with_manager(|mgr| {
             mgr.open_outlet_stream(crate::manager::OpenOutletStreamParams {
                 context_id: &context_id,
@@ -484,6 +496,7 @@ pub fn outlet_invoke_stream(
                 caveats_binding,
                 stream_epoch: stream_epoch_u64,
                 credit_window: effective_credit_window,
+                max_calls,
             })
         })
         .map_err(ScpWasmError::into_js)?;
@@ -604,19 +617,42 @@ pub const TERMINATE_REASON_REVOKED_MID_STREAM: u32 = 0;
 pub const TERMINATE_REASON_CANCEL_ACK_TIMEOUT: u32 = 1;
 /// `execution.credit-stall` wire-stable code (§5.4.5).
 pub const TERMINATE_REASON_CREDIT_STALL: u32 = 2;
+/// `protocol.context-closed-mid-stream` wire-stable code (§5.4.5
+/// round 8 — `SCP-TOOL-6101`, Protocol class). The hosting context was
+/// closed or the operator evicted/left while the stream was active.
+pub const TERMINATE_REASON_CONTEXT_CLOSED_MID_STREAM: u32 = 3;
+/// `execution.credit-exhausted` wire-stable code (§5.4.5:758 —
+/// `SCP-TOOL-6131`, Execution class).
+///
+/// The HARD cumulative billable-chunk ceiling (`min(credit_window,
+/// max_calls)`) was reached: no further billable chunk may flow regardless
+/// of executor behavior, and no credit grant can raise the cap. Lets the
+/// receiver-side framework re-check loop surface the same terminal cause
+/// the lazy `outlet_stream_next` gate emits internally.
+pub const TERMINATE_REASON_CREDIT_EXHAUSTED: u32 = 4;
 
 fn terminate_reason_from_u32(
     code: u32,
 ) -> Result<scp_protocol::context::outlets::stream::TerminateReason, ScpWasmError> {
     use scp_protocol::context::outlets::stream::TerminateReason;
+    // Total over the §5.4.5 closed `TerminateReason` set: every protocol
+    // variant has a wire-stable WASM code, so the WASM bridge can surface
+    // any framework-initiated termination cause the native bridges can —
+    // including the R3 `CreditExhausted` (`SCP-TOOL-6131`) the TypeScript
+    // `TerminateReasonSlug` exhaustiveness check depends on. New protocol
+    // variants MUST allocate a fresh monotonically-increasing code here;
+    // reusing a retired code would silently re-route past callers.
     match code {
         TERMINATE_REASON_REVOKED_MID_STREAM => Ok(TerminateReason::RevokedMidStream),
         TERMINATE_REASON_CANCEL_ACK_TIMEOUT => Ok(TerminateReason::CancelAckTimeout),
         TERMINATE_REASON_CREDIT_STALL => Ok(TerminateReason::CreditStall),
+        TERMINATE_REASON_CONTEXT_CLOSED_MID_STREAM => Ok(TerminateReason::ContextClosedMidStream),
+        TERMINATE_REASON_CREDIT_EXHAUSTED => Ok(TerminateReason::CreditExhausted),
         _ => Err(ScpWasmError::Validation {
             message: format!(
                 "unknown TerminateReason code {code}; expected 0 (RevokedMidStream), \
-                 1 (CancelAckTimeout), or 2 (CreditStall) (§5.4.4 closed set)"
+                 1 (CancelAckTimeout), 2 (CreditStall), 3 (ContextClosedMidStream), or \
+                 4 (CreditExhausted) (§5.4.4 closed set)"
             ),
             code: codes::VALID_7000.to_owned(),
         }),
@@ -642,6 +678,11 @@ fn terminate_reason_from_u32(
 ///   emit a terminal chunk within `stream_cancel_ack_secs`.
 /// - [`TERMINATE_REASON_CREDIT_STALL`] (2) — credit window remained at
 ///   zero past `stream_credit_stall_secs`.
+/// - [`TERMINATE_REASON_CONTEXT_CLOSED_MID_STREAM`] (3) — hosting context
+///   closed or operator evicted/left while the stream was active.
+/// - [`TERMINATE_REASON_CREDIT_EXHAUSTED`] (4) — §5.4.5:758 HARD
+///   cumulative billable-chunk ceiling reached; no further billable chunk
+///   may flow and no grant can raise the cap.
 ///
 /// Unknown codes are rejected with a `Validation` error. The canonical
 /// §5.4.4 slug + code carried by the synthetic chunk are derived
