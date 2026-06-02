@@ -115,6 +115,8 @@ The protocol invariant "every action traces to a human" (§04, §09) applies to 
 
 When reading protocol documents, "bridge" means bridge connector unless the context explicitly refers to FFI layer code.
 
+The FFI `BridgeInstance` is the layer that selects the storage backend and threads it into the supervisor. Storage selection at this layer MUST fail closed: if the caller selects a durable backend that cannot be opened, the `BridgeInstance` MUST return an error rather than silently falling back to in-memory or no storage. In-memory storage is reachable only via an explicit in-memory selection and is dev/test-only. The runtime never defaults storage — the `BridgeInstance` supplies it as a required parameter. These rules are normative in §17.6 ("In-Memory Storage Is Dev/Test-Only", "Storage Selection Fails Closed", "The Runtime Never Defaults Storage").
+
 ## 12.3 Shadow Identities
 
 When a bridge connector brings external platform participants into an SCP context, it creates **shadow identities** — protocol-level representations of entities that exist on the external platform but do not (yet) have native SCP identities.

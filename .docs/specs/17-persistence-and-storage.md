@@ -420,6 +420,22 @@ The `Storage` trait operates on opaque bytes. Platform-specific encryption happe
 | `FilesystemStorage` | Key -> file path | POSIX systems | Server/CLI, inspectable/debuggable storage | Phase 2 |
 | `WasmSqliteStorage` | wa-sqlite (TypeScript) | Browser WASM | Browser default | Phase 4 |
 
+### In-Memory Storage Is Dev/Test-Only
+
+In-memory storage — `InMemoryStorage`, the FFI-layer `BridgeInMemoryStorage`, and `EncryptingAdapter<InMemoryStorage>` — is a development and test affordance only. It MUST NOT be used as a production system-of-record.
+
+In-memory storage loses all state on process restart. For SCP, that state includes MLS group state, identity keys, the event log, and provenance records. Losing it on restart contradicts the durability and provenance tenets directly: a restarted node would silently lose its cryptographic membership, its append-only audit trail, and its identity. Production deployments MUST use a durable, encrypted backend — `SqliteStorage` (SQLCipher) is the default.
+
+### Storage Selection Fails Closed
+
+When a caller selects a durable storage backend (e.g. `Sqlite`) and the backend cannot be opened — bad path, insufficient permissions, corruption, or a wrong key/passphrase — the bridge or builder layer MUST return an error. Silent fallback to in-memory storage, or to no storage at all, is FORBIDDEN.
+
+In-memory storage is reachable only through an explicit in-memory selection (`{type: "in_memory"}`). It MUST NOT be reachable as a degradation path from a failed durable-backend open. A failed durable open is a terminal error the caller observes, not a condition the system silently recovers from by downgrading durability.
+
+### The Runtime Never Defaults Storage
+
+The runtime core (`scp-runtime`) MUST NOT manufacture or default a storage backend. Storage is supplied by the caller at the bridge or builder layer and threaded into the supervisor as a required (non-optional) parameter. This requirement is enforced by the type system — the supervisor construction surface takes storage as a non-`Option` argument, so there is no code path by which the runtime can run without a caller-supplied backend. The choice of backend (durable vs. in-memory) is made once, at the bridge/builder layer, never silently inside the runtime.
+
 ### SQLite Is the Universal Default
 
 Via `rusqlite`, SQLite works on every native platform: iOS, Android, macOS, Linux, Windows, Python (PyO3), Node (napi-rs). The Rust core bundles its own SQLite — no system dependency. Platform-specific ORMs (SwiftData, Room, Core Data) are unnecessary; the SDK calls through FFI into the Rust core's bundled SQLite. This is the same pattern Mozilla uses for Firefox mobile.
@@ -447,6 +463,47 @@ derived_key = hex_encode(okm)             // 64 hex characters for PRAGMA key
 ```
 
 The `ikm` is the raw private key bytes of the `#0` Identity Key, retrieved from platform key custody (iOS Keychain, Android Keystore, macOS Keychain, or OS keyring). The HKDF domain separation (`"SCP-SQLCIPHER-KEY-V1"`) ensures the derived key is distinct from any signing key, preventing cross-protocol attacks. The DID in the `info` parameter binds the database to a specific identity — databases for different identities on the same device use different encryption keys.
+
+This HKDF-from-identity-key derivation is the **raw-key mode**: the caller supplies 32 bytes of key material (the `#0` identity key bytes) and the SQLCipher PRAGMA key is derived deterministically from them. Raw-key mode is the default and is unchanged by the passphrase mode defined below.
+
+#### Passphrase Key-Derivation Mode
+
+Some SDK callers supply a human-chosen passphrase rather than raw key material (for example, a CLI or desktop deployment with no platform key custody and no `#0` identity key available at database-open time). For these callers, the SQLCipher PRAGMA key MAY instead be derived from a passphrase using **Argon2id**. The caller selects exactly one derivation mode: raw-key (above) or passphrase. The two modes are mutually exclusive — supplying both is a validation error.
+
+Passphrase derivation MUST use the following parameters, which are NORMATIVE and MUST be identical to the platform key-custody Argon2id parameters (§17.8, `FileKeyCustody`):
+
+```
+algorithm  = Argon2id
+version    = 0x13                              // Argon2 v1.3
+m_cost     = 65536                             // 65536 KiB = 64 MiB memory
+t_cost     = 3                                 // 3 iterations
+p_cost     = 1                                 // parallelism = 1
+output_len = 32                                // 32-byte derived key
+input      = passphrase (UTF-8 bytes)
+salt       = per-database 16-byte salt         // see Salt Persistence below
+derived_key = hex_encode(argon2id(...))        // 64 hex characters for PRAGMA key
+```
+
+A single Argon2id parameterization across the entire codebase is REQUIRED. The passphrase-mode SQLCipher key derivation and the `FileKeyCustody` passphrase-to-wrapping-key derivation MUST share one parameter source; implementations MUST NOT define a second, divergent Argon2id parameter set. The derived 32-byte key feeds the same SQLCipher PRAGMA-key path as raw-key mode (identical `cipher_page_size`, `kdf_iter`, HMAC, and KDF PRAGMAs below).
+
+The passphrase and every intermediate buffer carrying it (and the derived key) MUST be held in zeroizing memory and cleared on drop.
+
+#### Salt Persistence
+
+The Argon2id salt is per-database and persisted, because passphrase derivation MUST be deterministic across process restarts — the same passphrase MUST re-derive the same key, or the database becomes permanently unreadable.
+
+- The salt is generated **once** — 16 bytes from a cryptographically secure RNG — when the database directory is first initialized.
+- The salt is persisted to a sidecar file `{dir}/scp.salt`, located **outside** the encrypted `{dir}/scp.db`. The salt is required to derive the key that decrypts the database, so it MUST NOT live inside the encrypted database (that would be a bootstrap deadlock).
+- The salt file MUST be written atomically (write to a temporary file, then rename).
+- On reopen, the existing `{dir}/scp.salt` is read so the same passphrase deterministically re-derives the same key.
+
+A salt is not secret — it is integrity-relevant only. Its presence and length, however, are load-bearing, so the following conditions MUST fail closed (return an error; the system MUST NOT proceed):
+
+- A missing `{dir}/scp.salt` beside an existing `{dir}/scp.db`. The system MUST NOT regenerate the salt: a fresh salt would derive a different key and permanently brick the existing database.
+- A `{dir}/scp.salt` of the wrong length (not 16 bytes).
+- A wrong passphrase. SQLCipher rejects the derived key on the first query against the database; the system MUST surface this as a fail-closed error and MUST NOT silently create or open a fresh, empty database.
+
+Only the first-initialization case — no `scp.db` and no `scp.salt` — generates and writes a new salt.
 
 **SQLCipher configuration:**
 
@@ -573,6 +630,22 @@ Key custody is NOT part of this spec — it is the existing `KeyCustody` trait (
 | Browser | WebCrypto + IndexedDB (non-extractable CryptoKey) | Ed25519 (Chrome 113+, Firefox 130+, Safari 17+) | Ephemeral in incognito |
 | Python/Node/Server | Software keys in SQLCipher-encrypted SQLite | Ed25519, X25519 | No hardware key store on typical servers |
 | Testing | `InMemoryKeyCustody` | Ed25519, X25519 | Already defined (ADR-006) |
+
+### FileKeyCustody Argon2id Parameters
+
+The software-key custody backend for non-HSM platforms (`FileKeyCustody`, the universal fallback used by the Python/Node/Server row above) derives an AES-256 wrapping key from a passphrase using Argon2id. Its parameters are the canonical Argon2id parameterization for the codebase and MUST be:
+
+```
+algorithm  = Argon2id
+version    = 0x13                              // Argon2 v1.3
+m_cost     = 65536                             // 65536 KiB = 64 MiB memory
+t_cost     = 3                                 // 3 iterations
+p_cost     = 1                                 // parallelism = 1
+output_len = 32                                // 32-byte derived key
+salt       = per-file 16-byte salt             // generated once, persisted with the custody file
+```
+
+These are the same parameters the SQLCipher passphrase key-derivation mode (§17.6) MUST use. A single Argon2id parameterization is REQUIRED across the codebase: both the `FileKeyCustody` passphrase-to-wrapping-key derivation and the SQLCipher passphrase-to-PRAGMA-key derivation MUST draw from one shared parameter source. Implementations MUST NOT define a second, divergent Argon2id parameter set.
 
 ## 17.9 OpenMLS StorageProvider Bridge
 
