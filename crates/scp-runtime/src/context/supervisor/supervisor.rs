@@ -1088,7 +1088,7 @@ impl Supervisor {
     /// - [`ContextError::TransportTimeout`] is surfaced through the
     ///   oneshot reply, not the method result.
     pub async fn dispatch_lifecycle_command(
-        &self,
+        self: &Arc<Self>,
         cmd: LifecycleCommand,
     ) -> Result<Outcome<()>, ContextError> {
         // ADR-049 Phase 2A finalization — bootstrap variants always
@@ -1132,19 +1132,29 @@ impl Supervisor {
     /// Mirrors [`Self::dispatch_standing_direct`]: each arm wraps the
     /// supervisor-scoped body in a 30s timeout matching the actor-
     /// handler shape (plan §"Transport timeouts inside actor handlers")
-    /// and relays the typed reply on the variant's oneshot. The
-    /// bootstrap arms delegate to the legacy `&Supervisor`-shape helpers
-    /// in [`crate::context::lifecycle_helpers_legacy`] (designated
-    /// survivors — the supervisor cannot synthesize the full
-    /// `ActorDeps` bundle that the actor-shape helpers require because
-    /// `OpenMlsStorageAdapter` and per-identity `KeyPackageStoreHandle`
-    /// are caller-supplied at FFI boundary, not stored on the
-    /// supervisor). Per-context variants surface
-    /// `ContextError::ContextNotRegistered` when they reach this method
-    /// — they should never get here once bootstrap dual-write is in
-    /// place.
+    /// and relays the typed reply on the variant's oneshot.
+    ///
+    /// **Bootstrap arms (Create / Import / Restore)** build an
+    /// [`ActorDeps`](crate::context::actor::deps::ActorDeps) bundle via
+    /// [`Self::build_actor_deps`] (self-sourced from the supervisor's own
+    /// provider slots — `OpenMlsStorageAdapter` is now the supervisor's
+    /// `mls_storage` slot and the per-identity `KeyPackageStoreHandle` is
+    /// get-or-spawned, both since the storage-foundation reshape) and
+    /// delegate to the actor-shape helpers in
+    /// [`crate::context::lifecycle_helpers`]. Those helpers spawn the
+    /// per-context actor (`spawn_actor_for_context`) while continuing to
+    /// dual-write the legacy `contexts` `DashMap` during the ADR-049
+    /// Phase 2A transition window. Building deps requires
+    /// `self: &Arc<Self>` so the spawned actor and its handle wrap the
+    /// same supervisor instance.
+    ///
+    /// **Per-context variants** (Join / Leave / Close / Export +
+    /// access-key generate / revoke / restore) still delegate to the
+    /// designated-legacy `&Supervisor`-shape helpers in
+    /// [`crate::context::lifecycle_helpers_legacy`]; they reach this
+    /// method only when no actor is registered for the target context.
     #[allow(clippy::too_many_lines)] // flat match over every lifecycle variant
-    async fn dispatch_lifecycle_direct(&self, cmd: LifecycleCommand) -> Outcome<()> {
+    async fn dispatch_lifecycle_direct(self: &Arc<Self>, cmd: LifecycleCommand) -> Outcome<()> {
         use crate::context::lifecycle_helpers_legacy;
         const LIFECYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -1158,8 +1168,26 @@ impl Supervisor {
             LifecycleCommand::CreateContext { payload, reply } => {
                 let p = *payload;
                 let context_id = p.context_id.clone();
-                let fut = lifecycle_helpers_legacy::create_context_legacy(
-                    self,
+                // ADR-049 Phase 2A finalization: bootstrap now builds the
+                // actor-shape `ActorDeps` (self-sourced from the
+                // supervisor's provider slots, scoped to the creator's
+                // identity for KeyPackageStore resolution) and delegates
+                // to `lifecycle_helpers::create_context`, which spawns the
+                // per-context actor (and dual-writes the legacy DashMap).
+                let deps = match self.build_actor_deps(&p.creator_did).await {
+                    Ok(deps) => deps,
+                    Err(e) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        let err =
+                            scp_protocol::context::builder::ContextCreationError::CreationFailed(
+                                format!("create_context: deps unavailable: {e}"),
+                            );
+                        let _ = reply.send(Err(err));
+                        return Outcome::err_mutated(sketch);
+                    }
+                };
+                let fut = crate::context::lifecycle_helpers::create_context(
+                    &deps,
                     p.context_id,
                     p.params,
                     p.creator_did,
@@ -1191,12 +1219,37 @@ impl Supervisor {
             }
             LifecycleCommand::ImportContext { export, reply } => {
                 let context_id = export.snapshot.context_id.clone();
+                // ADR-049 Phase 2A finalization: scope the actor-shape
+                // deps to a deterministic member of the imported roster
+                // (the lexicographically-minimum member DID). The import
+                // path never consumes the resolved `KeyPackageStoreHandle`
+                // (it rehydrates a snapshot rather than joining), so the
+                // identity choice only selects which per-identity store
+                // actor is touched; picking the min member DID keeps it
+                // deterministic and a genuine context participant rather
+                // than fabricating one. An empty roster falls back to the
+                // context id so deps construction never panics.
+                let owning_did = export
+                    .snapshot
+                    .membership
+                    .members()
+                    .map(|m| m.did.clone())
+                    .min()
+                    .unwrap_or_else(|| DID(context_id.clone()));
+                let deps = match self.build_actor_deps(&owning_did).await {
+                    Ok(deps) => deps,
+                    Err(e) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        let _ = reply.send(Err(e));
+                        return Outcome::err_mutated(sketch);
+                    }
+                };
                 // Box::pin — the per-variant import future crosses
                 // clippy's 16 KB stack budget (ContextExport ~2 KB +
                 // the full PerContextState-construction locals inside
-                // the legacy `import_context` body).
-                let fut = Box::pin(lifecycle_helpers_legacy::import_context_legacy(
-                    self, *export,
+                // the `import_context` body).
+                let fut = Box::pin(crate::context::lifecycle_helpers::import_context(
+                    &deps, *export,
                 ));
                 let (outcome, reply_result) = match tokio::time::timeout(LIFECYCLE_TIMEOUT, fut)
                     .await
@@ -1229,8 +1282,31 @@ impl Supervisor {
                     let _ = reply.send(Err(e));
                     return Outcome::err(sketch);
                 }
-                let fut = Box::pin(lifecycle_helpers_legacy::restore_context_legacy(
-                    self,
+                // ADR-049 Phase 2A finalization: the restore payload
+                // carries no identity (it rehydrates a persisted snapshot
+                // rather than joining), and `restore_context` never
+                // consumes the resolved `KeyPackageStoreHandle`. Scope the
+                // deps to a registered local DID when one exists (the node
+                // performing the restore), falling back to a context-id-
+                // derived seed so deps construction stays deterministic
+                // and never fabricates a foreign participant.
+                let owning_did = self
+                    .local_dids_ref()
+                    .load()
+                    .iter()
+                    .min()
+                    .cloned()
+                    .unwrap_or_else(|| DID(p.context_id.clone()));
+                let deps = match self.build_actor_deps(&owning_did).await {
+                    Ok(deps) => deps,
+                    Err(e) => {
+                        let sketch = standing_outcome_error_sketch(&e);
+                        let _ = reply.send(Err(e));
+                        return Outcome::err_mutated(sketch);
+                    }
+                };
+                let fut = Box::pin(crate::context::lifecycle_helpers::restore_context(
+                    &deps,
                     &p.context_id,
                     &handle,
                 ));
@@ -3088,7 +3164,7 @@ impl Supervisor {
     ///
     /// - [`ContextError::PersistenceFailed`] if the persistence
     ///   provider is unconfigured or `list_persisted_contexts` fails.
-    pub async fn restore_all_contexts(&self) -> Result<Vec<String>, ContextError> {
+    pub async fn restore_all_contexts(self: &Arc<Self>) -> Result<Vec<String>, ContextError> {
         crate::context::lifecycle_helpers::restore_all_contexts(self).await
     }
 
@@ -3105,7 +3181,7 @@ impl Supervisor {
     ///
     /// Propagates [`ContextError`] from the handler.
     pub async fn restore_context(
-        &self,
+        self: &Arc<Self>,
         context_id: &str,
         handle: &crate::context::ContextHandle,
     ) -> Result<(), ContextError> {
@@ -3560,7 +3636,7 @@ impl Supervisor {
     /// fails. A dropped reply channel maps to
     /// [`ContextCreationError::CreationFailed`](scp_protocol::context::builder::ContextCreationError::CreationFailed).
     pub async fn create_context(
-        &self,
+        self: &Arc<Self>,
         context_id: String,
         params: scp_protocol::context::ContextParams,
         creator_did: DID,
@@ -3604,7 +3680,7 @@ impl Supervisor {
     ///
     /// Propagates [`ContextError`] from the handler.
     pub async fn join_context(
-        &self,
+        self: &Arc<Self>,
         handle: &crate::context::ContextHandle,
         key_package: scp_protocol::context::membership::KeyPackage,
         spending_ucan: Option<&scp_protocol::crypto::ucan::UcanToken>,
@@ -3638,7 +3714,7 @@ impl Supervisor {
     ///
     /// Propagates [`ContextError`] from the handler.
     pub async fn leave_context(
-        &self,
+        self: &Arc<Self>,
         handle: &crate::context::ContextHandle,
         caller_did: &DID,
         member_did: &DID,

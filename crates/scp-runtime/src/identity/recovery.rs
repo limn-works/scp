@@ -1934,7 +1934,7 @@ mod tests {
 
     /// Helper to create a context in the manager for testing.
     async fn setup_context(
-        manager: &crate::context::supervisor::Supervisor,
+        manager: &Arc<crate::context::supervisor::Supervisor>,
         context_id: &str,
         creator_did: &DID,
     ) {
@@ -1943,7 +1943,7 @@ mod tests {
 
     /// Helper to create a context with the creator and additional members.
     async fn setup_context_with_members(
-        manager: &crate::context::supervisor::Supervisor,
+        manager: &Arc<crate::context::supervisor::Supervisor>,
         context_id: &str,
         creator_did: &DID,
         additional_members: &[&DID],

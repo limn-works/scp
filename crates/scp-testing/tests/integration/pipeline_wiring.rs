@@ -52,6 +52,16 @@ const MANAGER_SRC: &str = concat!(
 const PROVIDER_SRC: &str =
     include_str!("../../../../crates/scp-runtime/src/crypto/mls/provider.rs");
 
+// Supervisor dispatch source — owns `dispatch_lifecycle_direct`, whose
+// bootstrap arms (Create / Import / Restore) moved to the actor-shape
+// `lifecycle_helpers::{create,import,restore}_context` in the ADR-049
+// Phase 2A finalization (storage-foundation keystone). The structural
+// assertion below pins that wiring so a future refactor cannot silently
+// regress the bootstrap path back to the `_legacy` `&Supervisor` helpers
+// (which no longer spawn a per-context actor).
+const SUPERVISOR_SRC: &str =
+    include_str!("../../../../crates/scp-runtime/src/context/supervisor/supervisor.rs");
+
 // WASM bridge sources. Bridge has its own consequence-dispatch path and is
 // asserted separately below — scp-runtime and scp-ffi-wasm are two parallel
 // implementations of the same protocol and both must honor the wiring.
@@ -77,7 +87,7 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 38;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 39;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -196,6 +206,44 @@ fn deliver_incoming_calls_open() {
                 && fn_body_contains(MANAGER_SRC, "decrypt_and_dispatch", ".open(")),
         "deliver_incoming must call crypto.open (envelope pipeline), either directly \
          or via decrypt_and_dispatch"
+    );
+}
+
+// Supervisor level: the lifecycle bootstrap arms spawn a real per-context
+// actor by delegating to the actor-shape `lifecycle_helpers::*` bodies
+// (each of which calls `spawn_actor_for_context`). ADR-049 Phase 2A
+// finalization. This is an additive assertion — `dispatch_lifecycle_direct`
+// still references the `_legacy` helpers for the per-context Join / Leave /
+// Close / Export / AccessKey arms, so we pin the presence of the actor-shape
+// bootstrap calls rather than the absence of all legacy references.
+#[test]
+fn dispatch_lifecycle_direct_bootstrap_arms_call_actor_shape_helpers() {
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "dispatch_lifecycle_direct",
+            "lifecycle_helpers::create_context("
+        ),
+        "dispatch_lifecycle_direct CreateContext arm must delegate to the \
+         actor-shape lifecycle_helpers::create_context (spawns the per-context actor)"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "dispatch_lifecycle_direct",
+            "lifecycle_helpers::import_context("
+        ),
+        "dispatch_lifecycle_direct ImportContext arm must delegate to the \
+         actor-shape lifecycle_helpers::import_context (spawns the per-context actor)"
+    );
+    assert!(
+        fn_body_contains(
+            SUPERVISOR_SRC,
+            "dispatch_lifecycle_direct",
+            "lifecycle_helpers::restore_context("
+        ),
+        "dispatch_lifecycle_direct RestoreContext arm must delegate to the \
+         actor-shape lifecycle_helpers::restore_context (spawns the per-context actor)"
     );
 }
 

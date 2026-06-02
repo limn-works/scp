@@ -185,6 +185,13 @@ pub async fn export_context_legacy(
 /// See the legacy method's doc comment for the full C3 per-instance wipe
 /// policy, consequence-rule validation, and crypto-state restore
 /// semantics. Byte-identical behavior.
+// ADR-049 Phase 2A finalization: the `ImportContext` dispatch arm now
+// routes to the actor-shape `lifecycle_helpers::import_context`, so this
+// `&Supervisor`-shape body has no remaining caller. It is retained
+// (un-deleted) in this step because a subsequent finalization step owns
+// the bulk removal of the orphaned lifecycle bootstrap legacy bodies;
+// removing it here would be out of this step's scope.
+#[allow(dead_code)] // retained until the legacy-body deletion finalization step
 #[allow(clippy::too_many_lines)] // Reimport guard adds 10 lines to an already-100-line function.
 pub async fn import_context_legacy(
     supervisor: &Supervisor,
@@ -1719,6 +1726,12 @@ pub async fn close_context_with_key_legacy(
 /// Returns [`ContextError::PersistenceFailed`] if no persistence
 /// provider is configured, no snapshot exists, or the load operation
 /// fails.
+// ADR-049 Phase 2A finalization: only reachable from
+// `restore_context_legacy`, which lost its dispatch caller when the
+// `RestoreContext` arm moved to the actor-shape
+// `lifecycle_helpers::restore_context`. Retained until the legacy-body
+// deletion finalization step.
+#[allow(dead_code)] // retained until the legacy-body deletion finalization step
 pub fn load_persisted_context_state_legacy(
     supervisor: &Supervisor,
     context_id: &str,
@@ -1762,6 +1775,10 @@ pub fn load_persisted_context_state_legacy(
 ///
 /// Hoisted from `ContextManager::restore_event_log_best_effort`
 /// (ADR-049 commit 12). Byte-identical behavior.
+// ADR-049 Phase 2A finalization: only reachable from
+// `restore_context_legacy` (now caller-less). Retained until the
+// legacy-body deletion finalization step.
+#[allow(dead_code)] // retained until the legacy-body deletion finalization step
 fn restore_event_log_best_effort_legacy(supervisor: &Supervisor, context_id: &str) {
     use crate::context::state::context_id_to_bytes;
     let ctx_id_bytes = context_id_to_bytes(context_id);
@@ -1805,6 +1822,12 @@ fn restore_event_log_best_effort_legacy(supervisor: &Supervisor, context_id: &st
 /// Returns [`ContextError::PersistenceFailed`] if no persisted state
 /// exists. Returns [`ContextError::MembershipFailed`] if the context
 /// cannot be inserted (already registered).
+// ADR-049 Phase 2A finalization: the `RestoreContext` dispatch arm now
+// routes to the actor-shape `lifecycle_helpers::restore_context`, so this
+// `&Supervisor`-shape body has no remaining caller. Retained (un-deleted)
+// in this step; the bulk removal of the orphaned lifecycle bootstrap
+// legacy bodies belongs to a subsequent finalization step.
+#[allow(dead_code)] // retained until the legacy-body deletion finalization step
 #[tracing::instrument(skip_all, fields(context_id))]
 #[allow(clippy::too_many_lines)]
 pub async fn restore_context_legacy(

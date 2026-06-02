@@ -2011,7 +2011,7 @@ pub async fn restore_context(
 /// - [`ContextError::PersistenceFailed`] if the persistence provider
 ///   is unconfigured or `list_persisted_contexts` fails.
 pub async fn restore_all_contexts(
-    supervisor: &crate::context::supervisor::Supervisor,
+    supervisor: &Arc<crate::context::supervisor::Supervisor>,
 ) -> Result<Vec<String>, ContextError> {
     let Some(persistence) = supervisor.persistence_ref() else {
         return Err(ContextError::PersistenceFailed(
