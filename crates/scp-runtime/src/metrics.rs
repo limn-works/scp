@@ -14,6 +14,7 @@
 //! | `scp_mls_encrypt_duration_seconds`| Histogram | MLS + sender key encryption latency            |
 //! | `scp_mls_decrypt_duration_seconds`| Histogram | MLS + sender key decryption latency            |
 //! | `scp_persistence_failures_total`  | Counter   | Persistence write failures (best-effort saves) |
+//! | `scp_pseudonym_announcements_rejected_total` | Counter | Rejected pseudonym announcements (reserved value or cross-DID RID collision, §9.10.4) |
 //! | `scp_active_contexts`             | Gauge     | Number of registered (active) contexts         |
 //! | `scp_buffer_occupancy`            | Gauge     | Total events buffered across all contexts      |
 //!
@@ -42,6 +43,16 @@ pub fn record_decrypt_duration(duration: std::time::Duration) {
 /// Records a persistence failure (counter).
 pub fn record_persistence_failure() {
     metrics::counter!("scp_persistence_failures_total").increment(1);
+}
+
+/// Records a rejected pseudonym announcement (§9.10.4).
+///
+/// Incremented when an ingested `PseudonymAnnouncement` is dropped because it
+/// uses a reserved routing ID value or collides with a routing ID already
+/// claimed by a different member. A nonzero rate here signals either a
+/// misbehaving/forging peer or a routing-ID derivation bug.
+pub fn record_pseudonym_announcement_rejected() {
+    metrics::counter!("scp_pseudonym_announcements_rejected_total").increment(1);
 }
 
 /// Sets the active context gauge to the given count.

@@ -93,6 +93,17 @@ fn reconstruct_broadcast_context_for_import(
         .filter(|did| role_state.member_has_capability(did.as_ref(), &Capability::MessagesWrite))
         .collect();
     author_dids.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+    // A broadcast context with zero authors cannot publish content and is
+    // almost certainly a malformed or partial export (no member carries
+    // `messages:write` in the imported role state). Silently producing it
+    // is a diagnosability gap, so surface it — the import still proceeds
+    // (a node may legitimately re-grant authors after import).
+    if author_dids.is_empty() {
+        tracing::warn!(
+            context_id,
+            "broadcast context import produced an empty author roster — no member holds messages:write; likely a malformed or partial export"
+        );
+    }
     for did in author_dids {
         // `add_author` only errors on a duplicate; the dedup above plus the
         // membership invariant (one entry per DID) means this cannot collide.

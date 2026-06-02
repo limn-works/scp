@@ -337,6 +337,7 @@ fn deliver_plaintext_or_announcement(
         // every honest sender's app-data fan-out, defeating unlinkability or
         // leaking ciphertext onto the shared channel.
         if is_reserved_pseudonym(&announcement.pseudonym, context_id) {
+            crate::metrics::record_pseudonym_announcement_rejected();
             tracing::warn!(
                 context_id,
                 sender_did,
@@ -353,6 +354,7 @@ fn deliver_plaintext_or_announcement(
             // is still allowed. Leave the registry unchanged on collision.
             if pseudonym_collides_with_other_did(pseudonym_registry, &did, &announcement.pseudonym)
             {
+                crate::metrics::record_pseudonym_announcement_rejected();
                 tracing::warn!(
                     context_id,
                     sender_did,
@@ -1582,6 +1584,7 @@ impl ContextManager {
             // leaking ciphertext onto the shared channel. Drop without updating
             // state — the registry is left unchanged.
             if is_reserved_pseudonym(&announcement.pseudonym, context_id) {
+                crate::metrics::record_pseudonym_announcement_rejected();
                 tracing::warn!(
                     context_id,
                     sender_did,
@@ -1605,6 +1608,7 @@ impl ContextManager {
                     &announced_did,
                     &announcement.pseudonym,
                 ) {
+                    crate::metrics::record_pseudonym_announcement_rejected();
                     tracing::warn!(
                         context_id,
                         sender_did,
