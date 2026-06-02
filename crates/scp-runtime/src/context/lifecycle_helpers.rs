@@ -508,7 +508,7 @@ pub async fn close_context_with_key(
         deps.event_tx.as_ref(),
     );
 
-    deps.supervisor.update_context_gauges();
+    deps.supervisor.update_context_gauges().await;
 
     // Persist context state after close (best-effort).
     crate::context::messaging_helpers::persist_state_best_effort(state, deps, &context_id);
@@ -1185,7 +1185,7 @@ pub async fn finalize_create(
     ttl_duration: Option<std::time::Duration>,
     handle: &ContextHandle,
 ) {
-    deps.supervisor.update_context_gauges();
+    deps.supervisor.update_context_gauges().await;
     // Designated-legacy supervisor-scoped iteration helper — see module
     // doc comment.
     let supervisor = deps.supervisor.shim_supervisor();
@@ -1598,7 +1598,7 @@ pub async fn import_context(
         .await
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
-    deps.supervisor.update_context_gauges();
+    deps.supervisor.update_context_gauges().await;
 
     // Start governance timeout task (ADR-031 §5).
     let supervisor = deps.supervisor.shim_supervisor();

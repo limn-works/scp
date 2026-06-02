@@ -362,7 +362,7 @@ pub async fn finalize_create_legacy(
     ttl_duration: Option<std::time::Duration>,
     handle: &ContextHandle,
 ) {
-    manager_methods::update_context_gauges(supervisor);
+    manager_methods::update_context_gauges(supervisor).await;
     crate::context::governance_helpers_legacy::start_governance_timeout_task_legacy(
         supervisor, context_id,
     )
@@ -1226,7 +1226,7 @@ pub async fn close_context_with_key_legacy(
         }
     }
 
-    manager_methods::update_context_gauges(supervisor);
+    manager_methods::update_context_gauges(supervisor).await;
 
     // Persist context state after close (best-effort).
     if manager_methods::has_persistence(supervisor)

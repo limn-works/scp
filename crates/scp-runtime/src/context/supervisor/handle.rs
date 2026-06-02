@@ -365,8 +365,12 @@ impl SupervisorHandle {
 
     /// Update operational gauges (active contexts, buffer occupancy).
     /// Best-effort: skipped if no metrics recorder is installed.
-    pub(crate) fn update_context_gauges(&self) {
-        crate::context::manager_methods::update_context_gauges(&self.supervisor);
+    ///
+    /// Async because the gauge sweep mailboxes each per-context actor for
+    /// its receive-buffer length (ADR-049 Phase 2A finalization — DashMap
+    /// removal).
+    pub(crate) async fn update_context_gauges(&self) {
+        crate::context::manager_methods::update_context_gauges(&self.supervisor).await;
     }
 
     /// Persist the per-context state and broadcast snapshot for

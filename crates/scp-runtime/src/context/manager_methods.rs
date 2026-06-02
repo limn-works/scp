@@ -293,27 +293,45 @@ pub fn has_persistence(supervisor: &Supervisor) -> bool {
 
 /// Updates operational gauge metrics (active contexts, buffer occupancy).
 ///
-/// Hoisted body of the legacy
-/// [`ContextManager::update_context_gauges`](crate::context::supervisor::Supervisor::update_context_gauges)
-/// (ADR-049 commit 12). Byte-identical behavior.
+/// ADR-049 Phase 2A finalization (`DashMap` removal): the gauge sweep now
+/// reads the per-context actor registry instead of the legacy `contexts`
+/// `DashMap`. `active_contexts` is the registered actor count
+/// ([`Supervisor::actor_ids`](crate::context::supervisor::Supervisor::actor_ids));
+/// `buffer_occupancy` is the sum of each actor's receive-buffer length,
+/// gathered by mailboxing
+/// [`LifecycleCommand::ReportBufferLen`](crate::context::actor::commands::LifecycleCommand::ReportBufferLen)
+/// to each actor (the handler reads `state.receive_buffer.len()` from
+/// owned state — no cross-actor lock).
 ///
 /// Called after mutations that change context count or buffer state.
 /// Best-effort: if no metrics recorder is installed, these are no-ops
-/// (#1467). On a detached supervisor, both gauges are skipped.
-pub fn update_context_gauges(supervisor: &Supervisor) {
-    let contexts = supervisor.contexts_ref();
-    crate::metrics::set_active_contexts(contexts.len());
-    // Collect Arcs first to release DashMap shard locks.
-    let arcs: Vec<(String, Arc<Mutex<PerContextState>>)> = contexts
-        .iter()
-        .map(|entry| (entry.key().clone(), Arc::clone(entry.value())))
-        .collect();
+/// (#1467); actors that fail to reply within the send timeout are skipped
+/// (metrics are approximate, exactly as the legacy `try_lock` skip was).
+pub async fn update_context_gauges(supervisor: &Supervisor) {
+    use crate::context::actor::commands::{ContextCommand, LifecycleCommand};
+
+    let actor_ids = supervisor.actor_ids();
+    crate::metrics::set_active_contexts(actor_ids.len());
+
     let mut total_buffered: usize = 0;
-    for (_id, arc) in arcs {
-        // Use try_lock to avoid convoy effects: metrics are approximate,
-        // so skipping locked contexts is acceptable.
-        if let Ok(ctx) = arc.try_lock() {
-            total_buffered += ctx.receive_buffer.len();
+    for ctx_id in actor_ids {
+        let Some(actor) = supervisor.lookup(&ctx_id) else {
+            continue;
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::Lifecycle(LifecycleCommand::ReportBufferLen { reply: tx });
+        // Skip actors that cannot accept the command (closed mailbox /
+        // timeout) — approximate metrics, same as the legacy try_lock
+        // skip-on-contention behaviour.
+        if actor
+            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+            .await
+            .is_err()
+        {
+            continue;
+        }
+        if let Ok(len) = rx.await {
+            total_buffered += len;
         }
     }
     crate::metrics::set_buffer_occupancy(total_buffered);
