@@ -5381,3 +5381,81 @@ async fn event_channel_receives_member_left_on_leave() {
         "MemberLeft must appear on channel after leave_context"
     );
 }
+
+/// §9.10.4: ingesting a pseudonym announcement whose `member_did` does not match
+/// the MLS-authenticated sender (a forged RID-hijack attempt) is rejected AND
+/// increments the `scp_pseudonym_announcements_rejected_total` counter.
+///
+/// Drives the live ingest path: Alice (the authenticated sender) sends a message
+/// body that is a serialized `PseudonymAnnouncement` claiming Bob's DID. On
+/// delivery the sender resolves to Alice but the announcement claims Bob, so the
+/// forged-DID branch fires — rejecting the announcement and metering it.
+///
+/// A `current_thread` runtime is constructed inside the `with_local_recorder`
+/// closure so every metric emission happens on the test thread under the
+/// thread-local debugging recorder (isolation-safe; no global recorder install).
+#[test]
+fn forged_did_announcement_increments_rejection_counter() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+
+    metrics::with_local_recorder(&recorder, || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build current-thread runtime");
+
+        rt.block_on(async {
+            let (manager, handle, sent) = setup_two_member_verified_context().await;
+            let alice_did: DID = "did:key:alice".into();
+            let alice_sk = signing_key_for_did(&alice_did);
+
+            // Forged announcement: Alice sends a body claiming a pseudonym for
+            // Bob's DID, not her own. member_did (bob) != sender_did (alice).
+            let forged = super::super::PseudonymAnnouncement {
+                tag: super::super::PSEUDONYM_ANNOUNCEMENT_TAG.to_owned(),
+                member_did: "did:key:bob".to_owned(),
+                pseudonym: [0xCCu8; 32],
+            };
+            let body = rmp_serde::to_vec_named(&forged).expect("serialize announcement");
+
+            // Send as Alice — this is a normal, MLS-authenticated send whose
+            // plaintext body happens to be a forged announcement.
+            manager
+                .send_message(&handle, &alice_did, &body, Some(&alice_sk), None, None)
+                .await
+                .expect("send should succeed");
+
+            let encrypted = last_sent(&sent);
+            let _ = manager.drain_events("test-ctx").await;
+
+            // Delivering the forged announcement must be rejected.
+            let result = manager.deliver_incoming("test-ctx", &encrypted).await;
+            assert!(
+                matches!(result, Err(ContextError::PermissionDenied(_))),
+                "forged-DID announcement must be rejected, got {result:?}"
+            );
+        });
+    });
+
+    // The forged-DID rejection must have incremented the counter.
+    let snapshot = snapshotter.snapshot().into_vec();
+    let count = snapshot
+        .iter()
+        .find_map(|(ck, _unit, _desc, value)| {
+            (ck.key().name() == "scp_pseudonym_announcements_rejected_total").then_some(value)
+        })
+        .and_then(|value| match value {
+            DebugValue::Counter(n) => Some(*n),
+            _ => None,
+        });
+
+    assert_eq!(
+        count,
+        Some(1),
+        "forged-DID announcement rejection must increment \
+         scp_pseudonym_announcements_rejected_total exactly once"
+    );
+}

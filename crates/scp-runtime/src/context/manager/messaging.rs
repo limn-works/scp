@@ -322,6 +322,7 @@ fn deliver_plaintext_or_announcement(
         && announcement.tag == super::PSEUDONYM_ANNOUNCEMENT_TAG
     {
         if announcement.member_did != sender_did {
+            crate::metrics::record_pseudonym_announcement_rejected();
             tracing::warn!(
                 context_id,
                 sender_did,
@@ -1566,6 +1567,7 @@ impl ContextManager {
             // sender_did. Without this check, any member could forge a pseudonym
             // announcement for another member, redirecting their messages.
             if announcement.member_did != sender_did {
+                crate::metrics::record_pseudonym_announcement_rejected();
                 tracing::warn!(
                     context_id,
                     sender_did,

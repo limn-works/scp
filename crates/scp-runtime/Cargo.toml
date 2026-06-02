@@ -71,6 +71,7 @@ scp-event-log = { path = "../scp-event-log", features = ["testing"] }
 openmls_basic_credential = { workspace = true, features = ["test-utils"] }
 proptest = "1"
 scp-media = { path = "../scp-media" }
+metrics-util = { version = "0.19", features = ["debugging"] }
 
 [[test]]
 name = "economy_integration"
