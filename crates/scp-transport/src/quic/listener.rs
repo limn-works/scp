@@ -277,7 +277,7 @@ impl<S: BlobStorage + 'static> QuicListener<S> {
         tokio::spawn(async move {
             cleanup_rate_limiter
                 .cleanup_loop(
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                     Duration::from_secs(90),
                     cleanup_token,
                 )
