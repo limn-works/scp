@@ -39,11 +39,23 @@ use ed25519_dalek::{Signer, SigningKey};
 /// extra wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamSignerError {
-    /// The backing custody / signer failed to produce a signature. `detail`
-    /// carries a non-sensitive description of the failure (never key
-    /// material). Native custody adapters map their backend error here.
+    /// The backing custody / signer failed to produce a signature. Native
+    /// custody adapters map their backend error here.
+    ///
+    /// `detail` carries a description of the failure that surfaces in the
+    /// dispatch pump's structured logs. Implementors MUST sanitize the
+    /// backend error before populating it: `detail` MUST NOT contain key
+    /// material (private-key bytes, seeds, derived secrets), nor the raw
+    /// preimage / caller-supplied input, nor backend-internal handles that
+    /// could leak custody state. Map the backend failure to a stable,
+    /// non-sensitive category string instead (ADR-006 custody isolation,
+    /// ADR-049 §4 error-detail sanitization). The operator private key
+    /// never enters the runtime address space, and neither does any
+    /// derivative of it via this field.
     Custody {
-        /// Non-sensitive description of the custody-side failure.
+        /// Sanitized, non-sensitive description of the custody-side
+        /// failure. See the variant docs: never key material, never raw
+        /// preimage / caller input, never backend-internal handles.
         detail: String,
     },
     /// JCS canonicalization of the payload failed while composing the
@@ -95,7 +107,14 @@ pub trait StreamSigner: Send + Sync + 'static {
     /// # Errors
     ///
     /// Returns [`StreamSignerError::Custody`] if the backing signer fails to
-    /// produce a signature.
+    /// produce a signature. Implementors MUST sanitize the backend error
+    /// before placing it in [`StreamSignerError::Custody::detail`]: the
+    /// field MUST NOT carry key material, the raw `preimage`, any other
+    /// caller-supplied input, or backend-internal handles. Map the backend
+    /// failure to a stable non-sensitive category string instead (ADR-006
+    /// custody isolation, ADR-049 §4 error-detail sanitization). `detail`
+    /// surfaces in structured logs, so a leak here is an information-
+    /// disclosure bug.
     async fn sign(&self, preimage: &[u8]) -> Result<[u8; 64], StreamSignerError>;
 
     /// Returns the operator's Ed25519 verifying key. Used by the dispatch

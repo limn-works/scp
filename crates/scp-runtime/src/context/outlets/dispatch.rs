@@ -428,6 +428,15 @@ pub(crate) struct SharedSessionState {
     /// the per-context parameter wins for streams opened against
     /// different contexts on the same node.
     pub stream_ucan_recheck_secs: u32,
+    /// `true` once the pump has left its loop and published the close
+    /// summary in the settlement block. Set under the state lock at
+    /// settlement. A `terminate_with_error` observing this flag returns
+    /// [`TerminateError::AlreadyTerminated`]: the pump can no longer
+    /// consume `pending_terminate`, so arming it would silently strand
+    /// the request. This is the only authoritative signal that the
+    /// pump's control plane is gone — `pending_terminate` alone cannot
+    /// distinguish "not yet armed" from "pump already exited".
+    pub pump_exited: bool,
     /// Handle to the hosting context. The pump consults its lifecycle
     /// [`ContextState`](crate::context::ContextState) in the same
     /// re-check arm that drives revocation: when the context is no
@@ -458,6 +467,7 @@ impl core::fmt::Debug for SharedSessionState {
             .field("ucan_cid", &self.ucan_cid)
             .field("revocation_checker", &"<dyn RevocationChecker>")
             .field("stream_ucan_recheck_secs", &self.stream_ucan_recheck_secs)
+            .field("pump_exited", &self.pump_exited)
             .field("context_handle", &self.context_handle.context_id())
             .finish()
     }
@@ -1014,6 +1024,13 @@ impl StreamSessionHandle {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The pump has already broken its loop and published the close
+        // summary: there is no consumer left to drain `pending_terminate`,
+        // so honor the documented `AlreadyTerminated` contract rather than
+        // silently arming a request that will never fire.
+        if guard.pump_exited {
+            return Err(TerminateError::AlreadyTerminated);
+        }
         if guard.pending_terminate.is_some() {
             return Err(TerminateError::AlreadyPending);
         }
@@ -1217,6 +1234,7 @@ fn build_shared_state(
         ucan_cid: params.ucan_cid.clone(),
         revocation_checker: Arc::clone(&params.revocation_checker),
         stream_ucan_recheck_secs: params.stream_ucan_recheck_secs,
+        pump_exited: false,
         context_handle,
     }))
 }
@@ -2152,6 +2170,12 @@ async fn run_stream_pump_v2(
         let (billed_amount, refund_amount, billed_count) = guard.escrow.settle_at_close();
         let cancel_ack_seq = guard.cancel_ack.cancel_ack_seq();
         guard.cancel_ack.record_terminal();
+        // Mark the pump's control plane as gone under the same lock as
+        // settlement: any `terminate_with_error` racing past this point
+        // observes `pump_exited == true` and returns
+        // `TerminateError::AlreadyTerminated` rather than arming a
+        // `pending_terminate` no consumer will ever drain.
+        guard.pump_exited = true;
         // Take the admission Arc out of the guard so we can release
         // through the invoke.rs public helper (which lifts the type
         // reference into invoke.rs for grep enforcement).
@@ -2377,6 +2401,7 @@ mod tests {
             ucan_cid: "bafyrei-test".to_owned(),
             revocation_checker,
             stream_ucan_recheck_secs,
+            pump_exited: false,
             context_handle,
         }))
     }
@@ -2501,6 +2526,86 @@ mod tests {
                  emission path re-introduced"
             );
         }
+    }
+
+    /// Once the pump has broken its loop and published the close
+    /// summary, a late `terminate_with_error` MUST return
+    /// [`TerminateError::AlreadyTerminated`] — not silently succeed by
+    /// arming a `pending_terminate` no consumer will drain. This pins
+    /// the `pump_exited` settlement flag wired in the settlement block.
+    #[tokio::test]
+    async fn terminate_with_error_returns_already_terminated_after_pump_exit() {
+        let state = build_test_state();
+        let grant_wake = Arc::new(Notify::new());
+        let cancel_wake = Arc::new(Notify::new());
+        let terminate_wake = Arc::new(Notify::new());
+        let (_inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (outer_tx, mut outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (summary_tx, summary_rx) = tokio::sync::oneshot::channel();
+        let request_id: RequestId = [0x99; 16];
+
+        let pump_state = Arc::clone(&state);
+        let pump_grant = Arc::clone(&grant_wake);
+        let pump_cancel = Arc::clone(&cancel_wake);
+        let pump_terminate = Arc::clone(&terminate_wake);
+        let pump_handle = tokio::spawn(async move {
+            run_stream_pump_v2(
+                pump_state,
+                pump_grant,
+                pump_cancel,
+                pump_terminate,
+                inner_rx,
+                outer_tx,
+                summary_tx,
+                Duration::from_secs(30),
+                Duration::from_secs(5),
+                request_id,
+                PumpEventEmissionInputs {
+                    sink: None,
+                    context_id: "ctx-test".to_owned(),
+                    outlet_id: "outlet-test".to_owned(),
+                    invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),
+                    input_hash: "0".repeat(64),
+                    start: Instant::now(),
+                },
+            )
+            .await;
+        });
+
+        let handle = StreamSessionHandle {
+            receiver: None,
+            state: Arc::clone(&state),
+            grant_wake: Arc::clone(&grant_wake),
+            cancel_wake: Arc::clone(&cancel_wake),
+            terminate_wake: Arc::clone(&terminate_wake),
+            summary_rx: None,
+            request_id,
+        };
+
+        // Drive the stream to pump exit: the first terminate arms the
+        // synthetic terminal chunk, the pump emits it and breaks its
+        // loop, runs settlement (setting `pump_exited`), and ends.
+        handle
+            .terminate_with_error(TerminateReason::RevokedMidStream, Some("first".to_owned()))
+            .expect("first terminate accepted");
+        let _terminal = tokio::time::timeout(Duration::from_secs(2), outer_rx.recv())
+            .await
+            .expect("pump emits synthetic terminal within 2s")
+            .expect("chunk arrives");
+        pump_handle.await.expect("pump task settles after exit");
+        // Confirm the pump fully settled (summary published) before the
+        // late terminate — otherwise we could be racing `pump_exited`.
+        let _summary = summary_rx.await.expect("summary published");
+
+        // Late terminate: the pump is gone, so this MUST report
+        // `AlreadyTerminated` rather than no-op with `Ok(())`. No panic.
+        let err = handle
+            .terminate_with_error(TerminateReason::RevokedMidStream, Some("late".to_owned()))
+            .expect_err("late terminate after pump exit must error");
+        assert!(
+            matches!(err, TerminateError::AlreadyTerminated),
+            "expected AlreadyTerminated after pump exit, got {err:?}"
+        );
     }
 
     /// `terminate_with_error` is idempotent: a second call while the
@@ -2939,5 +3044,122 @@ mod tests {
             assert!(g.cancel_ack_armed, "accepted cancel arms the timer");
             assert_eq!(g.cancel_ack_seq, Some(0));
         }
+    }
+
+    /// FIX 2(a): `apply_outlet_cancel_signed` rejects a `CancelIdentity`
+    /// whose `context_id` OR `caveats_binding` diverges from the pinned
+    /// triple as `SignatureInvalid`, WITHOUT mutating stream state. The
+    /// pinned values are `("ctx-test", "outlet-test", [0xAB; 32])`. The
+    /// `outlet_id` dimension is covered by
+    /// `n2_apply_outlet_cancel_signed_records_and_validates_identity`;
+    /// this test fills the remaining two dimensions so all three
+    /// cross-checked fields have a direct negative-path assertion.
+    #[tokio::test]
+    async fn apply_outlet_cancel_signed_rejects_context_and_caveats_mismatch() {
+        // Each case keeps two fields correct and corrupts exactly one so
+        // the failing dimension is unambiguous.
+        let mismatches = [
+            (
+                "context_id",
+                CancelIdentity {
+                    context_id: "WRONG-CTX".to_owned(),
+                    outlet_id: "outlet-test".to_owned(),
+                    caveats_binding: [0xAB; 32],
+                },
+            ),
+            (
+                "caveats_binding",
+                CancelIdentity {
+                    context_id: "ctx-test".to_owned(),
+                    outlet_id: "outlet-test".to_owned(),
+                    caveats_binding: [0xCD; 32],
+                },
+            ),
+        ];
+
+        for (dimension, bad_id) in mismatches {
+            let state = build_test_state();
+            let request_id: RequestId = [0x31; 16];
+            let (handle, _outer_rx, _summary_rx, _pump_join, _inner_tx) =
+                spawn_test_pump(Arc::clone(&state), request_id, Duration::from_secs(3_601));
+            // Signer wraps the correctly-pinned key — the ONLY thing wrong
+            // here is the claimed identity, so the rejection comes from the
+            // identity cross-check, not the self-verify.
+            let signer = super::super::signer::InProcessStreamSigner::new(fixed_signing_key());
+
+            let res = handle.apply_outlet_cancel_signed(&signer, &bad_id).await;
+            assert!(
+                matches!(
+                    res,
+                    Err(super::super::stream::CancelError::SignatureInvalid)
+                ),
+                "{dimension} mismatch must reject as SignatureInvalid, got {res:?}"
+            );
+            let g = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                !g.cancel_ack_armed,
+                "{dimension} mismatch must NOT arm the cancel-ack timer"
+            );
+            assert_eq!(
+                g.cancel_ack_seq, None,
+                "{dimension} mismatch must NOT record a cancel-ack seq"
+            );
+        }
+    }
+
+    /// FIX 2(b): a signer wrapping a key that differs from the pinned
+    /// `invoker_pk` produces a signature that fails the runtime's own
+    /// self-verify under the pinned key. The identity triple matches, so
+    /// the rejection is forced through the self-verify branch (an internal
+    /// invariant violation), surfacing as `SignatureInvalid` WITHOUT
+    /// mutating stream state. The fixture pins `[0x42; 32]` as `invoker_pk`;
+    /// the signer here wraps `[0x11; 32]`.
+    #[tokio::test]
+    async fn apply_outlet_cancel_signed_rejects_signer_key_mismatch() {
+        let state = build_test_state();
+        let request_id: RequestId = [0x32; 16];
+        let (handle, _outer_rx, _summary_rx, _pump_join, _inner_tx) =
+            spawn_test_pump(Arc::clone(&state), request_id, Duration::from_secs(3_601));
+
+        // Wrong key: the fixture pinned `fixed_signing_key()` ([0x42; 32])
+        // as the invoker key, but this signer wraps a different key. The
+        // produced signature cannot verify under the pinned verifying key.
+        let wrong_key = SigningKey::from_bytes(&[0x11; 32]);
+        debug_assert_ne!(
+            wrong_key.verifying_key(),
+            fixed_signing_key().verifying_key(),
+            "test misconfigured: wrong key must differ from the pinned key"
+        );
+        let signer = super::super::signer::InProcessStreamSigner::new(wrong_key);
+
+        // Identity triple is correct — the ONLY thing wrong is the key, so
+        // the rejection is driven by the post-signing self-verify branch.
+        let good_id = CancelIdentity {
+            context_id: "ctx-test".to_owned(),
+            outlet_id: "outlet-test".to_owned(),
+            caveats_binding: [0xAB; 32],
+        };
+
+        let res = handle.apply_outlet_cancel_signed(&signer, &good_id).await;
+        assert!(
+            matches!(
+                res,
+                Err(super::super::stream::CancelError::SignatureInvalid)
+            ),
+            "wrong signer key must fail self-verify as SignatureInvalid, got {res:?}"
+        );
+        let g = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            !g.cancel_ack_armed,
+            "self-verify failure must NOT arm the cancel-ack timer"
+        );
+        assert_eq!(
+            g.cancel_ack_seq, None,
+            "self-verify failure must NOT record a cancel-ack seq"
+        );
     }
 }

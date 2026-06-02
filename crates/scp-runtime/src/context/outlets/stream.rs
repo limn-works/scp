@@ -783,8 +783,12 @@ impl CancelAckTracker {
     }
 
     /// Records `OutletCancel` arrival. `next_seq` is the next-to-emit
-    /// sequence at the moment of arrival; chunks at or above
-    /// `next_seq` are NOT billable.
+    /// sequence at the moment of arrival and becomes the cancel-ack
+    /// billing ceiling. The §5.4.5 predicate is inclusive: a chunk is
+    /// billable when `sequence <= ceiling`, so the chunk AT the ceiling
+    /// (`sequence == next_seq`) IS billable; only chunks strictly above
+    /// it (`sequence > next_seq`) are NOT billable. See
+    /// [`Self::billing_ceiling`] and `compute_chunks_billed_ref`.
     ///
     /// Idempotent: a second `OutletCancel` after the first is a
     /// no-op (the cancel-ack-seq is pinned at first arrival per
