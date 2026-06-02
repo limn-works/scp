@@ -155,17 +155,18 @@ impl crate::scp::PyScp {
             source: relay_source,
         };
         let profile = scp_transport::profile::TransportProfile::platform_default();
-        // Route through the transport selector for transparent QUIC↔WebSocket
-        // selection (spec §10.14.3 item 4; ADR-037). The advertised-transports
-        // list from `.well-known/scp` is NOT available at this bridge entry
-        // point — `source` is provenance, not the relay's transport binding
-        // list — so the selector degrades to the WebSocket baseline here. When
-        // a `.well-known/scp` transports list is plumbed to this site in a
-        // future change, pass it as the second argument to enable QUIC.
-        let selector = scp_transport::TransportSelector::new();
+        // Route through the instance-scoped transport selector for transparent
+        // QUIC↔WebSocket selection (spec §10.14.3 item 4; ADR-037). The
+        // discovering variant fetches the relay's advertised transports from
+        // `.well-known/scp` (spec §10.5.1) at connect time and feeds that list
+        // into the QUIC-vs-WebSocket decision — fail-open to WebSocket if the
+        // relay serves no well-known. The selector is owned by the bridge
+        // instance so its per-relay QUIC-suppression and well-known caches
+        // survive across connects.
+        let selector = bi.core.transport_selector();
         let result = rt.block_on(async {
             selector
-                .select_and_connect_with_suppression(&sourced, None, Some(&profile))
+                .select_and_connect_discovering_with_suppression(&sourced, Some(&profile))
                 .await
         });
 
@@ -316,15 +317,16 @@ impl crate::scp::PyScp {
             source: RelayUrlSource::Explicit,
         };
         let profile = scp_transport::profile::TransportProfile::platform_default();
-        // Route through the transport selector for transparent QUIC↔WebSocket
-        // selection (spec §10.14.3 item 4; ADR-037). No advertised-transports
-        // list is available at this site, so the selector uses the WebSocket
-        // baseline (see `transport_connect` for the plumbing-gap rationale).
-        let selector = scp_transport::TransportSelector::new();
+        // Route through the instance-scoped transport selector for transparent
+        // QUIC↔WebSocket selection (spec §10.14.3 item 4; ADR-037). The
+        // discovering variant reads the relay's advertised transports from
+        // `.well-known/scp` (spec §10.5.1) at connect time to enable QUIC,
+        // failing open to WebSocket when discovery is unavailable.
+        let selector = bi.core.transport_selector();
         let adapter = rt
             .block_on(async {
                 selector
-                    .select_and_connect(&sourced, None, Some(&profile))
+                    .select_and_connect_discovering(&sourced, Some(&profile))
                     .await
             })
             .map_err(|e| {
@@ -392,19 +394,20 @@ impl crate::scp::PyScp {
             source: relay_source,
         };
         let profile = scp_transport::profile::TransportProfile::platform_default();
-        // Route through the transport selector for transparent QUIC↔WebSocket
-        // selection (spec §10.14.3 item 4; ADR-037). No advertised-transports
-        // list is available at this site, so the selector uses the WebSocket
-        // baseline (see `transport_connect` for the plumbing-gap rationale).
-        // Cover traffic auto-starts per adapter via the profile —
+        // Route through the instance-scoped transport selector for transparent
+        // QUIC↔WebSocket selection (spec §10.14.3 item 4; ADR-037). The
+        // discovering variant reads the relay's advertised transports from
+        // `.well-known/scp` (spec §10.5.1) at connect time to enable QUIC,
+        // failing open to WebSocket when discovery is unavailable. Cover
+        // traffic auto-starts per adapter via the profile —
         // `finalize_connection` launches the cover traffic background task
         // based on the profile's tier (#1532 AC6). The selector surfaces the
         // suppression receiver (drained into reliability scoring, #1533 AC5).
-        let selector = scp_transport::TransportSelector::new();
+        let selector = bi.core.transport_selector();
         let (adapter, suppression_rx) = rt
             .block_on(async {
                 selector
-                    .select_and_connect_with_suppression(&sourced, None, Some(&profile))
+                    .select_and_connect_discovering_with_suppression(&sourced, Some(&profile))
                     .await
             })
             .map_err(ScpPyError::from)?;

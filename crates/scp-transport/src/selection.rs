@@ -44,6 +44,7 @@ use std::sync::Mutex;
 
 use zeroize::Zeroizing;
 
+use crate::discovery::RelayTransportDiscovery;
 use crate::error::TransportError;
 use crate::heartbeat::SuppressionSuspected;
 use crate::native::adapter::NativeRelayAdapter;
@@ -81,14 +82,37 @@ pub struct TransportSelector {
     /// [`clear_suppression`](Self::clear_suppression) is called (on the next
     /// `.well-known/scp` refresh).
     quic_suppressed: Mutex<HashSet<String>>,
+    /// Per-relay cache of the transports a relay advertises in its
+    /// `.well-known/scp` document (spec §10.5.1). Co-located with
+    /// `quic_suppressed` because the two share a lifecycle: a fresh
+    /// `.well-known/scp` fetch (a discovery *refresh*) is exactly the point at
+    /// which QUIC suppression for the relay is cleared (spec §10.14.3 item 4).
+    discovery: RelayTransportDiscovery,
 }
 
 impl TransportSelector {
-    /// Creates a selector with no suppressed relays.
+    /// Creates a selector with no suppressed relays and an empty discovery
+    /// cache.
     #[must_use]
     pub fn new() -> Self {
         Self {
             quic_suppressed: Mutex::new(HashSet::new()),
+            discovery: RelayTransportDiscovery::new(),
+        }
+    }
+
+    /// Test-only constructor that injects a preconfigured discovery cache.
+    ///
+    /// Lets the discovering-connect tests point discovery at a local
+    /// self-signed `.well-known/scp` server (see
+    /// [`RelayTransportDiscovery::with_client_for_test`]). Production builds the
+    /// discovery cache with its own non-permissive client.
+    #[cfg(all(test, feature = "quic"))]
+    #[must_use]
+    pub(crate) fn with_discovery_for_test(discovery: RelayTransportDiscovery) -> Self {
+        Self {
+            quic_suppressed: Mutex::new(HashSet::new()),
+            discovery,
         }
     }
 
@@ -200,6 +224,76 @@ impl TransportSelector {
         let mut ws = NativeRelayAdapter::connect_sourced(sourced, profile).await?;
         let suppression = ws.take_suppression_receiver();
         Ok((Box::new(ws), suppression))
+    }
+
+    /// Connects to the relay, discovering its advertised transports from
+    /// `.well-known/scp` first, then transparently selecting QUIC or WebSocket.
+    ///
+    /// This is the connect entry point used by the FFI/SDK layer (spec §10.5.1,
+    /// §10.14.3 item 4; ADR-037). It closes the gap that
+    /// [`select_and_connect`](Self::select_and_connect) leaves when its caller
+    /// has no advertised-transports list: instead of always degrading to the
+    /// WebSocket baseline, it fetches the relay's `relay_config.transports`
+    /// (cached per relay) and feeds that list into the same QUIC-vs-WebSocket
+    /// decision. The signature is unchanged from the caller's perspective —
+    /// discovery happens internally (decision D3).
+    ///
+    /// Discovery is fail-open: any fetch/parse failure resolves to "transports
+    /// unknown", i.e. the WebSocket baseline. A discovery failure never fails
+    /// the connect.
+    ///
+    /// On a *fresh* discovery fetch (a `.well-known/scp` refresh, as opposed to
+    /// a cache hit) QUIC suppression for this relay is cleared first, so a
+    /// relay that has reconfigured its QUIC support since the last failed probe
+    /// is re-probed (spec §10.14.3 item 4: suppression lasts "until the next
+    /// `.well-known/scp` refresh").
+    ///
+    /// # Errors
+    ///
+    /// Returns the WebSocket connection error if the WebSocket fallback (or
+    /// direct WebSocket) cannot be established. A failed QUIC probe is not an
+    /// error — it transparently triggers WebSocket fallback.
+    pub async fn select_and_connect_discovering(
+        &self,
+        sourced: &SourcedRelayUrl,
+        profile: Option<&TransportProfile>,
+    ) -> Result<Box<dyn TransportAdapter>, TransportError> {
+        let (adapter, _suppression) = self
+            .select_and_connect_discovering_with_suppression(sourced, profile)
+            .await?;
+        Ok(adapter)
+    }
+
+    /// Like [`select_and_connect_discovering`](Self::select_and_connect_discovering),
+    /// but also returns the WebSocket adapter's suppression-event receiver when
+    /// one was created (drained into reliability scoring at the FFI/SDK layer).
+    ///
+    /// See [`select_and_connect_with_suppression`](Self::select_and_connect_with_suppression)
+    /// for when the receiver is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the WebSocket connection error if the WebSocket fallback (or
+    /// direct WebSocket) cannot be established. A failed QUIC probe is not an
+    /// error — it transparently triggers WebSocket fallback.
+    pub async fn select_and_connect_discovering_with_suppression(
+        &self,
+        sourced: &SourcedRelayUrl,
+        profile: Option<&TransportProfile>,
+    ) -> Result<(Box<dyn TransportAdapter>, Option<SuppressionReceiver>), TransportError> {
+        // Fetch the relay's advertised transports (cached per relay). Fail-open:
+        // on any failure this resolves to `None` → WebSocket baseline.
+        let discovered = self.discovery.advertised_transports(&sourced.url).await;
+
+        // A fresh `.well-known/scp` fetch is the refresh point at which QUIC
+        // suppression for this relay is cleared (spec §10.14.3 item 4). A cache
+        // hit is NOT a refresh, so leave any standing suppression in place.
+        if discovered.refreshed {
+            self.clear_suppression(&sourced.url);
+        }
+
+        self.select_and_connect_with_suppression(sourced, discovered.transports.as_deref(), profile)
+            .await
     }
 
     /// Like [`select_and_connect`](Self::select_and_connect), but for relays
@@ -323,6 +417,8 @@ fn url_is_tls_scheme(relay_url: &str) -> bool {
 mod tests {
     use super::*;
     use crate::relay::connection::RelayUrlSource;
+    #[cfg(feature = "quic")]
+    use std::time::Duration;
 
     fn sourced(url: &str, source: RelayUrlSource) -> SourcedRelayUrl {
         SourcedRelayUrl {
@@ -499,6 +595,157 @@ mod tests {
         assert!(
             !selector.should_try_quic(&s, Some(&list)),
             "a suppressed relay must skip the QUIC probe on the next connect"
+        );
+    }
+
+    // -- select_and_connect_discovering: end-to-end discovery → selection ---
+
+    /// END-TO-END PROOF that QUIC is now actually selected (the gap PR-3a
+    /// left): a relay whose `.well-known/scp` advertises `["quic",
+    /// "websocket"]` is fetched at connect time, and the discovered list drives
+    /// a real QUIC probe. The relay has no QUIC listener (the advertising
+    /// endpoint serves HTTPS, not QUIC/UDP), so the probe fails within ~3s and
+    /// the selector suppresses QUIC for the relay. The suppression side effect
+    /// is observable ONLY if discovery fed the `"quic"` advertisement into the
+    /// selector — which is exactly what PR-3a's `None` plumbing prevented.
+    #[cfg(feature = "quic")]
+    #[tokio::test]
+    async fn discovering_connect_attempts_quic_when_advertised() {
+        use crate::discovery::RelayTransportDiscovery;
+        use crate::discovery_test_support::{start_well_known_server, trusting_client};
+
+        // The well-known server advertises QUIC. It serves HTTPS only — there
+        // is no QUIC (UDP) listener on its port, so the QUIC probe will fail.
+        let body = r#"{
+            "version": 1,
+            "did": "did:dht:z6MkRelay",
+            "relay": "wss://127.0.0.1/scp/v1",
+            "relay_config": { "transports": ["websocket", "quic"] }
+        }"#
+        .to_owned();
+        let server = start_well_known_server(body).await;
+        let client = trusting_client(&server.cert_pem, Duration::from_secs(2));
+        let discovery = RelayTransportDiscovery::with_client_for_test(
+            client,
+            crate::discovery::DEFAULT_DISCOVERY_TTL,
+        );
+        let selector = TransportSelector::with_discovery_for_test(discovery);
+
+        let relay_url = server.relay_url();
+        let s = sourced(&relay_url, RelayUrlSource::WellKnown);
+
+        // The discovering connect fetches transports (QUIC advertised), probes
+        // QUIC (no listener → fails within ~3s → suppresses), then falls back
+        // to WebSocket. The WS leg targets the same HTTPS-only port and so
+        // cannot complete; we only care that QUIC was *attempted*, proven by
+        // the suppression side effect.
+        let start = std::time::Instant::now();
+        let _ = selector.select_and_connect_discovering(&s, None).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            selector.is_quic_suppressed(&relay_url),
+            "discovery must have fed the advertised QUIC list into the selector, \
+             triggering a QUIC probe that failed and suppressed QUIC for the relay"
+        );
+        assert!(
+            elapsed <= Duration::from_secs(6),
+            "the QUIC probe must remain ~3s-bounded end-to-end, took {elapsed:?}"
+        );
+    }
+
+    /// Discovery fetch failure (the relay serves no `.well-known/scp`) → the
+    /// selector falls open to the WebSocket baseline, the connect succeeds, and
+    /// QUIC is never probed (so the relay is not suppressed). Verified against
+    /// a real local WebSocket relay.
+    #[cfg(feature = "quic")]
+    #[tokio::test]
+    async fn discovering_connect_fails_open_to_websocket_no_quic_probe() {
+        use crate::discovery::RelayTransportDiscovery;
+        use crate::discovery_test_support::trusting_client;
+        use crate::native::server::{RelayConfig, RelayServer};
+        use crate::native::storage::BlobStorageBackend;
+        use std::net::SocketAddr;
+        use std::sync::Arc;
+
+        // Live plaintext WebSocket relay for the baseline connect.
+        let config = RelayConfig {
+            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            ttl_check_interval: Duration::from_millis(100),
+            delivery_jitter_ms: 0,
+            ..RelayConfig::default()
+        };
+        let storage = Arc::new(BlobStorageBackend::in_memory());
+        let server = RelayServer::new(config, storage);
+        let (_handle, ws_addr) = server.start().await.unwrap();
+        let url = format!("ws://{ws_addr}/scp/v1");
+
+        // Discovery is configured with a real client, but the `ws://` relay
+        // maps to no `https://` well-known URL, so the fetch never happens and
+        // discovery fails open to None → WebSocket baseline.
+        let dummy_cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
+            .unwrap()
+            .cert
+            .pem();
+        let client = trusting_client(&dummy_cert, Duration::from_millis(500));
+        let discovery = RelayTransportDiscovery::with_client_for_test(
+            client,
+            crate::discovery::DEFAULT_DISCOVERY_TTL,
+        );
+        let selector = TransportSelector::with_discovery_for_test(discovery);
+
+        let s = sourced(&url, RelayUrlSource::DhtResolved);
+        let adapter = selector
+            .select_and_connect_discovering(&s, None)
+            .await
+            .expect("WebSocket baseline connect should succeed when discovery fails open");
+        drop(adapter);
+
+        assert!(
+            !selector.is_quic_suppressed(&url),
+            "a plaintext relay must never trigger a QUIC probe, so it is never suppressed"
+        );
+    }
+
+    /// Two discovering connects to the same relay fetch `.well-known/scp`
+    /// exactly once: the second connect is served from the per-relay cache.
+    /// Asserted via the server's request counter.
+    #[cfg(feature = "quic")]
+    #[tokio::test]
+    async fn discovering_connect_caches_well_known_fetched_once() {
+        use crate::discovery::RelayTransportDiscovery;
+        use crate::discovery_test_support::{start_well_known_server, trusting_client};
+
+        let body = r#"{
+            "version": 1,
+            "did": "did:dht:z6MkRelay",
+            "relay": "wss://127.0.0.1/scp/v1",
+            "relay_config": { "transports": ["websocket", "quic"] }
+        }"#
+        .to_owned();
+        let server = start_well_known_server(body).await;
+        let client = trusting_client(&server.cert_pem, Duration::from_secs(2));
+        let discovery = RelayTransportDiscovery::with_client_for_test(
+            client,
+            crate::discovery::DEFAULT_DISCOVERY_TTL,
+        );
+        let selector = TransportSelector::with_discovery_for_test(discovery);
+
+        let relay_url = server.relay_url();
+        let s = sourced(&relay_url, RelayUrlSource::WellKnown);
+
+        // Two discovering connects. Each probes QUIC (no listener) and the WS
+        // leg fails, but the well-known fetch is what we are counting. After the
+        // first connect QUIC is suppressed, so the second connect must NOT
+        // re-fetch from a cache miss — the cached transports satisfy it.
+        let _ = selector.select_and_connect_discovering(&s, None).await;
+        let _ = selector.select_and_connect_discovering(&s, None).await;
+
+        assert_eq!(
+            server.request_count(),
+            1,
+            ".well-known/scp must be fetched exactly once across two connects \
+             to the same relay"
         );
     }
 }

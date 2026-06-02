@@ -18,7 +18,7 @@ combined = ["dep:rusqlite", "dep:scp-platform"]
 relay-persistence = ["dep:scp-platform"]
 postgres-blob = ["dep:sqlx"]
 s3-blob = ["dep:aws-sdk-s3", "dep:aws-config", "dep:http-body"]
-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots"]
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots", "dep:reqwest"]
 udp = ["dep:openssl", "dep:socket2"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:http"]
 webtransport-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:getrandom_02", "dep:getrandom_03"]
@@ -83,6 +83,20 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 # the same trust anchors the OS/browser would use, without pulling in a second
 # crypto provider. Gated on `quic` to keep the default build lean.
 webpki-roots = { version = "1", optional = true }
+# Async HTTPS client for connect-time `.well-known/scp` transport discovery
+# (spec §10.5.1, §10.14.3 item 4). Gated on `quic`: the discovery fetch only
+# matters when QUIC selection is possible — without `quic` the WebSocket
+# baseline is the only transport, so there is nothing to discover. `rustls-tls`
+# (default-features off) keeps the single ring-backed rustls provider this
+# crate already pins (see the `quinn`/`rustls` notes above), avoiding a second
+# crypto provider, and gives a non-permissive WebPKI-roots TLS client for the
+# `https://` well-known fetch. Matches the canonical reqwest config used by
+# scp-identity's DHT gateway client.
+# `stream` enables `Response::bytes_stream()` so the `.well-known/scp` body can
+# be read with a running size cap (a chunked response that omits Content-Length
+# is still bounded). It pulls only futures plumbing this crate already depends
+# on (futures 0.3) — no new TLS or crypto provider.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
 rcgen = { version = "0.13", optional = true }
 bytes = "1"
 http = { version = "1", optional = true }
@@ -113,6 +127,11 @@ tempfile = "3"
 rcgen = "0.13"
 k256 = { version = "0.13", features = ["schnorr"] }
 base64 = { workspace = true }
+# Minimal local HTTPS server for connect-time `.well-known/scp` discovery
+# tests (discovery.rs / selection.rs). ring backend to match the crate's
+# single rustls provider. Dev-only — production discovery uses reqwest.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [[test]]
 name = "combined_conformance"

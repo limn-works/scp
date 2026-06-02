@@ -251,6 +251,19 @@ pub struct CoreFields {
     /// across `.await` points.
     transport: RwLock<Option<Arc<scp_transport::TransportManager>>>,
 
+    /// Instance-scoped transport selector (transparent QUIC↔WebSocket
+    /// selection, spec §10.14.3 item 4; ADR-037).
+    ///
+    /// Owned per bridge instance (no globals) so its per-relay caches survive
+    /// across connects: a QUIC-suppression set (a dead/blocked QUIC port is not
+    /// re-probed every reconnect) and a `.well-known/scp` transports cache (the
+    /// relay's advertised transports are fetched once per relay, not on every
+    /// dial). Connect sites route through this selector's
+    /// `select_and_connect_discovering*` methods so connect-time discovery
+    /// feeds the QUIC-vs-WebSocket decision (spec §10.5.1) — closing the gap
+    /// where a `None` advertised list always degraded to WebSocket.
+    transport_selector: Arc<scp_transport::TransportSelector>,
+
     /// Known context-to-relay mappings for discovery (SCP-213).
     ///
     /// Tracks contexts that have been created/joined locally, along with their
@@ -482,6 +495,7 @@ impl CoreFields {
             shutdown: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
+            transport_selector: Arc::new(scp_transport::TransportSelector::new()),
             known_contexts: DashMap::new(),
             rate_limiters: DashMap::new(),
             economy_budgets: DashMap::new(),
@@ -562,6 +576,7 @@ impl CoreFields {
             shutdown: AtomicBool::new(false),
             suspended: AtomicBool::new(false),
             transport: RwLock::new(None),
+            transport_selector: Arc::new(scp_transport::TransportSelector::new()),
             known_contexts: DashMap::new(),
             rate_limiters: DashMap::new(),
             economy_budgets: DashMap::new(),
@@ -1193,6 +1208,19 @@ impl CoreFields {
             .read()
             .ok()
             .is_some_and(|guard| guard.is_some())
+    }
+
+    /// Returns this instance's transport selector for connect-time transparent
+    /// QUIC↔WebSocket selection (spec §10.14.3 item 4; ADR-037).
+    ///
+    /// Connect sites route through the returned selector's
+    /// `select_and_connect_discovering*` methods so the relay's advertised
+    /// transports (`.well-known/scp`, spec §10.5.1) drive the QUIC-vs-WebSocket
+    /// decision, and so the per-relay QUIC-suppression and well-known caches
+    /// persist across connects/reconnects to the same relay.
+    #[must_use]
+    pub fn transport_selector(&self) -> Arc<scp_transport::TransportSelector> {
+        Arc::clone(&self.transport_selector)
     }
 
     /// Registers `url` as a relay that this bridge intends to stay
