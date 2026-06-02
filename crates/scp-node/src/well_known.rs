@@ -33,20 +33,27 @@ use crate::http::NodeState;
 /// Returns the list of transports advertised in `.well-known/scp`.
 ///
 /// WebSocket is always included (it is the baseline SCP transport).
-/// Additional transports are included when their corresponding feature
-/// flags are enabled at compile time:
+/// Additional transports are advertised only when this node actually serves
+/// them, so the document never advertises a transport the binary does not run:
 ///
-/// - `quic` feature -> `"quic"`
+/// - `"quic"` -> advertised only when a QUIC listener is started, i.e. the
+///   `quic` feature is enabled **and** a TLS certificate was provisioned
+///   (`quic_listening == true`). In no-domain (plaintext) mode QUIC is not
+///   served, so it is not advertised — closing the advertise-but-don't-serve
+///   gap (spec §10.14.3 item 1).
 /// - `http3` feature -> `"webtransport"`
 /// - `udp` feature -> `"udp-dtls"`
 ///
-/// See spec §10.5.1 and SCP-264.
+/// See spec §10.5.1 and §10.14.3.
 #[must_use]
-fn advertised_transports() -> Vec<String> {
+fn advertised_transports(quic_listening: bool) -> Vec<String> {
     #[allow(unused_mut)]
     let mut transports = vec!["websocket".to_owned()];
-    #[cfg(feature = "quic")]
-    transports.push("quic".to_owned());
+    // `quic_listening` is only ever `true` when the `quic` feature is enabled
+    // (the field that feeds it is gated), so this reflects the running listener.
+    if quic_listening {
+        transports.push("quic".to_owned());
+    }
     #[cfg(feature = "http3")]
     transports.push("webtransport".to_owned());
     #[cfg(feature = "udp")]
@@ -54,6 +61,36 @@ fn advertised_transports() -> Vec<String> {
     #[cfg(feature = "coap")]
     transports.push("coap".to_owned());
     transports
+}
+
+/// Returns whether this node serves a relay-side QUIC listener.
+///
+/// `true` only when the `quic` feature is enabled and the QUIC listener
+/// actually bound and started (set by [`ApplicationNode::serve`] after a
+/// successful UDP bind, not merely when the QUIC server config was built).
+/// Always `false` without the feature. Reading the *running* state rather than
+/// the config-built state ensures `.well-known/scp` does not advertise `"quic"`
+/// when the bind failed and the node degraded to WebSocket-only.
+///
+/// [`ApplicationNode::serve`]: crate::ApplicationNode::serve
+//
+// Not `const fn`: with the `quic` feature the body performs an atomic load,
+// which is not permitted in a const context. Without the feature the body is
+// trivially const-able, so silence the lint on that build only.
+#[cfg_attr(not(feature = "quic"), allow(clippy::missing_const_for_fn))]
+#[must_use]
+fn quic_listening(state: &NodeState) -> bool {
+    #[cfg(feature = "quic")]
+    {
+        state
+            .quic_listening
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    #[cfg(not(feature = "quic"))]
+    {
+        let _ = state;
+        false
+    }
 }
 
 /// Builds the complete [`WellKnownScp`] document from node state.
@@ -105,7 +142,7 @@ pub async fn build_well_known_scp(state: &NodeState) -> WellKnownScp {
         rate_limit_subscribe: Some(
             u32::try_from(rc.max_subscriptions_per_connection).unwrap_or(u32::MAX),
         ),
-        transports: Some(advertised_transports()),
+        transports: Some(advertised_transports(quic_listening(state))),
         economic: None,
     };
 
@@ -143,7 +180,7 @@ mod tests {
 
     #[test]
     fn advertised_transports_always_includes_websocket() {
-        let transports = advertised_transports();
+        let transports = advertised_transports(false);
         assert!(
             transports.contains(&"websocket".to_owned()),
             "websocket must always be present in advertised transports"
@@ -153,29 +190,32 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(feature = "quic"))]
-    fn advertised_transports_excludes_quic_without_feature() {
-        let transports = advertised_transports();
+    fn advertised_transports_excludes_quic_when_not_listening() {
+        // Regardless of the compile-time feature, a node that is not running a
+        // QUIC listener must not advertise quic (§10.14.3 item 1: no
+        // advertise-but-don't-serve).
+        let transports = advertised_transports(false);
         assert!(
             !transports.contains(&"quic".to_owned()),
-            "quic must not be advertised without the quic feature flag"
+            "quic must not be advertised when no QUIC listener is running"
         );
     }
 
     #[test]
-    #[cfg(feature = "quic")]
-    fn advertised_transports_includes_quic_with_feature() {
-        let transports = advertised_transports();
+    fn advertised_transports_includes_quic_when_listening() {
+        // When a QUIC listener is running, quic must be advertised so clients
+        // can discover and prefer it (§10.5.1).
+        let transports = advertised_transports(true);
         assert!(
             transports.contains(&"quic".to_owned()),
-            "quic must be advertised when the quic feature flag is enabled"
+            "quic must be advertised when a QUIC listener is running"
         );
     }
 
     #[test]
     #[cfg(not(feature = "http3"))]
     fn advertised_transports_excludes_webtransport_without_feature() {
-        let transports = advertised_transports();
+        let transports = advertised_transports(false);
         assert!(
             !transports.contains(&"webtransport".to_owned()),
             "webtransport must not be advertised without the http3 feature flag"
@@ -185,7 +225,7 @@ mod tests {
     #[test]
     #[cfg(feature = "http3")]
     fn advertised_transports_includes_webtransport_with_feature() {
-        let transports = advertised_transports();
+        let transports = advertised_transports(false);
         assert!(
             transports.contains(&"webtransport".to_owned()),
             "webtransport must be advertised when the http3 feature flag is enabled"
@@ -195,7 +235,7 @@ mod tests {
     #[test]
     #[cfg(not(feature = "udp"))]
     fn advertised_transports_excludes_udp_dtls_without_feature() {
-        let transports = advertised_transports();
+        let transports = advertised_transports(false);
         assert!(
             !transports.contains(&"udp-dtls".to_owned()),
             "udp-dtls must not be advertised without the udp feature flag"
@@ -205,7 +245,7 @@ mod tests {
     #[test]
     #[cfg(feature = "udp")]
     fn advertised_transports_includes_udp_dtls_with_feature() {
-        let transports = advertised_transports();
+        let transports = advertised_transports(false);
         assert!(
             transports.contains(&"udp-dtls".to_owned()),
             "udp-dtls must be advertised when the udp feature flag is enabled"
@@ -213,13 +253,15 @@ mod tests {
     }
 
     #[test]
-    #[cfg(not(any(feature = "quic", feature = "http3", feature = "udp")))]
-    fn advertised_transports_default_is_websocket_only() {
-        let transports = advertised_transports();
+    #[cfg(not(any(feature = "http3", feature = "udp", feature = "coap")))]
+    fn advertised_transports_not_listening_is_websocket_only() {
+        // With no other transport features and no QUIC listener, only websocket
+        // should be advertised.
+        let transports = advertised_transports(false);
         assert_eq!(
             transports,
             vec!["websocket".to_owned()],
-            "without any transport feature flags, only websocket should be advertised"
+            "without any transport features and no QUIC listener, only websocket should be advertised"
         );
     }
 }
