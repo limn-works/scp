@@ -52,7 +52,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use argon2::Argon2;
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -98,15 +97,6 @@ const KEY_TYPE_ED25519: u8 = 0x01;
 
 /// Key type byte for X25519.
 const KEY_TYPE_X25519: u8 = 0x02;
-
-/// Argon2id iteration count (OWASP minimum: 3).
-const ARGON2_ITERATIONS: u32 = 3;
-
-/// Argon2id memory cost in KiB (OWASP recommendation: 64 MiB = 65536 KiB).
-const ARGON2_MEMORY_KIB: u32 = 65_536;
-
-/// Argon2id parallelism.
-const ARGON2_PARALLELISM: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -359,28 +349,15 @@ impl FileKeyCustody {
     }
 
     /// Derives an AES-256 key from a passphrase and salt using Argon2id.
+    ///
+    /// Delegates to [`crate::kdf::derive_argon2id_key`] — the single source of
+    /// the Argon2id parameterization (spec §17.6 / §17.8). Behavior is
+    /// byte-identical to the historical inline derivation.
     fn derive_key(
         passphrase: &str,
         salt: &[u8; SALT_LEN],
     ) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-        let params = argon2::Params::new(
-            ARGON2_MEMORY_KIB,
-            ARGON2_ITERATIONS,
-            ARGON2_PARALLELISM,
-            Some(32),
-        )
-        .map_err(|e| PlatformError::CustodyError(format!("argon2 params error: {e}")))?;
-
-        let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
-
-        let mut key = Zeroizing::new([0u8; 32]);
-        argon2
-            .hash_password_into(passphrase.as_bytes(), salt, key.as_mut())
-            .map_err(|e| {
-                PlatformError::CustodyError(format!("argon2 key derivation failed: {e}"))
-            })?;
-
-        Ok(key)
+        crate::kdf::derive_argon2id_key(passphrase.as_bytes(), salt)
     }
 
     /// Encrypts a 32-byte private key using AES-256-GCM with a fresh nonce.
