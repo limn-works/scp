@@ -485,11 +485,10 @@ fn build_node_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeI
     crate::runtime::with_identity(bi, did, |entry| {
         let custody_clone = Arc::clone(&entry.custody);
 
-        // Hand-rolled sign_fn because `OpaqueInMemoryKeyCustody` does not
-        // implement `KeyCustody` (it wraps `InMemoryKeyCustody` in `.0`).
-        // `ConcreteDidMethod::make_sign_fn` requires `Arc<K: KeyCustody>`,
-        // so we delegate to the inner `.0` field directly. Same pattern as
-        // `make_dht_with_signer` in bridge.rs.
+        // Hand-rolled sign_fn: `ConcreteDidMethod::make_sign_fn` requires
+        // `Arc<K: KeyCustody>`, and `NapiKeyCustody` does implement `KeyCustody`
+        // via enum dispatch, so we sign through it directly. Same pattern as
+        // `make_dht_with_signer` in identity.rs.
         let sign_fn: Arc<
             dyn Fn(
                     u64,
@@ -506,10 +505,10 @@ fn build_node_identity(bi: &NapiBridgeInstance, did: &str) -> napi::Result<NodeI
             let kc = Arc::clone(&custody_clone);
             Box::pin(async move {
                 let handle = scp_platform::traits::KeyHandle::new(key_id);
-                let sig =
-                    kc.0.sign(&handle, &data)
-                        .await
-                        .map_err(scp_identity::IdentityError::Platform)?;
+                let sig = kc
+                    .sign(&handle, &data)
+                    .await
+                    .map_err(scp_identity::IdentityError::Platform)?;
                 Ok(sig.into_bytes())
             })
         });

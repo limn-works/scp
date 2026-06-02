@@ -44,8 +44,6 @@ use scp_platform::encrypting_adapter::EncryptingAdapter;
 
 use crate::context::NapiContextHandle;
 use crate::error::ScpNapiError;
-#[cfg(feature = "allow_in_memory_custody")]
-use crate::identity::OpaqueInMemoryKeyCustody;
 
 // ---------------------------------------------------------------------------
 // NapiBridgeInstance — per-bridge concrete bridge instance (#1549 Phase 4 PR 1)
@@ -1064,8 +1062,14 @@ impl scp_core::context::builder::ContextCryptoProvider for TestNoOpCryptoProvide
 pub(crate) struct NapiIdentityEntry {
     /// The scp-core identity handle (DID string, key handles).
     pub(crate) identity: scp_identity::ScpIdentity,
-    /// The key custody provider holding the actual key material.
-    pub(crate) custody: Arc<OpaqueInMemoryKeyCustody>,
+    /// The key custody provider holding (or delegating to) the key material.
+    ///
+    /// Enum-dispatched ([`NapiKeyCustody`](crate::custody::NapiKeyCustody)) so
+    /// the same registry entry can back either an in-memory test identity or a
+    /// caller-provided callback custody (`identityCreateWithCustody`). The
+    /// `KeyCustody` trait is not object-safe (RPITIT), so this is a concrete
+    /// enum rather than `Arc<dyn KeyCustody>`.
+    pub(crate) custody: Arc<crate::custody::NapiKeyCustody>,
     /// The DID document at the time of creation (or last key rotation).
     pub(crate) document: scp_identity::DidDocument,
     /// Identity link attestations (§3.5.1). Stored locally per identity.

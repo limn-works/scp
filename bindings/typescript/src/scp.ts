@@ -255,6 +255,50 @@ export interface McpAllowlistState {
   readonly unrestricted: boolean;
 }
 
+/**
+ * Caller-supplied custody backend for {@link SCP.identityCreateWithCustody}.
+ *
+ * Implement this to back a DID's key material with a platform keystore (OS
+ * keychain, hardware token, HSM wrapper, etc.). The private key material never
+ * crosses into the native core — every cryptographic operation is delegated
+ * back to your callbacks (ADR-006). Mirrors the Swift/Kotlin (`UniFFI`)
+ * `KeyCustodyProvider` callback interface and the Python `KeyCustodyProvider`
+ * protocol so all SDKs share an identical contract.
+ *
+ * Callbacks are invoked synchronously from the native bridge (marshalled onto
+ * the Node.js event loop). Key identifiers are opaque, numeric-string handles
+ * your implementation assigns in {@link generateKeypair}. Byte values are
+ * passed and returned as `Uint8Array`.
+ *
+ * Only available on the NAPI (Node.js / Bun) backend — the browser/WASM build
+ * does not expose the multi-instance `SCP` class (ADR-034 / ADR-048).
+ */
+export interface KeyCustodyProvider {
+  /** Generate a keypair (`"ed25519"` or `"x25519"`); return its opaque id. */
+  generateKeypair(keyType: string): string;
+  /** Return the 64-byte Ed25519 signature of `message` under `keyId`. */
+  sign(keyId: string, message: Uint8Array): Uint8Array;
+  /** Return the 32 public-key bytes for `keyId`. */
+  getPublicKey(keyId: string): Uint8Array;
+  /** Destroy key material for `keyId`; subsequent operations must fail. */
+  destroyKey(keyId: string): void;
+  /** Return the 32-byte X25519 shared secret with `peerPublic`. */
+  dhAgree(keyId: string, peerPublic: Uint8Array): Uint8Array;
+  /**
+   * Derive a context-scoped pseudonym keypair. Returns
+   * `publicKey(32) || keyIdUtf8` — the 32-byte pseudonym public key
+   * concatenated with the UTF-8 numeric id of the derived signing key.
+   */
+  derivePseudonym(keyId: string, contextId: Uint8Array): Uint8Array;
+  /**
+   * Return the 32 raw Ed25519 private-seed bytes for `keyId`. Required for
+   * governance vote signing; hardware-bound custody should throw.
+   */
+  exportSigningKeyBytes(keyId: string): Uint8Array;
+  /** Return `"hardware"`, `"software"`, or `"in_memory"`. */
+  custodyType(keyId: string): string;
+}
+
 // ---------------------------------------------------------------------------
 // SCP class
 // ---------------------------------------------------------------------------
@@ -405,6 +449,28 @@ export class SCP {
     const raw = await (this.#native.identityCreateWithAgentKey as (c: string) => Promise<unknown>)(
       custody,
     );
+    const { Identity: IdentityCls } = await import("./identity");
+    return IdentityCls._fromHandle(this, raw);
+  }
+
+  /**
+   * Create a DID whose key material lives in a caller-provided custody backend.
+   *
+   * `provider` is any object implementing {@link KeyCustodyProvider} — the
+   * private key material never crosses into the native core (ADR-006). Use this
+   * to back a DID with an OS keychain, hardware token, or HSM wrapper.
+   *
+   * Node.js / Bun only: the browser (WASM) build of `@limn-works/scp-ts` does
+   * not expose the `SCP` class (ADR-034 / ADR-048), so calling `new SCP(...)`
+   * there already throws before this method is reachable.
+   *
+   * @throws ValidationError if the provider is missing required methods, or
+   *   IdentityError if key/DID creation fails inside the provider.
+   */
+  async identityCreateWithCustody(provider: KeyCustodyProvider): Promise<Identity> {
+    const raw = await (
+      this.#native.identityCreateWithCustody as (p: KeyCustodyProvider) => Promise<unknown>
+    )(provider);
     const { Identity: IdentityCls } = await import("./identity");
     return IdentityCls._fromHandle(this, raw);
   }

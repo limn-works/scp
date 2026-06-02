@@ -43,7 +43,7 @@ import asyncio
 import logging
 import math
 from types import TracebackType
-from typing import Any, Literal, TypedDict
+from typing import Any, Literal, Protocol, TypedDict, runtime_checkable
 
 from scp_sdk.errors import ScpError
 from scp_sdk.types import CustodyType
@@ -53,10 +53,73 @@ logger = logging.getLogger("scp_sdk")
 __all__ = [
     "SCP",
     "InMemoryStorage",
+    "KeyCustodyProvider",
     "McpAllowlistState",
     "SqliteStorage",
     "StorageConfig",
 ]
+
+
+@runtime_checkable
+class KeyCustodyProvider(Protocol):
+    """Caller-supplied custody backend for :meth:`SCP.identity_create_with_custody`.
+
+    Implement this protocol to back a DID's key material with a platform
+    keystore (OS keychain, hardware token, HSM wrapper, etc.). The private
+    key material never crosses into the Rust core — every cryptographic
+    operation is delegated back to your implementation (ADR-006).
+
+    Mirrors the UniFFI ``KeyCustodyProvider`` callback interface so Swift,
+    Kotlin, and Python implementations share an identical contract. All
+    methods are invoked synchronously by the bridge (the Rust side releases
+    the GIL while orchestrating, then re-acquires it per call), so a method
+    body may block on a keystore without stalling the asyncio event loop.
+
+    Key identifiers are opaque, numeric-string handles your implementation
+    assigns in :meth:`generate_keypair` and maps internally to real key
+    material. Byte values are passed and returned as ``bytes``.
+    """
+
+    def generate_keypair(self, key_type: str) -> str:
+        """Generate a keypair (``"ed25519"`` or ``"x25519"``); return its id."""
+        ...
+
+    def sign(self, key_id: str, message: bytes) -> bytes:
+        """Return the 64-byte Ed25519 signature of ``message`` under ``key_id``."""
+        ...
+
+    def get_public_key(self, key_id: str) -> bytes:
+        """Return the 32 public-key bytes for ``key_id``."""
+        ...
+
+    def destroy_key(self, key_id: str) -> None:
+        """Destroy key material for ``key_id``; subsequent ops must fail."""
+        ...
+
+    def dh_agree(self, key_id: str, peer_public: bytes) -> bytes:
+        """Return the 32-byte X25519 shared secret with ``peer_public``."""
+        ...
+
+    def derive_pseudonym(self, key_id: str, context_id: bytes) -> bytes:
+        """Derive a context-scoped pseudonym keypair.
+
+        Returns ``public_key_bytes (32) || key_id_utf8`` — the 32-byte
+        pseudonym public key concatenated with the UTF-8 numeric id of the
+        derived signing key.
+        """
+        ...
+
+    def export_signing_key_bytes(self, key_id: str) -> bytes:
+        """Return the 32 raw Ed25519 private-seed bytes for ``key_id``.
+
+        Required for governance vote signing. Hardware-bound custody that
+        cannot export key material should raise an exception.
+        """
+        ...
+
+    def custody_type(self, key_id: str) -> str:
+        """Return ``"hardware"``, ``"software"``, or ``"in_memory"``."""
+        ...
 
 
 class McpAllowlistState(TypedDict):
@@ -465,6 +528,30 @@ class SCP:
 
         custody_str = custody.value if isinstance(custody, CustodyType) else custody
         raw = await asyncio.to_thread(self._native.identity_create_with_agent_key, custody_str)
+        return Identity(raw)
+
+    async def identity_create_with_custody(self, provider: KeyCustodyProvider) -> Any:
+        """Create a DID whose key material lives in a caller-provided custody.
+
+        Delegate to ``_scp_core.SCP.identity_create_with_custody``. The
+        ``provider`` is any object implementing the
+        :class:`KeyCustodyProvider` protocol — the private key material never
+        crosses into the Rust core (ADR-006). Use this to back a DID with a
+        platform keychain, hardware token, or HSM wrapper.
+
+        The blocking bridge call runs in :func:`asyncio.to_thread` so the
+        provider's (potentially blocking) keystore operations do not stall the
+        asyncio event loop.
+
+        :param provider: A :class:`KeyCustodyProvider` implementation.
+        :returns: An :class:`Identity` wrapper.
+        :raises ScpError: if the provider is missing required methods
+            (``ValidationError``) or key/DID creation fails inside the
+            provider (``IdentityError``).
+        """
+        from scp_sdk.identity import Identity
+
+        raw = await asyncio.to_thread(self._native.identity_create_with_custody, provider)
         return Identity(raw)
 
     async def identity_execute_custody_migration(

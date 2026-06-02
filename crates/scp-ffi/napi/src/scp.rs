@@ -17,6 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use napi::Env;
 use napi::Error as NapiError;
 use napi_derive::napi;
 use scp_ffi_common::bridge_instance::BridgeInstanceCore as _;
@@ -378,12 +379,14 @@ impl Scp {
                     .map_or_else(InMemoryKeyCustody::new, |seed| {
                         InMemoryKeyCustody::from_seed_bytes(**seed)
                     });
-                let key_custody = Arc::new(crate::identity::OpaqueInMemoryKeyCustody(in_memory));
+                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+                    crate::identity::OpaqueInMemoryKeyCustody(in_memory),
+                ));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                 let dht = DidDht::new();
                 let (scp_identity, document, pre_rotation_handle) = dht
-                    .create(&key_custody.0, pre_rotation_custody.as_ref())
+                    .create(&*key_custody, pre_rotation_custody.as_ref())
                     .await
                     .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
@@ -501,14 +504,14 @@ impl Scp {
                 use scp_platform::testing::InMemoryKeyCustody;
                 use scp_identity::DidDht;
 
-                let key_custody = Arc::new(crate::identity::OpaqueInMemoryKeyCustody(
-                    InMemoryKeyCustody::new(),
+                let key_custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+                    crate::identity::OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
                 ));
                 let pre_rotation_custody =
                     Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
                 let dht = DidDht::new();
                 let (scp_identity, document, pre_rotation_handle) = dht
-                    .create_with_agent_key(&key_custody.0, pre_rotation_custody.as_ref())
+                    .create_with_agent_key(&*key_custody, pre_rotation_custody.as_ref())
                     .await
                     .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
 
@@ -576,6 +579,123 @@ impl Scp {
                 ),
             }
             .into()),
+        }
+    }
+
+    /// Creates a new DID identity whose key material lives in a caller-provided
+    /// custody backend.
+    ///
+    /// `provider` is a JS object implementing the `KeyCustodyProvider` record
+    /// (`generateKeypair`, `sign`, `getPublicKey`, `destroyKey`, `dhAgree`,
+    /// `derivePseudonym`, `exportSigningKeyBytes`, `custodyType`). Private key
+    /// material never crosses into the Rust core (ADR-006): every crypto op is
+    /// marshalled back to the Node.js event loop via threadsafe functions and
+    /// awaited. This is the Node/Bun equivalent of the `UniFFI` bridge's
+    /// `identity_create_with_custody`, used to back a DID with an OS keychain,
+    /// hardware token, or HSM wrapper.
+    ///
+    /// The callbacks run on the JS thread; the pre-rotation seed is generated
+    /// locally (it never traverses the consumer callbacks). See SCP-214
+    /// acceptance criteria 2-3 and ADR-006.
+    #[napi(
+        js_name = "identityCreateWithCustody",
+        ts_return_type = "Promise<NapiIdentity>"
+    )]
+    #[cfg_attr(not(feature = "allow_in_memory_custody"), allow(unused_variables))]
+    pub fn identity_create_with_custody<'env>(
+        &self,
+        env: &'env Env,
+        provider: crate::custody::NapiKeyCustodyProvider,
+    ) -> napi::Result<napi::bindgen_prelude::PromiseRaw<'env, crate::identity::NapiIdentity>> {
+        // SYNC entry point. The JS `Function` fields on `provider` are not
+        // `Send`, so they MUST be promoted to `ThreadsafeFunction`s on the JS
+        // thread (here), before any work crosses to a tokio worker. We then
+        // hand the resulting `Send` custody to `Env::spawn_future`, which runs
+        // the async DID-creation on the tokio runtime and resolves the JS
+        // Promise on the event loop — leaving the loop free to service the
+        // custody callbacks the creation flow invokes. (An `async fn` taking
+        // the `Function`s directly cannot compile: its future would capture
+        // the non-`Send` callbacks.)
+
+        // The identity registry (which retains the callback custody so later
+        // signing / event-log / SCPID operations can reach it) is compiled
+        // only under `allow_in_memory_custody`, matching every other
+        // key-bearing identity path in this bridge.
+        #[cfg(not(feature = "allow_in_memory_custody"))]
+        {
+            return Err(ScpNapiError::Identity {
+                message: "identityCreateWithCustody requires the allow_in_memory_custody \
+                          build feature (the identity registry that retains the callback \
+                          custody is gated on it)"
+                    .to_owned(),
+                code: codes::IDENT_1008.to_owned(),
+            }
+            .into());
+        }
+
+        #[cfg(feature = "allow_in_memory_custody")]
+        {
+            use scp_identity::DidDht;
+
+            use crate::identity::{NapiIdentityInner, ensure_did_resolver_initialized_on};
+
+            let bi_arc = Arc::clone(&self.inner);
+            ensure_did_resolver_initialized_on(&bi_arc);
+
+            // Promote the JS callbacks to threadsafe functions on the JS
+            // thread (consuming the non-Send `Function`s). A malformed
+            // provider fails fast here, before any DID-creation work.
+            let callback = crate::custody::NapiCallbackKeyCustody::from_provider(provider)?;
+            let key_custody = Arc::new(crate::custody::NapiKeyCustody::Callback(callback));
+
+            env.spawn_future(async move {
+                let bi = &*bi_arc;
+                let pre_rotation_custody =
+                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                let dht = DidDht::new();
+                let (scp_identity, document, pre_rotation_handle) = dht
+                    .create(&*key_custody, pre_rotation_custody.as_ref())
+                    .await
+                    .map_err(|e| NapiError::from(ScpNapiError::from(e)))?;
+
+                let verifying_key_hex = crate::identity::identity_verifying_key_hex(
+                    &key_custody,
+                    &scp_identity.identity_key,
+                )
+                .await;
+
+                crate::runtime::register_identity(
+                    bi,
+                    &scp_identity.did,
+                    crate::runtime::NapiIdentityEntry {
+                        identity: scp_identity.clone(),
+                        custody: Arc::clone(&key_custody),
+                        document: document.clone(),
+                        identity_link_attestations: Vec::new(),
+                        pre_rotation_handle,
+                        pre_rotation_custody,
+                    },
+                );
+
+                crate::identity::publish_to_shared_dht_for(&scp_identity, &document, &key_custody)
+                    .await;
+
+                let handle = crate::identity::NapiIdentity {
+                    inner: Arc::new(NapiIdentityInner {
+                        did: scp_identity.did.clone(),
+                        custody_type: "callback".to_owned(),
+                        scp_identity: Some(scp_identity),
+                        in_memory_custody: Some(key_custody),
+                        document: Some(document),
+                        bi: Arc::clone(&bi_arc),
+                        verifying_key_hex,
+                        instance_id: bi.instance_id(),
+                        rotation_event_json: None,
+                    }),
+                };
+                crate::increment_handle_count();
+                Ok(handle)
+            })
         }
     }
 
@@ -859,7 +979,7 @@ impl Scp {
         })?;
 
         let sig = tokio::task::block_in_place(|| {
-            rt.block_on(custody.0.sign(&key_handle, &built.canonical_bytes))
+            rt.block_on(custody.sign(&key_handle, &built.canonical_bytes))
         })
         .map_err(|e| {
             NapiError::from(ScpNapiError::Identity {
@@ -3823,12 +3943,14 @@ mod concurrency_cap_tests {
             .build()
             .unwrap();
 
-        let custody = Arc::new(OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()));
+        let custody = Arc::new(crate::custody::NapiKeyCustody::InMemory(
+            OpaqueInMemoryKeyCustody(InMemoryKeyCustody::new()),
+        ));
         let pre_rotation_custody =
             Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
         let dht = scp_identity::DidDht::new();
         let (identity, document, pre_rotation_handle) = rt
-            .block_on(dht.create(&custody.0, pre_rotation_custody.as_ref()))
+            .block_on(dht.create(&*custody, pre_rotation_custody.as_ref()))
             .unwrap();
         let did = identity.did.clone();
 

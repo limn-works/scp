@@ -974,6 +974,135 @@ impl crate::scp::PyScp {
         })
     }
 
+    /// Creates a new DID identity whose key material lives in a
+    /// caller-provided custody backend.
+    ///
+    /// The `provider` is a Python object implementing the
+    /// [`KeyCustodyProvider`](scp_sdk.scp.KeyCustodyProvider) protocol
+    /// (`sign`, `get_public_key`, `destroy_key`, `generate_keypair`,
+    /// `dh_agree`, `derive_pseudonym`, `export_signing_key_bytes`,
+    /// `custody_type`). The private key material never crosses into Rust
+    /// ownership — every cryptographic operation re-enters Python under a
+    /// fresh GIL (ADR-006). This is the desktop/server equivalent of the
+    /// `UniFFI` bridge's `identity_create_with_custody`, used to inject an OS
+    /// keychain, hardware-token wrapper, or any platform custody.
+    ///
+    /// # Arguments
+    ///
+    /// * `provider` — a Python object exposing the `KeyCustodyProvider`
+    ///   protocol methods. Validated up-front; a missing or non-callable
+    ///   method raises `ValidationError`.
+    ///
+    /// # Returns
+    ///
+    /// A [`PyIdentity`] whose `custody` is reported as `"callback"`. The
+    /// `did:dht:` value is derived from the provider-generated identity key
+    /// and `verifying_key()` is populated from the provider's public key.
+    ///
+    /// # Errors
+    ///
+    /// Raises `ValidationError` if the provider does not expose the required
+    /// custody methods. Raises `IdentityError` if key generation, signing, or
+    /// DID creation fails inside the provider.
+    ///
+    /// See SCP-214 acceptance criteria 2-3 and ADR-006.
+    pub fn identity_create_with_custody(
+        &self,
+        py: Python<'_>,
+        provider: Py<PyAny>,
+    ) -> PyResult<PyIdentity> {
+        let bi_arc = Arc::clone(&self.inner);
+
+        // Validate the provider exposes the required protocol methods BEFORE
+        // releasing the GIL. A malformed provider fails fast here with a
+        // typed ValidationError instead of deep inside the async DID-creation
+        // flow. Construction binds the (validated) Python object into the
+        // GIL-independent shim.
+        let provider_shim =
+            crate::custody::PyKeyCustodyProvider::new(py, provider).map_err(|e| {
+                ScpPyError::ValidationError {
+                    message: format!("invalid KeyCustodyProvider: {e}"),
+                    code: scp_ffi_common::error_codes::VALID_7005.to_owned(),
+                }
+            })?;
+        let key_custody = Arc::new(FfiKeyCustody::Callback(
+            crate::custody::PyCallbackKeyCustody::new(provider_shim),
+        ));
+        let custody_str = "callback".to_owned();
+        let rt = crate::runtime()?;
+
+        // Ensure the production DID resolver is initialized on this bridge
+        // (idempotent). #311.
+        ensure_did_resolver_initialized_on(&bi_arc, rt.handle().clone());
+
+        // CRITICAL: a single top-level `py.allow_threads` releases the GIL for
+        // the whole async DID-creation flow. The provider's custody methods
+        // re-acquire the GIL via `Python::with_gil` per call — there is NO
+        // nested `block_on` and the GIL is NOT held across `block_on`, so
+        // tokio cannot deadlock against a Python callback that itself needs
+        // the GIL.
+        py.allow_threads(|| {
+            rt.block_on(async {
+                let did_method = DidDht::new();
+                // Fresh per-identity pre-rotation custody (see
+                // `identity_create` for rationale). The pre-rotation key lives
+                // in a separate in-memory substrate from the caller's
+                // operational custody (ADR-003 §4b).
+                let pre_rotation_custody =
+                    Arc::new(scp_platform::testing::InMemoryPreRotationCustody::new());
+                let (identity, document, pre_rotation_handle) = did_method
+                    .create(key_custody.as_ref(), pre_rotation_custody.as_ref())
+                    .await
+                    .map_err(ScpPyError::from)?;
+
+                let did = identity.did.clone();
+                let document_for_handle = document.clone();
+
+                // Snapshot the #0 (identity) verifying key for ADR-046 parity
+                // BEFORE moving the custody into the registry.
+                let pk = key_custody
+                    .public_key(&identity.identity_key)
+                    .await
+                    .map_err(|e| {
+                        ScpPyError::identity(format!(
+                            "failed to read identity key after identity create: {e}"
+                        ))
+                    })?;
+                let verifying_key_hex = Some(hex::encode(pk.as_bytes()));
+
+                crate::runtime::register_identity(
+                    &bi_arc,
+                    &did,
+                    IdentityEntry {
+                        identity,
+                        custody: key_custody,
+                        document,
+                        identity_link_attestations: Vec::new(),
+                        pre_rotation_handle,
+                        pre_rotation_custody,
+                    },
+                );
+
+                // Persist identity state if storage is initialized (SCP-217).
+                if let Ok(storage) = crate::runtime::get_storage(&bi_arc) {
+                    let key = identity_state_key(&did);
+                    let data = serialize_identity_state(&did, &custody_str);
+                    storage.store(&key, &data).await.map_err(|e| {
+                        ScpPyError::identity(format!("failed to persist identity state: {e}"))
+                    })?;
+                }
+
+                Ok(PyIdentity::from_document(
+                    &bi_arc,
+                    did,
+                    custody_str,
+                    &document_for_handle,
+                    verifying_key_hex,
+                ))
+            })
+        })
+    }
+
     /// Loads an existing identity from storage.
     ///
     /// Retrieves persisted identity state (DID, custody type) from the storage

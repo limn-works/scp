@@ -22,6 +22,11 @@ napi_status napi_get_and_clear_last_exception(napi_env env, napi_value* r) { (vo
 napi_status napi_create_string_utf8(napi_env env, const char* s, size_t l, napi_value* r) { (void)env; (void)s; (void)l; if (r) *r = (napi_value)0; return 0; }
 napi_status napi_set_named_property(napi_env env, napi_value o, const char* n, napi_value v) { (void)env; (void)o; (void)n; (void)v; return 0; }
 napi_status napi_call_threadsafe_function(napi_threadsafe_function f, void* d, napi_threadsafe_function_call_mode b) { (void)f; (void)d; (void)b; return 0; }
+napi_status napi_release_threadsafe_function(napi_threadsafe_function f, int32_t mode) { (void)f; (void)mode; return 0; }
+napi_status napi_acquire_threadsafe_function(napi_threadsafe_function f) { (void)f; return 0; }
+napi_status napi_ref_threadsafe_function(napi_env env, napi_threadsafe_function f) { (void)env; (void)f; return 0; }
+napi_status napi_unref_threadsafe_function(napi_env env, napi_threadsafe_function f) { (void)env; (void)f; return 0; }
+napi_status napi_create_threadsafe_function(napi_env env, napi_value func, napi_value res, napi_value name, size_t max_queue, size_t initial_thread, void* ctx, void* finalize_cb, void* finalize_data, void* call_js_cb, napi_threadsafe_function* r) { (void)env; (void)func; (void)res; (void)name; (void)max_queue; (void)initial_thread; (void)ctx; (void)finalize_cb; (void)finalize_data; (void)call_js_cb; if (r) *r = (napi_threadsafe_function)0; return 0; }
 ";
 
 fn main() {

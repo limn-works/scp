@@ -2085,6 +2085,21 @@
       ]
     },
     {
+      "canonical": "identity_create_with_custody",
+      "category": "identity",
+      "wasm_required": false,
+      "pyo3": [
+        "identity_create_with_custody"
+      ],
+      "uniffi": [
+        "identity_create_with_custody"
+      ],
+      "napi": [
+        "identity_create_with_custody"
+      ],
+      "wasm": []
+    },
+    {
       "canonical": "identity_execute_recovery",
       "category": "identity",
       "wasm_required": true,
@@ -3033,6 +3048,10 @@
     "uniffi": [],
     "napi": [],
     "wasm": [
+      {
+        "canonical": "identity_create_with_custody",
+        "reason": "Custody-backed DID creation requires DidDht::create from scp-identity, which transitively pulls scp-runtime (tokio multi-thread); wasm32 cannot compile it per ADR-034. WASM identity_create generates keys locally (crates/scp-ffi/wasm/src/identity.rs)."
+      },
       {
         "canonical": "scpid_verify",
         "reason": "SCPID verification requires DID resolver with DHT/network access; WASM lacks raw UDP and the tokio multi-thread runtime per ADR-034 (see crates/scp-ffi/wasm/src/scpid.rs:11)"

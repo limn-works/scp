@@ -44,6 +44,13 @@
           "swift": true
         },
         {
+          "name": "create_with_custody",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true
+        },
+        {
           "name": "add_agent_key",
           "python": true,
           "typescript": true,
