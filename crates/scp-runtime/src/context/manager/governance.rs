@@ -5041,6 +5041,20 @@ impl ContextManager {
 
         // Create the destination context AFTER the source has been
         // transitioned to MigratingOut. If creation fails, roll back.
+        //
+        // The destination context is created with a zero local pseudonym
+        // (`[0u8; 32]`). The runtime layer has no `KeyCustody` access to derive
+        // a real per-context pseudonym — custody lives at the FFI boundary — and
+        // the generic governance dispatch carries no identity to thread one
+        // through. This is a placeholder pending completion of the migration
+        // feature, which must derive a real pseudonym for the destination
+        // (either by threading identity through the migration entry point, or via
+        // a dedicated `context_set_local_pseudonym` FFI the SDK invokes after
+        // migration). Per spec §9.10.4 the zero is safe-but-incomplete: it is
+        // fail-loud, not a silent privacy fallback — an encrypted multi-member
+        // send raises `PseudonymRegistryEmpty`, and `send_pseudonym_announcement`
+        // skips the zero sentinel rather than poisoning peer registries. The only
+        // gap is that the destination creator cannot yet announce a real pseudonym.
         if let Err(e) = self
             .create_context(
                 destination_context_id.clone(),
