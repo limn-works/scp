@@ -226,7 +226,7 @@ struct PostTerminalLifecycleTests {
             // discard
         }
         do {
-            _ = try await handle.cancel(nextSeq: 0)
+            _ = try await handle.cancel()
             #expect(Bool(false), "expected throw")
         } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
             // expected — Fix #4: lifecycle error nests under .protocol(envelope)

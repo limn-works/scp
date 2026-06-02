@@ -3,14 +3,14 @@
 // Wraps the UniFFI-generated streaming bridge (see
 // `crates/scp-ffi/uniffi/src/outlet_stream.rs`) as idiomatic Kotlin:
 //
-// - `OutletStreamFlow` — a `Flow<OutletStreamChunk>` over an opened
-//   stream session, driven by polling `OutletStreamHandle.next()`.
-// - `Context.openOutletStream(...)` — opens a stream and returns the
-//   flow.
 // - `OutletStreaming.grantCredit(...)` / `OutletStreaming.cancel(...)` /
-//   `OutletStreaming.verifyChunkSignature(...)` /
+//   `OutletStreaming.terminate(...)` / `OutletStreaming.verifyChunkSignature(...)` /
 //   `OutletStreaming.computeCaveatsBinding(...)` — top-level
 //   helpers for the FFI streaming functions.
+//
+// All stream invocation flows through `ctx.outlets.invoke(...)` →
+// `InvocationHandle` (SCP-OUT-038 AC1 — the SOLE public verb). The
+// reusable abnormal-closure flow logic lives in `outletStreamFlowFromNext`.
 //
 // Pure ergonomics layer (ADR-021 — protocol logic stays in Rust). The
 // Rust bridge enforces the §5.4.5 invariants; this file translates the
@@ -18,14 +18,10 @@
 //
 // UniFFI-generated symbols this file uses (regenerated from
 // `crates/scp-ffi/uniffi/src/outlet_stream.rs`):
-// - `OutletStreamHandle` — opaque async-iterator class with `next()`
-//   and `cancel(nextSeq:)`.
 // - `OutletStreamChunkRecord` — chunk payload record.
-// - `OutletStreamSubscriber` — push-style callback interface.
-// - `outletInvokeStream(...)` — open returns `OutletStreamHandle`.
-// - `outletInvokeStreamWithSubscriber(...)` — open + push.
 // - `outletStreamGrantCredit(requestIdHex, grant)`
 // - `outletStreamCancel(requestIdHex, nextSeq)`
+// - `outletStreamTerminate(requestIdHex, callerDid, reason, messageOverride)`
 // - `verifyChunkSignature(chunkJson, operatorPk, contextId, outletId, caveatsBinding)`
 // - `computeCaveatsBinding(ucanCid, requestId, invokerDid, estimatedChunkCount, effectiveCaveatsJson)`
 
@@ -35,14 +31,8 @@ package works.limn.scp
 
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
-import uniffi.scp.ContextHandle
-import uniffi.scp.Identity
-import uniffi.scp.OutletStreamHandle
-import uniffi.scp.OutletStreamSubscriber
 import uniffi.scp.TerminateReason
 import uniffi.scp.computeCaveatsBinding as ffiComputeCaveatsBinding
-import uniffi.scp.outletInvokeStream as ffiOutletInvokeStream
-import uniffi.scp.outletInvokeStreamWithSubscriber as ffiOutletInvokeStreamWithSubscriber
 import uniffi.scp.outletStreamCancel as ffiOutletStreamCancel
 import uniffi.scp.outletStreamTerminate as ffiOutletStreamTerminate
 import uniffi.scp.outletStreamGrantCredit as ffiOutletStreamGrantCredit
@@ -55,10 +45,9 @@ import uniffi.scp.verifyChunkSignature as ffiVerifyChunkSignature
 // ---------------------------------------------------------------------------
 
 /**
- * One chunk yielded by [OutletStreamFlow] or pushed to a
- * `OutletStreamSubscriber`. Mirrors the §5.4.5 wire form variant-by-
- * variant — callers branch on [payloadType] and read the variant
- * fields directly.
+ * One chunk yielded by the [outletStreamFlowFromNext] flow. Mirrors the
+ * §5.4.5 wire form variant-by-variant — callers branch on [payloadType]
+ * and read the variant fields directly.
  *
  * Distinct from the SDK-shaped sealed class [OutletStreamChunk] in
  * `Outlets.kt`; this record carries every wire field including `sig`
@@ -134,7 +123,7 @@ data class OutletStreamChunkData(
     /**
      * Adapter constructor for converting a raw `OutletStreamChunkRecord`
      * (UniFFI-generated record) into this SDK-side shape. Lives at the
-     * companion so `OutletStreamFlow` can forward without exposing the
+     * companion so the flow seam can forward without exposing the
      * generated class to callers (the generated `OutletStreamChunkRecord`
      * shape may change as UniFFI bindings regenerate).
      */
@@ -174,154 +163,24 @@ data class OutletStreamChunkData(
 }
 
 // ---------------------------------------------------------------------------
-// OutletStreamFlow — Flow<OutletStreamChunkData> wrapper around
-// `OutletStreamHandle.next()` polling.
+// outletStreamFlowFromNext — reusable abnormal-closure flow logic over a
+// `next()` cursor. The §5.4.5 streaming control plane is `InvocationHandle`
+// (SCP-OUT-038 AC1); this seam carries the converged §5.4.4 abnormal-
+// closure contract (6131, NO slug) independent of any opaque bridge handle.
 // ---------------------------------------------------------------------------
 
 /**
- * Cold [Flow] over the chunks of an open outlet stream session.
+ * Builds a cold [Flow] over outlet-stream chunks pulled from a `next`
+ * suspend lambda. Accepting `next` rather than an opaque
+ * `OutletStreamHandle` keeps the abnormal-closure contract testable
+ * without the regenerated `uniffi.scp` bindings or the compiled cdylib.
  *
- * Construction wraps the UniFFI-generated `OutletStreamHandle` and
- * exposes:
- * - [asFlow] — `Flow<OutletStreamChunkData>` driven by `next()`
- *   polling. Emission ends when the handle reports `done` or the
- *   receiver closes.
- * - [requestIdHex] — 32-char lowercase hex `request_id` for control-
- *   plane lookups.
- * - [grantCredit] — sign + apply an `OutletStreamCredit` grant.
- * - [cancel] — apply an `OutletCancel`.
- *
- * Callers obtain instances from [Context.openOutletStream]. The
- * underlying handle is owned by the Rust bridge and freed on JVM
- * garbage-collection of this wrapper (UniFFI emits a `Disposable`
- * lifecycle; the Kotlin SDK relies on default GC semantics).
- *
- * **DEPRECATED for direct use** — Per SCP-OUT-038 AC1 the SOLE public
- * verb is `ctx.outlets.invoke(...)`. Pass the streaming-mode
- * parameters (`caveatsBindingHex`, `streamEpoch`, `creditWindow`,
- * `estimatedChunkCount`, `aggregateSchemaJson`) to that method to
- * obtain an [InvocationHandle] which exposes the same control-plane
- * surface (`grantCredit` / `cancel`). This class is retained for
- * advanced callers that need direct access to the UniFFI-shaped chunk
- * record (`OutletStreamChunkData`) but should not be used for new
- * call sites.
- */
-@Deprecated(
-    message = "Use ctx.outlets.invoke(streaming params) per SCP-OUT-038 AC1; " +
-        "control-plane via the returned InvocationHandle.",
-)
-class OutletStreamFlow internal constructor(
-    private val handle: OutletStreamHandle,
-    /**
-     * Pinned invoker DID — required by the bridge's CRITICAL #1
-     * caller-authentication gate on every control-plane call.
-     */
-    private val invokerDid: String,
-) {
-    /** 32-char lowercase hex `request_id`. */
-    val requestIdHex: String
-        get() = handle.requestId()
-
-    /** `true` once a terminal chunk has been observed (or close). */
-    val isDone: Boolean
-        get() = handle.done()
-
-    /**
-     * Returns a cold [Flow] that emits one chunk per
-     * `OutletStreamHandle.next()` call. Emission ends on receiver close
-     * AFTER a terminal chunk (`End` / `Error{terminal:true}`) has been
-     * observed.
-     *
-     * Abnormal-closure handling: if `handle.next()` returns `null`
-     * BEFORE a terminal chunk has been emitted, the flow throws
-     * [ExecutionError] with code `SCP-TOOL-6131` and NO slug per §5.4.4
-     * (converged with Python / TypeScript / Swift). Synthesising a
-     * silent end-of-flow on receiver close would let callers mistake a
-     * transport drop, executor crash, or bridge fault for a clean
-     * stream completion.
-     */
-    fun asFlow(): Flow<OutletStreamChunkData> =
-        outletStreamFlowFromNext {
-            handle.next()?.let { raw ->
-                StreamChunkSource(
-                    requestId = raw.requestId,
-                    sequence = raw.sequence,
-                    sig = raw.sig,
-                    payloadType = raw.payloadType,
-                    valueJson = raw.valueJson,
-                    pct = raw.pct,
-                    note = raw.note,
-                    aggregateJson = raw.aggregateJson,
-                    provenanceJson = raw.provenanceJson,
-                    executionTimeMs = raw.executionTimeMs,
-                    code = raw.code,
-                    message = raw.message,
-                    terminal = raw.terminal,
-                )
-            }
-        }
-
-    /**
-     * Signs and applies an `OutletStreamCredit` grant for this stream.
-     *
-     * Takes a typed [Credit] to keep parity with [InvocationHandle.grantCredit]
-     * and the §5.4.4 round-6 zero-rejection rule. The compiler rejects
-     * passing a raw [UInt]; [Credit]'s constructor itself raises
-     * [InvalidGrant] for `raw == 0u`.
-     *
-     * @throws ScpException.Context when the runtime tracker rejects
-     *   the grant or the stream has already terminated.
-     */
-    suspend fun grantCredit(grant: Credit): UInt =
-        ffiOutletStreamGrantCredit(
-            requestIdHex = requestIdHex,
-            callerDid = invokerDid,
-            grant = grant.raw,
-        )
-
-    /**
-     * Applies an `OutletCancel` to this stream.
-     *
-     * CRITICAL #3 — `next_seq` is no longer accepted; the bridge
-     * derives the canonical next-emission cursor from runtime state.
-     *
-     * @return Recorded cancel-ack sequence number, or `null` when the
-     *   stream had already reached a terminal chunk (idempotent per
-     *   §5.4.5).
-     */
-    suspend fun cancel(): ULong? = handle.cancel()
-
-    /**
-     * Forces a terminal `Error{terminal:true}` chunk into this stream
-     * (§5.4.5 framework-initiated stream termination).
-     *
-     * Called by the SDK framework's periodic UCAN re-check loop with
-     * [TerminateReason.RevokedMidStream] when it observes the opening
-     * UCAN has been revoked since stream open. The runtime emits a
-     * synthetic terminal Error chunk under the pinned operator key.
-     *
-     * @param reason Closed-set termination cause — the bridge derives
-     *   the canonical §5.4.4 slug + code from this value.
-     * @param messageOverride Optional human-readable suffix; `null`
-     *   uses the spec's canonical default message for the variant.
-     */
-    suspend fun terminate(reason: TerminateReason, messageOverride: String?) {
-        ffiOutletStreamTerminate(
-            requestIdHex = requestIdHex,
-            callerDid = invokerDid,
-            reason = reason,
-            messageOverride = messageOverride,
-        )
-    }
-}
-
-/**
- * Internal test-seam variant of [OutletStreamFlow.asFlow] — accepts a
- * `next` suspend lambda so tests can drive the flow against synthetic
- * chunk sources without constructing a UniFFI `OutletStreamHandle`
- * (which would require the regenerated `uniffi.scp` bindings and the
- * compiled cdylib). Production callers go through the
- * [OutletStreamFlow.asFlow] method which pins `next` to `handle.next()`.
+ * Abnormal-closure handling: if `next()` returns `null` BEFORE a terminal
+ * chunk (`End` / `Error{terminal:true}`) has been emitted, the flow throws
+ * [ExecutionError] with code `SCP-TOOL-6131` and NO slug per §5.4.4
+ * (converged with Python / TypeScript / Swift). Synthesising a silent
+ * end-of-flow on receiver close would let callers mistake a transport
+ * drop, executor crash, or bridge fault for a clean stream completion.
  *
  * Surfaced via an internal helper so unit tests in the same package can
  * reach it without exposing it on the public API.
@@ -338,10 +197,12 @@ internal fun outletStreamFlowFromNext(
             }
             // Abnormal closure — `next()` returned null before any
             // terminal chunk. Code `SCP-TOOL-6131`, NO slug — converged
-            // with Python / TypeScript / Swift. The spec registers no
-            // slug for this 6131 condition (the prior `execution.stream-gap`
-            // string was an unregistered divergence), so we omit it
-            // (defaults to null).
+            // with Python / TypeScript / Swift. §5.4.5 does list
+            // `execution.stream-gap` sharing the 6131 band, but that slug
+            // names a distinct condition (an explicit gap signal in the
+            // stream). The SDK intentionally omits the slug for THIS
+            // condition — the receiver closed before any terminal chunk —
+            // so it is not conflated with the spec's StreamGap.
             throw ExecutionError(
                 message = "stream closed without terminal chunk",
                 code = "SCP-TOOL-6131",
@@ -430,114 +291,6 @@ internal data class StreamChunkSource(
         return result
     }
 }
-
-// ---------------------------------------------------------------------------
-// Top-level open-stream helpers — work directly against the UniFFI
-// `ContextHandle` and `Identity` opaque classes (no Kotlin-side
-// `Context` wrapper exists yet in this SDK; SDKs evolve toward one).
-// ---------------------------------------------------------------------------
-
-/**
- * Opens a §5.4.5 streaming outlet invocation and returns a
- * [OutletStreamFlow].
- *
- * Mirrors the PyO3 / NAPI / Swift contracts: re-validates the UCAN
- * under the full 11-step ADR-016 pipeline, reserves a per-stream
- * `request_id`, and registers the session for later
- * `grantCredit` / `cancel` lookups.
- *
- * @param contextHandle Hosting [ContextHandle].
- * @param outletId Outlet to invoke.
- * @param inputJson JSON-encoded input matching the outlet's input schema.
- * @param identity Invoker [Identity].
- * @param ucanToken UCAN authorising the invocation.
- * @param caveatsBindingHex 32-byte `caveats_binding` rendered as 64-char
- *   lowercase hex. Compute via [OutletStreaming.computeCaveatsBinding].
- * @param streamEpoch Hosting context's MLS epoch counter at open
- *   acceptance.
- * @param proofTokens Optional encoded parent UCANs for delegation-chain
- *   traversal.
- * @param creditWindow Initial credit-window size; defaults to §5.4.5
- *   `DEFAULT_CREDIT_WINDOW` when `null`.
- * @param estimatedChunkCount Optional upper bound on billable chunks.
- * @param spendingUcan Optional JWT-encoded spending-capability UCAN
- *   (§19.5) that AND-composes the streaming escrow's available balance
- *   against the spending UCAN's `max_per_action`. `null` for the
- *   no-spending default (Query / zero-cost outlets).
- * @return An [OutletStreamFlow] ready for `.asFlow().collect { }`.
- *   Use [OutletStreamFlow.grantCredit] / [OutletStreamFlow.cancel] to
- *   manage flow.
- */
-@Suppress("LongParameterList", "DEPRECATION")
-@Deprecated(
-    message = "Use ctx.outlets.invoke(streaming params) per SCP-OUT-038 AC1; " +
-        "the returned InvocationHandle exposes grantCredit / cancel as " +
-        "control-plane methods.",
-)
-suspend fun openOutletStreamSession(
-    contextHandle: ContextHandle,
-    outletId: String,
-    inputJson: String,
-    identity: Identity,
-    ucanToken: String,
-    caveatsBindingHex: String,
-    streamEpoch: ULong,
-    proofTokens: List<String>? = null,
-    creditWindow: UInt? = null,
-    estimatedChunkCount: UInt? = null,
-    spendingUcan: String? = null,
-): OutletStreamFlow {
-    val raw = ffiOutletInvokeStream(
-        handle = contextHandle,
-        outletId = outletId,
-        inputJson = inputJson,
-        identity = identity,
-        ucanToken = ucanToken,
-        caveatsBindingHex = caveatsBindingHex,
-        streamEpoch = streamEpoch,
-        proofTokens = proofTokens,
-        creditWindow = creditWindow,
-        estimatedChunkCount = estimatedChunkCount,
-        spendingUcan = spendingUcan,
-    )
-    return OutletStreamFlow(raw, invokerDid = identity.did())
-}
-
-/**
- * Push-style variant of [openOutletStreamSession] that drives every
- * chunk into a caller-supplied [OutletStreamSubscriber]. Returns the
- * 32-char hex `request_id` so the caller can address the active stream
- * from [OutletStreaming.grantCredit] / [OutletStreaming.cancel] before
- * the pump exits.
- */
-@Suppress("LongParameterList")
-suspend fun openOutletStreamSessionWithSubscriber(
-    contextHandle: ContextHandle,
-    outletId: String,
-    inputJson: String,
-    identity: Identity,
-    ucanToken: String,
-    caveatsBindingHex: String,
-    streamEpoch: ULong,
-    proofTokens: List<String>? = null,
-    creditWindow: UInt? = null,
-    estimatedChunkCount: UInt? = null,
-    spendingUcan: String? = null,
-    subscriber: OutletStreamSubscriber,
-): String = ffiOutletInvokeStreamWithSubscriber(
-    handle = contextHandle,
-    outletId = outletId,
-    inputJson = inputJson,
-    identity = identity,
-    ucanToken = ucanToken,
-    caveatsBindingHex = caveatsBindingHex,
-    streamEpoch = streamEpoch,
-    proofTokens = proofTokens,
-    creditWindow = creditWindow,
-    estimatedChunkCount = estimatedChunkCount,
-    spendingUcan = spendingUcan,
-    subscriber = subscriber,
-)
 
 // ---------------------------------------------------------------------------
 // Top-level helpers — verify_chunk_signature, compute_caveats_binding,

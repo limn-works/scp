@@ -11,13 +11,13 @@ import Foundation
 // UniFFI-generated symbols this file uses (regenerated from
 // `crates/scp-ffi/uniffi/src/outlet_stream.rs`):
 // - `OutletStreamHandle` — opaque async-iterator class with `next()`
-//   and `cancel(nextSeq:)`
+//   and `cancel()` (CRITICAL #3 — `next_seq` is no longer accepted)
 // - `OutletStreamChunkRecord` — chunk payload record
 // - `OutletStreamSubscriber` — push-style callback interface
 // - `outletInvokeStream(...)` — open returns OutletStreamHandle
 // - `outletInvokeStreamWithSubscriber(...)` — open + push
 // - `outletStreamGrantCredit(requestIdHex:grant:)`
-// - `outletStreamCancel(requestIdHex:nextSeq:)`
+// - `outletStreamCancel(requestIdHex:)`
 // - `verifyChunkSignature(chunkJson:operatorPk:contextId:outletId:caveatsBinding:)`
 // - `computeCaveatsBinding(ucanCid:requestId:invokerDid:estimatedChunkCount:effectiveCaveatsJson:)`
 
@@ -89,7 +89,7 @@ extension Context {
         proofTokens: [String]? = nil,
         creditWindow: UInt32? = nil,
         estimatedChunkCount: UInt32? = nil,
-        spendingUcanJwt: String? = nil,
+        spendingUcan: String? = nil,
         subscriber: OutletStreamSubscriber
     ) async throws -> String {
         try await outletInvokeStreamWithSubscriber(
@@ -103,7 +103,7 @@ extension Context {
             proofTokens: proofTokens,
             creditWindow: creditWindow,
             estimatedChunkCount: estimatedChunkCount,
-            spendingUcan: spendingUcanJwt,
+            spendingUcan: spendingUcan,
             subscriber: subscriber
         )
     }
@@ -248,14 +248,16 @@ func pumpStreamingChunksWithNext(
     }
 }
 
-/// Abnormal-closure envelope for the §5.4.4 stream-gap path (bridge
+/// Abnormal-closure envelope for the receiver-closed-early path (bridge
 /// receiver returned `nil` before any terminal chunk).
 ///
 /// Code `SCP-TOOL-6131`, NO slug — matching the Python reference and the
-/// other SDKs. The spec registers no slug for this condition (the
-/// `execution.stream-gap` string was never a registered slug — only a
-/// prose label in §5.4.4 for the shared 6131 code band), so the SDK
-/// MUST NOT attach one. `OutletEnvelope.slug` is a non-optional `String`,
+/// other SDKs. §5.4.5 does register `execution.stream-gap` on the shared
+/// 6131 code band, but that slug names a DISTINCT condition (an explicit
+/// in-stream gap signal). The condition the SDK surfaces here — the
+/// receiver closed before any terminal chunk — is not the spec's
+/// StreamGap, so the SDK intentionally omits the slug to avoid
+/// conflating the two. `OutletEnvelope.slug` is a non-optional `String`,
 /// so "no slug" is the empty string.
 private func streamGapEnvelope() -> OutletEnvelope {
     OutletEnvelope(
@@ -273,11 +275,18 @@ private func streamGapEnvelope() -> OutletEnvelope {
 
 /// Envelope for a terminal `Error{terminal: true}` chunk observed
 /// mid-stream — the chunk's own code+message become the envelope's.
+///
+/// The §5.4.5 Error chunk wire form carries `code` / `message` /
+/// `terminal` only — there is no per-chunk slug field. So the envelope
+/// MUST NOT borrow `code` as the slug: `code` is the `SCP-TOOL-NNNN`
+/// string, which is not a valid slug (slugs match `^[a-z][a-z0-9-]…`).
+/// `OutletEnvelope.slug` is a non-optional `String`, so absence of a
+/// slug is the empty string — matching `streamGapEnvelope()`.
 private func terminalErrorEnvelope(code: String, message: String) -> OutletEnvelope {
     OutletEnvelope(
         classWire: .execution,
         code: code,
-        slug: code,
+        slug: "",
         message: message,
         retry: .never,
         detail: nil,

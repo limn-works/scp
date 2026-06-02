@@ -553,7 +553,7 @@ public final class CaveatBuilder {
 ///   chunks observed).
 ///
 /// SCP-OUT-038 control plane (AC2-3): every handle exposes
-/// `grantCredit(_: Credit)` and `cancel(nextSeq:)`. When the handle was
+/// `grantCredit(_: Credit)` and `cancel()`. When the handle was
 /// opened against a real §5.4.5 streaming session, these route to the
 /// UniFFI `outletStreamGrantCredit` / `outletStreamCancel` exports.
 /// When the handle wraps a degenerate single-shot invocation (no
@@ -1077,7 +1077,7 @@ public actor OutletNamespace {
     /// Returns an `InvocationHandle` that exposes both
     /// `await handle.aggregate` and `for try await chunk in handle`,
     /// plus the SCP-OUT-038 control-plane methods
-    /// `handle.grantCredit(_:)` and `handle.cancel(nextSeq:)`.
+    /// `handle.grantCredit(_:)` and `handle.cancel()`.
     ///
     /// When `caveatsBindingHex` AND `streamEpoch` are supplied, opens
     /// a real §5.4.5 streaming session via `outletInvokeStream` — the
@@ -1091,7 +1091,7 @@ public actor OutletNamespace {
         input: String,
         ucanToken: String? = nil,
         proofTokens: [String]? = nil,
-        spendingUcanJwt: String? = nil,
+        spendingUcan: String? = nil,
         caveatsBindingHex: String? = nil,
         streamEpoch: UInt64? = nil,
         creditWindow: UInt32? = nil,
@@ -1108,7 +1108,7 @@ public actor OutletNamespace {
                 proofTokens: proofTokens,
                 creditWindow: creditWindow,
                 estimatedChunkCount: estimatedChunkCount,
-                spendingUcanJwt: spendingUcanJwt,
+                spendingUcan: spendingUcan,
                 aggregateSchemaJson: aggregateSchemaJson
             )
         }
@@ -1117,7 +1117,7 @@ public actor OutletNamespace {
             inputJson: input,
             ucanToken: ucanToken,
             proofTokens: proofTokens,
-            spendingUcanJwt: spendingUcanJwt,
+            spendingUcan: spendingUcan,
             aggregateSchemaJson: aggregateSchemaJson
         )
     }
@@ -1127,7 +1127,7 @@ public actor OutletNamespace {
         inputJson: String,
         ucanToken: String?,
         proofTokens: [String]?,
-        spendingUcanJwt: String?,
+        spendingUcan: String?,
         aggregateSchemaJson: String?
     ) -> InvocationHandle {
         let handle = self.handle
@@ -1145,7 +1145,7 @@ public actor OutletNamespace {
                         identity: identity,
                         ucanToken: ucanToken,
                         proofTokens: proofTokens,
-                        spendingUcanJwt: spendingUcanJwt
+                        spendingUcanJwt: spendingUcan
                     )
                     let chunk = OutletStreamChunk(
                         requestId: Data(count: 16),
@@ -1175,7 +1175,7 @@ public actor OutletNamespace {
         proofTokens: [String]?,
         creditWindow: UInt32?,
         estimatedChunkCount: UInt32?,
-        spendingUcanJwt: String?,
+        spendingUcan: String?,
         aggregateSchemaJson: String?,
         ucanRecheckSecs: UInt32 = 10
     ) -> InvocationHandle {
@@ -1200,7 +1200,7 @@ public actor OutletNamespace {
                         proofTokens: proofTokens,
                         creditWindow: creditWindow,
                         estimatedChunkCount: estimatedChunkCount,
-                        spendingUcan: spendingUcanJwt
+                        spendingUcan: spendingUcan
                     )
                     let recheckTask = makeRevocationRecheckTask(
                         contextHandle: handle,

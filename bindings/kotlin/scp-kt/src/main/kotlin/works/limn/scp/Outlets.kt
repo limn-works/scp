@@ -671,7 +671,7 @@ interface OutletNamespace {
      *   11-step ADR-016 pipeline at open).
      * @param proofTokens Optional encoded parent UCANs for delegation
      *   chain traversal (ADR-016 step 3).
-     * @param spendingUcanJwt Optional spending-cap UCAN for paid
+     * @param spendingUcan Optional spending-cap UCAN for paid
      *   outlets. Streaming-mode ignores this (the streaming bridge
      *   wires economy via the credit grant path).
      * @param caveatsBindingHex 32-byte SHA-256 binding rendered as
@@ -695,7 +695,7 @@ interface OutletNamespace {
         inputJson: String,
         ucanToken: String? = null,
         proofTokens: List<String>? = null,
-        spendingUcanJwt: String? = null,
+        spendingUcan: String? = null,
         caveatsBindingHex: String? = null,
         streamEpoch: ULong? = null,
         creditWindow: UInt? = null,
@@ -804,7 +804,7 @@ internal class InMemoryOutletNamespace(
         inputJson: String,
         ucanToken: String?,
         proofTokens: List<String>?,
-        spendingUcanJwt: String?,
+        spendingUcan: String?,
         caveatsBindingHex: String?,
         streamEpoch: ULong?,
         creditWindow: UInt?,
