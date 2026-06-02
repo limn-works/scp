@@ -77,7 +77,13 @@
           "typescript": false,
           "kotlin": false,
           "swift": false,
-          "notes": "Rust core only in phase 1 — recovers a `migrate_identity` partial DHT publish via `DidDht::resume_migration_publish`. SDK callers currently see the `SCP-IDENT-1053` error code without structured plumbing. Per-SDK idiomatic exception types carrying `MigrationPartialState` land in subsequent PRs (ADR-048 §7)."
+          "notes": "Rust core only in phase 1 — recovers a `migrate_identity` partial DHT publish via `DidDht::resume_migration_publish`. SDK callers currently see the `SCP-IDENT-1053` error code without structured plumbing. Per-SDK idiomatic exception types carrying `MigrationPartialState` land in subsequent PRs (ADR-048 §7).",
+          "exemptions": {
+            "python": "phase-1 surface: structured MigrationPartialState plumbing deferred to per-SDK idiom follow-up (ADR-048 §7)",
+            "typescript": "phase-1 surface: structured MigrationPartialState plumbing deferred to per-SDK idiom follow-up (ADR-048 §7)",
+            "kotlin": "phase-1 surface: structured MigrationPartialState plumbing deferred to per-SDK idiom follow-up (ADR-048 §7)",
+            "swift": "phase-1 surface: structured MigrationPartialState plumbing deferred to per-SDK idiom follow-up (ADR-048 §7)"
+          }
         },
         {
           "name": "attest_device",
