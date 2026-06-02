@@ -1226,6 +1226,12 @@ pub(crate) async fn context_subscribe_on(
             None
         } else {
             match manager_for_task.as_ref() {
+                // `.ok()` discards the now-typed error (`NotPseudonymousContext`
+                // or a registry miss) deliberately: broadcast contexts are
+                // already routed to `None` by the `is_broadcast` guard above, and
+                // for an encrypted context a derivation/registry miss legitimately
+                // falls back to shared-RID-only subscription rather than failing
+                // the whole subscribe.
                 Some(mgr) => mgr.local_pseudonym(&context_id).await.ok(),
                 None => None,
             }
