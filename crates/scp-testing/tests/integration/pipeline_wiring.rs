@@ -2163,6 +2163,7 @@ async fn streaming_settlement_moves_budget_via_in_memory_sink() {
                         s.billed_count,
                         s.request_id,
                         &s.outlet_id,
+                        s.economic_policy_snapshot,
                     )
                     .await;
             });
@@ -2187,6 +2188,7 @@ async fn streaming_settlement_moves_budget_via_in_memory_sink() {
         billed_count: 3,
         request_id: *uuid::Uuid::now_v7().as_bytes(),
         outlet_id: scp_protocol::context::outlets::OutletId::from("outlet-z"),
+        economic_policy_snapshot: None,
     });
     assert!(
         fired.load(std::sync::atomic::Ordering::SeqCst),

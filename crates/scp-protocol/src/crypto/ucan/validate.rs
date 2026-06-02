@@ -448,6 +448,47 @@ impl CaveatResolver for NoCaveatResolver {
     }
 }
 
+/// A [`CaveatResolver`] that reads each token's caveats directly from its
+/// own `nb` field — the canonical wire location for §7.3.8 invocation
+/// caveats.
+///
+/// This is the production resolver for outlet-stream open: it feeds the
+/// leaf token's signed `nb` and every parent proof's `nb` into the
+/// per-edge `narrow()` loop ([`verify_attenuation`] Step 7b) and into the
+/// leaf time-box gate ([`verify_caveat_time_box`] Step 11b), so the set
+/// that survives validation is the VALIDATED-NARROWED `effective_caveats`
+/// the §5.4.5 `caveats_binding` is computed over — not an unverified leaf
+/// assertion (§5.4.5 "`effective_caveats` MUST be the VALIDATED-NARROWED
+/// set"). Because `nb` is covered by the token signature, a resolver that
+/// reads it cannot be made to disagree with what the issuer signed.
+///
+/// Zero-sized: holds no state, so it is `Copy` and trivially shareable as
+/// `&dyn CaveatResolver` across the open path and any spawned validation
+/// task without an adapter.
+///
+/// Tokens with no `nb` field resolve to `None` (caveat-free), preserving
+/// the [`CaveatResolver`] `None`-handling contract: such tokens skip Step
+/// 7b / 11b for themselves while caveat-bearing siblings in the same chain
+/// are still checked.
+///
+/// Call-site note: switching the runtime / bridge validation call sites
+/// from [`NoCaveatResolver`] to this resolver is a separate wiring step.
+/// The shared cross-target validation helper MUST NOT hardcode this
+/// resolver — the generic UCAN-validation entry point funnels through the
+/// same helper, so the resolver is threaded as a parameter at each call
+/// site that opts into caveat enforcement.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TokenNbCaveatResolver;
+
+impl CaveatResolver for TokenNbCaveatResolver {
+    fn resolve_caveats(
+        &self,
+        token: &UcanToken,
+    ) -> Option<crate::trust::caveats::InvocationCaveats> {
+        token.payload.nb.clone()
+    }
+}
+
 /// In-memory [`CaveatResolver`] keyed by encoded JWT string.
 ///
 /// Used by tests and by adapters that pre-compute caveats out-of-band
@@ -1505,6 +1546,197 @@ mod tests {
         match err {
             UcanError::CaveatTimeBoxViolation(reason) => {
                 assert!(reason.contains("days_of_week"), "reason: {reason}");
+            }
+            other => panic!("expected CaveatTimeBoxViolation, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // TokenNbCaveatResolver (§5.4.5 VALIDATED-NARROWED effective_caveats)
+    // -----------------------------------------------------------------------
+
+    /// Builds a synthetic token whose caveats live in its own `nb` field —
+    /// the canonical wire location the [`TokenNbCaveatResolver`] reads.
+    fn synthetic_token_with_nb(
+        encoded: &str,
+        atts: &[&str],
+        proofs: &[&str],
+        nb: Option<InvocationCaveats>,
+    ) -> UcanToken {
+        let mut token = synthetic_token(encoded, atts, proofs);
+        token.payload.nb = nb;
+        token
+    }
+
+    /// AC: the resolver returns the token's own `nb` caveats verbatim.
+    #[test]
+    fn token_nb_resolver_returns_nb_field() {
+        let caveats = InvocationCaveats {
+            max_calls: Some(10),
+            origin_kind: Some(crate::context::outlets::OutletKind::Action),
+            ..InvocationCaveats::empty()
+        };
+        let token = synthetic_token_with_nb(
+            "T",
+            &["scp:ctx:abc/outlet_call:assistant"],
+            &[],
+            Some(caveats.clone()),
+        );
+        let resolved = TokenNbCaveatResolver
+            .resolve_caveats(&token)
+            .expect("token carries nb caveats");
+        assert_eq!(resolved.max_calls, caveats.max_calls);
+        assert_eq!(resolved.origin_kind, caveats.origin_kind);
+    }
+
+    /// AC: a token with no `nb` field resolves to `None` (caveat-free),
+    /// preserving the `CaveatResolver` `None`-handling contract.
+    #[test]
+    fn token_nb_resolver_none_when_nb_absent() {
+        let token = synthetic_token_with_nb("T", &["scp:ctx:abc/outlet_call:assistant"], &[], None);
+        assert!(
+            TokenNbCaveatResolver.resolve_caveats(&token).is_none(),
+            "absent nb must resolve to None"
+        );
+    }
+
+    /// AC: chain narrowing under `TokenNbCaveatResolver` rejects a child
+    /// that WIDENS `max_calls` above its parent — the resolver feeds each
+    /// token's signed `nb` into the per-edge `narrow()` loop (Step 7b).
+    #[test]
+    fn token_nb_chain_rejects_widened_max_calls() {
+        let parent = synthetic_token_with_nb(
+            "PARENT",
+            &["scp:ctx:abc/outlet_call:assistant"],
+            &[],
+            Some(InvocationCaveats {
+                max_calls: Some(10),
+                origin_kind: Some(crate::context::outlets::OutletKind::Action),
+                ..InvocationCaveats::empty()
+            }),
+        );
+        let child = synthetic_token_with_nb(
+            "CHILD",
+            &["scp:ctx:abc/outlet_call:assistant"],
+            &["PARENT"],
+            Some(InvocationCaveats {
+                // Widening: child raises the parent's max_calls ceiling.
+                max_calls: Some(100),
+                origin_kind: Some(crate::context::outlets::OutletKind::Action),
+                ..InvocationCaveats::empty()
+            }),
+        );
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        proof_resolver.proofs.insert("PARENT".to_owned(), parent);
+
+        let err = verify_attenuation(&child, &proof_resolver, &TokenNbCaveatResolver)
+            .expect_err("widened max_calls must reject under TokenNbCaveatResolver");
+        match err {
+            UcanError::CaveatAttenuationViolation(AttenuationViolation::U64Widened {
+                field: crate::trust::caveats::CaveatField::MaxCalls,
+                parent,
+                child,
+            }) => {
+                assert_eq!(parent, 10);
+                assert_eq!(child, 100);
+            }
+            other => panic!("expected U64Widened on max_calls, got {other:?}"),
+        }
+    }
+
+    /// AC: a correctly-narrowed child (max_calls 10 → 5) is accepted under
+    /// `TokenNbCaveatResolver`.
+    #[test]
+    fn token_nb_chain_accepts_correctly_narrowed_max_calls() {
+        let parent = synthetic_token_with_nb(
+            "PARENT",
+            &["scp:ctx:abc/outlet_call:assistant"],
+            &[],
+            Some(InvocationCaveats {
+                max_calls: Some(10),
+                origin_kind: Some(crate::context::outlets::OutletKind::Action),
+                ..InvocationCaveats::empty()
+            }),
+        );
+        let child = synthetic_token_with_nb(
+            "CHILD",
+            &["scp:ctx:abc/outlet_call:assistant"],
+            &["PARENT"],
+            Some(InvocationCaveats {
+                // Narrowing: child tightens the parent's ceiling.
+                max_calls: Some(5),
+                origin_kind: Some(crate::context::outlets::OutletKind::Action),
+                ..InvocationCaveats::empty()
+            }),
+        );
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        proof_resolver.proofs.insert("PARENT".to_owned(), parent);
+
+        verify_attenuation(&child, &proof_resolver, &TokenNbCaveatResolver)
+            .expect("correctly-narrowed max_calls must be accepted");
+    }
+
+    /// AC: a child token with NO `nb` field at all inherits its parent's
+    /// caveats by reference — the resolver returns `None` for the child, so
+    /// the per-edge `narrow()` is skipped and the parent's bound stands as
+    /// the effective ceiling (the §5.4.5 / §7.3.8 "absent = parent applies"
+    /// contract). This is distinct from a child that PRESENTS an `nb` with
+    /// `max_calls = None`, which would widen and reject via `FieldRemoved`.
+    #[test]
+    fn token_nb_chain_absent_child_nb_inherits_parent() {
+        let parent = synthetic_token_with_nb(
+            "PARENT",
+            &["scp:ctx:abc/outlet_call:assistant"],
+            &[],
+            Some(InvocationCaveats {
+                max_calls: Some(10),
+                origin_kind: Some(crate::context::outlets::OutletKind::Action),
+                ..InvocationCaveats::empty()
+            }),
+        );
+        // Child carries NO nb field — resolver returns None for it, so the
+        // narrow edge is skipped and the child inherits the parent's ceiling.
+        let child = synthetic_token_with_nb(
+            "CHILD",
+            &["scp:ctx:abc/outlet_call:assistant"],
+            &["PARENT"],
+            None,
+        );
+
+        let mut proof_resolver = InMemoryProofResolver::new();
+        proof_resolver.proofs.insert("PARENT".to_owned(), parent);
+
+        verify_attenuation(&child, &proof_resolver, &TokenNbCaveatResolver)
+            .expect("absent child nb inherits parent — narrow edge skipped");
+    }
+
+    /// AC: an expired leaf (Step 11b time-box) is rejected when the leaf's
+    /// own `nb` carries a `valid_until` in the past. Exercises the full
+    /// `validate_ucan` path with `TokenNbCaveatResolver` so Step 11b reads
+    /// the leaf `nb` directly.
+    #[test]
+    fn token_nb_leaf_time_box_rejects_expired() {
+        // valid_until is in the past relative to `now`.
+        let clock = scp_primitives::TestClock::new(3_000);
+        let caveats = InvocationCaveats {
+            valid_until: Some(2_000),
+            ..InvocationCaveats::empty()
+        };
+        let resolved = TokenNbCaveatResolver
+            .resolve_caveats(&synthetic_token_with_nb(
+                "LEAF",
+                &["scp:ctx:abc/outlet_call:assistant"],
+                &[],
+                Some(caveats),
+            ))
+            .expect("leaf carries nb caveats");
+        let err = verify_caveat_time_box(&resolved, &clock)
+            .expect_err("expired leaf valid_until must reject at Step 11b");
+        match err {
+            UcanError::CaveatTimeBoxViolation(reason) => {
+                assert!(reason.contains("valid_until"), "reason: {reason}");
             }
             other => panic!("expected CaveatTimeBoxViolation, got {other:?}"),
         }

@@ -72,9 +72,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::context::outlets::error_codes::{
-    CODE_AUTHORIZATION_DENIED, CODE_EXECUTION_CANCEL_ACK_TIMEOUT, CODE_EXECUTION_CREDIT_STALL,
-    CODE_PROTOCOL_SESSION, CODE_PROTOCOL_VIOLATION, SLUG_AUTHORIZATION_ATTENUATION_VIOLATION,
-    SLUG_AUTHORIZATION_REVOKED_MID_STREAM, SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
+    CODE_AUTHORIZATION_DENIED, CODE_EXECUTION_CANCEL_ACK_TIMEOUT, CODE_EXECUTION_CREDIT,
+    CODE_EXECUTION_CREDIT_STALL, CODE_PROTOCOL_SESSION, CODE_PROTOCOL_VIOLATION,
+    SLUG_AUTHORIZATION_ATTENUATION_VIOLATION, SLUG_AUTHORIZATION_REVOKED_MID_STREAM,
+    SLUG_EXECUTION_CANCEL_ACK_TIMEOUT, SLUG_EXECUTION_CREDIT_EXHAUSTED,
     SLUG_EXECUTION_CREDIT_STALL, SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
     SLUG_PROTOCOL_STREAM_ALREADY_OPEN, SLUG_PROTOCOL_UNKNOWN_SESSION,
 };
@@ -946,6 +947,15 @@ pub enum TerminateReason {
     /// precedence over revocation when both are observable in the same
     /// re-check tick.
     ContextClosedMidStream,
+    /// `execution.credit-exhausted` / `SCP-TOOL-6131` (Execution class)
+    /// — the §5.4.5:758 HARD cumulative billable-chunk ceiling
+    /// (`min(credit_window, max_calls)`) was reached. The framework
+    /// terminates the stream because no further billable chunk may flow
+    /// "regardless of executor behavior" — additional credit grants
+    /// cannot raise the cumulative cap. The per-chunk gate
+    /// (`StreamGateOutcome::CreditExhausted` in the runtime) drives this
+    /// path when a billable chunk arrives at an already-saturated stream.
+    CreditExhausted,
 }
 
 impl TerminateReason {
@@ -963,6 +973,7 @@ impl TerminateReason {
             Self::CancelAckTimeout => SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
             Self::CreditStall => SLUG_EXECUTION_CREDIT_STALL,
             Self::ContextClosedMidStream => SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+            Self::CreditExhausted => SLUG_EXECUTION_CREDIT_EXHAUSTED,
         }
     }
 
@@ -975,6 +986,7 @@ impl TerminateReason {
             Self::CancelAckTimeout => CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
             Self::CreditStall => CODE_EXECUTION_CREDIT_STALL,
             Self::ContextClosedMidStream => CODE_PROTOCOL_SESSION,
+            Self::CreditExhausted => CODE_EXECUTION_CREDIT,
         }
     }
 
@@ -996,6 +1008,9 @@ impl TerminateReason {
             }
             Self::CreditStall => "credit window remained at zero past stream_credit_stall_secs",
             Self::ContextClosedMidStream => "hosting context closed or operator evicted mid-stream",
+            Self::CreditExhausted => {
+                "cumulative billable-chunk ceiling reached (min(credit_window, max_calls))"
+            }
         }
     }
 
@@ -1013,6 +1028,7 @@ impl TerminateReason {
             SLUG_EXECUTION_CANCEL_ACK_TIMEOUT => Some(Self::CancelAckTimeout),
             SLUG_EXECUTION_CREDIT_STALL => Some(Self::CreditStall),
             SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM => Some(Self::ContextClosedMidStream),
+            SLUG_EXECUTION_CREDIT_EXHAUSTED => Some(Self::CreditExhausted),
             _ => None,
         }
     }
@@ -2666,6 +2682,7 @@ mod tests {
             TerminateReason::CancelAckTimeout,
             TerminateReason::CreditStall,
             TerminateReason::ContextClosedMidStream,
+            TerminateReason::CreditExhausted,
         ] {
             assert_eq!(TerminateReason::from_slug(r.slug()), Some(r));
         }
@@ -2689,6 +2706,7 @@ mod tests {
             TerminateReason::CancelAckTimeout,
             TerminateReason::CreditStall,
             TerminateReason::ContextClosedMidStream,
+            TerminateReason::CreditExhausted,
         ] {
             let msg = r.default_message();
             assert!(!msg.is_empty(), "empty default message for {r:?}");

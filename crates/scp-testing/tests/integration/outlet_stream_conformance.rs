@@ -798,7 +798,8 @@ fn credit_exhaustion_vector_drains_credit_tracker_to_zero() {
         .expect("credit_exhaustion vector must exist");
 
     let identity = synthetic_identity(&v.open);
-    let mut credit = CreditTracker::new(v.open.credit_window, synthetic_invoker_pk(), identity);
+    let mut credit =
+        CreditTracker::new(v.open.credit_window, synthetic_invoker_pk(), identity, None);
 
     // Initial state.
     assert_eq!(credit.remaining(), v.open.credit_window);

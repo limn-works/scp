@@ -380,6 +380,7 @@ fn build_open_stream_params(invoker_signing: &SigningKey) -> OpenStreamParams {
         revocation_checker: std::sync::Arc::new(
             scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
         ),
+        economic_policy_snapshot: None,
     }
 }
 
@@ -440,6 +441,7 @@ async fn signed_credit_grant_verifies_through_apply_credit_grant() {
             None,
             build_open_stream_params(&invoker_signing),
             admission,
+            None,
         )
         .await
         .expect("open_outlet_stream must succeed for fixture-backed open");
@@ -534,6 +536,7 @@ async fn tampered_credit_grant_rejected_with_signature_invalid() {
             None,
             build_open_stream_params(&invoker_signing),
             admission,
+            None,
         )
         .await
         .expect("open_outlet_stream");
@@ -608,6 +611,7 @@ async fn credit_grant_with_wrong_caveats_binding_rejected() {
             None,
             build_open_stream_params(&invoker_signing),
             admission,
+            None,
         )
         .await
         .expect("open_outlet_stream");

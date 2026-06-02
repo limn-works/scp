@@ -269,6 +269,22 @@ pub enum OpenStreamRejection {
     /// (`CODE_EXECUTION_CREDIT`, the shared Execution resource-exhaustion
     /// band per §5.4.5 round-8).
     StreamCapExhausted,
+    /// The §7.3.8 caveat post-input check
+    /// ([`CaveatPostInputCheck`](super::invoke::CaveatPostInputCheck))
+    /// rejected the open. The stream validates its input ONCE at open
+    /// (§5.4.5), so this gate runs the same `check_invocation_local`
+    /// (`amount_max_per_call` / `allowed_adapters` / `allowed_target_dids`
+    /// / `input_schema`) plus the counter-store CAS
+    /// (`max_calls` / `amount_max_cumulative` / `rate_window`) the
+    /// non-streaming `invoke` path runs — before the pump spawns. Carries
+    /// the precise §5.4.4 slug from the rule that fired so the FFI / SDK
+    /// surface routes identically to the non-streaming caveat path. The
+    /// slug determines the class: `input.schema-violation` →
+    /// `SCP-TOOL-6120`, every other caveat slug → `SCP-TOOL-6110`.
+    CaveatPostInputViolation {
+        /// The §5.4.4 slug of the violated caveat rule.
+        slug: &'static str,
+    },
 }
 
 impl OpenStreamRejection {
@@ -276,7 +292,9 @@ impl OpenStreamRejection {
     #[must_use]
     pub const fn slug(&self) -> &'static str {
         match *self {
-            Self::AdmissionRateLimited { slug } => slug,
+            // Both carry a precomputed slug verbatim (the admission tier's
+            // rate-limit slug / the §7.3.8 caveat rule's slug).
+            Self::AdmissionRateLimited { slug } | Self::CaveatPostInputViolation { slug } => slug,
             Self::EstimateExceedsBound => error_codes::SLUG_INPUT_ESTIMATE_EXCEEDS_BOUND,
             Self::EscrowOverflow => error_codes::SLUG_ECONOMIC_ESCROW_OVERFLOW,
             Self::InsufficientFunds => error_codes::SLUG_ECONOMIC_INSUFFICIENT_FUNDS,
@@ -287,13 +305,23 @@ impl OpenStreamRejection {
 
     /// Returns the §5.4.4 error code for this rejection.
     #[must_use]
-    pub const fn error_code(&self) -> &'static str {
+    pub fn error_code(&self) -> &'static str {
         match *self {
             Self::AdmissionRateLimited { .. } => error_codes::CODE_TRANSPORT_FAULT,
             Self::EstimateExceedsBound => error_codes::CODE_INPUT_VIOLATION,
             Self::EscrowOverflow | Self::InsufficientFunds => error_codes::CODE_ECONOMIC_FAULT,
             Self::CaveatsBindingMismatch => error_codes::CODE_AUTHORIZATION_DENIED,
             Self::StreamCapExhausted => error_codes::CODE_EXECUTION_CREDIT,
+            // Mirror `caveat_violation_chunk`'s slug→code routing: the
+            // input-schema slug is Input-class (`SCP-TOOL-6120`), every
+            // other caveat slug is Authorization-class (`SCP-TOOL-6110`).
+            Self::CaveatPostInputViolation { slug } => {
+                if slug == error_codes::SLUG_INPUT_SCHEMA_VIOLATION {
+                    error_codes::CODE_INPUT_VIOLATION
+                } else {
+                    error_codes::CODE_AUTHORIZATION_DENIED
+                }
+            }
         }
     }
 
@@ -445,6 +473,14 @@ pub struct OpenStreamParams {
     /// FFI bridges. The bound is `Send + Sync` because the checker
     /// is shared across the open path and the spawned pump task.
     pub revocation_checker: Arc<dyn RevocationChecker + Send + Sync>,
+    /// §5.4.5 MED-HIGH — the economic policy snapshotted at acceptance so
+    /// close-time settlement can capture the `PaymentReceipt` for rendered
+    /// service even if the hosting context is closed / evicted mid-stream
+    /// (ADR-048 per-instance snapshot; H8 "service rendered is billed").
+    /// Carried verbatim into the [`StreamSettlement`] the pump emits.
+    /// `None` for zero-cost / Query streams and callers without an
+    /// economic policy at open.
+    pub economic_policy_snapshot: Option<super::invoke::EconomicPolicySnapshot>,
 }
 
 impl core::fmt::Debug for OpenStreamParams {
@@ -471,6 +507,7 @@ impl core::fmt::Debug for OpenStreamParams {
             .field("ucan_cid", &self.ucan_cid)
             .field("request_id", &self.request_id)
             .field("revocation_checker", &"<dyn RevocationChecker>")
+            .field("economic_policy_snapshot", &self.economic_policy_snapshot)
             .finish()
     }
 }
@@ -851,6 +888,18 @@ impl StreamSessionHandle {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // §5.4.4:426 grant-after-close lifecycle gate. A grant that arrives
+        // after the pump has exited (terminal chunk, channel close, or
+        // forced terminate) is a Protocol-class session-lifecycle violation
+        // — reject with `GrantError::StreamClosed` BEFORE the
+        // signature / replay / escrow path so a post-terminal grant never
+        // mutates the credit counter or escrow ledger. The caller reverses
+        // any top-up it reserved (the §5.4.5 atomicity invariant) exactly as
+        // it does for the signature / replay rejections below. Mirrors the
+        // `pump_exited` gate in `terminate_with_error`.
+        if guard.pump_exited {
+            return Err(GrantError::StreamClosed);
+        }
         let identity_clone = guard.credit.identity().clone();
         // Signature / replay verification FIRST. On rejection we return
         // before touching escrow — the caller reverses the top-up it
@@ -1333,10 +1382,21 @@ fn build_shared_state(
     admission: &Arc<Mutex<StreamAdmissionTracker>>,
     context_handle: ContextHandle,
 ) -> Arc<Mutex<SharedSessionState>> {
+    // §5.4.5:758 HARD cumulative billable-chunk ceiling = the
+    // VALIDATED-NARROWED `caveats.max_calls`, coerced to `u32` (saturating
+    // — a `max_calls` above `u32::MAX` is clamped). `None` = unbounded.
+    // Once Phase 2 switches the resolver to `TokenNbCaveatResolver`, the
+    // `params.caveats` threaded in here are the post-narrowing effective
+    // caveats, so the pinned ceiling is the validated-narrowed `max_calls`.
+    let max_billable: Option<u32> = params
+        .caveats
+        .max_calls
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX));
     let credit = CreditTracker::new(
         params.credit_window,
         params.invoker_pk,
         params.identity.clone(),
+        max_billable,
     );
     let cancel_ack = CancelAckTracker::new(params.stream_cancel_ack_secs);
     let admission_release_keys = AdmissionReleaseKeys {
@@ -1399,6 +1459,106 @@ pub(crate) struct PumpEventEmissionInputs {
     /// `Instant` captured at acceptance — used to derive
     /// `execution_time_ms` at terminal-chunk emission.
     pub start: Instant,
+    /// §5.4.5 MED-HIGH — economic policy snapshotted at acceptance.
+    /// Carried into the [`StreamSettlement`] the pump emits so close-time
+    /// settlement survives a mid-stream context teardown. `None` for
+    /// zero-cost / Query / legacy callers.
+    pub economic_policy_snapshot: Option<super::invoke::EconomicPolicySnapshot>,
+}
+
+/// §5.4.5 LOW (stranded-hold guard) — a `Drop`-time safety net that runs
+/// the escrow settlement if the pump body unwinds (panics) before reaching
+/// its normal settlement block.
+///
+/// The pump's normal close path settles the escrow, marks `pump_exited`,
+/// and fires the settlement sink. A panic anywhere in the pump body would
+/// otherwise skip ALL of that — the open-time escrow hold (already DEBITED
+/// against the invoker's `MemberBudgetTracker`) would never be refunded,
+/// stranding the hold permanently. This guard lives on the pump task's
+/// stack: on a panic the stack unwinds through its `Drop`, which — if the
+/// normal settlement has NOT already run (`settled == false`) — fires the
+/// settlement sink with the current escrow state so the unspent hold is
+/// refunded (budget net zero for an un-billed panic).
+///
+/// On the normal close path the pump sets [`Self::settled`] `= true` after
+/// the settlement block completes, so `Drop` is a no-op and the escrow is
+/// never double-settled.
+///
+/// Pairs with the `catch_unwind` wrapper at the spawn site
+/// ([`spawn_pump_task`]): the wrapper contains the panic so the task does
+/// not abort the runtime and the owned pump permit drops cleanly, while
+/// THIS guard performs the economic refund as the stack unwinds.
+struct PumpEscrowGuard {
+    /// Shared session state — the escrow ledger + `pump_exited` flag.
+    state: Arc<Mutex<SharedSessionState>>,
+    /// Settlement sink fired on the panic path (same sink the normal close
+    /// uses). `None` disables panic-path settlement (legacy / test callers
+    /// without a `ContextManager` handle — the escrow ledger is still
+    /// surfaced via `StreamCloseSummary` on the normal path, and a panic
+    /// without a sink has no economic hold to strand).
+    settlement_sink: Option<Arc<dyn StreamSettlementSink>>,
+    /// Settlement inputs needed to build the `StreamSettlement` on the
+    /// panic path. Cloned at pump start so the guard owns them
+    /// independently of `event_inputs` (which is consumed by the normal
+    /// settlement block).
+    context_id: String,
+    invoker_did: DID,
+    request_id: RequestId,
+    outlet_id: OutletId,
+    economic_policy_snapshot: Option<super::invoke::EconomicPolicySnapshot>,
+    /// `true` once the normal settlement block has run. When set, `Drop` is
+    /// a no-op (the escrow was already settled exactly once).
+    settled: bool,
+}
+
+impl Drop for PumpEscrowGuard {
+    fn drop(&mut self) {
+        if self.settled {
+            // Normal close already settled — nothing to do.
+            return;
+        }
+        // Panic path: the pump body unwound before its settlement block.
+        // Settle the escrow now so the open-time hold is refunded rather
+        // than stranded. Guard against double-settle via `pump_exited`
+        // under the lock — a concurrent terminate that observed
+        // `pump_exited == false` cannot have run settlement.
+        let settlement = {
+            let mut guard = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if guard.pump_exited {
+                // Settlement already ran (or is running) elsewhere.
+                return;
+            }
+            let (billed_amount, refund_amount, billed_count) = guard.escrow.settle_at_close();
+            guard.pump_exited = true;
+            let reserved = scp_protocol::economy::types::Amount::new(
+                billed_amount.value().saturating_add(refund_amount.value()),
+            );
+            StreamSettlement {
+                context_id: self.context_id.clone(),
+                invoker_did: self.invoker_did.clone(),
+                reserved,
+                billed_amount,
+                refund_amount,
+                billed_count,
+                request_id: self.request_id,
+                outlet_id: self.outlet_id.clone(),
+                economic_policy_snapshot: self.economic_policy_snapshot.clone(),
+            }
+        };
+        if let Some(sink) = self.settlement_sink.as_ref() {
+            // `settle` is non-blocking (spawns the async reconcile onto a
+            // runtime handle), so firing it from a `Drop` is safe.
+            tracing::warn!(
+                request_id = %hex::encode(self.request_id),
+                outlet_id = %self.outlet_id,
+                "outlet stream pump panicked — refunding escrow via the stranded-hold guard"
+            );
+            sink.settle(settlement);
+        }
+    }
 }
 
 /// Spawns the streaming pump task. Owns the `inner_rx` (chunks coming
@@ -1429,7 +1589,19 @@ fn spawn_pump_task(
         // Bind the permit for the whole task body so it drops on every
         // exit path (return, terminal-break, or panic-unwind).
         let _pump_permit = pump_permit;
-        run_stream_pump_v2(
+        // §5.4.5 LOW (stranded-hold guard): wrap the pump body in
+        // `catch_unwind` so a panic in the OUTER pump (NOT the executor,
+        // which is already guarded) is contained at the task boundary —
+        // the task does not abort the runtime and the owned `_pump_permit`
+        // above drops cleanly. The economic refund on the panic path is
+        // performed by the `PumpEscrowGuard` inside `run_stream_pump_v2`
+        // as the stack unwinds; this wrapper only contains the panic and
+        // logs it. `AssertUnwindSafe` is sound here: the only state shared
+        // across the unwind boundary is the `Arc<Mutex<_>>` session state,
+        // which the guard re-locks and leaves consistent
+        // (`pump_exited == true`, escrow settled) before the unwind
+        // completes.
+        let pump = std::panic::AssertUnwindSafe(run_stream_pump_v2(
             state,
             grant_wake,
             cancel_wake,
@@ -1441,8 +1613,17 @@ fn spawn_pump_task(
             stream_cancel_ack,
             request_id,
             event_inputs,
-        )
-        .await;
+        ));
+        if futures::future::FutureExt::catch_unwind(pump)
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                request_id = %hex::encode(request_id),
+                "outlet stream pump panicked — escrow refunded by the stranded-hold guard; \
+                 stream closed"
+            );
+        }
     });
 }
 
@@ -1469,6 +1650,7 @@ fn spawn_pump_task(
 /// None — every primitive consulted is `Send + Sync` and the spawned
 /// task uses cooperative cancellation.
 #[allow(clippy::too_many_arguments)] // mirrors invoke_outlet
+#[allow(clippy::too_many_lines)] // §5.4.5 ordered open sequence (binding → admission → estimate → caveat hook → escrow → permit → spawn); splitting masks the spec ordering
 pub async fn open_stream_session<E>(
     context: &ContextHandle,
     registry: &OutletRegistry,
@@ -1495,6 +1677,18 @@ pub async fn open_stream_session<E>(
     // hard-rejects with `OpenStreamRejection::StreamCapExhausted` and rolls
     // back the admission counters this open consumed.
     pump_semaphore: Arc<tokio::sync::Semaphore>,
+    // §7.3.8 caveat post-input check (crypto-MED). A stream validates its
+    // input ONCE at open (§5.4.5), so this hook — built exactly as the
+    // non-streaming `invoke` path builds it (`amount_max_per_call` /
+    // `allowed_adapters` / `allowed_target_dids` / `input_schema` +
+    // counter-store CAS for `max_calls` / `amount_max_cumulative` /
+    // `rate_window`) — runs ONCE at the open-time validation point, BEFORE
+    // the pump spawns. `None` for callers that do not enforce §7.3.8
+    // caveats at open (legacy / test paths; bridge call sites pass `None`
+    // until Phase 2 wires the builder). On failure the open is rejected
+    // with `OpenStreamRejection::CaveatPostInputViolation` carrying the
+    // precise slug.
+    caveat_post_input_check: Option<super::invoke::CaveatPostInputCheck<'_>>,
 ) -> Result<StreamSessionHandle, OpenStreamRejection>
 where
     E: OutletExecutor + ?Sized + 'static,
@@ -1525,6 +1719,39 @@ where
                 OpenStreamRejection::EstimateExceedsBound
             }
         });
+    }
+
+    // Step 2.5 (§7.3.8 caveat post-input check, crypto-MED): a stream
+    // validates its input ONCE at open. Run the §7.3.8 hook — built the
+    // same way the non-streaming `invoke` path builds it — at this single
+    // open-time validation point, BEFORE escrow reservation and the pump
+    // spawn. This is the only locus where the §7.3.8 synchronous local
+    // checks (`amount_max_per_call`, `allowed_adapters`,
+    // `allowed_target_dids`, `input_schema`) and the counter-store CAS
+    // (`max_calls`, `amount_max_cumulative`, `rate_window`) run for a
+    // stream; per-chunk re-validation is neither performed nor required
+    // (§5.4.5 "checked ONCE at open"). On rejection, roll back the
+    // admission counters this open consumed (mirroring the
+    // estimate-bound path) and surface the precise slug.
+    if let Some(check) = caveat_post_input_check
+        && let Err(invocation_err) = check(&input).await
+    {
+        release_admission(&admission, &params);
+        // The §7.3.8 hook returns `CaveatViolation { slug }` for caveat
+        // rules and `InputValidationFailed` for schema failures. Map both
+        // to the open-time caveat-violation rejection carrying the precise
+        // slug so the FFI / SDK surface routes identically to the
+        // non-streaming path.
+        let slug = match invocation_err {
+            InvocationError::CaveatViolation { slug, .. } => slug,
+            InvocationError::InputValidationFailed { .. } => {
+                error_codes::SLUG_INPUT_SCHEMA_VIOLATION
+            }
+            // Any other variant from the hook is an authorization-class
+            // denial by §5.4.4 default routing.
+            _ => error_codes::SLUG_AUTHORIZATION_DENIED,
+        };
+        return Err(OpenStreamRejection::CaveatPostInputViolation { slug });
     }
 
     // Step 3: escrow ledger from the manager-debited hold (E2). The
@@ -1573,6 +1800,11 @@ where
     let event_outlet_id: OutletId = outlet_id.clone();
     let event_invoker_did: DID = invoker_did.clone();
     let pump_start = Instant::now();
+    // §5.4.5 MED-HIGH — clone the open-time economic policy snapshot so the
+    // pump's settlement can capture the receipt even if the context is torn
+    // down mid-stream. Cloned here (before `params` fields are consumed by
+    // the spawn) so it travels with the pump's event-emission inputs.
+    let economic_policy_snapshot = params.economic_policy_snapshot.clone();
 
     // Step 5: launch the underlying executor stream. Pass `None` for
     // the sink — the dispatch pump emits the event itself at
@@ -1651,6 +1883,7 @@ where
             invoker_did: event_invoker_did,
             input_hash,
             start: pump_start,
+            economic_policy_snapshot,
         },
         pump_permit,
     );
@@ -1928,6 +2161,24 @@ async fn run_stream_pump_v2(
     let mut emitted_chunks: Vec<OutletStreamChunk> = Vec::new();
     let mut next_seq: u64 = 0;
     let mut parked: Option<OutletStreamChunk> = None;
+
+    // §5.4.5 LOW (stranded-hold guard): arm the escrow safety net BEFORE
+    // any pump work runs. If the pump body panics, this guard's `Drop`
+    // refunds the open-time escrow hold as the stack unwinds. On the
+    // normal close path it is disarmed (`settled = true`) after the
+    // settlement block, so it never double-settles. Holds an independent
+    // clone of the settlement inputs so it is unaffected by
+    // `event_inputs` being consumed by the normal settlement block.
+    let mut escrow_guard = PumpEscrowGuard {
+        state: Arc::clone(&state),
+        settlement_sink: event_inputs.settlement_sink.clone(),
+        context_id: event_inputs.context_id.clone(),
+        invoker_did: event_inputs.invoker_did.clone(),
+        request_id,
+        outlet_id: event_inputs.outlet_id.clone(),
+        economic_policy_snapshot: event_inputs.economic_policy_snapshot.clone(),
+        settled: false,
+    };
 
     // Snapshot the operator signing context once at task start so the
     // per-chunk signing path does not retake the session mutex for
@@ -2265,6 +2516,18 @@ async fn run_stream_pump_v2(
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     let g = &mut *guard;
                     accrue_data_chunk_if_billable(&mut g.escrow, &g.cancel_ack, &final_chunk);
+                    // §5.4.5:758 cumulative ceiling: advance
+                    // `billed_emitted` for THIS forwarded chunk iff it is
+                    // billable (Data, at/below the cancel-ack ceiling) —
+                    // the SAME `is_billable_chunk` predicate the escrow
+                    // accrual above uses, so the cumulative counter and the
+                    // escrow ledger can never disagree on what was billed.
+                    if super::invoke::is_billable_chunk(
+                        &final_chunk,
+                        g.cancel_ack.billing_ceiling(),
+                    ) {
+                        g.credit.record_billed_emission();
+                    }
                     // §5.4.5 next-emission-cursor publication — the
                     // bridge layer reads this value to derive the
                     // canonical `cancel_ack_seq` written into
@@ -2291,6 +2554,32 @@ async fn run_stream_pump_v2(
             }
             StreamGateOutcome::DropAboveCancelAck => {
                 // §5.4.5: drop without billing or forwarding.
+            }
+            StreamGateOutcome::CreditExhausted => {
+                // §5.4.5:758 cumulative billable ceiling reached
+                // (`min(credit_window, max_calls)`). Drop this chunk
+                // (it must NOT be forwarded or billed) and arm a
+                // framework-driven terminal `Error{terminal:true}` with
+                // `TerminateReason::CreditExhausted`. The loop-top drain
+                // signs + emits the synthetic terminal chunk under the
+                // pinned operator key on the next iteration, then breaks
+                // into settlement — escrow refund, audit event, and
+                // admission release all run end-to-end. The slug/code
+                // (`execution.credit-exhausted` / `SCP-TOOL-6131`) are
+                // derived from the enum, never caller-controlled.
+                {
+                    let mut guard = state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if guard.pending_terminate.is_none() {
+                        guard.pending_terminate = Some(PendingTerminate {
+                            reason: TerminateReason::CreditExhausted,
+                            message_override: None,
+                        });
+                    }
+                }
+                // Fall through to the loop top, which drains
+                // `pending_terminate` and emits the terminal chunk.
             }
         }
     }
@@ -2441,6 +2730,9 @@ async fn run_stream_pump_v2(
             billed_count: summary.billed_count,
             request_id,
             outlet_id: event_inputs.outlet_id.clone(),
+            // §5.4.5 MED-HIGH — carry the open-time economic snapshot so
+            // settlement survives a mid-stream context teardown.
+            economic_policy_snapshot: event_inputs.economic_policy_snapshot.clone(),
         });
     }
 
@@ -2450,6 +2742,14 @@ async fn run_stream_pump_v2(
     // `OutletInvokedEvent` does not carry (per §19.15.5
     // PaymentReceipt).
     let _ = summary_tx.send(summary);
+
+    // §5.4.5 LOW (stranded-hold guard): the normal close path has now run
+    // settlement (escrow settled, `pump_exited` set, settlement sink
+    // fired). Disarm the guard so its `Drop` is a no-op — the escrow is
+    // settled exactly once. Reached only on the normal return path; a
+    // panic before this line leaves `settled == false`, so the guard's
+    // `Drop` performs the refund as the stack unwinds.
+    escrow_guard.settled = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -2499,7 +2799,15 @@ pub fn reference_chunks_billed(manifest: &[OutletStreamChunk], cancel_ack_seq: O
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::too_many_lines,
+    clippy::match_wildcard_for_single_variants,
+    clippy::match_wild_err_arm,
+    clippy::significant_drop_in_scrutinee
+)]
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
@@ -2530,7 +2838,7 @@ mod tests {
             stream_epoch: 1,
             caveats_binding: [0xAB; 32],
         };
-        let credit = CreditTracker::new(32, *signer.verifying_key(), identity);
+        let credit = CreditTracker::new(32, *signer.verifying_key(), identity, None);
         let cancel_ack = CancelAckTracker::new(5);
         let admission = Arc::new(Mutex::new(StreamAdmissionTracker::new()));
         // A fresh context handle (in `Creating`) so the F6 round-8
@@ -2564,6 +2872,260 @@ mod tests {
             pump_exited: false,
             context_handle,
         }))
+    }
+
+    /// §5.4.4:426 grant-after-close lifecycle gate (HIGH-1). A credit
+    /// grant arriving after the pump has exited
+    /// (`pump_exited == true`) is rejected with
+    /// [`GrantError::StreamClosed`] BEFORE any signature / replay / escrow
+    /// mutation, and the escrow ledger is left unchanged.
+    #[test]
+    fn apply_credit_grant_after_close_rejects_stream_closed_escrow_unchanged() {
+        let state = build_test_state();
+        // Install a non-zero escrow so we can prove it is NOT mutated by a
+        // post-close grant.
+        {
+            let mut guard = state.lock().unwrap();
+            guard.escrow =
+                super::super::stream::StreamEscrow::from_reserved(Amount::new(7), Amount::new(70));
+            // Drive the stream to its terminal state.
+            guard.pump_exited = true;
+        }
+        let reserved_before = state.lock().unwrap().escrow.reserved();
+        let billed_count_before = state.lock().unwrap().escrow.billed_count();
+        let seen_seq_before = state.lock().unwrap().credit.seen_seq();
+
+        let handle = StreamSessionHandle {
+            receiver: None,
+            state: Arc::clone(&state),
+            grant_wake: Arc::new(Notify::new()),
+            cancel_wake: Arc::new(Notify::new()),
+            terminate_wake: Arc::new(Notify::new()),
+            summary_rx: None,
+            request_id: [0x77; 16],
+        };
+
+        // The grant content is irrelevant — the gate fires before the
+        // signature / replay path, so an all-zero sig is sufficient.
+        let credit = OutletStreamCredit {
+            request_id: [0x77; 16],
+            grant: 100,
+            monotonic_seq: 1,
+            sig: [0u8; 64],
+        };
+
+        let err = handle
+            .apply_credit_grant(&credit, Amount::new(700))
+            .expect_err("grant after close must reject");
+        assert_eq!(err, GrantError::StreamClosed, "post-close grant slug");
+        assert_eq!(
+            super::super::stream::grant_error_to_slug(err),
+            scp_protocol::context::outlets::error_codes::SLUG_PROTOCOL_STREAM_ALREADY_CLOSED,
+            "StreamClosed routes to protocol.stream-already-closed",
+        );
+        assert_eq!(
+            super::super::stream::grant_error_to_code(err),
+            scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION,
+            "StreamClosed routes to the Protocol-class SCP-TOOL-6101 code",
+        );
+
+        // Escrow and credit state must be byte-for-byte unchanged.
+        let guard = state.lock().unwrap();
+        assert_eq!(
+            guard.escrow.reserved(),
+            reserved_before,
+            "reserved unchanged"
+        );
+        assert_eq!(
+            guard.escrow.billed_count(),
+            billed_count_before,
+            "billed_count unchanged",
+        );
+        assert_eq!(
+            guard.credit.seen_seq(),
+            seen_seq_before,
+            "credit counter (seen_seq) did not advance",
+        );
+    }
+
+    /// §5.4.5 LOW (stranded-hold guard): a panic in the OUTER pump body
+    /// (here injected via a signer that panics in `sign`) is contained by
+    /// the `catch_unwind` wrapper at the spawn, and the `PumpEscrowGuard`'s
+    /// `Drop` fires the settlement sink as the stack unwinds — so the
+    /// open-time escrow hold is refunded (budget net zero) rather than
+    /// stranded. Without the guard the panic would skip settlement and the
+    /// consumed escrow ticket could never refund.
+    #[tokio::test]
+    async fn pump_panic_refunds_escrow_via_stranded_hold_guard() {
+        use ed25519_dalek::SigningKey;
+
+        /// A `StreamSigner` that panics on the first `sign` call —
+        /// injecting a panic into the OUTER pump body's chunk-signing path.
+        struct PanickingSigner {
+            verifying_key: ed25519_dalek::VerifyingKey,
+        }
+        #[async_trait::async_trait]
+        impl super::super::signer::StreamSigner for PanickingSigner {
+            async fn sign(
+                &self,
+                _preimage: &[u8],
+            ) -> Result<[u8; 64], super::super::signer::StreamSignerError> {
+                panic!("injected pump-body panic for stranded-hold guard test");
+            }
+            fn verifying_key(&self) -> &ed25519_dalek::VerifyingKey {
+                &self.verifying_key
+            }
+        }
+
+        /// Settlement sink that records the single settlement it receives.
+        #[derive(Default)]
+        struct RecordingSettlementSink {
+            settlement: Mutex<Option<super::super::invoke::StreamSettlement>>,
+        }
+        impl super::super::invoke::StreamSettlementSink for RecordingSettlementSink {
+            fn settle(&self, settlement: super::super::invoke::StreamSettlement) {
+                *self
+                    .settlement
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(settlement);
+            }
+        }
+
+        // Build a state whose operator signer panics, with a non-zero
+        // escrow hold (reserved 70, billed 0) so the refund is observable.
+        let signing = SigningKey::from_bytes(&[0x42; 32]);
+        let verifying_key = signing.verifying_key();
+        let signer: Arc<dyn StreamSigner> = Arc::new(PanickingSigner { verifying_key });
+        let identity = super::super::stream::StreamIdentity {
+            context_id: "ctx-test".to_owned(),
+            outlet_id: "outlet-test".to_owned(),
+            stream_epoch: 1,
+            caveats_binding: [0xAB; 32],
+        };
+        let credit = CreditTracker::new(32, verifying_key, identity, None);
+        let admission = Arc::new(Mutex::new(StreamAdmissionTracker::new()));
+        let context_handle = ContextHandle::new(
+            "ctx-test".to_owned(),
+            scp_protocol::context::ContextParams::default(),
+        );
+        let state = Arc::new(Mutex::new(SharedSessionState {
+            credit,
+            escrow: super::super::stream::StreamEscrow::from_reserved(
+                Amount::new(7),
+                Amount::new(70),
+            ),
+            cancel_ack: CancelAckTracker::new(5),
+            admission,
+            admission_release_keys: AdmissionReleaseKeys {
+                invoker_did: "did:dht:invoker".to_owned(),
+                origin_invoker_did: "did:dht:origin".to_owned(),
+                outlet_id: "outlet-test".to_owned(),
+            },
+            cancel_ack_armed: false,
+            credit_stall_armed_at: None,
+            cancel_ack_seq: None,
+            next_emission_seq: 0,
+            operator_signer: Arc::clone(&signer),
+            pending_terminate: None,
+            ucan_cid: "bafyrei-test".to_owned(),
+            revocation_checker: Arc::new(
+                scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
+            ),
+            stream_ucan_recheck_secs: 3_600,
+            pump_exited: false,
+            context_handle,
+        }));
+
+        let sink = Arc::new(RecordingSettlementSink::default());
+        let (inner_tx, inner_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (outer_tx, _outer_rx) = mpsc::channel::<OutletStreamChunk>(16);
+        let (summary_tx, _summary_rx) = tokio::sync::oneshot::channel();
+        let request_id: RequestId = [0x99; 16];
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let permit = Arc::clone(&semaphore).try_acquire_owned().unwrap();
+
+        spawn_pump_task(
+            Arc::clone(&state),
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+            inner_rx,
+            outer_tx,
+            summary_tx,
+            30,
+            5,
+            request_id,
+            PumpEventEmissionInputs {
+                sink: None,
+                settlement_sink: Some(
+                    sink.clone() as Arc<dyn super::super::invoke::StreamSettlementSink>
+                ),
+                context_id: "ctx-test".to_owned(),
+                outlet_id: "outlet-test".to_owned(),
+                invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),
+                input_hash: "0".repeat(64),
+                start: Instant::now(),
+                economic_policy_snapshot: None,
+            },
+            permit,
+        );
+
+        // Send one Data chunk — the pump's signing path will panic.
+        inner_tx
+            .send(OutletStreamChunk {
+                request_id,
+                sequence: 0,
+                payload: ChunkPayload::Data {
+                    value: serde_json::json!({ "x": 1 }),
+                },
+                sig: [0u8; 64],
+            })
+            .await
+            .expect("inner send");
+
+        // Wait until the guard fires the settlement sink (the panic unwinds
+        // through `PumpEscrowGuard::Drop`).
+        let settlement = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(s) = sink
+                    .settlement
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone()
+                {
+                    break s;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("stranded-hold guard fires settlement within 2s after pump panic");
+
+        // No chunk was billed (the panic struck during signing of the first
+        // chunk, before any billable accrual), so the full hold is refunded:
+        // billed 0, refund == reserved (70) → budget net zero.
+        assert_eq!(settlement.billed_amount.value(), 0, "panic before any bill");
+        assert_eq!(
+            settlement.refund_amount.value(),
+            70,
+            "full escrow hold refunded — no stranded hold"
+        );
+        // `pump_exited` was set by the guard so a late terminate would
+        // observe AlreadyTerminated.
+        assert!(
+            state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pump_exited,
+            "guard marks pump_exited on the panic path"
+        );
+        // The semaphore permit was released when the panicking task
+        // unwound (the owned permit drops with the task stack).
+        assert_eq!(
+            semaphore.available_permits(),
+            4,
+            "pump permit released on panic"
+        );
     }
 
     /// §5.4.5 receiver-side revocation re-check: `terminate_with_error`
@@ -2605,6 +3167,7 @@ mod tests {
                     invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),
                     input_hash: "0".repeat(64),
                     start: Instant::now(),
+                    economic_policy_snapshot: None,
                 },
             )
             .await;
@@ -2729,6 +3292,7 @@ mod tests {
                     invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),
                     input_hash: "0".repeat(64),
                     start: Instant::now(),
+                    economic_policy_snapshot: None,
                 },
             )
             .await;
@@ -2846,6 +3410,7 @@ mod tests {
                         invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),
                         input_hash: "0".repeat(64),
                         start: Instant::now(),
+                        economic_policy_snapshot: None,
                     },
                 )
                 .await;
@@ -2964,6 +3529,7 @@ mod tests {
                     invoker_did: scp_primitives::DID("did:dht:invoker".to_owned()),
                     input_hash: "0".repeat(64),
                     start: Instant::now(),
+                    economic_policy_snapshot: None,
                 },
             )
             .await;
@@ -3009,6 +3575,101 @@ mod tests {
             summary.stream_chunk_count, 1,
             "exactly one terminal emitted"
         );
+    }
+
+    /// §5.4.5:758 cumulative ceiling (HIGH-2): with `credit_window=32` but a
+    /// pinned `max_billable=10`, the pump forwards at most 10 billable Data
+    /// chunks regardless of how much credit is granted, then emits a
+    /// terminal `Error{terminal:true}` with `execution.credit-exhausted` /
+    /// `SCP-TOOL-6131`. The executor here floods 100 Data chunks; only 10
+    /// reach the consumer before the cumulative cap fires.
+    #[tokio::test]
+    async fn pump_enforces_cumulative_max_calls_ceiling() {
+        let state = build_test_state();
+        // Re-pin the credit tracker with a max_billable of 10 (credit_window
+        // 32 is clamped to 10 at construction).
+        {
+            let mut g = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let identity = g.credit.identity().clone();
+            let pk = *g.credit.invoker_pk();
+            g.credit = CreditTracker::new(32, pk, identity, Some(10));
+        }
+        let request_id: RequestId = [0x3C; 16];
+        let (_handle, mut outer_rx, summary_rx, pump_join, inner_tx) =
+            spawn_test_pump(state, request_id, Duration::from_secs(3_601));
+
+        // Flood 100 Data chunks. The inner sig is irrelevant — the pump
+        // re-signs every forwarded chunk under the pinned operator key.
+        let flood = tokio::spawn(async move {
+            for seq in 0..100u64 {
+                let chunk = OutletStreamChunk {
+                    request_id,
+                    sequence: seq,
+                    payload: ChunkPayload::Data {
+                        value: serde_json::json!({ "i": seq }),
+                    },
+                    sig: [0u8; 64],
+                };
+                if inner_tx.send(chunk).await.is_err() {
+                    break;
+                }
+            }
+            // Hold the sender open until the pump terminates on its own.
+            inner_tx
+        });
+
+        // Collect every chunk the pump forwards until the channel closes.
+        let mut data_chunks = 0u32;
+        let mut terminal: Option<ChunkPayload> = None;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(2), outer_rx.recv()).await {
+                Ok(Some(chunk)) => match chunk.payload {
+                    ChunkPayload::Data { .. } => data_chunks += 1,
+                    payload @ ChunkPayload::Error { .. } => {
+                        terminal = Some(payload);
+                        break;
+                    }
+                    _ => {}
+                },
+                Ok(None) => break,
+                Err(_elapsed) => panic!("pump did not terminate within 2s"),
+            }
+        }
+
+        assert_eq!(
+            data_chunks, 10,
+            "exactly max_calls (10) billable Data chunks forwarded, not credit_window (32) or 100"
+        );
+        let ChunkPayload::Error {
+            code,
+            message,
+            terminal: is_terminal,
+        } = terminal.expect("pump emits a terminal Error chunk at the cumulative cap")
+        else {
+            unreachable!("matched Error above");
+        };
+        assert!(is_terminal, "credit-exhausted chunk is terminal");
+        assert_eq!(
+            code,
+            scp_protocol::context::outlets::error_codes::CODE_EXECUTION_CREDIT,
+            "cumulative cap maps to SCP-TOOL-6131",
+        );
+        assert!(
+            message.starts_with(&format!(
+                "{}: ",
+                scp_protocol::context::outlets::error_codes::SLUG_EXECUTION_CREDIT_EXHAUSTED
+            )),
+            "message carries the execution.credit-exhausted slug prefix, got: {message}",
+        );
+
+        pump_join.await.expect("pump settles");
+        let summary = summary_rx.await.expect("summary published");
+        // Only the 10 forwarded Data chunks are billable; the terminal
+        // Error is not billed.
+        assert_eq!(summary.billed_count, 10, "billed_count == max_calls");
+        drop(flood.await.expect("flood task joins"));
     }
 
     /// F6 (a): a context closed mid-stream terminates with

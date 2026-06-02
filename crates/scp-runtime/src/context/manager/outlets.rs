@@ -1709,6 +1709,14 @@ impl ContextManager {
         admission: std::sync::Arc<
             std::sync::Mutex<crate::context::outlets::stream::StreamAdmissionTracker>,
         >,
+        // §7.3.8 caveat post-input check (crypto-MED). Built the same way
+        // the non-streaming `invoke` path builds it (see
+        // `build_post_input_hook`) and run ONCE at open by
+        // `open_stream_session` before the pump spawns — the stream
+        // validates its input once (§5.4.5). `None` disables the §7.3.8
+        // gate (legacy / test paths; Phase-2 bridge call sites pass the
+        // built hook here, mirroring the non-streaming invoke).
+        caveat_post_input_check: Option<crate::context::outlets::invoke::CaveatPostInputCheck<'_>>,
     ) -> Result<
         crate::context::outlets::dispatch::StreamSessionHandle,
         crate::context::outlets::dispatch::OpenStreamRejection,
@@ -1717,13 +1725,27 @@ impl ContextManager {
         E: crate::context::outlets::invoke::OutletExecutor + ?Sized + 'static,
     {
         // Snapshot the per-context handle so we can hand the underlying
-        // executor pump a stable ContextHandle.
+        // executor pump a stable ContextHandle. In the same lock window,
+        // snapshot the §5.4.5 MED-HIGH economic policy at acceptance so
+        // close-time settlement can capture the receipt for rendered
+        // service even if the context is torn down mid-stream (H8). The
+        // snapshot is only taken when the context has an economic policy
+        // AND the caller did not already supply one in `params` (the
+        // caller-supplied value wins so a bridge that already computed the
+        // snapshot is not overridden).
+        let mut params = params;
         let handle_snapshot = {
             let (guard, _ctx_gen) = self.lock_context(context_id).await.map_err(|_| {
                 crate::context::outlets::dispatch::OpenStreamRejection::AdmissionRateLimited {
                     slug: scp_protocol::context::outlets::error_codes::SLUG_TRANSPORT_RATE_LIMITED,
                 }
             })?;
+            if params.economic_policy_snapshot.is_none()
+                && let Some(policy) = guard.governance.economic_policy.clone()
+            {
+                params.economic_policy_snapshot =
+                    Some(crate::context::outlets::invoke::EconomicPolicySnapshot { policy });
+            }
             guard.handle.clone()
         };
 
@@ -1746,6 +1768,8 @@ impl ContextManager {
             // ceiling. `open_stream_session` acquires a permit after its
             // per-context gates pass and moves it into the pump task.
             std::sync::Arc::clone(&self.outlet_stream_pump_semaphore),
+            // §7.3.8 caveat post-input check — run once at open.
+            caveat_post_input_check,
         )
         .await
     }
@@ -1784,11 +1808,22 @@ impl ContextManager {
     ///
     /// # Errors
     ///
-    /// Returns [`ContextError::ContextNotRegistered`] only when the context
-    /// is gone (in which case the budget tracker was torn down with it and
-    /// the refund is moot). Payment-capture failures are recorded to the
-    /// event log and surfaced as `Ok(None)` — they MUST NOT strand the
-    /// refund, which already happened.
+    /// §5.4.5 MED-HIGH — settlement is resilient to a mid-stream context
+    /// teardown. When the hosting context is still registered the runtime
+    /// refunds the unspent escrow under the context lock and reads the LIVE
+    /// economic policy. When the context is GONE (closed / evicted
+    /// mid-stream) the budget tracker was torn down with it so the refund is
+    /// moot — but the runtime STILL captures the `PaymentReceipt` for
+    /// already-rendered service using the open-time
+    /// [`EconomicPolicySnapshot`](crate::context::outlets::invoke::EconomicPolicySnapshot)
+    /// (H8 "service rendered is billed"), recording a durable
+    /// `PaymentCaptureFailed` event on capture failure rather than stranding
+    /// the bill behind a `ContextNotRegistered` early-return.
+    ///
+    /// Payment-capture failures are recorded to the event log and surfaced
+    /// as `Ok(None)` — they MUST NOT strand a refund that already happened.
+    /// This method no longer early-returns `ContextNotRegistered`: an absent
+    /// context is a settlement path, not an error.
     #[allow(clippy::too_many_arguments)]
     pub async fn outlet_stream_settle(
         &self,
@@ -1799,16 +1834,19 @@ impl ContextManager {
         billed_count: u32,
         request_id: scp_protocol::context::outlets::stream::RequestId,
         outlet_id: &OutletId,
+        // §5.4.5 MED-HIGH — open-time economic policy snapshot. Used as the
+        // capture policy when the hosting context is no longer registered
+        // (teardown mid-stream). `None` for zero-cost / Query streams.
+        economic_policy_snapshot: Option<crate::context::outlets::invoke::EconomicPolicySnapshot>,
     ) -> Result<Option<crate::economy::adapter::PaymentReceipt>, ContextError> {
-        // Step 1: refund the unspent escrow under the context lock, and
-        // snapshot the economic policy needed for the capture so the adapter
-        // call (which must not hold the lock) sees a consistent view. The
-        // hold was debited at open + grants; reversing the refund leaves net
-        // spent == billed_amount.
-        let economic_policy = {
-            let arc = self
-                .get_context_arc(context_id)
-                .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        // Step 1: if the context is STILL registered, refund the unspent
+        // escrow under its lock and read the LIVE economic policy (it may
+        // have changed via governance since open). If the context is GONE,
+        // skip the refund (the budget tracker was torn down with it — moot)
+        // and fall back to the open-time snapshot policy so capture for
+        // already-rendered service still proceeds. The adapter call (Step 2)
+        // runs off-lock either way.
+        let economic_policy = if let Ok(arc) = self.get_context_arc(context_id) {
             let mut guard = arc.lock().await;
             let ctx = &mut *guard;
             if refund_amount.value() > 0 {
@@ -1819,6 +1857,17 @@ impl ContextManager {
             let policy = ctx.governance.economic_policy.clone();
             drop(guard);
             policy
+        } else {
+            // Context torn down mid-stream. The refund is moot (no budget
+            // tracker to credit), but service was rendered, so capture
+            // proceeds against the open-time snapshot (H8).
+            tracing::debug!(
+                context_id,
+                request_id = %hex::encode(request_id),
+                "outlet stream settlement: context gone mid-stream — \
+                 capturing against open-time economic snapshot"
+            );
+            economic_policy_snapshot.map(|snap| snap.policy)
         };
 
         // Step 2: capture the §19.15.5 PaymentReceipt for the EXACT billed
@@ -2287,6 +2336,9 @@ impl ContextManager {
         admission: std::sync::Arc<
             std::sync::Mutex<crate::context::outlets::stream::StreamAdmissionTracker>,
         >,
+        // §7.3.8 caveat post-input check (crypto-MED) — forwarded to
+        // `open_outlet_stream`, which runs it once at open.
+        caveat_post_input_check: Option<crate::context::outlets::invoke::CaveatPostInputCheck<'_>>,
     ) -> Result<
         crate::context::outlets::dispatch::StreamSessionHandle,
         crate::context::outlets::dispatch::OpenStreamRejection,
@@ -2309,6 +2361,7 @@ impl ContextManager {
             settlement_sink,
             params,
             admission,
+            caveat_post_input_check,
         )
         .await
     }

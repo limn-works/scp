@@ -680,6 +680,7 @@ fn build_open_stream_params(open: &OpenSpec) -> OpenStreamParams {
         revocation_checker: std::sync::Arc::new(
             scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
         ),
+        economic_policy_snapshot: None,
     }
 }
 
@@ -777,6 +778,7 @@ async fn drive_vector(vector: &StreamVector) -> Vec<OutletStreamChunk> {
             None,
             build_open_stream_params(&vector.open),
             admission,
+            None,
         )
         .await
         .expect("vector replay: open_outlet_stream must succeed for fixture-backed vectors");

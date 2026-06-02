@@ -1218,6 +1218,7 @@ async fn outlet_stream_paid_decrements_budget_by_billed_at_close() {
             3,
             *uuid::Uuid::now_v7().as_bytes(),
             &scp_protocol::context::outlets::OutletId::from("outlet-x"),
+            None,
         )
         .await
         .expect("settle must succeed");
@@ -1262,6 +1263,7 @@ async fn outlet_stream_refunds_unspent_escrow() {
             6,
             *uuid::Uuid::now_v7().as_bytes(),
             &scp_protocol::context::outlets::OutletId::from("outlet-y"),
+            None,
         )
         .await
         .unwrap();
@@ -1294,6 +1296,7 @@ async fn outlet_stream_refunds_unspent_escrow() {
             0,
             *uuid::Uuid::now_v7().as_bytes(),
             &scp_protocol::context::outlets::OutletId::from("outlet-y"),
+            None,
         )
         .await
         .unwrap();
@@ -1433,4 +1436,184 @@ fn caveats_binding_commits_to_real_effective_set() {
     let binding_narrowed_again =
         compute_caveats_binding(ucan_cid, &request_id, invoker_did, estimate, &narrowed_jcs);
     assert_eq!(binding_narrowed, binding_narrowed_again);
+}
+
+// -----------------------------------------------------------------------
+// §5.4.5 MED-HIGH — context-close mid-stream capture + audit via the
+// open-time EconomicPolicySnapshot. The settlement path must NOT
+// early-return ContextNotRegistered once the context is gone — it must
+// still capture the receipt (or record a durable PaymentCaptureFailed)
+// for already-rendered service (H8).
+// -----------------------------------------------------------------------
+
+/// Builds an `EconomicPolicy` with a non-zero `per_outlet_call` cost so the
+/// settlement capture path runs.
+fn step5_economic_policy() -> scp_protocol::economy::types::EconomicPolicy {
+    use scp_protocol::economy::types::{Amount, CostSchedule, CurrencyCode, EconomicPolicy};
+    EconomicPolicy {
+        locked: false,
+        cost_schedule: CostSchedule {
+            currency: CurrencyCode(*b"USD\0"),
+            per_message: None,
+            per_outlet_call: Some(Amount::new(7)),
+            per_join: None,
+            per_period: None,
+            per_byte_stored: None,
+        },
+        payment_adapters: vec![],
+        pricing_formula: None,
+        payee: DID::from("did:key:payee"),
+    }
+}
+
+/// Builds a manager wired with `adapter` and an `OrderedMockEventLog` whose
+/// durable appends the test can inspect, creates a context with a
+/// `per_outlet_call` policy, and grants the invoker budget. Returns the
+/// manager, the event-log handle, and the open-time policy snapshot.
+async fn step5_setup<A: crate::economy::adapter::PaymentAdapter + 'static>(
+    adapter: A,
+) -> (
+    ContextManager,
+    std::sync::Arc<OrderedMockEventLog>,
+    crate::context::outlets::invoke::EconomicPolicySnapshot,
+) {
+    let event_log = std::sync::Arc::new(OrderedMockEventLog::default());
+    let manager = ContextManager::builder()
+        .crypto(Box::new(MockCrypto::default()))
+        .transport(Box::new(MockTransport::connected()))
+        .event_log(Box::new(ArcOrderedEventLog(event_log.clone())))
+        .payment_adapter(std::sync::Arc::new(adapter))
+        .key_resolver(noop_key_resolver())
+        .build()
+        .unwrap();
+
+    let policy = step5_economic_policy();
+    let params = ContextParams {
+        economic_policy: Some(policy.clone()),
+        ..ContextParams::default()
+    };
+    manager
+        .create_context("step5-ctx".into(), params, "did:key:creator".into(), None)
+        .await
+        .unwrap();
+    {
+        let arc = manager.get_context_arc("step5-ctx").unwrap();
+        let mut g = arc.lock().await;
+        g.governance.budget_tracker.grant(
+            &DID::from("did:key:creator"),
+            scp_protocol::economy::types::Amount::new(1_000_000),
+        );
+    }
+
+    let snapshot = crate::context::outlets::invoke::EconomicPolicySnapshot { policy };
+    (manager, event_log, snapshot)
+}
+
+/// (i) Context evicted mid-stream, adapter succeeds → the `PaymentReceipt`
+/// for N×cost is STILL captured from the open-time snapshot; no
+/// `ContextNotRegistered` strands the bill.
+#[tokio::test]
+async fn outlet_stream_settle_captures_receipt_after_context_evicted() {
+    let (manager, _event_log, snapshot) =
+        step5_setup(crate::economy::adapter::NoOpPaymentAdapter).await;
+    let invoker: DID = "did:key:creator".into();
+
+    // Evict the context mid-stream: settlement must still proceed.
+    manager.contexts_map().remove("step5-ctx");
+    assert!(
+        manager.get_context_arc("step5-ctx").is_err(),
+        "context is gone after eviction"
+    );
+
+    // N = 3 billable Data chunks at cost 7 → billed 21.
+    let receipt = manager
+        .outlet_stream_settle(
+            "step5-ctx",
+            &invoker,
+            scp_protocol::economy::types::Amount::new(21),
+            scp_protocol::economy::types::Amount::new(0),
+            3,
+            *uuid::Uuid::now_v7().as_bytes(),
+            &scp_protocol::context::outlets::OutletId::from("outlet-evicted"),
+            Some(snapshot),
+        )
+        .await
+        .expect("settle MUST NOT return ContextNotRegistered when the context is gone");
+
+    let receipt = receipt.expect("receipt captured from the open-time snapshot");
+    assert_eq!(
+        receipt.amount.value(),
+        21,
+        "receipt bills exactly N×cost for rendered service"
+    );
+}
+
+/// (ii) Context evicted mid-stream, adapter capture FAILS → a durable
+/// `PaymentCaptureFailed` event is appended (not just a `tracing::warn`), and
+/// settlement returns `Ok(None)` without panicking or stranding.
+#[tokio::test]
+async fn outlet_stream_settle_records_durable_capture_failure_after_evict() {
+    let (manager, event_log, snapshot) = step5_setup(FailingCapturePaymentAdapter).await;
+    let invoker: DID = "did:key:creator".into();
+
+    manager.contexts_map().remove("step5-ctx");
+
+    let result = manager
+        .outlet_stream_settle(
+            "step5-ctx",
+            &invoker,
+            scp_protocol::economy::types::Amount::new(21),
+            scp_protocol::economy::types::Amount::new(0),
+            3,
+            *uuid::Uuid::now_v7().as_bytes(),
+            &scp_protocol::context::outlets::OutletId::from("outlet-fail"),
+            Some(snapshot),
+        )
+        .await
+        .expect("capture failure MUST surface as Ok(None), never an error");
+    assert!(
+        result.is_none(),
+        "failed capture yields no receipt (service rendered, bill not reversed)"
+    );
+
+    // The durable event-log append (record_payment_capture_failure ->
+    // append_context_event_with_payload) MUST have recorded a
+    // PaymentCaptureFailed entry.
+    let entries = event_log.entries.lock().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|(_, event, _, _, _)| event == "PaymentCaptureFailed"),
+        "a durable PaymentCaptureFailed event must be appended on capture failure"
+    );
+}
+
+/// (iii) No snapshot supplied AND context gone → settlement is a graceful
+/// no-op (`Ok(None)`), never a panic or `ContextNotRegistered`. Guards the
+/// degenerate path where neither a live policy nor a snapshot is available.
+#[tokio::test]
+async fn outlet_stream_settle_no_snapshot_no_context_is_graceful_noop() {
+    let (manager, _event_log, _snapshot) =
+        step5_setup(crate::economy::adapter::NoOpPaymentAdapter).await;
+    let invoker: DID = "did:key:creator".into();
+
+    manager.contexts_map().remove("step5-ctx");
+
+    let result = manager
+        .outlet_stream_settle(
+            "step5-ctx",
+            &invoker,
+            scp_protocol::economy::types::Amount::new(21),
+            scp_protocol::economy::types::Amount::new(0),
+            3,
+            *uuid::Uuid::now_v7().as_bytes(),
+            &scp_protocol::context::outlets::OutletId::from("outlet-nosnap"),
+            None,
+        )
+        .await
+        .expect("absent context + absent snapshot MUST NOT error");
+    assert!(
+        result.is_none(),
+        "no policy available → no capture, graceful Ok(None)"
+    );
 }

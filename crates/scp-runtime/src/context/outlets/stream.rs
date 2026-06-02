@@ -110,6 +110,18 @@ pub enum GrantError {
     /// Invoker's available balance is below the top-up amount at
     /// grant-acceptance time. Maps to `economic.insufficient-funds`.
     InsufficientFunds,
+    /// The stream's pump has already exited (terminal chunk emitted,
+    /// channel closed, or forced terminate) — a credit grant arriving
+    /// after the stream reached its terminal state is a session-lifecycle
+    /// violation, not an authorization denial. Maps to the Protocol-class
+    /// `protocol.stream-already-closed` slug (`SCP-TOOL-6101`,
+    /// `CODE_PROTOCOL_SESSION`) per §5.4.4:426. Gated in
+    /// `apply_credit_grant` BEFORE the signature/replay checks run, so a
+    /// grant against a closed stream never mutates escrow or the credit
+    /// counter. Distinct from the Authorization-class `SCP-TOOL-6110`
+    /// band: the caller's right to grant was never withdrawn; the stream's
+    /// substrate is simply gone.
+    StreamClosed,
 }
 
 /// Routes a [`GrantError`] to its §5.4.4 slug.
@@ -124,6 +136,7 @@ pub const fn grant_error_to_slug(err: GrantError) -> &'static str {
         }
         GrantError::EscrowOverflow => error_codes::SLUG_ECONOMIC_ESCROW_OVERFLOW,
         GrantError::InsufficientFunds => error_codes::SLUG_ECONOMIC_INSUFFICIENT_FUNDS,
+        GrantError::StreamClosed => error_codes::SLUG_PROTOCOL_STREAM_ALREADY_CLOSED,
     }
 }
 
@@ -209,6 +222,10 @@ pub const fn grant_error_to_code(err: GrantError) -> &'static str {
         GrantError::EscrowOverflow | GrantError::InsufficientFunds => {
             error_codes::CODE_ECONOMIC_FAULT
         }
+        // §5.4.4:426 — a control-plane call against an already-terminal
+        // stream is a Protocol-class session-lifecycle violation
+        // (`SCP-TOOL-6101`), NOT the Authorization-class `SCP-TOOL-6110`.
+        GrantError::StreamClosed => error_codes::CODE_PROTOCOL_SESSION,
     }
 }
 
@@ -255,6 +272,22 @@ pub struct CreditTracker {
     /// MUST match these or it is rejected as
     /// [`GrantError::StreamIdentityMismatch`].
     identity: StreamIdentity,
+    /// §5.4.5:758 HARD cumulative billable-chunk ceiling, pinned at
+    /// acceptance to the VALIDATED-NARROWED `max_calls` caveat (coerced to
+    /// `u32`; `None` means no `max_calls` constraint — unbounded). This is
+    /// the protocol's upper limit on how many billable (Data) chunks CAN
+    /// flow over the stream's lifetime "regardless of executor behavior":
+    /// no quantity of credit grants can raise it. [`Self::grant`] clamps
+    /// every replenishment so `billed_emitted + remaining` never exceeds
+    /// `max_billable`, and the per-chunk gate refuses any billable chunk
+    /// once `billed_emitted` reaches it.
+    max_billable: Option<u32>,
+    /// Count of billable (Data, at/below the cancel-ack ceiling) chunks
+    /// emitted so far. Monotonically increasing; never reset. Compared
+    /// against [`Self::max_billable`] to enforce the §5.4.5:758 cumulative
+    /// ceiling. Incremented exactly once per forwarded billable Data chunk
+    /// by [`Self::record_billed_emission`].
+    billed_emitted: u32,
 }
 
 impl CreditTracker {
@@ -264,17 +297,30 @@ impl CreditTracker {
     /// `invoker_pk` is the invoker's Ed25519 verifying key recorded
     /// at acceptance; every credit-grant signature is verified
     /// against it.
+    ///
+    /// `max_billable` is the §5.4.5:758 HARD cumulative billable-chunk
+    /// ceiling — the VALIDATED-NARROWED `caveats.max_calls` coerced to
+    /// `u32` (`None` = unbounded). The initial `credit_window` is itself
+    /// clamped to this ceiling so a stream can never start with more
+    /// headroom than `max_calls` permits.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         credit_window: u32,
         invoker_pk: VerifyingKey,
         identity: StreamIdentity,
+        max_billable: Option<u32>,
     ) -> Self {
+        // The initial window cannot exceed the cumulative ceiling: at open
+        // `billed_emitted == 0`, so the headroom is clamped to
+        // `max_billable` directly.
+        let remaining = max_billable.map_or(credit_window, |cap| credit_window.min(cap));
         Self {
-            remaining: credit_window,
+            remaining,
             seen_seq: None,
             invoker_pk,
             identity,
+            max_billable,
+            billed_emitted: 0,
         }
     }
 
@@ -309,6 +355,73 @@ impl CreditTracker {
     #[must_use]
     pub const fn invoker_pk(&self) -> &VerifyingKey {
         &self.invoker_pk
+    }
+
+    /// §5.4.5:758 HARD cumulative billable-chunk ceiling (read-only).
+    /// `None` means no `max_calls` constraint (unbounded).
+    #[must_use]
+    pub const fn max_billable(&self) -> Option<u32> {
+        self.max_billable
+    }
+
+    /// Count of billable Data chunks emitted so far (read-only). Compared
+    /// against [`Self::max_billable`] by the per-chunk gate to enforce the
+    /// §5.4.5:758 cumulative ceiling.
+    #[must_use]
+    pub const fn billed_emitted(&self) -> u32 {
+        self.billed_emitted
+    }
+
+    /// `true` when the §5.4.5:758 cumulative billable ceiling has been
+    /// reached — `billed_emitted >= max_billable`. Always `false` when
+    /// `max_billable` is `None` (unbounded). The per-chunk gate consults
+    /// this BEFORE consuming credit so a stream that has already emitted
+    /// `max_calls` billable chunks forwards no further billable chunk
+    /// regardless of available credit.
+    #[must_use]
+    pub const fn cumulative_ceiling_reached(&self) -> bool {
+        match self.max_billable {
+            Some(cap) => self.billed_emitted >= cap,
+            None => false,
+        }
+    }
+
+    /// Records that one billable Data chunk was emitted, advancing
+    /// `billed_emitted` toward the §5.4.5:758 cumulative ceiling.
+    /// Saturating — the counter never wraps. Called exactly once per
+    /// forwarded billable Data chunk (at or below the cancel-ack ceiling).
+    pub const fn record_billed_emission(&mut self) {
+        self.billed_emitted = self.billed_emitted.saturating_add(1);
+    }
+
+    /// Replenishes `remaining` by `grant`, CLAMPED so the stream's
+    /// cumulative billable headroom never exceeds the §5.4.5:758
+    /// `max_billable` ceiling: after the clamp,
+    /// `billed_emitted + remaining <= max_billable`.
+    ///
+    /// The clamp does NOT reject the grant — partial headroom up to the
+    /// ceiling is still made available (a grant whose full amount would
+    /// overshoot is honored up to the remaining cumulative budget). The
+    /// invariant it preserves is that no number of grants can raise the
+    /// cumulative ceiling "regardless of executor behavior": the most a
+    /// stream can ever bill is `max_billable`. When `max_billable` is
+    /// `None` (unbounded) the grant is a plain saturating add.
+    const fn replenish_clamped(&mut self, grant: u32) {
+        let raw = self.remaining.saturating_add(grant);
+        self.remaining = match self.max_billable {
+            // Headroom that remains under the cumulative ceiling, given how
+            // many billable chunks have already been emitted. Saturating
+            // sub so an already-exhausted stream clamps to zero.
+            Some(cap) => {
+                let cumulative_headroom = cap.saturating_sub(self.billed_emitted);
+                if raw < cumulative_headroom {
+                    raw
+                } else {
+                    cumulative_headroom
+                }
+            }
+            None => raw,
+        };
     }
 
     /// Decrements credit by one for an emitted `Data` or `Progress`
@@ -388,9 +501,11 @@ impl CreditTracker {
             return Err(GrantError::SignatureInvalid);
         }
 
-        // Advance state.
+        // Advance state. Replenishment is CLAMPED to the §5.4.5:758
+        // cumulative ceiling so no grant can raise the maximum billable
+        // chunk count beyond the pinned `max_billable`.
         self.seen_seq = Some(credit.monotonic_seq);
-        self.remaining = self.remaining.saturating_add(credit.grant);
+        self.replenish_clamped(credit.grant);
         Ok(self.remaining)
     }
 
@@ -407,6 +522,13 @@ impl CreditTracker {
     /// a different `caveats_binding` is detected here AFTER the
     /// signature check — the §5.4.5 binding-eviction race attack
     /// described in "Binding-pinning invariant".
+    ///
+    /// Lifecycle note: this method is PURE — it never inspects stream
+    /// liveness. The §5.4.4:426 grant-after-close gate
+    /// (`GrantError::StreamClosed`) lives in the dispatch layer's
+    /// `apply_credit_grant`, which checks `SharedSessionState::pump_exited`
+    /// under the session lock BEFORE calling this method. A post-terminal
+    /// grant is rejected there and never reaches the credit counter.
     ///
     /// # Errors
     ///
@@ -449,8 +571,10 @@ impl CreditTracker {
 
         match (asserted_ok, pinned_ok) {
             (_, true) => {
+                // Replenishment CLAMPED to the §5.4.5:758 cumulative
+                // ceiling — see [`Self::replenish_clamped`].
                 self.seen_seq = Some(credit.monotonic_seq);
-                self.remaining = self.remaining.saturating_add(credit.grant);
+                self.replenish_clamped(credit.grant);
                 Ok(self.remaining)
             }
             (true, false) => Err(GrantError::StreamIdentityMismatch),
@@ -1322,7 +1446,7 @@ mod tests {
     #[test]
     fn credit_tracker_consumes_until_exhausted() {
         let key = fixed_signing_key();
-        let mut tracker = CreditTracker::new(2, key.verifying_key(), fixed_identity());
+        let mut tracker = CreditTracker::new(2, key.verifying_key(), fixed_identity(), None);
         assert!(tracker.try_consume().is_ok());
         assert!(tracker.try_consume().is_ok());
         assert_eq!(tracker.try_consume(), Err(OutOfCredit::Exhausted));
@@ -1332,7 +1456,7 @@ mod tests {
     #[test]
     fn credit_grant_happy_path_replenishes() {
         let key = fixed_signing_key();
-        let mut tracker = CreditTracker::new(0, key.verifying_key(), fixed_identity());
+        let mut tracker = CreditTracker::new(0, key.verifying_key(), fixed_identity(), None);
         let grant = make_grant(&key, &fixed_identity(), &fixed_request_id(), 5, 1);
         let new_total = tracker.grant(&grant).unwrap();
         assert_eq!(new_total, 5);
@@ -1342,7 +1466,7 @@ mod tests {
     #[test]
     fn credit_grant_replay_rejected() {
         let key = fixed_signing_key();
-        let mut tracker = CreditTracker::new(0, key.verifying_key(), fixed_identity());
+        let mut tracker = CreditTracker::new(0, key.verifying_key(), fixed_identity(), None);
         let g1 = make_grant(&key, &fixed_identity(), &fixed_request_id(), 5, 5);
         tracker.grant(&g1).unwrap();
         // Same monotonic_seq — replay.
@@ -1359,7 +1483,7 @@ mod tests {
     fn credit_grant_bad_signature_rejected() {
         let key = fixed_signing_key();
         let other_key = SigningKey::from_bytes(&[0x77; 32]);
-        let mut tracker = CreditTracker::new(0, key.verifying_key(), fixed_identity());
+        let mut tracker = CreditTracker::new(0, key.verifying_key(), fixed_identity(), None);
         // Grant signed by a different key — verification fails.
         let bad = make_grant(&other_key, &fixed_identity(), &fixed_request_id(), 5, 1);
         assert_eq!(tracker.grant(&bad), Err(GrantError::SignatureInvalid));
@@ -1377,7 +1501,7 @@ mod tests {
             stream_epoch: 99,
             caveats_binding: [0xCD; 32],
         };
-        let mut tracker = CreditTracker::new(0, key.verifying_key(), pinned);
+        let mut tracker = CreditTracker::new(0, key.verifying_key(), pinned, None);
         // Sign a grant for a DIFFERENT stream's identity. Verifying
         // against the asserted identity succeeds, but it does not
         // match the pinned identity — surfaced as
@@ -1393,7 +1517,7 @@ mod tests {
     fn credit_grant_cross_epoch_rejected() {
         let key = fixed_signing_key();
         let pinned = fixed_identity();
-        let mut tracker = CreditTracker::new(0, key.verifying_key(), pinned.clone());
+        let mut tracker = CreditTracker::new(0, key.verifying_key(), pinned.clone(), None);
         // Sign a grant for the SAME (context, outlet,
         // caveats_binding) but a different stream_epoch — still
         // gets rejected by the basic grant() because the preimage
@@ -1911,7 +2035,7 @@ mod tests {
         // Executor sends 100 Data + End with credit_window=32 and a
         // grant after every 32 chunks.
         let key = fixed_signing_key();
-        let mut tracker = CreditTracker::new(32, key.verifying_key(), fixed_identity());
+        let mut tracker = CreditTracker::new(32, key.verifying_key(), fixed_identity(), None);
         // Consume 32, then accept a grant of 32, then consume 32, ...
         for round in 0..3u64 {
             for _ in 0..32u32 {
@@ -1930,11 +2054,84 @@ mod tests {
         assert_eq!(tracker.remaining(), 28);
     }
 
+    /// §5.4.5:758 grant clamp (HIGH-2): a `CreditTracker` pinned with
+    /// `max_billable = Some(10)` never exposes more cumulative headroom
+    /// than the ceiling, no matter how large a grant arrives. The grant is
+    /// NOT rejected — partial headroom up to the ceiling is still usable —
+    /// but the cumulative cap cannot be raised.
+    #[test]
+    fn grant_clamps_remaining_to_cumulative_max_calls_ceiling() {
+        let key = fixed_signing_key();
+        // credit_window 32 is clamped to max_billable 10 at construction.
+        let mut tracker = CreditTracker::new(32, key.verifying_key(), fixed_identity(), Some(10));
+        assert_eq!(
+            tracker.remaining(),
+            10,
+            "initial window clamped to max_billable at open"
+        );
+
+        // Emit 4 billable chunks (consume + record).
+        for _ in 0..4u32 {
+            tracker.try_consume().unwrap();
+            tracker.record_billed_emission();
+        }
+        assert_eq!(tracker.billed_emitted(), 4);
+        assert_eq!(tracker.remaining(), 6);
+
+        // A massive grant cannot raise the cumulative ceiling: with 4
+        // billed, only 6 cumulative headroom remains (10 - 4), so the
+        // clamped remaining is 6 — NOT 6 + 100.
+        let grant = make_grant(&key, &fixed_identity(), &fixed_request_id(), 100, 1);
+        let new_total = tracker
+            .grant(&grant)
+            .expect("grant accepted (clamped, not rejected)");
+        assert_eq!(
+            new_total, 6,
+            "remaining clamped to max_billable - billed_emitted"
+        );
+        assert_eq!(tracker.remaining(), 6);
+
+        // Consume the remaining 6 (total 10 billable) and record them.
+        for _ in 0..6u32 {
+            tracker.try_consume().unwrap();
+            tracker.record_billed_emission();
+        }
+        assert_eq!(tracker.billed_emitted(), 10);
+        assert!(
+            tracker.cumulative_ceiling_reached(),
+            "ceiling reached at exactly max_calls billable chunks"
+        );
+
+        // A further grant yields zero cumulative headroom — the ceiling
+        // holds regardless of executor behavior.
+        let grant2 = make_grant(&key, &fixed_identity(), &fixed_request_id(), 100, 2);
+        let after = tracker
+            .grant(&grant2)
+            .expect("grant accepted but clamped to zero");
+        assert_eq!(after, 0, "no headroom past the cumulative ceiling");
+    }
+
+    /// `max_billable = None` (no `max_calls` caveat) is unbounded — the
+    /// cumulative ceiling never trips and grants are plain saturating adds.
+    #[test]
+    fn unbounded_max_billable_never_trips_cumulative_ceiling() {
+        let key = fixed_signing_key();
+        let mut tracker = CreditTracker::new(32, key.verifying_key(), fixed_identity(), None);
+        assert_eq!(tracker.remaining(), 32, "no clamp when unbounded");
+        for _ in 0..1000u32 {
+            tracker.record_billed_emission();
+        }
+        assert!(
+            !tracker.cumulative_ceiling_reached(),
+            "unbounded stream never reaches a cumulative ceiling"
+        );
+    }
+
     #[test]
     fn billing_integration_no_grant_stalls_at_32() {
         // Executor exhausts 32 and gets no grant.
         let key = fixed_signing_key();
-        let mut tracker = CreditTracker::new(32, key.verifying_key(), fixed_identity());
+        let mut tracker = CreditTracker::new(32, key.verifying_key(), fixed_identity(), None);
         for _ in 0..32u32 {
             assert!(tracker.try_consume().is_ok());
         }
@@ -1960,7 +2157,7 @@ mod tests {
         // cancel-ack/credit-stall payload helpers, not via
         // try_consume.
         let key = fixed_signing_key();
-        let mut tracker = CreditTracker::new(0, key.verifying_key(), fixed_identity());
+        let mut tracker = CreditTracker::new(0, key.verifying_key(), fixed_identity(), None);
         assert_eq!(tracker.try_consume(), Err(OutOfCredit::Exhausted));
         // Framework can still build a terminal Error chunk.
         let payload = CancelAckTracker::cancel_ack_timeout_payload();

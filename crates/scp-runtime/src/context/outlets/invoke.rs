@@ -580,6 +580,39 @@ pub struct StreamSettlement {
     pub request_id: RequestId,
     /// Outlet id — receipt + event-log provenance.
     pub outlet_id: OutletId,
+    /// §5.4.5 MED-HIGH — the economic policy snapshotted at
+    /// `OutletStreamOpen` acceptance (ADR-048 per-instance snapshot; H8
+    /// "service rendered is billed"). The settlement path prefers the LIVE
+    /// per-context policy when the hosting context is still registered, but
+    /// when the context was closed / evicted mid-stream the live policy is
+    /// gone — the snapshot lets the runtime STILL capture the
+    /// `PaymentReceipt` for service already rendered (and record a durable
+    /// `PaymentCaptureFailed` on capture failure) rather than stranding the
+    /// bill behind a `ContextNotRegistered` early-return. `None` for
+    /// zero-cost / Query streams and legacy/test callers without an
+    /// economic policy at open.
+    pub economic_policy_snapshot: Option<EconomicPolicySnapshot>,
+}
+
+/// §5.4.5 MED-HIGH — economic state snapshotted at `OutletStreamOpen`
+/// acceptance so close-time settlement survives a mid-stream context
+/// teardown.
+///
+/// The hosting context's `economic_policy` (which carries the `payee` and
+/// `cost_schedule.currency` the payment adapter needs to authorize +
+/// capture) is cloned into this snapshot at open. If the context is still
+/// registered at settlement the runtime reads the LIVE policy (it may have
+/// changed via governance); if the context is GONE, the runtime falls back
+/// to this snapshot so the receipt for already-rendered service is still
+/// captured. The payment-adapter handle itself lives on the
+/// `ContextManager` (not per-context), so it is available regardless of
+/// context liveness and is not part of the snapshot.
+#[derive(Debug, Clone)]
+pub struct EconomicPolicySnapshot {
+    /// The hosting context's economic policy at open. Carries `payee` and
+    /// `cost_schedule.currency` for the `authorize → capture` adapter
+    /// sequence.
+    pub policy: scp_protocol::economy::types::EconomicPolicy,
 }
 
 /// Sink fired once at the close of each streaming-native outlet invocation.
@@ -4153,6 +4186,29 @@ pub enum StreamGateOutcome {
     Stall,
     /// Cancel-ack ceiling exceeded. Caller drops without billing.
     DropAboveCancelAck,
+    /// §5.4.5:758 cumulative billable ceiling reached — the stream has
+    /// already emitted `min(credit_window, max_calls)` billable Data
+    /// chunks, the HARD upper limit "regardless of executor behavior". A
+    /// further billable chunk MUST NOT be forwarded. The pump maps this to
+    /// a terminal `Error { terminal: true }` with slug
+    /// `execution.credit-exhausted` (`CODE_EXECUTION_CREDIT`,
+    /// `SCP-TOOL-6131`) and closes the stream. Distinct from
+    /// [`Self::Stall`] (transient — credit may be replenished) and
+    /// [`Self::DropAboveCancelAck`] (a single dropped chunk, stream
+    /// continues): `CreditExhausted` is terminal.
+    CreditExhausted,
+}
+
+/// §5.4.5 shared billable-chunk predicate.
+///
+/// A chunk is billable iff it is a `Data` chunk at or below the cancel-ack
+/// billing `ceiling`. Used by BOTH [`apply_stream_chunk_gate`] (the
+/// §5.4.5:758 cumulative-ceiling gate) and [`accrue_data_chunk_if_billable`]
+/// (escrow accrual) so the two paths can never drift on what counts as a
+/// billable chunk.
+#[must_use]
+pub const fn is_billable_chunk(chunk: &OutletStreamChunk, ceiling: u64) -> bool {
+    matches!(chunk.payload, ChunkPayload::Data { .. }) && chunk.sequence <= ceiling
 }
 
 /// Applies the SCP-OUT-034 per-chunk gate using the shared session
@@ -4165,15 +4221,22 @@ pub enum StreamGateOutcome {
 /// 1. Compare `chunk.sequence` against
 ///    [`super::stream::CancelAckTracker::billing_ceiling`] —
 ///    chunks above the ceiling return [`StreamGateOutcome::DropAboveCancelAck`].
-/// 2. Call [`super::stream::CreditTracker::try_consume`]. On
+/// 2. §5.4.5:758 cumulative ceiling: if the chunk is billable (a `Data`
+///    chunk at/below the cancel-ack ceiling) AND the §5.4.5:758
+///    cumulative ceiling has already been reached
+///    ([`super::stream::CreditTracker::cumulative_ceiling_reached`]),
+///    return [`StreamGateOutcome::CreditExhausted`] WITHOUT consuming
+///    credit — the HARD `min(credit_window, max_calls)` cap is reached and
+///    the stream MUST terminate.
+/// 3. Call [`super::stream::CreditTracker::try_consume`]. On
 ///    [`super::stream::OutOfCredit::Exhausted`], stamp
 ///    `credit_stall_armed_at` to the current `Instant` and return
 ///    [`StreamGateOutcome::Stall`].
-/// 3. Otherwise return [`StreamGateOutcome::Forward`].
+/// 4. Otherwise return [`StreamGateOutcome::Forward`].
 ///
 /// The function takes a single mutex guard window so the
-/// (consume → ceiling → bill) decision is atomic with respect to
-/// concurrent grant / cancel deliveries on
+/// (ceiling → cumulative → consume → bill) decision is atomic with respect
+/// to concurrent grant / cancel deliveries on
 /// [`super::stream::CreditTracker::grant_with_identity`] /
 /// [`super::stream::CancelAckTracker::record_cancel`].
 #[must_use]
@@ -4190,6 +4253,15 @@ pub fn apply_stream_chunk_gate(
     if chunk.sequence > ceiling {
         return StreamGateOutcome::DropAboveCancelAck;
     }
+    // §5.4.5:758 cumulative billable ceiling. Only billable (Data,
+    // at/below the cancel-ack ceiling) chunks are subject to the
+    // `max_calls` cap — Progress chunks below the ceiling still consume
+    // credit but are never billed, so they do not count toward the cap.
+    // Checked BEFORE `try_consume` so a chunk rejected by the cumulative
+    // ceiling does not burn credit.
+    if is_billable_chunk(chunk, ceiling) && credit.cumulative_ceiling_reached() {
+        return StreamGateOutcome::CreditExhausted;
+    }
     if credit.try_consume().is_err() {
         if credit_stall_armed_at.is_none() {
             *credit_stall_armed_at = Some(std::time::Instant::now());
@@ -4201,19 +4273,15 @@ pub fn apply_stream_chunk_gate(
 
 /// Accrues a Data chunk in the per-stream [`super::stream::StreamEscrow`].
 ///
-/// Bills only when the chunk's sequence is at or below the cancel-ack
-/// ceiling. Progress / End / Error chunks and chunks above the ceiling
-/// are NOT billed (§5.4.5).
+/// Bills only when the chunk is billable (a `Data` chunk at or below the
+/// cancel-ack ceiling — see [`is_billable_chunk`]). Progress / End / Error
+/// chunks and chunks above the ceiling are NOT billed (§5.4.5).
 pub const fn accrue_data_chunk_if_billable(
     escrow: &mut super::stream::StreamEscrow,
     cancel_ack: &super::stream::CancelAckTracker,
     chunk: &OutletStreamChunk,
 ) {
-    if !matches!(chunk.payload, ChunkPayload::Data { .. }) {
-        return;
-    }
-    let ceiling = cancel_ack.billing_ceiling();
-    if chunk.sequence <= ceiling {
+    if is_billable_chunk(chunk, cancel_ack.billing_ceiling()) {
         escrow.accrue_one_chunk();
     }
 }
@@ -7026,6 +7094,7 @@ mod tests {
             revocation_checker: StdArc::new(
                 scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
             ),
+            economic_policy_snapshot: None,
         }
     }
 
@@ -7091,6 +7160,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -7195,6 +7265,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -7348,6 +7419,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -7473,6 +7545,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
         )
         .await
         .expect("open should succeed");
@@ -7572,6 +7645,7 @@ mod tests {
             revocation_checker: StdArc::new(
                 scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
             ),
+            economic_policy_snapshot: None,
         }
     }
 
@@ -7641,6 +7715,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -7759,6 +7834,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -7958,6 +8034,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -8085,6 +8162,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
         )
         .await
         .expect("OUT-034 open should succeed");
@@ -8363,6 +8441,7 @@ mod tests {
             revocation_checker: StdArc::new(
                 scp_protocol::crypto::ucan::validate::InMemoryRevocationChecker::new(),
             ),
+            economic_policy_snapshot: None,
         };
 
         let result = super::super::dispatch::open_stream_session(
@@ -8381,6 +8460,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
         )
         .await;
         let Err(rejection) = result else {
@@ -8417,6 +8497,313 @@ mod tests {
         assert_eq!(
             count_per_outlet, 0,
             "forged-binding open MUST NOT consume admission quota"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // §7.3.8 caveat post-input check at open (crypto-MED)
+    // -----------------------------------------------------------------------
+
+    /// Builds a §7.3.8 caveat post-input hook that mirrors the synchronous
+    /// half of the production `build_post_input_hook`: runs
+    /// `check_invocation_local` (input_schema / amount_max_per_call /
+    /// allowed_adapters / allowed_target_dids) and maps a failure to
+    /// `InvocationError::CaveatViolation { slug }` (or
+    /// `InputValidationFailed` for the schema slug).
+    fn sync_caveat_hook<'a>(
+        caveats: scp_protocol::trust::caveats::InvocationCaveats,
+        estimated_cost: scp_protocol::economy::types::Amount,
+        target_did: Option<DID>,
+    ) -> super::CaveatPostInputCheck<'a> {
+        Box::new(move |input: &serde_json::Value| {
+            let input = input.clone();
+            Box::pin(async move {
+                caveats
+                    .check_invocation_local(&input, estimated_cost, None, target_did.as_ref())
+                    .map_err(|err| {
+                        if err.slug()
+                            == scp_protocol::context::outlets::error_codes::SLUG_INPUT_SCHEMA_VIOLATION
+                        {
+                            super::InvocationError::InputValidationFailed {
+                                message: err.to_string(),
+                            }
+                        } else {
+                            super::InvocationError::CaveatViolation {
+                                slug: err.slug(),
+                                message: err.to_string(),
+                            }
+                        }
+                    })
+            })
+        })
+    }
+
+    /// Builds an Action-outlet open params fixture with the given caveats.
+    fn step4_open_params(
+        outlet_id: &OutletId,
+        creator_did: &str,
+        verifying_key: ed25519_dalek::VerifyingKey,
+        caveats: scp_protocol::trust::caveats::InvocationCaveats,
+    ) -> super::super::dispatch::OpenStreamParams {
+        // Declare a small explicit estimate (1) so the Step 2
+        // estimate-bound check passes regardless of the caveat's
+        // `max_calls` — these fixtures exercise the Step 2.5 caveat hook,
+        // NOT the estimate bound.
+        let mut params = out034_open_params(
+            outlet_id,
+            creator_did,
+            scp_protocol::economy::types::Amount::new(0),
+            scp_protocol::economy::types::Amount::new(u64::MAX),
+            Some(1),
+            16,
+            verifying_key,
+        );
+        params.caveats = caveats;
+        params
+    }
+
+    /// Runs an open with a caveat hook and returns the rejection (the open
+    /// MUST be rejected — these fixtures all violate a caveat at open).
+    async fn open_expecting_caveat_rejection(
+        caveats: scp_protocol::trust::caveats::InvocationCaveats,
+        hook: super::CaveatPostInputCheck<'_>,
+    ) -> super::super::dispatch::OpenStreamRejection {
+        struct NopExecutor;
+        #[async_trait::async_trait]
+        impl super::OutletExecutor for NopExecutor {
+            async fn exec_action_stream(
+                &self,
+                _ctx: &mut super::MutableInvocation<'_>,
+                _input: serde_json::Value,
+                _tx: tokio::sync::mpsc::Sender<ChunkPayload>,
+            ) -> Result<(), super::OutletExecutorError> {
+                Ok(())
+            }
+        }
+
+        let creator_did = "did:dht:z6MkCreator";
+        let role_state = test_role_state(creator_did);
+        let registry = setup_registry_with_tool(&role_state, creator_did);
+        let context = active_context().await;
+        let outlet_id_owned: OutletId = "calculator".to_owned();
+        let executor: StdArc<dyn super::OutletExecutor> = StdArc::new(NopExecutor);
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]);
+        let admission = StdArc::new(std::sync::Mutex::new(
+            super::super::stream::StreamAdmissionTracker::new(),
+        ));
+        let params = step4_open_params(
+            &outlet_id_owned,
+            creator_did,
+            signing.verifying_key(),
+            caveats,
+        );
+
+        let result = super::super::dispatch::open_stream_session(
+            &context,
+            &registry,
+            &role_state,
+            &outlet_id_owned,
+            serde_json::json!({"a": 1, "b": 2}),
+            &DID::from(creator_did),
+            None,
+            executor,
+            None,
+            None,
+            None,
+            None,
+            params,
+            StdArc::clone(&admission),
+            out034_pump_semaphore(),
+            Some(hook),
+        )
+        .await;
+
+        // Admission quota MUST be released on a caveat rejection at open.
+        let count_per_outlet = {
+            let admission_guard = admission.lock().expect("admission lock");
+            admission_guard.count_per_outlet(&outlet_id_owned)
+        };
+        assert_eq!(
+            count_per_outlet, 0,
+            "caveat-rejected open MUST release admission quota"
+        );
+
+        // `StreamSessionHandle` is not `Debug`, so match rather than
+        // `expect_err`.
+        match result {
+            Ok(_) => panic!("caveat violation MUST reject the stream open"),
+            Err(rejection) => rejection,
+        }
+    }
+
+    /// crypto-MED: an `input_schema` caveat violation rejects the stream
+    /// open via the §7.3.8 post-input hook, surfacing the
+    /// `input.schema-violation` slug (Input class, `SCP-TOOL-6120`).
+    #[tokio::test]
+    async fn stream_open_rejected_on_input_schema_violation() {
+        // Caveat schema requires property "a" to equal const 999; the
+        // open's input has a == 1, so the schema check fails.
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "a": { "const": 999 } }
+        });
+        let caveats = scp_protocol::trust::caveats::InvocationCaveats {
+            input_schema: Some(schema),
+            ..scp_protocol::trust::caveats::InvocationCaveats::empty()
+        };
+        let hook = sync_caveat_hook(
+            caveats.clone(),
+            scp_protocol::economy::types::Amount::new(0),
+            None,
+        );
+        let rejection = open_expecting_caveat_rejection(caveats, hook).await;
+        assert_eq!(
+            rejection.slug(),
+            scp_protocol::context::outlets::error_codes::SLUG_INPUT_SCHEMA_VIOLATION,
+        );
+        assert_eq!(
+            rejection.error_code(),
+            scp_protocol::context::outlets::error_codes::CODE_INPUT_VIOLATION,
+            "input_schema violation routes to the Input class SCP-TOOL-6120",
+        );
+    }
+
+    /// crypto-MED: an `allowed_target_dids` mismatch (the open's target DID
+    /// is not in the caveat's allow-list) rejects the stream open.
+    #[tokio::test]
+    async fn stream_open_rejected_on_allowed_target_dids_mismatch() {
+        let caveats = scp_protocol::trust::caveats::InvocationCaveats {
+            allowed_target_dids: Some(vec![DID::from("did:dht:z6MkAllowedOnly")]),
+            ..scp_protocol::trust::caveats::InvocationCaveats::empty()
+        };
+        // The presented target DID is NOT in the allow-list.
+        let hook = sync_caveat_hook(
+            caveats.clone(),
+            scp_protocol::economy::types::Amount::new(0),
+            Some(DID::from("did:dht:z6MkSomeOtherTarget")),
+        );
+        let rejection = open_expecting_caveat_rejection(caveats, hook).await;
+        assert_eq!(
+            rejection.slug(),
+            scp_protocol::context::outlets::error_codes::SLUG_AUTHORIZATION_DENIED,
+            "target-DID mismatch collapses to authorization.denied per §5.4.4",
+        );
+        assert_eq!(
+            rejection.error_code(),
+            scp_protocol::context::outlets::error_codes::CODE_AUTHORIZATION_DENIED,
+        );
+    }
+
+    /// crypto-MED: `amount_max_cumulative` below the projected billed total
+    /// rejects the stream open. The hook's counter-store CAS rejects when
+    /// the per-call estimated cost would exceed the cumulative cap.
+    #[tokio::test]
+    async fn stream_open_rejected_on_amount_max_cumulative_below_projected() {
+        use crate::store::ProtocolRepository;
+        use crate::trust::caveat_counter_store::CaveatCounterStore;
+        use scp_platform::testing::InMemoryStorage;
+
+        let store = StdArc::new(CaveatCounterStore::new(
+            StdArc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new())),
+            StdArc::new(scp_primitives::SystemClock),
+        ));
+        let ucan_cid = "bafy-step4-cumulative".to_owned();
+        // Cumulative cap of 5; the projected per-open cost is 50 — far over
+        // the cap, so the very first open is rejected.
+        let cap = scp_protocol::economy::types::Amount::new(5);
+        let estimated_cost = scp_protocol::economy::types::Amount::new(50);
+        let caveats = scp_protocol::trust::caveats::InvocationCaveats {
+            amount_max_cumulative: Some(cap),
+            ..scp_protocol::trust::caveats::InvocationCaveats::empty()
+        };
+        let hook: super::CaveatPostInputCheck<'_> = Box::new(move |_input| {
+            let store = StdArc::clone(&store);
+            let ucan_cid = ucan_cid.clone();
+            Box::pin(async move {
+                store
+                    .check_and_increment(
+                        "ctx-invoke-test",
+                        &ucan_cid,
+                        scp_protocol::trust::CaveatKind::AmountCumulative,
+                        estimated_cost.value(),
+                        cap.value(),
+                        0,
+                    )
+                    .await
+                    .map_err(|_| super::InvocationError::CaveatViolation {
+                        slug:
+                            scp_protocol::context::outlets::error_codes::SLUG_AUTHORIZATION_DENIED,
+                        message: "amount_max_cumulative exceeded at open".to_owned(),
+                    })
+            })
+        });
+        let rejection = open_expecting_caveat_rejection(caveats, hook).await;
+        assert_eq!(
+            rejection.slug(),
+            scp_protocol::context::outlets::error_codes::SLUG_AUTHORIZATION_DENIED,
+        );
+    }
+
+    /// crypto-MED: a `rate_window` already exhausted (the window's `max`
+    /// calls have been consumed) rejects the stream open.
+    #[tokio::test]
+    async fn stream_open_rejected_on_rate_window_exhausted() {
+        use crate::store::ProtocolRepository;
+        use crate::trust::caveat_counter_store::CaveatCounterStore;
+        use scp_platform::testing::InMemoryStorage;
+
+        let store = StdArc::new(CaveatCounterStore::new(
+            StdArc::new(ProtocolRepository::new_for_testing(InMemoryStorage::new())),
+            StdArc::new(scp_primitives::SystemClock),
+        ));
+        let ucan_cid = "bafy-step4-rate".to_owned();
+        // Rate window: max 1 call per 3600s. Pre-consume the single slot so
+        // the open's increment exhausts the window.
+        let window = scp_protocol::trust::caveats::RateWindow {
+            max: 1,
+            window_secs: 3600,
+        };
+        store
+            .check_and_increment(
+                "ctx-invoke-test",
+                &ucan_cid,
+                scp_protocol::trust::CaveatKind::RateWindow,
+                0,
+                u64::from(window.max),
+                window.window_secs,
+            )
+            .await
+            .expect("first call consumes the only slot");
+
+        let caveats = scp_protocol::trust::caveats::InvocationCaveats {
+            rate_window: Some(window),
+            ..scp_protocol::trust::caveats::InvocationCaveats::empty()
+        };
+        let hook: super::CaveatPostInputCheck<'_> = Box::new(move |_input| {
+            let store = StdArc::clone(&store);
+            let ucan_cid = ucan_cid.clone();
+            Box::pin(async move {
+                store
+                    .check_and_increment(
+                        "ctx-invoke-test",
+                        &ucan_cid,
+                        scp_protocol::trust::CaveatKind::RateWindow,
+                        0,
+                        u64::from(window.max),
+                        window.window_secs,
+                    )
+                    .await
+                    .map_err(|_| super::InvocationError::CaveatViolation {
+                        slug:
+                            scp_protocol::context::outlets::error_codes::SLUG_AUTHORIZATION_DENIED,
+                        message: "rate_window exhausted at open".to_owned(),
+                    })
+            })
+        });
+        let rejection = open_expecting_caveat_rejection(caveats, hook).await;
+        assert_eq!(
+            rejection.slug(),
+            scp_protocol::context::outlets::error_codes::SLUG_AUTHORIZATION_DENIED,
         );
     }
 
@@ -8550,6 +8937,7 @@ mod tests {
             // token from "live" to "revoked" after the open succeeds.
             revocation_checker: StdArc::clone(&checker)
                 as StdArc<dyn RevocationChecker + Send + Sync>,
+            economic_policy_snapshot: None,
         };
 
         let mut handle = super::super::dispatch::open_stream_session(
@@ -8568,6 +8956,7 @@ mod tests {
             params,
             StdArc::clone(&admission),
             out034_pump_semaphore(),
+            None,
         )
         .await
         .expect("open succeeds with matching binding");
@@ -8811,6 +9200,7 @@ mod tests {
             params_a,
             StdArc::clone(&admission_a),
             StdArc::clone(&semaphore),
+            None,
         )
         .await
         .expect("first open acquires the only permit");
@@ -8848,6 +9238,7 @@ mod tests {
             params_b,
             StdArc::clone(&admission_b),
             StdArc::clone(&semaphore),
+            None,
         )
         .await;
         // `StreamSessionHandle` is not Debug, so reduce to is_ok + the err
@@ -8910,6 +9301,7 @@ mod tests {
             params_c,
             StdArc::clone(&admission_c),
             StdArc::clone(&semaphore),
+            None,
         )
         .await;
         // StreamSessionHandle does not implement Debug; map the error to
