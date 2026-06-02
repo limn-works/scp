@@ -179,7 +179,8 @@ pub const IDENT_1053: &str = "SCP-IDENT-1053";
 // -----------------------------------------------------------------------
 // Per-context pseudonym derivation errors (§9.10.4).
 //
-// Surfaced by the UniFFI context_create / context_join / context_import
+// Surfaced by all native bridges (PyO3, napi-rs, UniFFI) on the
+// context_create / context_join / context_import
 // lifecycle entry points when deriving the caller's per-member routing
 // pseudonym from custody-held identity key material. Encrypted /
 // pseudonymous contexts hard-fail on derivation error; broadcast contexts

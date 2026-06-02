@@ -397,7 +397,7 @@ async fn derive_context_pseudonym(
         .as_ref()
         .ok_or_else(|| ScpNapiError::Identity {
             message: "identity missing scp_identity — cannot derive pseudonym".to_owned(),
-            code: codes::IDENT_1050.to_owned(),
+            code: codes::IDENT_1054.to_owned(),
         })?;
     let custody =
         identity
@@ -407,7 +407,7 @@ async fn derive_context_pseudonym(
             .ok_or_else(|| ScpNapiError::Identity {
                 message: "identity has no in-memory custody provider — cannot derive pseudonym"
                     .to_owned(),
-                code: codes::IDENT_1052.to_owned(),
+                code: codes::IDENT_1056.to_owned(),
             })?;
     let pseudonym = custody
         .0
@@ -415,7 +415,7 @@ async fn derive_context_pseudonym(
         .await
         .map_err(|e| ScpNapiError::Identity {
             message: format!("pseudonym derivation failed: {e}"),
-            code: codes::IDENT_1051.to_owned(),
+            code: codes::IDENT_1055.to_owned(),
         })?;
     let bytes: [u8; 32] =
         pseudonym
@@ -424,7 +424,7 @@ async fn derive_context_pseudonym(
             .try_into()
             .map_err(|_| ScpNapiError::Identity {
                 message: "pseudonym public key must be 32 bytes".to_owned(),
-                code: codes::IDENT_1053.to_owned(),
+                code: codes::IDENT_1057.to_owned(),
             })?;
     Ok(bytes)
 }
@@ -441,7 +441,7 @@ async fn derive_context_pseudonym(
         message: "in-memory custody feature disabled — pseudonym derivation unavailable. Enable \
                   `allow_in_memory_custody` or supply a callback custody provider."
             .to_owned(),
-        code: codes::IDENT_1052.to_owned(),
+        code: codes::IDENT_1056.to_owned(),
     }
     .into())
 }
@@ -761,7 +761,7 @@ pub(crate) async fn context_join_on(
                 .map_err(|e| {
                     NapiError::from(ScpNapiError::Identity {
                         message: format!("identity not registered: {e}"),
-                        code: codes::IDENT_1050.to_owned(),
+                        code: codes::IDENT_1054.to_owned(),
                     })
                 })?;
             let pseudonym = custody
@@ -771,13 +771,13 @@ pub(crate) async fn context_join_on(
                 .map_err(|e| {
                     NapiError::from(ScpNapiError::Identity {
                         message: format!("pseudonym derivation failed: {e}"),
-                        code: codes::IDENT_1051.to_owned(),
+                        code: codes::IDENT_1055.to_owned(),
                     })
                 })?;
             pseudonym.public_key.as_bytes().try_into().map_err(|_| {
                 NapiError::from(ScpNapiError::Identity {
                     message: "pseudonym public key must be 32 bytes".to_owned(),
-                    code: codes::IDENT_1053.to_owned(),
+                    code: codes::IDENT_1057.to_owned(),
                 })
             })?
         }
@@ -786,7 +786,7 @@ pub(crate) async fn context_join_on(
             return Err(NapiError::from(ScpNapiError::Identity {
                 message: "in-memory custody feature disabled — pseudonym derivation unavailable"
                     .to_owned(),
-                code: codes::IDENT_1052.to_owned(),
+                code: codes::IDENT_1056.to_owned(),
             }));
         }
     };
