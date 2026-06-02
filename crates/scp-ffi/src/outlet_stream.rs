@@ -31,7 +31,7 @@
 use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use pyo3::exceptions::{PyRuntimeError, PyStopAsyncIteration};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -108,6 +108,87 @@ impl scp_protocol::crypto::ucan::validate::RevocationChecker for BridgeStreamRev
 }
 
 // ---------------------------------------------------------------------------
+// CustodyStreamSigner — custody-backed StreamSigner (ADR-006)
+// ---------------------------------------------------------------------------
+
+/// Custody-backed [`scp_runtime::context::outlets::signer::StreamSigner`].
+///
+/// ADR-006: private keys never cross the FFI boundary. Instead of exporting
+/// the operator's `ed25519_dalek::SigningKey` into the runtime address space
+/// (the deleted `resolve_invoker_signing_key_via_custody` path), the bridge
+/// hands the runtime this object-safe adapter. Each
+/// [`scp_runtime::context::outlets::signer::StreamSigner::sign`] call routes
+/// the §5.4.5 preimage back through [`FfiKeyCustody::sign`] so the private
+/// bytes only ever exist inside custody for the duration of a single signing
+/// call.
+///
+/// In the local single-context streaming path the operator (chunk signer)
+/// and the invoker (UCAN holder) are the same custody-held key, so the same
+/// adapter backs both the dispatch pump's chunk signing and the
+/// [`scp_runtime::context::outlets::dispatch::StreamSessionHandle::apply_outlet_cancel_signed`]
+/// cancel path (which verifies the cancel signature under the pinned
+/// `invoker_pk`).
+pub(crate) struct CustodyStreamSigner {
+    /// Custody provider that owns [`Self::key_handle`]. Held as an `Arc` so
+    /// the custody outlives the stream even if the identity is rotated out.
+    custody: Arc<FfiKeyCustody>,
+    /// Opaque handle for the Ed25519 signing key. ADR-006: opaque, never the
+    /// raw key bytes.
+    key_handle: KeyHandle,
+    /// Cached public verifying key so
+    /// [`scp_runtime::context::outlets::signer::StreamSigner::verifying_key`]
+    /// can return a reference without re-querying custody.
+    vk: VerifyingKey,
+}
+
+impl CustodyStreamSigner {
+    /// Builds a custody-backed signer for `key_handle` owned by `custody`,
+    /// pinned to the public `vk`.
+    pub(crate) const fn new(
+        custody: Arc<FfiKeyCustody>,
+        key_handle: KeyHandle,
+        vk: VerifyingKey,
+    ) -> Self {
+        Self {
+            custody,
+            key_handle,
+            vk,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl scp_runtime::context::outlets::signer::StreamSigner for CustodyStreamSigner {
+    async fn sign(
+        &self,
+        preimage: &[u8],
+    ) -> Result<[u8; 64], scp_runtime::context::outlets::signer::StreamSignerError> {
+        let signature = self
+            .custody
+            .sign(&self.key_handle, preimage)
+            .await
+            .map_err(|_e: scp_platform::error::PlatformError| {
+                // Sanitize: never surface the custody backend's detail (it
+                // can echo key identifiers or the raw signing input). The
+                // §5.4.5 pump logs the error class; the wire collapses to a
+                // generic signing failure.
+                scp_runtime::context::outlets::signer::StreamSignerError::Custody {
+                    detail: "custody signing operation failed".to_owned(),
+                }
+            })?;
+        signature.into_bytes().try_into().map_err(|_got: Vec<u8>| {
+            scp_runtime::context::outlets::signer::StreamSignerError::Custody {
+                detail: "custody returned a signature of unexpected length".to_owned(),
+            }
+        })
+    }
+
+    fn verifying_key(&self) -> &VerifyingKey {
+        &self.vk
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stream registry
 // ---------------------------------------------------------------------------
 
@@ -178,6 +259,13 @@ pub(crate) struct StreamRegistryEntry {
     /// pump task and the close path can look up by either the hex
     /// string (registry key) or the typed wire form.
     pub request_id: [u8; 16],
+    /// The presented spending UCAN's `max_per_action` ceiling (§19.5),
+    /// pinned at open. `None` for the no-spending case (free / Query /
+    /// zero-cost — the legitimate default). When `Some`, every per-grant
+    /// escrow top-up re-derives the available balance as
+    /// `min(MemberBudgetTracker::remaining, max_per_action)` so a grant
+    /// can never escrow more than the spending capability authorizes.
+    pub spending_max_per_action: Option<scp_protocol::economy::types::Amount>,
 }
 
 impl Drop for StreamRegistryEntry {
@@ -475,10 +563,11 @@ fn chunk_to_py_dict<'py>(
     proof_tokens=None,
     credit_window=None,
     estimated_chunk_count=None,
+    spending_ucan=None,
 ))]
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_lines)] // round-7 operator-key plumbing extends the open path
+#[allow(clippy::too_many_lines)] // §5.4.5 economy + operator-signer plumbing extends the open path
 pub fn py_outlet_invoke_stream(
     context_id: &str,
     outlet_id: &str,
@@ -490,6 +579,7 @@ pub fn py_outlet_invoke_stream(
     proof_tokens: Option<Vec<String>>,
     credit_window: Option<u32>,
     estimated_chunk_count: Option<u32>,
+    spending_ucan: Option<&str>,
 ) -> PyResult<PyOutletInvocationStream> {
     validate_inputs(
         context_id,
@@ -498,6 +588,9 @@ pub fn py_outlet_invoke_stream(
         ucan_token,
         proof_tokens.as_deref(),
     )?;
+    if let Some(jwt) = spending_ucan {
+        validate::validate_ucan_token(jwt)?;
+    }
     // Ensure the default bridge instance exists so the stream registry
     // is reachable. `with_context` below will fail with a clean
     // ContextError if the bridge has not been initialised, but we want
@@ -527,18 +620,15 @@ pub fn py_outlet_invoke_stream(
         ))
     })?;
     let role_state = crate::runtime::with_context(context_id, |rt| Ok(rt.role_state.clone()))?;
-    // §5.4.5 HIGH-wave-3 Fix A — resolve the invoker's key handle + custody
-    // Arc instead of caching a raw `SigningKey` on the registry entry.
-    // The runtime's stream pump still needs an `Arc<SigningKey>` for
-    // chunk signing (`OpenStreamParams::operator_signing_key`); that key
-    // lives only inside the pump task and is dropped when the pump
-    // exits. The registry entry keeps the custody handle so credit /
-    // cancel / terminate signatures hit custody rather than a cached
-    // private key — private bytes never linger on the bridge heap for
-    // the stream's lifetime (ADR-006).
+    // §5.4.5 / ADR-006 — resolve the invoker's key handle + custody Arc.
+    // The operator (chunk signer) and invoker (UCAN holder) are the same
+    // custody-held key in the local single-context streaming path, so a
+    // single `CustodyStreamSigner` over this handle backs BOTH the runtime
+    // pump's chunk signing (`OpenStreamParams::operator_signer`) and the
+    // bridge's grant/cancel signing — the private key never crosses the FFI
+    // boundary (the round-7 raw-`SigningKey` export was deleted).
     let (custody, invoker_key_handle) = resolve_invoker_key_handle(identity_did)?;
-    let signing_key = resolve_invoker_signing_key_via_custody(&custody, invoker_key_handle)?;
-    let invoker_verifying_key = signing_key.verifying_key();
+    let invoker_verifying_key = resolve_invoker_verifying_key(&custody, invoker_key_handle)?;
 
     let ctx_id_owned = context_id.to_owned();
     let outlet_id_owned = outlet_id.to_owned();
@@ -551,7 +641,62 @@ pub fn py_outlet_invoke_stream(
             handler,
         });
 
-    let signing_key_arc = Arc::new(signing_key);
+    // §5.4.5 economy (N3) — wire real escrow inputs.
+    // `cost_per_chunk` is the outlet's registered per-invocation cost
+    // (§5.4.1 / §19.3); `Amount::new(0)` for Query and zero-cost outlets.
+    let cost_per_chunk = registry_snapshot
+        .get(outlet_id)
+        .and_then(|reg| reg.cost.as_ref())
+        .map_or_else(
+            || scp_protocol::economy::types::Amount::new(0),
+            |cost| scp_protocol::economy::types::Amount::new(cost.amount),
+        );
+    // Parse the optional spending UCAN once, here, so a malformed token
+    // surfaces as a clean error before any per-stream state is allocated.
+    // The extracted `max_per_action` (§19.5) is pinned on the registry
+    // entry so each per-grant escrow top-up re-reads the live budget
+    // AND-composed against the same ceiling. `None` is the legitimate
+    // no-spending default for Query / zero-cost outlets.
+    let spending_max_per_action = match spending_ucan {
+        None => None,
+        Some(jwt) => {
+            let token = scp_protocol::crypto::ucan::validate::parse_ucan(jwt)
+                .map_err(|_e| ScpPyError::ucan("invalid spending UCAN"))?;
+            let cap =
+                scp_protocol::crypto::ucan::spending::SpendingCapability::from_ucan_token(&token)
+                    .map_err(|_e| ScpPyError::ucan("spending UCAN missing spending capability"))?;
+            // §19.5: `SpendingCapability.max_per_action` is the UCAN-side
+            // `Amount` newtype; the budget/escrow layer uses the economy
+            // `Amount`. Both are `u64`-backed; bridge across the `.0` value.
+            Some(scp_protocol::economy::types::Amount::new(
+                cap.max_per_action.0,
+            ))
+        }
+    };
+    let invoker_did_typed_for_balance: scp_primitives::DID = identity_did_owned.clone().into();
+    let manager_for_balance = crate::runtime::context_manager()?;
+    let rt_for_balance = crate::runtime()?;
+    // `available_balance` = member's remaining budget (re-read live) ∧ the
+    // spending UCAN's per-action ceiling. The runtime is the authoritative
+    // AND-composition locus (mirrors `invoke_outlet_with_economy`).
+    let available_balance = rt_for_balance
+        .block_on(async {
+            manager_for_balance
+                .outlet_stream_member_balance(
+                    &ctx_id_owned,
+                    &invoker_did_typed_for_balance,
+                    spending_max_per_action,
+                )
+                .await
+        })
+        .map_err(|e| ScpPyError::context(format!("stream balance lookup failed: {e}")))?;
+
+    let operator_signer: Arc<dyn scp_runtime::context::outlets::signer::StreamSigner> =
+        Arc::new(CustodyStreamSigner::new(
+            Arc::clone(&custody),
+            invoker_key_handle,
+            invoker_verifying_key,
+        ));
 
     // §5.4.5 HIGH-wave-2 Fix A — supply the runtime with the inputs it
     // needs to recompute the `caveats_binding`. The bridge already
@@ -564,7 +709,7 @@ pub fn py_outlet_invoke_stream(
     // a future SDK update echo the same value into its own
     // `compute_caveats_binding` call so the bridge and SDK agree.
     let ucan_token_parsed = scp_protocol::crypto::ucan::validate::parse_ucan(ucan_token)
-        .map_err(|e| ScpPyError::ucan(format!("failed to parse ucan_token for cid: {e}")))?;
+        .map_err(|_e| ScpPyError::ucan("failed to parse ucan_token for cid"))?;
     let ucan_cid_for_binding = scp_runtime::crypto::ucan::mint::compute_cid(&ucan_token_parsed);
     let request_id: scp_protocol::context::outlets::stream::RequestId =
         *uuid::Uuid::now_v7().as_bytes();
@@ -586,7 +731,9 @@ pub fn py_outlet_invoke_stream(
         credit_window,
         estimated_chunk_count,
         invoker_verifying_key,
-        Arc::clone(&signing_key_arc),
+        operator_signer,
+        cost_per_chunk,
+        available_balance,
         ucan_cid_for_binding,
         request_id,
         revocation_checker,
@@ -651,6 +798,7 @@ pub fn py_outlet_invoke_stream(
         invoker_verifying_key,
         invoker_did: identity_did_owned,
         request_id,
+        spending_max_per_action,
     })?;
 
     Ok(PyOutletInvocationStream {
@@ -682,18 +830,18 @@ fn validate_inputs(
 
 /// Builds the §5.4.5 [`OpenStreamParams`] for an outlet stream open.
 ///
-/// Uses 0-cost / `u64::MAX` balance because the bridge does not yet
-/// wire the §19 economy pipeline into the streaming path; SCP-OUT-038
-/// is the SDK story that promotes the streaming bridge to the
-/// economy-aware variant.
+/// `cost_per_chunk` and `available_balance` carry the real §5.4.5 escrow
+/// inputs the caller derived from the outlet's `registration.cost` and the
+/// member's live budget (∧ the spending UCAN's `max_per_action`). Query and
+/// zero-cost outlets legitimately pass `Amount::new(0)` for the cost (the
+/// §5.4.5 zero-escrow shape).
 ///
-/// The `operator_signing_key` is the round-7 wire-signing key the
-/// dispatch pump uses to sign every chunk it emits under
-/// `SCP-OUTLET-CHUNK-SIG-V1:`. In the local-context invocation case
-/// (the only case this bridge implements today) the SDK that opens
-/// the stream is also the executor — so the operator key is the
-/// invoker's own signing key. Native bridges always pass `Some`;
-/// `None` is reserved for legacy / test callers.
+/// The `operator_signer` is the [`scp_runtime::context::outlets::signer::StreamSigner`]
+/// the dispatch pump signs every emitted chunk through under
+/// `SCP-OUTLET-CHUNK-SIG-V1:`. In the local single-context invocation case
+/// the SDK that opens the stream is also the executor, so the operator
+/// signer is a [`CustodyStreamSigner`] over the invoker's custody-held key
+/// — the private key never crosses the FFI boundary (ADR-006).
 #[allow(clippy::too_many_arguments)]
 fn build_open_stream_params(
     context_id: String,
@@ -704,7 +852,9 @@ fn build_open_stream_params(
     credit_window: Option<u32>,
     estimated_chunk_count: Option<u32>,
     invoker_pk: ed25519_dalek::VerifyingKey,
-    operator_signing_key: std::sync::Arc<ed25519_dalek::SigningKey>,
+    operator_signer: std::sync::Arc<dyn scp_runtime::context::outlets::signer::StreamSigner>,
+    cost_per_chunk: scp_protocol::economy::types::Amount,
+    available_balance: scp_protocol::economy::types::Amount,
     ucan_cid: String,
     request_id: scp_protocol::context::outlets::stream::RequestId,
     revocation_checker: std::sync::Arc<
@@ -727,8 +877,8 @@ fn build_open_stream_params(
         },
         invoker_did: invoker_did.clone(),
         origin_invoker_did: invoker_did,
-        cost_per_chunk: scp_protocol::economy::types::Amount::new(0),
-        available_balance: scp_protocol::economy::types::Amount::new(u64::MAX),
+        cost_per_chunk,
+        available_balance,
         declared_estimated_chunk_count: estimated_chunk_count,
         credit_window: credit_window_value,
         caveats: InvocationCaveats::empty(),
@@ -738,11 +888,10 @@ fn build_open_stream_params(
         // are the same key custody-side. The cross-context bridge
         // path that distinguishes these two roles is the §6.2.0.5
         // re-encryption boundary; this single-context streaming path
-        // is the degenerate case where invoker == operator. The
-        // runtime now requires a non-optional key (the all-zero-sig
-        // placeholder fallback was deleted to close the wire-corruption
-        // path).
-        operator_signing_key,
+        // is the degenerate case where invoker == operator. The signer
+        // is a `CustodyStreamSigner` so the operator private key never
+        // enters the runtime address space (ADR-006).
+        operator_signer,
         stream_credit_stall_secs:
             scp_protocol::context::outlets::stream::DEFAULT_STREAM_CREDIT_STALL_SECS,
         stream_cancel_ack_secs: 5,
@@ -841,12 +990,36 @@ pub fn py_outlet_stream_grant_credit(
 
     let credit = sign_credit_grant(&entry, grant, next_seq)?;
 
+    // §5.4.5 credit-grant escrow top-up (N3): re-read the invoker's live
+    // budget (∧ the pinned spending-UCAN `max_per_action`) at grant time so
+    // the per-grant escrow top-up of `cost_per_chunk × grant` gates against
+    // funds the member actually holds RIGHT NOW. Re-reading (rather than
+    // caching the open-time balance) closes the window where budget granted
+    // then spent between open and this grant would otherwise escrow against
+    // stale funds. For zero-cost / Query streams the runtime computes a
+    // zero top-up regardless, so this balance is not consulted.
+    let available_balance = {
+        let manager = crate::runtime::context_manager()?;
+        let rt = crate::runtime()?;
+        let invoker_did_typed: scp_primitives::DID = entry.invoker_did.clone().into();
+        rt.block_on(async {
+            manager
+                .outlet_stream_member_balance(
+                    &entry.context_id,
+                    &invoker_did_typed,
+                    entry.spending_max_per_action,
+                )
+                .await
+        })
+        .map_err(|e| ScpPyError::context(format!("stream balance lookup failed: {e}")))?
+    };
+
     let handle_guard = entry
         .handle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let new_total = handle_guard
-        .apply_credit_grant(&credit, scp_protocol::economy::types::Amount::new(u64::MAX))
+        .apply_credit_grant(&credit, available_balance)
         .map_err(|grant_err| {
             ScpPyError::context(format!("credit grant rejected: {grant_err:?}"))
         })?;
@@ -917,64 +1090,82 @@ fn sign_credit_grant(
 // outlet_stream_cancel
 // ---------------------------------------------------------------------------
 
-/// Applies a signed [`OutletStreamCancel`] to an active stream by
-/// `request_id_hex` (round-7 cancel-auth tightening).
+/// Cancels an active stream by `request_id_hex` (ADR-049 round-8, N2).
 ///
-/// The bridge builds the [`OutletStreamCancel`] under the registry
-/// entry's pinned `(context_id, outlet_id, caveats_binding)` triple,
-/// signs it with the invoker's signing key (mirroring `grant_credit`),
-/// and forwards it to
-/// [`StreamSessionHandle::apply_outlet_cancel`]. The runtime verifies
-/// the signature under the same pinned `invoker_pk` it uses for credit
-/// grants — an unsigned-or-tampered cancel is rejected as
-/// `OutletErrorClass::Authorization::AuthorizationFailed`.
+/// Routes through
+/// [`StreamSessionHandle::apply_outlet_cancel_signed`]: the bridge passes
+/// only the caller's pinned [`scp_runtime::context::outlets::dispatch::CancelIdentity`]
+/// (`context_id`, `outlet_id`, `caveats_binding`) and a custody-backed
+/// invoker signer. The runtime atomically reads its own live emission
+/// cursor, signs the `SCP-OUTLET-CANCEL-V1:` preimage over THAT cursor, and
+/// records the cancel-ack at the cursor it actually signed — closing the
+/// round-7 TOCTOU where a caller-derived `next_seq` (read off-lock, then
+/// applied) let the cursor drift in between. A caller can no longer forge
+/// `cancel_ack_seq` to 0 (zero-bill delivered chunks) or `u64::MAX`
+/// (over-bill): the cursor never crosses the FFI boundary.
 ///
-/// A returning `Some(seq)` indicates the cancel was recorded; `None`
-/// means the stream was already terminal at cancel receipt (the
-/// runtime ignored the cancel per §5.4.5 idempotency).
+/// The bridge `caller_did` authentication gate (`lookup_entry_authenticated`)
+/// still runs first; the runtime cross-checks the pinned identity triple as
+/// defense-in-depth before wielding the operator key.
+///
+/// A returning `Some(seq)` indicates the cancel-ack was recorded at runtime
+/// cursor `seq`.
 ///
 /// # Errors
 ///
 /// * `ContextError` (slug `protocol.unknown-session`) — `request_id_hex`
 ///   does not match any active stream.
-/// * `ContextError` (slug `authorization.denied`, code
-///   `SCP-TOOL-6110`) — the cancel signature does not verify under
-///   the pinned invoker key (cannot happen via this bridge path under
-///   normal operation; surfaces if the bridge's signing key has been
-///   rotated out from under the runtime's pinned identity).
+/// * `ContextError` (slug `authorization.denied`, code `SCP-TOOL-6110`) —
+///   the caller's identity did not match the pinned triple, or the runtime's
+///   own just-produced signature failed self-verification
+///   ([`scp_runtime::context::outlets::stream::CancelError::SignatureInvalid`]),
+///   or the custody signer failed
+///   ([`scp_runtime::context::outlets::stream::CancelError::Signing`]).
+/// * `ContextError` (slug `transport.rate-limited`, code `SCP-TOOL-6160`) —
+///   the live cursor advanced on every bounded retry
+///   ([`scp_runtime::context::outlets::stream::CancelError::CursorAdvanced`]);
+///   retryable, the caller re-issues.
 #[pyfunction]
 #[pyo3(name = "outlet_stream_cancel")]
 pub fn py_outlet_stream_cancel(request_id_hex: &str, caller_did: &str) -> PyResult<Option<u64>> {
     validate::validate_did(caller_did)?;
     let entry = lookup_entry_authenticated(request_id_hex, caller_did)?;
-    // §5.4.5: derive `next_seq` from the runtime's live emission cursor
-    // — never accept caller input. A caller-supplied `next_seq` lets the
-    // caller pin `cancel_ack_seq` to 0 (zero-bill delivered chunks) or
-    // `u64::MAX` (over-bill). The cursor is published by the dispatch
-    // pump under the same mutex as the gate decision.
-    let next_seq = {
-        let handle_guard = entry
-            .handle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        handle_guard.current_next_emission_seq()
+    // The invoker signs the cancel; the runtime verifies under the pinned
+    // `invoker_pk`. A `CustodyStreamSigner` keeps the private key inside
+    // custody (ADR-006) — the runtime composes the preimage and awaits this
+    // signer only for the 64-byte signature.
+    let invoker_signer = CustodyStreamSigner::new(
+        Arc::clone(&entry.custody),
+        entry.invoker_key_handle,
+        entry.invoker_verifying_key,
+    );
+    let identity = scp_runtime::context::outlets::dispatch::CancelIdentity {
+        context_id: entry.context_id.clone(),
+        outlet_id: entry.outlet_id.clone(),
+        caveats_binding: entry.caveats_binding,
     };
-    let cancel = sign_cancel_for_entry(&entry, next_seq)?;
+    let rt = crate::runtime()?;
     let handle_guard = entry
         .handle
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let recorded = handle_guard
-        .apply_outlet_cancel(&cancel)
+    let recorded = rt
+        .block_on(async {
+            handle_guard
+                .apply_outlet_cancel_signed(&invoker_signer, &identity)
+                .await
+        })
         .map_err(|cancel_err| {
-            // Round-7: route the granular CancelError to the §5.4.4
-            // collapsed `authorization.denied` slug + code.
+            // Route the granular CancelError to its §5.4.4 slug + code: the
+            // SignatureInvalid / Signing pair collapse to
+            // `authorization.denied`; CursorAdvanced is the retryable
+            // `transport.rate-limited`.
             ScpPyError::ContextError {
                 message: format!(
-                    "cancel rejected ({}): {cancel_err:?}",
-                    scp_runtime::context::outlets::stream::cancel_error_to_slug(cancel_err)
+                    "cancel rejected ({})",
+                    scp_runtime::context::outlets::stream::cancel_error_to_slug(&cancel_err)
                 ),
-                code: scp_runtime::context::outlets::stream::cancel_error_to_code(cancel_err)
+                code: scp_runtime::context::outlets::stream::cancel_error_to_code(&cancel_err)
                     .to_owned(),
             }
         })?;
@@ -1064,58 +1255,6 @@ pub fn py_outlet_stream_terminate(
     Ok(())
 }
 
-/// Builds and signs an [`OutletStreamCancel`] for `entry` against
-/// `next_seq`. Mirrors [`sign_credit_grant`].
-///
-/// §5.4.5 HIGH-wave-3 Fix A — calls into custody for the actual signing
-/// step so the bridge does not need to hold a raw `SigningKey` for the
-/// stream's lifetime. The freshly-produced signature is self-verified
-/// under the entry's pinned verifying key before returning so preimage
-/// or key drift surfaces here rather than as a downstream
-/// `AuthorizationFailed` from the runtime's `apply_outlet_cancel`.
-fn sign_cancel_for_entry(
-    entry: &StreamRegistryEntry,
-    next_seq: u64,
-) -> PyResult<scp_protocol::context::outlets::stream::OutletStreamCancel> {
-    use scp_protocol::context::outlets::stream::{OutletStreamCancel, compute_cancel_sig_preimage};
-    let preimage = compute_cancel_sig_preimage(
-        entry.context_id.as_str(),
-        entry.outlet_id.as_str(),
-        &entry.request_id,
-        next_seq,
-        &entry.caveats_binding,
-    );
-    let rt = crate::runtime()?;
-    let custody = Arc::clone(&entry.custody);
-    let key_handle = entry.invoker_key_handle;
-    let signature = rt
-        .block_on(async move { custody.sign(&key_handle, &preimage).await })
-        .map_err(|e| ScpPyError::context(format!("custody sign failed for cancel: {e}")))?;
-    let sig_bytes: [u8; 64] = signature.into_bytes().try_into().map_err(|got: Vec<u8>| {
-        ScpPyError::context(format!(
-            "custody returned signature of {} bytes; expected 64",
-            got.len()
-        ))
-    })?;
-    let signature_typed = ed25519_dalek::Signature::from_bytes(&sig_bytes);
-    if entry
-        .invoker_verifying_key
-        .verify_strict(&preimage, &signature_typed)
-        .is_err()
-    {
-        return Err(ScpPyError::context(
-            "freshly-signed cancel failed self-verification \
-             — SCP-OUTLET-CANCEL-V1 preimage drift or custody/key mismatch",
-        )
-        .into());
-    }
-    Ok(OutletStreamCancel {
-        request_id: entry.request_id,
-        next_seq,
-        sig: sig_bytes,
-    })
-}
-
 // ---------------------------------------------------------------------------
 // verify_chunk_signature — pure helper
 // ---------------------------------------------------------------------------
@@ -1141,8 +1280,11 @@ pub fn py_verify_chunk_signature(
     caveats_binding_bytes: &[u8],
 ) -> PyResult<bool> {
     let chunk: OutletStreamChunk =
-        serde_json::from_str(chunk_json).map_err(|e| ScpPyError::ValidationError {
-            message: format!("malformed chunk JSON: {e}"),
+        serde_json::from_str(chunk_json).map_err(|_e| ScpPyError::ValidationError {
+            // N5 (ADR-049 §4): never echo the serde Display — it can quote
+            // bytes of the attacker-supplied chunk JSON. Keep the CODE and a
+            // generic, input-free message.
+            message: "malformed chunk JSON".to_owned(),
             code: scp_ffi_common::error_codes::VALID_7000.to_owned(),
         })?;
     let pk_array: [u8; 32] =
@@ -1218,13 +1360,14 @@ pub fn py_compute_caveats_binding(
                 code: scp_ffi_common::error_codes::VALID_7000.to_owned(),
             })?;
     let caveats_value: Value =
-        serde_json::from_str(effective_caveats_json).map_err(|e| ScpPyError::ValidationError {
-            message: format!("invalid effective_caveats JSON: {e}"),
+        serde_json::from_str(effective_caveats_json).map_err(|_e| ScpPyError::ValidationError {
+            // N5 (ADR-049 §4): drop the serde Display — generic message only.
+            message: "invalid effective_caveats JSON".to_owned(),
             code: scp_ffi_common::error_codes::VALID_7000.to_owned(),
         })?;
     let caveats: InvocationCaveats =
-        serde_json::from_value(caveats_value).map_err(|e| ScpPyError::ValidationError {
-            message: format!("effective_caveats does not match InvocationCaveats: {e}"),
+        serde_json::from_value(caveats_value).map_err(|_e| ScpPyError::ValidationError {
+            message: "effective_caveats does not match the InvocationCaveats schema".to_owned(),
             code: scp_ffi_common::error_codes::VALID_7000.to_owned(),
         })?;
     // §5.4.5 requires JCS canonicalization of `effective_caveats` before
@@ -1263,6 +1406,17 @@ fn decode_caveats_binding(hex_str: &str) -> PyResult<[u8; 32]> {
 }
 
 fn lookup_entry(request_id_hex: &str) -> PyResult<Arc<StreamRegistryEntry>> {
+    // N4: validate the request_id at the FFI boundary BEFORE it is used as
+    // a registry key or interpolated into any message. A malformed hex
+    // string (wrong length, uppercase, non-hex, control chars) is rejected
+    // with a typed ValidationError carrying the canonical code and a
+    // generic, input-free message — the offending bytes are never echoed.
+    scp_ffi_common::validate::validate_request_id_hex(request_id_hex).map_err(|_e| {
+        ScpPyError::ValidationError {
+            message: "request_id must be 32 lowercase hex characters (16-byte UUIDv7)".to_owned(),
+            code: scp_ffi_common::error_codes::VALID_7000.to_owned(),
+        }
+    })?;
     // Ensure the default bridge instance exists so the registry exists
     // — this lets the unknown-session error path surface even when no
     // stream has ever been opened (e.g., a test or stale handle on the
@@ -1272,10 +1426,11 @@ fn lookup_entry(request_id_hex: &str) -> PyResult<Arc<StreamRegistryEntry>> {
     reg.get(request_id_hex)
         .map(|kv| Arc::clone(kv.value()))
         .ok_or_else(|| {
+            // N5: do not echo the request_id back into the message (ADR-049
+            // §4). The CODE carries the machine-actionable signal; the slug
+            // is named for the human reader.
             ScpPyError::ContextError {
-                message: format!(
-                    "stream '{request_id_hex}' not found in registry (protocol.unknown-session)"
-                ),
+                message: "stream not found in registry (protocol.unknown-session)".to_owned(),
                 code: scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION.to_owned(),
             }
             .into()
@@ -1303,10 +1458,8 @@ fn lookup_entry_authenticated(
     let entry = lookup_entry(request_id_hex)?;
     if entry.invoker_did != caller_did {
         return Err(ScpPyError::ContextError {
-            message: format!(
-                "caller {caller_did} is not the pinned invoker for stream '{request_id_hex}' \
-                 (authorization.denied)"
-            ),
+            message: "caller is not the pinned invoker for this stream (authorization.denied)"
+                .to_owned(),
             code: scp_ffi_common::error_codes::PERM_3001.to_owned(),
         }
         .into());
@@ -1329,19 +1482,29 @@ fn resolve_invoker_key_handle(identity_did: &str) -> PyResult<(Arc<FfiKeyCustody
     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
-/// Resolves the invoker's [`SigningKey`] via custody. Used at stream
-/// open to build the runtime pump's `Arc<SigningKey>` (the pump signs
-/// every chunk under this key — see
-/// [`scp_runtime::context::outlets::dispatch::OpenStreamParams::operator_signing_key`]).
-/// The returned key lives only inside the pump task and is dropped when
-/// the pump exits; the bridge does NOT cache it on the registry entry.
-fn resolve_invoker_signing_key_via_custody(
+/// Resolves the invoker's public [`VerifyingKey`] via custody — ADR-006:
+/// only the PUBLIC key is read out, never the private signing key. Pinned
+/// on the registry entry so the bridge can build the
+/// [`scp_runtime::context::outlets::dispatch::OpenStreamParams::invoker_pk`]
+/// and back the [`CustodyStreamSigner::verifying_key`] without exporting any
+/// private material (the raw-`SigningKey` export path was deleted).
+fn resolve_invoker_verifying_key(
     custody: &FfiKeyCustody,
     handle: KeyHandle,
-) -> PyResult<SigningKey> {
+) -> PyResult<VerifyingKey> {
     let rt = crate::runtime()?;
-    rt.block_on(async move { custody.export_ed25519_signing_key(&handle).await })
-        .map_err(|e| PyRuntimeError::new_err(format!("failed to export invoker signing key: {e}")))
+    let public = rt
+        .block_on(async { custody.public_key(&handle).await })
+        .map_err(|_e| PyRuntimeError::new_err("failed to resolve invoker public key"))?;
+    let pk_bytes: [u8; 32] =
+        public
+            .as_bytes()
+            .try_into()
+            .map_err(|_e: std::array::TryFromSliceError| {
+                PyRuntimeError::new_err("invoker public key is not a 32-byte Ed25519 key")
+            })?;
+    VerifyingKey::from_bytes(&pk_bytes)
+        .map_err(|_e| PyRuntimeError::new_err("invoker public key is not a valid Ed25519 key"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1760,6 +1923,101 @@ mod tests {
         assert!(
             reg.get(&request_id_hex).is_none(),
             "drop must leave the registry without the entry"
+        );
+    }
+
+    /// N1 — the custody-backed [`CustodyStreamSigner`] signs the §5.4.5
+    /// preimage through custody (the operator private key never leaves the
+    /// custody boundary) and the produced signature verifies under the
+    /// signer's own `verifying_key()`. This is the exact contract the
+    /// dispatch pump's `debug_assert!` self-check and the cancel primitive's
+    /// own-signature check rely on.
+    #[tokio::test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    async fn custody_stream_signer_signs_and_verifies_under_its_own_key() {
+        use scp_platform::testing::InMemoryKeyCustody;
+        use scp_platform::{KeyCustody, KeyType};
+        use scp_runtime::context::outlets::signer::StreamSigner;
+
+        let custody = Arc::new(FfiKeyCustody::InMemory(InMemoryKeyCustody::new()));
+        let handle = custody
+            .generate_keypair(KeyType::Ed25519)
+            .await
+            .expect("generate ed25519");
+        let public = custody.public_key(&handle).await.expect("public key");
+        let pk_bytes: [u8; 32] = public.as_bytes().try_into().expect("32-byte pk");
+        let vk = VerifyingKey::from_bytes(&pk_bytes).expect("valid vk");
+
+        let signer = CustodyStreamSigner::new(Arc::clone(&custody), handle, vk);
+        // Sign an arbitrary 32-byte preimage (the runtime composes the real
+        // §5.4.5 digest; the signer signs whatever bytes it is handed).
+        let preimage = [0x33u8; 32];
+        let sig = signer.sign(&preimage).await.expect("custody sign");
+        let signature = ed25519_dalek::Signature::from_bytes(&sig);
+        assert!(
+            signer
+                .verifying_key()
+                .verify_strict(&preimage, &signature)
+                .is_ok(),
+            "custody-produced signature must verify under the signer's own verifying key"
+        );
+        // The signer's verifying key matches what custody reports — i.e. the
+        // bridge never substituted a different key.
+        assert_eq!(*signer.verifying_key(), vk);
+    }
+
+    /// N1 — compile-time + object-safety assertion that
+    /// [`CustodyStreamSigner`] satisfies the runtime's `StreamSigner` trait
+    /// object. `OpenStreamParams` carries `Arc<dyn StreamSigner>`, not a raw
+    /// `Arc<SigningKey>`, so the bridge can never thread a private key into
+    /// the runtime address space.
+    #[test]
+    #[cfg(feature = "allow_in_memory_custody")]
+    fn custody_stream_signer_is_object_safe() {
+        use scp_platform::testing::InMemoryKeyCustody;
+        let custody = Arc::new(FfiKeyCustody::InMemory(InMemoryKeyCustody::new()));
+        let vk = ed25519_dalek::SigningKey::from_bytes(&[0x42; 32]).verifying_key();
+        let signer = CustodyStreamSigner::new(custody, KeyHandle::new(0), vk);
+        let _erased: Arc<dyn scp_runtime::context::outlets::signer::StreamSigner> =
+            Arc::new(signer);
+    }
+
+    /// N4 — a malformed `request_id_hex` on the cancel path surfaces a
+    /// `ValidationError` and the offending string is NOT echoed back in the
+    /// message (ADR-049 §4 / shared `validate_request_id_hex`).
+    #[test]
+    fn cancel_rejects_malformed_request_id_without_echo() {
+        // Uppercase hex is rejected by `validate_request_id_hex` (the wire
+        // form is canonical lowercase). The sentinel below would be echoed
+        // by the pre-N4 interpolating message.
+        let sentinel = "DEADBEEFDEADBEEFDEADBEEFDEADBEEF";
+        let result = py_outlet_stream_cancel(sentinel, "did:dht:z6MkInvoker");
+        let err = result.expect_err("malformed request_id must be rejected");
+        let err_str = format!("{err}");
+        assert!(
+            !err_str.contains(sentinel),
+            "validation error must NOT echo the malformed request_id: {err_str}"
+        );
+        assert!(
+            err_str.contains("request_id"),
+            "validation error should name the offending field generically: {err_str}"
+        );
+    }
+
+    /// N5 — a chunk JSON carrying a recognizable sentinel substring is
+    /// rejected with a `ValidationError` whose message does NOT contain the
+    /// sentinel (the serde Display is dropped; only the CODE + a generic
+    /// message survive).
+    #[test]
+    fn verify_chunk_signature_scrubs_malformed_json_detail() {
+        let sentinel = "SENTINEL_LEAK_MARKER_7f3a";
+        let malformed = format!("{{ not valid json {sentinel} ");
+        let result = py_verify_chunk_signature(&malformed, &[0u8; 32], "ctx", "outlet", &[0u8; 32]);
+        let err = result.expect_err("malformed chunk JSON must be rejected");
+        let err_str = format!("{err}");
+        assert!(
+            !err_str.contains(sentinel),
+            "chunk-JSON validation error must NOT echo input bytes: {err_str}"
         );
     }
 }

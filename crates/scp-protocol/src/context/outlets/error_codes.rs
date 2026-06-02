@@ -23,7 +23,7 @@
 //! | Code | Class | Default slug | Slugs covered (§5.4.4 + round-4/5/6) |
 //! |------|-------|--------------|--------------------------------------|
 //! | [`CODE_PROTOCOL_VIOLATION`] (`SCP-TOOL-6100`) | `Protocol` | `protocol.violation` | `query-cost-violation`, `query-violation`, `kind-mismatch`, `amplification-violation`, `structural-floor-violation`, `schema-immutability-violation`, `query-misdeclaration`, `protocol.catalog-rotation-too-frequent`, `protocol.stream-already-open`, `protocol.violation` |
-//! | [`CODE_PROTOCOL_SESSION`] (`SCP-TOOL-6101`) | `Protocol` | `protocol.session-id-conflict` | `protocol.session-id-conflict`, `protocol.malformed-session-id`, `protocol.unknown-session`, `protocol.context-closed-mid-stream` |
+//! | [`CODE_PROTOCOL_SESSION`] (`SCP-TOOL-6101`) | `Protocol` | `protocol.session-id-conflict` | `protocol.session-id-conflict`, `protocol.malformed-session-id`, `protocol.unknown-session`, `protocol.context-closed-mid-stream`, `protocol.stream-already-closed` |
 //! | [`CODE_AUTHORIZATION_DENIED`] (`SCP-TOOL-6110`) | `Authorization` | `authorization.denied` | `authorization.denied` (oracle-collapse target), `authorization.expired`, `authorization.revoked`, `authorization.missing`, `authorization.attenuation-violation`, `authorization.mint-limit-exceeded`, `authorization.time-box-violation`, `authorization.rate-exceeded`, `authorization.cumulative-exceeded`, `authorization.adapter-not-allowed`, `authorization.revoked-mid-stream`, `authorization.credit-stream-mismatch`, `authorization.ikm-signature-invalid`, `authorization.credit-replay` |
 //! | [`CODE_AUTHORIZATION_ATTENUATION`] (`SCP-TOOL-6114`) | `Authorization` | `attenuation.mask-width-violation` | `attenuation.caveat-mint-limit-exceeded`, `attenuation.hours-of-day-high-bits-set`, `attenuation.days-of-week-high-bit-set`, `attenuation.origin-kind-stem-mismatch`, `attenuation.origin-kind-mixed-stem-root`, `attenuation.origin-kind-unspecified`, `attenuation.mask-width-violation` |
 //! | [`CODE_AUTHORIZATION_SALT_ROTATION`] (`SCP-TOOL-6115`) | `Authorization` | `authorization.salt-rotation-unjustified` | `authorization.salt-rotation-unjustified` |
@@ -85,7 +85,8 @@ pub const CODE_PROTOCOL_VIOLATION: &str = "SCP-TOOL-6100"; // SCP-CODE-OK: §5.4
 /// Default slug `protocol.session-id-conflict`. Slugs:
 /// `protocol.session-id-conflict`, `protocol.malformed-session-id`,
 /// `protocol.unknown-session`, `protocol.context-closed-mid-stream`
-/// (round-8 context teardown mid-stream). See §6.2.1.1(a) (round-5
+/// (round-8 context teardown mid-stream), `protocol.stream-already-closed`
+/// (control-plane call after terminal). See §6.2.1.1(a) (round-5
 /// `UUIDv7`) and §5.4.4.
 pub const CODE_PROTOCOL_SESSION: &str = "SCP-TOOL-6101"; // SCP-CODE-OK: §5.4.4 registry constant (Protocol class)
 
@@ -262,6 +263,19 @@ pub const SLUG_PROTOCOL_UNKNOWN_SESSION: &str = "protocol.unknown-session";
 /// Authorization) so a context teardown is never recorded as a UCAN
 /// revocation. See §5.4.5 "Context teardown vs. revocation (round 8)".
 pub const SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM: &str = "protocol.context-closed-mid-stream";
+/// Slug `protocol.stream-already-closed` — stream-lifecycle guard.
+///
+/// Surfaced when a control-plane method (`grant_credit`, `cancel`,
+/// `terminate`) is invoked against a stream that has already reached a
+/// terminal chunk (`End` / `Error{terminal:true}` / cancel-ack). Shares
+/// [`CODE_PROTOCOL_SESSION`] (`SCP-TOOL-6101`) with the other
+/// Protocol-session-lifecycle conditions (`protocol.unknown-session`,
+/// `protocol.context-closed-mid-stream`) — a post-terminal control-plane
+/// call is a session-lifecycle violation, not an authorization failure,
+/// so it MUST NOT collapse onto the Authorization band. See §5.4.5
+/// "Cancellation and billing boundary" and the SDK lifecycle-guard
+/// surface (`StreamAlreadyClosed`).
+pub const SLUG_PROTOCOL_STREAM_ALREADY_CLOSED: &str = "protocol.stream-already-closed";
 
 // --- Authorization class --------------------------------------------------
 
@@ -594,7 +608,8 @@ pub fn slug_to_class(slug: &str) -> Option<OutletErrorClass> {
         | SLUG_PROTOCOL_SESSION_ID_CONFLICT
         | SLUG_PROTOCOL_MALFORMED_SESSION_ID
         | SLUG_PROTOCOL_UNKNOWN_SESSION
-        | SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM => Some(OutletErrorClass::Protocol),
+        | SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM
+        | SLUG_PROTOCOL_STREAM_ALREADY_CLOSED => Some(OutletErrorClass::Protocol),
 
         // Authorization class — code 6110 (general denial) AND code 6114
         // (attenuation sub-class) AND code 6115 (salt-rotation) all map to
@@ -1118,6 +1133,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn stream_already_closed_is_protocol_session_lifecycle() {
+        // `protocol.stream-already-closed` is the stream-lifecycle guard
+        // raised when a control-plane method runs after the stream reached
+        // a terminal chunk. It shares the Protocol-session code band
+        // (SCP-TOOL-6101) with `protocol.unknown-session` and
+        // `protocol.context-closed-mid-stream` — a post-terminal call is a
+        // session-lifecycle violation, NOT an authorization failure, so it
+        // must resolve to the Protocol class and pass the §5.4.4 regex.
+        assert_eq!(
+            slug_to_class(SLUG_PROTOCOL_STREAM_ALREADY_CLOSED),
+            Some(OutletErrorClass::Protocol),
+            "stream-already-closed must map to the Protocol class"
+        );
+        assert_eq!(
+            error_code_to_class(CODE_PROTOCOL_SESSION),
+            Some(OutletErrorClass::Protocol),
+            "CODE_PROTOCOL_SESSION must map to the Protocol class"
+        );
+        validate_slug(SLUG_PROTOCOL_STREAM_ALREADY_CLOSED)
+            .unwrap_or_else(|e| panic!("stream-already-closed fails the §5.4.4 regex: {e:?}"));
+        // It must NOT collapse onto the Authorization band — a lifecycle
+        // guard is not a UCAN/authorization denial.
+        assert_ne!(
+            slug_to_class(SLUG_PROTOCOL_STREAM_ALREADY_CLOSED),
+            slug_to_class(SLUG_AUTHORIZATION_DENIED),
+            "stream-already-closed must NOT share the Authorization class"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Slug count — the §5.4.4 round-5 taxonomy registers ≥ 40 slugs.
     // -----------------------------------------------------------------------
@@ -1131,7 +1176,7 @@ mod tests {
     #[test]
     fn slug_count_is_at_least_forty() {
         let slugs: &[&str] = &[
-            // Protocol (13)
+            // Protocol (15)
             SLUG_PROTOCOL_VIOLATION,
             SLUG_QUERY_COST_VIOLATION,
             SLUG_QUERY_VIOLATION,
@@ -1146,6 +1191,7 @@ mod tests {
             SLUG_PROTOCOL_MALFORMED_SESSION_ID,
             SLUG_PROTOCOL_UNKNOWN_SESSION,
             SLUG_PROTOCOL_CONTEXT_CLOSED_MID_STREAM,
+            SLUG_PROTOCOL_STREAM_ALREADY_CLOSED,
             // Authorization (15)
             SLUG_AUTHORIZATION_DENIED,
             SLUG_AUTHORIZATION_EXPIRED,

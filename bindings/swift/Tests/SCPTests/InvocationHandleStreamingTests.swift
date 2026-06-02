@@ -98,7 +98,7 @@ struct StreamAlreadyClosedDepthTests {
             return
         }
         #expect(env.classWire == .protocol)
-        #expect(env.code == "SCP-TOOL-6102")
+        #expect(env.code == "SCP-TOOL-6101")
         #expect(env.slug == "protocol.stream-already-closed")
     }
 
@@ -208,7 +208,7 @@ struct PostTerminalLifecycleTests {
             #expect(Bool(false), "expected throw")
         } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
             // expected — Fix #4: lifecycle error nests under .protocol(envelope)
-            #expect(env.code == "SCP-TOOL-6102")
+            #expect(env.code == "SCP-TOOL-6101")
         } catch {
             #expect(Bool(false), "wrong error: \(error)")
         }
@@ -230,7 +230,7 @@ struct PostTerminalLifecycleTests {
             #expect(Bool(false), "expected throw")
         } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
             // expected — Fix #4: lifecycle error nests under .protocol(envelope)
-            #expect(env.code == "SCP-TOOL-6102")
+            #expect(env.code == "SCP-TOOL-6101")
         } catch {
             #expect(Bool(false), "wrong error: \(error)")
         }
@@ -259,7 +259,7 @@ struct PostTerminalLifecycleTests {
             #expect(Bool(false), "expected throw")
         } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
             // expected — Fix #4: lifecycle error nests under .protocol(envelope)
-            #expect(env.code == "SCP-TOOL-6102")
+            #expect(env.code == "SCP-TOOL-6101")
         } catch {
             #expect(Bool(false), "wrong error: \(error)")
         }
@@ -281,7 +281,7 @@ struct NonStreamingControlPlaneTests {
             #expect(Bool(false), "expected throw")
         } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
             // expected — Fix #4: lifecycle error nests under .protocol(envelope)
-            #expect(env.code == "SCP-TOOL-6102")
+            #expect(env.code == "SCP-TOOL-6101")
         } catch {
             #expect(Bool(false), "wrong error: \(error)")
         }
@@ -299,7 +299,7 @@ struct NonStreamingControlPlaneTests {
             #expect(Bool(false), "expected throw")
         } catch let OutletError.protocol(env) where env.slug == "protocol.stream-already-closed" {
             // expected — Fix #4: lifecycle error nests under .protocol(envelope)
-            #expect(env.code == "SCP-TOOL-6102")
+            #expect(env.code == "SCP-TOOL-6101")
         } catch {
             #expect(Bool(false), "wrong error: \(error)")
         }

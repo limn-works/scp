@@ -554,6 +554,17 @@
           "swift": true
         },
         {
+          "name": "invoke_stream_with_spending_ucan",
+          "python": true,
+          "typescript": true,
+          "kotlin": true,
+          "swift": true,
+          "notes": "context_outlet_invoke_stream accepts an optional spending_ucan parameter (§19.5) that AND-composes the streaming escrow's available_balance against the spending UCAN's max_per_action. All three native bridges (PyO3 py_outlet_invoke_stream, NAPI context_outlet_invoke_stream, UniFFI outlet_invoke_stream / outlet_invoke_stream_with_subscriber) parse the token at open, pin its max_per_action on the registry entry, and thread it through ContextManager::outlet_stream_member_balance at open AND at every per-grant escrow top-up. The bridge layer is fully wired (no hard-coded None at the Rust bridge boundary); the SDK wrappers expose the optional parameter on a separate integration branch — passing None for the no-spending case (Query / zero-cost outlets) is the legitimate default. WASM streaming has no economy layer (ADR-034) and does not surface this parameter.",
+          "exemptions": {
+            "wasm": "ADR-034: WASM bridge has no economy/escrow layer; the streaming spending_ucan AND-composition does not apply."
+          }
+        },
+        {
           "name": "stream_grant_credit",
           "python": true,
           "typescript": true,

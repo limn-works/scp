@@ -367,7 +367,7 @@ class InvalidGrant(val grant: UInt) : OutletProtocolError(
  */
 class StreamAlreadyClosed(message: String? = null) : OutletProtocolError(
     message = message ?: "stream has already terminated; control-plane methods rejected",
-    code = "SCP-TOOL-6102",
+    code = "SCP-TOOL-6101",
     slug = "protocol.stream-already-closed",
 )
 

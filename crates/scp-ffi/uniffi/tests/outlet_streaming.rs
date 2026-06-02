@@ -223,6 +223,7 @@ async fn open_rejects_empty_outlet_id_at_ffi_boundary() {
         None,
         None,
         Some(4u32),
+        None,
     )
     .await;
     let err = match result {
@@ -274,6 +275,7 @@ async fn invoke_stream_input_validation_layer_reachable() {
         None,
         None,
         Some(4u32),
+        None,
     )
     .await;
     let err = match result {

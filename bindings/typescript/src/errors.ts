@@ -860,7 +860,7 @@ export class InvalidGrant extends OutletProtocolError {
  */
 export class StreamAlreadyClosed extends OutletProtocolError {
   static override readonly scpClassTag: string = "StreamAlreadyClosed";
-  static override readonly defaultCode = "SCP-TOOL-6102";
+  static override readonly defaultCode = "SCP-TOOL-6101";
   constructor(message?: string) {
     super(
       message ?? "stream has already terminated; control-plane methods rejected",

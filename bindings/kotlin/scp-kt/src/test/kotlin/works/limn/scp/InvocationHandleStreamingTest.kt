@@ -131,7 +131,7 @@ class InvocationHandleStreamingTest {
         assertTrue(err is OutletProtocolError)
         assertTrue(err is OutletError)
         assertEquals(OutletErrorClass.PROTOCOL, err.classWire)
-        assertEquals("SCP-TOOL-6102", err.code)
+        assertEquals("SCP-TOOL-6101", err.code)
         assertEquals("protocol.stream-already-closed", err.slug)
     }
 

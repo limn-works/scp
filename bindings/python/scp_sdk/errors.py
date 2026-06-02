@@ -817,12 +817,12 @@ class StreamAlreadyClosed(OutletProtocolError):
     protocol-class violation uniformly across SDKs.
     """
 
-    _default_code = "SCP-TOOL-6102"
+    _default_code = "SCP-TOOL-6101"
 
     def __init__(self, message: str | None = None) -> None:
         super().__init__(
             message=message or "stream has already terminated; control-plane methods rejected",
-            code="SCP-TOOL-6102",
+            code="SCP-TOOL-6101",
             slug="protocol.stream-already-closed",
             retry=RetryPolicy.never(),
         )

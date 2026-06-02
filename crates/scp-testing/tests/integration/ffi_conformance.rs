@@ -1273,3 +1273,144 @@ fn min_parity_operations_comment_references_real_deletion() {
          'economy_evaluate_relay_cost'"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SCP-OUT N-wave structural invariants (ADR-006 / ADR-049 §4 / §5.4.5)
+//
+// These are ADDITIVE assertions over the three native streaming bridges'
+// source text. They mechanically pin the N1–N5 remediation so a future edit
+// that re-introduces a raw-key export, an economy sentinel, an un-validated
+// request_id, or a parse-error leak fails CI rather than slipping through.
+// ---------------------------------------------------------------------------
+
+/// The three native streaming bridges' `outlet_stream.rs` source text, paired
+/// with a human-readable bridge label for assertion messages.
+const fn native_stream_sources() -> [(&'static str, &'static str); 3] {
+    [
+        ("PyO3", PYO3_OUTLET_STREAM),
+        ("NAPI", NAPI_OUTLET_STREAM),
+        ("UniFFI", UNIFFI_OUTLET_STREAM),
+    ]
+}
+
+/// N1 — no native streaming bridge may export a raw Ed25519 signing key for
+/// the stream path. ADR-006: private keys never cross the FFI boundary; the
+/// operator signs through a custody-backed `CustodyStreamSigner`. The
+/// `export_*_signing_key` custody methods still exist for the governance
+/// lifecycle, but they MUST NOT appear in the streaming bridge source.
+#[test]
+fn native_stream_bridges_never_export_signing_key() {
+    for (bridge, src) in native_stream_sources() {
+        assert!(
+            !src.contains("export_ed25519_signing_key"),
+            "{bridge} outlet_stream.rs must not export a raw signing key \
+             (ADR-006); operator signing routes through CustodyStreamSigner"
+        );
+        assert!(
+            !src.contains("export_signing_key"),
+            "{bridge} outlet_stream.rs must not call a signing-key export \
+             helper (ADR-006)"
+        );
+        // The custody-backed signer MUST be present and wired into the open
+        // path's OpenStreamParams.
+        assert!(
+            src.contains("CustodyStreamSigner"),
+            "{bridge} outlet_stream.rs must define/use CustodyStreamSigner"
+        );
+        assert!(
+            src.contains("operator_signer"),
+            "{bridge} outlet_stream.rs must set OpenStreamParams.operator_signer"
+        );
+        assert!(
+            !src.contains("operator_signing_key"),
+            "{bridge} outlet_stream.rs must not reference the removed \
+             operator_signing_key field"
+        );
+    }
+}
+
+/// N2 — cancel routes through the atomic `apply_outlet_cancel_signed`
+/// primitive (the runtime derives + signs the cursor internally). The
+/// TOCTOU-prone `current_next_emission_seq` read + `apply_outlet_cancel`
+/// verbatim-apply pair MUST NOT appear in any native streaming bridge.
+#[test]
+fn native_stream_bridges_route_cancel_through_signed_primitive() {
+    for (bridge, src) in native_stream_sources() {
+        assert!(
+            src.contains("apply_outlet_cancel_signed"),
+            "{bridge} outlet_stream.rs must route cancel through \
+             apply_outlet_cancel_signed (N2)"
+        );
+        assert!(
+            !src.contains("current_next_emission_seq"),
+            "{bridge} outlet_stream.rs must not read the live cursor at the \
+             FFI boundary — the runtime derives next_seq internally (N2 TOCTOU)"
+        );
+        // The bridge must construct the runtime CancelIdentity it passes in.
+        assert!(
+            src.contains("CancelIdentity"),
+            "{bridge} outlet_stream.rs must build a CancelIdentity for the \
+             signed cancel primitive (N2)"
+        );
+    }
+}
+
+/// N3 — the §19 economy sentinels are gone: no `u64::MAX` available-balance
+/// and no `Amount::new(0)` literal threaded as `cost_per_chunk` in the open
+/// path. The real values come from `registration.cost` and the runtime
+/// `outlet_stream_member_balance` query.
+#[test]
+fn native_stream_bridges_have_no_economy_sentinels() {
+    for (bridge, src) in native_stream_sources() {
+        assert!(
+            !src.contains("Amount::new(u64::MAX)"),
+            "{bridge} outlet_stream.rs must not pass the u64::MAX \
+             available-balance sentinel (N3) — wire MemberBudgetTracker"
+        );
+        assert!(
+            src.contains("outlet_stream_member_balance"),
+            "{bridge} outlet_stream.rs must query the real member balance \
+             via outlet_stream_member_balance (N3)"
+        );
+    }
+}
+
+/// N4 — every native streaming bridge calls the shared
+/// `validate_request_id_hex` at the FFI boundary (in `lookup_entry`) so a
+/// malformed request_id is rejected before it is used as a registry key or
+/// interpolated into any message. This is a real call, not a dead `let _`.
+#[test]
+fn native_stream_bridges_validate_request_id_hex() {
+    for (bridge, src) in native_stream_sources() {
+        assert!(
+            src.contains("validate_request_id_hex(request_id_hex)"),
+            "{bridge} outlet_stream.rs must CALL validate_request_id_hex on \
+             the request_id_hex argument in lookup_entry (N4) — not a dead \
+             reference"
+        );
+    }
+}
+
+/// N5 — the parse sites in the pure helpers no longer interpolate the serde
+/// Display of attacker-supplied input (ADR-049 §4). The scrubbed sites must
+/// not carry the pre-N5 leaking format strings.
+#[test]
+fn native_stream_bridges_scrub_parse_error_leaks() {
+    for (bridge, src) in native_stream_sources() {
+        assert!(
+            !src.contains("malformed chunk JSON: {e}"),
+            "{bridge} outlet_stream.rs must not echo the serde Display for a \
+             malformed chunk JSON (N5 / ADR-049 §4)"
+        );
+        assert!(
+            !src.contains("invalid effective_caveats JSON: {e}"),
+            "{bridge} outlet_stream.rs must not echo the serde Display for \
+             malformed effective_caveats JSON (N5 / ADR-049 §4)"
+        );
+        assert!(
+            !src.contains("failed to parse ucan_token for cid: {e}"),
+            "{bridge} outlet_stream.rs must not echo the parse-error Display \
+             for the open-path UCAN cid parse (N5 / ADR-049 §4)"
+        );
+    }
+}

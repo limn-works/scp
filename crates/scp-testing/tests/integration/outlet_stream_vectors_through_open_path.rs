@@ -94,9 +94,7 @@ use scp_protocol::context::outlets::error_codes::{
     CODE_EXECUTION_CREDIT, CODE_EXECUTION_CREDIT_STALL, CODE_EXECUTION_FAULT,
     SLUG_EXECUTION_CREDIT_STALL, SLUG_EXECUTION_STREAM_GAP,
 };
-use scp_protocol::context::outlets::stream::{
-    ChunkPayload, OutletStreamCancel, OutletStreamChunk, sign_cancel,
-};
+use scp_protocol::context::outlets::stream::{ChunkPayload, OutletStreamChunk};
 use scp_runtime::context::outlets::dispatch::OpenStreamParams;
 use scp_runtime::context::outlets::invoke::{
     MutableInvocation, OutletExecutor, OutletExecutorError, ReadOnlyInvocation,
@@ -647,7 +645,15 @@ fn build_open_stream_params(open: &OpenSpec) -> OpenStreamParams {
         credit_window: open.credit_window,
         caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
         invoker_pk: invoker_signing.verifying_key(),
-        operator_signing_key: std::sync::Arc::new(operator_signing),
+        // ADR-049 round 8: the runtime signs chunks through a `StreamSigner`
+        // trait object, not a raw `Arc<SigningKey>`. This through-open-path
+        // test runs entirely in-process (no custody / no FFI), so it wraps
+        // the synthetic operator key in the `testing`-gated
+        // `InProcessStreamSigner` — the in-process analogue of the native
+        // bridges' `CustodyStreamSigner`.
+        operator_signer: std::sync::Arc::new(
+            scp_runtime::context::outlets::signer::InProcessStreamSigner::new(operator_signing),
+        ),
         // Use a very short stall for the credit_exhaustion vector so
         // the framework's stall timer fires within the test runtime.
         stream_credit_stall_secs: open.stream_credit_stall_secs.min(2),
@@ -764,10 +770,10 @@ async fn drive_vector(vector: &StreamVector) -> Vec<OutletStreamChunk> {
         .await
         .expect("vector replay: open_outlet_stream must succeed for fixture-backed vectors");
 
-    // Snapshot request_id BEFORE detaching the receiver so the
-    // cancellation-vector path can sign an `OutletStreamCancel`
-    // bound to it.
-    let request_id = *session_handle.request_id();
+    // ADR-049 round 8: the cancel path is `apply_outlet_cancel_signed`,
+    // which derives `next_seq` from the handle's own live cursor and uses
+    // the handle's pinned `request_id` — the caller no longer snapshots or
+    // supplies the request_id.
     let mut rx = session_handle
         .receiver()
         .expect("freshly opened session has receiver");
@@ -789,25 +795,28 @@ async fn drive_vector(vector: &StreamVector) -> Vec<OutletStreamChunk> {
                 break;
             }
             if seq == after_sequence {
-                // Build and sign an OutletStreamCancel bound to the
-                // session's request_id under the invoker signing key
-                // pinned by `OpenStreamParams.invoker_pk`.
-                let inputs = scp_protocol::context::outlets::stream::CancelSigningInputs {
-                    context_id: vector.open.context_id.as_str(),
-                    outlet_id: vector.open.outlet_id.as_str(),
-                    request_id: &request_id,
-                    next_seq: seq + 1,
-                    caveats_binding: &[0u8; 32],
-                };
-                let sig = sign_cancel(&harness.invoker_signing, &inputs);
-                let cancel_msg = OutletStreamCancel {
-                    request_id,
-                    next_seq: seq + 1,
-                    sig,
+                // ADR-049 round 8: route the cancel through the atomic
+                // `apply_outlet_cancel_signed` primitive. The bridge contract
+                // is that the caller supplies only the pinned identity triple
+                // ([`CancelIdentity`]) + a signer over the invoker key; the
+                // runtime reads its own live emission cursor, signs the
+                // `SCP-OUTLET-CANCEL-V1:` preimage over THAT cursor, and
+                // records the cancel-ack at the cursor it signed. This test
+                // wraps the harness's invoker signing key in the in-process
+                // signer (the analogue of the bridges' `CustodyStreamSigner`).
+                let invoker_signer =
+                    scp_runtime::context::outlets::signer::InProcessStreamSigner::new(
+                        harness.invoker_signing.clone(),
+                    );
+                let identity = scp_runtime::context::outlets::dispatch::CancelIdentity {
+                    context_id: vector.open.context_id.clone(),
+                    outlet_id: vector.open.outlet_id.clone(),
+                    caveats_binding: [0u8; 32],
                 };
                 session_handle
-                    .apply_outlet_cancel(&cancel_msg)
-                    .expect("vector replay: apply_outlet_cancel must accept signed cancel");
+                    .apply_outlet_cancel_signed(&invoker_signer, &identity)
+                    .await
+                    .expect("vector replay: apply_outlet_cancel_signed must accept the cancel");
             }
         }
         // Drain any trailing chunks the pump emitted after we broke.

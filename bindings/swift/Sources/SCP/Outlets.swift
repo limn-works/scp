@@ -185,7 +185,7 @@ public enum OutletError: Error, Sendable, Equatable {
     public static func streamAlreadyClosed(message: String? = nil) -> OutletError {
         let envelope = OutletEnvelope(
             classWire: .protocol,
-            code: "SCP-TOOL-6102",
+            code: "SCP-TOOL-6101",
             slug: "protocol.stream-already-closed",
             message: message ?? "stream has already terminated; control-plane methods rejected",
             retry: .never,
