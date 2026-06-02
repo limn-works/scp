@@ -2430,7 +2430,6 @@ impl TransportManager {
     /// Returns `ScpError::Transport` if the URL is invalid or the connection
     /// fails.
     pub fn add_relay(self: Arc<Self>, relay_url: String) -> Result<u32, ScpError> {
-        use scp_transport::native::adapter::NativeRelayAdapter;
         use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
         validate_relay_url(&relay_url)?;
@@ -2442,24 +2441,30 @@ impl TransportManager {
             url: relay_url.clone(),
             source: RelayUrlSource::Explicit,
         };
-        // Cover traffic auto-starts per adapter via `connect_sourced` with a
-        // profile — `finalize_connection` launches the cover traffic background
-        // task based on the profile's tier (#1532 AC6).
+        // Route through the instance-scoped transport selector for transparent
+        // QUIC↔WebSocket selection (spec §10.14.3 item 4; ADR-037). The
+        // discovering variant reads the relay's advertised transports from
+        // `.well-known/scp` (spec §10.5.1) at connect time to enable QUIC,
+        // failing open to WebSocket when discovery is unavailable. Cover traffic
+        // auto-starts per adapter via the profile inside `finalize_connection`
+        // (#1532 AC6). The selector surfaces the suppression receiver (drained
+        // into reliability scoring, #1533 AC5). Mirrors the PyO3 reference
+        // bridge's `transport_add_relay`.
         let profile = scp_transport::profile::TransportProfile::platform_default();
-        let mut adapter = rt
-            .block_on(async { NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await })
+        let selector = self.bi.core.transport_selector();
+        let (adapter, suppression_rx) = rt
+            .block_on(async {
+                selector
+                    .select_and_connect_discovering_with_suppression(&sourced, Some(&profile))
+                    .await
+            })
             .map_err(ScpError::from)?;
-
-        // Extract the suppression event receiver BEFORE moving the adapter
-        // into the TransportManager. The spawned task drains suppression
-        // events and downgrades the relay's reliability score (#1533 AC5).
-        let suppression_rx = adapter.take_suppression_receiver();
 
         let count = self
             .bi
             .core
             .with_transport_mut(|mgr| {
-                let _eviction = mgr.add_adapter(Box::new(adapter));
+                let _eviction = mgr.add_adapter(adapter);
                 #[allow(clippy::cast_possible_truncation)] // Bounded by connection budget.
                 let count = mgr.adapter_count() as u32;
                 count
@@ -2578,9 +2583,23 @@ impl Drop for TransportManager {
 /// The bridge instance is captured as a [`std::sync::Weak`], not an `Arc`.
 /// Holding an `Arc<UniffiBridgeInstance>` here would keep the instance
 /// alive forever because this task is spawned on the shared tokio runtime
-/// (`tokio::spawn(...)`) and is NOT enrolled in the per-instance
+/// (`crate::runtime().spawn(...)`) and is NOT enrolled in the per-instance
 /// [`JoinSet`](scp_ffi_common::bridge_instance::CoreFields::task_handle)
 /// that `emergency_cancel_tasks` aborts.
+///
+/// # Runtime context (must spawn on the shared runtime handle)
+///
+/// This is spawned via `crate::runtime().spawn(...)` — the shared
+/// `&'static tokio::runtime::Runtime` handle — NOT a bare
+/// `tokio::spawn(...)`. The sole sync caller, `TransportManager::add_relay`,
+/// is a sync `#[uniffi::export]` method, which `UniFFI` runs on the foreign
+/// caller thread with NO ambient tokio runtime entered. After
+/// `add_relay`'s internal `runtime().block_on(...)` returns, the runtime
+/// context is gone, so a bare `tokio::spawn(...)` would panic ("there is no
+/// reactor running"). Spawning through the runtime handle works regardless
+/// of ambient context. This mirrors the `PyO3` reference bridge's
+/// `spawn_suppression_scoring_task` (`crates/scp-ffi/src/transport.rs`),
+/// which uses `rt.spawn(...)` for the same reason.
 ///
 /// Without a `Weak`, dropping the last `Arc<UniffiBridgeInstance>` from
 /// the caller side would not actually drop the instance: the task body
@@ -2600,7 +2619,10 @@ fn spawn_suppression_scoring_task(
     mut rx: tokio::sync::mpsc::Receiver<scp_transport::heartbeat::SuppressionSuspected>,
     relay_url: String,
 ) {
-    tokio::spawn(async move {
+    // Spawn on the shared runtime handle, not a bare `tokio::spawn`: the sync
+    // `TransportManager::add_relay` caller runs outside any tokio runtime
+    // context (see this fn's doc comment), so a bare spawn would panic.
+    crate::runtime().spawn(async move {
         loop {
             let suppression = tokio::select! {
                 () = cancel_token.cancelled() => {
@@ -11624,7 +11646,6 @@ impl Scp {
         &self,
         relay_url: String,
     ) -> Result<Arc<TransportManager>, ScpError> {
-        use scp_transport::native::adapter::NativeRelayAdapter;
         use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
         validate_relay_url(&relay_url)?;
@@ -11637,25 +11658,33 @@ impl Scp {
                     source: RelayUrlSource::Explicit,
                 };
 
-                // Establish a real WebSocket connection to the relay. Cover
-                // traffic auto-starts per adapter via `connect_sourced` with
-                // a profile — `finalize_connection` launches the cover
-                // traffic background task based on the profile's tier.
+                // Route through the instance-scoped transport selector for
+                // transparent QUIC↔WebSocket selection (spec §10.14.3 item 4;
+                // ADR-037). The discovering variant fetches the relay's
+                // advertised transports from `.well-known/scp` (spec §10.5.1)
+                // at connect time and feeds that list into the
+                // QUIC-vs-WebSocket decision — failing open to WebSocket when
+                // the relay serves no well-known. The selector is owned by the
+                // bridge instance so its per-relay QUIC-suppression and
+                // well-known caches survive across connects. Cover traffic
+                // auto-starts per adapter via the profile inside
+                // `finalize_connection`. The selector surfaces the suppression
+                // receiver (drained into reliability scoring). Mirrors the PyO3
+                // reference bridge's `transport_connect`.
                 let profile = scp_transport::profile::TransportProfile::platform_default();
-                let mut adapter = NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
+                let selector = bi.core.transport_selector();
+                let (adapter, suppression_rx) = selector
+                    .select_and_connect_discovering_with_suppression(&sourced, Some(&profile))
                     .await
                     .map_err(ScpError::from)?;
 
-                // Extract the suppression event receiver BEFORE moving the
-                // adapter into the TransportManager. The spawned task drains
-                // suppression events and downgrades the relay's reliability
-                // score.
-                let suppression_rx = adapter.take_suppression_receiver();
-
-                // Wrap the adapter in a real TransportManager for multi-relay
-                // support (ADR-012). The manager provides relay set
+                // Wrap the selected adapter in a real TransportManager for
+                // multi-relay support (ADR-012). The manager provides relay set
                 // assignment, reliability scoring, and suppression detection.
-                let manager = scp_transport::TransportManager::new(Box::new(adapter));
+                // The selector returns a `Box<dyn TransportAdapter>`; the
+                // blanket `impl TransportAdapter for Box<dyn TransportAdapter>`
+                // lets it be used where a concrete adapter is expected.
+                let manager = scp_transport::TransportManager::new(adapter);
 
                 // Install the manager on THIS instance's CoreFields — not on
                 // the process-wide DEFAULT_BRIDGE_INSTANCE.
@@ -11828,13 +11857,20 @@ impl Scp {
         };
 
         let profile = scp_transport::profile::TransportProfile::platform_default();
-        let adapter =
-            scp_transport::native::NativeRelayAdapter::connect_sourced(&sourced, Some(&profile))
-                .await
-                .map_err(|e| ScpError::Transport {
-                    msg: format!("failed to connect to relay '{relay_url}': {e}"),
-                    code: codes::TRANS_5001.to_owned(),
-                })?;
+        // Route through the instance-scoped transport selector for transparent
+        // QUIC↔WebSocket selection (spec §10.14.3 item 4; ADR-037). The
+        // discovering variant reads the relay's advertised transports from
+        // `.well-known/scp` (spec §10.5.1) at connect time to enable QUIC,
+        // failing open to WebSocket when discovery is unavailable. Mirrors the
+        // PyO3 reference bridge's `configure_relay_transport`.
+        let selector = self.inner.core.transport_selector();
+        let adapter = selector
+            .select_and_connect_discovering(&sourced, Some(&profile))
+            .await
+            .map_err(|e| ScpError::Transport {
+                msg: format!("failed to connect to relay '{relay_url}': {e}"),
+                code: codes::TRANS_5001.to_owned(),
+            })?;
 
         self.inner
             .init_context_manager_with_relay_transport(&local_did, adapter);
@@ -16074,5 +16110,119 @@ mod tests {
     fn non_pre_rotation_identity_errors_keep_generic_envelope() {
         let err: ScpError = scp_identity::IdentityError::InvalidDidFormat("bad".into()).into();
         assert_eq!(pre_rotation_code_of(err), codes::IDENT_1001);
+    }
+
+    // -----------------------------------------------------------------------
+    // Selector routing — connect sites must go through the instance selector
+    // (cross-SDK QUIC selection). The in-memory relay serves no
+    // `.well-known/scp`, so the selector's discovering connect fails open to
+    // WebSocket and still succeeds. These tests prove each uniffi connect site
+    // routes through `self.inner.core.transport_selector()` rather than dialing
+    // `NativeRelayAdapter::connect_sourced` directly.
+    //
+    // Driven via `runtime().block_on(...)` from sync `#[test]` fns because the
+    // bridge methods spawn / block on the bridge's own static runtime; a
+    // `#[tokio::test]` would nest runtimes and panic.
+    // -----------------------------------------------------------------------
+
+    /// `Scp::transport_connect` must route through the instance selector and
+    /// connect via WebSocket fallback against a relay that advertises no QUIC.
+    #[cfg(feature = "server")]
+    #[test]
+    fn transport_connect_routes_through_selector_ws_fallback() {
+        let scp = crate::scp::Scp::new();
+        // An in-memory relay serves no `.well-known/scp`; QUIC is never
+        // advertised, so a selector-routed connect must fail open to WS.
+        let relay = runtime()
+            .block_on(scp.relay_start_in_memory())
+            .expect("in-memory relay must start");
+        let relay_url = relay.relay_url();
+
+        let handle = runtime()
+            .block_on(scp.transport_connect(relay_url))
+            .expect("selector-routed connect to a no-QUIC relay must succeed via WS fallback");
+
+        assert!(
+            handle.is_connected(),
+            "handle must report connected after selector-routed connect"
+        );
+        assert_eq!(handle.adapter_count(), 1);
+
+        relay.shutdown();
+    }
+
+    /// `TransportManager::add_relay` must route through the instance selector
+    /// and add a second WS-fallback adapter to the manager.
+    #[cfg(feature = "server")]
+    #[test]
+    fn add_relay_routes_through_selector_ws_fallback() {
+        let scp = crate::scp::Scp::new();
+        let relay = runtime()
+            .block_on(scp.relay_start_in_memory())
+            .expect("in-memory relay must start");
+        let relay_url = relay.relay_url();
+
+        let handle = runtime()
+            .block_on(scp.transport_connect(relay_url.clone()))
+            .expect("initial selector-routed connect must succeed");
+        assert_eq!(handle.adapter_count(), 1);
+
+        // Invoke `add_relay` exactly as production does: it is a SYNC
+        // `#[uniffi::export]` method, which UniFFI runs on the foreign caller
+        // thread with NO ambient tokio runtime entered. Call it from a plain
+        // `std::thread` that never enters/spawns on a runtime, so this test
+        // genuinely exercises the sync production path. `add_relay` drives its
+        // own connect via the bridge's static `runtime().block_on(...)` and
+        // then spawns the suppression-scoring task on that same runtime handle.
+        //
+        // This is the regression guard for the suppression task's spawn: if it
+        // reverts to a bare `tokio::spawn(...)`, that spawn runs after
+        // `block_on` returns (when the runtime context is gone) and panics
+        // ("there is no reactor running"), failing this test. The prior
+        // `spawn_blocking` wrapper hid that panic by providing a runtime
+        // context the real sync export never has.
+        let add_handle = Arc::clone(&handle);
+        let count = std::thread::spawn(move || add_handle.add_relay(relay_url))
+            .join()
+            .expect("add_relay thread must not panic — a panic here means the suppression task spawned without a runtime context")
+            .expect("selector-routed add_relay to a no-QUIC relay must succeed via WS fallback");
+        assert_eq!(
+            count, 2,
+            "second selector-routed adapter must be registered in the manager"
+        );
+
+        relay.shutdown();
+    }
+
+    /// `Scp::configure_relay_transport` must route through the instance selector
+    /// and install a `RelayTransportProvider` over the WS-fallback adapter.
+    #[cfg(feature = "server")]
+    #[test]
+    fn configure_relay_transport_routes_through_selector_ws_fallback() {
+        let scp = crate::scp::Scp::new();
+        let relay = runtime()
+            .block_on(scp.relay_start_in_memory())
+            .expect("in-memory relay must start");
+        let relay_url = relay.relay_url();
+
+        runtime()
+            .block_on(
+                scp.configure_relay_transport(
+                    relay_url,
+                    "did:dht:z6MkTestConfigureRelay".to_owned(),
+                ),
+            )
+            .expect(
+                "selector-routed configure_relay_transport to a no-QUIC relay must succeed via \
+                 WS fallback and install a ContextManager",
+            );
+
+        assert!(
+            scp.inner.core.has_context_manager(),
+            "ContextManager must be attached after configure_relay_transport routes through \
+             the selector"
+        );
+
+        relay.shutdown();
     }
 }

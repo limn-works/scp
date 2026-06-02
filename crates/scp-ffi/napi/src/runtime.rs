@@ -848,7 +848,7 @@ pub fn init_context_manager_with_local_transport(bi: &NapiBridgeInstance, local_
 pub fn init_context_manager_with_relay_transport(
     bi: &NapiBridgeInstance,
     local_did: &str,
-    adapter: scp_transport::native::adapter::NativeRelayAdapter,
+    adapter: Box<dyn scp_transport::TransportAdapter>,
 ) {
     if bi.core.has_context_manager() {
         tracing::warn!(
