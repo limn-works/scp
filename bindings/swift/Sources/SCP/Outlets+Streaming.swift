@@ -89,6 +89,7 @@ extension Context {
         proofTokens: [String]? = nil,
         creditWindow: UInt32? = nil,
         estimatedChunkCount: UInt32? = nil,
+        spendingUcanJwt: String? = nil,
         subscriber: OutletStreamSubscriber
     ) async throws -> String {
         try await outletInvokeStreamWithSubscriber(
@@ -102,6 +103,7 @@ extension Context {
             proofTokens: proofTokens,
             creditWindow: creditWindow,
             estimatedChunkCount: estimatedChunkCount,
+            spendingUcan: spendingUcanJwt,
             subscriber: subscriber
         )
     }

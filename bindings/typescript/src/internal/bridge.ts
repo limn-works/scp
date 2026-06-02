@@ -359,6 +359,13 @@ export interface Bridge {
    * `Symbol.asyncIterator` (the napi-rs `#[napi]` macro does not expose
    * Symbol-keyed methods directly, so the iterator-protocol shim lives
    * in the SDK).
+   *
+   * `spendingUcan` is optional and may be omitted or `undefined`. When
+   * supplied it is a JWT-encoded spending-capability UCAN (§19.5) that
+   * AND-composes the streaming escrow's available balance against the
+   * spending UCAN's `max_per_action`. `undefined` is the no-spending
+   * default (Query / zero-cost outlets). WASM has no economy layer
+   * (ADR-034) and ignores the parameter.
    */
   contextOutletInvokeStream(
     handle: BridgeContextHandle,
@@ -371,6 +378,7 @@ export interface Bridge {
     proofTokens?: readonly string[],
     creditWindow?: number,
     estimatedChunkCount?: number,
+    spendingUcan?: string,
   ): Promise<BridgeOutletInvocationStream>;
 
   /**

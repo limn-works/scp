@@ -1222,6 +1222,7 @@ export class OutletNamespace {
               proofTokens,
               creditWindow,
               estimatedChunkCount,
+              spendingUcan,
             );
             // Resolve the request-id promise before we start pumping
             // chunks — control-plane methods that raced to grantCredit

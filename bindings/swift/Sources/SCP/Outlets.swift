@@ -1108,6 +1108,7 @@ public actor OutletNamespace {
                 proofTokens: proofTokens,
                 creditWindow: creditWindow,
                 estimatedChunkCount: estimatedChunkCount,
+                spendingUcanJwt: spendingUcanJwt,
                 aggregateSchemaJson: aggregateSchemaJson
             )
         }
@@ -1174,6 +1175,7 @@ public actor OutletNamespace {
         proofTokens: [String]?,
         creditWindow: UInt32?,
         estimatedChunkCount: UInt32?,
+        spendingUcanJwt: String?,
         aggregateSchemaJson: String?,
         ucanRecheckSecs: UInt32 = 10
     ) -> InvocationHandle {
@@ -1197,7 +1199,8 @@ public actor OutletNamespace {
                         streamEpoch: streamEpoch,
                         proofTokens: proofTokens,
                         creditWindow: creditWindow,
-                        estimatedChunkCount: estimatedChunkCount
+                        estimatedChunkCount: estimatedChunkCount,
+                        spendingUcan: spendingUcanJwt
                     )
                     let recheckTask = makeRevocationRecheckTask(
                         contextHandle: handle,

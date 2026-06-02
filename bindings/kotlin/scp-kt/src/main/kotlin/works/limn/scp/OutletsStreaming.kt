@@ -460,6 +460,10 @@ internal data class StreamChunkSource(
  * @param creditWindow Initial credit-window size; defaults to §5.4.5
  *   `DEFAULT_CREDIT_WINDOW` when `null`.
  * @param estimatedChunkCount Optional upper bound on billable chunks.
+ * @param spendingUcan Optional JWT-encoded spending-capability UCAN
+ *   (§19.5) that AND-composes the streaming escrow's available balance
+ *   against the spending UCAN's `max_per_action`. `null` for the
+ *   no-spending default (Query / zero-cost outlets).
  * @return An [OutletStreamFlow] ready for `.asFlow().collect { }`.
  *   Use [OutletStreamFlow.grantCredit] / [OutletStreamFlow.cancel] to
  *   manage flow.
@@ -481,6 +485,7 @@ suspend fun openOutletStreamSession(
     proofTokens: List<String>? = null,
     creditWindow: UInt? = null,
     estimatedChunkCount: UInt? = null,
+    spendingUcan: String? = null,
 ): OutletStreamFlow {
     val raw = ffiOutletInvokeStream(
         handle = contextHandle,
@@ -493,6 +498,7 @@ suspend fun openOutletStreamSession(
         proofTokens = proofTokens,
         creditWindow = creditWindow,
         estimatedChunkCount = estimatedChunkCount,
+        spendingUcan = spendingUcan,
     )
     return OutletStreamFlow(raw, invokerDid = identity.did())
 }
@@ -516,6 +522,7 @@ suspend fun openOutletStreamSessionWithSubscriber(
     proofTokens: List<String>? = null,
     creditWindow: UInt? = null,
     estimatedChunkCount: UInt? = null,
+    spendingUcan: String? = null,
     subscriber: OutletStreamSubscriber,
 ): String = ffiOutletInvokeStreamWithSubscriber(
     handle = contextHandle,
@@ -528,6 +535,7 @@ suspend fun openOutletStreamSessionWithSubscriber(
     proofTokens = proofTokens,
     creditWindow = creditWindow,
     estimatedChunkCount = estimatedChunkCount,
+    spendingUcan = spendingUcan,
     subscriber = subscriber,
 )
 

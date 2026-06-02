@@ -921,6 +921,7 @@ export function createNativeBridge(): Bridge {
       proofTokens?: readonly string[],
       creditWindow?: number,
       estimatedChunkCount?: number,
+      spendingUcan?: string,
     ): Promise<BridgeOutletInvocationStream> {
       return await (
         addon.contextOutletInvokeStream as (
@@ -934,6 +935,7 @@ export function createNativeBridge(): Bridge {
           pt: readonly string[] | undefined,
           cw: number | undefined,
           ecc: number | undefined,
+          su: string | undefined,
         ) => Promise<BridgeOutletInvocationStream>
       )(
         handle,
@@ -946,6 +948,7 @@ export function createNativeBridge(): Bridge {
         proofTokens,
         creditWindow,
         estimatedChunkCount,
+        spendingUcan,
       );
     },
 

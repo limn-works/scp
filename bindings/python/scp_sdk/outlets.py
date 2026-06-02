@@ -1286,6 +1286,7 @@ class OutletNamespace:
                 proof_tokens=proof_tokens,
                 credit_window=credit_window,
                 estimated_chunk_count=estimated_chunk_count,
+                spending_ucan=spending_ucan,
                 aggregate_schema=aggregate_schema,
                 ucan_recheck_secs=ucan_recheck_secs,
             )
@@ -1388,6 +1389,7 @@ class OutletNamespace:
         proof_tokens: list[str] | None,
         credit_window: int | None,
         estimated_chunk_count: int | None,
+        spending_ucan: str | None,
         aggregate_schema: dict[str, Any] | None,
         ucan_recheck_secs: int = 10,
     ) -> InvocationHandle:
@@ -1431,6 +1433,7 @@ class OutletNamespace:
                 proof_tokens,
                 credit_window,
                 estimated_chunk_count,
+                spending_ucan,
             )
         except Exception as exc:
             raise _translate_bridge_error(exc) from exc

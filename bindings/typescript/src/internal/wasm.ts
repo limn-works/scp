@@ -73,6 +73,35 @@ function wasmTerminateReasonCode(reason: TerminateReasonSlug): number {
   }
 }
 
+/**
+ * Resolves the hosting `WasmContextHandle` for an open stream's
+ * `requestIdHex` from the per-bridge map populated at
+ * `contextOutletInvokeStream`.
+ *
+ * SCP-OUT-037 W2: the WASM streaming registry is keyed by
+ * `(context_id, request_id_hex)`, so the control-plane exports require
+ * the context. The unified `Bridge` interface does not pass it (the NAPI
+ * registry needs only `request_id`), so the wasm bridge carries the
+ * mapping itself. A missing entry means the `request_id` does not match
+ * any active stream this bridge instance opened — surfaced as the same
+ * `protocol.unknown-session` (`SCP-TOOL-6101`) the WASM export raises for
+ * an unknown `(context, request_id)` pair, so SDK callers see one
+ * consistent error regardless of where the lookup fails.
+ */
+function requireStreamContext(
+  streamContexts: ReadonlyMap<string, BridgeContextHandle>,
+  requestIdHex: string,
+): BridgeContextHandle {
+  const context = streamContexts.get(requestIdHex);
+  if (context === undefined) {
+    throw new OutletError(
+      `no active stream for request_id ${requestIdHex} (protocol.unknown-session)`,
+      "SCP-TOOL-6101",
+    );
+  }
+  return context;
+}
+
 import { safeJsonParse } from "./json-utils";
 
 // ---------------------------------------------------------------------------
@@ -203,12 +232,18 @@ interface WasmModule {
     estimatedChunkCount: number | undefined,
   ) => Promise<WasmOutletInvocationStream>;
   outletStreamGrantCredit: (
+    context: BridgeContextHandle,
     requestIdHex: string,
     callerDid: string,
     grant: number,
   ) => Promise<number>;
-  outletStreamCancel: (requestIdHex: string, callerDid: string) => Promise<number | null>;
+  outletStreamCancel: (
+    context: BridgeContextHandle,
+    requestIdHex: string,
+    callerDid: string,
+  ) => Promise<number | null>;
   outletStreamTerminate: (
+    context: BridgeContextHandle,
     requestIdHex: string,
     callerDid: string,
     reason: number,
@@ -811,6 +846,21 @@ function rethrowEconomyFailClosed(error: unknown): unknown {
  * Creates a `Bridge` implementation backed by the wasm-bindgen WASM module.
  */
 export function createWasmBridge(): Bridge {
+  // SCP-OUT-037 W2 — the WASM streaming registry is keyed by
+  // `(context_id, request_id_hex)`, so the control-plane exports
+  // (`outletStreamGrantCredit` / `outletStreamCancel` /
+  // `outletStreamTerminate`) require the hosting `WasmContextHandle` as
+  // their first argument. The unified `Bridge` interface, however, only
+  // carries `requestIdHex` on those methods (the NAPI registry is keyed
+  // by `request_id` alone, so it needs no context). This per-instance
+  // map bridges that gap: `contextOutletInvokeStream` records the open
+  // stream's `request_id_hex -> WasmContextHandle` here, and the
+  // control-plane methods look it up to supply `context` to the WASM
+  // export. Entries are evicted when the stream reaches a terminal
+  // chunk, is cancelled to completion, or is terminated. It is a
+  // closure-local `const` (one map per `createWasmBridge()` call —
+  // matching the per-instance Rust registry), never a module global.
+  const streamContexts = new Map<string, BridgeContextHandle>();
   return {
     // Identity
     async identityCreate(custody: string): Promise<BridgeIdentityHandle> {
@@ -1530,6 +1580,12 @@ export function createWasmBridge(): Bridge {
       proofTokens?: readonly string[],
       creditWindow?: number,
       estimatedChunkCount?: number,
+      // ADR-034: the WASM bridge has no economy/escrow layer, so the
+      // §19.5 spending-UCAN AND-composition does not apply. The unified
+      // `Bridge` interface carries the parameter for the native bridges;
+      // the WASM path accepts and ignores it (the WASM `outletInvokeStream`
+      // export does not declare it).
+      _spendingUcan?: string,
     ): Promise<BridgeOutletInvocationStream> {
       const wasm = getWasm();
       const native = await wasm.outletInvokeStream(
@@ -1544,18 +1600,39 @@ export function createWasmBridge(): Bridge {
         creditWindow,
         estimatedChunkCount,
       );
+      // SCP-OUT-037 W2 — record the hosting context so the control-plane
+      // methods (which the unified `Bridge` interface does not pass a
+      // context to) can supply it to the `(context_id, request_id_hex)`-
+      // keyed WASM registry. Evicted on terminal chunk below, or in
+      // `outletStreamCancel` / `outletStreamTerminate` when those drive
+      // the stream to completion.
+      const ridHex = native.requestId;
+      streamContexts.set(ridHex, handle);
       // Wrap the wasm-bindgen class in the Bridge-shaped iterator. The
       // wasm-bindgen class already returns chunks in the
       // `BridgeOutletStreamChunk` shape (built in `chunk_to_js` on the
       // Rust side), so the wrapper is a thin pass-through.
       return {
-        requestId: native.requestId,
+        requestId: ridHex,
         async next(): Promise<BridgeOutletStreamChunk | null> {
           const raw = await native.next();
           if (raw === null || raw === undefined) {
+            // End of stream — drop the context mapping so a long-lived
+            // bridge does not accumulate handles for closed streams.
+            streamContexts.delete(ridHex);
             return null;
           }
-          return raw as BridgeOutletStreamChunk;
+          const chunk = raw as BridgeOutletStreamChunk;
+          // Terminal chunk (End / terminal Error) — evict eagerly so the
+          // mapping is gone before the consumer's next `next()` returns
+          // `null`. Idempotent with the `null`-branch delete above.
+          if (
+            chunk.payloadType === "end" ||
+            (chunk.payloadType === "error" && chunk.terminal === true)
+          ) {
+            streamContexts.delete(ridHex);
+          }
+          return chunk;
         },
       };
     },
@@ -1566,12 +1643,19 @@ export function createWasmBridge(): Bridge {
       grant: number,
     ): Promise<number> {
       const wasm = getWasm();
-      return await wasm.outletStreamGrantCredit(requestIdHex, callerDid, grant);
+      const context = requireStreamContext(streamContexts, requestIdHex);
+      return await wasm.outletStreamGrantCredit(context, requestIdHex, callerDid, grant);
     },
 
     async outletStreamCancel(requestIdHex: string, callerDid: string): Promise<number | null> {
       const wasm = getWasm();
-      return await wasm.outletStreamCancel(requestIdHex, callerDid);
+      const context = requireStreamContext(streamContexts, requestIdHex);
+      const recorded = await wasm.outletStreamCancel(context, requestIdHex, callerDid);
+      // A cancel that drives the stream to completion makes the context
+      // mapping unreachable from the pump's terminal branch in some
+      // races; drop it here too (idempotent).
+      streamContexts.delete(requestIdHex);
+      return recorded;
     },
 
     async outletStreamTerminate(
@@ -1588,7 +1672,16 @@ export function createWasmBridge(): Bridge {
       // `crates/scp-ffi/wasm/src/outlet_stream.rs`).
       const reasonCode = wasmTerminateReasonCode(reason);
       const wasm = getWasm();
-      await wasm.outletStreamTerminate(requestIdHex, callerDid, reasonCode, messageOverride);
+      const context = requireStreamContext(streamContexts, requestIdHex);
+      await wasm.outletStreamTerminate(
+        context,
+        requestIdHex,
+        callerDid,
+        reasonCode,
+        messageOverride,
+      );
+      // Terminate closes the stream; drop the context mapping.
+      streamContexts.delete(requestIdHex);
     },
 
     async verifyChunkSignature(

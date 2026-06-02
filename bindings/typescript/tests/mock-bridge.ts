@@ -644,6 +644,7 @@ export function createMockBridge(): Bridge & {
       _proofTokens?: readonly string[],
       _creditWindow?: number,
       _estimatedChunkCount?: number,
+      _spendingUcan?: string,
     ): Promise<BridgeOutletInvocationStream> {
       throw new Error(
         "[SCP-TOOL-6020] streaming outlet invocation is not implemented in the mock bridge",
