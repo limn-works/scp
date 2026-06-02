@@ -150,12 +150,13 @@ def _make_scp_without_attestation_methods(*, missing: tuple[str, ...]) -> MagicM
     mock_scp = MagicMock()
     # Start with every attestation method present, then drop the ones
     # under test so hasattr() returns False for them specifically.
+    # py_verify_identity_link_attestation moved to a module-level free fn
+    # under ADR-048 §1 — no longer probed via hasattr on self._native.
     all_methods = {
         "create_identity_link_attestation",
         "identity_link_attestations",
         "remove_identity_link_attestation",
         "identity_renew_attestation",
-        "py_verify_identity_link_attestation",
     }
     present = tuple(all_methods - set(missing))
     mock_scp._native = MagicMock(spec=present)

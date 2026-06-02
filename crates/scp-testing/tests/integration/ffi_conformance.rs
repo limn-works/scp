@@ -144,7 +144,6 @@ struct BridgeExemptions {
 struct ExemptionEntry {
     canonical: String,
     #[serde(default)]
-    #[allow(dead_code)]
     reason: String,
 }
 
@@ -447,6 +446,167 @@ impl<'ast> Visit<'ast> for FnCollector {
     }
 }
 
+// ---------------------------------------------------------------------------
+// FFI-EXPORTED scanner (strict): collects only `pub fn` definitions decorated
+// with a per-bridge FFI export macro on the fn itself OR on its enclosing
+// impl block. This is the scanner the alias-resolution path uses: an alias
+// only "resolves" if the named fn is actually exported through the bridge's
+// binding tooling, not merely defined in source.
+//
+// The looser `FnCollector` above stays in place for the cfg(test) drift
+// fixtures (which test the cfg-gate semantics in isolation). Two scanners
+// with two purposes — do not collapse.
+//
+// The macros recognized are the ones each bridge's binding tool consumes:
+//
+//   • PyO3:  free `pub fn` decorated `#[pyfunction]`,
+//            method inside `#[pymethods] impl <T> { ... }`.
+//   • NAPI:  free `pub fn` decorated `#[napi]` / `#[napi(...)]`,
+//            method inside `#[napi] impl <T> { ... }` (or `#[napi(...)]`).
+//   • UniFFI: free `pub fn` decorated `#[uniffi::export]` / `#[uniffi::export(...)]`,
+//             method inside `#[uniffi::export] impl <T> { ... }` (or `#[uniffi::export(...)]`).
+//   • WASM:   free `pub fn` decorated `#[wasm_bindgen]` / `#[wasm_bindgen(...)]`,
+//             method inside `#[wasm_bindgen] impl <T> { ... }` (or `#[wasm_bindgen(...)]`).
+//
+// Visibility rule: NOT enforced. The FFI macro is the export marker — every
+// SCP bridge tool (PyO3, NAPI, UniFFI, wasm-bindgen) accepts the macro on
+// any visibility (pub, pub(crate), naked fn). PyO3 even has many real
+// examples of `#[pyfunction] fn name(...)` without `pub` — see
+// `runtime_is_initialized` / `version` / `shutdown_runtime` in
+// `crates/scp-ffi/src/lib.rs`. Visibility controls Rust-internal access; the
+// macro generates a separate language-callable wrapper that exports
+// regardless. The phantom-alias attack surface this PR closes is "alias
+// resolves to a fn the binding tooling does NOT process" — i.e. a fn missing
+// the macro entirely. Adding a `pub` requirement on top would create false
+// positives without adding security.
+// ---------------------------------------------------------------------------
+
+/// Returns true if `attrs` carries a free-fn-level FFI export macro
+/// (`#[pyfunction]`, `#[napi]`, `#[wasm_bindgen]`, `#[uniffi::export]`,
+/// or any of those with parenthesized arguments).
+fn attrs_have_free_fn_ffi_export(attrs: &[syn::Attribute]) -> bool {
+    for attr in attrs {
+        let path = attr.path();
+        if let Some(ident) = path.get_ident()
+            && matches!(
+                ident.to_string().as_str(),
+                "pyfunction" | "napi" | "wasm_bindgen"
+            )
+        {
+            return true;
+        }
+        if path.segments.len() == 2
+            && path.segments[0].ident == "uniffi"
+            && path.segments[1].ident == "export"
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns true if `attrs` carries an impl-block-level FFI export macro
+/// (`#[pymethods]`, `#[napi]`, `#[wasm_bindgen]`, `#[uniffi::export]`).
+/// Matches `#[napi]`, `#[napi(...)]`, etc. uniformly.
+fn attrs_have_impl_block_ffi_export(attrs: &[syn::Attribute]) -> bool {
+    for attr in attrs {
+        let path = attr.path();
+        if let Some(ident) = path.get_ident()
+            && matches!(
+                ident.to_string().as_str(),
+                "pymethods" | "napi" | "wasm_bindgen"
+            )
+        {
+            return true;
+        }
+        if path.segments.len() == 2
+            && path.segments[0].ident == "uniffi"
+            && path.segments[1].ident == "export"
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Strict scanner: collects every fn name a bridge's binding tool would
+/// actually export. See module-level docs above for the export rules.
+fn collect_ffi_exported_fns(source: &str) -> HashSet<String> {
+    let file = match syn::parse_file(source) {
+        Ok(f) => f,
+        Err(err) => panic!(
+            "ffi_conformance: syn failed to parse bridge source: {err}. \
+             Refusing to enforce with a degraded scanner."
+        ),
+    };
+    let mut v = FfiFnCollector {
+        names: HashSet::new(),
+        impl_decorated_stack: Vec::new(),
+    };
+    v.visit_file(&file);
+    v.names
+}
+
+struct FfiFnCollector {
+    names: HashSet<String>,
+    /// Stack of "is enclosing `impl` block FFI-decorated?" flags. Pushed in
+    /// `visit_item_impl`, popped after recursion. Nested impls are not a
+    /// real Rust pattern but the stack costs nothing and keeps the scanner
+    /// composable.
+    impl_decorated_stack: Vec<bool>,
+}
+
+impl<'ast> Visit<'ast> for FfiFnCollector {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if attrs_contain_cfg_test(&node.attrs) {
+            return;
+        }
+        if !attrs_have_free_fn_ffi_export(&node.attrs) {
+            return;
+        }
+        self.names.insert(node.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, node);
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if attrs_contain_cfg_test(&node.attrs) {
+            return;
+        }
+        let impl_decorated = self.impl_decorated_stack.last().copied().unwrap_or(false);
+        // Either the impl carries the FFI macro (the common case for
+        // `#[pymethods] impl ...` / `#[napi] impl ...`) OR the method itself
+        // does (rare but legal — e.g. an individual `#[uniffi::export]`
+        // method inside an undecorated impl block).
+        let fn_decorated = attrs_have_free_fn_ffi_export(&node.attrs);
+        if !impl_decorated && !fn_decorated {
+            return;
+        }
+        self.names.insert(node.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, node);
+    }
+
+    fn visit_item_trait(&mut self, _node: &'ast syn::ItemTrait) {
+        // Trait method signatures are not exports.
+    }
+
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if attrs_contain_cfg_test(&node.attrs) {
+            return;
+        }
+        syn::visit::visit_item_mod(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if attrs_contain_cfg_test(&node.attrs) {
+            return;
+        }
+        let decorated = attrs_have_impl_block_ffi_export(&node.attrs);
+        self.impl_decorated_stack.push(decorated);
+        syn::visit::visit_item_impl(self, node);
+        self.impl_decorated_stack.pop();
+    }
+}
+
 /// Cache key for `FnSetCache`. `(ptr, len)` keys the parsed set against the
 /// identity of a `&'static str` — see `fns_of_source` for rationale.
 type FnSetCacheKey = (usize, usize);
@@ -454,9 +614,10 @@ type FnSetCacheKey = (usize, usize);
 /// Process-wide cache of parsed fn-name sets, keyed by `FnSetCacheKey`.
 type FnSetCache = Mutex<HashMap<FnSetCacheKey, &'static HashSet<String>>>;
 
-/// Returns a cached `HashSet<String>` of function-definition names for the
-/// given source. Keyed by `(ptr, len)` of the `&'static str` so each
-/// `include_str!`-ed bridge file is parsed exactly once per test process.
+/// Returns a cached `HashSet<String>` of FFI-exported function names for the
+/// given source — the names a bridge's binding tool would actually expose.
+/// Keyed by `(ptr, len)` of the `&'static str` so each `include_str!`-ed
+/// bridge file is parsed exactly once per test process.
 ///
 /// Invariant note: every `include_str!(...)` produces a distinct static byte
 /// slice with a unique pointer — but in theory a rustc string-constant-merging
@@ -467,6 +628,10 @@ type FnSetCache = Mutex<HashMap<FnSetCacheKey, &'static HashSet<String>>>;
 /// degenerate case: two distinct sources with identical bytes share a cache
 /// entry (correct: they parse to the same fn set), and the rare case of two
 /// DIFFERENT sources sharing a pointer is impossible when lengths differ.
+///
+/// Backed by the STRICT scanner (`collect_ffi_exported_fns`) — see its
+/// module-level docs above for the export-detection rules. The looser
+/// `collect_defined_fns` continues to exist for the cfg(test)-gate fixtures.
 fn fns_of_source(source: &'static str) -> &'static HashSet<String> {
     static CACHE: OnceLock<FnSetCache> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
@@ -479,12 +644,17 @@ fn fns_of_source(source: &'static str) -> &'static HashSet<String> {
         }
     }
     // Slow path: parse, leak to get a 'static reference, insert.
-    let parsed: &'static HashSet<String> = Box::leak(Box::new(collect_defined_fns(source)));
+    let parsed: &'static HashSet<String> = Box::leak(Box::new(collect_ffi_exported_fns(source)));
     let mut guard = cache.lock().expect("fns_of_source cache mutex");
     // Another thread may have inserted between the two lock acquisitions.
     guard.entry(key).or_insert(parsed)
 }
 
+/// Resolves an alias name against a single bridge source — STRICT semantics.
+/// Returns true iff `source` defines `name` AS AN FFI-EXPORTED FUNCTION:
+/// `pub fn` decorated with the bridge's export macro (free-fn form), OR a
+/// method inside a `#[pymethods]` / `#[napi]` / `#[uniffi::export]` /
+/// `#[wasm_bindgen]` impl block.
 fn source_has_fn(source: &'static str, name: &str) -> bool {
     fns_of_source(source).contains(name)
 }
@@ -826,6 +996,216 @@ fn napi_bridge_covers_core_operations() {
          implemented but still listed as exempt): {stale_exemptions:?}. \
          Remove them from exemptions.napi."
     );
+}
+
+/// Returns true iff `reason` cites a DURABLE provenance artifact: an ADR
+/// (`ADR-NNN`), a spec section (`§N…`), or a PRD story (`SCP-NNN`). Issue /
+/// PR numbers are deliberately NOT accepted — they are ephemeral and project
+/// policy forbids issue references in tracked source/data. An exemption is a
+/// permanent statement that an operation is intentionally absent from a
+/// bridge; it must point at the artifact that justifies the absence, not at a
+/// mutable ticket or a hand-wave like "known gap".
+fn cites_durable_provenance(reason: &str) -> bool {
+    // `prefix` immediately followed by an ASCII digit (e.g. `ADR-0`, `SCP-2`,
+    // `§9`). `§` is a 2-byte UTF-8 char, so `i + prefix.len()` lands on a char
+    // boundary and the slice is safe.
+    let has_numbered = |prefix: &str| {
+        reason.match_indices(prefix).any(|(i, _)| {
+            reason[i + prefix.len()..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_digit())
+        })
+    };
+    has_numbered("ADR-") || has_numbered("SCP-") || has_numbered("§")
+}
+
+/// Extracts every `{prefix}NNN` token cited in `text` (maximal digit run after
+/// each `prefix`). `cited_tokens("per ADR-034", "ADR-")` yields `["ADR-034"]`,
+/// never the prefix `ADR-03` — the maximal run is what makes the existence
+/// check reject a fabricated `ADR-3` that happens to be a prefix of a real
+/// `ADR-34`. `prefix` is ASCII here (`ADR-` / `SCP-`), so `i + prefix.len()`
+/// lands on a char boundary and the slice is safe.
+fn cited_tokens(text: &str, prefix: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for (i, _) in text.match_indices(prefix) {
+        let digits: String = text[i + prefix.len()..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        if !digits.is_empty() {
+            out.push(format!("{prefix}{digits}"));
+        }
+    }
+    out
+}
+
+/// The set of `{prefix}NNN` tokens that actually EXIST under `rel_dir`, read
+/// once. ADRs are filed both as standalone `ADR-NNN-*.md` and as headings
+/// inside `phase-N.md`; PRD stories are scattered across `.docs/prds/*.json` —
+/// in both cases the reliable existence signal is the set of tokens appearing
+/// anywhere in the corpus. This turns the exemption gate from "cites something
+/// ADR-/SCP-shaped" into "cites a REAL artifact": a fabricated `ADR-999` /
+/// `SCP-9999` no longer satisfies the gate.
+fn prefixed_tokens_under(rel_dir: &str, prefix: &str) -> BTreeSet<String> {
+    let dir = workspace_root().join(rel_dir);
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    let mut set = BTreeSet::new();
+    for entry in entries {
+        let path = entry.expect("doc dir entry").path();
+        if path.is_file() {
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            set.extend(cited_tokens(&text, prefix));
+        }
+    }
+    assert!(
+        !set.is_empty(),
+        "no {prefix}NNN tokens found under {} — the provenance existence \
+         check cannot function; has the directory moved?",
+        dir.display()
+    );
+    set
+}
+
+/// `ADR-NNN` tokens that exist under `.docs/adrs/`.
+fn adrs_in_repo() -> &'static BTreeSet<String> {
+    static CELL: OnceLock<BTreeSet<String>> = OnceLock::new();
+    CELL.get_or_init(|| prefixed_tokens_under(".docs/adrs", "ADR-"))
+}
+
+/// `SCP-NNN` PRD-story tokens that exist under `.docs/prds/`.
+fn scp_stories_in_repo() -> &'static BTreeSet<String> {
+    static CELL: OnceLock<BTreeSet<String>> = OnceLock::new();
+    CELL.get_or_init(|| prefixed_tokens_under(".docs/prds", "SCP-"))
+}
+
+/// Every per-bridge exemption MUST justify itself by citing a durable
+/// provenance artifact (ADR / spec section / PRD story). This closes the
+/// hole where an exemption could be added with an unsubstantiated reason
+/// ("not yet implemented", "known gap") that silently suppresses a real
+/// parity finding forever. The exemption is the override for the
+/// coverage gate — so the override itself must trace to an artifact, per the
+/// project's provenance-everywhere tenet.
+#[test]
+fn every_exemption_reason_cites_durable_provenance() {
+    let file = aliases();
+    let mut offenders: Vec<String> = Vec::new();
+    for (bridge, entries) in [
+        ("pyo3", &file.exemptions.pyo3),
+        ("uniffi", &file.exemptions.uniffi),
+        ("napi", &file.exemptions.napi),
+        ("wasm", &file.exemptions.wasm),
+    ] {
+        for entry in entries {
+            if !cites_durable_provenance(&entry.reason) {
+                offenders.push(format!(
+                    "{bridge}/{}: reason {:?} cites no ADR-/§/SCP- artifact",
+                    entry.canonical, entry.reason
+                ));
+                continue;
+            }
+            // Shape is necessary but not sufficient: a cited ADR or SCP story
+            // must EXIST. This rejects a fabricated `ADR-999` / `SCP-9999`
+            // reason that would otherwise pass the shape check and silently
+            // substantiate a bogus exemption forever. Both `.docs/adrs/` and
+            // `.docs/prds/` are token-greppable, so both synonyms are closed.
+            // Spec `§` sections remain shape-only — section numbers like
+            // `§9.16` are not a single greppable token against the multi-file
+            // spec — but a reason citing only a bare `§` cannot lean on the
+            // ADR/SCP synonyms to dodge existence verification.
+            let fabricated_adrs: Vec<String> = cited_tokens(&entry.reason, "ADR-")
+                .into_iter()
+                .filter(|t| !adrs_in_repo().contains(t))
+                .collect();
+            let fabricated_stories: Vec<String> = cited_tokens(&entry.reason, "SCP-")
+                .into_iter()
+                .filter(|t| !scp_stories_in_repo().contains(t))
+                .collect();
+            if !fabricated_adrs.is_empty() {
+                offenders.push(format!(
+                    "{bridge}/{}: reason {:?} cites non-existent ADR(s) {:?} \
+                     (no matching file/heading under .docs/adrs/)",
+                    entry.canonical, entry.reason, fabricated_adrs
+                ));
+            }
+            if !fabricated_stories.is_empty() {
+                offenders.push(format!(
+                    "{bridge}/{}: reason {:?} cites non-existent PRD story(s) \
+                     {:?} (no matching SCP-NNN under .docs/prds/)",
+                    entry.canonical, entry.reason, fabricated_stories
+                ));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "bridge-aliases.json exemption(s) lack durable provenance \
+         (cite a REAL ADR-NNN, spec §section, or SCP-NNN story — not an issue \
+         number, not a hand-wave, not a fabricated ADR/story): {offenders:#?}"
+    );
+}
+
+#[test]
+fn provenance_detector_accepts_durable_artifacts() {
+    assert!(cites_durable_provenance(
+        "WASM lacks the tokio runtime per ADR-034"
+    ));
+    assert!(cites_durable_provenance(
+        "Sender-side key layer, separate from MLS (spec §9.16)"
+    ));
+    assert!(cites_durable_provenance(
+        "Tracked by PRD story SCP-214 criterion 10"
+    ));
+}
+
+#[test]
+fn provenance_detector_rejects_hand_waves_and_issue_refs() {
+    // Hand-wave with no artifact.
+    assert!(!cites_durable_provenance("not yet exported (known gap)"));
+    // Issue / PR numbers are ephemeral and policy-forbidden — not provenance.
+    assert!(!cites_durable_provenance("see issue #1543 and PR #1735"));
+    // Bare prefix with no number must not pass.
+    assert!(!cites_durable_provenance("documented in an ADR- somewhere"));
+    assert!(!cites_durable_provenance("see § for details"));
+    assert!(!cites_durable_provenance(""));
+}
+
+#[test]
+fn cited_tokens_extracts_maximal_digit_runs() {
+    assert_eq!(
+        cited_tokens("per ADR-034 and ADR-3", "ADR-"),
+        ["ADR-034", "ADR-3"]
+    );
+    assert_eq!(cited_tokens("tracked by SCP-214", "SCP-"), ["SCP-214"]);
+    assert_eq!(cited_tokens("no token here", "ADR-"), Vec::<String>::new());
+    // Prefix with no trailing digit yields nothing.
+    assert_eq!(
+        cited_tokens("an ADR- without a number", "ADR-"),
+        Vec::<String>::new()
+    );
+}
+
+/// The existence check backing the exemption gate: a real artifact is present
+/// in its corpus; a fabricated one is not. This is what makes the gate reject
+/// shape-valid-but-bogus reasons like "WASM gap, see ADR-999" / "see SCP-9999".
+#[test]
+fn provenance_existence_distinguishes_real_from_fabricated() {
+    let adrs = adrs_in_repo();
+    // ADR-048 is this very document; ADR-034 governs WASM constraints and is
+    // cited by every current wasm exemption — both must be present.
+    assert!(adrs.contains("ADR-048"), "ADR-048 should exist in corpus");
+    assert!(adrs.contains("ADR-034"), "ADR-034 should exist in corpus");
+    // A fabricated ADR must NOT be present (the prefix `ADR-9` of a real ADR
+    // must not produce a false positive either — maximal-run extraction).
+    assert!(!adrs.contains("ADR-999"), "ADR-999 must not exist");
+
+    let stories = scp_stories_in_repo();
+    assert!(
+        stories.contains("SCP-214"),
+        "SCP-214 should exist in corpus"
+    );
+    assert!(!stories.contains("SCP-9999"), "SCP-9999 must not exist");
 }
 
 /// WASM bridge has intentionally fewer operations per ADR-034.
@@ -1439,23 +1819,14 @@ fn aliases_json_is_in_sync_with_parity_operations() {
             .collect::<Vec<_>>()
     );
 
-    // 5. Every canonical op must have at least one alias per bridge
-    //    (even if the bridge is exempt in the JSON's exemption list — the
-    //    alias the script would search for must still be documented).
-    for op in &file.operations {
-        for (bridge_name, aliases) in [
-            ("pyo3", &op.pyo3),
-            ("uniffi", &op.uniffi),
-            ("napi", &op.napi),
-            ("wasm", &op.wasm),
-        ] {
-            assert!(
-                !aliases.is_empty(),
-                "canonical {} has no aliases for bridge {bridge_name}",
-                op.canonical
-            );
-        }
-    }
+    // 5. Every canonical op's per-bridge alias array is either non-empty
+    //    (the alias the script searches for) OR the canonical is in the
+    //    bridge's exemption list with a documented reason. The combined
+    //    invariant is enforced by `every_bridge_alias_array_is_non_empty_or_exempt`,
+    //    which runs as its own test and gives a complete (op, bridge) report
+    //    on violation rather than panicking on the first one. We delegate to
+    //    that test here rather than re-running the same loop with a weaker
+    //    error message.
 }
 
 /// Every alias declared in `bridge-aliases.json` must EITHER resolve to a
@@ -1543,6 +1914,79 @@ fn every_alias_resolves_to_a_real_fn_or_exemption() {
          the canonical is not exempted:\n  {}",
         phantom.len(),
         phantom.join("\n  ")
+    );
+}
+
+/// Guards the cleanup pass that emptied placeholder alias arrays for
+/// operations a bridge has been excused from implementing. Every per-bridge
+/// alias array in `scripts/bridge-aliases.json` must be either:
+///
+///   • non-empty (real impl is expected to exist in source — verified by
+///     `every_alias_resolves_to_a_real_fn_or_exemption`), OR
+///   • empty AND the canonical is in `exemptions[bridge]` (intentionally
+///     not implemented in that bridge).
+///
+/// Empty arrays without an exemption are a phantom: they declare "no aliases"
+/// for a bridge that nominally must support the op. The opposite (non-empty
+/// arrays + exemption) is also redundant — exemption already says the bridge
+/// does not need to implement, so a non-empty alias is either a stale
+/// placeholder or a stale exemption. Both are flagged.
+///
+/// Companion to `every_alias_resolves_to_a_real_fn_or_exemption`: that test
+/// verifies the *content* of non-empty arrays resolves to real fns; this test
+/// verifies the *presence* of every (op, bridge) pair as either non-empty or
+/// exempt, with no in-between placeholder state.
+#[test]
+fn every_bridge_alias_array_is_non_empty_or_exempt() {
+    let file = aliases();
+    let pyo3_exempt = exemptions_for("pyo3");
+    let uniffi_exempt = exemptions_for("uniffi");
+    let napi_exempt = exemptions_for("napi");
+    let wasm_exempt = exemptions_for("wasm");
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut redundant: Vec<String> = Vec::new();
+
+    for op in &file.operations {
+        // (bridge, alias_array, exempt_set)
+        let cells: [(&str, &[String], &BTreeSet<&'static str>); 4] = [
+            ("pyo3", op.pyo3.as_slice(), &pyo3_exempt),
+            ("uniffi", op.uniffi.as_slice(), &uniffi_exempt),
+            ("napi", op.napi.as_slice(), &napi_exempt),
+            ("wasm", op.wasm.as_slice(), &wasm_exempt),
+        ];
+        for (bridge, aliases, exempt) in cells {
+            let is_exempt = exempt.contains(op.canonical.as_str());
+            if aliases.is_empty() && !is_exempt {
+                violations.push(format!(
+                    "{}:{} has empty alias array but is not in exemptions.{}",
+                    bridge, op.canonical, bridge
+                ));
+            } else if !aliases.is_empty() && is_exempt {
+                redundant.push(format!(
+                    "{}:{} is in exemptions.{} but still declares aliases {:?} \
+                     — empty the array (preferred) or remove the exemption",
+                    bridge, op.canonical, bridge, aliases
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "bridge-aliases.json has {} (op, bridge) cell(s) with an empty alias \
+         array and no matching exemption — either declare an alias or add an \
+         exemption with a reason:\n  {}",
+        violations.len(),
+        violations.join("\n  ")
+    );
+    assert!(
+        redundant.is_empty(),
+        "bridge-aliases.json has {} (op, bridge) cell(s) listed as exempt \
+         but still carrying a non-empty alias placeholder — empty the array \
+         (cleanup) or remove the exemption (no longer accurate):\n  {}",
+        redundant.len(),
+        redundant.join("\n  ")
     );
 }
 
@@ -1795,4 +2239,759 @@ fn syn_scanner_excludes_cfg_test_above_cfg_attr() {
         "fn `test_only_fn` under `cfg(test)` + `cfg_attr(test, …)` is \
          test-only and must be excluded; collected: {fns:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Strict-scanner adversarial tests — guard against phantom aliases that
+// resolve to UNDECORATED fns (no FFI macro on either the fn or its enclosing
+// impl). The `every_alias_resolves_to_a_real_fn_or_exemption` test relies on
+// `collect_ffi_exported_fns` via the `fns_of_source` cache; these tests
+// exercise that scanner directly so a future weakening is caught at the
+// fixture level instead of as a coverage anomaly nobody investigates.
+// ---------------------------------------------------------------------------
+
+/// Free fn with no FFI macro must NOT be FFI-resolvable, even if `pub`.
+/// An attacker could declare `"napi": ["ghost_op"]` in `bridge-aliases.json`
+/// and define `pub fn ghost_op() {}` in `crates/scp-ffi/napi/src/` — the
+/// looser scanner would happily report the alias as resolved. The strict
+/// scanner refuses because the binding tool (napi-rs) never sees an
+/// undecorated fn.
+#[test]
+fn ffi_scanner_excludes_undecorated_pub_fn() {
+    const SRC: &str = r"
+        pub fn ghost_op() {}
+        pub(crate) fn another_ghost() {}
+        fn naked_ghost() {}
+    ";
+    let fns = collect_ffi_exported_fns(SRC);
+    for name in ["ghost_op", "another_ghost", "naked_ghost"] {
+        assert!(
+            !fns.contains(name),
+            "fn `{name}` has no FFI macro and must NOT be FFI-resolvable — \
+             collected: {fns:?}"
+        );
+    }
+}
+
+/// Method inside an undecorated `impl` block must NOT be FFI-resolvable,
+/// even with `pub` visibility. The phantom-alias adversary can otherwise
+/// add a method whose name matches the canonical alias, satisfying a naive
+/// scanner. The strict scanner requires the impl block to carry one of the
+/// FFI binding macros.
+#[test]
+fn ffi_scanner_excludes_method_in_undecorated_impl() {
+    const SRC: &str = r"
+        struct PyScp;
+        impl PyScp {
+            pub fn ghost_method(&self) {}
+        }
+    ";
+    let fns = collect_ffi_exported_fns(SRC);
+    assert!(
+        !fns.contains("ghost_method"),
+        "method inside undecorated impl block must not be FFI-resolvable — \
+         collected: {fns:?}"
+    );
+}
+
+/// Positive cases: the strict scanner MUST recognize every form of FFI
+/// decoration the SCP bridges actually use. If this test fails, the
+/// `attrs_have_*_ffi_export` allow-lists are too narrow and may have stopped
+/// detecting a real export pattern that landed in the codebase.
+#[test]
+fn ffi_scanner_recognizes_all_bridge_macros() {
+    const SRC: &str = r#"
+        // PyO3 free fn — no `pub` (real pattern in lib.rs)
+        #[pyfunction]
+        fn py_free_fn() {}
+
+        // PyO3 free fn — with `pub`
+        #[pyfunction]
+        pub fn py_free_fn_pub() {}
+
+        // PyO3 impl — pymethods
+        struct PyScp;
+        #[pymethods]
+        impl PyScp {
+            pub fn py_method(&self) {}
+        }
+
+        // NAPI free fn
+        #[napi]
+        pub fn napi_free_fn() {}
+
+        // NAPI free fn with args
+        #[napi(js_name = "napiNamed")]
+        pub fn napi_named_fn() {}
+
+        // NAPI impl
+        struct NapiScp;
+        #[napi]
+        impl NapiScp {
+            pub fn napi_method(&self) {}
+        }
+
+        // UniFFI free fn
+        #[uniffi::export]
+        pub fn uniffi_free_fn() {}
+
+        // UniFFI free fn with args
+        #[uniffi::export(async_runtime = "tokio")]
+        pub async fn uniffi_async_fn() {}
+
+        // UniFFI impl
+        struct UniffiScp;
+        #[uniffi::export]
+        impl UniffiScp {
+            pub fn uniffi_method(&self) {}
+        }
+
+        // WASM free fn
+        #[wasm_bindgen]
+        pub fn wasm_free_fn() {}
+
+        // WASM free fn with args
+        #[wasm_bindgen(js_name = "wasmNamed")]
+        pub fn wasm_named_fn() {}
+
+        // WASM impl
+        struct WasmScp;
+        #[wasm_bindgen]
+        impl WasmScp {
+            pub fn wasm_method(&self) {}
+        }
+    "#;
+    let fns = collect_ffi_exported_fns(SRC);
+    let expected = [
+        "py_free_fn",
+        "py_free_fn_pub",
+        "py_method",
+        "napi_free_fn",
+        "napi_named_fn",
+        "napi_method",
+        "uniffi_free_fn",
+        "uniffi_async_fn",
+        "uniffi_method",
+        "wasm_free_fn",
+        "wasm_named_fn",
+        "wasm_method",
+    ];
+    for name in expected {
+        assert!(
+            fns.contains(name),
+            "FFI scanner failed to detect `{name}` — at least one bridge \
+             macro form is no longer recognized. Collected: {fns:?}"
+        );
+    }
+}
+
+/// Reads the fixture file added in this PR which deliberately defines a
+/// `pub(crate) fn ghost_op` (no FFI macro) AND a regular `pub fn` named
+/// `widget_create_not_real` (also no macro). Neither must be FFI-resolvable.
+/// Pair of the `bad-alias-undecorated-fn` bash fixture — both scanners must
+/// fail on the same source to keep them in lockstep.
+#[test]
+fn ffi_scanner_rejects_undecorated_fixture() {
+    const FIXTURE: &str = include_str!(
+        "../../../../scripts/tests/bridge-symmetry/fixtures/\
+         bad-alias-undecorated-fn/crates/scp-ffi/napi/src/widgets.rs"
+    );
+    let fns = collect_ffi_exported_fns(FIXTURE);
+    assert!(
+        !fns.contains("ghost_op"),
+        "`pub(crate) fn ghost_op` (no FFI macro) was accepted by the strict \
+         scanner — this is the phantom-alias hole the strict scanner closes. \
+         Collected: {fns:?}"
+    );
+    assert!(
+        !fns.contains("widget_create_not_real"),
+        "undecorated `pub fn widget_create_not_real` was accepted by the \
+         strict scanner. Collected: {fns:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// PR-E #28: Mechanize ADR-048 §1 — pure protocol helpers stay free fns at the
+// FFI Rust layer.
+//
+// Background. ADR-048 §1 says: "pure protocol helpers stay free fns at FFI
+// Rust layer". The rule exists because a helper that takes `&self` but never
+// reads from the receiver is structurally bound to an instance for no reason:
+// it forces a `SCP` constructor call to invoke a pure validator, and it
+// inflates the FFI binding surface for every language wrapper that has to
+// generate per-instance method bindings instead of free-function bindings.
+//
+// Before PR-E this rule lived only in review. This test mechanizes it: scan
+// every `crates/scp-ffi/{src,napi/src,uniffi/src,wasm/src}/**/*.rs` impl
+// block; for each `&self` (or `&mut self` / `self`) method, walk the body
+// and the non-receiver signature parts. If the method body, its non-receiver
+// args, return type, generics, and where-clause never reference `self` or
+// `Self` (as an `Expr::Path`, `Type::Path`, `Pat::Path`, or `Pat::Struct`),
+// it is a pure helper bound to a receiver — flag.
+//
+// False-positive escape hatch. `scripts/pure-helpers-allowlist.txt` lists
+// (file-relative, fn-name) exemptions one per line, `#`-prefixed comments
+// allowed. Empty by default; exemptions are rare and require a documented
+// reason. The list is path-qualified to prevent a fn name in one bridge
+// from accidentally exempting a same-named fn in another bridge.
+//
+// Tests:
+//   * `pure_helpers_stay_free_fns_at_ffi_layer` — the production gate, scans
+//     all four bridges. Default policy: fail on any flagged method.
+//   * `pure_helpers_detector_recognizes_genuinely_bound_method` — positive
+//     test against a `self.field` example. Locks the detector.
+//   * `pure_helpers_detector_flags_genuinely_pure_method` — negative test
+//     against a `&self` method that never reads the receiver. Locks the
+//     detector against false negatives.
+// ---------------------------------------------------------------------------
+
+use std::path::{Path, PathBuf};
+
+/// Walks a directory recursively and yields every `.rs` file. No filtering
+/// of test files or generated code at this layer — the caller decides via
+/// the `#[cfg(test)]` skip inside the impl visitor.
+fn collect_rs_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Returns the workspace root computed from `CARGO_MANIFEST_DIR`.
+/// `scp-testing`'s manifest lives at `<workspace>/crates/scp-testing`, so the
+/// workspace root is two parents up. This is the same convention used by the
+/// other crate-root path computations in the SCP codebase.
+fn workspace_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
+/// Returns the absolute paths of the four FFI bridge source roots that
+/// ADR-048 §1 governs. `crates/scp-ffi/common/src/` is intentionally not
+/// included: it hosts shared bridge plumbing (BridgeInstance, validators),
+/// not bridge-exported surface, and its impl methods serve a different role
+/// (trait impls for cross-bridge composability) where the §1 rule does not
+/// straightforwardly apply.
+fn ffi_bridge_roots() -> Vec<PathBuf> {
+    let root = workspace_root();
+    vec![
+        root.join("crates/scp-ffi/src"),
+        root.join("crates/scp-ffi/napi/src"),
+        root.join("crates/scp-ffi/uniffi/src"),
+        root.join("crates/scp-ffi/wasm/src"),
+    ]
+}
+
+/// Loads `scripts/pure-helpers-allowlist.txt`. Each non-empty, non-`#` line
+/// is a workspace-relative path followed by `::` followed by the fn name —
+/// e.g. `crates/scp-ffi/src/runtime.rs::with_state`. The path qualifier is
+/// required: a fn name alone could match across bridges and exempt code the
+/// authors did not intend.
+fn load_pure_helpers_allowlist() -> HashSet<String> {
+    let path = workspace_root().join("scripts/pure-helpers-allowlist.txt");
+    let mut out = HashSet::new();
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return out;
+    };
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        out.insert(line.to_owned());
+    }
+    out
+}
+
+/// Returns true if the receiver is `&self`, `&mut self`, `self`, or
+/// `self: Self`. All forms bind the method to an instance, all are subject
+/// to the §1 rule.
+fn impl_method_has_self_receiver(method: &syn::ImplItemFn) -> bool {
+    method
+        .sig
+        .inputs
+        .first()
+        .is_some_and(|arg| matches!(arg, syn::FnArg::Receiver(_)))
+}
+
+/// Returns true if any part of `method`'s body, non-receiver signature,
+/// return type, generics, or where-clause references the identifier `self`
+/// or `Self`. Receiver-only references (e.g. `&self` in the signature
+/// itself) do NOT count — every &self method has those by definition. Only
+/// USES of the receiver count as binding.
+fn method_uses_self_outside_receiver(method: &syn::ImplItemFn) -> bool {
+    let mut scanner = SelfRefScanner { found: false };
+
+    syn::visit::Visit::visit_block(&mut scanner, &method.block);
+    if scanner.found {
+        return true;
+    }
+
+    for arg in method.sig.inputs.iter().skip(1) {
+        if let syn::FnArg::Typed(pt) = arg {
+            syn::visit::Visit::visit_type(&mut scanner, &pt.ty);
+            if scanner.found {
+                return true;
+            }
+        }
+    }
+    if let syn::ReturnType::Type(_, ty) = &method.sig.output {
+        syn::visit::Visit::visit_type(&mut scanner, ty);
+        if scanner.found {
+            return true;
+        }
+    }
+    syn::visit::Visit::visit_generics(&mut scanner, &method.sig.generics);
+    scanner.found
+}
+
+struct SelfRefScanner {
+    found: bool,
+}
+
+fn path_starts_with_self_or_self_kw(path: &syn::Path) -> bool {
+    path.segments
+        .first()
+        .is_some_and(|seg| seg.ident == "self" || seg.ident == "Self")
+}
+
+impl<'ast> syn::visit::Visit<'ast> for SelfRefScanner {
+    fn visit_expr_path(&mut self, p: &'ast syn::ExprPath) {
+        if path_starts_with_self_or_self_kw(&p.path) {
+            self.found = true;
+        }
+        syn::visit::visit_expr_path(self, p);
+    }
+    fn visit_type_path(&mut self, t: &'ast syn::TypePath) {
+        if path_starts_with_self_or_self_kw(&t.path) {
+            self.found = true;
+        }
+        syn::visit::visit_type_path(self, t);
+    }
+    /// Catches `Pat::Path(PatPath { path: Self, ... })` and
+    /// `Pat::Struct(PatStruct { path: Self, ... })` uniformly. `syn::visit`
+    /// has dedicated `visit_pat_struct` / `visit_pat_tuple_struct` overrides
+    /// but not a separate `visit_pat_path`, so we match on the enum here and
+    /// fall through to the default visitor so nested patterns still recurse.
+    fn visit_pat(&mut self, p: &'ast syn::Pat) {
+        match p {
+            syn::Pat::Path(pp) if path_starts_with_self_or_self_kw(&pp.path) => {
+                self.found = true;
+            }
+            syn::Pat::Struct(ps) if path_starts_with_self_or_self_kw(&ps.path) => {
+                self.found = true;
+            }
+            syn::Pat::TupleStruct(pts) if path_starts_with_self_or_self_kw(&pts.path) => {
+                self.found = true;
+            }
+            _ => {}
+        }
+        syn::visit::visit_pat(self, p);
+    }
+    /// Macros (`format!`, `println!`, `bail!`, `tracing::error!`, `vec!`,
+    /// …) carry an unparsed `TokenStream`. `syn::visit` does NOT descend into
+    /// macro tokens — they were not parsed as expressions, so the AST has
+    /// no expression nodes to visit. Without this override, a method like
+    /// `fn __repr__(&self) -> String { format!("X({})", self.field) }` would
+    /// look bound-free to the scanner because `self.field` lives inside the
+    /// macro's opaque tokens. Walk the token stream byte-by-byte looking
+    /// for the `self` / `Self` identifier — sufficient because both are
+    /// keywords and cannot appear as unrelated substrings.
+    ///
+    /// **Known limitation — identifier-splitting macros.** Macros that
+    /// CONSTRUCT the `self` / `Self` ident from sub-tokens evade this
+    /// walker: `paste::paste!([<se lf>])`, `concat_idents!(se, lf)` (nightly),
+    /// custom proc-macros that emit `Ident::new("self", ...)` programmatically.
+    /// Any such macro inside the body would let an undecorated method pass
+    /// even though it never reads from the receiver. SCP bridge code does
+    /// not currently use these macros; if you reach for one in a `&self`
+    /// method, prefer making the method a free fn (per ADR-048 §1) over
+    /// rebinding the scanner's blindspot. Strengthening this scanner to
+    /// expand recognised expression macros and reject everything else is
+    /// tracked as a future hardening if the codebase ever adopts a macro
+    /// in this shape.
+    fn visit_macro(&mut self, m: &'ast syn::Macro) {
+        if tokens_have_self_or_self_kw(m.tokens.clone()) {
+            self.found = true;
+        }
+        syn::visit::visit_macro(self, m);
+    }
+}
+
+/// Walks a `proc_macro2::TokenStream` recursively looking for the identifier
+/// `self` or `Self`. Used by the macro-body fallback in `SelfRefScanner`.
+/// proc_macro2 is a transitive dep of syn so no extra Cargo entry is needed.
+fn tokens_have_self_or_self_kw(stream: proc_macro2::TokenStream) -> bool {
+    for tree in stream {
+        match tree {
+            proc_macro2::TokenTree::Ident(ident) => {
+                let s = ident.to_string();
+                if s == "self" || s == "Self" {
+                    return true;
+                }
+            }
+            proc_macro2::TokenTree::Group(group) if tokens_have_self_or_self_kw(group.stream()) => {
+                return true;
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+#[derive(Debug)]
+struct PureHelperViolation {
+    file_rel: String,
+    method_name: String,
+}
+
+/// Walks all FFI bridge sources and collects every impl method that has
+/// a `self` receiver but never references `self` / `Self` in its body,
+/// non-receiver signature parts, or generics. These are pure helpers
+/// wrongly bound to an instance — ADR-048 §1 mandates they be free fns.
+fn scan_pure_helpers() -> Vec<PureHelperViolation> {
+    let workspace = workspace_root();
+    let allowlist = load_pure_helpers_allowlist();
+    let mut violations = Vec::new();
+
+    for bridge_root in ffi_bridge_roots() {
+        let mut files = Vec::new();
+        collect_rs_files(&bridge_root, &mut files);
+        for file_path in files {
+            let Ok(src) = std::fs::read_to_string(&file_path) else {
+                continue;
+            };
+            let parsed = match syn::parse_file(&src) {
+                Ok(f) => f,
+                Err(err) => panic!(
+                    "pure-helpers scanner: syn parse failed for \
+                     {} — {err}",
+                    file_path.display()
+                ),
+            };
+            let rel = file_path
+                .strip_prefix(&workspace)
+                .unwrap_or(&file_path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            scan_items_for_pure_helpers(&parsed.items, &rel, &allowlist, &mut violations);
+        }
+    }
+    violations
+}
+
+/// Recursive worker for [`scan_pure_helpers`]. Flags pure-helper §1 violations
+/// in FFI-exported inherent impls and DESCENDS INTO inline `mod { … }` blocks,
+/// so a decorated impl nested in a module is not missed. The module recursion
+/// matches the strict alias scanner's `visit_item_mod`, keeping the two
+/// scanners' reachability identical.
+fn scan_items_for_pure_helpers(
+    items: &[syn::Item],
+    rel: &str,
+    allowlist: &HashSet<String>,
+    out: &mut Vec<PureHelperViolation>,
+) {
+    for item in items {
+        match item {
+            // Recurse into inline modules (skipping `#[cfg(test)] mod`). The
+            // alias scanner descends here too; not doing so would let a
+            // decorated impl inside `mod foo { … }` evade the §1 gate.
+            syn::Item::Mod(item_mod) => {
+                if attrs_contain_cfg_test(&item_mod.attrs) {
+                    continue;
+                }
+                if let Some((_, inner)) = &item_mod.content {
+                    scan_items_for_pure_helpers(inner, rel, allowlist, out);
+                }
+            }
+            syn::Item::Impl(item_impl) => {
+                if attrs_contain_cfg_test(&item_impl.attrs) {
+                    continue;
+                }
+                // Trait impls (`impl Trait for Type`) are out of scope: the
+                // trait dictates the signature, not the FFI author.
+                // `Drop::drop(&mut self)`, `Display::fmt(&self, …)`, and the
+                // bridge-adapter traits (`BridgeDidResolver`,
+                // `BridgeNonceTracker`, `ContextProvider`, …) all require
+                // `self`-shaped methods even when the impl body delegates to a
+                // free fn. ADR-048 §1 is about INHERENT impls that the binding
+                // tooling actually exports as methods on the language-level SCP
+                // class — those are what the test catches when an author binds
+                // a pure validator to the receiver.
+                if item_impl.trait_.is_some() {
+                    continue;
+                }
+                // §1 applies to methods the FFI binding tooling actually
+                // EXPORTS. A method is exported when the impl block carries the
+                // macro (`#[pymethods]` / `#[napi]` / `#[uniffi::export]` /
+                // `#[wasm_bindgen]` — the dominant pattern) OR the method itself
+                // carries it (rare but legal — e.g. an individual
+                // `#[uniffi::export]` / `#[napi]` method inside an
+                // otherwise-undecorated impl). A method in a FULLY undecorated
+                // impl produces no export, so "should this be a free fn?" is
+                // internal coding style, not an enforcement matter — real
+                // instance: `impl WasmContextManager { ... }` hosts internal
+                // helpers called from `#[wasm_bindgen] pub fn context_*` free
+                // fns, not exposed as JS methods. This mirrors the strict alias
+                // scanner's `visit_impl_item_fn` exactly (block-decorated OR
+                // fn-decorated), closing the gap where a pure `&self` helper
+                // decorated per-method in an undecorated impl would evade the
+                // gate while still counting as an export.
+                let impl_decorated = attrs_have_impl_block_ffi_export(&item_impl.attrs);
+                for impl_item in &item_impl.items {
+                    let syn::ImplItem::Fn(method) = impl_item else {
+                        continue;
+                    };
+                    if attrs_contain_cfg_test(&method.attrs) {
+                        continue;
+                    }
+                    let fn_decorated = attrs_have_free_fn_ffi_export(&method.attrs);
+                    if !impl_decorated && !fn_decorated {
+                        continue;
+                    }
+                    if !impl_method_has_self_receiver(method) {
+                        continue;
+                    }
+                    if method_uses_self_outside_receiver(method) {
+                        continue;
+                    }
+                    let name = method.sig.ident.to_string();
+                    let key = format!("{rel}::{name}");
+                    if allowlist.contains(&key) {
+                        continue;
+                    }
+                    out.push(PureHelperViolation {
+                        file_rel: rel.to_owned(),
+                        method_name: name,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn pure_helpers_stay_free_fns_at_ffi_layer() {
+    let violations = scan_pure_helpers();
+    assert!(
+        violations.is_empty(),
+        "ADR-048 §1 violation: {} impl method(s) take `self` but never use \
+         it. Move them to free fns, or add an exemption to \
+         scripts/pure-helpers-allowlist.txt with a documented reason:\n{}",
+        violations.len(),
+        violations
+            .iter()
+            .map(|v| format!("  {}::{}", v.file_rel, v.method_name))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+/// Positive case: a method that reads `self.inner` IS a genuinely bound
+/// method and the detector must NOT flag it. Locks the detector against
+/// false positives that would force real methods to be moved to free fns.
+#[test]
+fn pure_helpers_detector_recognizes_genuinely_bound_method() {
+    let src = "
+        struct PyScp { inner: Inner }
+        impl PyScp {
+            pub fn helper(&self, x: u32) -> u32 {
+                self.inner.value + x
+            }
+        }
+    ";
+    let parsed = syn::parse_file(src).unwrap();
+    let item_impl = parsed
+        .items
+        .iter()
+        .find_map(|it| match it {
+            syn::Item::Impl(ii) => Some(ii),
+            _ => None,
+        })
+        .unwrap();
+    let method = item_impl
+        .items
+        .iter()
+        .find_map(|ii| match ii {
+            syn::ImplItem::Fn(f) => Some(f),
+            _ => None,
+        })
+        .unwrap();
+    assert!(impl_method_has_self_receiver(method));
+    assert!(
+        method_uses_self_outside_receiver(method),
+        "detector failed to recognize `self.inner.value` as a self reference"
+    );
+}
+
+/// Negative case: a `&self` method whose body never touches `self` IS a
+/// pure helper and the detector MUST flag it. Locks the detector against
+/// false negatives that would let new violations slip in.
+#[test]
+fn pure_helpers_detector_flags_genuinely_pure_method() {
+    let src = "
+        struct PyScp;
+        impl PyScp {
+            pub fn pure_validator(&self, input: &str) -> bool {
+                !input.is_empty() && input.len() < 1024
+            }
+        }
+    ";
+    let parsed = syn::parse_file(src).unwrap();
+    let item_impl = parsed
+        .items
+        .iter()
+        .find_map(|it| match it {
+            syn::Item::Impl(ii) => Some(ii),
+            _ => None,
+        })
+        .unwrap();
+    let method = item_impl
+        .items
+        .iter()
+        .find_map(|ii| match ii {
+            syn::ImplItem::Fn(f) => Some(f),
+            _ => None,
+        })
+        .unwrap();
+    assert!(impl_method_has_self_receiver(method));
+    assert!(
+        !method_uses_self_outside_receiver(method),
+        "detector wrongly flagged a method that never uses `self` as bound"
+    );
+}
+
+/// F4 escape-hatch closure: a pure `&self` method individually decorated with
+/// an FFI macro inside an OTHERWISE-UNDECORATED impl is still an export, so it
+/// must be subject to §1. The scanner's gate is `impl_decorated || fn_decorated`
+/// (mirroring the strict alias scanner) — this test locks that an undecorated
+/// impl block does NOT short-circuit when the method itself carries the macro.
+#[test]
+fn pure_helpers_scanner_descends_into_per_method_decorated_undecorated_impl() {
+    let src = "
+        struct Scp;
+        impl Scp {
+            #[uniffi::export]
+            pub fn pure_validator(&self, input: &str) -> bool {
+                !input.is_empty()
+            }
+        }
+    ";
+    let parsed = syn::parse_file(src).unwrap();
+    let item_impl = parsed
+        .items
+        .iter()
+        .find_map(|it| match it {
+            syn::Item::Impl(ii) => Some(ii),
+            _ => None,
+        })
+        .unwrap();
+    let method = item_impl
+        .items
+        .iter()
+        .find_map(|ii| match ii {
+            syn::ImplItem::Fn(f) => Some(f),
+            _ => None,
+        })
+        .unwrap();
+    // The scanner's in-scope gate is `impl_decorated || fn_decorated`. Here the
+    // block is UNDECORATED, so the `fn_decorated` operand is the one that must
+    // carry the method into §1 scope — that is the gap this closes.
+    assert!(
+        !attrs_have_impl_block_ffi_export(&item_impl.attrs),
+        "impl block must be undecorated for this test to exercise the gap"
+    );
+    assert!(
+        attrs_have_free_fn_ffi_export(&method.attrs),
+        "per-method FFI decoration must bring the method into §1 scope even \
+         when the impl block is undecorated"
+    );
+    // And it is a genuine pure-helper violation that must be flagged.
+    assert!(impl_method_has_self_receiver(method));
+    assert!(!method_uses_self_outside_receiver(method));
+}
+
+/// The pure-helpers scanner must DESCEND into inline `mod { … }` blocks, just
+/// like the strict alias scanner's `visit_item_mod`. A pure `&self` helper in a
+/// decorated impl nested in a module would otherwise evade §1 while still being
+/// an export. Drives `scan_items_for_pure_helpers` directly on parsed source.
+#[test]
+fn pure_helpers_scanner_recurses_into_inline_modules() {
+    let src = "
+        mod inner {
+            struct Scp;
+            #[uniffi::export]
+            impl Scp {
+                pub fn pure_validator(&self, input: &str) -> bool {
+                    !input.is_empty()
+                }
+            }
+        }
+    ";
+    let parsed = syn::parse_file(src).unwrap();
+    let allowlist: HashSet<String> = HashSet::new();
+    let mut out: Vec<PureHelperViolation> = Vec::new();
+    scan_items_for_pure_helpers(&parsed.items, "test.rs", &allowlist, &mut out);
+    assert_eq!(
+        out.len(),
+        1,
+        "a decorated impl nested in `mod` must be scanned (module recursion)"
+    );
+    assert_eq!(out[0].method_name, "pure_validator");
+}
+
+/// Locks the false-positive guards from ADR-048 §1: methods that use
+/// `Self::CONST`, `let Self { ... } = ...`, `<Self ...>` (turbofish),
+/// `: Self` (type position), or `-> Self` (return type) are valid even
+/// without explicit `self.<field>` reads. Each is a genuine binding to
+/// the impl block's `Self` type. The detector must accept all of them.
+#[test]
+fn pure_helpers_detector_accepts_self_type_references() {
+    let cases = [
+        // Self:: in body
+        "struct S; impl S { fn f(&self) -> u32 { Self::CONST } }",
+        // let Self { .. } in body
+        "struct S { x: u32 } impl S { fn f(&self) { let Self { x } = self; let _ = x; } }",
+        // : Self in arg position
+        "struct S; impl S { fn f(&self, _other: &Self) {} }",
+        // -> Self in return position
+        "struct S; impl S { fn f(&self) -> Self { Self } }",
+        // <Self ...> turbofish
+        "struct S; impl S { fn f(&self) -> Vec<Self> { Vec::<Self>::new() } }",
+    ];
+    for src in cases {
+        let parsed = syn::parse_file(src).unwrap();
+        let item_impl = parsed
+            .items
+            .iter()
+            .find_map(|it| match it {
+                syn::Item::Impl(ii) => Some(ii),
+                _ => None,
+            })
+            .unwrap();
+        let method = item_impl
+            .items
+            .iter()
+            .find_map(|ii| match ii {
+                syn::ImplItem::Fn(f) => Some(f),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            method_uses_self_outside_receiver(method),
+            "detector failed to recognize Self-type reference in: {src}"
+        );
+    }
 }

@@ -548,12 +548,15 @@ class TestProvenance:
     """Provenance evaluation and attachment through real FFI."""
 
     async def test_evaluate_quality(self, scp: SCP):
-        # Pure-function FFI call via SCP instance; no bridge-global state.
-        result = scp._native.evaluate_provenance_quality(None, "persistent", "active", None)
+        # ADR-048 §1: pure helper now exposed as a module-level free fn.
+        import _scp_core  # type: ignore[import-not-found]
+
+        result = _scp_core.evaluate_provenance_quality(None, "persistent", "active", None)
         assert isinstance(result, int)
         assert 0 <= result <= 3
 
     async def test_attach(self, scp: SCP):
+        # provenance_attach is stateful — stays on the SCP class.
         result = scp._native.provenance_attach(
             "source-ctx",
             "persistent",
@@ -566,8 +569,11 @@ class TestProvenance:
         assert isinstance(result, dict)
 
     async def test_chain_depth(self, scp: SCP):
-        assert scp._native.provenance_check_chain_depth(3, 5)
-        assert not scp._native.provenance_check_chain_depth(6, 5)
+        # ADR-048 §1: pure helper now exposed as a module-level free fn.
+        import _scp_core  # type: ignore[import-not-found]
+
+        assert _scp_core.provenance_check_chain_depth(3, 5)
+        assert not _scp_core.provenance_check_chain_depth(6, 5)
 
 
 # ---------------------------------------------------------------------------

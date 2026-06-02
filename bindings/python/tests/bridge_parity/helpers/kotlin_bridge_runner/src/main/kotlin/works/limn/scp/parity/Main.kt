@@ -454,7 +454,7 @@ private const val FAKE_UNREGISTERED_DID =
 
 @Suppress("UnusedParameter")
 private suspend fun opUnregisteredDidRejected(args: JsonObject): JsonObject =
-    uniffi.scp.Scp().use { scp ->
+    uniffi.scp.Scp().use {
         // UniFFI `scpidSign` takes an opaque `Identity` handle rather
         // than a DID string, so the bridge-local registry lookup path
         // the PyO3/NAPI/WASM bridges exercise is not reachable. Instead,
@@ -464,9 +464,11 @@ private suspend fun opUnregisteredDidRejected(args: JsonObject): JsonObject =
         // returns `IdentityError::InvalidDidFormat` locally (no DHT
         // round-trip). The bridge's blanket `From<IdentityError>`
         // mapping surfaces it as SCP-IDENT-1001 — the committed code
-        // every bridge agrees on.
+        // every bridge agrees on. `identityResolve` is a module-level free
+        // function (ADR-048 §1), so it is called on `uniffi.scp`, not the
+        // instance.
         try {
-            scp.identityResolve(FAKE_UNREGISTERED_DID)
+            uniffi.scp.identityResolve(FAKE_UNREGISTERED_DID)
             buildJsonObject {
                 put(
                     "error",

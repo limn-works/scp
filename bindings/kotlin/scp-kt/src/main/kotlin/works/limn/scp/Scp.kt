@@ -333,13 +333,18 @@ class SCP internal constructor(
             currentTimestamp = currentTimestamp,
         )
 
-    /** Forwards to [NativeScp.bridgeEvaluateTrust] on [inner]. */
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.bridgeEvaluateTrust]. ADR-048 §1 + §7 Kotlin bullet:
+     * pure helper at the FFI Rust layer, method on `SCP` at the SDK
+     * surface per Kotlin idiom.
+     */
     fun bridgeEvaluateTrust(
         isBridged: Boolean,
         isNativeTransport: Boolean,
         shadowStatus: String,
     ): UByte =
-        inner.bridgeEvaluateTrust(
+        uniffi.scp.bridgeEvaluateTrust(
             isBridged = isBridged,
             isNativeTransport = isNativeTransport,
             shadowStatus = shadowStatus,
@@ -945,25 +950,36 @@ class SCP internal constructor(
             attestationId = attestationId,
         )
 
-    /** Forwards to [NativeScp.identityResolve] on [inner]. */
-    suspend fun identityResolve(did: String): DidDocument = inner.identityResolve(did = did)
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.identityResolve]. ADR-048 §1 + §7 Kotlin bullet.
+     */
+    suspend fun identityResolve(did: String): DidDocument = uniffi.scp.identityResolve(did = did)
 
-    /** Forwards to [NativeScp.identityVerifyDeviceAttestation] on [inner]. */
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.identityVerifyDeviceAttestation]. ADR-048 §1 + §7
+     * Kotlin bullet.
+     */
     suspend fun identityVerifyDeviceAttestation(
         did: String,
         tokenBase64: String,
     ): Boolean =
-        inner.identityVerifyDeviceAttestation(
+        uniffi.scp.identityVerifyDeviceAttestation(
             did = did,
             tokenBase64 = tokenBase64,
         )
 
-    /** Forwards to [NativeScp.identityVerifyLinkAttestation] on [inner]. */
-    suspend fun identityVerifyLinkAttestation(
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.identityVerifyLinkAttestation]. ADR-048 §1 + §7
+     * Kotlin bullet.
+     */
+    fun identityVerifyLinkAttestation(
         attestationJson: String,
         issuerPublicKeyHex: String,
     ): Boolean =
-        inner.identityVerifyLinkAttestation(
+        uniffi.scp.identityVerifyLinkAttestation(
             attestationJson = attestationJson,
             issuerPublicKeyHex = issuerPublicKeyHex,
         )
@@ -1211,32 +1227,42 @@ class SCP internal constructor(
         policyJson = policyJson,
     )
 
-    /** Forwards to [NativeScp.syncClassifyOffline] on [inner]. */
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.syncClassifyOffline]. ADR-048 §1 + §7 Kotlin bullet.
+     */
     fun syncClassifyOffline(
         lastRelayContact: ULong,
         now: ULong,
     ): String =
-        inner.syncClassifyOffline(
+        uniffi.scp.syncClassifyOffline(
             lastRelayContact = lastRelayContact,
             now = now,
         )
 
-    /** Forwards to [NativeScp.syncClassifyOfflineCustom] on [inner]. */
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.syncClassifyOfflineCustom]. ADR-048 §1 + §7 Kotlin
+     * bullet.
+     */
     fun syncClassifyOfflineCustom(
         lastRelayContact: ULong,
         now: ULong,
         tier1ThresholdSecs: ULong,
         tier2ThresholdSecs: ULong,
     ): String =
-        inner.syncClassifyOfflineCustom(
+        uniffi.scp.syncClassifyOfflineCustom(
             lastRelayContact = lastRelayContact,
             now = now,
             tier1ThresholdSecs = tier1ThresholdSecs,
             tier2ThresholdSecs = tier2ThresholdSecs,
         )
 
-    /** Forwards to [NativeScp.syncGetPolicy] on [inner]. */
-    fun syncGetPolicy(): SyncPolicyResult = inner.syncGetPolicy()
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.syncGetPolicy]. ADR-048 §1 + §7 Kotlin bullet.
+     */
+    fun syncGetPolicy(): SyncPolicyResult = uniffi.scp.syncGetPolicy()
 
     /** Forwards to [NativeScp.tombstoneMigratedContext] on [inner]. */
     suspend fun tombstoneMigratedContext(handle: ContextHandle) = inner.tombstoneMigratedContext(handle = handle)
@@ -1393,19 +1419,26 @@ class SCP internal constructor(
     /** Forwards to [NativeScp.trustCreateChallenge] on [inner]. */
     fun trustCreateChallenge(targetDid: String): ChallengeResult = inner.trustCreateChallenge(targetDid = targetDid)
 
-    /** Forwards to [NativeScp.trustQueryScore] on [inner]. */
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.trustQueryScore]. ADR-048 §1 + §7 Kotlin bullet.
+     */
     fun trustQueryScore(
         did: String,
         contextId: String,
     ): TrustScoreResult =
-        inner.trustQueryScore(
+        uniffi.scp.trustQueryScore(
             did = did,
             contextId = contextId,
         )
 
-    /** Forwards to [NativeScp.trustVerifyAttestation] on [inner]. */
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.trustVerifyAttestation]. ADR-048 §1 + §7 Kotlin
+     * bullet.
+     */
     fun trustVerifyAttestation(attestationJson: String): AttestationVerificationResult =
-        inner.trustVerifyAttestation(
+        uniffi.scp.trustVerifyAttestation(
             attestationJson = attestationJson,
         )
 
@@ -1475,12 +1508,16 @@ class SCP internal constructor(
         proofTokens = proofTokens,
     )
 
-    /** Forwards to [NativeScp.verifyParticipationRequirements] on [inner]. */
+    /**
+     * Routes through the UniFFI-generated free function
+     * [uniffi.scp.verifyParticipationRequirements]. ADR-048 §1 + §7
+     * Kotlin bullet.
+     */
     fun verifyParticipationRequirements(
         profileJson: String,
         requirementsJson: String,
     ): Boolean =
-        inner.verifyParticipationRequirements(
+        uniffi.scp.verifyParticipationRequirements(
             profileJson = profileJson,
             requirementsJson = requirementsJson,
         )

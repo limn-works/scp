@@ -5,6 +5,87 @@ All notable changes to SCP will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] - 2026-05-10
+
+### Enforcement infra hardening — PR-E (PR #1735)
+
+Five enforcement-infra improvements that close gaps surfaced in the #1543
+review series, plus the §1 cleanup the new gate identified. No protocol
+behaviour change; all changes are mechanical hardening of the bridge
+surface tests and refactoring of pure helpers per ADR-048 §1.
+
+**Internal changes only — no external SDK behaviour change** other than
+the SDK class methods listed below routing to module-level FFI exports
+internally (the SDK class shape is unchanged for TypeScript / Swift /
+Kotlin; Python continues to expose module-level functions per
+`scp_sdk.{auth,identity,provenance}` per ADR-048 §7).
+
+- **Phantom-alias scanner hardening (#26).** Bridge-symmetry alias
+  resolution now requires the candidate fn to be exported through the
+  bridge binding tooling, not merely defined in source. Both
+  `scripts/check-bridge-symmetry.sh` and the syn-based
+  `every_alias_resolves_to_a_real_fn_or_exemption` test in
+  `crates/scp-testing/tests/integration/ffi_conformance.rs` were
+  tightened. New fixture `bad-alias-undecorated-fn/`.
+- **Empty arrays for exempt bridges (#27).** 24 placeholder cells in
+  `scripts/bridge-aliases.json` (all wasm) replaced with `[]`. New invariant
+  `every_bridge_alias_array_is_non_empty_or_exempt`. (A 25th placeholder, the
+  napi `identity_migrate` cell, was instead wired to its real export — see the
+  exemption durable-provenance bullet below.)
+- **ADR-048 §1 pure-helpers mechanization (#28).** New syn-based gate
+  `pure_helpers_stay_free_fns_at_ffi_layer` flags methods with a `self`
+  receiver that never use it inside FFI-decorated impl blocks. Macro
+  bodies are walked via `proc-macro2` so `format!("{}", self.field)` is
+  correctly recognized as bound. 19 pre-existing violations cleaned up:
+  - 1 NAPI: `NapiScp::check_scoped_capability` → module-level free fn.
+  - 8 PyO3: `scpid_challenge`, `identity_verify_device_attestation`,
+    `verify_identity_link_attestation`, and 5 provenance helpers moved
+    from `#[pymethods] impl PyScp { ... }` to `#[pyfunction]` free fns
+    registered in the appropriate `register_*` hook.
+  - 10 UniFFI: `bridge_evaluate_trust`, `identity_resolve`,
+    `identity_verify_{device_attestation,link_attestation}`,
+    `sync_classify_offline{,_custom}`, `sync_get_policy`,
+    `trust_query_score`, `trust_verify_attestation`,
+    `verify_participation_requirements` moved from
+    `#[uniffi::export] impl Scp { ... }` to free fns.
+- **ADR-048 §7b cross-bridge semantic divergence registry (#29).**
+  Documents canonical operations where bridge implementations diverged in
+  semantics despite sharing the same name, and the evidence required to retire
+  an entry. Both current entries are RESOLVED (retained one release cycle to
+  flag the behavioral shift to consumers): `identity_create_link_attestation`
+  (WASM aligned to `#active` signing per spec §3.5.2) and `identity_rotate_key`
+  (WASM aligned to native active-key rotation by a later upstream change;
+  DID-migration semantics now live in WASM's separate `identity_migrate`
+  export). A single inline `// SEMANTIC DIVERGENCE` comment remains at the WASM
+  attestation call site for its retention window.
+- **Exemption durable-provenance gate.** New invariant
+  `every_exemption_reason_cites_durable_provenance` requires every
+  per-bridge exemption in `scripts/bridge-aliases.json` to justify itself
+  with an ADR (`ADR-NNN`), spec section (`§N…`), or PRD story (`SCP-NNN`).
+  Cited ADRs and SCP stories are existence-verified against `.docs/adrs/`
+  and `.docs/prds/` (a fabricated `ADR-999`/`SCP-9999` is rejected, not just
+  hand-waves); `§` sections remain shape-only. Issue/PR numbers are rejected
+  (ephemeral; policy forbids issue refs in tracked data). The gate
+  immediately caught a factually wrong exemption: `identity_migrate` was
+  marked "not yet exported (known gap)" in NAPI, but it IS exported as the
+  `Identity#migrate` instance method — the alias was simply never recorded.
+  Wired the real `migrate` alias and removed the false exemption.
+
+**Side fix:** `scripts/hooks/pretooluse-enforcement-files.sh` switched
+from suffix to exact-canonical-path matching anchored at the worktree
+root, and the enforcement-file guard was extended to `Bash` tool calls:
+best-effort detection of write verbs (`tee`/`mv`/`cp`/`sed` in-place in all
+GNU/BSD flag orderings/`python -c`) and stdout redirections (including `>|`
+force-clobber) targeting a protected basename. Reads
+(`cat`/`grep`/`jq`/`sed -n`/`node x.js file`/`python validate.py file`) are
+still allowed; CI remains the canonical gate. `check-pure-helpers.sh`,
+`pure-helpers-allowlist.txt`, and the hook script itself were registered in
+both the CLAUDE.md enforcement list and the hook's protected-paths set.
+Fixture copies of `bridge-aliases.json` no longer trigger false-positive
+blocks; symlink-bypass protection preserved. A regression matrix at
+`scripts/tests/enforcement-files-hook/run-tests.sh` locks the block/allow
+behavior and runs in CI.
+
 ## [Unreleased] - 2026-04-18
 
 ### Per-instance MCP stdio allowlist (PR #1725)

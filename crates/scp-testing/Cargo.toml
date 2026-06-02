@@ -65,6 +65,12 @@ serde_json = { workspace = true }
 # script `scripts/check-bridge-symmetry.sh` uses an awk-based brace-tracking
 # collector to get the same semantics; syn here gives the Rust side parity.
 syn = { version = "2", features = ["full", "visit"] }
+# proc-macro2 is needed alongside syn so the ADR-048 §1 pure-helpers scanner
+# can descend into MACRO token streams (`format!`, `bail!`, `tracing::error!`,
+# etc.). syn parses macros as opaque `TokenStream` and never walks their
+# contents — without this dep the scanner would falsely flag `__repr__` and
+# friends as unbound because `self.field` lives inside `format!(...)`.
+proc-macro2 = "1"
 rmp-serde = { workspace = true }
 tempfile = "3"
 x25519-dalek = { workspace = true }

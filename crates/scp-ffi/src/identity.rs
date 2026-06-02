@@ -620,7 +620,110 @@ fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyErro
 }
 
 // ---------------------------------------------------------------------------
-// PyScp methods — migrated from #[pyfunction] exports (Phase 4 PR 4, #1549).
+// Pure helpers — module-level `#[pyfunction]` exports (ADR-048 §1).
+// ---------------------------------------------------------------------------
+
+/// Verifies a device attestation token.
+///
+/// Uses `InMemoryDeviceAttestation` to check the token format.
+///
+/// # Arguments
+///
+/// * `_did` -- The DID string (unused in verification but kept for API
+///   consistency with the `UniFFI` bridge).
+/// * `token_base64` -- The base64-encoded attestation token to verify.
+///
+/// # Returns
+///
+/// `True` if the token is valid, `False` otherwise.
+///
+/// # Errors
+///
+/// Raises `IdentityError` if base64 decoding fails.
+///
+/// See §9.3.
+#[cfg(feature = "allow_in_memory_custody")]
+#[pyfunction]
+pub fn identity_verify_device_attestation(
+    py: Python<'_>,
+    _did: &str,
+    token_base64: &str,
+) -> PyResult<bool> {
+    let token_b64_owned = token_base64.to_owned();
+    let rt = crate::runtime()?;
+
+    py.allow_threads(|| -> Result<bool, ScpPyError> {
+        use base64::Engine;
+        let token_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&token_b64_owned)
+            .map_err(|e| ScpPyError::identity(format!("invalid base64 attestation token: {e}")))?;
+
+        let token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
+        let attestation = scp_platform::testing::InMemoryDeviceAttestation::new();
+
+        let result = rt
+            .block_on(async {
+                scp_platform::traits::DeviceAttestation::verify(&attestation, &token).await
+            })
+            .map_err(|e| {
+                ScpPyError::identity(format!("device attestation verification failed: {e}"))
+            })?;
+
+        Ok(result)
+    })
+    .map_err(PyErr::from)
+}
+
+/// Verifies the Ed25519 signature on an identity link attestation.
+///
+/// Parses the attestation JSON string and verifies the signature using the
+/// provided issuer public key.
+///
+/// The issuer's public key cannot be reliably extracted from the DID string
+/// because attestations are signed with `#active` or `#agent` keys
+/// (spec §3.5.2), not the `#0` identity key embedded in the DID.
+///
+/// # Arguments
+///
+/// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
+/// * `issuer_public_key_hex` — Hex-encoded Ed25519 public key of the
+///   issuer.
+///
+/// # Returns
+///
+/// `True` if the signature is valid, `False` otherwise.
+///
+/// # Errors
+///
+/// Raises `IdentityError` if the JSON is malformed or the hex key is
+/// invalid.
+///
+/// See spec §3.5.1.
+#[pyfunction]
+#[pyo3(name = "py_verify_identity_link_attestation")]
+pub fn verify_identity_link_attestation(
+    py: Python<'_>,
+    attestation_json: &str,
+    issuer_public_key_hex: &str,
+) -> PyResult<bool> {
+    use scp_core::identity::attestation::IdentityLinkAttestation;
+
+    let json_owned = attestation_json.to_owned();
+    let hex_key_owned = issuer_public_key_hex.to_owned();
+
+    py.allow_threads(move || -> Result<bool, ScpPyError> {
+        let attestation: IdentityLinkAttestation = serde_json::from_str(&json_owned)
+            .map_err(|e| ScpPyError::identity(format!("failed to parse attestation JSON: {e}")))?;
+
+        let pub_bytes = hex::decode(&hex_key_owned)
+            .map_err(|e| ScpPyError::identity(format!("invalid issuer_public_key_hex: {e}")))?;
+        Ok(attestation.verify_signature(&pub_bytes).is_ok())
+    })
+    .map_err(PyErr::from)
+}
+
+// ---------------------------------------------------------------------------
+// PyScp methods — stateful identity operations.
 // ---------------------------------------------------------------------------
 
 #[pymethods]
@@ -1490,7 +1593,7 @@ impl crate::scp::PyScp {
     /// Raises `IdentityError` if the identity is not in the registry or
     /// attestation fails.
     ///
-    /// See §9.3, issue #362.
+    /// See §9.3.
     #[cfg(feature = "allow_in_memory_custody")]
     pub fn identity_attest_device(&self, py: Python<'_>, identity_did: &str) -> PyResult<String> {
         let bi_arc = Arc::clone(&self.inner);
@@ -1532,59 +1635,6 @@ impl crate::scp::PyScp {
 
                 Ok(token_b64)
             })
-        })
-        .map_err(PyErr::from)
-    }
-
-    /// Verifies a device attestation token.
-    ///
-    /// Uses `InMemoryDeviceAttestation` to check the token format.
-    ///
-    /// # Arguments
-    ///
-    /// * `_did` -- The DID string (unused in verification but kept for API
-    ///   consistency with the `UniFFI` bridge).
-    /// * `token_base64` -- The base64-encoded attestation token to verify.
-    ///
-    /// # Returns
-    ///
-    /// `True` if the token is valid, `False` otherwise.
-    ///
-    /// # Errors
-    ///
-    /// Raises `IdentityError` if base64 decoding fails.
-    ///
-    /// See §9.3, issue #362.
-    #[cfg(feature = "allow_in_memory_custody")]
-    pub fn identity_verify_device_attestation(
-        &self,
-        py: Python<'_>,
-        _did: &str,
-        token_base64: &str,
-    ) -> PyResult<bool> {
-        let token_b64_owned = token_base64.to_owned();
-        let rt = crate::runtime()?;
-
-        py.allow_threads(|| -> Result<bool, ScpPyError> {
-            use base64::Engine;
-            let token_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&token_b64_owned)
-                .map_err(|e| {
-                    ScpPyError::identity(format!("invalid base64 attestation token: {e}"))
-                })?;
-
-            let token = scp_platform::traits::DeviceAttestationToken::new(token_bytes);
-            let attestation = scp_platform::testing::InMemoryDeviceAttestation::new();
-
-            let result = rt
-                .block_on(async {
-                    scp_platform::traits::DeviceAttestation::verify(&attestation, &token).await
-                })
-                .map_err(|e| {
-                    ScpPyError::identity(format!("device attestation verification failed: {e}"))
-                })?;
-
-            Ok(result)
         })
         .map_err(PyErr::from)
     }
@@ -1767,56 +1817,6 @@ impl crate::scp::PyScp {
                     .retain(|a| a.id != id_owned);
                 Ok(entry.identity_link_attestations.len() < before)
             })
-        })
-        .map_err(PyErr::from)
-    }
-
-    /// Verifies the Ed25519 signature on an identity link attestation.
-    ///
-    /// Parses the attestation JSON string and verifies the signature using the
-    /// provided issuer public key.
-    ///
-    /// The issuer's public key cannot be reliably extracted from the DID string
-    /// because attestations are signed with `#active` or `#agent` keys
-    /// (spec §3.5.2), not the `#0` identity key embedded in the DID.
-    ///
-    /// # Arguments
-    ///
-    /// * `attestation_json` — JSON string of an `IdentityLinkAttestation`.
-    /// * `issuer_public_key_hex` — Hex-encoded Ed25519 public key of the
-    ///   issuer.
-    ///
-    /// # Returns
-    ///
-    /// `True` if the signature is valid, `False` otherwise.
-    ///
-    /// # Errors
-    ///
-    /// Raises `IdentityError` if the JSON is malformed or the hex key is
-    /// invalid.
-    ///
-    /// See spec §3.5.1.
-    #[pyo3(name = "py_verify_identity_link_attestation")]
-    pub fn verify_identity_link_attestation(
-        &self,
-        py: Python<'_>,
-        attestation_json: &str,
-        issuer_public_key_hex: &str,
-    ) -> PyResult<bool> {
-        use scp_core::identity::attestation::IdentityLinkAttestation;
-
-        let json_owned = attestation_json.to_owned();
-        let hex_key_owned = issuer_public_key_hex.to_owned();
-
-        py.allow_threads(move || -> Result<bool, ScpPyError> {
-            let attestation: IdentityLinkAttestation =
-                serde_json::from_str(&json_owned).map_err(|e| {
-                    ScpPyError::identity(format!("failed to parse attestation JSON: {e}"))
-                })?;
-
-            let pub_bytes = hex::decode(&hex_key_owned)
-                .map_err(|e| ScpPyError::identity(format!("invalid issuer_public_key_hex: {e}")))?;
-            Ok(attestation.verify_signature(&pub_bytes).is_ok())
         })
         .map_err(PyErr::from)
     }
@@ -2083,19 +2083,24 @@ impl crate::scp::PyScp {
 
 /// Registers identity bridge classes on the `_scp_core` module.
 ///
-/// Post-migration (Phase 4 PR 4 sub-slice C) identity operations are exposed
-/// as methods on `SCP` (see the `#[pymethods]` block above) and registered
-/// automatically with the class. Only the opaque [`PyIdentity`] and
-/// [`PyDIDDocument`] classes still require manual class registration here.
+/// Stateful identity operations are methods on the `SCP` class (see the
+/// `#[pymethods]` block above) and registered automatically with the
+/// class. The opaque [`PyIdentity`] and [`PyDIDDocument`] classes plus the
+/// pure verification helpers (`identity_verify_device_attestation`,
+/// `verify_identity_link_attestation`) are registered manually here per
+/// ADR-048 §1.
 ///
 /// Called from the `_scp_core` module init function in `lib.rs`.
 ///
 /// # Errors
 ///
-/// Returns `PyErr` if adding classes to the module fails.
+/// Returns `PyErr` if adding classes or functions to the module fails.
 pub fn register_identity(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyIdentity>()?;
     m.add_class::<PyDIDDocument>()?;
+    #[cfg(feature = "allow_in_memory_custody")]
+    m.add_function(wrap_pyfunction!(identity_verify_device_attestation, m)?)?;
+    m.add_function(wrap_pyfunction!(verify_identity_link_attestation, m)?)?;
     Ok(())
 }
 

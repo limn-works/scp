@@ -367,6 +367,17 @@ collect_fn_names_from_file() {
         cfg_test_depth = 0
         brace_depth = 0
         pending_cfg_test = 0
+        pending_ffi_attr = 0
+        # impl_state: 0 = not inside an impl, 1 = inside an FFI-decorated
+        # impl block, 2 = inside an undecorated impl block. The brace_depth
+        # at which the impl opened is recorded in impl_depth; emission exits
+        # the impl when brace_depth drops back to impl_depth (the impl
+        # block-closing right-brace). Mirrors the Rust `FfiFnCollector`
+        # impl_decorated_stack in
+        # `crates/scp-testing/tests/integration/ffi_conformance.rs` — both
+        # scanners reject fns inside undecorated impls.
+        impl_state = 0
+        impl_depth = 0
     }
     {
         # Strip `//` line comments FIRST so neither cfg(test) detection nor
@@ -387,10 +398,37 @@ collect_fn_names_from_file() {
             }
         }
 
+        # Detect any FFI-bridge export attribute on this line. The macros
+        # that mark a fn or impl as exported through SCP binding tooling:
+        #   PyO3:   #[pyfunction]          (free fn only)
+        #           #[pymethods]           (impl block only)
+        #   NAPI:   #[napi] / #[napi(...)] (free fn OR impl block)
+        #   UniFFI: #[uniffi::export]      (free fn OR impl block)
+        #   WASM:   #[wasm_bindgen]        (free fn OR impl block)
+        # Bare-token and parenthesized-arg forms must both match. Detection
+        # mirrors `attrs_have_free_fn_ffi_export` /
+        # `attrs_have_impl_block_ffi_export` in the syn scanner; both layers
+        # must accept the same surface or an adversary can thread a phantom
+        # alias through whichever layer is weaker.
+        if (code ~ /#\[pyfunction\]/ \
+            || code ~ /#\[pymethods\]/ \
+            || code ~ /#\[napi\]/ \
+            || code ~ /#\[napi\(/ \
+            || code ~ /#\[uniffi::export\]/ \
+            || code ~ /#\[uniffi::export\(/ \
+            || code ~ /#\[wasm_bindgen\]/ \
+            || code ~ /#\[wasm_bindgen\(/) {
+            pending_ffi_attr = 1
+        }
+
+        # --- Phase A: cfg(test) state transitions (priority over FFI) ---
+        consumed = 0
         if (pending_cfg_test && line_has_mod_open(code)) {
             in_cfg_test = 1
             cfg_test_depth = brace_depth
             pending_cfg_test = 0
+            pending_ffi_attr = 0
+            consumed = 1
         } else if (pending_cfg_test && line_has_impl_open(code)) {
             # Impl-level #[cfg(test)]: the annotation applies to an entire
             # `impl Foo { ... }` block inside a non-test module. Every fn
@@ -406,6 +444,8 @@ collect_fn_names_from_file() {
             in_cfg_test = 1
             cfg_test_depth = brace_depth
             pending_cfg_test = 0
+            pending_ffi_attr = 0
+            consumed = 1
         } else if (pending_cfg_test && line_has_fn_open(code)) {
             # Fn-level #[cfg(test)]: the annotation applies to a single fn
             # inside a non-test module. Suppress the fn for this line by
@@ -416,6 +456,8 @@ collect_fn_names_from_file() {
             # every fn-open token on that line).
             gsub(/fn[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*[(<]/, " ", code)
             pending_cfg_test = 0
+            pending_ffi_attr = 0
+            consumed = 1
         } else if (!blank && pending_cfg_test) {
             # Non-empty line without matching mod/impl/fn — if the line is
             # another attribute (#[doc = "..."], #[allow(...)], #[inline],
@@ -437,8 +479,69 @@ collect_fn_names_from_file() {
             }
         }
 
+        # --- Phase B: FFI-attribute / impl_state transitions ---
+        # Run AFTER Phase A so that any cfg(test) handler that fired above
+        # has already consumed pending_ffi_attr (test-gated items never
+        # become exports, regardless of decoration).
+        if (!consumed) {
+            if (pending_ffi_attr && line_has_impl_open(code)) {
+                # FFI-decorated impl: every fn defined inside the block
+                # counts as an export. Mirrors `FfiFnCollector::visit_item_impl`
+                # tracking `impl_decorated_stack.last() == true`.
+                if (impl_state == 0) {
+                    impl_state = 1
+                    impl_depth = brace_depth
+                }
+                pending_ffi_attr = 0
+            } else if (line_has_impl_open(code) && impl_state == 0) {
+                # Undecorated impl: every fn inside is INVISIBLE to the FFI
+                # tooling and must not be collected. The strict scanner
+                # closes the phantom-alias hole where someone could add a
+                # `pub fn alias_name()` method inside `impl Helper { ... }`
+                # (no FFI macro) and satisfy a naive substring check.
+                impl_state = 2
+                impl_depth = brace_depth
+            } else if (!blank && pending_ffi_attr) {
+                # Continuation rule for pending_ffi_attr: KEEP alive until
+                # the attribute is consumed by a fn / impl emission handler
+                # above OR until we see a line that opens a non-fn item
+                # the attribute clearly landed on instead. Concretely, the
+                # rule "clear only when this line opens a struct / enum /
+                # trait / union / mod / const / static / type / use"
+                # tolerates the messy multi-line attribute patterns rustfmt
+                # produces — e.g.
+                #
+                #     #[pyfunction]
+                #     #[pyo3(name = "bridge_register")]
+                #     #[pyo3(signature = (
+                #         context_id,
+                #         operator_did,
+                #         ...
+                #     ))]
+                #     #[allow(clippy::too_many_arguments)]
+                #     pub fn py_bridge_register(...)
+                #
+                # without clearing pending on the `    context_id,` or
+                # `    ))]` continuation lines (which the simpler
+                # "starts with #[" check would mishandle). Doc-comment
+                # continuation lines have already been stripped to blank
+                # by `strip_line_comment` above. An attribute that lands
+                # on a struct is correctly absorbed by the struct line so
+                # a later, unrelated `fn` cannot inherit the pending
+                # decoration.
+                if (code ~ /^[ \t]*(pub[ \t]*(\([^)]*\)[ \t]*)?)?(async[ \t]+)?(unsafe[ \t]+)?(extern([ \t]+\"[^\"]*\")?[ \t]+)?(struct|enum|trait|union|mod|const|static|type|use)[ \t]+/) {
+                    pending_ffi_attr = 0
+                }
+            }
+        }
+
         # Track brace depth char-by-char on the COMMENT-STRIPPED source so
         # `//` comments with stray braces do not desynchronize the counter.
+        # Brace tracking handles BOTH cfg(test) exit and impl_state exit:
+        # cfg_test_depth and impl_depth are independent counters because an
+        # adversary could plausibly nest one inside the other (e.g.,
+        # `#[cfg(test)] impl Foo { ... }` is a distinct scope from a plain
+        # `impl Foo { ... }`).
         n = length(code)
         for (i = 0; i < n; i++) {
             c = substr(code, i + 1, 1)
@@ -448,24 +551,59 @@ collect_fn_names_from_file() {
                 if (in_cfg_test && brace_depth == cfg_test_depth) {
                     in_cfg_test = 0
                 }
+                if (impl_state > 0 && brace_depth == impl_depth) {
+                    impl_state = 0
+                    impl_depth = 0
+                }
             }
         }
 
         if (!in_cfg_test) {
-            # Find every `fn NAME(` or `fn NAME<` on the comment-stripped
-            # line. Trait method declarations `fn NAME(&self);` inside
-            # `trait { ... }` blocks ARE matched here — we accept this minor
-            # over-match in the shell collector; the Rust-side scanner uses
-            # syn and correctly excludes trait signatures. A phantom alias
-            # that happens to collide with an unimplemented trait method name
-            # would be caught by the Rust test.
-            rest = code
-            while (match(rest, /fn[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*[(<]/)) {
-                seg = substr(rest, RSTART, RLENGTH)
-                sub(/^fn[ \t]+/, "", seg)
-                sub(/[ \t]*[(<].*$/, "", seg)
-                print seg
-                rest = substr(rest, RSTART + RLENGTH)
+            # Strict-scanner emission gate (PR-E #26 hardening). A fn name
+            # is collected only when the binding tooling would actually
+            # export it:
+            #   * impl_state == 1 (inside FFI-decorated impl): every method
+            #     counts. The decoration on the impl block applies to all
+            #     its methods.
+            #   * impl_state == 0 (free) + pending_ffi_attr (free-fn FFI
+            #     macro on a preceding line): emit, then consume the
+            #     pending flag so it cannot bleed into the next fn.
+            #   * impl_state == 2 (undecorated impl): skip; the FFI tooling
+            #     never sees these methods.
+            #   * impl_state == 0 + !pending_ffi_attr: skip; an undecorated
+            #     free fn is not an export.
+            # The looser pre-hardening behaviour (emit every `fn NAME(`) is
+            # gone. Existing fixtures got `#[napi]` / `#[uniffi::export]`
+            # / `#[wasm_bindgen]` / `#[pyfunction]` decorations on their
+            # widget_create production fns; the new
+            # `bad-alias-undecorated-fn` fixture exercises the undecorated
+            # phantom-alias case the strict scanner now rejects.
+            emit = 0
+            if (impl_state == 1) {
+                emit = 1
+            } else if (impl_state == 0 && pending_ffi_attr) {
+                emit = 1
+            }
+            if (emit) {
+                emitted_any = 0
+                rest = code
+                while (match(rest, /fn[ \t]+[A-Za-z_][A-Za-z0-9_]*[ \t]*[(<]/)) {
+                    seg = substr(rest, RSTART, RLENGTH)
+                    sub(/^fn[ \t]+/, "", seg)
+                    sub(/[ \t]*[(<].*$/, "", seg)
+                    print seg
+                    rest = substr(rest, RSTART + RLENGTH)
+                    emitted_any = 1
+                }
+                # Free-fn decoration is per-fn; impl-block decoration is
+                # sticky for the lifetime of the impl block (impl_state).
+                # Only consume pending_ffi_attr when we actually emitted a
+                # fn name on this line — otherwise the attribute is still
+                # waiting for its fn (rustfmt frequently puts the macro
+                # alone on one line and the fn signature on the next).
+                if (impl_state != 1 && emitted_any) {
+                    pending_ffi_attr = 0
+                }
             }
         }
     }

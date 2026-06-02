@@ -1564,9 +1564,13 @@ export function createNativeBridge(scp: SCP): Bridge {
       attestationJson: string,
       issuerPublicKeyHex: string,
     ): Promise<boolean> {
-      return await (
-        native.identityVerifyLinkAttestation as (j: string, k: string) => Promise<boolean>
-      )(attestationJson, issuerPublicKeyHex);
+      // Module-level NAPI free fn (per ADR-048 §1) — route through `addon`.
+      // The previous `Scp::identity_verify_link_attestation` method (with its
+      // `let _ = &self.inner;` gate-defang) was deleted in PR-E #28.
+      return (addon.identityVerifyLinkAttestation as (j: string, k: string) => boolean)(
+        attestationJson,
+        issuerPublicKeyHex,
+      );
     },
 
     // Recovery and custody migration (#632, spec §9.12, §3.2.1)
@@ -1609,7 +1613,12 @@ export function createNativeBridge(scp: SCP): Bridge {
       grantedCapabilities: readonly string[],
       requiredCapability: string,
     ): boolean {
-      return (native.checkScopedCapability as (g: string[], r: string) => boolean)(
+      // Module-level free function (per ADR-048 §1) — route through
+      // `addon`, not `native`. The previous routing through the per-
+      // instance handle was incorrect after PR-E #28 deleted the
+      // `Scp::check_scoped_capability` method on the napi side; the
+      // dispatcher-invariant test catches this exactly.
+      return (addon.checkScopedCapability as unknown as (g: string[], r: string) => boolean)(
         [...grantedCapabilities],
         requiredCapability,
       );

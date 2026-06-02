@@ -168,14 +168,17 @@ public extension SCP {
     func verifyLinkAttestation(
         _ attestation: IdentityAttestation,
         issuerPublicKeyHex: String
-    ) async throws -> Bool {
+    ) throws -> Bool {
         let json: String
         if let raw = attestation.rawJson {
             json = raw
         } else {
             json = try AttestationWire.serializeAttestation(attestation)
         }
-        return try await identityVerifyLinkAttestation(
+        // identityVerifyLinkAttestation moved to a UniFFI-generated free
+        // top-level function under ADR-048 §1 — Ed25519 signature verification
+        // is a pure helper that does not require the tokio runtime.
+        return try identityVerifyLinkAttestation(
             attestationJson: json,
             issuerPublicKeyHex: issuerPublicKeyHex
         )

@@ -934,38 +934,14 @@ impl Scp {
         .map_err(NapiError::from)
     }
 
-    /// Per-instance equivalent of `identity_verify_link_attestation`.
-    ///
-    /// Pure Ed25519 signature verification; does not consult bridge state.
-    /// Exposed on `Scp` for API symmetry so the demolition slice can drop
-    /// the free function without leaving callers stranded.
-    #[napi(js_name = "identityVerifyLinkAttestation")]
-    #[allow(clippy::unused_async)] // napi-rs requires async for Promise return
-    pub async fn identity_verify_link_attestation(
-        &self,
-        attestation_json: String,
-        issuer_public_key_hex: String,
-    ) -> napi::Result<bool> {
-        use scp_core::identity::attestation::IdentityLinkAttestation;
-
-        let _ = &self.inner;
-
-        let attestation: IdentityLinkAttestation = serde_json::from_str(&attestation_json)
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Identity {
-                    message: format!("failed to parse attestation JSON: {e}"),
-                    code: codes::IDENT_1044.to_owned(),
-                })
-            })?;
-
-        let pub_bytes = hex::decode(&issuer_public_key_hex).map_err(|e| {
-            NapiError::from(ScpNapiError::Identity {
-                message: format!("invalid issuer_public_key_hex: {e}"),
-                code: codes::IDENT_1044.to_owned(),
-            })
-        })?;
-        Ok(attestation.verify_signature(&pub_bytes).is_ok())
-    }
+    // `identity_verify_link_attestation` is exposed as a module-level free
+    // fn at `crates/scp-ffi/napi/src/identity.rs::identity_verify_link_attestation`
+    // per ADR-048 §1 — pure Ed25519 signature verification touches no
+    // bridge-instance state. The TypeScript SDK's
+    // `SCP.identityVerifyLinkAttestation` routes through `addon.X` per the
+    // dispatcher-invariant test. Moved out of the `Scp` impl in PR-E #28
+    // along with the cleanup of the `let _ = &self.inner;` gate-defang that
+    // CLAUDE.md flags as "Gaming enforcement tests with dead references".
 
     /// Per-instance equivalent of `identity_execute_recovery` (spec §9.12).
     ///
@@ -2552,19 +2528,12 @@ impl Scp {
         )
     }
 
-    /// Per-instance equivalent of the free-function `check_scoped_capability`.
-    ///
-    /// This operation is pure — it does not touch any bridge-instance state —
-    /// so the method forwards to a shared inner helper with no `bi` argument.
-    #[napi(js_name = "checkScopedCapability")]
-    #[must_use]
-    pub fn check_scoped_capability(
-        &self,
-        granted_capabilities: Vec<String>,
-        required_capability: String,
-    ) -> bool {
-        crate::context::check_scoped_capability_inner(granted_capabilities, required_capability)
-    }
+    // `check_scoped_capability` is exposed as a module-level free fn at
+    // `crates/scp-ffi/napi/src/context.rs::check_scoped_capability` per
+    // ADR-048 §1 — the operation reads no `Scp` state, so binding it to
+    // the receiver is pure ceremony. The TypeScript SDK's
+    // `SCP.checkScopedCapability` routes through `nativeFreeFn(...)` to
+    // reach the module-level export.
 
     /// Per-instance equivalent of the free-function `evaluate_invitation`.
     #[napi(js_name = "evaluateInvitation")]

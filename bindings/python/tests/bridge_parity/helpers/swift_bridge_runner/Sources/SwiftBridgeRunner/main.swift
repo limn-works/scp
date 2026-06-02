@@ -518,9 +518,10 @@ func opUnregisteredDidRejected(_ req: BridgeRequest) async throws -> [String: JS
     // did:dht), so `DidDht::extract_public_key` returns
     // `IdentityError::InvalidDidFormat` locally — and the bridge's
     // blanket `From<IdentityError>` maps that to SCP-IDENT-1001.
-    let scp = Scp()
+    // `identityResolve` is a module-level free function (ADR-048 §1) — it
+    // resolves via a process-scoped resolver and needs no `Scp` instance.
     do {
-        _ = try await scp.identityResolve(did: fakeUnregisteredDid)
+        _ = try await identityResolve(did: fakeUnregisteredDid)
         return [
             "error": .object([
                 "type": .string("none"),
