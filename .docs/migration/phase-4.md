@@ -293,7 +293,12 @@ def scp() -> scp_sdk.SCP:
 async def test_context_create(scp: scp_sdk.SCP) -> None:
     identity = await scp_sdk.Identity.create(scp, custody="in_memory")
     ctx = await scp_sdk.Context.create(scp, creator=identity, ...)
-    assert ctx.instance_id == scp.instance_id
+    # Handles expose no instanceId getter (ADR-048); affinity is observed
+    # via misuse — a handle from one SCP is rejected by another.
+    other = scp_sdk.SCP()
+    with pytest.raises(scp_sdk.ScpError, match="SCP-PERM-3030"):
+        await scp_sdk.Context.send(other, ctx, payload)
+    other.shutdown(5.0)
 ```
 
 ### TypeScript (bun test)
@@ -317,7 +322,11 @@ describe("lifecycle", () => {
   test("context_create", async () => {
     const identity = await Identity.create(scp, { custody: "in_memory" });
     const ctx = await Context.create(identity, params);
-    expect(ctx.instanceId).toBe(scp.instanceId);
+    // Handles expose no instanceId getter (ADR-048); affinity is observed
+    // via misuse — a handle from one SCP is rejected by another.
+    const other = new SCP();
+    await expect(other.contextSend(ctx, payload)).rejects.toThrow(/SCP-PERM-3030/);
+    await other.shutdown(5);
   });
 });
 ```

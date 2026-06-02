@@ -100,27 +100,11 @@ describe.skipIf(!addon)(`SCP class (Phase 4) [${skipReason}]`, () => {
     expect(scp.instanceId).not.toBe("0");
   });
 
-  test("handles minted by an SCP instance are stamped with its instanceId", async () => {
-    // Post-ADR-048 demolition: handle minting happens through SCP class
-    // methods (e.g. `scp.identityCreate(...)`), not module-level free
-    // functions. This test asserts the core affinity invariant — every
-    // handle carries the `instanceId` of the SCP that minted it — by
-    // minting an Identity through `scp.identityCreate(...)` and
-    // comparing the stamped id against the owning `scp.instanceId`.
-    // Cross-instance rejection is enforced by the Rust-side
-    // `check-handle-affinity` gate and exercised by the
-    // `bridge_instance` tests in `crates/scp-ffi/common`.
-    const scp = new addon.SCP();
-    if (typeof scp.identityCreate !== "function") {
-      // Addon predates per-instance `identityCreate` — can't exercise
-      // the affinity path here. Covered by the Rust-side test suite.
-      return;
-    }
-    const identity = await scp.identityCreate("in_memory");
-    expect(typeof identity.instanceId).toBe("string");
-    expect(identity.instanceId).not.toBe("0");
-    expect(identity.instanceId).toBe(scp.instanceId);
-  });
+  // NOTE: per-handle `instanceId` is intentionally NOT host-visible (ADR-048 —
+  // "Per-handle host-visible `instanceId` is NOT exposed on any bridge"). Handle
+  // affinity is asserted behaviorally below ("handle minted by one SCP is
+  // rejected by another (SCP-PERM-3030)"), not by reading a stamped id off the
+  // handle. Only the `SCP` class exposes `instanceId`.
 
   test("suspend / resume round-trip succeeds", async () => {
     const scp = new addon.SCP();
