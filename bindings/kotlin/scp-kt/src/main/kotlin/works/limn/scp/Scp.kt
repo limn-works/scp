@@ -500,7 +500,14 @@ class SCP internal constructor(
     suspend fun contextHandleTtlExpiry(handle: ContextHandle) = inner.contextHandleTtlExpiry(handle = handle)
 
     /** Forwards to [NativeScp.contextImport] on [inner]. */
-    suspend fun contextImport(data: ByteArray): String = inner.contextImport(data = data)
+    suspend fun contextImport(
+        data: ByteArray,
+        importerIdentity: Identity,
+    ): String =
+        inner.contextImport(
+            data = data,
+            importerIdentity = importerIdentity,
+        )
 
     /** Forwards to [NativeScp.contextIsMember] on [inner]. */
     suspend fun contextIsMember(
