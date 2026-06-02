@@ -92,7 +92,11 @@ webpki-roots = { version = "1", optional = true }
 # crypto provider, and gives a non-permissive WebPKI-roots TLS client for the
 # `https://` well-known fetch. Matches the canonical reqwest config used by
 # scp-identity's DHT gateway client.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+# `stream` enables `Response::bytes_stream()` so the `.well-known/scp` body can
+# be read with a running size cap (a chunked response that omits Content-Length
+# is still bounded). It pulls only futures plumbing this crate already depends
+# on (futures 0.3) — no new TLS or crypto provider.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"], optional = true }
 rcgen = { version = "0.13", optional = true }
 bytes = "1"
 http = { version = "1", optional = true }

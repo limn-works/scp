@@ -34,9 +34,11 @@
 //! roots). It never falls back to a permissive HTTPS client. See spec §10.5.1
 //! (`.well-known/scp` is HTTP discovery) and ADR-037.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use lru::LruCache;
 
 /// Bounded timeout for the `.well-known/scp` discovery fetch.
 ///
@@ -57,6 +59,27 @@ const DISCOVERY_FETCH_TIMEOUT: Duration = Duration::from_secs(2);
 /// where the selector clears QUIC suppression for the relay.
 pub const DEFAULT_DISCOVERY_TTL: Duration = Duration::from_mins(5);
 
+/// Short time-to-live applied to a *transient fetch failure*.
+///
+/// A failed fetch (timeout, connection refused, redirect-induced non-success,
+/// oversized/garbled body) is cached only briefly so one network blip does not
+/// suppress QUIC for the full [`DEFAULT_DISCOVERY_TTL`]. A *resolved* result —
+/// the relay genuinely advertised a list, or genuinely advertised nothing — is
+/// cached for the full TTL because it reflects relay configuration, not a
+/// transient condition. The short window still avoids hammering a flapping
+/// relay on every reconnect.
+const DISCOVERY_FAILURE_TTL: Duration = Duration::from_secs(10);
+
+/// Maximum number of distinct relays whose discovery results are cached.
+///
+/// The cache is keyed by relay URL; without a bound it would grow one entry per
+/// distinct relay URL seen for the lifetime of the
+/// [`TransportSelector`](crate::selection::TransportSelector). An LRU bound caps
+/// memory while keeping the hot set of recently-dialed relays resident. 256 is
+/// the same bound scp-node's webhook dispatcher uses for an analogous per-URL
+/// registry.
+const MAX_CACHED_RELAYS: usize = 256;
+
 /// Outcome of a transports lookup for a relay.
 ///
 /// Distinguishes a *fresh* fetch (a new `.well-known/scp` read just happened)
@@ -74,11 +97,57 @@ pub struct DiscoveredTransports {
     pub refreshed: bool,
 }
 
-/// A cache entry: the resolved transports and when it was stored.
+/// A cache entry: the transports result, when it was stored, and whether it
+/// came from a transient fetch failure (so a short TTL applies to it).
 #[derive(Debug, Clone)]
 struct CacheEntry {
     transports: Option<Vec<String>>,
     stored_at: Instant,
+    /// `true` when this entry records a transient fetch failure (timeout,
+    /// connection refused, non-success status, oversized/garbled body) rather
+    /// than a resolved answer. Failures expire after [`DISCOVERY_FAILURE_TTL`];
+    /// resolved entries live for the full [`RelayTransportDiscovery::ttl`].
+    transient_failure: bool,
+}
+
+impl CacheEntry {
+    /// Whether this entry is still fresh given the resolved/failure TTLs.
+    ///
+    /// Transient failures use the short `failure_ttl` so a single network blip
+    /// does not suppress QUIC for the full resolved TTL; resolved answers use
+    /// `resolved_ttl`.
+    fn is_fresh(&self, resolved_ttl: Duration, failure_ttl: Duration) -> bool {
+        let ttl = if self.transient_failure {
+            failure_ttl
+        } else {
+            resolved_ttl
+        };
+        self.stored_at.elapsed() < ttl
+    }
+}
+
+/// Outcome of a `.well-known/scp` fetch, distinguishing a *resolved* answer
+/// (the relay genuinely advertised a list, or genuinely advertised nothing)
+/// from a *transient failure* (timeout, connection refused, non-success,
+/// oversized/garbled body).
+///
+/// Both resolve to the same WebSocket baseline at the selector, but they cache
+/// for different durations: a resolved answer reflects relay configuration and
+/// is cached for the full TTL, whereas a transient failure is cached only
+/// briefly (see [`DISCOVERY_FAILURE_TTL`]) so one blip does not suppress QUIC
+/// for minutes.
+#[derive(Debug)]
+enum FetchOutcome {
+    /// The fetch completed and produced an answer: `Some(list)` when the relay
+    /// advertised transports, `None` when it advertised none.
+    Resolved(Option<Vec<String>>),
+    /// The fetch failed transiently; the relay's transports remain unknown.
+    ///
+    /// Only the `quic` build path can produce a real fetch (and therefore a real
+    /// failure); without `quic` there is no HTTP client, so this variant is
+    /// never constructed in that configuration.
+    #[cfg_attr(not(feature = "quic"), allow(dead_code))]
+    Failed,
 }
 
 /// Result of consulting the per-relay cache.
@@ -104,10 +173,17 @@ enum CacheLookup {
 /// caller.
 #[derive(Debug)]
 pub struct RelayTransportDiscovery {
-    /// relay URL → cached transports + timestamp.
-    cache: Mutex<HashMap<String, CacheEntry>>,
-    /// How long a cached entry is served before a re-fetch.
+    /// relay URL → cached transports + timestamp, bounded LRU
+    /// ([`MAX_CACHED_RELAYS`]) so the cache cannot grow without bound across
+    /// distinct relay URLs. `LruCache::get` requires `&mut`, which the `Mutex`
+    /// already provides; the guard is always dropped before any `.await`.
+    cache: Mutex<LruCache<String, CacheEntry>>,
+    /// How long a *resolved* cached entry is served before a re-fetch.
     ttl: Duration,
+    /// How long a *transient failure* entry is served before a re-fetch. Always
+    /// the short [`DISCOVERY_FAILURE_TTL`] in production; a test constructor may
+    /// shrink it for deterministic expiry assertions.
+    failure_ttl: Duration,
     /// HTTPS client used for the `.well-known/scp` fetch.
     ///
     /// Built lazily on first use from the crate's non-permissive ring-backed
@@ -140,11 +216,40 @@ impl RelayTransportDiscovery {
     #[must_use]
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(Self::new_cache()),
             ttl,
+            failure_ttl: DISCOVERY_FAILURE_TTL,
             #[cfg(feature = "quic")]
             client: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Test-only constructor that sets both the resolved and failure TTLs, so a
+    /// test can drive failure-entry expiry deterministically without sleeping
+    /// the full production [`DISCOVERY_FAILURE_TTL`].
+    #[cfg(test)]
+    #[must_use]
+    fn with_ttls_for_test(ttl: Duration, failure_ttl: Duration) -> Self {
+        Self {
+            cache: Mutex::new(Self::new_cache()),
+            ttl,
+            failure_ttl,
+            #[cfg(feature = "quic")]
+            client: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Builds the bounded LRU backing store for the per-relay cache.
+    ///
+    /// [`MAX_CACHED_RELAYS`] is a non-zero compile-time constant, so the
+    /// `NonZeroUsize` conversion cannot fail; a `const` assertion keeps that
+    /// guarantee from silently regressing if the bound is ever changed to `0`.
+    fn new_cache() -> LruCache<String, CacheEntry> {
+        const {
+            assert!(MAX_CACHED_RELAYS > 0, "MAX_CACHED_RELAYS must be non-zero");
+        }
+        let capacity = NonZeroUsize::new(MAX_CACHED_RELAYS).unwrap_or(NonZeroUsize::MIN);
+        LruCache::new(capacity)
     }
 
     /// Test-only constructor that injects a preconfigured HTTPS client.
@@ -159,8 +264,9 @@ impl RelayTransportDiscovery {
         let cell = std::sync::OnceLock::new();
         let _ = cell.set(Some(client));
         Self {
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(Self::new_cache()),
             ttl,
+            failure_ttl: DISCOVERY_FAILURE_TTL,
             client: cell,
         }
     }
@@ -183,9 +289,13 @@ impl RelayTransportDiscovery {
         }
 
         // Cache miss or expiry: fetch fresh. `fetch_transports` is fail-open
-        // (returns None on any error) so this never propagates a failure.
-        let transports = self.fetch_transports(relay_url).await;
-        self.store(relay_url, transports.clone());
+        // (never errors out) but reports whether the answer was *resolved* or a
+        // *transient failure* so the two can be cached for different durations.
+        let (transports, transient_failure) = match self.fetch_transports(relay_url).await {
+            FetchOutcome::Resolved(transports) => (transports, false),
+            FetchOutcome::Failed => (None, true),
+        };
+        self.store(relay_url, transports.clone(), transient_failure);
         DiscoveredTransports {
             transports,
             refreshed: true,
@@ -198,11 +308,16 @@ impl RelayTransportDiscovery {
     /// transports for a relay that advertised nothing) or [`CacheLookup::Miss`]
     /// (no entry or expired — fetch).
     fn cached(&self, relay_url: &str) -> CacheLookup {
-        let Ok(cache) = self.cache.lock() else {
+        // `LruCache::get` takes `&mut self` (it updates recency), so the guard
+        // must be mutable. It is dropped at the end of this sync scope, before
+        // `advertised_transports` performs any `.await`.
+        let Ok(mut cache) = self.cache.lock() else {
             return CacheLookup::Miss;
         };
         let lookup = match cache.get(relay_url) {
-            Some(entry) if entry.stored_at.elapsed() < self.ttl => {
+            // A transient failure expires after the short DISCOVERY_FAILURE_TTL;
+            // a resolved answer lives for the full configured TTL.
+            Some(entry) if entry.is_fresh(self.ttl, self.failure_ttl) => {
                 CacheLookup::Fresh(entry.transports.clone())
             }
             _ => CacheLookup::Miss,
@@ -213,39 +328,56 @@ impl RelayTransportDiscovery {
 
     /// Stores a transports result for `relay_url`, stamped with the current
     /// time for TTL accounting.
-    fn store(&self, relay_url: &str, transports: Option<Vec<String>>) {
+    ///
+    /// `transient_failure` records whether the result came from a failed fetch
+    /// (short TTL) or a resolved answer (full TTL). Insertion may evict the
+    /// least-recently-used entry once [`MAX_CACHED_RELAYS`] is reached.
+    fn store(&self, relay_url: &str, transports: Option<Vec<String>>, transient_failure: bool) {
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(
+            cache.put(
                 relay_url.to_owned(),
                 CacheEntry {
                     transports,
                     stored_at: Instant::now(),
+                    transient_failure,
                 },
             );
         }
     }
 
     /// Fetches and parses `.well-known/scp` for `relay_url`, returning its
-    /// `relay_config.transports` list.
+    /// `relay_config.transports` list as a [`FetchOutcome`].
     ///
-    /// Fail-open: returns `None` on any failure (no well-known URL derivable, a
-    /// non-TLS relay, a network/timeout/HTTP error, a parse error, or an absent
-    /// `transports` field).
+    /// Fail-open: never errors out. A [`FetchOutcome::Resolved`] means the relay
+    /// answered (with a list or with nothing); a [`FetchOutcome::Failed`] means
+    /// the fetch failed transiently (network/timeout/HTTP error, oversized or
+    /// garbled body). A parse error or an absent `transports` field on an
+    /// otherwise-successful response is a *resolved* `None`, not a failure — the
+    /// relay simply advertises no usable list.
+    ///
+    /// A non-TLS relay (no `https://` authority to fetch from) is also
+    /// `Resolved(None)`: there is genuinely nothing to discover, not a transient
+    /// failure, so it is cached for the full TTL.
     ///
     /// When the `quic` feature is disabled there is no HTTP client and no QUIC
-    /// to select, so this always returns `None` (WebSocket baseline) without a
-    /// fetch.
+    /// to select, so this always returns `Resolved(None)` (WebSocket baseline)
+    /// without a fetch.
     #[cfg_attr(not(feature = "quic"), allow(clippy::unused_async))]
-    async fn fetch_transports(&self, relay_url: &str) -> Option<Vec<String>> {
+    async fn fetch_transports(&self, relay_url: &str) -> FetchOutcome {
         #[cfg(feature = "quic")]
         {
-            let well_known_url = well_known_url(relay_url)?;
+            // No https authority to fetch from (plaintext relay / empty
+            // authority): nothing to discover. This is a settled answer, not a
+            // transient failure, so cache it for the full TTL.
+            let Some(well_known_url) = well_known_url(relay_url) else {
+                return FetchOutcome::Resolved(None);
+            };
             self.http_fetch_transports(&well_known_url).await
         }
         #[cfg(not(feature = "quic"))]
         {
             let _ = relay_url;
-            None
+            FetchOutcome::Resolved(None)
         }
     }
 
@@ -262,6 +394,21 @@ impl RelayTransportDiscovery {
             .get_or_init(|| {
                 reqwest::Client::builder()
                     .timeout(DISCOVERY_FETCH_TIMEOUT)
+                    // SSRF: the `.well-known/scp` document is served directly at
+                    // the authority root (RFC 8615), so a redirect is never a
+                    // legitimate part of discovery. Following one would let a
+                    // hostile relay 30x-bounce the fetch to an internal service
+                    // (SSRF) or to a cleartext `http://` target. Refuse all
+                    // redirects; a 3xx then hits the `!is_success()` branch and
+                    // falls open to the WebSocket baseline. Matches the hardened
+                    // precedent in scp-node's webhook dispatcher.
+                    .redirect(reqwest::redirect::Policy::none())
+                    // Never downgrade the discovery fetch to `http://`: QUIC
+                    // mandates TLS 1.3, and a cleartext fetch is exactly the
+                    // downgrade a hostile relay would force. `well_known_url`
+                    // only ever yields an `https://` URL, so this is also a
+                    // defense-in-depth guard against any future caller.
+                    .https_only(true)
                     .build()
                     .ok()
             })
@@ -269,12 +416,20 @@ impl RelayTransportDiscovery {
     }
 
     /// Performs the actual HTTPS GET of the well-known document and extracts
-    /// the transports list. Fail-open (`None` on any error).
+    /// the transports list.
+    ///
+    /// Fail-open: returns [`FetchOutcome::Failed`] on any transport-level error
+    /// (no client, network/timeout error, non-success status, or an oversized
+    /// or unreadable body), and [`FetchOutcome::Resolved`] once the body is read
+    /// — including `Resolved(None)` when the body fails to parse or carries no
+    /// `transports` field (the relay simply advertises nothing usable).
     #[cfg(feature = "quic")]
-    async fn http_fetch_transports(&self, well_known_url: &str) -> Option<Vec<String>> {
+    async fn http_fetch_transports(&self, well_known_url: &str) -> FetchOutcome {
         use crate::relay::wellknown::parse_well_known;
 
-        let client = self.http_client()?;
+        let Some(client) = self.http_client() else {
+            return FetchOutcome::Failed;
+        };
 
         let response = match client.get(well_known_url).send().await {
             Ok(resp) => resp,
@@ -285,7 +440,7 @@ impl RelayTransportDiscovery {
                     "relay transport discovery: .well-known/scp fetch failed; \
                      falling open to WebSocket baseline"
                 );
-                return None;
+                return FetchOutcome::Failed;
             }
         };
 
@@ -296,11 +451,76 @@ impl RelayTransportDiscovery {
                 "relay transport discovery: .well-known/scp returned non-success; \
                  falling open to WebSocket baseline"
             );
-            return None;
+            return FetchOutcome::Failed;
         }
 
-        let body = match response.text().await {
-            Ok(body) => body,
+        let Some(body) = read_capped_body(response, well_known_url).await else {
+            return FetchOutcome::Failed;
+        };
+
+        match parse_well_known(&body) {
+            // A successful read that parses: the relay's settled answer, whether
+            // it lists transports or not.
+            Ok(doc) => FetchOutcome::Resolved(doc.relay_config.and_then(|rc| rc.transports)),
+            Err(e) => {
+                tracing::debug!(
+                    well_known_url = %well_known_url,
+                    error = %e,
+                    "relay transport discovery: parsing .well-known/scp failed; \
+                     falling open to WebSocket baseline"
+                );
+                // A response that parses to nothing is a resolved "no usable
+                // list", not a transient failure: re-fetching won't help, so
+                // cache it for the full TTL rather than retrying every 10s.
+                FetchOutcome::Resolved(None)
+            }
+        }
+    }
+}
+
+/// Maximum number of bytes read from a `.well-known/scp` response body.
+///
+/// The document is a small JSON object (a DID, a relay URL, a short transports
+/// list); 64 KiB is generous. reqwest imposes no default body-size limit, so an
+/// uncapped `text()`/`bytes()` would let a hostile relay stream an unbounded
+/// body into memory. The cap bounds memory both via the advertised
+/// `Content-Length` (cheap reject) and via a running byte count while streaming
+/// (defends against a chunked response that omits `Content-Length`).
+#[cfg(feature = "quic")]
+const MAX_WELL_KNOWN_BODY: u64 = 64 * 1024;
+
+/// Reads a response body into a `String`, capping it at [`MAX_WELL_KNOWN_BODY`].
+///
+/// Returns `None` (a transient failure) when the body is too large or cannot be
+/// read/decoded:
+/// - an advertised `Content-Length` over the cap is rejected before any body is
+///   buffered;
+/// - the body is then streamed chunk-by-chunk with a running total, so a
+///   chunked response that omits `Content-Length` is still bounded;
+/// - a chunk read error or non-UTF-8 body yields `None`.
+#[cfg(feature = "quic")]
+async fn read_capped_body(response: reqwest::Response, well_known_url: &str) -> Option<String> {
+    use futures::StreamExt;
+
+    // Cheap reject: an advertised length over the cap never gets buffered.
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_WELL_KNOWN_BODY)
+    {
+        tracing::debug!(
+            well_known_url = %well_known_url,
+            "relay transport discovery: .well-known/scp Content-Length exceeds cap; \
+             falling open to WebSocket baseline"
+        );
+        return None;
+    }
+
+    // Chunked responses omit Content-Length, so also stream with a running cap.
+    let mut stream = response.bytes_stream();
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
             Err(e) => {
                 tracing::debug!(
                     well_known_url = %well_known_url,
@@ -311,18 +531,27 @@ impl RelayTransportDiscovery {
                 return None;
             }
         };
+        if body.len() as u64 + chunk.len() as u64 > MAX_WELL_KNOWN_BODY {
+            tracing::debug!(
+                well_known_url = %well_known_url,
+                "relay transport discovery: .well-known/scp body exceeds cap; \
+                 falling open to WebSocket baseline"
+            );
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
 
-        match parse_well_known(&body) {
-            Ok(doc) => doc.relay_config.and_then(|rc| rc.transports),
-            Err(e) => {
-                tracing::debug!(
-                    well_known_url = %well_known_url,
-                    error = %e,
-                    "relay transport discovery: parsing .well-known/scp failed; \
-                     falling open to WebSocket baseline"
-                );
-                None
-            }
+    match String::from_utf8(body) {
+        Ok(body) => Some(body),
+        Err(e) => {
+            tracing::debug!(
+                well_known_url = %well_known_url,
+                error = %e,
+                "relay transport discovery: .well-known/scp body is not valid UTF-8; \
+                 falling open to WebSocket baseline"
+            );
+            None
         }
     }
 }
@@ -568,6 +797,212 @@ mod tests {
         assert!(
             result.refreshed,
             "a failed fetch is still a refresh attempt"
+        );
+    }
+
+    // -- SSRF / cleartext downgrade hardening (fix 1) -----------------------
+
+    /// A relay that 30x-redirects the well-known fetch to an `http://` target
+    /// (SSRF + cleartext downgrade) must NOT be followed: the discovery client
+    /// refuses all redirects, surfaces the 302 as a non-success status, falls
+    /// open to `None`, and issues exactly one request (no second fetch).
+    #[cfg(feature = "quic")]
+    #[tokio::test]
+    async fn redirect_is_refused_and_issues_no_second_request() {
+        use crate::discovery_test_support::{hardened_trusting_client, start_redirect_server};
+
+        // A hostile relay tries to bounce the fetch to an internal cleartext
+        // service. With redirects refused this is never followed.
+        let server = start_redirect_server("http://169.254.169.254/latest/meta-data").await;
+        let client = hardened_trusting_client(&server.cert_pem, Duration::from_secs(2));
+        let discovery =
+            RelayTransportDiscovery::with_client_for_test(client, DEFAULT_DISCOVERY_TTL);
+
+        let result = discovery.advertised_transports(&server.relay_url()).await;
+        assert_eq!(
+            result.transports, None,
+            "a 30x redirect must fall open to the WebSocket baseline, not be followed"
+        );
+        assert_eq!(
+            server.request_count(),
+            1,
+            "the redirect must not trigger a second request (no SSRF follow)"
+        );
+    }
+
+    /// The hardened discovery client refuses to fetch an `http://` URL outright
+    /// (`https_only`), so even a caller that somehow produced a cleartext target
+    /// can never downgrade the discovery fetch.
+    #[cfg(feature = "quic")]
+    #[tokio::test]
+    async fn https_only_rejects_cleartext_target() {
+        use crate::discovery_test_support::hardened_trusting_client;
+
+        let dummy_cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])
+            .unwrap()
+            .cert
+            .pem();
+        let client = hardened_trusting_client(&dummy_cert, Duration::from_millis(500));
+
+        // A direct GET of an http:// URL must error before any connection: the
+        // client is https_only. This asserts the flag the production builder
+        // sets, independent of whether anything is listening.
+        let err = client
+            .get("http://127.0.0.1:1/.well-known/scp")
+            .send()
+            .await;
+        assert!(
+            err.is_err(),
+            "an https_only client must reject an http:// target outright"
+        );
+    }
+
+    // -- response body cap (fix 2) -----------------------------------------
+
+    /// A relay that serves an oversized `.well-known/scp` body (here via a
+    /// truthful Content-Length over the 64 KiB cap) is rejected before parse and
+    /// falls open to `None`, bounding memory.
+    #[cfg(feature = "quic")]
+    #[tokio::test]
+    async fn oversized_body_is_rejected_fail_open() {
+        use crate::discovery_test_support::{start_oversized_body_server, trusting_client};
+
+        let oversized = usize::try_from(MAX_WELL_KNOWN_BODY).expect("64 KiB fits in usize") + 1;
+        let server = start_oversized_body_server(oversized).await;
+        let client = trusting_client(&server.cert_pem, Duration::from_secs(2));
+        let discovery =
+            RelayTransportDiscovery::with_client_for_test(client, DEFAULT_DISCOVERY_TTL);
+
+        let result = discovery.advertised_transports(&server.relay_url()).await;
+        assert_eq!(
+            result.transports, None,
+            "an oversized well-known body must fail open to the WebSocket baseline"
+        );
+    }
+
+    // -- transient-vs-resolved TTL (fix 3) ---------------------------------
+
+    /// A transient fetch failure is cached only for the short failure TTL, so a
+    /// network blip does not suppress QUIC for the full resolved TTL: a second
+    /// lookup after the short window re-fetches (refreshes).
+    ///
+    /// Uses a tiny real failure TTL and a real sleep: the cache stamps entries
+    /// with `std::time::Instant`, which is unaffected by tokio's virtual clock,
+    /// so `tokio::time::advance` cannot drive its expiry.
+    #[cfg(feature = "quic")]
+    #[tokio::test]
+    async fn transient_failure_caches_briefly() {
+        // Long resolved TTL, tiny failure TTL: if the failure were cached as a
+        // resolved entry it would NOT re-fetch for 5 minutes. The short failure
+        // TTL must win. The production client is built lazily on first fetch;
+        // the dead-port connect is refused before any TLS, so no trusted root is
+        // needed for this failure path.
+        let failure_ttl = Duration::from_millis(100);
+        let discovery =
+            RelayTransportDiscovery::with_ttls_for_test(DEFAULT_DISCOVERY_TTL, failure_ttl);
+
+        // Nothing listening on port 1 → transient failure.
+        let first = discovery
+            .advertised_transports("wss://127.0.0.1:1/scp/v1")
+            .await;
+        assert!(first.refreshed, "first lookup fetches");
+        assert_eq!(first.transports, None);
+
+        // Within the short failure window: served from cache, not re-fetched.
+        let within = discovery
+            .advertised_transports("wss://127.0.0.1:1/scp/v1")
+            .await;
+        assert!(
+            !within.refreshed,
+            "a transient failure is cached for the short failure TTL"
+        );
+
+        // Past the failure TTL (but far within the resolved TTL): must re-fetch.
+        tokio::time::sleep(failure_ttl + Duration::from_millis(50)).await;
+        let after = discovery
+            .advertised_transports("wss://127.0.0.1:1/scp/v1")
+            .await;
+        assert!(
+            after.refreshed,
+            "past the short failure TTL the failure entry expires and re-fetches"
+        );
+    }
+
+    /// A *resolved* negative (a relay that genuinely advertises no transports —
+    /// here a plaintext relay with nothing to discover) is cached for the full
+    /// resolved TTL, NOT the short failure TTL: it is not re-fetched after the
+    /// short window.
+    ///
+    /// Uses a tiny real failure TTL and a real sleep that exceeds it while
+    /// staying far inside the long resolved TTL, so the assertion proves the
+    /// resolved path ignores the failure TTL (cache uses `std::time::Instant`,
+    /// which tokio's virtual clock cannot drive).
+    #[tokio::test]
+    async fn resolved_none_caches_for_full_ttl() {
+        let failure_ttl = Duration::from_millis(50);
+        let discovery =
+            RelayTransportDiscovery::with_ttls_for_test(DEFAULT_DISCOVERY_TTL, failure_ttl);
+
+        // A ws:// relay resolves to None (nothing to discover) — a settled
+        // answer, not a transient failure.
+        let first = discovery
+            .advertised_transports("ws://127.0.0.1:9000/scp/v1")
+            .await;
+        assert!(first.refreshed);
+        assert_eq!(first.transports, None);
+
+        // Sleep past the SHORT failure TTL but far within the resolved TTL: a
+        // resolved-none must still be served from cache (no re-fetch). If the
+        // resolved entry were (wrongly) subject to the failure TTL it would have
+        // expired here and re-fetched.
+        tokio::time::sleep(failure_ttl + Duration::from_millis(50)).await;
+        let after = discovery
+            .advertised_transports("ws://127.0.0.1:9000/scp/v1")
+            .await;
+        assert!(
+            !after.refreshed,
+            "a resolved-none is cached for the full TTL, not the short failure TTL"
+        );
+    }
+
+    // -- bounded LRU cache (fix 4) -----------------------------------------
+
+    /// Inserting more than `MAX_CACHED_RELAYS` distinct relays evicts the
+    /// least-recently-used entry: the oldest relay is no longer served from
+    /// cache (its next lookup is a refresh), while a recent relay still is.
+    #[tokio::test]
+    async fn cache_evicts_oldest_beyond_capacity() {
+        let discovery = RelayTransportDiscovery::with_ttl(DEFAULT_DISCOVERY_TTL);
+
+        // Fill the cache to capacity with distinct plaintext relays (each
+        // resolves to None without a network fetch and is cached).
+        for i in 0..MAX_CACHED_RELAYS {
+            let url = format!("ws://127.0.0.1:{}/scp/v1", 10_000 + i);
+            let r = discovery.advertised_transports(&url).await;
+            assert!(r.refreshed, "first insert of relay {i} fetches");
+        }
+
+        // The first relay is currently the least-recently-used. Insert one more
+        // distinct relay to push the cache over capacity and evict it.
+        let overflow = format!("ws://127.0.0.1:{}/scp/v1", 10_000 + MAX_CACHED_RELAYS);
+        let r = discovery.advertised_transports(&overflow).await;
+        assert!(r.refreshed);
+
+        // The evicted (oldest) relay is no longer cached → its next lookup is a
+        // fresh fetch (refresh), proving the cache is bounded, not unbounded.
+        let evicted = discovery
+            .advertised_transports("ws://127.0.0.1:10000/scp/v1")
+            .await;
+        assert!(
+            evicted.refreshed,
+            "the least-recently-used relay must have been evicted past capacity"
+        );
+
+        // A recently-inserted relay is still resident (served from cache).
+        let recent = discovery.advertised_transports(&overflow).await;
+        assert!(
+            !recent.refreshed,
+            "a recently-used relay must remain cached"
         );
     }
 }

@@ -55,11 +55,52 @@ impl Drop for WellKnownServer {
     }
 }
 
-/// Starts a local HTTPS server that serves `body_json` at `/.well-known/scp`.
+/// Starts a local HTTPS server that serves `body_json` at `/.well-known/scp`
+/// with a `200 OK`.
 ///
 /// The server presents a self-signed cert for `127.0.0.1`; the returned
 /// `cert_pem` must be loaded into the test client's root store.
 pub async fn start_well_known_server(body_json: String) -> WellKnownServer {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body_json.len(),
+        body_json
+    );
+    start_raw_response_server(response).await
+}
+
+/// Starts a local HTTPS server that answers every request with a `302` redirect
+/// to `location`, so discovery's no-redirect / `https_only` hardening can be
+/// exercised (a hostile relay 30x-bouncing the well-known fetch).
+///
+/// The redirect carries no body. A discovery client that refuses redirects must
+/// surface the `302` as a non-success status and never issue a second request.
+pub async fn start_redirect_server(location: &str) -> WellKnownServer {
+    let response = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {location}\r\n\
+         Content-Length: 0\r\nConnection: close\r\n\r\n"
+    );
+    start_raw_response_server(response).await
+}
+
+/// Starts a local HTTPS server that serves a body of exactly `size` bytes at
+/// `/.well-known/scp` with a truthful `Content-Length`, so discovery's body cap
+/// can be exercised. The body is ASCII filler (not valid SCP JSON), which is
+/// irrelevant: an oversized body must be rejected before it is ever parsed.
+pub async fn start_oversized_body_server(size: usize) -> WellKnownServer {
+    let filler = "a".repeat(size);
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+         Content-Length: {size}\r\nConnection: close\r\n\r\n{filler}"
+    );
+    start_raw_response_server(response).await
+}
+
+/// Starts a local HTTPS server that answers every accepted connection with the
+/// exact `raw_response` bytes (status line + headers + body), counting served
+/// requests. The building block for the convenience servers above.
+async fn start_raw_response_server(raw_response: String) -> WellKnownServer {
     // Self-signed cert/key for 127.0.0.1 (so the SNI/hostname check passes).
     let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
     let cert_pem = cert.cert.pem();
@@ -85,7 +126,7 @@ pub async fn start_well_known_server(body_json: String) -> WellKnownServer {
     let count_for_task = Arc::clone(&request_count);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel();
 
-    let body = Arc::new(body_json);
+    let response = Arc::new(raw_response);
 
     tokio::spawn(async move {
         loop {
@@ -98,7 +139,7 @@ pub async fn start_well_known_server(body_json: String) -> WellKnownServer {
             };
             let acceptor = acceptor.clone();
             let count = Arc::clone(&count_for_task);
-            let body = Arc::clone(&body);
+            let response = Arc::clone(&response);
             tokio::spawn(async move {
                 let Ok(mut tls) = acceptor.accept(stream).await else {
                     return;
@@ -107,12 +148,6 @@ pub async fn start_well_known_server(body_json: String) -> WellKnownServer {
                 let mut buf = [0u8; 1024];
                 let _ = tls.read(&mut buf).await;
                 count.fetch_add(1, Ordering::SeqCst);
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
                 let _ = tls.write_all(response.as_bytes()).await;
                 let _ = tls.flush().await;
                 let _ = tls.shutdown().await;
@@ -138,6 +173,22 @@ pub fn trusting_client(cert_pem: &str, timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .add_root_certificate(cert)
         .timeout(timeout)
+        .build()
+        .unwrap()
+}
+
+/// Builds a trusting `reqwest::Client` that *also* carries the production
+/// discovery hardening: no redirects ([`reqwest::redirect::Policy::none`]) and
+/// `https_only`. Used by the SSRF/downgrade tests so they exercise the exact
+/// hardening flags production's `http_client()` sets, differing only in the
+/// trusted root (a local self-signed cert instead of the `WebPKI` bundle).
+pub fn hardened_trusting_client(cert_pem: &str, timeout: Duration) -> reqwest::Client {
+    let cert = reqwest::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+    reqwest::Client::builder()
+        .add_root_certificate(cert)
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
         .build()
         .unwrap()
 }
