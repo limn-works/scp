@@ -619,6 +619,21 @@ fn deserialize_identity_state(data: &[u8]) -> Result<(String, String), ScpPyErro
     Ok((did, custody))
 }
 
+/// Serializes a [`scp_identity::DidRotationEvent`] to JSON for return
+/// across the `PyO3` boundary, wrapping serialization errors in
+/// `ScpPyError::IdentityError` with code `IDENT_1004`.
+///
+/// Extracted from `identity_migrate` to keep the latter inside the
+/// `too_many_lines` clippy threshold after the recovery-handle
+/// refactor moved the call to `migrate_identity` to a struct
+/// destructure.
+fn serialize_rotation_event(event: &scp_identity::DidRotationEvent) -> Result<String, ScpPyError> {
+    serde_json::to_string(event).map_err(|e| ScpPyError::IdentityError {
+        message: format!("failed to serialize rotation event: {e}"),
+        code: scp_ffi_common::error_codes::IDENT_1004.to_owned(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers — module-level `#[pyfunction]` exports (ADR-048 §1).
 // ---------------------------------------------------------------------------
@@ -1502,25 +1517,24 @@ impl crate::scp::PyScp {
                     Arc::new(DidCache::new()),
                     sign_fn,
                 );
-                let (new_identity, new_document, rotation_event, new_pre_rotation_handle) =
-                    did_method
-                        .migrate_identity(
-                            &old_identity,
-                            &old_doc,
-                            &pre_rotation_handle,
-                            pre_rotation_custody.as_ref(),
-                            custody.as_ref(),
-                            rotated_at,
-                        )
-                        .await
-                        .map_err(ScpPyError::from)?;
-                let rotation_event_json = serde_json::to_string(&rotation_event).map_err(|e| {
-                    ScpPyError::IdentityError {
-                        message: format!("failed to serialize rotation event: {e}"),
-                        code: scp_ffi_common::error_codes::IDENT_1004.to_owned(),
-                    }
-                })?;
-
+                let outcome = did_method
+                    .migrate_identity(
+                        &old_identity,
+                        &old_doc,
+                        &pre_rotation_handle,
+                        pre_rotation_custody.as_ref(),
+                        custody.as_ref(),
+                        rotated_at,
+                    )
+                    .await
+                    .map_err(ScpPyError::from)?;
+                let rotation_event_json = serialize_rotation_event(&outcome.rotation_event)?;
+                let scp_identity::MigrationOutcome {
+                    new_identity,
+                    new_document,
+                    new_pre_rotation_handle,
+                    ..
+                } = outcome;
                 let new_did = new_identity.did.clone();
                 let document_for_handle = new_document.clone();
 

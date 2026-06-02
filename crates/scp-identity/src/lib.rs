@@ -48,9 +48,9 @@ pub use attestation::{
 };
 pub use cache::{DidCache, DidResolutionResult, Staleness};
 pub use dht::{
-    DidDht, InMemorySequenceStore, PostResolveHook, SequenceStore, decode_multibase_key,
-    did_from_ed25519_public_key, extract_public_key, verify_bep44_signature, verify_migration,
-    verify_self_certification,
+    DidDht, InMemorySequenceStore, MigrationOutcome, MigrationPartialState, MigrationResumePhase,
+    PostResolveHook, SequenceStore, decode_multibase_key, did_from_ed25519_public_key,
+    extract_public_key, verify_bep44_signature, verify_migration, verify_self_certification,
 };
 // SigningKeyId re-exported from scp-primitives (see pub use above).
 pub use dht_client::{DhtClient, InMemoryDhtClient};
@@ -263,6 +263,91 @@ pub enum IdentityError {
         /// The maximum allowed.
         max: usize,
     },
+
+    /// A DHT publish step inside [`DidDht::migrate_identity`](crate::dht::DidDht::migrate_identity)
+    /// failed AFTER the irreversible cold-custody mutation (step 5
+    /// `destroy_after_migration`) — meaning the caller cannot simply
+    /// re-invoke `migrate_identity`. The carried
+    /// [`MigrationPartialState`](crate::dht::MigrationPartialState) is the
+    /// byte-identical artifact set needed by
+    /// [`DidDht::resume_migration_publish`](crate::dht::DidDht::resume_migration_publish)
+    /// to finish the migration without re-deriving keys.
+    ///
+    /// `partial` is boxed to keep [`IdentityError`]'s size bounded — the
+    /// partial state holds two full identities, two documents, and a
+    /// rotation event, which would otherwise inflate every `Err` path in
+    /// the crate.
+    #[error("migration publish failed at {phase:?}: {source}")]
+    MigrationPublishFailed {
+        /// Which publish step failed; dictates which steps the resume
+        /// path must re-run.
+        phase: MigrationResumePhase,
+        /// The recovery handle — pass to
+        /// [`DidDht::resume_migration_publish`](crate::dht::DidDht::resume_migration_publish)
+        /// to finish the migration. Boxed to keep [`IdentityError`] size
+        /// bounded; the partial state aggregates two full identities,
+        /// two documents, the rotation event, and a pre-rotation handle.
+        partial: Box<crate::dht::MigrationPartialState>,
+        /// The underlying publish failure (DHT, relay, or sequence-store
+        /// error). Boxed for `IdentityError` size, and surfaced via
+        /// [`std::error::Error::source`] so callers can drill into the
+        /// root cause.
+        #[source]
+        source: Box<Self>,
+    },
+}
+
+impl IdentityError {
+    /// Borrows the partial state from a
+    /// [`IdentityError::MigrationPublishFailed`] variant. Returns
+    /// `None` for any other variant.
+    ///
+    /// Useful when a caller bubbled the error up through `?` and only
+    /// wants to peek at the recovery handle without destructuring the
+    /// `IdentityError` enum manually (for example, to log the in-flight
+    /// migration's old/new DID strings via
+    /// [`crate::dht::MigrationPartialState::old_did`] and
+    /// [`crate::dht::MigrationPartialState::new_did`]).
+    ///
+    /// For owning access — needed when calling
+    /// [`crate::dht::DidDht::resume_migration_publish`] — use
+    /// [`Self::into_migration_partial`] instead.
+    #[must_use]
+    pub fn as_migration_partial(&self) -> Option<&crate::dht::MigrationPartialState> {
+        match self {
+            Self::MigrationPublishFailed { partial, .. } => Some(partial),
+            _ => None,
+        }
+    }
+
+    /// Consumes this error, returning the owned partial state when the
+    /// variant is [`IdentityError::MigrationPublishFailed`]. Otherwise
+    /// returns the original error verbatim in the `Err` arm so the
+    /// caller can re-propagate it.
+    ///
+    /// This is the idiomatic shape for handing a recovery handle to
+    /// [`crate::dht::DidDht::resume_migration_publish`], which consumes
+    /// the partial state by value:
+    ///
+    /// ```ignore
+    /// match err.into_migration_partial() {
+    ///     Ok(partial) => dht.resume_migration_publish(partial, &custody).await?,
+    ///     Err(other) => return Err(other),
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(self)` if the variant is not
+    /// [`IdentityError::MigrationPublishFailed`] — the original error is
+    /// returned unchanged so callers can re-propagate without
+    /// allocating a fresh wrapper.
+    pub fn into_migration_partial(self) -> Result<crate::dht::MigrationPartialState, Self> {
+        match self {
+            Self::MigrationPublishFailed { partial, .. } => Ok(*partial),
+            other => Err(other),
+        }
+    }
 }
 
 /// Abstract trait for DID method implementations.

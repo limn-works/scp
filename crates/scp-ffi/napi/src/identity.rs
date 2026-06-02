@@ -853,7 +853,12 @@ impl NapiIdentity {
             let rotated_at = scp_primitives::SystemClock.now_secs();
 
             let dht = make_dht_with_signer(&custody);
-            let (new_identity, new_document, rotation_event, new_pre_rotation_handle) = dht
+            let scp_identity::MigrationOutcome {
+                new_identity,
+                new_document,
+                rotation_event,
+                new_pre_rotation_handle,
+            } = dht
                 .migrate_identity(
                     &scp_identity,
                     &document,

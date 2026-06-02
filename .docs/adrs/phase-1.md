@@ -398,6 +398,23 @@ None. This is foundational. Key generation uses the platform adapter (in-memory 
      (forwarding record maintenance, recommended 90 days).
    - **The DID string changes. All per-context references must be
      migrated via DidRotationEvent.**
+   - **Partial-publish recovery.** Either of the two DHT publishes
+     (publish-new, republish-old-with-alsoKnownAs) can fail after
+     step 5 (`destroy_after_migration`) has already consumed the OLD
+     pre-rotation key. A retry of `migrate_identity` is impossible
+     at that point. The function instead returns
+     `IdentityError::MigrationPublishFailed { phase, partial, source }`
+     where `partial: Box<MigrationPartialState>` carries the
+     byte-identical artifacts (new identity, new document,
+     rotation_event, new pre-rotation handle, old identity, old
+     document) needed by `DidDht::resume_migration_publish` to
+     finish the migration without re-deriving keys or re-signing
+     proofs. Spec §9.7.4.1 "Partial-publish recovery" governs the
+     byte-parity invariant of the carried `pre_rotation_proof`;
+     ADR-046 governs the sibling cross-bridge byte-parity (seed-window
+     order, ephemeral RNG). Structured FFI plumbing of the
+     `MigrationPartialState` handle is delivered in subsequent PRs
+     per ADR-048 §7 per-SDK idiom.
 
    **4c. `verify_migration(old_did, old_document, new_did, migration_proof, pre_rotation_proof, rotated_at, now) -> Result<bool, IdentityError>`**
    - Returns `Ok(true)` only if every applicable invariant below holds; returns `Err(IdentityError::MigrationVerificationFailed(...))` describing the first failure otherwise. Never returns `Ok(false)` — verification is a typed all-or-nothing predicate.

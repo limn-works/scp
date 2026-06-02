@@ -616,6 +616,17 @@ impl From<scp_identity::IdentityError> for ScpError {
             };
         }
 
+        // `MigrationPublishFailed` is the typed recovery handle from
+        // `DidDht::migrate_identity` (phase-1 surface). Structured
+        // partial-state plumbing lands in subsequent PRs — this arm only
+        // surfaces the code + message body.
+        if matches!(&e, IE::MigrationPublishFailed { .. }) {
+            return Self::Identity {
+                msg: format!("{e}"),
+                code: codes::IDENT_1053.to_owned(),
+            };
+        }
+
         Self::Identity {
             msg: format!("{e} — check DID format, key custody configuration, or DHT connectivity"),
             code: codes::IDENT_1001.to_owned(),
@@ -12691,7 +12702,12 @@ impl Scp {
                     // `DidDht::new()` would surface
                     // "no signing function configured".
                     let dht = make_dht_with_signer(kc)?;
-                    let (new_identity, new_document, rotation_event, new_pre_rotation_handle) = dht
+                    let scp_identity::MigrationOutcome {
+                        new_identity,
+                        new_document,
+                        rotation_event,
+                        new_pre_rotation_handle,
+                    } = dht
                         .migrate_identity(
                             &old_identity,
                             &old_document,
@@ -12767,7 +12783,12 @@ impl Scp {
                     let rotated_at = scp_primitives::SystemClock.now_secs();
 
                     let dht = DidDht::new();
-                    let (new_identity, new_document, rotation_event, new_pre_rotation_handle) = dht
+                    let scp_identity::MigrationOutcome {
+                        new_identity,
+                        new_document,
+                        rotation_event,
+                        new_pre_rotation_handle,
+                    } = dht
                         .migrate_identity(
                             &old_identity,
                             &old_document,
