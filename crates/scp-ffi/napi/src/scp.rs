@@ -2494,6 +2494,9 @@ impl Scp {
         data: Vec<u8>,
         importer: &NapiIdentity,
     ) -> napi::Result<String> {
+        // Reject an importer identity handle minted by a DIFFERENT SCP instance
+        // BEFORE it is used for §9.10.4 pseudonym derivation (SCP-PERM-3030).
+        crate::napi_check_handle!(&self.inner.core, importer);
         // `Box::pin` keeps the §9.10.4 pseudonym-derivation future under the
         // `clippy::large_futures` size threshold (.clippy.toml) — the importer
         // derivation + announcement path pushes the inline future over 16 KiB.

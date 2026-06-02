@@ -14217,6 +14217,14 @@ impl Scp {
         data: Vec<u8>,
         importer_identity: Arc<Identity>,
     ) -> Result<String, ScpError> {
+        // Reject an importer `Identity` minted by a DIFFERENT `SCP` instance
+        // BEFORE it is moved into the spawned task and used for §9.10.4
+        // pseudonym derivation — cross-instance handle misuse surfaces as
+        // `ScpError::Permission` with code `SCP-PERM-3030` (SCP-PERM-3030).
+        self.inner
+            .core
+            .check_handle(importer_identity.instance_id())
+            .map_err(ScpError::from)?;
         let bi = Arc::clone(&self.inner);
         runtime()
             .spawn(async move {
