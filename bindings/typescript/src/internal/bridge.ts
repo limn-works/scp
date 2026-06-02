@@ -485,6 +485,18 @@ export interface Bridge {
   ): Promise<string>;
   identityLinkAttestations(did: string): string;
   identityRemoveLinkAttestation(did: string, attestationId: string): boolean;
+
+  /**
+   * Removes a DID from this instance's SCP-side identity registry.
+   * Idempotent — does nothing when the DID is not present.
+   */
+  identityRemove(did: string): void;
+
+  /**
+   * Removes a DID from the identity registry if present. Returns `true`
+   * if the identity was found and removed, `false` otherwise.
+   */
+  identityRemoveIfPresent(did: string): boolean;
   identityVerifyLinkAttestation(
     attestationJson: string,
     issuerPublicKeyHex: string,

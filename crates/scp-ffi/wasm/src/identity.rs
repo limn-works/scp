@@ -3695,6 +3695,45 @@ pub fn identity_remove_link_attestation(did: String, attestation_id: String) -> 
     })
 }
 
+/// Removes a DID from the WASM-local SCP-side identity registry.
+///
+/// Drops the retained identity record (key material, pre-rotation handle)
+/// and any link attestations for `did`. Idempotent — does nothing when the
+/// DID is not in the registry, matching the NAPI bridge's `identity_remove`
+/// semantics (where a single registry entry bundles key material and
+/// attestations).
+///
+/// See spec §3.5.1 (link attestations) and SCP-214 (identity registry).
+#[wasm_bindgen]
+pub fn identity_remove(did: String) {
+    IDENTITY_REGISTRY.with(|reg| {
+        reg.borrow_mut().remove(&did);
+    });
+    LINK_ATTESTATIONS.with(|reg| {
+        reg.borrow_mut().remove(&did);
+    });
+}
+
+/// Removes a DID from the WASM-local SCP-side identity registry if present,
+/// reporting whether the identity was removed.
+///
+/// Returns `true` if the identity was found in the registry and removed,
+/// `false` if the DID was not present. Any link attestations for the DID
+/// are dropped alongside the identity. Companion to [`identity_remove`]
+/// (which is unconditional), matching the NAPI bridge's
+/// `identity_remove_if_present` semantics.
+///
+/// See spec §3.5.1 (link attestations) and SCP-214 (identity registry).
+#[must_use]
+#[wasm_bindgen]
+pub fn identity_remove_if_present(did: String) -> bool {
+    let removed = IDENTITY_REGISTRY.with(|reg| reg.borrow_mut().remove(&did).is_some());
+    LINK_ATTESTATIONS.with(|reg| {
+        reg.borrow_mut().remove(&did);
+    });
+    removed
+}
+
 /// Extracts a required string field from an attestation JSON value, returning
 /// an identity error if the field is missing or not a string.
 fn attestation_required_str<'a>(
@@ -4130,6 +4169,68 @@ mod tests {
             "unknown DID should have no alsoKnownAs entries"
         );
         assert_eq!(fields.services_json, "[]");
+
+        cleanup_registries();
+    }
+
+    #[test]
+    fn test_identity_remove_drops_registry_entry() {
+        cleanup_registries();
+
+        let (did, _pub_bytes, _active_pub_bytes) = register_identity();
+        // Attach a link attestation so we can confirm it is dropped too.
+        LINK_ATTESTATIONS.with(|reg| {
+            reg.borrow_mut()
+                .insert(did.clone(), vec![serde_json::json!({"id": "att-1"})]);
+        });
+        assert!(
+            IDENTITY_REGISTRY.with(|reg| reg.borrow().contains_key(&did)),
+            "identity must be registered before removal"
+        );
+
+        identity_remove(did.clone());
+
+        assert!(
+            !IDENTITY_REGISTRY.with(|reg| reg.borrow().contains_key(&did)),
+            "identity must be absent from the registry after identity_remove"
+        );
+        assert!(
+            !LINK_ATTESTATIONS.with(|reg| reg.borrow().contains_key(&did)),
+            "link attestations must be dropped alongside the identity"
+        );
+
+        cleanup_registries();
+    }
+
+    #[test]
+    fn test_identity_remove_if_present_true_then_false() {
+        cleanup_registries();
+
+        let (did, _pub_bytes, _active_pub_bytes) = register_identity();
+
+        assert!(
+            identity_remove_if_present(did.clone()),
+            "first removal must report the identity was present"
+        );
+        assert!(
+            !identity_remove_if_present(did),
+            "second removal must report the identity was already gone"
+        );
+
+        cleanup_registries();
+    }
+
+    #[test]
+    fn test_identity_remove_nonexistent_is_silent() {
+        cleanup_registries();
+
+        let missing = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest".to_owned();
+        // Unconditional remove on a missing DID is a no-op (no panic).
+        identity_remove(missing.clone());
+        assert!(
+            !identity_remove_if_present(missing),
+            "removing an unregistered DID must report false"
+        );
 
         cleanup_registries();
     }

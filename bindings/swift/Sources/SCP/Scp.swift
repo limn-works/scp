@@ -546,6 +546,22 @@ public extension SCP {
         inner.identityRemoveLinkAttestation(did: did, attestationId: attestationId)
     }
 
+    /// Forwards to ``Scp/identityRemove`` on ``inner``.
+    ///
+    /// Removes the DID from this instance's SCP-side identity registry.
+    /// Idempotent — succeeds silently when the DID is not present.
+    func identityRemove(did: String) {
+        inner.identityRemove(did: did)
+    }
+
+    /// Forwards to ``Scp/identityRemoveIfPresent`` on ``inner``.
+    ///
+    /// Returns `true` if the identity was found and removed, `false` if the
+    /// DID was not in the registry.
+    func identityRemoveIfPresent(did: String) -> Bool {
+        inner.identityRemoveIfPresent(did: did)
+    }
+
     // `identityResolve`, `identityVerifyDeviceAttestation`, and
     // `identityVerifyLinkAttestation` moved to UniFFI-generated free
     // top-level functions under ADR-048 §1 + §7 Swift bullet. Call them

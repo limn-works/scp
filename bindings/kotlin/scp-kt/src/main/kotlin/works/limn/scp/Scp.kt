@@ -951,6 +951,22 @@ class SCP internal constructor(
         )
 
     /**
+     * Forwards to [NativeScp.identityRemove] on [inner].
+     *
+     * Removes the DID from this instance's SCP-side identity registry.
+     * Idempotent — succeeds silently when the DID is not present.
+     */
+    fun identityRemove(did: String) = inner.identityRemove(did = did)
+
+    /**
+     * Forwards to [NativeScp.identityRemoveIfPresent] on [inner].
+     *
+     * Returns `true` if the identity was found and removed, `false` if the
+     * DID was not in the registry.
+     */
+    fun identityRemoveIfPresent(did: String): Boolean = inner.identityRemoveIfPresent(did = did)
+
+    /**
      * Routes through the UniFFI-generated free function
      * [uniffi.scp.identityResolve]. ADR-048 §1 + §7 Kotlin bullet.
      */

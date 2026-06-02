@@ -1430,6 +1430,38 @@ impl crate::scp::PyScp {
         result.map_err(PyErr::from)
     }
 
+    /// Removes a DID from this instance's SCP-side identity registry.
+    ///
+    /// Drops the retained identity state (opaque key handles, custody
+    /// provider, DID document) for the given DID. Idempotent — succeeds
+    /// silently when the DID is not in the registry, matching the NAPI
+    /// bridge's `identity_remove` semantics.
+    ///
+    /// Use this as a cleanup mechanism for long-running processes that
+    /// create many ephemeral identities. The DID document published to the
+    /// DHT is unaffected; this only releases the bridge's in-memory state.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[pyo3(name = "identity_remove")]
+    pub fn identity_remove(&self, did: &str) -> PyResult<()> {
+        validate::validate_did(did)?;
+        crate::runtime::remove_identity(&self.inner, did);
+        Ok(())
+    }
+
+    /// Removes a DID from this instance's SCP-side identity registry if
+    /// present, reporting whether anything was removed.
+    ///
+    /// Returns `true` if the identity was found and removed, `false` if the
+    /// DID was not in the registry. Companion to
+    /// [`PyScp::identity_remove`] (which is unconditional), matching the
+    /// NAPI bridge's `identity_remove_if_present` semantics.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[pyo3(name = "identity_remove_if_present")]
+    pub fn identity_remove_if_present(&self, did: &str) -> PyResult<bool> {
+        validate::validate_did(did)?;
+        Ok(crate::runtime::remove_identity_if_present(&self.inner, did))
+    }
+
     /// Migrates an identity to a new DID (Layer 2 rotation).
     ///
     /// Creates a new DID using the pre-rotation key as the new Identity Key.

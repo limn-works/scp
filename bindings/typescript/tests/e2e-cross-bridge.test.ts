@@ -140,6 +140,25 @@ if (napiBridge === null || scp === null || wasmModule === null) {
       const b = await wasm.identity_create("in_memory");
       expect(a.did).not.toBe(b.did);
     });
+
+    test("WASM removes an existing identity from the registry", async () => {
+      const identity = await wasm.identity_create("in_memory");
+      // `identity_remove` is void and idempotent; afterward the DID is gone.
+      wasm.identity_remove(identity.did);
+      expect(wasm.identity_remove_if_present(identity.did)).toBe(false);
+    });
+
+    test("WASM identity_remove_if_present reports true then false", async () => {
+      const identity = await wasm.identity_create("in_memory");
+      expect(wasm.identity_remove_if_present(identity.did)).toBe(true);
+      expect(wasm.identity_remove_if_present(identity.did)).toBe(false);
+    });
+
+    test("WASM removing a non-existent identity is silent", () => {
+      const missing = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest";
+      expect(() => wasm.identity_remove(missing)).not.toThrow();
+      expect(wasm.identity_remove_if_present(missing)).toBe(false);
+    });
   });
 
   // -------------------------------------------------------------------------

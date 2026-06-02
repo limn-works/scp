@@ -1560,6 +1560,14 @@ export function createNativeBridge(scp: SCP): Bridge {
       );
     },
 
+    identityRemove(did: string): void {
+      (native.identityRemove as (d: string) => void)(did);
+    },
+
+    identityRemoveIfPresent(did: string): boolean {
+      return (native.identityRemoveIfPresent as (d: string) => boolean)(did);
+    },
+
     async identityVerifyLinkAttestation(
       attestationJson: string,
       issuerPublicKeyHex: string,

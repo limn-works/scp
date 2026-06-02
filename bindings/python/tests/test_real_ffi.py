@@ -187,6 +187,30 @@ class TestIdentity:
         removed = await scp.identity_remove_agent_key(rotated._raw_handle)
         assert not removed._raw_handle.has_agent_key
 
+    async def test_remove_existing_identity(self, scp: SCP):
+        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        # The DID is in the registry, so removal succeeds. `identity_remove`
+        # returns None (void) and the subsequent if_present probe reports the
+        # DID is no longer present.
+        result = await scp.identity_remove(identity.did)
+        assert result is None
+        assert await scp.identity_remove_if_present(identity.did) is False
+
+    async def test_remove_if_present_true_then_false(self, scp: SCP):
+        identity = await scp.identity_create(CustodyType.IN_MEMORY)
+        # First removal finds the identity and reports True.
+        assert await scp.identity_remove_if_present(identity.did) is True
+        # Second removal finds nothing and reports False.
+        assert await scp.identity_remove_if_present(identity.did) is False
+
+    async def test_remove_nonexistent_is_silent(self, scp: SCP):
+        # Removing a DID that was never registered is a silent no-op,
+        # matching the cross-bridge `identity_remove` contract.
+        missing = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest"
+        result = await scp.identity_remove(missing)
+        assert result is None
+        assert await scp.identity_remove_if_present(missing) is False
+
     async def test_create_with_agent_key(self, scp: SCP):
         identity = await scp.identity_create_with_agent_key(CustodyType.IN_MEMORY)
         assert identity._raw_handle.has_agent_key

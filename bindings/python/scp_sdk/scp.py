@@ -578,6 +578,24 @@ class SCP:
         raw = await asyncio.to_thread(self._native.identity_remove_agent_key, identity)
         return Identity(raw)
 
+    async def identity_remove(self, did: str) -> None:
+        """Remove a DID from this instance's SCP-side identity registry.
+
+        Drops the retained identity state for ``did``. Idempotent — returns
+        without error when the DID is not present. Delegates to
+        ``_scp_core.SCP.identity_remove``.
+        """
+        await asyncio.to_thread(self._native.identity_remove, did)
+
+    async def identity_remove_if_present(self, did: str) -> bool:
+        """Remove a DID from the identity registry if present.
+
+        Returns ``True`` if the identity was found and removed, ``False`` if
+        the DID was not in the registry. Delegates to
+        ``_scp_core.SCP.identity_remove_if_present``.
+        """
+        return await asyncio.to_thread(self._native.identity_remove_if_present, did)
+
     async def identity_renew_attestation(self, did: str, attestation_id: str) -> Any:
         """Renew an identity link attestation (§3.5.2).
 

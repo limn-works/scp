@@ -57,6 +57,40 @@
       ]
     },
     {
+      "canonical": "identity_remove",
+      "category": "identity",
+      "wasm_required": true,
+      "pyo3": [
+        "identity_remove"
+      ],
+      "uniffi": [
+        "identity_remove"
+      ],
+      "napi": [
+        "identity_remove"
+      ],
+      "wasm": [
+        "identity_remove"
+      ]
+    },
+    {
+      "canonical": "identity_remove_if_present",
+      "category": "identity",
+      "wasm_required": true,
+      "pyo3": [
+        "identity_remove_if_present"
+      ],
+      "uniffi": [
+        "identity_remove_if_present"
+      ],
+      "napi": [
+        "identity_remove_if_present"
+      ],
+      "wasm": [
+        "identity_remove_if_present"
+      ]
+    },
+    {
       "canonical": "identity_migrate",
       "category": "identity",
       "wasm_required": true,

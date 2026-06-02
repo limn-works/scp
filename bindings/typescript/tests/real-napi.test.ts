@@ -268,6 +268,29 @@ if (!napiAvailable || createNativeBridge === null || rawAddon === null) {
       expect(migrated.did).not.toBe(handle.did);
     });
 
+    test("removes an existing identity from the registry", async () => {
+      const handle = await napi.identityCreate("in_memory");
+      // `identityRemove` is void and idempotent; after it runs the DID is
+      // no longer present, so `identityRemoveIfPresent` reports false.
+      napi.identityRemove(handle.did);
+      expect(napi.identityRemoveIfPresent(handle.did)).toBe(false);
+    });
+
+    test("identityRemoveIfPresent reports true then false", async () => {
+      const handle = await napi.identityCreate("in_memory");
+      // First call finds the identity and removes it.
+      expect(napi.identityRemoveIfPresent(handle.did)).toBe(true);
+      // Second call finds nothing.
+      expect(napi.identityRemoveIfPresent(handle.did)).toBe(false);
+    });
+
+    test("removing a non-existent identity is silent", () => {
+      const missing = "did:dht:z6MkNeverRegisteredIdentityForRemoveTest";
+      // No throw; idempotent no-op matching the cross-bridge contract.
+      expect(() => napi.identityRemove(missing)).not.toThrow();
+      expect(napi.identityRemoveIfPresent(missing)).toBe(false);
+    });
+
     test("generates and verifies a device attestation", async () => {
       const handle = await napi.identityCreate("in_memory");
       const token = await napi.identityAttestDevice(handle.did);

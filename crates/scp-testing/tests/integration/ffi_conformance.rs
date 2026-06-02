@@ -1529,6 +1529,8 @@ const WASM_REQUIRED_OPERATIONS: &[&str] = &[
     "identity_create",
     "identity_load",
     "identity_resolve",
+    "identity_remove",
+    "identity_remove_if_present",
     "identity_migrate",
     "identity_attest_device",
     "identity_verify_device_attestation",

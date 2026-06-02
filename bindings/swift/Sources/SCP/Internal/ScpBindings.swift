@@ -2559,6 +2559,32 @@ public protocol ScpProtocol: AnyObject, Sendable {
     func identityMigrate(identity: Identity) async throws  -> Identity
     
     /**
+     * Removes a DID from this instance's SCP-side identity registry.
+     *
+     * Drops the retained identity state — the custody provider / key
+     * handle and any link attestations — for `did` on `&*self.inner`.
+     * Idempotent: succeeds silently when the DID is not in the registry,
+     * matching the NAPI bridge's `identity_remove` semantics (where a
+     * single registry entry bundles custody and attestations).
+     *
+     * The DID document published to the DHT is unaffected; this only
+     * releases the bridge's in-memory state.
+     */
+    func identityRemove(did: String) 
+    
+    /**
+     * Removes a DID from this instance's SCP-side identity registry if
+     * present, reporting whether the identity was removed.
+     *
+     * Returns `true` if the identity was found in the custody registry and
+     * removed, `false` if the DID was not present. Any link attestations
+     * for the DID are dropped alongside the identity. Companion to
+     * [`Scp::identity_remove`] (which is unconditional), matching the NAPI
+     * bridge's `identity_remove_if_present` semantics.
+     */
+    func identityRemoveIfPresent(did: String)  -> Bool
+    
+    /**
      * Per-instance equivalent of the free-function
      * `identity_remove_link_attestation`.
      *
@@ -4698,6 +4724,43 @@ open func identityMigrate(identity: Identity)async throws  -> Identity  {
             liftFunc: FfiConverterTypeIdentity_lift,
             errorHandler: FfiConverterTypeScpError_lift
         )
+}
+    
+    /**
+     * Removes a DID from this instance's SCP-side identity registry.
+     *
+     * Drops the retained identity state — the custody provider / key
+     * handle and any link attestations — for `did` on `&*self.inner`.
+     * Idempotent: succeeds silently when the DID is not in the registry,
+     * matching the NAPI bridge's `identity_remove` semantics (where a
+     * single registry entry bundles custody and attestations).
+     *
+     * The DID document published to the DHT is unaffected; this only
+     * releases the bridge's in-memory state.
+     */
+open func identityRemove(did: String)  {try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_scp_identity_remove(self.uniffiClonePointer(),
+        FfiConverterString.lower(did),$0
+    )
+}
+}
+    
+    /**
+     * Removes a DID from this instance's SCP-side identity registry if
+     * present, reporting whether the identity was removed.
+     *
+     * Returns `true` if the identity was found in the custody registry and
+     * removed, `false` if the DID was not present. Any link attestations
+     * for the DID are dropped alongside the identity. Companion to
+     * [`Scp::identity_remove`] (which is unconditional), matching the NAPI
+     * bridge's `identity_remove_if_present` semantics.
+     */
+open func identityRemoveIfPresent(did: String) -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_scp_ffi_uniffi_fn_method_scp_identity_remove_if_present(self.uniffiClonePointer(),
+        FfiConverterString.lower(did),$0
+    )
+})
 }
     
     /**
@@ -14513,6 +14576,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_migrate() != 35072) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove() != 3517) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_if_present() != 9273) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_identity_remove_link_attestation() != 51771) {

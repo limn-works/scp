@@ -279,6 +279,8 @@ interface WasmModule {
   ) => Promise<string>;
   identity_link_attestations: (did: string) => string;
   identity_remove_link_attestation: (did: string, attestationId: string) => boolean;
+  identity_remove: (did: string) => void;
+  identity_remove_if_present: (did: string) => boolean;
   identity_verify_link_attestation: (
     attestationJson: string,
     issuerPublicKeyHex: string,
@@ -1847,6 +1849,16 @@ export function createWasmBridge(): Bridge {
     identityRemoveLinkAttestation(did: string, attestationId: string): boolean {
       const wasm = getWasm();
       return wasm.identity_remove_link_attestation(did, attestationId);
+    },
+
+    identityRemove(did: string): void {
+      const wasm = getWasm();
+      wasm.identity_remove(did);
+    },
+
+    identityRemoveIfPresent(did: string): boolean {
+      const wasm = getWasm();
+      return wasm.identity_remove_if_present(did);
     },
 
     async identityVerifyLinkAttestation(

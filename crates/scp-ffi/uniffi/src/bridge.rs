@@ -7482,6 +7482,40 @@ impl Scp {
         entry.len() < before
     }
 
+    /// Removes a DID from this instance's SCP-side identity registry.
+    ///
+    /// Drops the retained identity state — the custody provider / key
+    /// handle and any link attestations — for `did` on `&*self.inner`.
+    /// Idempotent: succeeds silently when the DID is not in the registry,
+    /// matching the NAPI bridge's `identity_remove` semantics (where a
+    /// single registry entry bundles custody and attestations).
+    ///
+    /// The DID document published to the DHT is unaffected; this only
+    /// releases the bridge's in-memory state.
+    #[cfg(feature = "allow_in_memory_custody")]
+    pub fn identity_remove(&self, did: String) {
+        identity_custody_registry(&self.inner).remove(&did);
+        identity_link_attestation_registry(&self.inner).remove(&did);
+    }
+
+    /// Removes a DID from this instance's SCP-side identity registry if
+    /// present, reporting whether the identity was removed.
+    ///
+    /// Returns `true` if the identity was found in the custody registry and
+    /// removed, `false` if the DID was not present. Any link attestations
+    /// for the DID are dropped alongside the identity. Companion to
+    /// [`Scp::identity_remove`] (which is unconditional), matching the NAPI
+    /// bridge's `identity_remove_if_present` semantics.
+    #[cfg(feature = "allow_in_memory_custody")]
+    #[must_use]
+    pub fn identity_remove_if_present(&self, did: String) -> bool {
+        let removed = identity_custody_registry(&self.inner)
+            .remove(&did)
+            .is_some();
+        identity_link_attestation_registry(&self.inner).remove(&did);
+        removed
+    }
+
     // ===== Context lifecycle — per-instance methods on `Scp` =====
     //
     // The 6 context lifecycle operations (`context_create`, `context_join`,
