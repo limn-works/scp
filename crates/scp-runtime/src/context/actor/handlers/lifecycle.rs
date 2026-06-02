@@ -204,6 +204,7 @@ async fn dispatch_actor_inner(
             handle_flush_snapshot_actor(state, deps, reply)
         }
         LifecycleCommand::ShutdownSelf { reply } => handle_shutdown_self_actor(state, deps, reply),
+        LifecycleCommand::ReportBufferLen { reply } => handle_report_buffer_len_actor(state, reply),
     }
 }
 
@@ -578,5 +579,24 @@ fn handle_shutdown_self_actor(
     // Shutdown mutates external resources (crypto, event log, task
     // handles) but does NOT mutate `state` itself — `cancel()` takes
     // `&self`. Mark non-mutated for the actor's dirty tracking.
+    Outcome::ok(())
+}
+
+/// Handle [`LifecycleCommand::ReportBufferLen`] (actor-shape).
+///
+/// Per-actor body of the gauge sweep. Reads this actor's
+/// receive-buffer occupancy directly from owned `&state` and replies
+/// with the length. Mirrors the per-context body of the legacy
+/// `update_context_gauges`, which iterated `Supervisor::contexts` and
+/// `try_lock`ed each `Arc<Mutex<PerContextState>>` to read
+/// `receive_buffer.len()` (ADR-049 Phase 2A finalization — DashMap
+/// removal). The actor owns its state, so no cross-actor lock is taken.
+///
+/// Read-only: returns `Outcome::ok(())` (`mutated = false`).
+fn handle_report_buffer_len_actor(
+    state: &PerContextState,
+    reply: oneshot::Sender<usize>,
+) -> Outcome<()> {
+    let _ = reply.send(state.receive_buffer.len());
     Outcome::ok(())
 }

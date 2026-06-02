@@ -1600,6 +1600,21 @@ impl Supervisor {
                 let _ = reply.send(Err(err));
                 Outcome::err(sketch)
             }
+            // Read-only gauge sweep. Like `FlushSnapshot`/`ShutdownSelf`,
+            // this must never reach the direct path — it is dispatched
+            // per-actor via the mailbox by `update_context_gauges`. The
+            // reply channel carries a bare `usize`, so the
+            // never-should-happen branch replies 0 (degenerate) and
+            // returns a typed error `Outcome`.
+            LifecycleCommand::ReportBufferLen { reply } => {
+                let _ = reply.send(0);
+                Outcome::err(ContextError::InvalidState(
+                    "LifecycleCommand::ReportBufferLen reached dispatch_lifecycle_direct — \
+                     the gauge sweep must be dispatched per-actor via the mailbox in \
+                     `manager_methods::update_context_gauges`"
+                        .to_owned(),
+                ))
+            }
         }
     }
 
@@ -4189,7 +4204,8 @@ impl Supervisor {
             LifecycleCommand::ImportContext { .. }
             | LifecycleCommand::Placeholder { .. }
             | LifecycleCommand::FlushSnapshot { .. }
-            | LifecycleCommand::ShutdownSelf { .. } => None,
+            | LifecycleCommand::ShutdownSelf { .. }
+            | LifecycleCommand::ReportBufferLen { .. } => None,
         }
     }
 
@@ -4234,7 +4250,12 @@ impl Supervisor {
             | TtlCloseCommand::ResetTtlTimer { payload, .. } => Some(payload.context_id.as_str()),
             TtlCloseCommand::ExecuteTtlClose { payload, .. }
             | TtlCloseCommand::FinalizeClose { payload, .. } => Some(payload.context_id.as_str()),
-            TtlCloseCommand::Placeholder { .. } => None,
+            // `FireTimer` carries no `context_id` field: the per-context
+            // TTL timer task resolves the actor itself via
+            // [`Self::lookup`] and mailboxes the command through the
+            // returned handle, so it never routes through
+            // `dispatch_ttl_close_command`. `Placeholder` has no target.
+            TtlCloseCommand::FireTimer { .. } | TtlCloseCommand::Placeholder { .. } => None,
         }
     }
 

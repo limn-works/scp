@@ -713,6 +713,28 @@ pub enum LifecycleCommand {
         /// shutdown contract.
         reply: oneshot::Sender<Result<(), ContextError>>,
     },
+
+    /// Sweep: report THIS actor's receive-buffer occupancy.
+    ///
+    /// Dispatched per-actor by the supervisor's gauge sweep
+    /// [`update_context_gauges`](crate::context::manager_methods::update_context_gauges).
+    /// The supervisor iterates [`actor_ids`](crate::context::supervisor::Supervisor::actor_ids)
+    /// and sends one of these commands per actor, summing the replies to
+    /// produce the `buffer_occupancy` gauge.
+    ///
+    /// Replaces the legacy gauge path that iterated the `contexts`
+    /// DashMap and `try_lock`ed each `Arc<Mutex<PerContextState>>` to read
+    /// `receive_buffer.len()` (ADR-049 Phase 2A finalization — DashMap
+    /// removal). The actor owns its state, so the handler reads
+    /// `state.receive_buffer.len()` directly with no cross-actor lock.
+    ///
+    /// Read-only: the handler returns an [`Outcome`] with `mutated =
+    /// false`.
+    ReportBufferLen {
+        /// Oneshot reply channel carrying this actor's receive-buffer
+        /// length.
+        reply: oneshot::Sender<usize>,
+    },
 }
 
 /// Reply-channel type alias for
@@ -1728,6 +1750,29 @@ pub enum TtlCloseCommand {
         /// Oneshot reply channel. Handler stub sends
         /// `Err(ContextError::NotImplemented(..))` back.
         reply: oneshot::Sender<Result<(), ContextError>>,
+    },
+
+    /// Fires a single TTL tick on THIS actor: evaluate whether the
+    /// context's TTL has elapsed and, if so, run the close pipeline on the
+    /// actor-owned state.
+    ///
+    /// Sent by the per-context TTL timer task (spawned at
+    /// `create_context` / `restore_context` time) on each wake. The task
+    /// holds no `&Supervisor` and reads no DashMap; it resolves the actor
+    /// via [`Supervisor::lookup`](crate::context::supervisor::Supervisor::lookup)
+    /// (lock-free registry) and mailboxes this command. A `lookup → None`
+    /// (actor gone) replaces the legacy stale-generation gate: the timer
+    /// task stops when the context's actor no longer exists.
+    ///
+    /// Replaces the legacy `spawn_ttl_timer_legacy` task that probed
+    /// `contexts_arc.get(ctx).generation` for the stale-gen gate and held
+    /// the supervisor's `task_set` (ADR-049 Phase 2A finalization — DashMap
+    /// removal). The handler operates on the actor's owned `&mut state`.
+    FireTimer {
+        /// Oneshot reply channel. `Ok(true)` iff the timer should keep
+        /// running (context still open); `Ok(false)` once the close
+        /// pipeline has fired so the task can exit.
+        reply: oneshot::Sender<Result<bool, ContextError>>,
     },
 
     /// Spawns (or respawns) the TTL timer for the given context with a

@@ -65,6 +65,7 @@ pub async fn dispatch(
 ) -> Outcome<()> {
     match cmd {
         TtlCloseCommand::Placeholder { reply } => reply_not_implemented(reply),
+        TtlCloseCommand::FireTimer { reply } => handle_fire_timer(state, deps, reply).await,
         TtlCloseCommand::StartTtlTimer { payload, reply } => {
             let p = *payload;
             handle_start_ttl_timer(state, deps, p.context_id, p.params, p.duration, reply).await
@@ -274,6 +275,60 @@ async fn handle_execute_ttl_close(
 
     let _ = reply.send(reply_result);
     outcome
+}
+
+/// Handle [`TtlCloseCommand::FireTimer`] against actor-owned state.
+///
+/// Per-context TTL-timer tick. Sent by the per-context timer task on
+/// each wake (see
+/// [`ttl_close_helpers::spawn_ttl_timer`](crate::context::ttl_close_helpers::spawn_ttl_timer))
+/// once the configured TTL duration elapses. Runs the actor-shape
+/// expiry pipeline
+/// ([`ttl_close_helpers::handle_ttl_expiry`](crate::context::ttl_close_helpers::handle_ttl_expiry))
+/// against owned `&mut state`: it cancels the governance-timeout task,
+/// decays participation, emits the `Expired` / `ExpiryFailed` event, and
+/// persists best-effort.
+///
+/// Replaces the legacy `spawn_ttl_timer_legacy` task's inline expiry tail
+/// that locked the `contexts` DashMap entry and applied a stale-generation
+/// gate (ADR-049 Phase 2A finalization — DashMap removal). The
+/// generation gate is gone: the timer task resolves the actor via
+/// [`Supervisor::lookup`](crate::context::supervisor::Supervisor::lookup),
+/// so a despawned actor (context gone / recreated) is never reached, and
+/// the actor owns its state for the whole turn (no concurrent
+/// close-and-recreate window).
+///
+/// Reply: `Ok(false)` — the expiry pipeline has fired, so the timer task
+/// stops after this tick. (The reply currently always reports "do not
+/// continue"; a future repeating-timer variant would return `Ok(true)`.)
+async fn handle_fire_timer(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    reply: oneshot::Sender<Result<bool, ContextError>>,
+) -> Outcome<()> {
+    let handle = state.handle.clone();
+    let expiry_fut = crate::context::ttl_close_helpers::handle_ttl_expiry(state, deps, &handle);
+
+    match tokio::time::timeout(HANDLER_TIMEOUT, expiry_fut).await {
+        Ok(Ok(())) => {
+            let _ = reply.send(Ok(false));
+            Outcome::ok_mutated(())
+        }
+        Ok(Err(e)) => {
+            let sketch = outcome_error_sketch(&e);
+            let _ = reply.send(Err(e));
+            Outcome::err_mutated(sketch)
+        }
+        Err(_elapsed) => {
+            let context_id = handle.context_id().to_owned();
+            let err = ContextError::TransportTimeout(format!(
+                "TTL FireTimer expiry exceeded {HANDLER_TIMEOUT:?} budget for context {context_id}"
+            ));
+            let sketch = outcome_error_sketch(&err);
+            let _ = reply.send(Err(err));
+            Outcome::err_mutated(sketch)
+        }
+    }
 }
 
 /// Handle [`TtlCloseCommand::FinalizeClose`] against actor-owned state.

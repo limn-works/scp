@@ -960,6 +960,13 @@ impl ContextActor {
                 reply,
                 "lifecycle::shutdown_self (sweep — use lifecycle_helpers::shutdown_all_contexts iterator)",
             ),
+            // Read-only gauge sweep: a skeleton actor owns no
+            // receive-buffer state, so report 0. The reply channel
+            // carries a bare `usize` (not a `Result`), so it cannot use
+            // `ack_not_impl`.
+            LifecycleCommand::ReportBufferLen { reply } => {
+                let _ = reply.send(0);
+            }
         }
     }
 
@@ -1152,6 +1159,10 @@ impl ContextActor {
         }
         match sub {
             TtlCloseCommand::Placeholder { reply } => ack_not_impl(reply, "ttl_close"),
+            TtlCloseCommand::FireTimer { reply } => ack_not_impl(
+                reply,
+                "ttl_close::fire_timer (use Supervisor::dispatch_ttl_close_command)",
+            ),
             TtlCloseCommand::StartTtlTimer { reply, .. } => ack_not_impl(
                 reply,
                 "ttl_close::start_ttl_timer (use Supervisor::dispatch_ttl_close_command during commits 9-11)",
