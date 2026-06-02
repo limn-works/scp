@@ -49,7 +49,8 @@ struct SubscriptionHandle {
 /// QUIC stream, eliminating head-of-line blocking and `ref_id` correlation.
 ///
 /// QUIC provides:
-/// - **0-RTT reconnection** via session tickets (section 10.14.2).
+/// - **Session resumption (1-RTT)** via session tickets (section 10.14.2).
+///   0-RTT early data is intentionally NOT enabled — see [`QuicAdapter::connect_url`].
 /// - **Connection migration** when the client's IP address changes.
 /// - **Native keepalive** via QUIC PING frames (no application-level PING/PONG).
 /// - **Independent streams** per operation (no head-of-line blocking).
@@ -72,7 +73,7 @@ pub struct QuicAdapter {
     /// The underlying QUIC connection.
     connection: RwLock<Option<quinn::Connection>>,
 
-    /// Connection lifecycle manager (0-RTT, keepalive, backoff).
+    /// Connection lifecycle manager (session resumption, keepalive, backoff).
     lifecycle: RwLock<QuicLifecycleManager>,
 
     /// Active subscription handles keyed by routing ID.
@@ -101,7 +102,8 @@ impl QuicAdapter {
     /// * `relay_addr` -- Socket address of the QUIC relay.
     /// * `server_name` -- TLS server name (SNI) for the connection.
     /// * `client_config` -- Pre-configured quinn `ClientConfig` with TLS and ALPN.
-    /// * `lifecycle` -- Lifecycle manager for keepalive, backoff, and 0-RTT.
+    /// * `lifecycle` -- Lifecycle manager for keepalive, backoff, and session
+    ///   resumption.
     ///
     /// # Errors
     ///
@@ -113,7 +115,21 @@ impl QuicAdapter {
         client_config: quinn::ClientConfig,
         lifecycle: QuicLifecycleManager,
     ) -> Result<Self, TransportError> {
-        let mut endpoint = quinn::Endpoint::client(std::net::SocketAddr::from(([0, 0, 0, 0], 0)))
+        // Bind the client UDP socket to the address family of the resolved
+        // relay. A socket bound to `AF_INET` (IPv4 wildcard) cannot reach an
+        // `AF_INET6` destination, so hardcoding the IPv4 wildcard would silently
+        // break QUIC for IPv6 / dual-stack relays (the family mismatch surfaces
+        // as a connect failure, then WS fallback + QUIC suppression). Mirror the
+        // resolved address's family for the ephemeral client bind.
+        let bind_addr = match relay_addr {
+            std::net::SocketAddr::V4(_) => {
+                std::net::SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            }
+            std::net::SocketAddr::V6(_) => {
+                std::net::SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+            }
+        };
+        let mut endpoint = quinn::Endpoint::client(bind_addr)
             .map_err(|e| TransportError::ConnectionFailed(e.to_string()))?;
         endpoint.set_default_client_config(client_config);
 
@@ -128,6 +144,67 @@ impl QuicAdapter {
             lifecycle: RwLock::new(lifecycle),
             subscriptions: TransportSubscriptionMap::new(),
         })
+    }
+
+    /// Creates a new `QuicAdapter` by resolving a relay URL and building a
+    /// QUIC client configuration with Web PKI trust, SCP ALPN, and TLS 1.3
+    /// session resumption (1-RTT). 0-RTT early data is intentionally NOT
+    /// enabled — see the 0-RTT safety note below.
+    ///
+    /// This is the URL-based counterpart to [`connect`](Self::connect): it
+    /// performs DNS resolution of the relay's host:port, constructs a
+    /// non-permissive `rustls::ClientConfig` (see security note below), wires
+    /// the lifecycle's [`SessionTicketStore`] for 1-RTT resumption, applies
+    /// the lifecycle keepalive, and then delegates to the same connection
+    /// path as [`connect`].
+    ///
+    /// The accepted URL schemes mirror the WebSocket adapter's relay URLs:
+    /// `wss://` / `https://` (TLS, Web PKI roots) connect over QUIC normally.
+    /// `ws://` / `http://` are **rejected** — QUIC mandates TLS 1.3
+    /// (RFC 9001 §4.1), so there is no plaintext QUIC. Plaintext local relays
+    /// stay on WebSocket; the [`TransportSelector`](crate::selection::TransportSelector)
+    /// only probes QUIC for TLS relays that advertise it.
+    ///
+    /// # 0-RTT safety (spec §10.14.2)
+    ///
+    /// This method establishes the connection with the **full 1-RTT
+    /// handshake** (`endpoint.connect(...).await`) and never calls
+    /// `Connecting::into_0rtt`. No application data is sent as 0-RTT early
+    /// data, so non-idempotent operations (PUBLISH, DELETE, UNSUBSCRIBE) are
+    /// inherently safe from 0-RTT replay — every operation runs only after the
+    /// handshake completes. The wired [`SessionTicketStore`] accelerates the
+    /// *handshake* (session resumption) but does not enable early data.
+    ///
+    /// # Security
+    ///
+    /// quinn's `platform-verifier` feature is intentionally disabled (it pulls
+    /// in a second crypto provider — see the crate `Cargo.toml`). The client
+    /// config therefore supplies its **own** root store, built from the
+    /// Mozilla Web PKI trust anchors (`webpki-roots`) via
+    /// `rustls::ClientConfig::builder_with_provider(ring::default_provider())`.
+    /// No accept-all / empty / permissive verifier is ever wired: an untrusted
+    /// server certificate fails the handshake closed. If no trust anchors are
+    /// available the config build fails rather than connecting insecurely.
+    ///
+    /// # Arguments
+    ///
+    /// * `relay_url` -- The relay URL (e.g. `"wss://relay.example.com/scp/v1"`).
+    /// * `lifecycle` -- Lifecycle manager supplying the ticket store, keepalive,
+    ///   and backoff configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransportError::ProtocolError`] if the URL scheme is not a TLS
+    /// scheme (e.g. `ws://`), if the host is missing, or if the rustls config
+    /// cannot be built. Returns [`TransportError::ConnectionFailed`] if DNS
+    /// resolution fails or the QUIC connection cannot be established.
+    pub async fn connect_url(
+        relay_url: &str,
+        lifecycle: QuicLifecycleManager,
+    ) -> Result<Self, TransportError> {
+        let (host, addr) = resolve_quic_target(relay_url).await?;
+        let client_config = build_quic_client_config(lifecycle.ticket_store(), &lifecycle)?;
+        Self::connect(addr, &host, client_config, lifecycle).await
     }
 
     /// Creates a `QuicAdapter` wrapping an existing QUIC connection.
@@ -569,6 +646,189 @@ impl TransportAdapter for QuicAdapter {
             }
         })
     }
+}
+
+/// Parses a relay URL and resolves its host:port to a [`SocketAddr`].
+///
+/// Only TLS schemes are accepted: `wss://` and `https://`. Plaintext schemes
+/// (`ws://`, `http://`) are rejected because QUIC mandates TLS 1.3
+/// (RFC 9001 §4.1) — there is no plaintext QUIC transport. Scheme matching is
+/// case-insensitive per RFC 3986 §3.1. When the URL omits a port, the QUIC
+/// default of `443` is used (QUIC runs over UDP/443 alongside HTTPS).
+///
+/// Returns the `(server_name, socket_addr)` pair: the server name is the host
+/// (for TLS SNI / certificate verification) and the socket address is the
+/// resolved UDP target for the QUIC endpoint.
+///
+/// [`SocketAddr`]: std::net::SocketAddr
+async fn resolve_quic_target(
+    relay_url: &str,
+) -> Result<(String, std::net::SocketAddr), TransportError> {
+    // Normalize scheme to lowercase (RFC 3986 §3.1: scheme is case-insensitive).
+    let lower = relay_url.to_ascii_lowercase();
+    let host_and_path = if let Some(stripped) = lower.strip_prefix("wss://") {
+        stripped
+    } else if let Some(stripped) = lower.strip_prefix("https://") {
+        stripped
+    } else {
+        return Err(TransportError::ProtocolError(format!(
+            "QUIC requires a TLS relay URL (wss:// or https://), got: {relay_url}"
+        )));
+    };
+
+    // Strip any path/query, keeping only the authority (host[:port]).
+    let authority = host_and_path
+        .split('/')
+        .next()
+        .unwrap_or(host_and_path)
+        .split('?')
+        .next()
+        .unwrap_or(host_and_path);
+
+    if authority.is_empty() {
+        return Err(TransportError::ProtocolError(
+            "QUIC relay URL has an empty host".to_owned(),
+        ));
+    }
+
+    // Strip userinfo (RFC 3986 §3.2.1) before host extraction to prevent a
+    // bypass via `wss://user:pass@evil.com` — the `@` separates userinfo from
+    // the authority, so the real connection target is `evil.com`. The native /
+    // WebSocket path strips userinfo for the same reason (see
+    // `relay::connection::is_loopback`); mirror it here for defense-in-depth.
+    let authority = authority
+        .rfind('@')
+        .map_or(authority, |at_pos| &authority[at_pos + 1..]);
+
+    if authority.is_empty() {
+        return Err(TransportError::ProtocolError(
+            "QUIC relay URL has an empty host".to_owned(),
+        ));
+    }
+
+    // Split host:port. IPv6 literals are bracketed (`[::1]:443`); handle them
+    // by locating the closing bracket before scanning for the port colon.
+    let (host, port) = parse_host_port(authority)?;
+
+    // Resolve to a concrete socket address via DNS (or direct IP parse).
+    let resolved = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|e| {
+            TransportError::ConnectionFailed(format!("DNS resolution failed for {host}: {e}"))
+        })?
+        .next()
+        .ok_or_else(|| {
+            TransportError::ConnectionFailed(format!("no addresses resolved for host: {host}"))
+        })?;
+
+    Ok((host, resolved))
+}
+
+/// Splits an authority (`host`, `host:port`, `[ipv6]`, or `[ipv6]:port`) into
+/// its host and port components. Defaults to port `443` (QUIC over UDP/443)
+/// when no port is present.
+fn parse_host_port(authority: &str) -> Result<(String, u16), TransportError> {
+    /// QUIC default port — runs over UDP/443 alongside HTTPS.
+    const DEFAULT_QUIC_PORT: u16 = 443;
+
+    if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal: `[addr]` or `[addr]:port`.
+        let close = rest.find(']').ok_or_else(|| {
+            TransportError::ProtocolError(format!(
+                "malformed IPv6 host in QUIC relay URL: {authority}"
+            ))
+        })?;
+        let host = rest[..close].to_owned();
+        let after = &rest[close + 1..];
+        let port = if let Some(p) = after.strip_prefix(':') {
+            p.parse::<u16>().map_err(|_| {
+                TransportError::ProtocolError(format!(
+                    "invalid port in QUIC relay URL: {authority}"
+                ))
+            })?
+        } else {
+            DEFAULT_QUIC_PORT
+        };
+        return Ok((host, port));
+    }
+
+    // IPv4 / DNS host: split on the single ':' if present.
+    match authority.rsplit_once(':') {
+        Some((host, port_str)) => {
+            let port = port_str.parse::<u16>().map_err(|_| {
+                TransportError::ProtocolError(format!(
+                    "invalid port in QUIC relay URL: {authority}"
+                ))
+            })?;
+            Ok((host.to_owned(), port))
+        }
+        None => Ok((authority.to_owned(), DEFAULT_QUIC_PORT)),
+    }
+}
+
+/// Builds a quinn `ClientConfig` for connecting to a TLS QUIC relay.
+///
+/// The TLS config is built via
+/// `rustls::ClientConfig::builder_with_provider(ring::default_provider())`
+/// with a root store populated from the Mozilla Web PKI trust anchors
+/// (`webpki-roots`). This is a **non-permissive** verifier: untrusted server
+/// certificates fail the handshake. quinn's `platform-verifier` is disabled
+/// (see crate `Cargo.toml`), so this explicit root store is the trust anchor.
+///
+/// The lifecycle's [`SessionTicketStore`] is wired as the rustls
+/// `ClientSessionStore` so resumed connections reuse session tickets for a
+/// faster (1-RTT) handshake. 0-RTT early data is **not** enabled here — see
+/// [`QuicAdapter::connect_url`] for the 0-RTT safety rationale.
+///
+/// # Errors
+///
+/// Returns [`TransportError::ProtocolError`] if the rustls protocol-version or
+/// QUIC-config construction fails.
+fn build_quic_client_config(
+    ticket_store: &crate::quic::lifecycle::SessionTicketStore,
+    lifecycle: &QuicLifecycleManager,
+) -> Result<quinn::ClientConfig, TransportError> {
+    use std::sync::Arc;
+
+    // WebPKI (Mozilla) root trust anchors. This is the same trust set a
+    // browser/OS would use for HTTPS — no custom or permissive verifier.
+    let root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+
+    // Build the rustls client config on the ring provider (quinn is ring-only;
+    // see crate Cargo.toml). builder_with_provider keeps the process-default
+    // crypto provider unambiguous.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut tls_config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| {
+            TransportError::ProtocolError(format!("failed to set TLS protocol versions: {e}"))
+        })?
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    // SCP ALPN — the relay negotiates the SCP application protocol.
+    tls_config.alpn_protocols = vec![crate::quic::listener::SCP_ALPN.to_vec()];
+
+    // Wire the session ticket store for 1-RTT resumption. The store is
+    // Arc-backed internally, so cloning shares the same ticket state used by
+    // the lifecycle manager.
+    tls_config.resumption =
+        rustls::client::Resumption::store(Arc::new(ticket_store.clone()) as Arc<_>);
+
+    let quic_client_config = quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
+        .map_err(|e| {
+            TransportError::ProtocolError(format!("failed to build QUIC client config: {e}"))
+        })?;
+    let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_config));
+
+    // Apply lifecycle keepalive (QUIC-native PING frames replace WS PING/PONG).
+    let mut transport_config = quinn::TransportConfig::default();
+    lifecycle.configure_transport(&mut transport_config);
+    client_config.transport_config(Arc::new(transport_config));
+
+    Ok(client_config)
 }
 
 /// Stream adapter that converts QUIC subscription messages (received via a
@@ -1173,6 +1433,157 @@ mod tests {
         assert!(
             result.is_none(),
             "BLOB with mismatched routing_id must be dropped, got {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // connect_url: client config trust (non-permissive verifier)
+    // -----------------------------------------------------------------------
+
+    /// The production client config built for `connect_url` uses the Web PKI
+    /// root store, NOT an accept-all verifier. Connecting to a relay that
+    /// presents an untrusted self-signed certificate MUST fail the handshake.
+    ///
+    /// This proves no permissive/accept-all verifier is wired: a self-signed
+    /// cert (untrusted by the Mozilla root bundle) is rejected. If a permissive
+    /// verifier were used, the handshake would succeed and this test would fail.
+    #[tokio::test]
+    async fn connect_url_rejects_untrusted_self_signed_cert() {
+        // Start a QUIC listener with a self-signed cert (untrusted by Web PKI).
+        let (handle, addr, _certs, _storage, _subs) = start_test_listener();
+
+        // Build the *production* client config (Web PKI roots), the same one
+        // connect_url uses. Bypass DNS resolution by connecting to the bound
+        // loopback addr directly with QuicAdapter::connect.
+        let lifecycle = test_lifecycle();
+        let client_config = super::build_quic_client_config(lifecycle.ticket_store(), &lifecycle)
+            .expect("client config should build");
+
+        // The relay's self-signed cert is NOT in the Web PKI root store, so the
+        // TLS handshake must fail. Use "localhost" as the SNI (the cert's name)
+        // to isolate the failure to trust, not name mismatch.
+        let result = QuicAdapter::connect(addr, "localhost", client_config, test_lifecycle()).await;
+
+        assert!(
+            result.is_err(),
+            "connecting with the Web PKI client config to an untrusted self-signed \
+             relay MUST fail — a permissive verifier would have accepted it"
+        );
+
+        handle.shutdown();
+    }
+
+    /// `connect_url` rejects plaintext schemes: QUIC mandates TLS 1.3, so
+    /// `ws://` / `http://` have no QUIC form and must error before any IO.
+    #[tokio::test]
+    async fn connect_url_rejects_plaintext_scheme() {
+        let lifecycle = test_lifecycle();
+        let err = QuicAdapter::connect_url("ws://127.0.0.1:9000/scp/v1", lifecycle)
+            .await
+            .expect_err("ws:// must be rejected for QUIC");
+        assert!(
+            matches!(err, TransportError::ProtocolError(_)),
+            "expected ProtocolError for plaintext scheme, got {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // IPv6 / dual-stack: client endpoint must bind to the relay's address family
+    // -----------------------------------------------------------------------
+
+    /// The client endpoint must bind to the *same address family* as the
+    /// resolved relay. A socket bound to the IPv4 wildcard cannot reach an
+    /// IPv6 destination, which would surface as a connect failure and silently
+    /// disable QUIC for IPv6 / dual-stack relays.
+    ///
+    /// This connects to a dead `[::1]` port. The expectation is a *connection*
+    /// failure from the handshake never completing (no listener), NOT a bind /
+    /// address-family error. If the endpoint were still bound to IPv4, quinn
+    /// would reject the IPv6 destination at `endpoint.connect()` with an
+    /// "invalid remote address" / family-mismatch error before any handshake —
+    /// proving the bug. A clean timeout/connection error proves the socket is
+    /// IPv6-capable.
+    #[tokio::test]
+    async fn connect_binds_ipv6_for_ipv6_relay() {
+        use std::net::{Ipv6Addr, SocketAddr};
+
+        // A dead loopback IPv6 target: a port nothing is listening on.
+        let relay_addr = SocketAddr::from((Ipv6Addr::LOCALHOST, 1));
+
+        let lifecycle = test_lifecycle();
+        let client_config = super::build_quic_client_config(lifecycle.ticket_store(), &lifecycle)
+            .expect("client config should build");
+
+        // Bound the time: a missing listener means the handshake never
+        // completes, so cap the wait so the test can assert on the outcome.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            QuicAdapter::connect(relay_addr, "localhost", client_config, test_lifecycle()),
+        )
+        .await;
+
+        match result {
+            // Handshake to a dead IPv6 port never completed within the bound:
+            // the socket *was* IPv6-capable and tried to reach the target.
+            // A cross-family bind would have failed synchronously, well under
+            // the timeout, so a timeout here proves the IPv6 bind worked.
+            Err(_elapsed) => {}
+            // Connect returned an error. It MUST be a connection-level failure
+            // (handshake/transport), NOT an address-family / bind error.
+            Ok(Err(TransportError::ConnectionFailed(msg))) => {
+                let lower = msg.to_ascii_lowercase();
+                assert!(
+                    !(lower.contains("address family")
+                        || lower.contains("invalid remote address")
+                        || lower.contains("family")),
+                    "connect failed with an address-family/bind error, meaning the \
+                     client endpoint was NOT bound IPv6-capable: {msg}"
+                );
+            }
+            Ok(Err(other)) => panic!("unexpected error variant for dead IPv6 target: {other:?}"),
+            Ok(Ok(_)) => panic!("connect unexpectedly succeeded against a dead [::1] port"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_quic_target: userinfo stripping (RFC 3986 §3.2.1 bypass defense)
+    // -----------------------------------------------------------------------
+
+    /// `resolve_quic_target` must strip userinfo (`user:pass@`) before host
+    /// extraction so a URL like `wss://user@host` connects to `host`, not to a
+    /// host smuggled in the userinfo. Mirrors the WebSocket path's defense.
+    ///
+    /// Resolving `wss://user:pass@[::1]:8443/scp` must yield `[::1]:8443`. If
+    /// userinfo were not stripped, `parse_host_port` would see `user:pass@[::1]`
+    /// and either fail or resolve the wrong host.
+    #[tokio::test]
+    async fn resolve_quic_target_strips_userinfo() {
+        let (host, addr) = super::resolve_quic_target("wss://user:pass@[::1]:8443/scp/v1")
+            .await
+            .expect("userinfo-bearing IPv6 URL should resolve to the bracketed host");
+
+        assert_eq!(host, "::1", "host must be the authority host, not userinfo");
+        assert!(addr.is_ipv6(), "resolved addr must be IPv6: {addr}");
+        assert_eq!(addr.port(), 8443, "port must come from the authority");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 8443)),
+            "must resolve to [::1]:8443 after stripping userinfo"
+        );
+    }
+
+    /// IPv4 userinfo form: `wss://user@127.0.0.1:9443` resolves to
+    /// `127.0.0.1:9443`, not to a userinfo-smuggled host.
+    #[tokio::test]
+    async fn resolve_quic_target_strips_userinfo_ipv4() {
+        let (host, addr) = super::resolve_quic_target("wss://user@127.0.0.1:9443/scp")
+            .await
+            .expect("userinfo-bearing IPv4 URL should resolve to the authority host");
+
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(
+            addr,
+            std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 9443))
         );
     }
 

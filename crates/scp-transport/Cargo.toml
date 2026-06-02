@@ -18,7 +18,7 @@ combined = ["dep:rusqlite", "dep:scp-platform"]
 relay-persistence = ["dep:scp-platform"]
 postgres-blob = ["dep:sqlx"]
 s3-blob = ["dep:aws-sdk-s3", "dep:aws-config", "dep:http-body"]
-quic = ["dep:quinn", "dep:rustls", "dep:rcgen"]
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:webpki-roots"]
 udp = ["dep:openssl", "dep:socket2"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:http"]
 webtransport-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:getrandom_02", "dep:getrandom_03"]
@@ -77,6 +77,12 @@ socket2 = { version = "0.5", optional = true, features = ["all"] }
 h3 = { version = "0.0.8", optional = true }
 h3-quinn = { version = "0.0.10", optional = true }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+# Mozilla CA root bundle for QUIC client TLS verification. quinn dropped the
+# `platform-verifier` feature (see the `quinn` dep note above), so the QUIC
+# client config must supply its own WebPKI root store. webpki-roots provides
+# the same trust anchors the OS/browser would use, without pulling in a second
+# crypto provider. Gated on `quic` to keep the default build lean.
+webpki-roots = { version = "1", optional = true }
 rcgen = { version = "0.13", optional = true }
 bytes = "1"
 http = { version = "1", optional = true }

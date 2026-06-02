@@ -3,11 +3,14 @@
 //! This module implements the full QUIC connection lifecycle per spec
 //! section 10.14.2 and ADR-037:
 //!
-//! - **0-RTT session resumption** via stored session tickets. Session
-//!   tickets are persisted across adapter restarts using
-//!   [`SessionTicketStore`], enabling clients to send application data
-//!   immediately on reconnection without waiting for the handshake to
-//!   complete (RFC 9001 section 4.6.1).
+//! - **TLS 1.3 session resumption (1-RTT)** via stored session tickets.
+//!   Session tickets are persisted across adapter restarts using
+//!   [`SessionTicketStore`], letting clients abbreviate the handshake on
+//!   reconnection (RFC 8446 section 2.2). 0-RTT early data is deliberately
+//!   NOT enabled — application data is only sent after the handshake
+//!   completes, so non-idempotent SCP operations cannot ride 0-RTT and be
+//!   replayed. See [`QuicAdapter::connect_url`](super::QuicAdapter::connect_url)
+//!   for the 0-RTT safety rationale.
 //!
 //! - **Connection migration** when the client's IP address changes
 //!   (e.g., Wi-Fi to cellular). QUIC migrates the connection without
@@ -39,24 +42,27 @@ use zeroize::Zeroizing;
 use crate::profile::TransportProfile;
 
 // ---------------------------------------------------------------------------
-// Session Ticket Store (0-RTT resumption)
+// Session Ticket Store (TLS 1.3 session resumption, 1-RTT)
 // ---------------------------------------------------------------------------
 
-/// Opaque session ticket data for QUIC 0-RTT resumption.
+/// Opaque session ticket data for TLS 1.3 session resumption (1-RTT).
 ///
 /// Wraps the raw bytes of a TLS 1.3 session ticket (`NewSessionTicket`
 /// message). The ticket is issued by the server at the end of the QUIC
-/// handshake and stored by the client for future 0-RTT connections.
+/// handshake and stored by the client to abbreviate future handshakes.
 ///
 /// Session tickets are opaque to the client -- only the server can
 /// validate them. The client stores them by relay URL and presents them
-/// on reconnection to enable 0-RTT data transmission.
+/// on reconnection to resume the TLS session (1-RTT). 0-RTT early data is
+/// not enabled (see the module docs), so resumption speeds up the
+/// handshake but does not let application data ride the first flight.
 ///
 /// # Security
 ///
-/// 0-RTT data has no forward secrecy and is vulnerable to replay attacks
-/// (RFC 9001 section 9.2). SCP operations sent as 0-RTT MUST be idempotent
-/// or the relay MUST implement anti-replay measures per spec section 10.14.2.
+/// 0-RTT early data has no forward secrecy and is vulnerable to replay
+/// attacks (RFC 9001 section 9.2). Because SCP does not enable 0-RTT, no
+/// application data is exposed to that replay window; every operation runs
+/// only after the resumed handshake completes.
 #[derive(Debug, Clone)]
 pub struct SessionTicket {
     /// The raw session ticket bytes (opaque TLS 1.3 `NewSessionTicket`).
@@ -69,7 +75,7 @@ pub struct SessionTicket {
     received_at: Instant,
 
     /// Maximum lifetime of the ticket as declared by the server.
-    /// After this duration, the ticket MUST NOT be used for 0-RTT.
+    /// After this duration, the ticket MUST NOT be used for resumption.
     max_lifetime: Duration,
 }
 
@@ -92,7 +98,7 @@ impl SessionTicket {
     /// Returns `true` if this ticket has expired.
     ///
     /// A ticket expires when `elapsed_since_received >= max_lifetime`.
-    /// Expired tickets MUST NOT be used for 0-RTT resumption.
+    /// Expired tickets MUST NOT be used for session resumption.
     #[must_use]
     pub fn is_expired(&self) -> bool {
         self.received_at.elapsed() >= self.max_lifetime
@@ -117,14 +123,14 @@ impl SessionTicket {
     }
 }
 
-/// Persistent session ticket store for QUIC 0-RTT resumption across
-/// adapter restarts (section 10.14.2).
+/// Persistent session ticket store for TLS 1.3 session resumption (1-RTT)
+/// across adapter restarts (section 10.14.2).
 ///
 /// Stores session tickets keyed by relay URL. When a QUIC connection
 /// completes a handshake and the server issues a session ticket, the
 /// client stores it here. On reconnection, the client retrieves the
-/// stored ticket for the target relay and uses it for 0-RTT data
-/// transmission.
+/// stored ticket for the target relay and uses it to resume the TLS
+/// session, abbreviating the handshake. 0-RTT early data is not enabled.
 ///
 /// The store is thread-safe (`Send + Sync`) via interior mutability so
 /// it can be shared across adapter instances and tokio tasks.
@@ -156,7 +162,7 @@ struct SessionTicketStoreInner {
     capacity: usize,
 
     /// TLS 1.3 session tickets keyed by server name, used by rustls
-    /// via the [`ClientSessionStore`] trait for 0-RTT resumption.
+    /// via the [`ClientSessionStore`] trait for session resumption (1-RTT).
     /// Each server may have multiple valid tickets (FIFO queue).
     tls13_tickets: HashMap<ServerName<'static>, Vec<rustls::client::Tls13ClientSessionValue>>,
 
@@ -596,8 +602,9 @@ const RECONNECT_GAP_FILL_OVERLAP: Duration = Duration::from_secs(5);
 ///
 /// Coordinates all aspects of QUIC connection lifecycle:
 ///
-/// 1. **0-RTT resumption:** Stores and retrieves session tickets via
-///    [`SessionTicketStore`] for instant reconnection.
+/// 1. **Session resumption (1-RTT):** Stores and retrieves TLS 1.3 session
+///    tickets via [`SessionTicketStore`] to abbreviate the reconnection
+///    handshake. 0-RTT early data is not enabled.
 /// 2. **Connection migration:** Monitors for IP address changes and
 ///    reports migration events.
 /// 3. **Keepalive:** Configures QUIC-native PING frames via
@@ -624,7 +631,7 @@ pub struct QuicLifecycleManager {
     /// Transport profile driving reconnection and keepalive behavior.
     profile: TransportProfile,
 
-    /// Session ticket store for 0-RTT resumption.
+    /// Session ticket store for TLS 1.3 session resumption (1-RTT).
     ticket_store: SessionTicketStore,
 
     /// Keepalive configuration for QUIC PING frames.
@@ -706,7 +713,7 @@ impl QuicLifecycleManager {
         self.keepalive.apply_to_transport_config(config);
     }
 
-    /// Stores a session ticket for future 0-RTT resumption.
+    /// Stores a session ticket for future session resumption (1-RTT).
     ///
     /// Called when the server issues a session ticket after a successful
     /// QUIC handshake. The ticket is stored by relay URL for use on
@@ -721,7 +728,7 @@ impl QuicLifecycleManager {
         self.ticket_store.store(relay_url, ticket);
     }
 
-    /// Retrieves a stored session ticket for 0-RTT resumption.
+    /// Retrieves a stored session ticket for session resumption (1-RTT).
     ///
     /// Returns `None` if no valid (non-expired) ticket exists for the
     /// relay URL.
