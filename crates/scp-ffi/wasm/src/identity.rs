@@ -299,37 +299,96 @@ pub(crate) fn resolve_verification_method_key(did: &str, kid: &str) -> Result<[u
     })
 }
 
-/// Exports the Ed25519 [`SigningKey`] for the identity identified by `did`.
+/// Runs `op` with a transient Ed25519 [`SigningKey`] for the identity
+/// `did`, materialising the key only for the duration of `op` and
+/// dropping (zeroing) it before this function returns.
 ///
-/// SCP-OUT-037 (WASM portion) — the streaming bridge needs the invoker's
-/// signing key to produce per-chunk and per-credit-grant signatures
-/// (§5.4.5). The key never leaves WASM linear memory; the returned
-/// [`SigningKey`] is consumed in the same `with_manager` closure.
+/// SCP-OUT-037 W1 (ADR-006; ADR-034 §1 + ADR-049 round-7) — the §5.4.5
+/// streaming control plane needs the invoker's `#active` signing key to
+/// produce per-chunk, per-credit-grant, and per-cancel signatures, but
+/// MUST NOT retain that key for the multi-call lifetime of a stream
+/// session. This helper inverts control: instead of handing the caller a
+/// long-lived owned `SigningKey` (the W1 retention footgun this replaced
+/// — a prior `export_signing_key` helper that returned the key by value
+/// has been removed), it builds the key from the registry's
+/// `Zeroizing<[u8; 32]>` bytes *inside* the registry borrow, runs the
+/// caller's signing closure against a `&` reference, and drops the key
+/// the instant `op` returns —
+/// minimising the window in which secret bytes exist as a live
+/// [`SigningKey`] in WASM linear memory.
+///
+/// # Threat model (ADR-034 §1; ADR-049 round-7)
+///
+/// On the browser WASM target there is no out-of-process operator and no
+/// platform [`crate::custody::JsKeyCustody`] routing for the signing path
+/// — that custody indirection is a separate redesign and out of scope
+/// here. ADR-034 §1 keeps the WASM bridge invoker-as-operator,
+/// single-process; ADR-049 round-7 confirms the WASM bridge retains the
+/// invoker-as-operator model on a single process. WASM linear memory is
+/// readable by same-origin JS, so any materialised key sits inside the
+/// JS-host trust boundary regardless. The mitigation this helper provides
+/// is therefore not isolation (impossible on this target) but
+/// *minimisation*: the transient key is built from `Zeroizing` source
+/// bytes, lives only across one synchronous signing closure, and is
+/// scrubbed on drop. No key bytes persist across `await` points, across
+/// JS-host re-entry, or for the multi-call lifetime of a stream session.
+/// `JsKeyCustody`-routed signing is N/A on this path until the custody
+/// redesign lands.
 ///
 /// # Errors
 ///
-/// Returns `ScpWasmError::Identity` (`SCP-IDENT-1041`) if the DID is not
-/// in the local identity registry. The agent key is never used here —
-/// outlet streaming binds to the identity-key-bound `#active` signing
-/// key per §5.4.5 / §3.5.
-///
-/// # Security
-///
-/// Callers MUST drop the returned [`SigningKey`] promptly. The key
-/// implements `ZeroizeOnDrop` so its memory is overwritten when the
-/// owning binding is dropped.
-pub(crate) fn export_signing_key(did: &str) -> Result<ed25519_dalek::SigningKey, ScpWasmError> {
+/// Returns `ScpWasmError::Identity` (`SCP-IDENT-1041`) if `did` is not in
+/// the local identity registry. Propagates any error `op` returns.
+pub(crate) fn with_signing_key<T, F>(did: &str, op: F) -> Result<T, ScpWasmError>
+where
+    F: FnOnce(&ed25519_dalek::SigningKey) -> Result<T, ScpWasmError>,
+{
     IDENTITY_REGISTRY.with(|reg| {
         let map = reg.borrow();
         let entry = map.get(did).ok_or_else(|| ScpWasmError::Identity {
             message: format!("DID '{did}' not found in identity registry"),
             code: codes::IDENT_1041.to_owned(),
         })?;
-        // `signing_key_bytes` is `Zeroizing<[u8; 32]>`. `Deref` yields a
-        // `&[u8; 32]` which `SigningKey::from_bytes` accepts directly.
+        // Build the transient key inside the borrow from the
+        // `Zeroizing<[u8; 32]>` source bytes. `SigningKey` is
+        // `ZeroizeOnDrop`, so the materialised key is scrubbed when this
+        // binding drops at the end of the closure — the key never
+        // outlives `op`.
         let sk_bytes: &[u8; 32] = &entry.signing_key_bytes;
-        Ok(ed25519_dalek::SigningKey::from_bytes(sk_bytes))
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(sk_bytes);
+        op(&signing_key)
     })
+}
+
+/// Test-only: registers an identity in the WASM-local registry directly
+/// from a known [`ed25519_dalek::SigningKey`], returning the derived
+/// `did:dht:z{zbase32(pubkey)}` DID.
+///
+/// SCP-OUT-037 W1 test support: the streaming control plane signs
+/// on-demand via [`with_signing_key`], which requires the invoker DID to
+/// be present in `IDENTITY_REGISTRY`. The streaming manager tests use a
+/// deterministic signing key; this helper installs it under its real
+/// derived DID so `with_signing_key` resolves and the test's expected
+/// verifying key matches the session's pinned key. Mirrors the
+/// key-storage block of [`identity_create`] minus the custody-string and
+/// agent-key plumbing.
+#[cfg(test)]
+pub(crate) fn register_identity_for_test(signing_key: &ed25519_dalek::SigningKey) -> String {
+    let verifying_key = signing_key.verifying_key();
+    let pub_bytes = verifying_key.to_bytes();
+    let did = format!("did:dht:z{}", zbase32_encode(&pub_bytes));
+    IDENTITY_REGISTRY.with(|reg| {
+        reg.borrow_mut().insert(
+            did.clone(),
+            IdentityEntry {
+                signing_key_bytes: zeroize::Zeroizing::new(signing_key.to_bytes()),
+                public_key_bytes: pub_bytes,
+                custody_type: "in_memory".to_owned(),
+                agent_signing_key_bytes: None,
+            },
+        );
+    });
+    did
 }
 
 /// Verifies an HMAC-SHA256 tag over `data` using a key derived from the
