@@ -593,12 +593,6 @@ public protocol ContextHandleProtocol: AnyObject, Sendable {
     func creatorDid()  -> String
     
     /**
-     * Returns the monotonic identifier of the bridge instance that minted
-     * this handle.
-     */
-    func instanceId()  -> UInt64
-    
-    /**
      * Returns the context's current lifecycle state as a string.
      *
      * One of: `"creating"`, `"active"`, `"closing"`, `"closed"`, `"expired"`,
@@ -690,17 +684,6 @@ open func contextId() -> String  {
 open func creatorDid() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_scp_ffi_uniffi_fn_method_contexthandle_creator_did(self.uniffiClonePointer(),$0
-    )
-})
-}
-    
-    /**
-     * Returns the monotonic identifier of the bridge instance that minted
-     * this handle.
-     */
-open func instanceId() -> UInt64  {
-    return try!  FfiConverterUInt64.lift(try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_method_contexthandle_instance_id(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -866,12 +849,6 @@ public protocol IdentityProtocol: AnyObject, Sendable {
      * See ADR-039 acceptance criterion 4.
      */
     func hasAgentKey()  -> Bool
-    
-    /**
-     * Returns the monotonic identifier of the bridge instance that minted
-     * this handle.
-     */
-    func instanceId()  -> UInt64
     
     /**
      * Removes the agent signing key from this identity (ADR-039).
@@ -1121,17 +1098,6 @@ open func hasAgentKey() -> Bool  {
 }
     
     /**
-     * Returns the monotonic identifier of the bridge instance that minted
-     * this handle.
-     */
-open func instanceId() -> UInt64  {
-    return try!  FfiConverterUInt64.lift(try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_method_identity_instance_id(self.uniffiClonePointer(),$0
-    )
-})
-}
-    
-    /**
      * Removes the agent signing key from this identity (ADR-039).
      *
      * Removes the `#agent` verification method from the DID document,
@@ -1370,12 +1336,6 @@ public protocol NodeHandleProtocol: AnyObject, Sendable {
     func httpUrl() async  -> String?
     
     /**
-     * Returns the monotonic identifier of the bridge instance that minted
-     * this handle.
-     */
-    func instanceId()  -> UInt64
-    
-    /**
      * Returns `true` if shutdown has already been signaled.
      */
     func isShutdown()  -> Bool
@@ -1586,17 +1546,6 @@ open func httpUrl()async  -> String?  {
 }
     
     /**
-     * Returns the monotonic identifier of the bridge instance that minted
-     * this handle.
-     */
-open func instanceId() -> UInt64  {
-    return try!  FfiConverterUInt64.lift(try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_method_nodehandle_instance_id(self.uniffiClonePointer(),$0
-    )
-})
-}
-    
-    /**
      * Returns `true` if shutdown has already been signaled.
      */
 open func isShutdown() -> Bool  {
@@ -1755,12 +1704,6 @@ public func FfiConverterTypeNodeHandle_lower(_ value: NodeHandle) -> UnsafeMutab
 public protocol RelayHandleProtocol: AnyObject, Sendable {
     
     /**
-     * Returns the monotonic identifier of the bridge instance that minted
-     * this handle.
-     */
-    func instanceId()  -> UInt64
-    
-    /**
      * Returns `true` if shutdown has already been signaled.
      */
     func isShutdown()  -> Bool
@@ -1843,17 +1786,6 @@ open class RelayHandle: RelayHandleProtocol, @unchecked Sendable {
 
     
 
-    
-    /**
-     * Returns the monotonic identifier of the bridge instance that minted
-     * this handle.
-     */
-open func instanceId() -> UInt64  {
-    return try!  FfiConverterUInt64.lift(try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_method_relayhandle_instance_id(self.uniffiClonePointer(),$0
-    )
-})
-}
     
     /**
      * Returns `true` if shutdown has already been signaled.
@@ -2206,9 +2138,24 @@ public protocol ScpProtocol: AnyObject, Sendable {
     
     /**
      * Per-instance equivalent of the free-function `context_import`.
+     *
+     * # Arguments
+     *
+     * * `data` — serialized context export bytes.
+     * * `importer_identity` — the local identity importing the context.
+     * Required so the importer's own per-context pseudonym (§9.10.4) can
+     * be derived from their custody-held identity key. Passing `[0u8; 32]`
+     * here (the pre-fix behavior) would re-introduce the zero-pseudonym /
+     * membership-enumeration attack vector.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` if deserialization, validation, or import
+     * fails, or `ScpError::Identity` if the importer's pseudonym cannot be
+     * derived from custody (e.g. no custody provider configured).
      */
     func contextImport(data: Data, importerIdentity: Identity) async throws  -> String
-
+    
     /**
      * Per-instance equivalent of the free-function `context_is_member`.
      *
@@ -3779,6 +3726,21 @@ open func contextHandleTtlExpiry(handle: ContextHandle)async throws   {
     
     /**
      * Per-instance equivalent of the free-function `context_import`.
+     *
+     * # Arguments
+     *
+     * * `data` — serialized context export bytes.
+     * * `importer_identity` — the local identity importing the context.
+     * Required so the importer's own per-context pseudonym (§9.10.4) can
+     * be derived from their custody-held identity key. Passing `[0u8; 32]`
+     * here (the pre-fix behavior) would re-introduce the zero-pseudonym /
+     * membership-enumeration attack vector.
+     *
+     * # Errors
+     *
+     * Returns `ScpError::Context` if deserialization, validation, or import
+     * fails, or `ScpError::Identity` if the importer's pseudonym cannot be
+     * derived from custody (e.g. no custody provider configured).
      */
 open func contextImport(data: Data, importerIdentity: Identity)async throws  -> String  {
     return
@@ -6037,12 +5999,6 @@ public protocol TransportManagerProtocol: AnyObject, Sendable {
     func assignRelaySet(contextId: String) throws  -> [UInt32]
     
     /**
-     * Returns the monotonic identifier of the bridge instance that minted
-     * this handle.
-     */
-    func instanceId()  -> UInt64
-    
-    /**
      * Returns `true` if the transport is currently connected (has adapters).
      */
     func isConnected()  -> Bool
@@ -6194,17 +6150,6 @@ open func assignRelaySet(contextId: String)throws  -> [UInt32]  {
 }
     
     /**
-     * Returns the monotonic identifier of the bridge instance that minted
-     * this handle.
-     */
-open func instanceId() -> UInt64  {
-    return try!  FfiConverterUInt64.lift(try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_method_transportmanager_instance_id(self.uniffiClonePointer(),$0
-    )
-})
-}
-    
-    /**
      * Returns `true` if the transport is currently connected (has adapters).
      */
 open func isConnected() -> Bool  {
@@ -6338,12 +6283,6 @@ public protocol UcanTokenProtocol: AnyObject, Sendable {
     func expiresAt()  -> UInt64?
     
     /**
-     * Returns the monotonic identifier of the bridge instance that minted
-     * this handle.
-     */
-    func instanceId()  -> UInt64
-    
-    /**
      * Returns the issuer DID.
      */
     func issuer()  -> String
@@ -6460,17 +6399,6 @@ open func encoded() -> String  {
 open func expiresAt() -> UInt64?  {
     return try!  FfiConverterOptionUInt64.lift(try! rustCall() {
     uniffi_scp_ffi_uniffi_fn_method_ucantoken_expires_at(self.uniffiClonePointer(),$0
-    )
-})
-}
-    
-    /**
-     * Returns the monotonic identifier of the bridge instance that minted
-     * this handle.
-     */
-open func instanceId() -> UInt64  {
-    return try!  FfiConverterUInt64.lift(try! rustCall() {
-    uniffi_scp_ffi_uniffi_fn_method_ucantoken_instance_id(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -14218,9 +14146,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_creator_did() != 33786) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_instance_id() != 38096) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_method_contexthandle_state() != 16843) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14237,9 +14162,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_has_agent_key() != 16136) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_identity_instance_id() != 28218) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_identity_remove_agent_key() != 20170) {
@@ -14272,9 +14194,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_http_url() != 26199) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_instance_id() != 64848) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_is_shutdown() != 46152) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14291,9 +14210,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_nodehandle_shutdown() != 24736) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_relayhandle_instance_id() != 15482) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_relayhandle_is_shutdown() != 45597) {
@@ -14383,7 +14299,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_handle_ttl_expiry() != 26613) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_import() != 9378) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_import() != 8078) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_context_is_member() != 22393) {
@@ -14707,9 +14623,6 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_assign_relay_set() != 25796) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_instance_id() != 1025) {
-        return InitializationResult.apiChecksumMismatch
-    }
     if (uniffi_scp_ffi_uniffi_checksum_method_transportmanager_is_connected() != 58175) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14729,9 +14642,6 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_expires_at() != 8024) {
-        return InitializationResult.apiChecksumMismatch
-    }
-    if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_instance_id() != 22133) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_ucantoken_issuer() != 27562) {
