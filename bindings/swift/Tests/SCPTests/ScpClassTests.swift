@@ -85,8 +85,8 @@ final class ScpClassTests: XCTestCase {
     /// PR 3 added ``StorageConfig/sqlite(path:key:)`` alongside
     /// ``StorageConfig/inMemory``; the SQLite variant has its own
     /// convenience test below.
-    func testWithStorageInMemoryProducesFreshInstance() {
-        let scp = SCP.withStorage(.inMemory)
+    func testWithStorageInMemoryProducesFreshInstance() throws {
+        let scp = try SCP.withStorage(.inMemory)
         XCTAssertGreaterThan(scp.instanceId, 0)
     }
 
@@ -110,7 +110,7 @@ final class ScpClassTests: XCTestCase {
         }
         let key = Data(keyBytes)
 
-        let scp = SCP.withStorage(sqliteDir: dir, key: key)
+        let scp = try SCP.withStorage(sqliteDir: dir, key: key)
         XCTAssertGreaterThan(scp.instanceId, 0)
     }
 }

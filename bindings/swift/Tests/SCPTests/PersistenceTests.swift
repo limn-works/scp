@@ -56,7 +56,7 @@ final class PersistenceTests: XCTestCase {
             "scp.db must not exist before SCP.withStorage(sqliteDir:key:)"
         )
 
-        let scp = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
+        let scp = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         XCTAssertTrue(
             FileManager.default.fileExists(atPath: dbPath.path),
             "SCP.withStorage(sqliteDir:key:) must create scp.db at \(dbPath.path)"
@@ -71,7 +71,7 @@ final class PersistenceTests: XCTestCase {
         let dir = try makeTempDir()
         defer { removeTempDir(dir) }
 
-        let scp = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
+        let scp = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         try scp.suspend()
         try await scp.resume()
         try await scp.shutdown(timeout: 1)
@@ -84,12 +84,12 @@ final class PersistenceTests: XCTestCase {
         let dir = try makeTempDir()
         defer { removeTempDir(dir) }
 
-        let scp1 = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
+        let scp1 = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         let id1 = scp1.instanceId
         try await scp1.shutdown(timeout: 1)
 
         // Fresh SCP object, same underlying encrypted database.
-        let scp2 = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
+        let scp2 = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         let id2 = scp2.instanceId
         XCTAssertGreaterThan(
             id2, id1,
@@ -98,26 +98,74 @@ final class PersistenceTests: XCTestCase {
         try await scp2.shutdown(timeout: 1)
     }
 
-    /// Construction with a wrong key must not corrupt the original
-    /// encrypted database — the bridge logs and falls back, and a
-    /// subsequent correct-key open still works.
-    func testSqliteRejectsMismatchedKeyWithoutCorruption() async throws {
+    /// FAIL CLOSED (spec §17.6): opening an existing encrypted DB with a
+    /// wrong key must throw — never silently fall back to a fresh in-memory
+    /// instance — and must not corrupt the original DB (a subsequent
+    /// correct-key open still works).
+    func testSqliteWrongKeyFailsClosedWithoutCorruption() async throws {
         let dir = try makeTempDir()
         defer { removeTempDir(dir) }
 
         // First open with the correct key — creates the encrypted DB.
-        let scp1 = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
+        let scp1 = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         try await scp1.shutdown(timeout: 1)
 
-        // Second open with a wrong key. The bridge logs and falls back
-        // to an in-memory-only instance; construction succeeds but the
-        // original DB file must remain readable with the correct key.
+        // Second open with a wrong key must FAIL CLOSED (throw).
         let wrongKey = Data(repeating: 0x11, count: 32)
-        let scp2 = SCP.withStorage(sqliteDir: dir, key: wrongKey)
-        try await scp2.shutdown(timeout: 1)
+        do {
+            let scp2 = try SCP.withStorage(sqliteDir: dir, key: wrongKey)
+            try await scp2.shutdown(timeout: 1)
+            XCTFail("wrong-key open must fail closed, not silently fall back")
+        } catch {
+            // Expected: fail closed.
+        }
 
-        // Third open with the correct key — must still succeed.
-        let scp3 = SCP.withStorage(sqliteDir: dir, key: sqliteKey)
+        // Third open with the correct key — must still succeed (no corruption).
+        let scp3 = try SCP.withStorage(sqliteDir: dir, key: sqliteKey)
         try await scp3.shutdown(timeout: 1)
+    }
+
+    /// `SCP.withStorage(sqliteDir:passphrase:)` must open/create a SQLCipher
+    /// database whose key is derived from a passphrase (Argon2id; spec §17.6),
+    /// and reopen the SAME database with the same passphrase across restart.
+    func testSqlitePassphraseRoundTrip() async throws {
+        let dir = try makeTempDir()
+        defer { removeTempDir(dir) }
+
+        let dbPath = dir.appendingPathComponent("scp.db")
+        let scp1 = try SCP.withStorage(
+            sqliteDir: dir, passphrase: "correct horse battery staple"
+        )
+        XCTAssertTrue(
+            FileManager.default.fileExists(atPath: dbPath.path),
+            "passphrase construction must create scp.db"
+        )
+        try await scp1.shutdown(timeout: 1)
+
+        // Reopen with the SAME passphrase — must succeed (salt sidecar
+        // re-derives the same key).
+        let scp2 = try SCP.withStorage(
+            sqliteDir: dir, passphrase: "correct horse battery staple"
+        )
+        XCTAssertGreaterThan(scp2.instanceId, 0)
+        try await scp2.shutdown(timeout: 1)
+    }
+
+    /// FAIL CLOSED (spec §17.6): reopening a passphrase-protected DB with the
+    /// WRONG passphrase must throw — never silently open a fresh DB.
+    func testSqliteWrongPassphraseFailsClosed() async throws {
+        let dir = try makeTempDir()
+        defer { removeTempDir(dir) }
+
+        let scp1 = try SCP.withStorage(sqliteDir: dir, passphrase: "the-right-one")
+        try await scp1.shutdown(timeout: 1)
+
+        do {
+            let scp2 = try SCP.withStorage(sqliteDir: dir, passphrase: "the-WRONG-one")
+            try await scp2.shutdown(timeout: 1)
+            XCTFail("wrong passphrase must fail closed, not silently open a fresh DB")
+        } catch {
+            // Expected: fail closed.
+        }
     }
 }

@@ -1939,7 +1939,7 @@ public protocol ScpProtocol: AnyObject, Sendable {
      * Resumes a suspended bridge instance.
      *
      * Clears the suspended flag, then runs any per-bridge async work chained
-     * by the [`BridgeInstanceCore::resume`] override (transport reconnect
+     * by the `BridgeInstanceCore::resume` override (transport reconnect
      * from pending relay URLs, persisted-context restoration).
      *
      * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin.
@@ -2104,13 +2104,21 @@ public static func withPersistence() -> Scp  {
     /**
      * Constructs an `SCP` instance with a storage configuration.
      *
-     * PR 1 accepts the default (in-memory) configuration only. PR 3 adds
-     * filesystem-backed storage via an additional variant on
-     * [`StorageConfig`]. The `config` parameter is forwarded to the inner
-     * constructor; the current match honours only `InMemory`.
+     * `StorageConfig::InMemory` selects the encrypted in-memory dev/test
+     * backend; `StorageConfig::Sqlite { path, key }` selects a
+     * `SQLCipher`-encrypted database, where `key` is either raw key material
+     * or a passphrase (Argon2id; spec §17.6).
+     *
+     * # Errors
+     *
+     * FAIL CLOSED (spec §17.6): if a durable (`Sqlite`) backend cannot be
+     * opened — bad key/passphrase, permission denied, corrupt file, or a
+     * salt-sidecar fail-closed condition — this returns `ScpError::Context`
+     * rather than silently degrading to in-memory storage. Surfaces to Swift
+     * as `throws` and Kotlin as a thrown exception.
      */
-public static func withStorage(config: StorageConfig) -> Scp  {
-    return try!  FfiConverterTypeScp_lift(try! rustCall() {
+public static func withStorage(config: StorageConfig)throws  -> Scp  {
+    return try  FfiConverterTypeScp_lift(try rustCallWithError(FfiConverterTypeScpError_lift) {
     uniffi_scp_ffi_uniffi_fn_constructor_scp_with_storage(
         FfiConverterTypeStorageConfig_lower(config),$0
     )
@@ -2133,7 +2141,7 @@ open func instanceId() -> UInt64  {
      * Resumes a suspended bridge instance.
      *
      * Clears the suspended flag, then runs any per-bridge async work chained
-     * by the [`BridgeInstanceCore::resume`] override (transport reconnect
+     * by the `BridgeInstanceCore::resume` override (transport reconnect
      * from pending relay URLs, persisted-context restoration).
      *
      * `UniFFI` generates a `suspend`/`async` method on Swift and Kotlin.
@@ -7378,6 +7386,120 @@ extension SourceType: Equatable, Hashable {}
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
+ * `SQLCipher` key-material selector for [`StorageConfig::Sqlite`] (spec §17.6).
+ *
+ * The caller supplies EITHER raw key material OR a passphrase — never both,
+ * never neither. The sum type makes that mutual exclusion unrepresentable as
+ * an invalid state, so there is exactly one happy path per variant. This
+ * mirrors the `PyO3` bridge's `SqliteKeyMaterial`.
+ *
+ * - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+ * mode; the existing, unchanged path).
+ * - [`SqliteKeyMaterial::Passphrase`] feeds
+ * [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
+ * key from the passphrase via the shared Argon2id parameterization with a
+ * persisted per-database salt sidecar.
+ *
+ * # `UniFFI` representation
+ *
+ * `#[derive(uniffi::Enum)]` exposes this to Swift and Kotlin as an
+ * associated-value enum: Swift sees `case raw(Data)` / `case
+ * passphrase(String)`; Kotlin a `sealed class SqliteKeyMaterial`. The raw
+ * `Vec<u8>` and the `String` cross the FFI boundary by value; the Rust side
+ * moves the passphrase into `Zeroizing` and zeroes the raw bytes after
+ * `SQLCipher` has consumed them. Callers cannot zero their own copy across
+ * the boundary, so they should overwrite their source buffer after the call
+ * returns.
+ */
+
+public enum SqliteKeyMaterial {
+    
+    /**
+     * Raw encryption key material (32 bytes recommended).
+     */
+    case raw(
+        /**
+         * The raw key bytes.
+         */key: Data
+    )
+    /**
+     * Human-chosen passphrase; the `SQLCipher` key is derived via Argon2id.
+     */
+    case passphrase(
+        /**
+         * The passphrase. Moved into `Zeroizing` at the bridge boundary.
+         */passphrase: String
+    )
+}
+
+
+#if compiler(>=6)
+extension SqliteKeyMaterial: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSqliteKeyMaterial: FfiConverterRustBuffer {
+    typealias SwiftType = SqliteKeyMaterial
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SqliteKeyMaterial {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .raw(key: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 2: return .passphrase(passphrase: try FfiConverterString.read(from: &buf)
+        )
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SqliteKeyMaterial, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case let .raw(key):
+            writeInt(&buf, Int32(1))
+            FfiConverterData.write(key, into: &buf)
+            
+        
+        case let .passphrase(passphrase):
+            writeInt(&buf, Int32(2))
+            FfiConverterString.write(passphrase, into: &buf)
+            
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSqliteKeyMaterial_lift(_ buf: RustBuffer) throws -> SqliteKeyMaterial {
+    return try FfiConverterTypeSqliteKeyMaterial.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSqliteKeyMaterial_lower(_ value: SqliteKeyMaterial) -> RustBuffer {
+    return FfiConverterTypeSqliteKeyMaterial.lower(value)
+}
+
+
+extension SqliteKeyMaterial: Equatable, Hashable {}
+
+
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
  * Storage configuration for [`UniffiBridgeInstance`].
  *
  * Two variants are supported:
@@ -7412,8 +7534,10 @@ public enum StorageConfig {
          * through `std::path::PathBuf` on the Rust side.
          */path: String, 
         /**
-         * Raw encryption key material (typically 32 bytes).
-         */key: Data
+         * Encryption key material — raw bytes or a passphrase (mutually
+         * exclusive; the [`SqliteKeyMaterial`] sum type makes "exactly
+         * one" the only representable state).
+         */key: SqliteKeyMaterial
     )
 }
 
@@ -7434,7 +7558,7 @@ public struct FfiConverterTypeStorageConfig: FfiConverterRustBuffer {
         
         case 1: return .inMemory
         
-        case 2: return .sqlite(path: try FfiConverterString.read(from: &buf), key: try FfiConverterData.read(from: &buf)
+        case 2: return .sqlite(path: try FfiConverterString.read(from: &buf), key: try FfiConverterTypeSqliteKeyMaterial.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -7452,7 +7576,7 @@ public struct FfiConverterTypeStorageConfig: FfiConverterRustBuffer {
         case let .sqlite(path,key):
             writeInt(&buf, Int32(2))
             FfiConverterString.write(path, into: &buf)
-            FfiConverterData.write(key, into: &buf)
+            FfiConverterTypeSqliteKeyMaterial.write(key, into: &buf)
             
         }
     }
@@ -9592,7 +9716,8 @@ public func uniffiForeignFutureHandleCountScp() -> Int {
  * Generates and stores a per-member access key for explicit lifecycle
  * management.
  *
- * Delegates to [`ContextManager::generate_context_access_key`].
+ * Routed through the ADR-049 commit-9 lifecycle shim
+ * ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
  *
  * # Errors
  *
@@ -9617,7 +9742,8 @@ public func accessKeyGenerate(contextId: String, memberDid: String, callerDid: S
  * Restores a member's access key by generating a new key at the next
  * epoch.
  *
- * Delegates to [`ContextManager::restore_context_access_key`].
+ * Routed through the ADR-049 commit-9 lifecycle shim
+ * ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
  *
  * # Errors
  *
@@ -9642,7 +9768,8 @@ public func accessKeyRestore(contextId: String, memberDid: String, callerDid: St
  * Revokes (removes) a member's access key from the context's access key
  * store.
  *
- * Delegates to [`ContextManager::revoke_context_access_key`].
+ * Routed through the ADR-049 commit-9 lifecycle shim
+ * ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
  *
  * # Errors
  *
@@ -9730,6 +9857,9 @@ public func aggregateTrustInput(contextId: String, subjectDid: String, eventsJso
  * Applies a pending ceiling modification if the notification period has elapsed.
  *
  * Returns `true` if applied, `false` if no pending modification or not yet effective.
+ *
+ * Routed through the ADR-049 commit-10 governance shim
+ * ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
  *
  * # Errors
  *
@@ -9862,6 +9992,9 @@ public func bridgeRegister(contextId: String, operatorDid: String, governanceDid
  *
  * Returns the policy as a string: `"Open"` or `"Gated"`.
  * Returns `None` if the context is not a broadcast context.
+ *
+ * Routed through the ADR-049 commit-11 broadcast shim
+ * ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
  */
 public func broadcastAdmission(handle: ContextHandle)async  -> String?  {
     return
@@ -9908,6 +10041,9 @@ public func broadcastBlockSubscriber(handle: ContextHandle, subscriberDid: Strin
  * Validates the author DID is locally controlled and processes the key
  * distribution request.
  *
+ * Routed through the ADR-049 commit-11 broadcast shim
+ * ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
+ *
  * # Errors
  *
  * Returns `ScpError::Context` if the operation fails.
@@ -9928,6 +10064,9 @@ public func broadcastHandleKeyRequest(handle: ContextHandle, authorDid: String, 
 }
 /**
  * Returns `true` if the given DID is a broadcast subscriber.
+ *
+ * Routed through the ADR-049 commit-11 broadcast shim
+ * ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
  */
 public func broadcastIsSubscriber(handle: ContextHandle, did: String)async  -> Bool  {
     return
@@ -10064,6 +10203,9 @@ public func broadcastSubscribe(handle: ContextHandle, subscriberDid: String)asyn
  * Returns the number of broadcast subscribers for a context.
  *
  * Returns `None` if the context is not registered or not a broadcast context.
+ *
+ * Routed through the ADR-049 commit-11 broadcast shim
+ * ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
  */
 public func broadcastSubscriberCount(handle: ContextHandle)async  -> UInt64?  {
     return
@@ -10085,6 +10227,9 @@ public func broadcastSubscriberCount(handle: ContextHandle)async  -> UInt64?  {
  *
  * Forward-only: the unblocked subscriber can request the current key on
  * next pull but cannot decrypt content from the block period.
+ *
+ * Routed through the ADR-049 commit-11 broadcast shim
+ * ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
  *
  * # Errors
  *
@@ -10112,6 +10257,9 @@ public func broadcastUnblockSubscriber(handle: ContextHandle, subscriberDid: Str
  * When `rotate_keys` is `true`, all authors rotate their broadcast keys
  * for forward secrecy.
  *
+ * Routed through the ADR-049 commit-11 broadcast shim
+ * ([`Supervisor::dispatch_broadcast_command`](scp_core::context::supervisor::Supervisor::dispatch_broadcast_command)).
+ *
  * # Errors
  *
  * Returns `ScpError::Context` if the context is not active or not broadcast.
@@ -10131,7 +10279,7 @@ public func broadcastUnsubscribe(handle: ContextHandle, subscriberDid: String, r
         )
 }
 /**
- * Pre-configures the [`ContextManager`] with [`RelayTransportProvider`].
+ * Pre-configures the `ContextManager` with `RelayTransportProvider`.
  *
  * **Must be called before any `identityCreate` → `contextCreate` sequence.**
  * Once the `ContextManager` is initialized (by whichever call arrives first),
@@ -10277,6 +10425,9 @@ public func contextDiscover(query: String)async throws  -> String  {
  *
  * Returns a list of event descriptions as JSON strings. Returns empty
  * if the context is not registered.
+ *
+ * Routed through the ADR-049 commit-8 messaging shim
+ * ([`Supervisor::dispatch_command`](scp_core::context::supervisor::Supervisor::dispatch_command)).
  */
 public func contextDrainEvents(handle: ContextHandle)async  -> [String]  {
     return
@@ -10298,6 +10449,9 @@ public func contextDrainEvents(handle: ContextHandle)async  -> [String]  {
  *
  * Returns the serialized bytes of a `StoredValue<ContextExport>` envelope
  * (§17.5), suitable for backup, migration, or transfer to another node.
+ *
+ * Routed through the ADR-049 commit-9 lifecycle shim
+ * ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
  *
  * # Errors
  *
@@ -10322,6 +10476,9 @@ public func contextExport(handle: ContextHandle)async throws  -> Data  {
  * Handles TTL expiry for a context.
  *
  * Transitions from `Active` to `Expired`, destroys keys per memory scope.
+ *
+ * Routed through the ADR-049 commit-9 TTL-close shim
+ * ([`Supervisor::dispatch_ttl_close_command`](scp_core::context::supervisor::Supervisor::dispatch_ttl_close_command)).
  *
  * # Errors
  *
@@ -10370,6 +10527,9 @@ public func contextImport(data: Data)async throws  -> String  {
 }
 /**
  * Returns `true` if the given DID is a member of the context.
+ *
+ * Routed through the ADR-049 query shim. See
+ * [`context_member_count`] for the shim rationale.
  */
 public func contextIsMember(handle: ContextHandle, did: String)async  -> Bool  {
     return
@@ -10449,6 +10609,12 @@ public func contextLeave(handle: ContextHandle, identity: Identity)async throws 
  * Returns the current member count for a context.
  *
  * Returns `None` if the context is not registered.
+ *
+ * Routed through the ADR-049 query shim
+ * ([`Supervisor::dispatch_query`](scp_core::context::supervisor::Supervisor::dispatch_query))
+ * rather than calling `ContextManager::member_count` directly. The shim
+ * acquires the same per-context mutex as the legacy path and returns
+ * byte-identical results; see `crates/scp-runtime/tests/actor_query_shim.rs`.
  */
 public func contextMemberCount(handle: ContextHandle)async  -> UInt64?  {
     return
@@ -10467,6 +10633,9 @@ public func contextMemberCount(handle: ContextHandle)async  -> UInt64?  {
 }
 /**
  * Returns all member DIDs for a context.
+ *
+ * Routed through the ADR-049 query shim. See
+ * [`context_member_count`] for the shim rationale.
  */
 public func contextMemberDids(handle: ContextHandle)async  -> [String]  {
     return
@@ -10487,6 +10656,9 @@ public func contextMemberDids(handle: ContextHandle)async  -> [String]  {
  * Returns the role assignment for a specific member as a JSON string.
  *
  * Returns `None` if the member is not found or the context is not registered.
+ *
+ * Routed through the ADR-049 query shim. See
+ * [`context_member_count`] for the shim rationale.
  */
 public func contextMemberRole(handle: ContextHandle, did: String)async  -> String?  {
     return
@@ -10507,6 +10679,9 @@ public func contextMemberRole(handle: ContextHandle, did: String)async  -> Strin
  * Proposes a TTL extension. Records consent from the given member.
  *
  * Returns `true` if all members have consented (unanimous approval).
+ *
+ * Routed through the ADR-049 commit-9 TTL-close shim
+ * ([`Supervisor::dispatch_ttl_close_command`](scp_core::context::supervisor::Supervisor::dispatch_ttl_close_command)).
  *
  * # Errors
  *
@@ -10531,6 +10706,9 @@ public func contextProposeTtlExtension(handle: ContextHandle, memberDid: String,
  * Resets the TTL timer after a successful unanimous extension.
  *
  * Cancels the old timer and spawns a new one with the given duration.
+ *
+ * Routed through the ADR-049 commit-9 TTL-close shim
+ * ([`Supervisor::dispatch_ttl_close_command`](scp_core::context::supervisor::Supervisor::dispatch_ttl_close_command)).
  */
 public func contextResetTtlTimer(handle: ContextHandle, newSeconds: UInt64)async   {
     return
@@ -11010,7 +11188,8 @@ public func getEconomicPolicy(handle: ContextHandle)throws  -> String?  {
 /**
  * Casts an approval vote on a pending governance proposal.
  *
- * Delegates to `ContextManager::approve_governance_proposal`.
+ * Routed through the ADR-049 commit-10 governance shim
+ * ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
  *
  * # Errors
  *
@@ -11065,6 +11244,9 @@ public func governanceExecute(handle: ContextHandle, proposalJson: String)async 
 /**
  * Retrieves a single governance proposal by hex-encoded ID.
  *
+ * Routed through the ADR-049 commit-10 governance shim
+ * ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
+ *
  * # Errors
  *
  * Returns `ScpError::Context` (SCP-CTX-2045) if the proposal is not found.
@@ -11087,6 +11269,9 @@ public func governanceGetProposal(handle: ContextHandle, proposalIdHex: String)a
  * Lists all governance proposals for a context.
  *
  * Returns a JSON array of proposals.
+ *
+ * Routed through the ADR-049 commit-10 governance shim
+ * ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
  *
  * # Errors
  *
@@ -11145,7 +11330,8 @@ public func governancePropose(handle: ContextHandle, proposerDid: String, action
 /**
  * Casts a rejection vote on a pending governance proposal.
  *
- * Delegates to `ContextManager::reject_governance_proposal`.
+ * Routed through the ADR-049 commit-10 governance shim
+ * ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
  *
  * # Errors
  *
@@ -12103,6 +12289,9 @@ public func metadataRecordToJson(contextId: String, sequence: UInt64, signerDid:
  *
  * Returns a JSON string with migration state fields, or `None` if the
  * context is not migrating.
+ *
+ * Routed through the ADR-049 commit-10 governance shim
+ * ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
  */
 public func migrationState(handle: ContextHandle)async throws  -> String?  {
     return
@@ -12363,6 +12552,9 @@ public func provenanceUpdateSourceType(provenanceJson: String, newState: String)
  * Used for defense-in-depth validation in broadcast key request handling.
  * Ensures the `ContextManager` is initialized (idempotent) since local DID
  * registration is valid before any context exists.
+ *
+ * Routes through the supervisor's direct `register_local_did` method — the
+ * local-DID set is supervisor-wide (no per-context command target).
  */
 public func registerLocalDid(did: String)async throws   {
     return
@@ -12428,7 +12620,10 @@ public func relayStartLocal(dataDir: String)async throws  -> RelayHandle  {
 /**
  * Restores all persisted contexts from storage.
  *
- * Returns a JSON array of restored context ID strings.
+ * Returns a JSON array of restored context ID strings. Routes through
+ * the supervisor-scope direct method; `restore_all_contexts` operates
+ * on the supervisor-wide context registry and has no per-context
+ * command target.
  *
  * # Errors
  *
@@ -12450,6 +12645,13 @@ public func restoreAllContexts()async throws  -> String  {
 }
 /**
  * Restores a single persisted context from storage.
+ *
+ * Routed through the ADR-049 commit-9 lifecycle shim
+ * ([`Supervisor::dispatch_lifecycle_command`](scp_core::context::supervisor::Supervisor::dispatch_lifecycle_command)).
+ * The handler loads the persisted snapshot itself and reconstructs an
+ * ephemeral `ContextHandle` from it — the `ContextParams` supplied here
+ * are only used to initialise the ephemeral wrapper; the handler
+ * overwrites all memory-scope-sensitive state from the loaded snapshot.
  *
  * # Errors
  *
@@ -12805,6 +13007,9 @@ public func templateGetParams(templateId: String)throws  -> String  {
  * Tombstones a migrated context after its grace period has expired (§5.11A.5).
  *
  * Transitions the context from `MigratingOut` to `Tombstoned`.
+ *
+ * Routed through the ADR-049 commit-10 governance shim
+ * ([`Supervisor::dispatch_governance_command`](scp_core::context::supervisor::Supervisor::dispatch_governance_command)).
  *
  * # Errors
  *
@@ -13551,13 +13756,13 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_access_key_generate() != 33152) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_access_key_generate() != 17963) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_access_key_restore() != 51777) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_access_key_restore() != 60270) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_access_key_revoke() != 45262) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_access_key_revoke() != 11387) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_add_checkpoint_cosignature() != 55596) {
@@ -13569,7 +13774,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_aggregate_trust_input() != 34335) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_apply_pending_ceiling_modification() != 30477) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_apply_pending_ceiling_modification() != 47921) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_bridge_create_shadow() != 23486) {
@@ -13581,16 +13786,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_bridge_register() != 24353) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_admission() != 35635) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_admission() != 61011) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_block_subscriber() != 14388) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_handle_key_request() != 49269) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_handle_key_request() != 63768) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_is_subscriber() != 6475) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_is_subscriber() != 24635) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_publish() != 54635) {
@@ -13605,16 +13810,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_subscribe() != 51819) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_subscriber_count() != 44888) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_subscriber_count() != 10649) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_unblock_subscriber() != 7203) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_unblock_subscriber() != 19751) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_unsubscribe() != 49698) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_broadcast_unsubscribe() != 33420) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_configure_relay_transport() != 38447) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_configure_relay_transport() != 48214) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_close() != 27411) {
@@ -13626,19 +13831,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_context_discover() != 49364) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_drain_events() != 18382) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_drain_events() != 57723) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_export() != 47555) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_export() != 40694) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_handle_ttl_expiry() != 13868) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_handle_ttl_expiry() != 47786) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_import() != 61429) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_is_member() != 64785) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_is_member() != 29209) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_join() != 30234) {
@@ -13647,19 +13852,19 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_context_leave() != 33485) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_count() != 37326) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_count() != 6139) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_dids() != 8361) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_dids() != 63585) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_role() != 16107) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_member_role() != 53354) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_propose_ttl_extension() != 19380) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_propose_ttl_extension() != 26545) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_context_reset_ttl_timer() != 64326) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_context_reset_ttl_timer() != 9968) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_context_send() != 2368) {
@@ -13737,22 +13942,22 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_get_economic_policy() != 48515) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_governance_approve() != 41357) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_governance_approve() != 17277) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_governance_execute() != 62327) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_governance_get_proposal() != 12966) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_governance_get_proposal() != 35369) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_governance_list_proposals() != 8689) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_governance_list_proposals() != 64857) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_governance_propose() != 59163) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_governance_reject() != 9993) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_governance_reject() != 65180) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_governance_withdraw() != 27430) {
@@ -13884,7 +14089,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_metadata_record_to_json() != 58960) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_migration_state() != 55501) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_migration_state() != 62932) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_node_start_in_memory() != 46028) {
@@ -13932,7 +14137,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_provenance_update_source_type() != 33504) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_register_local_did() != 129) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_register_local_did() != 65090) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_relay_start_in_memory() != 43291) {
@@ -13941,10 +14146,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_relay_start_local() != 47076) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_restore_all_contexts() != 3679) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_restore_all_contexts() != 15041) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_restore_context() != 17499) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_restore_context() != 27965) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_sandbox_check_capability() != 25855) {
@@ -13995,7 +14200,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_func_template_get_params() != 28014) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_func_tombstone_migrated_context() != 35616) {
+    if (uniffi_scp_ffi_uniffi_checksum_func_tombstone_migrated_context() != 15505) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_func_tool_interface_accept() != 52020) {
@@ -14163,7 +14368,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_instance_id() != 43175) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_method_scp_resume() != 62509) {
+    if (uniffi_scp_ffi_uniffi_checksum_method_scp_resume() != 24128) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_scp_shutdown() != 65387) {
@@ -14226,7 +14431,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_persistence() != 28565) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 21004) {
+    if (uniffi_scp_ffi_uniffi_checksum_constructor_scp_with_storage() != 20129) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_scp_ffi_uniffi_checksum_method_deviceattestationprovider_attest() != 4506) {

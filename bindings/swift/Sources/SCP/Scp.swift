@@ -92,8 +92,8 @@ public final class SCP: @unchecked Sendable {
     /// ``StorageConfig/inMemory`` variant; callers who want a Swift-native
     /// `URL` + `Data` surface over the SQLite variant should prefer
     /// ``SCP/withStorage(sqliteDir:key:)``.
-    public static func withStorage(_ config: StorageConfig) -> SCP {
-        SCP(inner: Scp.withStorage(config: config))
+    public static func withStorage(_ config: StorageConfig) throws -> SCP {
+        try SCP(inner: Scp.withStorage(config: config))
     }
 
     /// Constructs an `SCP` backed by a `SQLCipher`-encrypted database at
@@ -110,10 +110,9 @@ public final class SCP: @unchecked Sendable {
     /// call returns — Foundation's `Data` does not guarantee zeroization
     /// on deallocation.
     ///
-    /// If the underlying database cannot be opened (bad key, unreadable
-    /// directory) the Rust layer logs via `tracing::error!` and returns
-    /// an in-memory-only instance — matching the PyO3 / NAPI fallback
-    /// behavior documented in PR 3.
+    /// FAIL CLOSED (spec §17.6): if the underlying database cannot be opened
+    /// (bad key, unreadable directory, corrupt file) the call throws rather
+    /// than silently degrading to an in-memory instance.
     ///
     /// - Parameters:
     ///   - sqliteDir: Directory the `scp.db` file lives in. The path is
@@ -124,10 +123,48 @@ public final class SCP: @unchecked Sendable {
     ///     (`SQLCipher` derives the final key via PBKDF2). Callers should
     ///     zero their copy after this call returns.
     /// - Returns: A fresh `SCP` wrapping a persistent bridge instance.
+    /// - Throws: ``ScpError/context`` if the database cannot be opened.
+    public static func withStorage(sqliteDir: URL, key: Data) throws -> SCP {
+        try SCP(
+            inner: Scp.withStorage(
+                config: .sqlite(path: sqliteDir.path, key: .raw(key: key))
+            )
+        )
+    }
+
+    /// Constructs an `SCP` backed by a `SQLCipher`-encrypted database at
+    /// `{sqliteDir}/scp.db`, with the encryption key derived from a
+    /// passphrase via Argon2id (spec §17.6).
     ///
-    /// Closes #1260, #1491 (Swift SDK surface).
-    public static func withStorage(sqliteDir: URL, key: Data) -> SCP {
-        SCP(inner: Scp.withStorage(config: .sqlite(path: sqliteDir.path, key: key)))
+    /// Convenience façade over ``withStorage(_:)`` with the
+    /// ``StorageConfig/sqlite(path:key:)`` variant carrying
+    /// ``SqliteKeyMaterial/passphrase(passphrase:)``. The passphrase derives
+    /// the same `SQLCipher` key on every open via a per-database salt sidecar
+    /// (`{sqliteDir}/scp.salt`), so the same passphrase re-opens the same
+    /// database across restarts.
+    ///
+    /// The passphrase crosses the UniFFI boundary as a `String`; the Rust
+    /// side moves it into zeroizing memory before deriving the key. Callers
+    /// should not retain the passphrase longer than necessary.
+    ///
+    /// - Parameters:
+    ///   - sqliteDir: Directory the `scp.db` (and `scp.salt`) files live in.
+    ///   - passphrase: Human-chosen passphrase. Mutually exclusive with the
+    ///     raw-key path — the ``SqliteKeyMaterial`` sum type enforces this.
+    /// - Returns: A fresh `SCP` wrapping a persistent bridge instance.
+    /// - Throws: ``ScpError/context`` if the database cannot be opened (bad
+    ///   passphrase against an existing DB, permission denied, corrupt file,
+    ///   or a salt-sidecar fail-closed condition). FAIL CLOSED (spec §17.6):
+    ///   the bridge never silently degrades to in-memory on a failed open.
+    public static func withStorage(sqliteDir: URL, passphrase: String) throws -> SCP {
+        try SCP(
+            inner: Scp.withStorage(
+                config: .sqlite(
+                    path: sqliteDir.path,
+                    key: .passphrase(passphrase: passphrase)
+                )
+            )
+        )
     }
 
     /// The monotonic identifier for this bridge instance, unique per
@@ -192,9 +229,8 @@ public final class SCP: @unchecked Sendable {
     ///   in-flight tasks, expressed as a ``Foundation/TimeInterval``
     ///   (`Double` seconds). Defaults to `5.0`.
     public func shutdown(timeout: TimeInterval = 5.0) async throws {
-        let millis: UInt64
-        if timeout.isNaN || timeout <= 0 {
-            millis = 0
+        let millis: UInt64 = if timeout.isNaN || timeout <= 0 {
+            0
         } else if timeout.isInfinite || timeout >= Double(UInt64.max) / 1000.0 {
             // `>=` (not `>`): `Double(UInt64.max) == 2^64` due to IEEE-754
             // rounding (`Double` has 53 bits of mantissa, `UInt64` has 64),
@@ -203,9 +239,9 @@ public final class SCP: @unchecked Sendable {
             // `>` would miss that single exact value and trap in the
             // fallthrough cast. Clamping to `UInt64.max` there is correct
             // and bounded — round 3 bug-catcher + api-design finding.
-            millis = UInt64.max
+            UInt64.max
         } else {
-            millis = UInt64((timeout * 1000).rounded())
+            UInt64((timeout * 1000).rounded())
         }
         try await inner.shutdown(timeoutMillis: millis)
     }

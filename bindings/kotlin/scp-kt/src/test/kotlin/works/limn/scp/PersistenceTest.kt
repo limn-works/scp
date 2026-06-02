@@ -33,6 +33,7 @@ import java.nio.file.Files
 import kotlin.io.path.exists
 import kotlin.io.path.pathString
 import kotlin.test.assertNotEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.Dispatchers
@@ -161,7 +162,7 @@ class PersistenceTest {
         }
 
     @Test
-    fun `withSqlite does not corrupt the original DB on mismatched-key attempt`() =
+    fun `withSqlite fails closed on mismatched key without corrupting the DB`() =
         runTest {
             val dir = Files.createTempDirectory("scp-kotlin-persist-mismatch-")
             dir.toFile().deleteOnExit()
@@ -170,16 +171,53 @@ class PersistenceTest {
             val scp1 = SCP.withSqlite(dir.toFile(), sqliteKey)
             createdInstances += scp1
 
-            // Second open with a wrong key. The UniFFI bridge currently
-            // logs the error and falls back to an in-memory-only
-            // instance — construction therefore succeeds, and the test
-            // guards against corruption of the original DB file.
+            // Second open with a wrong key must FAIL CLOSED (spec §17.6):
+            // the bridge throws rather than silently falling back to an
+            // in-memory instance.
             val wrongKey = ByteArray(32) { 0x11 }
-            val scp2 = SCP.withSqlite(dir.toFile(), wrongKey)
-            createdInstances += scp2
+            assertFailsWith<uniffi.scp.ScpException> {
+                SCP.withSqlite(dir.toFile(), wrongKey)
+            }
 
-            // Third open with the correct key — must still succeed.
+            // Third open with the correct key — must still succeed (no
+            // corruption from the rejected attempt).
             val scp3 = SCP.withSqlite(dir.toFile(), sqliteKey)
             createdInstances += scp3
+        }
+
+    @Test
+    fun `withSqlite passphrase round trips across two constructions`() =
+        runTest {
+            val dir = Files.createTempDirectory("scp-kotlin-persist-passphrase-")
+            dir.toFile().deleteOnExit()
+            val dbPath = dir.resolve("scp.db")
+
+            val scp1 = SCP.withSqlite(dir.toFile(), passphrase = "correct horse battery staple")
+            createdInstances += scp1
+            assertTrue(
+                dbPath.exists(),
+                "passphrase construction must create scp.db at ${dbPath.pathString}",
+            )
+
+            // Reopen with the SAME passphrase — must succeed (salt sidecar
+            // re-derives the same key).
+            val scp2 = SCP.withSqlite(dir.toFile(), passphrase = "correct horse battery staple")
+            createdInstances += scp2
+        }
+
+    @Test
+    fun `withSqlite fails closed on wrong passphrase`() =
+        runTest {
+            val dir = Files.createTempDirectory("scp-kotlin-persist-wrongpass-")
+            dir.toFile().deleteOnExit()
+
+            val scp1 = SCP.withSqlite(dir.toFile(), passphrase = "the-right-one")
+            createdInstances += scp1
+
+            // Reopen with the WRONG passphrase must fail closed — never
+            // silently open a fresh DB (spec §17.6).
+            assertFailsWith<uniffi.scp.ScpException> {
+                SCP.withSqlite(dir.toFile(), passphrase = "the-WRONG-one")
+            }
         }
 }
