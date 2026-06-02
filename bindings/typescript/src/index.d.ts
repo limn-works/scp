@@ -290,10 +290,20 @@ export declare class McpClient {
 /**
  * Storage configuration forwarded to `SCP.withStorage` / `new SCP({storage})`.
  *
- * Phase 4 PR 1 accepts only `{ type: "in_memory" }`; PR 3 adds SQLite
- * variants. Unknown types raise `SCP-VALID-7005`.
+ * Variants:
+ * - `{ type: "in_memory" }` — encrypted in-memory storage (ephemeral).
+ * - `{ type: "sqlite"; path; key }` — SQLCipher-encrypted on-disk storage
+ *   keyed by raw key material (`Uint8Array` or hex string).
+ * - `{ type: "sqlite"; path; passphrase }` — SQLCipher-encrypted on-disk
+ *   storage whose key is derived from a passphrase via Argon2id (spec §17.6).
+ *
+ * For `sqlite`, exactly one of `key`/`passphrase` must be supplied. Unknown
+ * types or both/neither key material raise `SCP-VALID-7005`.
  */
-export type StorageConfig = { type: "in_memory" } | { type: string; [k: string]: unknown };
+export type StorageConfig =
+  | { type: "in_memory" }
+  | { type: "sqlite"; path: string; key: Uint8Array | string }
+  | { type: "sqlite"; path: string; passphrase: string };
 
 /** Constructor options for `new SCP(...)`. */
 export interface ScpOptions {

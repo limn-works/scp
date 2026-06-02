@@ -24,7 +24,7 @@ use scp_ffi_common::bridge_instance::BridgeInstanceCore;
 // `napi_check_handle!` macro can refer to it as `$crate::runtime::CoreFields`
 // without each caller importing the full `scp_ffi_common` path.
 pub use scp_ffi_common::bridge_instance::CoreFields;
-use scp_ffi_common::bridge_runtime::BridgeInMemoryStorage;
+use scp_ffi_common::bridge_runtime::BridgeInMemoryStorageHandle;
 use scp_ffi_common::error_codes as codes;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -42,7 +42,6 @@ use scp_core::store::ProtocolRepository;
 use scp_core::store::context::ProtocolRepositoryEventLogBridge;
 use scp_event_log::EventLog;
 use scp_identity::cache::SystemClock;
-use scp_platform::encrypting_adapter::EncryptingAdapter;
 use scp_platform::sqlite::SqliteStorage;
 
 use crate::context::NapiContextHandle;
@@ -68,19 +67,82 @@ pub enum StorageConfig {
     /// Encrypted in-memory storage.
     #[default]
     InMemory,
-    /// SQLCipher-encrypted on-disk storage.
+    /// SQLCipher-encrypted on-disk storage at `{path}/scp.db`.
     ///
     /// Persists context snapshots, identity state, and the event log
-    /// across process restarts. The `key` is raw encryption key material
-    /// wrapped in `Zeroizing` so the caller's copy is zeroed after the
-    /// variant is consumed.
+    /// across process restarts. The encryption key material is selected via
+    /// [`SqliteKeyMaterial`] — either raw key bytes or a passphrase run
+    /// through Argon2id (spec §17.6). Both forms are held in `Zeroizing` so
+    /// the caller's copy is wiped after the variant is consumed.
     Sqlite {
         /// Directory the database file is created in.
         path: std::path::PathBuf,
-        /// Raw encryption key material (32 bytes recommended).
-        key: zeroize::Zeroizing<Vec<u8>>,
+        /// Encryption key material — raw bytes or passphrase (mutually
+        /// exclusive; the [`SqliteKeyMaterial`] sum type enforces "exactly
+        /// one").
+        key: SqliteKeyMaterial,
     },
 }
+
+/// `SQLCipher` key-material selector for [`StorageConfig::Sqlite`] (spec §17.6).
+///
+/// The caller supplies EITHER raw key material OR a passphrase — never both,
+/// never neither. The sum type makes that mutual exclusion unrepresentable as
+/// an invalid state: there is exactly one happy path per variant. Both forms
+/// are wrapped in `Zeroizing` so they are wiped from memory on drop. This
+/// mirrors the `PyO3` and `UniFFI` bridges' `SqliteKeyMaterial`.
+///
+/// - [`SqliteKeyMaterial::Raw`] feeds [`SqliteStorage::new`] directly (raw-key
+///   mode; the existing, unchanged path).
+/// - [`SqliteKeyMaterial::Passphrase`] feeds
+///   [`SqliteStorage::with_passphrase`], which derives the `SQLCipher` PRAGMA
+///   key from the passphrase via the shared Argon2id parameterization with a
+///   persisted per-database salt sidecar.
+#[derive(Debug, Clone)]
+pub enum SqliteKeyMaterial {
+    /// Raw encryption key material (32 bytes recommended).
+    Raw(zeroize::Zeroizing<Vec<u8>>),
+    /// Human-chosen passphrase; the `SQLCipher` key is derived via Argon2id.
+    Passphrase(zeroize::Zeroizing<String>),
+}
+
+/// Bridge-internal error returned by
+/// [`NapiBridgeInstance::with_storage_napi`] when a durable storage backend
+/// cannot be opened.
+///
+/// Surfacing this (rather than silently degrading to in-memory or no storage)
+/// is the fail-closed contract from spec §17.6: a failed durable-backend open
+/// is a terminal error the caller observes, never a condition the system
+/// recovers from by downgrading durability. Converted to a JS-thrown
+/// `ValidationError` at the [`crate::scp::Scp::with_storage`] factory surface.
+///
+/// Mirrors the `PyO3` and `UniFFI` bridges' `StorageInitError`. The message
+/// never contains key or passphrase bytes.
+#[derive(Debug)]
+pub enum StorageInitError {
+    /// `SqliteStorage::new` / `SqliteStorage::with_passphrase` failed —
+    /// directory permission denied, key/passphrase rejected by `SQLCipher` on
+    /// an existing DB, salt-sidecar fail-closed condition, corrupt file, and
+    /// so on. The message never carries key or passphrase bytes.
+    SqliteOpen {
+        /// The directory path the caller asked for (for the error message).
+        path: String,
+        /// The underlying `scp-platform` error rendered via `Display`.
+        message: String,
+    },
+}
+
+impl std::fmt::Display for StorageInitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SqliteOpen { path, message } => {
+                write!(f, "failed to open SQLCipher storage at {path}: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StorageInitError {}
 
 /// Protocol repository variant: an `Arc<ProtocolRepository<_>>` whose inner
 /// `Storage` matches the bridge's configured persistence backend.
@@ -181,6 +243,25 @@ pub struct NapiBridgeInstance {
     /// See [`ProtocolRepoVariant`] for the dispatch details.
     pub(crate) protocol_repository: ProtocolRepoVariant,
 
+    /// The single chosen `Storage` backend, erased ONCE into the supervisor's
+    /// required `mls_storage` (`OpenMLS`) view via
+    /// [`SpawnBlockingStorageAdapter`](scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter):
+    /// - in-memory path → the un-swallowed
+    ///   `Arc<EncryptingAdapter<BridgeInMemoryStorage>>` handle (3rd element
+    ///   returned by `build_event_log_provider`);
+    /// - `SQLite` path → the same `Arc<SqliteStorage>` that backs persistence
+    ///   and the event log.
+    ///
+    /// `build_supervisor_arc` reads this to satisfy the required `mls_storage`
+    /// argument of `Supervisor::with_providers`. The runtime never defaults
+    /// storage (spec §17.6 / ADR-049); `None` is the
+    /// storage-before-supervisor fail-closed condition. Note that
+    /// `NapiBridgePersistence` (a `DashMap`) is NOT a `Storage` and therefore
+    /// can never back `mls_storage` — the in-memory `mls_storage` always
+    /// comes from the `build_event_log_provider` handle.
+    pub(crate) mls_storage_backend:
+        Option<Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>>,
+
     // -----------------------------------------------------------------
     // #1549 Phase 4 PR 2 commit 1 — additive typed fields replacing
     // process-global singletons in later commits.
@@ -219,14 +300,21 @@ impl NapiBridgeInstance {
     /// callers attach one later via `CoreFields::set_context_manager`.
     #[must_use]
     pub fn new_napi() -> Self {
-        let (_event_log, protocol_repository, _storage_handle) =
+        let (_event_log, protocol_repository, storage_handle) =
             scp_ffi_common::bridge_runtime::build_event_log_provider();
+        // The un-swallowed in-memory storage handle backs the supervisor's
+        // `mls_storage` view. The SAME store backs the event-log repository
+        // above (spec §17.6 — one chosen backend, derived consumers). This is
+        // the in-memory storage source for `mls_storage` — NOT
+        // `NapiBridgePersistence`, which is a `DashMap` and not a `Storage`.
+        let mls_storage_backend = mls_storage_from_handle(storage_handle);
         Self {
             core: CoreFields::new(),
             ucan_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
+            mls_storage_backend: Some(mls_storage_backend),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
@@ -242,14 +330,16 @@ impl NapiBridgeInstance {
     /// [`StorageConfig::InMemory`] path on `NapiBridgeInstance::with_storage_napi`).
     #[must_use]
     pub fn with_persistence_napi(persistence: Box<dyn ContextPersistence + Send + Sync>) -> Self {
-        let (_event_log, protocol_repository, _storage_handle) =
+        let (_event_log, protocol_repository, storage_handle) =
             scp_ffi_common::bridge_runtime::build_event_log_provider();
+        let mls_storage_backend = mls_storage_from_handle(storage_handle);
         Self {
             core: CoreFields::with_persistence(persistence),
             ucan_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository: ProtocolRepoVariant::InMemory(protocol_repository),
+            mls_storage_backend: Some(mls_storage_backend),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
@@ -260,61 +350,83 @@ impl NapiBridgeInstance {
     /// Constructs a new `NapiBridgeInstance` honoring a [`StorageConfig`].
     ///
     /// - [`StorageConfig::InMemory`] — equivalent to
-    ///   `NapiBridgeInstance::new_napi`; no persistence provider is
-    ///   attached to the embedded `CoreFields` (the legacy
-    ///   `NapiBridgePersistence` `DashMap` is still wired into the
-    ///   `ContextManager` by `init_context_manager*`).
-    /// - [`StorageConfig::Sqlite`] — opens a `SQLCipher`-encrypted
-    ///   database at `{path}/scp.db` and attaches a
-    ///   `ProtocolRepositoryContextBridge<Arc<SqliteStorage>>` to
-    ///   `CoreFields::persistence`. Downstream
-    ///   `init_context_manager*` picks the shared `Arc` up via
-    ///   `persistence_arc_clone()` so the `ContextManager` and the
-    ///   `CoreFields` mirror share a single `SqliteStorage` instance. If
-    ///   opening fails, the error is logged via `tracing::error!` and the
-    ///   instance is returned without persistence (matching the `PyO3`
-    ///   bridge's behaviour).
-    #[must_use]
-    pub fn with_storage_napi(config: StorageConfig) -> Self {
+    ///   `NapiBridgeInstance::new_napi`; the supervisor's `mls_storage` view is
+    ///   backed by the same encrypted in-memory store as the event log
+    ///   (dev/test affordance; spec §17.6).
+    /// - [`StorageConfig::Sqlite`] — opens a `SQLCipher`-encrypted database at
+    ///   `{path}/scp.db`. The raw-key path feeds [`SqliteStorage::new`]; the
+    ///   passphrase path feeds [`SqliteStorage::with_passphrase`] (Argon2id;
+    ///   spec §17.6). The ONE `Arc<SqliteStorage>` backs the context-snapshot
+    ///   persistence bridge, the Merkle event log + trust aggregation
+    ///   repository, AND the supervisor's `mls_storage` `OpenMLS` view, so all
+    ///   three consumers share a single `SQLCipher` connection. Downstream
+    ///   `init_supervisor*` picks the shared persistence `Arc` up via
+    ///   `persistence_arc_clone()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageInitError::SqliteOpen`] if the `SQLCipher` database
+    /// cannot be opened (bad key/passphrase, permission denied, corrupt file,
+    /// or a salt-sidecar fail-closed condition). FAIL CLOSED (spec §17.6): the
+    /// bridge does NOT silently degrade to in-memory or no-storage on a failed
+    /// durable-backend open. The error is surfaced to the `SCP.withStorage`
+    /// factory and thrown as a JS `ValidationError`.
+    pub fn with_storage_napi(config: StorageConfig) -> Result<Self, StorageInitError> {
         match config {
-            StorageConfig::InMemory => Self::new_napi(),
+            StorageConfig::InMemory => Ok(Self::new_napi()),
             StorageConfig::Sqlite { path, key } => {
-                match scp_platform::sqlite::SqliteStorage::new(&path, &key) {
-                    Ok(storage) => {
-                        let arc_storage = Arc::new(storage);
-                        // The same `Arc<SqliteStorage>` backs BOTH the
-                        // context-snapshot persistence bridge AND the
-                        // Merkle event log + trust aggregation repository.
-                        // This is the fix for the split-brain where
-                        // `with_storage(Sqlite)` used to persist snapshots
-                        // but silently fall back to in-memory storage for
-                        // event log entries.
-                        let persistence_repo =
-                            Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
-                        let persistence: Arc<dyn ContextPersistence + Send + Sync> = Arc::new(
-                            scp_core::store::context::ProtocolRepositoryContextBridge::new(
-                                persistence_repo,
-                            ),
-                        );
-                        let event_log_repo =
-                            Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
-                        drop(arc_storage);
-                        drop(key);
-                        Self::with_persistence_napi_arc_and_repo(
-                            persistence,
-                            ProtocolRepoVariant::Sqlite(event_log_repo),
-                        )
+                // Open the database ONCE — the same `Arc<SqliteStorage>` is
+                // shared across persistence, event log, and `mls_storage` (a
+                // second open would hit `SQLITE_BUSY` on first write).
+                let open_result = match &key {
+                    SqliteKeyMaterial::Raw(bytes) => {
+                        scp_platform::sqlite::SqliteStorage::new(&path, bytes)
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            path = %path.display(),
-                            "with_storage_napi: SqliteStorage::new failed — instance created without persistence"
-                        );
-                        drop(key);
-                        Self::new_napi()
+                    SqliteKeyMaterial::Passphrase(pass) => {
+                        scp_platform::sqlite::SqliteStorage::with_passphrase(&path, pass.as_bytes())
                     }
-                }
+                };
+                // Zero our copy of the raw key / passphrase regardless of
+                // outcome. The error message never carries key bytes.
+                drop(key);
+
+                let storage = open_result.map_err(|e| {
+                    // FAIL CLOSED (spec §17.6): surface the error rather than
+                    // degrading to in-memory. No silent fallback.
+                    tracing::error!(
+                        error = %e,
+                        path = %path.display(),
+                        "with_storage_napi: SQLCipher open failed — failing closed, no in-memory fallback"
+                    );
+                    StorageInitError::SqliteOpen {
+                        path: path.display().to_string(),
+                        message: e.to_string(),
+                    }
+                })?;
+
+                let arc_storage = Arc::new(storage);
+                // The same `Arc<SqliteStorage>` backs the context-snapshot
+                // persistence bridge, the Merkle event log + trust aggregation
+                // repository, AND the supervisor's `mls_storage` `OpenMLS`
+                // view.
+                let persistence_repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                let persistence: Arc<dyn ContextPersistence + Send + Sync> = Arc::new(
+                    scp_core::store::context::ProtocolRepositoryContextBridge::new(
+                        persistence_repo,
+                    ),
+                );
+                let event_log_repo = Arc::new(ProtocolRepository::new(Arc::clone(&arc_storage)));
+                // Derive the supervisor's `mls_storage` view from the same
+                // `Arc<SqliteStorage>` — erased ONCE via
+                // `SpawnBlockingStorageAdapter`.
+                let mls_storage_backend = mls_storage_from_handle(Arc::clone(&arc_storage));
+                drop(arc_storage);
+
+                Ok(Self::with_persistence_napi_arc_and_repo(
+                    persistence,
+                    ProtocolRepoVariant::Sqlite(event_log_repo),
+                    mls_storage_backend,
+                ))
             }
         }
     }
@@ -338,6 +450,7 @@ impl NapiBridgeInstance {
     fn with_persistence_napi_arc_and_repo(
         persistence: Arc<dyn ContextPersistence + Send + Sync>,
         protocol_repository: ProtocolRepoVariant,
+        mls_storage_backend: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
     ) -> Self {
         Self {
             core: CoreFields::with_persistence_arc(persistence),
@@ -345,11 +458,28 @@ impl NapiBridgeInstance {
             #[cfg(feature = "allow_in_memory_custody")]
             identity_registry: Arc::new(DashMap::new()),
             protocol_repository,
+            mls_storage_backend: Some(mls_storage_backend),
             mcp_server_registry: Arc::new(DashMap::new()),
             mcp_client_registry: Arc::new(DashMap::new()),
             #[cfg(feature = "allow_in_memory_custody")]
             network: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Returns the supervisor's `mls_storage` (`OpenMLS`) backend for this
+    /// bridge instance, if populated.
+    ///
+    /// Populated at construction time from the single chosen `Storage`
+    /// backend (erased once via
+    /// [`SpawnBlockingStorageAdapter`](scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter)).
+    /// `build_supervisor_arc` reads it to satisfy the required `mls_storage`
+    /// argument of `Supervisor::with_providers`; a `None` here is the
+    /// storage-before-supervisor fail-closed condition (spec §17.6).
+    #[must_use]
+    pub(crate) fn mls_storage_ref(
+        &self,
+    ) -> Option<&Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>> {
+        self.mls_storage_backend.as_ref()
     }
 
     /// Returns the monotonic instance id for this bridge.
@@ -876,9 +1006,41 @@ pub fn init_supervisor(local_did: &str) {
         build_event_log_provider().0
     });
     let persistence = persistence_box_for_init(bi);
-    let supervisor_arc = build_supervisor_arc(crypto, transport, event_log, persistence);
+    // Storage-before-supervisor precondition (spec §17.6): the chosen storage
+    // must already be erased into the `mls_storage` view. The runtime never
+    // defaults storage, so a missing backend fails closed — no supervisor is
+    // attached and subsequent operations error, rather than fabricating an
+    // in-memory default. Every constructor populates this, so this is a
+    // defense-in-depth guard.
+    let Some(mls_storage) = bi.mls_storage_ref().map(Arc::clone) else {
+        tracing::error!(
+            "init_supervisor: storage-before-supervisor precondition failed — no \
+             mls_storage backend on the bridge instance; refusing to attach a \
+             supervisor (fail closed, spec §17.6)"
+        );
+        return;
+    };
+    let supervisor_arc =
+        build_supervisor_arc(crypto, transport, event_log, persistence, mls_storage);
 
     bi.core.set_supervisor(supervisor_arc);
+}
+
+/// Erases a chosen `Storage` backend into the supervisor's required
+/// `mls_storage` (`OpenMLS`) view via [`SpawnBlockingStorageAdapter`].
+///
+/// The single chosen backend (`Arc<EncryptingAdapter<BridgeInMemoryStorage>>`
+/// for the dev/in-memory path, or `Arc<SqliteStorage>` for the durable path)
+/// is wrapped ONCE so the event log, persistence, and the `OpenMLS` view all
+/// read/write one store (spec §17.6).
+fn mls_storage_from_handle<S>(
+    handle: Arc<S>,
+) -> Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>
+where
+    S: scp_platform::Storage + 'static,
+{
+    Arc::new(scp_core::crypto::mls::storage_adapter::SpawnBlockingStorageAdapter::new(handle))
+        as Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>
 }
 
 /// Constructs an `Arc<Supervisor>` with the given providers (ADR-049
@@ -886,11 +1048,17 @@ pub fn init_supervisor(local_did: &str) {
 /// `ContextManager`). [`scp_core::context::supervisor::Supervisor::with_providers`]
 /// is the single entry point that constructs the supervisor +
 /// populates the lifted-provider slots.
+///
+/// `mls_storage` is REQUIRED (non-Option): the runtime never defaults storage;
+/// the bridge supplies it (spec §17.6 / ADR-049). It is the single chosen
+/// `Storage` erased once into the `OpenMLS` view, derived from the bridge
+/// instance's `mls_storage_ref()`.
 fn build_supervisor_arc(
     crypto: Arc<scp_core::crypto::mls::provider::MlsCryptoProvider>,
     transport: Box<dyn ContextTransportProvider>,
     event_log: Box<dyn ContextEventLogProvider>,
     persistence: Box<dyn ContextPersistence>,
+    mls_storage: Arc<dyn scp_core::crypto::mls::storage_adapter::OpenMlsStorageAdapter>,
 ) -> Arc<scp_core::context::supervisor::Supervisor> {
     scp_core::context::supervisor::Supervisor::with_providers(
         crypto,
@@ -901,6 +1069,7 @@ fn build_supervisor_arc(
         None,
         None,
         None,
+        mls_storage,
     )
 }
 
@@ -959,7 +1128,16 @@ pub fn init_supervisor_with_local_transport(local_did: &str) {
         build_event_log_provider().0
     });
     let persistence = persistence_box_for_init(bi);
-    let supervisor_arc = build_supervisor_arc(crypto, transport, event_log, persistence);
+    let Some(mls_storage) = bi.mls_storage_ref().map(Arc::clone) else {
+        tracing::error!(
+            "init_supervisor_with_local_transport: storage-before-supervisor \
+             precondition failed — no mls_storage backend on the bridge instance; \
+             refusing to attach a supervisor (fail closed, spec §17.6)"
+        );
+        return;
+    };
+    let supervisor_arc =
+        build_supervisor_arc(crypto, transport, event_log, persistence, mls_storage);
 
     bi.core.set_supervisor(supervisor_arc);
 }
@@ -1014,7 +1192,16 @@ pub fn init_supervisor_with_relay_transport(
         build_event_log_provider().0
     });
     let persistence = persistence_box_for_init(bi);
-    let supervisor_arc = build_supervisor_arc(crypto, transport, event_log, persistence);
+    let Some(mls_storage) = bi.mls_storage_ref().map(Arc::clone) else {
+        tracing::error!(
+            "init_supervisor_with_relay_transport: storage-before-supervisor \
+             precondition failed — no mls_storage backend on the bridge instance; \
+             refusing to attach a supervisor (fail closed, spec §17.6)"
+        );
+        return;
+    };
+    let supervisor_arc =
+        build_supervisor_arc(crypto, transport, event_log, persistence, mls_storage);
 
     bi.core.set_supervisor(supervisor_arc);
 }
@@ -1036,19 +1223,19 @@ pub fn protocol_repository() -> Option<&'static ProtocolRepoVariant> {
 /// storage.
 ///
 /// Delegates to [`scp_ffi_common::bridge_runtime::build_event_log_provider`].
-/// Returns both the event log provider and the underlying `ProtocolRepository`
-/// (for registration in `NapiBridgeInstance`).
+/// Returns three handles to the SAME underlying store: the event log provider,
+/// the underlying `ProtocolRepository` (for registration in
+/// `NapiBridgeInstance`), and the raw
+/// [`BridgeInMemoryStorageHandle`](scp_ffi_common::bridge_runtime::BridgeInMemoryStorageHandle)
+/// — the un-swallowed in-memory storage handle the bridge wraps via
+/// `SpawnBlockingStorageAdapter` into the supervisor's required `mls_storage`
+/// consumer (spec §17.6 — one chosen backend, derived consumers).
 pub(crate) fn build_event_log_provider() -> (
     Box<dyn ContextEventLogProvider>,
     Arc<scp_ffi_common::bridge_runtime::BridgeInMemoryRepo>,
+    BridgeInMemoryStorageHandle,
 ) {
-    // Step 4: NAPI does not yet thread `mls_storage` into its supervisor, so
-    // the un-swallowed in-memory storage handle (the 3rd return element) is
-    // dropped here for now. When NAPI's `with_providers` callsite is wired in
-    // Step 4 this will retain the handle like the UniFFI bridge does.
-    let (event_log, repo, _storage_handle) =
-        scp_ffi_common::bridge_runtime::build_event_log_provider();
-    (event_log, repo)
+    scp_ffi_common::bridge_runtime::build_event_log_provider()
 }
 
 /// Builds an event log provider that reuses the already-registered
@@ -1102,6 +1289,17 @@ pub(crate) fn init_supervisor_for_test() {
         );
         build_event_log_provider().0
     });
+    // The default bridge instance (allocated by `ensure_bridge_instance` via
+    // `new_napi`) populates `mls_storage_backend` from the in-memory storage
+    // handle — the dev/test affordance (spec §17.6). Read it directly; a
+    // missing backend fails closed.
+    let Some(mls_storage) = bi.mls_storage_ref().map(Arc::clone) else {
+        tracing::error!(
+            "init_supervisor_for_test: storage-before-supervisor precondition failed — \
+             no mls_storage backend on the bridge instance"
+        );
+        return;
+    };
     let supervisor_arc = build_supervisor_arc(
         Arc::new(scp_core::crypto::mls::provider::MlsCryptoProvider::new(
             "did:test:napi-bridge-test".to_owned(),
@@ -1109,6 +1307,7 @@ pub(crate) fn init_supervisor_for_test() {
         Box::new(scp_core::context::LocalTransportProvider),
         event_log,
         Box::new(NapiBridgePersistence::new()),
+        mls_storage,
     );
 
     bi.core.set_supervisor(supervisor_arc);
@@ -1852,12 +2051,148 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let bi = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
             path: tmp.path().to_path_buf(),
-            key: zeroize::Zeroizing::new(vec![0x11u8; 32]),
-        });
+            key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x11u8; 32])),
+        })
+        .expect("raw-key sqlite open must succeed");
         assert!(
             matches!(&bi.protocol_repository, ProtocolRepoVariant::Sqlite(_)),
             "with_storage(Sqlite) must produce ProtocolRepoVariant::Sqlite so event log \
              entries persist to the same `SQLCipher` database as context snapshots"
+        );
+        assert!(
+            bi.mls_storage_ref().is_some(),
+            "Sqlite path must populate the mls_storage backend (spec §17.6)"
+        );
+    }
+
+    #[test]
+    fn test_in_memory_populates_mls_storage_backend() {
+        // The dev/in-memory path must populate `mls_storage` from the
+        // un-swallowed in-memory storage handle (spec §17.6 — one chosen
+        // backend, derived consumers). NapiBridgePersistence (a DashMap) is
+        // NOT the source; the build_event_log_provider handle is.
+        let bi = NapiBridgeInstance::new_napi();
+        assert!(
+            bi.mls_storage_ref().is_some(),
+            "in-memory dev path must populate the mls_storage backend"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_open_failure_fails_closed() {
+        // FAIL CLOSED (spec §17.6): a Sqlite open at an unwritable path must
+        // return an error, NOT silently fall back to in-memory/no storage.
+        // Point at a path whose parent is a regular file so the directory
+        // cannot be created.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let blocker = tmp.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("write blocker file");
+        let bad_dir = blocker.join("scp-data");
+        let result = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+            path: bad_dir,
+            key: SqliteKeyMaterial::Raw(zeroize::Zeroizing::new(vec![0x22u8; 32])),
+        });
+        assert!(
+            matches!(result, Err(StorageInitError::SqliteOpen { .. })),
+            "Sqlite open failure must fail closed with SqliteOpen, but the open \
+             unexpectedly succeeded (in-memory fallback is forbidden)"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_passphrase_round_trip() {
+        // Create with a passphrase, write data, reopen the same dir with the
+        // same passphrase, and confirm the data survives — the passphrase
+        // re-derives the same SQLCipher key via the persisted salt sidecar.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+
+        let bi = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+            path: dir.clone(),
+            key: SqliteKeyMaterial::Passphrase(zeroize::Zeroizing::new(
+                "correct horse battery staple".to_owned(),
+            )),
+        })
+        .expect("passphrase sqlite open must succeed");
+        // Write through the mls_storage backend (the OpenMLS view shares the
+        // one SQLCipher connection).
+        let backend = bi
+            .mls_storage_ref()
+            .cloned()
+            .expect("passphrase path must populate mls_storage");
+        crate::runtime().block_on(async {
+            backend
+                .store("scp-test/persist", b"durable-value")
+                .await
+                .expect("store via mls_storage backend");
+        });
+        drop(backend);
+        drop(bi);
+
+        // Reopen with the SAME passphrase.
+        let bi2 = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+            path: dir,
+            key: SqliteKeyMaterial::Passphrase(zeroize::Zeroizing::new(
+                "correct horse battery staple".to_owned(),
+            )),
+        })
+        .expect("reopen with same passphrase must succeed");
+        let backend2 = bi2
+            .mls_storage_ref()
+            .cloned()
+            .expect("reopened passphrase path must populate mls_storage");
+        let read_back = crate::runtime().block_on(async {
+            backend2
+                .retrieve("scp-test/persist")
+                .await
+                .expect("retrieve via reopened backend")
+        });
+        assert_eq!(
+            read_back.as_deref(),
+            Some(b"durable-value".as_slice()),
+            "data written under the passphrase must survive a reopen with the same passphrase"
+        );
+    }
+
+    #[test]
+    fn test_sqlite_wrong_passphrase_fails_closed() {
+        // Security-critical (spec §17.6): reopening an existing DB with the
+        // WRONG passphrase must fail closed — never silently open a fresh,
+        // empty database.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+
+        let bi = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+            path: dir.clone(),
+            key: SqliteKeyMaterial::Passphrase(zeroize::Zeroizing::new(
+                "the-right-passphrase".to_owned(),
+            )),
+        })
+        .expect("initial passphrase open must succeed");
+        let backend = bi
+            .mls_storage_ref()
+            .cloned()
+            .expect("mls_storage backend present");
+        crate::runtime().block_on(async {
+            backend
+                .store("scp-test/secret", b"top-secret")
+                .await
+                .expect("store secret");
+        });
+        drop(backend);
+        drop(bi);
+
+        // Reopen with the WRONG passphrase: must fail closed.
+        let result = NapiBridgeInstance::with_storage_napi(StorageConfig::Sqlite {
+            path: dir,
+            key: SqliteKeyMaterial::Passphrase(zeroize::Zeroizing::new(
+                "the-WRONG-passphrase".to_owned(),
+            )),
+        });
+        assert!(
+            matches!(result, Err(StorageInitError::SqliteOpen { .. })),
+            "wrong passphrase must fail closed (no silent fresh DB), but the open \
+             unexpectedly succeeded"
         );
     }
 

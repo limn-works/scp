@@ -242,12 +242,15 @@ export function __clampShutdownMillisForTests(timeoutSecs: number): number {
  * the NAPI `SCP.withStorage(configJson: string)` factory.
  *
  * - `in_memory` passes through unchanged.
- * - `sqlite` forwards `path` verbatim and normalizes `key`:
+ * - `sqlite` + `key` forwards `path` verbatim and normalizes `key`:
  *   - `Uint8Array` → JSON byte array (`number[]`) — required because
  *     `JSON.stringify` on a `Uint8Array` produces an object-with-numeric-
  *     keys, not an array, which the Rust side would reject.
  *   - `string` → passed through as a hex-encoded string; the NAPI layer
  *     accepts either shape.
+ * - `sqlite` + `passphrase` forwards `path` and the `passphrase` string
+ *   verbatim; the NAPI layer derives the SQLCipher key via Argon2id
+ *   (spec §17.6). Exactly one of `key`/`passphrase` is forwarded.
  *
  * Exported for tests so the wire format can be asserted without a live
  * native addon.
@@ -260,6 +263,14 @@ export function __serializeStorageConfigForTests(config: StorageConfig): string 
 
 function serializeStorageConfig(config: StorageConfig): string {
   if (config.type === "sqlite") {
+    if ("passphrase" in config) {
+      // Passphrase mode (spec §17.6): forward the passphrase verbatim.
+      // The NAPI layer moves it into zeroizing memory and derives the
+      // SQLCipher key via Argon2id.
+      return JSON.stringify({ type: "sqlite", path: config.path, passphrase: config.passphrase });
+    }
+    // Raw-key mode: a Uint8Array must be normalized to a number[] because
+    // `JSON.stringify(Uint8Array)` yields an object, not an array.
     const key = typeof config.key === "string" ? config.key : Array.from(config.key as Uint8Array);
     return JSON.stringify({ type: "sqlite", path: config.path, key });
   }
@@ -274,15 +285,24 @@ function serializeStorageConfig(config: StorageConfig): string {
  * Storage configuration forwarded to the native `SCP.withStorage`
  * factory.
  *
- * Two variants are supported today:
+ * Three variants are supported today:
  * - `{ type: "in_memory" }` — encrypted in-memory storage (ephemeral).
  * - `{ type: "sqlite"; path; key }` — SQLCipher-encrypted storage on
- *   disk at `{path}/scp.db`, backed by `scp-platform::sqlite::SqliteStorage`.
+ *   disk at `{path}/scp.db`, keyed by raw encryption key material.
  *   `key` accepts either a raw `Uint8Array` of key material or a hex-
  *   encoded string (JSON has no native bytes type; the NAPI layer
  *   accepts either shape). The key is consumed across the FFI boundary
  *   and the Rust side zeroizes its internal copy on drop — callers
  *   should zero their own copy after construction.
+ * - `{ type: "sqlite"; path; passphrase }` — SQLCipher-encrypted storage
+ *   whose key is derived from a human-chosen `passphrase` via Argon2id
+ *   (spec §17.6). The passphrase is moved into zeroizing memory on the
+ *   Rust side.
+ *
+ * For the `sqlite` type, exactly ONE of `key` or `passphrase` must be
+ * supplied — providing both, or neither, is rejected by the NAPI layer
+ * with `SCP-VALID-7005`. The two `sqlite` shapes are modeled as separate
+ * union arms so the type system enforces the mutual exclusion.
  *
  * Intentionally a closed union — the open `{ type: string; ... }`
  * branch swallowed typos and drifted from the Rust-side enum.
@@ -293,7 +313,8 @@ function serializeStorageConfig(config: StorageConfig): string {
  */
 export type StorageConfig =
   | { type: "in_memory" }
-  | { type: "sqlite"; path: string; key: Uint8Array | string };
+  | { type: "sqlite"; path: string; key: Uint8Array | string }
+  | { type: "sqlite"; path: string; passphrase: string };
 
 /**
  * Constructor options for `new SCP(...)`.

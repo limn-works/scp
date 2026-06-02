@@ -126,7 +126,7 @@ describeNapi("SCP with SQLite storage (#1549 PR 3)", () => {
     });
   });
 
-  it("survives a mismatched-key attempt without corrupting the original DB", async () => {
+  it("fails closed on a mismatched key without corrupting the original DB", async () => {
     await withTempDir(async (dir) => {
       // First open with the correct key — creates the encrypted DB.
       const scp1 = new SCP({
@@ -134,22 +134,82 @@ describeNapi("SCP with SQLite storage (#1549 PR 3)", () => {
       });
       await scp1.shutdown(1);
 
-      // Second open with a wrong key. The NAPI layer currently logs
-      // and falls back to an in-memory-only instance (matching the
-      // PyO3 bridge's `with_storage_py` behaviour). The construction
-      // therefore succeeds; what we guard against is corruption of
-      // the original encrypted DB file.
+      // Second open with a WRONG key. FAIL CLOSED (spec §17.6): the NAPI
+      // layer must surface a ValidationError (JS throw), NOT silently
+      // degrade to an in-memory instance or open a fresh database.
       const wrongKey = new Uint8Array(32).fill(0x11);
-      const scp2 = new SCP({
-        storage: { type: "sqlite", path: dir, key: wrongKey },
-      });
-      await scp2.shutdown(1);
+      expect(() => {
+        new SCP({
+          storage: { type: "sqlite", path: dir, key: wrongKey },
+        });
+      }).toThrow();
 
-      // Third open with the correct key — must still succeed.
+      // Third open with the correct key — must still succeed (the failed
+      // wrong-key open never touched the original encrypted DB file).
       const scp3 = new SCP({
         storage: { type: "sqlite", path: dir, key: SQLITE_KEY },
       });
       await scp3.shutdown(1);
     });
+  });
+
+  it("round-trips a passphrase-keyed SQLite instance across two constructions", async () => {
+    await withTempDir(async (dir) => {
+      const passphrase = "correct horse battery staple";
+
+      // First open with a passphrase — creates the encrypted DB and the
+      // persisted Argon2id salt sidecar.
+      const scp1 = new SCP({
+        storage: { type: "sqlite", path: dir, passphrase },
+      });
+      expect(scp1.instanceId).toBeDefined();
+      await scp1.shutdown(1);
+
+      // Reopen with the SAME passphrase — must succeed (the salt sidecar
+      // re-derives the same SQLCipher key).
+      const scp2 = new SCP({
+        storage: { type: "sqlite", path: dir, passphrase },
+      });
+      try {
+        expect(scp2.instanceId).toBeDefined();
+      } finally {
+        await scp2.shutdown(1);
+      }
+    });
+  });
+
+  it("fails closed when reopening a passphrase DB with the wrong passphrase", async () => {
+    await withTempDir(async (dir) => {
+      // Create with the correct passphrase.
+      const scp1 = new SCP({
+        storage: { type: "sqlite", path: dir, passphrase: "the-right-passphrase" },
+      });
+      await scp1.shutdown(1);
+
+      // Reopen with the WRONG passphrase. FAIL CLOSED (spec §17.6):
+      // SQLCipher rejects the derived key — the NAPI layer must throw,
+      // NOT silently open a fresh, empty database.
+      expect(() => {
+        new SCP({
+          storage: { type: "sqlite", path: dir, passphrase: "the-WRONG-passphrase" },
+        });
+      }).toThrow();
+    });
+  });
+
+  it("rejects sqlite config that supplies both key and passphrase", () => {
+    // The NAPI layer enforces the mutual exclusion at the JSON boundary
+    // (SCP-VALID-7005). We bypass the TS union type (which models the two
+    // sqlite shapes separately) with a cast to assert the runtime guard.
+    expect(() => {
+      new SCP({
+        storage: {
+          type: "sqlite",
+          path: "/tmp/scp-both",
+          key: SQLITE_KEY,
+          passphrase: "also-a-passphrase",
+        } as unknown as { type: "sqlite"; path: string; passphrase: string },
+      });
+    }).toThrow();
   });
 });
