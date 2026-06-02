@@ -102,7 +102,7 @@ pub enum ProtocolRepoVariant {
     /// Encrypted in-memory repository. Event log and trust aggregation are
     /// backed by an `EncryptingAdapter<BridgeInMemoryStorage>` with a random
     /// per-instance AES-256-GCM key. Data is lost when the instance drops.
-    InMemory(Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>),
+    InMemory(Arc<scp_ffi_common::bridge_runtime::BridgeInMemoryRepo>),
     /// SQLCipher-backed repository. Event log and trust aggregation share the
     /// same `Arc<SqliteStorage>` that backs `CoreFields::persistence`, so
     /// context snapshots, trust attestations, and event log entries all
@@ -219,7 +219,7 @@ impl NapiBridgeInstance {
     /// callers attach one later via `CoreFields::set_context_manager`.
     #[must_use]
     pub fn new_napi() -> Self {
-        let (_event_log, protocol_repository) =
+        let (_event_log, protocol_repository, _storage_handle) =
             scp_ffi_common::bridge_runtime::build_event_log_provider();
         Self {
             core: CoreFields::new(),
@@ -242,7 +242,7 @@ impl NapiBridgeInstance {
     /// [`StorageConfig::InMemory`] path on `NapiBridgeInstance::with_storage_napi`).
     #[must_use]
     pub fn with_persistence_napi(persistence: Box<dyn ContextPersistence + Send + Sync>) -> Self {
-        let (_event_log, protocol_repository) =
+        let (_event_log, protocol_repository, _storage_handle) =
             scp_ffi_common::bridge_runtime::build_event_log_provider();
         Self {
             core: CoreFields::with_persistence(persistence),
@@ -1040,9 +1040,15 @@ pub fn protocol_repository() -> Option<&'static ProtocolRepoVariant> {
 /// (for registration in `NapiBridgeInstance`).
 pub(crate) fn build_event_log_provider() -> (
     Box<dyn ContextEventLogProvider>,
-    Arc<ProtocolRepository<EncryptingAdapter<BridgeInMemoryStorage>>>,
+    Arc<scp_ffi_common::bridge_runtime::BridgeInMemoryRepo>,
 ) {
-    scp_ffi_common::bridge_runtime::build_event_log_provider()
+    // Step 4: NAPI does not yet thread `mls_storage` into its supervisor, so
+    // the un-swallowed in-memory storage handle (the 3rd return element) is
+    // dropped here for now. When NAPI's `with_providers` callsite is wired in
+    // Step 4 this will retain the handle like the UniFFI bridge does.
+    let (event_log, repo, _storage_handle) =
+        scp_ffi_common::bridge_runtime::build_event_log_provider();
+    (event_log, repo)
 }
 
 /// Builds an event log provider that reuses the already-registered

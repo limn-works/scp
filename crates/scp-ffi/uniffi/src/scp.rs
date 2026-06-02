@@ -67,18 +67,26 @@ impl Scp {
 
     /// Constructs an `SCP` instance with a storage configuration.
     ///
-    /// PR 1 accepts the default (in-memory) configuration only. PR 3 adds
-    /// filesystem-backed storage via an additional variant on
-    /// [`StorageConfig`]. The `config` parameter is forwarded to the inner
-    /// constructor; the current match honours only `InMemory`.
+    /// `StorageConfig::InMemory` selects the encrypted in-memory dev/test
+    /// backend; `StorageConfig::Sqlite { path, key }` selects a
+    /// `SQLCipher`-encrypted database, where `key` is either raw key material
+    /// or a passphrase (Argon2id; spec §17.6).
+    ///
+    /// # Errors
+    ///
+    /// FAIL CLOSED (spec §17.6): if a durable (`Sqlite`) backend cannot be
+    /// opened — bad key/passphrase, permission denied, corrupt file, or a
+    /// salt-sidecar fail-closed condition — this returns `ScpError::Context`
+    /// rather than silently degrading to in-memory storage. Surfaces to Swift
+    /// as `throws` and Kotlin as a thrown exception.
     #[uniffi::constructor]
-    #[must_use]
     #[allow(clippy::needless_pass_by_value)]
-    pub fn with_storage(config: StorageConfig) -> Arc<Self> {
+    pub fn with_storage(config: StorageConfig) -> Result<Arc<Self>, ScpError> {
+        let inner = UniffiBridgeInstance::with_storage_uniffi(config)?;
         increment_handle_count();
-        Arc::new(Self {
-            inner: Arc::new(UniffiBridgeInstance::with_storage_uniffi(config)),
-        })
+        Ok(Arc::new(Self {
+            inner: Arc::new(inner),
+        }))
     }
 
     /// Constructs an `SCP` instance with a persistence provider placeholder.
