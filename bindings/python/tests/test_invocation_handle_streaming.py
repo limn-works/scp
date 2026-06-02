@@ -31,6 +31,7 @@ import pytest
 from scp_sdk.errors import (
     Credit,
     OutletExecutionError,
+    OutletProtocolError,
     StreamAlreadyClosed,
 )
 from scp_sdk.outlets import (
@@ -125,6 +126,54 @@ class TestHappyPath:
         agg: Aggregate = await handle
         assert agg.value == {"total": 3}
         assert agg.execution_time_ms == 42
+
+
+# ---------------------------------------------------------------------------
+# Dual-consumption guard (cross-SDK consistency-B).
+# ---------------------------------------------------------------------------
+
+
+class TestDualConsumptionGuard:
+    """A handle backed by a single underlying source cannot be drained as
+    BOTH ``await handle`` (aggregate) and ``async for chunk in handle``
+    (stream). The convergence target — matching the Kotlin reference —
+    is the Protocol-class shape: :class:`OutletProtocolError` with code
+    ``SCP-TOOL-6020`` and slug ``protocol.handle-double-consumed`` (was
+    a generic ``ContextError`` / ``SCP-CTX-2020`` before round-5/6
+    convergence)."""
+
+    @pytest.mark.asyncio
+    async def test_aggregate_then_iterate_raises_protocol_error(self) -> None:
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        await _seed_queue(q, [_end_chunk(seq=0, aggregate={"sum": 1}), None])
+        handle = InvocationHandle(q, request_id="aa" * 16)
+        await handle  # claim "aggregate"
+        with pytest.raises(OutletProtocolError) as excinfo:
+            handle.__aiter__()  # claim "stream" — conflict
+        assert excinfo.value.code == "SCP-TOOL-6020"
+        assert excinfo.value.slug == "protocol.handle-double-consumed"
+        assert excinfo.value.class_wire == "protocol"
+
+    @pytest.mark.asyncio
+    async def test_iterate_then_aggregate_raises_protocol_error(self) -> None:
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        await _seed_queue(q, [_end_chunk(seq=0, aggregate={"sum": 1}), None])
+        handle = InvocationHandle(q, request_id="aa" * 16)
+        handle.__aiter__()  # claim "stream"
+        with pytest.raises(OutletProtocolError) as excinfo:
+            await handle  # claim "aggregate" — conflict
+        assert excinfo.value.code == "SCP-TOOL-6020"
+        assert excinfo.value.slug == "protocol.handle-double-consumed"
+
+    @pytest.mark.asyncio
+    async def test_same_mode_reconsumption_is_idempotent(self) -> None:
+        q: asyncio.Queue[OutletStreamChunk | BaseException | None] = asyncio.Queue()
+        await _seed_queue(q, [_end_chunk(seq=0, aggregate={"sum": 1}), None])
+        handle = InvocationHandle(q, request_id="aa" * 16)
+        # Re-claiming the SAME mode must NOT raise — the guard only
+        # rejects switching to a DIFFERENT mode.
+        handle.__aiter__()
+        handle.__aiter__()  # no raise
 
 
 # ---------------------------------------------------------------------------
@@ -413,10 +462,11 @@ class TestAbnormalClosure:
     """The bridge pump emits `None` to signal end-of-receiver. When the
     `None` arrives WITHOUT a prior terminal chunk (transport drop,
     executor crash, bridge fault) the SDK MUST surface this as an
-    :class:`OutletExecutionError` (`SCP-TOOL-6131` /
-    `execution.stream-gap`) on both the await and iterator paths —
-    NEVER as a degenerate ``Aggregate(value=None)`` or a silent
-    ``StopAsyncIteration``."""
+    :class:`OutletExecutionError` (`SCP-TOOL-6131`, NO slug) on both the
+    await and iterator paths — NEVER as a degenerate
+    ``Aggregate(value=None)`` or a silent ``StopAsyncIteration``. The
+    no-slug shape is the cross-SDK convergence target (Python is the
+    reference; TypeScript / Swift / Kotlin match it)."""
 
     @pytest.mark.asyncio
     async def test_await_path_raises_execution_error_when_pump_closes_without_terminal(

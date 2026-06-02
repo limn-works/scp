@@ -47,7 +47,9 @@ from scp_sdk.errors import (
     OutletError,
     OutletExecutionError,
     OutletNotFoundError,
+    OutletProtocolError,
     OutputError,
+    RetryPolicy,
     StreamAlreadyClosed,
     ValidationError,
 )
@@ -511,7 +513,9 @@ class InvocationHandle:
       instances as they arrive.
 
     The two styles are mutually exclusive per handle: once one is chosen,
-    the other raises :class:`ContextError` (API MAJOR 26).
+    the other raises :class:`OutletProtocolError` (slug
+    ``protocol.handle-double-consumed``, code ``SCP-TOOL-6020``) — the
+    Protocol-class shape converged across all four SDKs.
 
     SCP-OUT-038 control plane: every handle exposes
     :meth:`grant_credit` and :meth:`cancel`. When a handle was opened
@@ -569,9 +573,20 @@ class InvocationHandle:
 
     def _guard(self, mode: str) -> None:
         if self._consumed is not None and self._consumed != mode:
-            raise ContextError(
+            # Dual-consumption guard — a handle backed by a single
+            # underlying source cannot be drained as BOTH ``await handle``
+            # (aggregate) and ``async for chunk in handle`` (stream). The
+            # cross-SDK convergence target (Kotlin reference, OUT-038 AC13
+            # lifecycle-under-Protocol) is the Protocol-class shape: code
+            # ``SCP-TOOL-6020``, slug ``protocol.handle-double-consumed``.
+            # Round-5/6 chose ``OutletProtocolError`` (the §5.4.4
+            # Protocol-class type) over the generic ``ContextError`` so all
+            # four SDKs raise the same class for this condition.
+            raise OutletProtocolError(
                 f"InvocationHandle already consumed as {self._consumed}; cannot switch to {mode}",
-                code="SCP-CTX-2020",
+                code="SCP-TOOL-6020",
+                slug="protocol.handle-double-consumed",
+                retry=RetryPolicy.never(),
             )
         self._consumed = mode
 

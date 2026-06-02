@@ -23,7 +23,8 @@ import {
   Credit,
   InvalidGrant,
   OutletExecutionError,
-  type OutletProtocolError,
+  OutletProtocolError,
+  OutputError,
   StreamAlreadyClosed,
 } from "../src/errors";
 import {
@@ -464,9 +465,76 @@ describe("Aggregate-schema validation (OUT-038 AC12)", () => {
     } catch (err) {
       caught = err;
     }
-    expect(caught).toBeDefined();
-    // Must be an OutputError per AC12 wording (output-class violation).
-    expect((caught as Error).message).toContain("required field");
+    expect(caught).toBeInstanceOf(OutputError);
+    expect((caught as OutputError).code).toBe("SCP-TOOL-6140");
+    // Full jsonschema coverage (ajv) — the wrapped message matches the
+    // Python reference shape; the inner ajv text names the missing prop.
+    expect((caught as Error).message).toContain("does not match aggregate_schema");
+    expect((caught as Error).message).toContain("sum");
+  });
+
+  test("nested-property violation rejects (full schema depth, not shallow)", async () => {
+    // A shallow type+required checker would PASS this (top-level shape is
+    // fine); only a real JSON-schema engine catches the nested type error.
+    const schema = {
+      type: "object",
+      required: ["inner"],
+      properties: {
+        inner: { type: "object", required: ["n"], properties: { n: { type: "integer" } } },
+      },
+    };
+    const handle = makeHandleWithChunks([endChunk(0, { inner: { n: "not-an-int" } })], {
+      aggregateSchema: schema,
+    });
+    let caught: unknown = null;
+    try {
+      await handle;
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(OutputError);
+    expect((caught as OutputError).code).toBe("SCP-TOOL-6140");
+    expect((caught as Error).message).toContain("does not match aggregate_schema");
+  });
+
+  test("null aggregate against a typed schema rejects with OutputError 6140", async () => {
+    // Matches the Python reference: a None/null aggregate fed to a typed
+    // schema fails validation (the schema does not admit null).
+    const schema = { type: "object", required: ["sum"] };
+    const handle = makeHandleWithChunks(
+      [
+        {
+          requestId: new Uint8Array(16),
+          sequence: 0,
+          payloadType: "end",
+          aggregate: null,
+          executionTimeMs: 0,
+        },
+      ],
+      { aggregateSchema: schema },
+    );
+    let caught: unknown = null;
+    try {
+      await handle;
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(OutputError);
+    expect((caught as OutputError).code).toBe("SCP-TOOL-6140");
+  });
+
+  test("no schema bound is a no-op (null aggregate forwarded unchanged)", async () => {
+    const handle = makeHandleWithChunks([
+      {
+        requestId: new Uint8Array(16),
+        sequence: 0,
+        payloadType: "end",
+        aggregate: null,
+        executionTimeMs: 0,
+      },
+    ]);
+    const agg = await handle;
+    expect(agg.value).toBeNull();
   });
 
   test("type mismatch rejects with OutputError", async () => {
@@ -672,6 +740,41 @@ describe("Abnormal closure (HIGH wave 4)", () => {
     expect(observed.length).toBe(2);
     expect(observed.every((c) => c.payloadType === "data")).toBe(true);
   });
+
+  test("iterator rejects on bare-null close with no terminal and no Error (S2 guard)", async () => {
+    // Drive the handle's chunk channel with a bare `null` end-of-queue
+    // marker WITHOUT a preceding terminal chunk or Error. This is the
+    // defense-in-depth gap S2 closes: previously the iterator's null
+    // branch resolved `{done:true}` regardless of whether a terminal was
+    // observed, silently masking an abnormal closure. The contract now
+    // mirrors Python `__anext__`: no terminal seen ⇒ OutletExecutionError
+    // SCP-TOOL-6131 (no slug).
+    let sinkRef: __InternalInvocationHandleSink | null = null;
+    const handle = new InvocationHandle((sink) => {
+      sinkRef = sink;
+      // One Data chunk forwarded normally.
+      sink.chunk(dataChunk(0, { i: 0 }));
+    });
+    // Emulate the bridge's bare-null end-of-queue close (no terminal, no
+    // Error) by pushing `null` directly through the private chunk channel.
+    (handle as unknown as { enqueueChunk: (c: unknown) => void }).enqueueChunk(null);
+    void sinkRef;
+    const observed: OutletStreamChunk[] = [];
+    let caught: unknown;
+    try {
+      for await (const chunk of handle) {
+        observed.push(chunk);
+      }
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(OutletExecutionError);
+    expect((caught as OutletExecutionError).code).toBe("SCP-TOOL-6131");
+    expect((caught as Error).message).toContain("stream closed without terminal chunk");
+    // The no-slug invariant — OutletExecutionError carries no slug.
+    expect((caught as unknown as { slug?: string }).slug).toBeUndefined();
+    expect(observed.length).toBe(1);
+  });
 });
 
 // Reference the helper so biome doesn't warn about an unused function.
@@ -679,9 +782,45 @@ describe("Abnormal closure (HIGH wave 4)", () => {
 // because the only call site is gated behind `__tsCheckOnly` which is
 // `declare const __tsCheckOnly: never` and never holds a value.
 void _tscRejectsRawNumberForGrantCredit;
-// Type-level reference to OutletProtocolError so the import is
-// non-trivial at type-check time. Pure type annotation — no runtime
-// effect.
-type _UnusedProtoType = OutletProtocolError | null;
-const _unusedProtoSentinel: _UnusedProtoType = null;
-void _unusedProtoSentinel;
+
+// ---------------------------------------------------------------------------
+// Dual-consumption guard (cross-SDK consistency-B; OUT-038 AC13
+// lifecycle-under-Protocol). A handle drained as `await handle` cannot
+// then be iterated (and vice-versa). The convergence target — matching
+// the Kotlin reference — is the Protocol-class shape: code
+// `SCP-TOOL-6020`, slug `protocol.handle-double-consumed`.
+// ---------------------------------------------------------------------------
+
+describe("Dual-consumption guard (consistency-B)", () => {
+  test("aggregate then iterate throws OutletProtocolError with protocol slug", async () => {
+    const handle = makeHandleWithChunks([endChunk(0, { sum: 1 })]);
+    await handle; // claim "aggregate"
+    let caught: unknown = null;
+    try {
+      // Claiming the second mode trips the guard synchronously when the
+      // async iterator is requested.
+      handle[Symbol.asyncIterator]();
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(OutletProtocolError);
+    expect((caught as OutletProtocolError).code).toBe("SCP-TOOL-6020");
+    expect((caught as OutletProtocolError).slug).toBe("protocol.handle-double-consumed");
+    expect((caught as OutletProtocolError).classWire).toBe("protocol");
+  });
+
+  test("iterate then aggregate throws OutletProtocolError with protocol slug", async () => {
+    const handle = makeHandleWithChunks([endChunk(0, { sum: 1 })]);
+    handle[Symbol.asyncIterator](); // claim "stream"
+    let caught: unknown = null;
+    try {
+      // `then` is invoked when the handle is awaited; the guard fires there.
+      await handle;
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(OutletProtocolError);
+    expect((caught as OutletProtocolError).code).toBe("SCP-TOOL-6020");
+    expect((caught as OutletProtocolError).slug).toBe("protocol.handle-double-consumed");
+  });
+});
