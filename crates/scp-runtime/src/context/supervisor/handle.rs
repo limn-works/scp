@@ -569,6 +569,79 @@ impl SupervisorHandle {
     pub(in crate::context) async fn despawn_actor(&self, context_id: &str) -> bool {
         self.supervisor.despawn_actor(context_id).await
     }
+
+    // -----------------------------------------------------------------
+    // Timer-task surface (ADR-049 Phase 2A finalization — TTL +
+    // governance timer → actor registry + mailbox tick).
+    //
+    // Per-context timer tasks (TTL expiry, governance timeout) are
+    // supervisor-scoped infrastructure: they are spawned onto the
+    // supervisor's `task_set` so shutdown can abort them, and on each
+    // wake they resolve the target actor through the lock-free `actors`
+    // registry and mailbox a tick command (`TtlCloseCommand::FireTimer`
+    // / `GovernanceCommand::EvaluateTimeouts`). A `lookup → None`
+    // (despawned actor) replaces the legacy stale-generation gate: the
+    // timer stops cleanly when the context's actor no longer exists.
+    //
+    // `lookup` is the ONE place a `SupervisorHandle` yields a
+    // `ContextActorHandle`. It does NOT breach the "actors cannot reach
+    // sibling actors" contract: the caller is a detached timer task, not
+    // a handler running inside another actor's dispatch turn. Visibility
+    // is `pub(in crate::context)` so only `crate::context` infra (the
+    // timer-spawn helpers in `ttl_close_helpers` / `governance_helpers`)
+    // can reach it — handler bodies under `actor/handlers/` are
+    // `pub`-only consumers of the handle and cannot name this method.
+    // -----------------------------------------------------------------
+
+    /// Resolve the actor handle for `context_id` through the lock-free
+    /// `Supervisor::actors` registry. Returns `None` if no actor is
+    /// registered (context gone / not yet spawned).
+    ///
+    /// Used by the per-context timer tasks to mailbox their tick command
+    /// to the owning actor. See the timer-task surface comment above for
+    /// why this is the single sanctioned `ContextActorHandle` yield.
+    ///
+    /// `dead_code` allow: the first caller is the actor-shape TTL /
+    /// governance timer-spawn helpers in the next finalization commit.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(in crate::context) fn lookup(
+        &self,
+        context_id: &str,
+    ) -> Option<crate::context::actor::handle::ContextActorHandle> {
+        self.supervisor.lookup(context_id)
+    }
+
+    /// Spawn `fut` onto the supervisor's shared `task_set` JoinSet so the
+    /// task is tracked and aborted on supervisor shutdown. Returns the
+    /// task's [`AbortHandle`](tokio::task::AbortHandle) so the caller can
+    /// store it on actor-owned timer state for cancel/reset.
+    ///
+    /// Returns `None` if the supervisor has no task set (built via
+    /// [`Supervisor::new`] / `for_query_shim` rather than
+    /// [`Supervisor::with_providers`]); in that degraded configuration no
+    /// background timer can be spawned, matching the legacy
+    /// `task_set_ref() == None` early-return.
+    ///
+    /// Lock note: acquires the `task_set` mutex only to call
+    /// `JoinSet::spawn` (a synchronous push), then releases it. This is a
+    /// supervisor-scoped write-path lock, not a read-path lock — ADR-049
+    /// §12 (no `Mutex`/`RwLock` on read paths) is not implicated.
+    ///
+    /// `dead_code` allow: the first caller is the actor-shape TTL /
+    /// governance timer-spawn helpers in the next finalization commit.
+    #[allow(dead_code)]
+    pub(in crate::context) async fn tracked_spawn<F>(
+        &self,
+        fut: F,
+    ) -> Option<tokio::task::AbortHandle>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let task_set_arc = std::sync::Arc::clone(self.supervisor.task_set_ref()?);
+        let mut task_set = task_set_arc.lock().await;
+        Some(task_set.spawn(fut))
+    }
 }
 
 // Explicit non-exposure check: ensure no public method returns
