@@ -293,6 +293,14 @@ jobs:
           # builds (iOS XCFramework, Android .aar) MUST NOT enable this
           # feature. See GitHub issue #88.
           cargo clippy --workspace --all-targets --features scp-ffi-uniffi/allow_in_memory_custody,scp-ffi/allow_in_memory_custody,scp-ffi-napi/allow_in_memory_custody,scp-core/testing,scp-runtime/testing -- -D warnings
+          # The optional network transports (quic, http3, udp, coap) are not in
+          # the default feature set and are not activated by --workspace, so the
+          # sweep above never lints them. They rotted undetected for months
+          # (the quic feature stopped compiling). Lint them explicitly so a
+          # broken optional transport fails CI. They co-compile (openssl-backed
+          # udp/coap alongside ring-backed quic/http3), so a single combined
+          # invocation covers all four.
+          cargo clippy -p scp-transport --features quic,http3,udp,coap --all-targets -- -D warnings
 
   # Matrix jobs must always expand so each OS variant reports a status
   # to branch protection. Step-level `if` skips the heavy work instead.
@@ -346,6 +354,11 @@ jobs:
           # --workspace (combined includes rusqlite + scp-platform; local-cache
           # enables caching logic).
           cargo test -p scp-transport --features combined,local-cache
+          # The optional network transports (quic, http3, udp, coap) are also
+          # not activated by --workspace. They co-compile, so a single combined
+          # invocation exercises every transport's test suite and guards against
+          # the silent rot that broke the quic feature for months.
+          cargo nextest run -p scp-transport --features quic,http3,udp,coap
 
   rust-doc:
     needs: changes

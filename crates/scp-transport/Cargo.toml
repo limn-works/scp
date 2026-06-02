@@ -22,7 +22,10 @@ quic = ["dep:quinn", "dep:rustls", "dep:rcgen"]
 udp = ["dep:openssl", "dep:socket2"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn", "dep:rustls", "dep:http"]
 webtransport-wasm = ["dep:wasm-bindgen", "dep:js-sys", "dep:web-sys", "dep:wasm-bindgen-futures", "dep:getrandom_02", "dep:getrandom_03"]
-coap = ["dep:coap-lite", "dep:openssl"]
+# coap reuses the DTLS session primitive from the `udp` module
+# (CoAP-over-DTLS, §10.16.2), so it must pull `udp` to bring in
+# `udp::dtls::AsyncDtlsSession`.
+coap = ["dep:coap-lite", "dep:openssl", "udp"]
 nostr = ["dep:base64", "dep:k256"]
 webrtc = []
 upnp = ["dep:igd-next", "dep:natpmp"]

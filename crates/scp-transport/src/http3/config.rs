@@ -126,7 +126,7 @@ impl AltSvcHeader {
     pub const fn new(port: u16) -> Self {
         Self {
             port,
-            max_age: Duration::from_secs(86_400),
+            max_age: Duration::from_hours(24),
         }
     }
 
@@ -354,7 +354,16 @@ impl Http3Config {
     /// Returns [`TransportError::ConnectionFailed`] if the TLS configuration
     /// is invalid (e.g., certificate/key mismatch).
     pub fn build_rustls_config(&self) -> Result<rustls::ServerConfig, TransportError> {
-        let mut tls_config = rustls::ServerConfig::builder()
+        // Pin the ring crypto provider explicitly rather than relying on the
+        // process default. When a binary links both the `ring` and `aws-lc-rs`
+        // rustls providers (e.g. via aws-sdk / reqwest pulling aws-lc-rs
+        // alongside our ring backend), `ServerConfig::builder()` has no
+        // unambiguous default and panics. SCP is ring-only, so name the
+        // provider directly. Mirrors the QUIC listener fix.
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut tls_config = rustls::ServerConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| TransportError::ConnectionFailed(format!("TLS config error: {e}")))?
             .with_no_client_auth()
             .with_single_cert(self.certs.clone(), self.key.clone_key())
             .map_err(|e| TransportError::ConnectionFailed(format!("TLS config error: {e}")))?;
@@ -485,7 +494,7 @@ mod tests {
     fn alt_svc_default_port_443() {
         let alt_svc = AltSvcHeader::new(443);
         assert_eq!(alt_svc.port(), 443);
-        assert_eq!(alt_svc.max_age(), Duration::from_secs(86_400));
+        assert_eq!(alt_svc.max_age(), Duration::from_hours(24));
         assert_eq!(alt_svc.to_header_value(), "h3=\":443\"; ma=86400");
     }
 
@@ -497,7 +506,7 @@ mod tests {
 
     #[test]
     fn alt_svc_custom_max_age() {
-        let alt_svc = AltSvcHeader::new(443).with_max_age(Duration::from_secs(3600));
+        let alt_svc = AltSvcHeader::new(443).with_max_age(Duration::from_hours(1));
         assert_eq!(alt_svc.to_header_value(), "h3=\":443\"; ma=3600");
     }
 
@@ -536,13 +545,13 @@ mod tests {
             .with_bind_addr(bind_addr)
             .with_alt_svc(AltSvcHeader::new(8443))
             .with_max_bi_streams(200)
-            .with_idle_timeout(Duration::from_secs(120))
+            .with_idle_timeout(Duration::from_mins(2))
             .with_connection_coalescing(false);
 
         assert_eq!(config.bind_addr(), bind_addr);
         assert_eq!(config.alt_svc().port(), 8443);
         assert_eq!(config.max_bi_streams(), 200);
-        assert_eq!(config.idle_timeout(), Duration::from_secs(120));
+        assert_eq!(config.idle_timeout(), Duration::from_mins(2));
         assert!(!config.connection_coalescing());
     }
 

@@ -213,7 +213,7 @@ impl<S: BlobStorage + 'static> WebTransportListener<S> {
         tokio::spawn(async move {
             rate_limiter
                 .cleanup_loop(
-                    Duration::from_secs(60),
+                    Duration::from_mins(1),
                     Duration::from_secs(90),
                     shutdown_token,
                 )
