@@ -1102,6 +1102,28 @@ pub enum GovernanceCommand {
         /// `Ok(false)` stops it.
         reply: oneshot::Sender<Result<bool, ContextError>>,
     },
+
+    /// Install (or reinstall) THIS actor's governance-timeout interval
+    /// task on actor-owned state.
+    ///
+    /// The handler spawns the 60-second interval loop onto the
+    /// supervisor's tracked `task_set` via
+    /// [`SupervisorHandle::tracked_spawn`](crate::context::supervisor::handle::SupervisorHandle::tracked_spawn)
+    /// and stores its cancel `Notify` + `AbortHandle` on
+    /// `state.governance.timeout_task`. On each wake the task resolves
+    /// the owning actor through
+    /// [`SupervisorHandle::lookup`](crate::context::supervisor::handle::SupervisorHandle::lookup)
+    /// and mailboxes [`Self::EvaluateTimeouts`] — no `&Supervisor` /
+    /// `contexts` DashMap reach, no stale-generation gate.
+    ///
+    /// Dispatched by the lifecycle bootstrap paths (`finalize_create`,
+    /// `restore_context`, `import_context`) after actor spawn, since
+    /// those hold only `&ActorDeps` (no `&mut state`).
+    StartTimeoutTask {
+        /// Oneshot reply channel. `Ok(())` once the interval task is
+        /// installed.
+        reply: oneshot::Sender<Result<(), ContextError>>,
+    },
 }
 
 /// Reply-channel type alias for [`BroadcastCommand::SubscribeBroadcast`].

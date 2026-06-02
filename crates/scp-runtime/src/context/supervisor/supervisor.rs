@@ -4299,7 +4299,12 @@ impl Supervisor {
             GovernanceCommand::Placeholder { .. }
             | GovernanceCommand::EvaluatePeriodicConsequences { .. }
             | GovernanceCommand::ProcessPendingCommits { .. }
-            | GovernanceCommand::EvaluateTimeouts { .. } => None,
+            | GovernanceCommand::EvaluateTimeouts { .. }
+            // `StartTimeoutTask` is dispatched directly to the owning
+            // actor by `start_governance_timeout_task` (lookup + send),
+            // not through `dispatch_governance_command`. Returning `None`
+            // keeps the routed-dispatch path from accepting it.
+            | GovernanceCommand::StartTimeoutTask { .. } => None,
         }
     }
 
@@ -4950,6 +4955,126 @@ mod tests {
 
         // Cleanly shut down.
         handle.send_shutdown().await.unwrap();
+    }
+
+    /// End-to-end: a TTL timer installed via the actor mailbox
+    /// (`SupervisorHandle::dispatch_start_ttl_timer` →
+    /// `TtlCloseCommand::StartTtlTimer` → actor-shape
+    /// `ttl_close_helpers::spawn_ttl_timer`) actually fires after its
+    /// duration: the spawned timer task resolves the owning actor via
+    /// `Supervisor::lookup` and mailboxes `TtlCloseCommand::FireTimer`,
+    /// whose handler runs the expiry pipeline on owned state and
+    /// transitions the context `Active → Expired`. Proves the
+    /// registry + mailbox-tick timer path (ADR-049 Phase 2A
+    /// finalization) end-to-end, with no `contexts` DashMap reach.
+    #[tokio::test]
+    async fn dispatch_start_ttl_timer_fires_and_expires_context() {
+        use crate::context::supervisor::handle::SupervisorHandle;
+
+        let supervisor_arc = supervisor_with_providers();
+        let deps = test_actor_deps(&supervisor_arc).await;
+
+        let ctx_id_bytes = [0x7Au8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+        // Clone the shared handle BEFORE moving state into the actor so
+        // we can observe the actor's FSM transitions from this test.
+        // The actor's `state.handle` must be `Active` for the FireTimer
+        // expiry pipeline to run (it rejects non-Active contexts), so
+        // drive the shared handle to `Active` up front — the production
+        // create path leaves the context Active before the timer fires.
+        let observed_handle = state.handle.clone();
+        observed_handle
+            .transition_to(&crate::context::ContextState::Active)
+            .await
+            .unwrap();
+
+        let actor_handle = supervisor_arc
+            .spawn_actor_with_state(state, deps, None)
+            .await;
+        assert!(supervisor_arc.lookup(&ctx_key).is_some());
+
+        // Install a short TTL timer through the capability-reduced
+        // handle: StartTtlTimer → actor-shape `spawn_ttl_timer` installs
+        // the timer task on owned state.
+        let sup_handle = SupervisorHandle::wrap(Arc::clone(&supervisor_arc));
+        sup_handle
+            .dispatch_start_ttl_timer(
+                &ctx_key,
+                scp_protocol::context::ContextParams::default(),
+                std::time::Duration::from_millis(50),
+            )
+            .await;
+        assert_eq!(
+            observed_handle.state().await,
+            crate::context::ContextState::Active,
+            "context must remain Active immediately after the timer is installed"
+        );
+
+        // Wait for the timer to fire and the FireTimer expiry pipeline
+        // to run. Poll the shared handle until it leaves `Active`.
+        let expired = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if observed_handle.state().await != crate::context::ContextState::Active {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(
+            expired.is_ok(),
+            "TTL timer task must fire FireTimer and move the context out of Active"
+        );
+        assert_eq!(
+            observed_handle.state().await,
+            crate::context::ContextState::Expired,
+            "FireTimer expiry pipeline must transition the context to Expired"
+        );
+
+        actor_handle.send_shutdown().await.unwrap();
+    }
+
+    /// `GovernanceCommand::StartTimeoutTask` installs the per-context
+    /// governance-timeout interval task on the spawned actor's owned
+    /// state (actor-shape `governance_helpers::spawn_governance_timeout_task`
+    /// → `tracked_spawn` onto the supervisor's `task_set` → install on
+    /// `state.governance.timeout_task`). Asserts the handler replies
+    /// `Ok(())`, proving the install path runs end-to-end on a
+    /// registered actor with no `contexts` DashMap reach (ADR-049
+    /// Phase 2A finalization).
+    #[tokio::test]
+    async fn start_timeout_task_installs_on_actor() {
+        let supervisor_arc = supervisor_with_providers();
+        let deps = test_actor_deps(&supervisor_arc).await;
+
+        let ctx_id_bytes = [0x6Bu8; 32];
+        let ctx_key = hex::encode(ctx_id_bytes);
+        let state = crate::context::actor::state::PerContextState::new_for_test_encrypted(
+            ctx_id_bytes,
+            1_700_000_000,
+            DID("did:example:admin".to_owned()),
+        );
+
+        let actor_handle = supervisor_arc
+            .spawn_actor_with_state(state, deps, None)
+            .await;
+        assert!(supervisor_arc.lookup(&ctx_key).is_some());
+
+        // Dispatch StartTimeoutTask and observe the install reply.
+        let reply = actor_handle
+            .send(|reply| ContextCommand::Governance(GovernanceCommand::StartTimeoutTask { reply }))
+            .await;
+        assert!(
+            reply.is_ok(),
+            "StartTimeoutTask must install the governance-timeout task and reply Ok(()): {reply:?}"
+        );
+
+        actor_handle.send_shutdown().await.unwrap();
     }
 
     #[tokio::test]

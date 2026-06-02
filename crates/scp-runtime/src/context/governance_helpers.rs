@@ -3990,24 +3990,10 @@ pub async fn process_pending_commits(supervisor: &crate::context::supervisor::Su
 /// Returns `false` if the actor cannot be reached (mailbox closed or
 /// no actor registered for `context_id`) — the timer loop stops in
 /// that case, matching the legacy `contexts.get(ctx_id) = None ->
-/// return false` semantics.
-///
-/// First caller lands in Phase 2B per ADR-049 (per-context
-/// governance-timeout actor). The current
-/// `start_governance_timeout_task_legacy` body inlines the
-/// per-actor dispatch of `EvaluatePeriodicConsequences` /
-/// `ProcessPendingCommits` directly (rather than dispatching the
-/// whole-tick `EvaluateTimeouts` via this helper) so Phase 1-3
-/// machinery can still reach `Supervisor::contexts` for
-/// generation tracking during the migration window.
-#[allow(
-    dead_code,
-    reason = "first caller lands in Phase 2B per ADR-049 — entry point \
-              in place so the whole-tick mailbox dispatch shape is \
-              grep-findable and the `EvaluateTimeouts` variant is reachable"
-)]
-pub async fn tick_governance_timeout(
-    supervisor: &crate::context::supervisor::Supervisor,
+/// return false` semantics (registry-based replacement for the
+/// stale-generation gate).
+async fn tick_governance_timeout(
+    supervisor: &crate::context::supervisor::handle::SupervisorHandle,
     context_id: &str,
 ) -> bool {
     use crate::context::actor::commands::{ContextCommand, GovernanceCommand};
@@ -4030,34 +4016,108 @@ pub async fn tick_governance_timeout(
     }
 }
 
-/// Sweep entry point: spawn the supervisor-driven governance timeout
-/// task for a context.
+/// Spawn (or respawn) THIS context's governance-timeout interval task on
+/// actor-owned state.
 ///
-/// Per ADR-049 Phase 2A finalization §sweep-helper-relocation, the
-/// per-context governance-timeout actor lands in Phase 2B; for now the
-/// spawn-time setup stays supervisor-driven but the per-tick body is
-/// rerouted through the actor mailbox via
-/// [`tick_governance_timeout`]. The spawn dance (`task_set` + per-context
-/// `start_in`) remains in
-/// [`governance_helpers_legacy::start_governance_timeout_task_legacy`]
-/// because it deeply touches the legacy `Supervisor::contexts`
-/// generation tracking; full migration lands when the legacy `contexts`
-/// `DashMap` is removed.
+/// Replaces `start_governance_timeout_task_legacy`: the new interval
+/// loop holds no `&Supervisor` and reads no `contexts` `DashMap`. On each
+/// 60-second wake it resolves the owning actor via
+/// [`SupervisorHandle::lookup`](crate::context::supervisor::handle::SupervisorHandle::lookup)
+/// and mailboxes
+/// [`GovernanceCommand::EvaluateTimeouts`](crate::context::actor::commands::GovernanceCommand::EvaluateTimeouts),
+/// whose actor handler runs all five timeout phases (proposal
+/// resolution, deadlock detection, event writeback, consequence
+/// evaluation, commit-retry drain) on the actor's owned `&mut state`. A
+/// `lookup → None` / mailbox failure stops the loop — the registry-based
+/// replacement for the legacy stale-generation gate.
 ///
-/// This wrapper is provided so callers can address the migration via
-/// the non-legacy module surface. It currently delegates to the legacy
-/// helper byte-identically — the only observable behavior change is
-/// that the spawned task's PHASE 4/5 (consequences + commit retry)
-/// bodies now dispatch through this module's
-/// [`evaluate_periodic_consequences`] and
-/// [`process_pending_commits`] when they migrate in a follow-up
-/// commit of the same ladder.
+/// The loop is spawned onto the supervisor's tracked `task_set` via
+/// [`SupervisorHandle::tracked_spawn`](crate::context::supervisor::handle::SupervisorHandle::tracked_spawn);
+/// its cancel `Notify` + `AbortHandle` are installed on
+/// `state.governance.timeout_task` via
+/// [`GovernanceTimeoutTask::install`](crate::context::governance::timeout::GovernanceTimeoutTask::install),
+/// which aborts any prior task first (cancel/reset semantics preserved).
+///
+/// `tracked_spawn` is awaited (it acquires the `task_set` mutex) so the
+/// abort handle is available to install before returning. Called from
+/// the actor handler for
+/// [`GovernanceCommand::StartTimeoutTask`](crate::context::actor::commands::GovernanceCommand::StartTimeoutTask).
+pub async fn spawn_governance_timeout_task(state: &mut PerContextState, deps: &ActorDeps) {
+    use crate::context::governance::timeout::TIMEOUT_CHECK_INTERVAL_SECS;
+
+    let context_id = state.handle.context_id().to_owned();
+    let supervisor = deps.supervisor.clone();
+    let cancel = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    let loop_cancel = std::sync::Arc::clone(&cancel);
+    let loop_fut = async move {
+        loop {
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(
+                    TIMEOUT_CHECK_INTERVAL_SECS,
+                )) => {
+                    if !tick_governance_timeout(&supervisor, &context_id).await {
+                        break;
+                    }
+                }
+                () = loop_cancel.notified() => {
+                    break;
+                }
+            }
+        }
+    };
+
+    // Spawn onto the supervisor's tracked task_set and install the
+    // cancel signal + abort handle on actor-owned state. In the degraded
+    // no-task-set config `tracked_spawn` returns `None`; nothing to
+    // install (matches the legacy `task_set_ref() == None` early-return).
+    if let Some(abort) = deps.supervisor.tracked_spawn(loop_fut).await {
+        state.governance.timeout_task.install(cancel, abort);
+    }
+}
+
+/// Sweep entry point retained as the non-legacy module surface for the
+/// lifecycle bootstrap. Mailboxes
+/// [`GovernanceCommand::StartTimeoutTask`](crate::context::actor::commands::GovernanceCommand::StartTimeoutTask)
+/// to the freshly-spawned actor, which installs the interval task on its
+/// owned `state.governance.timeout_task` via
+/// [`spawn_governance_timeout_task`].
+///
+/// Best-effort: a `lookup → None` (actor not yet registered) or
+/// mailbox-send failure is logged and skipped — the governance-timeout
+/// task is a background facility, not part of the create/restore success
+/// contract.
 pub async fn start_governance_timeout_task(
-    supervisor: &crate::context::supervisor::Supervisor,
+    supervisor: &crate::context::supervisor::handle::SupervisorHandle,
     context_id: &str,
 ) {
-    crate::context::governance_helpers_legacy::start_governance_timeout_task_legacy(
-        supervisor, context_id,
-    )
-    .await;
+    use crate::context::actor::commands::{ContextCommand, GovernanceCommand};
+
+    let Some(actor) = supervisor.lookup(context_id) else {
+        tracing::warn!(
+            context_id,
+            "start_governance_timeout_task: no actor registered — timeout task not installed"
+        );
+        return;
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let cmd = ContextCommand::Governance(GovernanceCommand::StartTimeoutTask { reply: tx });
+    if actor
+        .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            context_id,
+            "start_governance_timeout_task: mailbox send failed — timeout task not installed"
+        );
+        return;
+    }
+    if let Ok(Err(e)) = rx.await {
+        tracing::warn!(
+            context_id,
+            error = %e,
+            "start_governance_timeout_task: actor reported timeout-task install failure"
+        );
+    }
 }

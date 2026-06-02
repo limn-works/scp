@@ -1186,29 +1186,22 @@ pub async fn finalize_create(
     handle: &ContextHandle,
 ) {
     deps.supervisor.update_context_gauges().await;
-    // Designated-legacy supervisor-scoped iteration helper — see module
-    // doc comment.
-    let supervisor = deps.supervisor.shim_supervisor();
-    crate::context::governance_helpers::start_governance_timeout_task(
-        supervisor.as_ref(),
-        context_id,
-    )
-    .await;
+    // Install the governance-timeout interval task on the freshly-spawned
+    // actor via the mailbox (registry + EvaluateTimeouts tick — no
+    // DashMap reach).
+    crate::context::governance_helpers::start_governance_timeout_task(&deps.supervisor, context_id)
+        .await;
     deps.supervisor
         .persist_context_and_broadcast(context_id)
         .await;
     if let Some(duration) = ttl_duration {
-        // Designated-legacy supervisor-scoped helper — TTL timer needs
-        // the supervisor's task_set + contexts_arc for cross-actor
-        // timer-fired mutation that ActorDeps does not surface (Phase
-        // 2A.6 Option B).
-        crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy(
-            supervisor.as_ref(),
-            context_id,
-            duration,
-            handle.clone(),
-        )
-        .await;
+        // Install the TTL timer by mailboxing StartTtlTimer to the
+        // freshly-spawned actor: the actor owns `state.ttl.timer` and
+        // installs the timer task on its own state (registry + mailbox
+        // tick — no DashMap reach).
+        deps.supervisor
+            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration)
+            .await;
     }
 }
 
@@ -1600,10 +1593,9 @@ pub async fn import_context(
 
     deps.supervisor.update_context_gauges().await;
 
-    // Start governance timeout task (ADR-031 §5).
-    let supervisor = deps.supervisor.shim_supervisor();
+    // Start governance timeout task (ADR-031 §5) via the actor mailbox.
     crate::context::governance_helpers::start_governance_timeout_task(
-        supervisor.as_ref(),
+        &deps.supervisor,
         &context_id,
     )
     .await;
@@ -1613,16 +1605,14 @@ pub async fn import_context(
         .persist_context_and_broadcast(&context_id)
         .await;
 
-    // 9. Re-spawn TTL timer if there was remaining TTL.
+    // 9. Re-spawn TTL timer if there was remaining TTL. Mailbox
+    // StartTtlTimer to the freshly-spawned actor (registry + mailbox
+    // tick — no DashMap reach).
     if let Some(remaining_secs) = export.snapshot.ttl_remaining_secs {
         let duration = std::time::Duration::from_secs(remaining_secs);
-        crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy(
-            supervisor.as_ref(),
-            &context_id,
-            duration,
-            handle.clone(),
-        )
-        .await;
+        deps.supervisor
+            .dispatch_start_ttl_timer(&context_id, handle.params().clone(), duration)
+            .await;
     }
 
     Ok(handle)
@@ -1942,25 +1932,18 @@ pub async fn restore_context(
         .await
         .map_err(|e| ContextError::MembershipFailed(e.to_string()))?;
 
-    // Start governance timeout task (ADR-031 §5). Designated-legacy
-    // supervisor-scoped iteration helper — see module doc comment.
-    let supervisor = deps.supervisor.shim_supervisor();
-    crate::context::governance_helpers::start_governance_timeout_task(
-        supervisor.as_ref(),
-        context_id,
-    )
-    .await;
+    // Start governance timeout task (ADR-031 §5) via the actor mailbox.
+    crate::context::governance_helpers::start_governance_timeout_task(&deps.supervisor, context_id)
+        .await;
 
-    // Re-spawn TTL timer if there was remaining TTL.
+    // Re-spawn TTL timer if there was remaining TTL. Mailbox
+    // StartTtlTimer to the freshly-spawned actor (registry + mailbox
+    // tick — no DashMap reach).
     if let Some(remaining_secs) = ttl_remaining {
         let duration = std::time::Duration::from_secs(remaining_secs);
-        crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy(
-            supervisor.as_ref(),
-            context_id,
-            duration,
-            handle.clone(),
-        )
-        .await;
+        deps.supervisor
+            .dispatch_start_ttl_timer(context_id, handle.params().clone(), duration)
+            .await;
     }
 
     Ok(())

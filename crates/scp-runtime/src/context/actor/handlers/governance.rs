@@ -206,6 +206,9 @@ async fn dispatch_state(
         GovernanceCommand::EvaluateTimeouts { reply } => {
             Box::pin(handle_evaluate_timeouts_actor(state, deps, reply)).await
         }
+        GovernanceCommand::StartTimeoutTask { reply } => {
+            handle_start_timeout_task_actor(state, deps, reply).await
+        }
         // Placeholder is a no-op handshake target reserved for mailbox
         // tests. Returns NotImplemented synchronously; no state mutation.
         GovernanceCommand::Placeholder { reply } => reply_not_implemented(reply),
@@ -1181,5 +1184,25 @@ async fn handle_evaluate_timeouts_actor(
     .await;
 
     let _ = reply.send(Ok(true));
+    Outcome::ok_mutated(())
+}
+
+/// Handle [`GovernanceCommand::StartTimeoutTask`] (actor-shape).
+///
+/// Installs the per-context governance-timeout interval task on
+/// actor-owned `state.governance.timeout_task` via the actor-shape
+/// [`governance_helpers::spawn_governance_timeout_task`](crate::context::governance_helpers::spawn_governance_timeout_task).
+/// The spawned loop mailboxes [`GovernanceCommand::EvaluateTimeouts`]
+/// back to THIS actor each tick — no DashMap reach, no generation gate.
+///
+/// Awaits the `tracked_spawn` task_set push so the abort handle is
+/// installed on `state.governance.timeout_task` before replying.
+async fn handle_start_timeout_task_actor(
+    state: &mut crate::context::actor::state::PerContextState,
+    deps: &ActorDeps,
+    reply: oneshot::Sender<Result<(), ContextError>>,
+) -> Outcome<()> {
+    crate::context::governance_helpers::spawn_governance_timeout_task(state, deps).await;
+    let _ = reply.send(Ok(()));
     Outcome::ok_mutated(())
 }

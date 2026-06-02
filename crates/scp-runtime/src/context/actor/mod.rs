@@ -1063,6 +1063,10 @@ impl ContextActor {
                 reply,
                 "governance::evaluate_timeouts (sweep — use governance_helpers::start_governance_timeout_task iterator)",
             ),
+            GovernanceCommand::StartTimeoutTask { reply } => ack_not_impl(
+                reply,
+                "governance::start_timeout_task (timer install — use governance_helpers::start_governance_timeout_task)",
+            ),
         }
     }
 

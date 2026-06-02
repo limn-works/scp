@@ -87,7 +87,7 @@ const ADAPTER_SRC: &str = include_str!("../../../../crates/scp-transport/src/nat
 // RATCHET CONSTANTS — may only increase
 // Any decrease requires human approval
 // =========================================================================
-const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 39;
+const MIN_ACTIVE_PIPELINE_ASSERTIONS: usize = 41;
 
 // ---------------------------------------------------------------------------
 // Function body extraction — brace-matching parser
@@ -244,6 +244,63 @@ fn dispatch_lifecycle_direct_bootstrap_arms_call_actor_shape_helpers() {
         ),
         "dispatch_lifecycle_direct RestoreContext arm must delegate to the \
          actor-shape lifecycle_helpers::restore_context (spawns the per-context actor)"
+    );
+}
+
+// Timer level: the actor-shape TTL timer helpers install the timer on
+// actor-owned state via `ttl_close_helpers::spawn_ttl_timer` (registry +
+// `FireTimer` mailbox tick), NOT the legacy `spawn_ttl_timer_legacy`
+// DashMap-reading task. ADR-049 Phase 2A finalization (timer → actor
+// registry + mailbox). Additive assertion — pins the actor-shape call so
+// a future refactor cannot regress the timer back to the legacy
+// `&Supervisor` / `contexts` DashMap path.
+#[test]
+fn ttl_timer_helpers_call_actor_shape_spawn_not_legacy() {
+    assert!(
+        fn_body_contains(MANAGER_SRC, "start_ttl_timer", "spawn_ttl_timer(")
+            && !fn_body_contains(MANAGER_SRC, "start_ttl_timer", "spawn_ttl_timer_legacy("),
+        "ttl_close_helpers::start_ttl_timer must install via the actor-shape \
+         spawn_ttl_timer (registry + FireTimer tick), not spawn_ttl_timer_legacy"
+    );
+    assert!(
+        fn_body_contains(MANAGER_SRC, "reset_ttl_timer", "spawn_ttl_timer(")
+            && !fn_body_contains(MANAGER_SRC, "reset_ttl_timer", "spawn_ttl_timer_legacy("),
+        "ttl_close_helpers::reset_ttl_timer must install via the actor-shape \
+         spawn_ttl_timer (registry + FireTimer tick), not spawn_ttl_timer_legacy"
+    );
+}
+
+// Timer level: the lifecycle bootstrap paths install timers by mailboxing
+// the freshly-spawned actor (`dispatch_start_ttl_timer` /
+// `start_governance_timeout_task` → StartTimeoutTask), NOT by reaching the
+// legacy `spawn_ttl_timer_legacy` / `start_governance_timeout_task_legacy`
+// `&Supervisor` helpers. ADR-049 Phase 2A finalization. Additive.
+#[test]
+fn lifecycle_bootstrap_installs_timers_via_mailbox_not_legacy() {
+    for fn_name in ["finalize_create", "restore_context", "import_context"] {
+        assert!(
+            !fn_body_contains(MANAGER_SRC, fn_name, "spawn_ttl_timer_legacy("),
+            "lifecycle_helpers::{fn_name} must not reach the legacy \
+             spawn_ttl_timer_legacy — install the TTL timer via the actor \
+             mailbox (dispatch_start_ttl_timer)"
+        );
+    }
+    // The non-legacy governance-timeout entry point installs via the
+    // actor mailbox (StartTimeoutTask), not the legacy DashMap-reading
+    // spawn dance.
+    assert!(
+        fn_body_contains(
+            MANAGER_SRC,
+            "start_governance_timeout_task",
+            "StartTimeoutTask"
+        ) && !fn_body_contains(
+            MANAGER_SRC,
+            "start_governance_timeout_task",
+            "start_governance_timeout_task_legacy("
+        ),
+        "governance_helpers::start_governance_timeout_task must dispatch \
+         StartTimeoutTask to the actor, not delegate to the legacy \
+         start_governance_timeout_task_legacy DashMap spawn dance"
     );
 }
 

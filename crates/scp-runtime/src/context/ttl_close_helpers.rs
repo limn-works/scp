@@ -19,31 +19,36 @@
 //! [`crate::context::ttl_close_helpers_legacy`] for the supervisor
 //! shim-fallback path.
 //!
-//! # `spawn_ttl_timer` ownership (Option B)
+//! # `spawn_ttl_timer` ownership (actor registry + mailbox tick)
 //!
-//! `spawn_ttl_timer` reaches the supervisor's `task_set` and contexts
-//! map for timer-task ownership and timer-fired cross-actor mutation;
-//! these are supervisor-scoped and not on `ActorDeps`. Out-of-scope
-//! callers (`finalize_create`, `restore_context`, `import_context`,
-//! `governance_helpers::handle_ttl_extension_proposal`) continue to call
-//! the byte-identical
-//! [`crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy`]
-//! during Phase 2A.6. The actor-shape [`start_ttl_timer`] /
-//! [`reset_ttl_timer`] reach `spawn_ttl_timer_legacy` via
+//! [`spawn_ttl_timer`] owns the per-context TTL timer task end-to-end on
+//! actor-owned state. It runs against `&mut state` (so it owns the
+//! `state.ttl.timer` cancel `Notify` + `AbortHandle`), spawns the timer
+//! task onto the supervisor's tracked `task_set` via
+//! [`SupervisorHandle::tracked_spawn`](crate::context::supervisor::handle::SupervisorHandle::tracked_spawn),
+//! and the task — holding no `&Supervisor` and reading no `DashMap` —
+//! resolves the owning actor through
+//! [`SupervisorHandle::lookup`](crate::context::supervisor::handle::SupervisorHandle::lookup)
+//! on each wake and mailboxes
+//! [`TtlCloseCommand::FireTimer`](crate::context::actor::commands::TtlCloseCommand::FireTimer).
+//! A `lookup → None` (actor despawned: context gone / recreated) stops
+//! the task cleanly — this replaces the legacy stale-generation gate, as
+//! the actor owns its state for the whole dispatch turn so there is no
+//! concurrent close-and-recreate window. This removes the
+//! `spawn_ttl_timer_legacy` `DashMap` reads and the
 //! [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-//! — the same transitional escape pattern used by the broadcast publish
-//! path. Phase 2A.9 (lifecycle migration) revisits timer ownership.
+//! escape that [`start_ttl_timer`] / [`reset_ttl_timer`] previously used.
 
 use std::sync::Arc;
 
 use scp_identity::DID;
 use scp_protocol::context::membership::ContextEvent;
 use scp_protocol::context::{ContextError, ContextState};
+use tokio::sync::Notify;
 
 use crate::context::ContextHandle;
 use crate::context::actor::deps::ActorDeps;
 use crate::context::actor::state::PerContextState;
-use crate::context::manager_methods::PROVIDER_NOT_INITIALIZED as ATTACHED_EXPECT;
 use crate::context::state::{context_id_to_bytes, strip_event_payload};
 use crate::context::ttl::{self, TtlExtension};
 
@@ -185,13 +190,9 @@ pub fn propose_ttl_extension(
 /// Cancels the old timer and spawns a new one with the given duration.
 /// Clears the extension proposal state.
 ///
-/// # `spawn_ttl_timer` reach
-///
-/// Timer spawning still requires the supervisor's `task_set` and
-/// `contexts_arc` for cross-actor timer-fired mutation, neither of
-/// which is on `ActorDeps`. The actor-shape helper reaches them through
-/// [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-/// — see the module-level doc comment.
+/// Timer ownership is actor-local: [`spawn_ttl_timer`] aborts the prior
+/// `state.ttl.timer` task and installs the replacement onto the
+/// supervisor's tracked `task_set`. See the module-level doc.
 pub async fn reset_ttl_timer(
     state: &mut PerContextState,
     deps: &ActorDeps,
@@ -199,18 +200,11 @@ pub async fn reset_ttl_timer(
     new_duration: std::time::Duration,
     handle: ContextHandle,
 ) {
-    // Cancel old timer and clear extension state (mutate owned state).
-    state.ttl.timer.cancel();
+    // Clear extension state; `spawn_ttl_timer` aborts the prior task and
+    // resets the cancel signal (mutate owned state).
     state.ttl.extension = None;
 
-    let supervisor = deps.supervisor.shim_supervisor();
-    crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy(
-        supervisor.as_ref(),
-        context_id,
-        new_duration,
-        handle,
-    )
-    .await;
+    spawn_ttl_timer(state, deps, context_id, new_duration, handle).await;
 
     // Persist context state after TTL reset (best-effort).
     persist_state_best_effort(state, deps, context_id);
@@ -222,28 +216,124 @@ pub async fn reset_ttl_timer(
 
 /// Installs a TTL timer for the given context on actor-owned state.
 ///
-/// Thin wrapper that delegates timer spawning to the legacy
-/// supervisor-shaped path — see [`reset_ttl_timer`] / module doc for the
-/// rationale.
-///
-/// `state` is currently not read here, but is part of the actor-shape
-/// contract for signature uniformity (and so that the `&mut`-borrow
-/// crosses awaits without forcing `Sync` on `PerContextState`).
+/// Delegates to [`spawn_ttl_timer`], which owns the timer task on
+/// `state.ttl.timer` and reaches the supervisor's tracked `task_set` /
+/// actor registry through `deps.supervisor` — see the module doc.
 pub async fn start_ttl_timer(
-    _state: &mut PerContextState,
+    state: &mut PerContextState,
     deps: &ActorDeps,
     context_id: &str,
     duration: std::time::Duration,
     handle: ContextHandle,
 ) {
-    let supervisor = deps.supervisor.shim_supervisor();
-    crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy(
-        supervisor.as_ref(),
-        context_id,
-        duration,
-        handle,
-    )
-    .await;
+    spawn_ttl_timer(state, deps, context_id, duration, handle).await;
+}
+
+// ---------------------------------------------------------------------------
+// spawn_ttl_timer (actor-owned timer task; registry + mailbox tick)
+// ---------------------------------------------------------------------------
+
+/// Spawns (or respawns) the per-context TTL timer on actor-owned state.
+///
+/// Replaces `ttl_close_helpers_legacy::spawn_ttl_timer_legacy`: the new
+/// task holds no `&Supervisor` and reads no `contexts` `DashMap`. On wake
+/// it resolves the owning actor via
+/// [`SupervisorHandle::lookup`](crate::context::supervisor::handle::SupervisorHandle::lookup)
+/// and mailboxes
+/// [`TtlCloseCommand::FireTimer`](crate::context::actor::commands::TtlCloseCommand::FireTimer),
+/// which runs the actor-shape expiry pipeline on the actor's owned
+/// `&mut state`. A `lookup → None` (actor despawned) stops the task —
+/// this is the registry-based replacement for the legacy
+/// stale-generation gate.
+///
+/// # Cancel / reset semantics
+///
+/// The cancel `Notify` and task `AbortHandle` live on actor-owned
+/// `state.ttl.timer`. A reset (or a fresh start) aborts the prior task
+/// and installs a fresh `Notify` so the replacement timer is cancellable
+/// independently of the old one — preserving the legacy
+/// abort-old + spawn-new behaviour.
+///
+/// # Degraded config
+///
+/// If the supervisor has no `task_set` (built without
+/// [`with_providers`](crate::context::supervisor::Supervisor::with_providers)),
+/// `tracked_spawn` returns `None` and no timer is installed — matching
+/// the legacy `task_set_ref() == None` early-return.
+async fn spawn_ttl_timer(
+    state: &mut PerContextState,
+    deps: &ActorDeps,
+    context_id: &str,
+    duration: std::time::Duration,
+    // The legacy timer task captured `handle` to run the expiry pipeline
+    // inline. The actor-shape `FireTimer` handler now clones
+    // `state.handle` itself, so the task no longer needs it. Retained on
+    // the signature so `start_ttl_timer` / `reset_ttl_timer` callers
+    // (and their handler call sites) are unchanged.
+    _handle: ContextHandle,
+) {
+    // Abort any prior timer task and install a fresh cancel signal so
+    // the replacement timer can be cancelled independently of the old
+    // one (mirrors the legacy reset's `cancel = Arc::new(Notify::new())`
+    // + `task = None`).
+    if let Some(prior) = state.ttl.timer.task.take() {
+        prior.abort();
+    }
+    let cancel = Arc::new(Notify::new());
+    state.ttl.timer.cancel = Arc::clone(&cancel);
+
+    // Record absolute deadline for persistence snapshots (mirrors
+    // `TtlTimer::spawn_with_transport`).
+    let now_secs = deps.clock.now_secs();
+    state.ttl.timer.deadline_unix_secs = Some(now_secs.saturating_add(duration.as_secs()));
+
+    // Clone the cross-actor providers the FireTimer pipeline needs. The
+    // timer task itself only resolves the actor + mailboxes FireTimer;
+    // the expiry work (crypto destroy / relay delete / event log) runs
+    // inside the actor handler against owned state.
+    let task_supervisor = deps.supervisor.clone();
+    let context_id_owned = context_id.to_owned();
+
+    let abort_handle = deps
+        .supervisor
+        .tracked_spawn(async move {
+            tokio::select! {
+                () = tokio::time::sleep(duration) => {
+                    // Timer fired. Resolve the owning actor; a despawned
+                    // actor (context gone / recreated) means nothing to
+                    // tick — stop cleanly (registry-based replacement for
+                    // the legacy stale-generation gate).
+                    let Some(actor) = task_supervisor.lookup(&context_id_owned) else {
+                        return;
+                    };
+                    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                    let cmd = crate::context::actor::commands::ContextCommand::TtlClose(
+                        crate::context::actor::commands::TtlCloseCommand::FireTimer {
+                            reply: reply_tx,
+                        },
+                    );
+                    if actor
+                        .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+                        .await
+                        .is_ok()
+                    {
+                        // Await the actor's reply so the expiry pipeline
+                        // has completed before the task exits. The bool
+                        // is informational (one-shot timer — always
+                        // stops after firing).
+                        let _ = reply_rx.await;
+                    }
+                }
+                () = cancel.notified() => {
+                    // Timer cancelled (reset / close).
+                }
+            }
+        })
+        .await;
+
+    // Store the abort handle for cancel / is_active checks on owned
+    // state. `None` only in the degraded no-task-set config.
+    state.ttl.timer.task = abort_handle;
 }
 
 // ---------------------------------------------------------------------------
@@ -428,11 +518,3 @@ fn build_snapshot_from_state(state: &PerContextState) -> crate::context::state::
             .collect(),
     }
 }
-
-// Silence unused-import lint when the only references are inside doc
-// comments and the legacy spawn helper. `Arc` is part of the
-// transitional `shim_supervisor()` wiring.
-const _: fn() = || {
-    let _: fn(&Arc<crate::context::supervisor::Supervisor>) = |_| ();
-    let _: &str = ATTACHED_EXPECT;
-};

@@ -15,18 +15,18 @@
 //!
 //! # Timer ownership
 //!
-//! Spawning the TTL timer still requires the supervisor's `task_set`
-//! and contexts map (cross-actor mutation on timer fire); neither
-//! resource is on `ActorDeps`. The actor-shape `start_ttl_timer` /
-//! `reset_ttl_timer` reach
-//! [`crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy`]
-//! through
-//! [`SupervisorHandle::shim_supervisor`](crate::context::supervisor::handle::SupervisorHandle::shim_supervisor)
-//! — see the [`crate::context::ttl_close_helpers`] module-level doc for
-//! the full rationale (Option B of the Phase 2A.6 plan). Phase 2A.9
-//! (lifecycle migration) revisits timer ownership so the TTL timer
-//! becomes a `select!` arm in
-//! [`ContextActor::run`](crate::context::actor::ContextActor).
+//! The actor-shape `start_ttl_timer` / `reset_ttl_timer` install the
+//! TTL timer on actor-owned `state.ttl.timer` via
+//! [`ttl_close_helpers::spawn_ttl_timer`](crate::context::ttl_close_helpers):
+//! the task is spawned onto the supervisor's tracked `task_set` through
+//! [`SupervisorHandle::tracked_spawn`](crate::context::supervisor::handle::SupervisorHandle::tracked_spawn)
+//! and, on fire, resolves the owning actor through
+//! [`SupervisorHandle::lookup`](crate::context::supervisor::handle::SupervisorHandle::lookup)
+//! and mailboxes [`TtlCloseCommand::FireTimer`] — no `&Supervisor` /
+//! `contexts` DashMap reach. See the
+//! [`crate::context::ttl_close_helpers`] module-level doc for the full
+//! rationale (ADR-049 Phase 2A finalization — timer → actor registry +
+//! mailbox tick).
 //!
 //! # Transport-timeout budget
 //!
@@ -107,13 +107,12 @@ pub async fn dispatch(
 
 /// Handle [`TtlCloseCommand::StartTtlTimer`] against actor-owned state.
 ///
-/// Routes to
-/// [`crate::context::ttl_close_helpers::start_ttl_timer`] which reaches
-/// [`crate::context::ttl_close_helpers_legacy::spawn_ttl_timer_legacy`]
-/// via the supervisor shim (Option B of the Phase 2A.6 plan). The
-/// timer itself has no inherent timeout, but we still wrap it so a
-/// pathological mutex contention storm cannot block the dispatcher
-/// indefinitely.
+/// Routes to [`crate::context::ttl_close_helpers::start_ttl_timer`],
+/// which installs the timer on `state.ttl.timer` via the actor-shape
+/// `spawn_ttl_timer` (tracked `task_set` spawn + registry-resolved
+/// `FireTimer` tick). The timer itself has no inherent timeout, but we
+/// still wrap it so a pathological mailbox / task-set contention storm
+/// cannot block the dispatcher indefinitely.
 async fn handle_start_ttl_timer(
     state: &mut PerContextState,
     deps: &ActorDeps,

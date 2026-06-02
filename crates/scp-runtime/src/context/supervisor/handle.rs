@@ -600,11 +600,7 @@ impl SupervisorHandle {
     /// Used by the per-context timer tasks to mailbox their tick command
     /// to the owning actor. See the timer-task surface comment above for
     /// why this is the single sanctioned `ContextActorHandle` yield.
-    ///
-    /// `dead_code` allow: the first caller is the actor-shape TTL /
-    /// governance timer-spawn helpers in the next finalization commit.
     #[must_use]
-    #[allow(dead_code)]
     pub(in crate::context) fn lookup(
         &self,
         context_id: &str,
@@ -627,10 +623,6 @@ impl SupervisorHandle {
     /// `JoinSet::spawn` (a synchronous push), then releases it. This is a
     /// supervisor-scoped write-path lock, not a read-path lock — ADR-049
     /// §12 (no `Mutex`/`RwLock` on read paths) is not implicated.
-    ///
-    /// `dead_code` allow: the first caller is the actor-shape TTL /
-    /// governance timer-spawn helpers in the next finalization commit.
-    #[allow(dead_code)]
     pub(in crate::context) async fn tracked_spawn<F>(
         &self,
         fut: F,
@@ -641,6 +633,69 @@ impl SupervisorHandle {
         let task_set_arc = std::sync::Arc::clone(self.supervisor.task_set_ref()?);
         let mut task_set = task_set_arc.lock().await;
         Some(task_set.spawn(fut))
+    }
+
+    /// Install the per-context TTL timer for `context_id` by mailboxing
+    /// [`TtlCloseCommand::StartTtlTimer`](crate::context::actor::commands::TtlCloseCommand::StartTtlTimer)
+    /// to the owning actor. The actor handler runs the actor-shape
+    /// `start_ttl_timer` on its owned `&mut state`, so the timer task and
+    /// its `state.ttl.timer` bookkeeping are installed by the actor that
+    /// owns the state — no `&Supervisor` / DashMap reach.
+    ///
+    /// Used by the lifecycle bootstrap paths (`finalize_create`,
+    /// `restore_context`, `import_context`) which run AFTER actor spawn
+    /// and hold only `&ActorDeps` (no `&mut state`). They delegate timer
+    /// installation to the actor through this mailbox dispatch.
+    ///
+    /// Best-effort: a `lookup → None` (actor not yet registered) or a
+    /// mailbox-send failure is logged and skipped — the timer is a
+    /// background facility, not part of the create/restore success
+    /// contract (matching the legacy `spawn_ttl_timer_legacy`
+    /// no-actor / no-task-set early-returns).
+    pub(in crate::context) async fn dispatch_start_ttl_timer(
+        &self,
+        context_id: &str,
+        params: scp_protocol::context::params::ContextParams,
+        duration: std::time::Duration,
+    ) {
+        use crate::context::actor::commands::{ContextCommand, TtlCloseCommand, TtlTimerPayload};
+
+        let Some(actor) = self.supervisor.lookup(context_id) else {
+            tracing::warn!(
+                context_id,
+                "dispatch_start_ttl_timer: no actor registered — TTL timer not installed"
+            );
+            return;
+        };
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let cmd = ContextCommand::TtlClose(TtlCloseCommand::StartTtlTimer {
+            payload: Box::new(TtlTimerPayload {
+                context_id: context_id.to_owned(),
+                params,
+                duration,
+            }),
+            reply: reply_tx,
+        });
+        if actor
+            .send_with_timeout(cmd, crate::context::actor::SEND_TIMEOUT)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                context_id,
+                "dispatch_start_ttl_timer: mailbox send failed — TTL timer not installed"
+            );
+            return;
+        }
+        // Await the install reply so the timer is registered before the
+        // bootstrap path returns control to the caller.
+        if let Ok(Err(e)) = reply_rx.await {
+            tracing::warn!(
+                context_id,
+                error = %e,
+                "dispatch_start_ttl_timer: actor reported TTL timer install failure"
+            );
+        }
     }
 }
 
