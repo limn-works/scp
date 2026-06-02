@@ -1571,16 +1571,21 @@ pub struct Identity {
     pub(crate) pre_rotation_custody: Arc<scp_platform::testing::InMemoryPreRotationCustody>,
 }
 
-#[uniffi::export]
 impl Identity {
     /// Returns the monotonic identifier of the bridge instance that minted
     /// this handle.
+    ///
+    /// Rust-internal only: consumed by `CoreFields::check_handle` for
+    /// per-instance handle affinity. NOT exposed through `#[uniffi::export]`
+    /// (see ADR-048 — per-handle `instanceId` is not host-visible).
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
-    pub fn instance_id(&self) -> u64 {
+    pub(crate) const fn instance_id(&self) -> u64 {
         self.instance_id
     }
+}
 
+#[uniffi::export]
+impl Identity {
     /// Returns the DID string for this identity.
     #[must_use]
     pub fn did(&self) -> String {
@@ -2154,16 +2159,21 @@ impl std::fmt::Debug for ContextHandle {
     }
 }
 
-#[uniffi::export]
 impl ContextHandle {
     /// Returns the monotonic identifier of the bridge instance that minted
     /// this handle.
+    ///
+    /// Rust-internal only: consumed by `CoreFields::check_handle` for
+    /// per-instance handle affinity. NOT exposed through `#[uniffi::export]`
+    /// (see ADR-048 — per-handle `instanceId` is not host-visible).
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
-    pub fn instance_id(&self) -> u64 {
+    pub(crate) const fn instance_id(&self) -> u64 {
         self.instance_id
     }
+}
 
+#[uniffi::export]
+impl ContextHandle {
     /// Returns the context's unique identifier.
     pub fn context_id(&self) -> String {
         self.context_id.clone()
@@ -2226,21 +2236,34 @@ pub struct UcanToken {
     pub(crate) encoded: String,
     /// Monotonic identifier of the bridge instance that minted this handle.
     ///
-    /// Consumed by [`uniffi_check_handle!`](crate::uniffi_check_handle) at
-    /// every `#[uniffi::export]` entry that accepts a `UcanToken`.
+    /// Affinity substrate: retained so that any future `#[uniffi::export]`
+    /// entry accepting a `UcanToken` can gate on
+    /// `CoreFields::check_handle(token.instance_id())`. No such entry exists
+    /// today (`UcanToken` is only ever returned, never passed back in), so the
+    /// field has no live reader — hence `#[allow(dead_code)]`. It is NOT
+    /// host-visible (see ADR-048 — per-handle `instanceId` is not exported).
+    #[allow(dead_code)]
     pub(crate) instance_id: u64,
+}
+
+impl UcanToken {
+    /// Returns the monotonic identifier of the bridge instance that minted
+    /// this handle.
+    ///
+    /// Rust-internal affinity substrate consumed by
+    /// `CoreFields::check_handle`. No caller passes a `UcanToken` back across
+    /// the FFI boundary yet, so this has no live caller — hence
+    /// `#[allow(dead_code)]`. NOT exposed through `#[uniffi::export]`
+    /// (see ADR-048 — per-handle `instanceId` is not host-visible).
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) const fn instance_id(&self) -> u64 {
+        self.instance_id
+    }
 }
 
 #[uniffi::export]
 impl UcanToken {
-    /// Returns the monotonic identifier of the bridge instance that minted
-    /// this handle.
-    #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
-    pub fn instance_id(&self) -> u64 {
-        self.instance_id
-    }
-
     /// Returns the token's stable metadata record.
     #[must_use]
     pub fn token_data(&self) -> UcanTokenData {
@@ -2364,16 +2387,21 @@ pub struct ReliabilityScoreRecord {
     pub total_failures: u64,
 }
 
-#[uniffi::export]
 impl TransportManager {
     /// Returns the monotonic identifier of the bridge instance that minted
     /// this handle.
+    ///
+    /// Rust-internal only: consumed by `CoreFields::check_handle` for
+    /// per-instance handle affinity. NOT exposed through `#[uniffi::export]`
+    /// (see ADR-048 — per-handle `instanceId` is not host-visible).
     #[must_use]
-    #[allow(clippy::missing_const_for_fn)] // UniFFI export methods cannot be const.
-    pub fn instance_id(&self) -> u64 {
+    pub(crate) const fn instance_id(&self) -> u64 {
         self.instance_id
     }
+}
 
+#[uniffi::export]
+impl TransportManager {
     /// Returns the current transport connection status record.
     ///
     /// Reflects actual connection state: `connected` is `true` only if the
