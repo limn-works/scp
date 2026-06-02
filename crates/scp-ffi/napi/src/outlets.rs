@@ -26,12 +26,35 @@ use crate::error::ScpNapiError;
 /// SCP-OUT-037 streaming bridge (`crate::outlet_stream`) can defence-
 /// in-depth re-validate the UCAN at open time, before allocating any
 /// per-stream registry state.
+///
+/// # Caveat resolver (HIGH-3, R3)
+///
+/// `caveat_resolver` is threaded as a parameter so each OUTLET call site
+/// chooses its §7.3.8 caveat-resolution policy explicitly rather than this
+/// shared helper hardcoding one:
+/// - The streaming open path
+///   ([`crate::outlet_stream::context_outlet_invoke_stream`]) passes
+///   [`scp_protocol::crypto::ucan::validate::TokenNbCaveatResolver`] so the
+///   leaf token's `nb` (post-narrowing) is resolved and run through Step 7b
+///   (narrow) + 11b (time-box); that VALIDATED-NARROWED set is exactly what
+///   the §5.4.5 `caveats_binding` commits to (R3 STEP 0).
+/// - The non-streaming invocation paths (`outlet_invoke`,
+///   `outlet_invoke_cross_context`, `outlet_session_invoke`) pass
+///   [`scp_core::crypto::ucan::validate::NoCaveatResolver`], preserving their
+///   prior behaviour (the post-input caveat enforcement for those paths runs
+///   in the `ContextManager` economy pipeline, not here).
+///
+/// The generic UCAN-validation entry point (`crate::ucan::ucan_validate`)
+/// builds its own `ValidationContext` and is NOT routed through this helper,
+/// so it stays on `NoCaveatResolver` independently — switching the outlet
+/// sites here cannot leak caveat enforcement into the generic path.
 pub(crate) fn validate_outlet_invocation_ucan_napi(
     context_id: &str,
     outlet_id: &str,
     identity_did: &str,
     ucan_token: &str,
     proof_resolver: &scp_ffi_common::BridgeProofResolver,
+    caveat_resolver: &dyn scp_core::crypto::ucan::validate::CaveatResolver,
 ) -> Result<(), ScpNapiError> {
     crate::runtime::with_context(context_id, |rt| {
         // SCP-OUT-014: select the split capability stem from the outlet's
@@ -69,7 +92,9 @@ pub(crate) fn validate_outlet_invocation_ucan_napi(
             clock_skew_tolerance_secs:
                 scp_core::crypto::ucan::validate::DEFAULT_CLOCK_SKEW_TOLERANCE_SECS,
             clock: &scp_primitives::SystemClock,
-            caveat_resolver: &scp_core::crypto::ucan::validate::NoCaveatResolver,
+            // HIGH-3 (R3): resolver is caller-selected — streaming passes
+            // `TokenNbCaveatResolver`, non-streaming passes `NoCaveatResolver`.
+            caveat_resolver,
         };
 
         scp_core::context::outlets::validate_outlet_invocation_ucan(
@@ -469,6 +494,10 @@ pub async fn outlet_invoke(
         &identity_did,
         &ucan_token,
         &proof_resolver,
+        // Non-streaming invoke: post-input caveat enforcement runs in the
+        // `ContextManager` economy pipeline, so validation stays caveat-free
+        // here (preserves prior behaviour; HIGH-3 R3).
+        &scp_core::crypto::ucan::validate::NoCaveatResolver,
     )
     .map_err(napi::Error::from)?;
 
@@ -746,6 +775,9 @@ pub async fn outlet_invoke_cross_context(
         &invoker_did,
         &ucan_token,
         &proof_resolver,
+        // Non-streaming cross-context invoke: caveat-free validation here
+        // (HIGH-3 R3).
+        &scp_core::crypto::ucan::validate::NoCaveatResolver,
     )
     .map_err(napi::Error::from)?;
 
@@ -955,6 +987,8 @@ pub async fn outlet_session_invoke(
         &invoker_did,
         &ucan_token,
         &proof_resolver,
+        // Non-streaming session invoke: caveat-free validation here (HIGH-3 R3).
+        &scp_core::crypto::ucan::validate::NoCaveatResolver,
     )
     .map_err(napi::Error::from)?;
 
