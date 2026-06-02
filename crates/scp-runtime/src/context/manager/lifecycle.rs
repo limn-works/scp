@@ -36,6 +36,49 @@ pub(super) fn build_routing_for_mode(
     }
 }
 
+/// Construction-time tripwire for the §9.10.4 routing invariant:
+/// `broadcast_context.is_some()` ⇔ `mode == Broadcast` ⇔ `routing.is_broadcast()`.
+///
+/// Every `PerContextState` built by `create_context`, `join_context`, and
+/// `import_context` flows `mode` → `routing` (via [`build_routing_for_mode`])
+/// and `mode` → `broadcast_context` (via `reconstruct_broadcast_context_for_import`
+/// / `init_broadcast_context`) through separate code paths. A future refactor
+/// that desyncs them would send a broadcast context down the pseudonymous
+/// fan-out branch (or vice-versa) and silently drop messages. This catches
+/// that desync at the construction site rather than deep in the send path.
+///
+/// `debug_assert!` only — a construction-time check for the test/debug builds,
+/// never a release panic (mirrors the existing send-path
+/// `debug_assert!(!ctx.routing.is_broadcast())`). `restore_context` already
+/// fail-closes its own snapshot mode↔routing cross-check at runtime.
+///
+/// Takes small `Copy` arguments (`mode`, two `bool`s) rather than a
+/// `&PerContextState` on purpose. Each caller (`create_context` /
+/// `join_context` / `import_context` / the governance builder) computes the
+/// two booleans from *source* values — the freshly built `ContextRouting`
+/// and the `broadcast_context` `Option` — BEFORE the `PerContextState`
+/// literal, then asserts. Reading them back off `per_context` after
+/// construction would keep that large struct live across the registration
+/// `.await` that follows, inflating the callers' (and the transitive
+/// governance) futures past `future-size-threshold` (`clippy::large_futures`).
+/// `#[inline(never)]` keeps the check's own machinery out of those futures too.
+#[inline(never)]
+fn debug_assert_routing_consistent(
+    mode: ContextMode,
+    routing_is_broadcast: bool,
+    broadcast_context_is_some: bool,
+) {
+    let is_broadcast = mode == ContextMode::Broadcast;
+    debug_assert!(
+        is_broadcast == routing_is_broadcast,
+        "routing variant disagrees with context mode at construction"
+    );
+    debug_assert!(
+        is_broadcast == broadcast_context_is_some,
+        "broadcast_context presence disagrees with context mode at construction"
+    );
+}
+
 /// Reconstructs a [`BroadcastContext`] for an imported Broadcast-mode context.
 ///
 /// A [`crate::context::export_import::ContextExport`] carries only the
@@ -1313,6 +1356,20 @@ impl ContextManager {
             &export.snapshot.role_state,
         )?;
 
+        // §9.10.4 routing invariant — checked on small `Copy` locals BEFORE
+        // building `per_context`. Asserting against `per_context` fields
+        // afterward would keep the whole (large) `PerContextState` borrowed
+        // across the registration `.await` below, inflating this fn's future
+        // past `future-size-threshold` (`clippy::large_futures`). Capturing
+        // the booleans up front sidesteps that without weakening the check.
+        let imported_mode = export.snapshot.context_params.mode;
+        let imported_routing = build_routing_for_mode(imported_mode, local_pseudonym);
+        debug_assert_routing_consistent(
+            imported_mode,
+            imported_routing.is_broadcast(),
+            imported_broadcast_context.is_some(),
+        );
+
         let per_context = PerContextState {
             generation: self
                 .next_generation
@@ -1447,7 +1504,7 @@ impl ContextManager {
             // exporter's is local-instance state and has no meaning here.
             // The pseudonym registry starts empty; the importer re-announces
             // and learns peers' pseudonyms via incoming announcements.
-            routing: build_routing_for_mode(export.snapshot.context_params.mode, local_pseudonym),
+            routing: imported_routing,
         };
 
         // 7. Register the context.
@@ -1570,6 +1627,16 @@ impl ContextManager {
             .unwrap_or_default();
         membership.add_member(creator_did.clone(), "admin".into(), creator_tokens);
         let broadcast_context = self.init_broadcast_context(&context_id, &params, &creator_did)?;
+        // §9.10.4 routing invariant — checked on small `Copy` locals BEFORE
+        // building `per_context`, so the (large) `PerContextState` is not kept
+        // borrowed across the registration `.await`, which would inflate this
+        // fn's future past `future-size-threshold` (`clippy::large_futures`).
+        let create_routing = build_routing_for_mode(params.mode, local_pseudonym);
+        debug_assert_routing_consistent(
+            params.mode,
+            create_routing.is_broadcast(),
+            broadcast_context.is_some(),
+        );
         let (initial_threshold_signers, initial_threshold_value) = match &params.governance {
             GovernanceModel::Threshold { threshold, signers } => (signers.clone(), *threshold),
             _ => (Vec::new(), 0),
@@ -1650,7 +1717,7 @@ impl ContextManager {
             // §9.10.4 / §5.14: build routing from context mode. Encrypted
             // contexts use per-member pseudonyms; broadcast contexts use
             // `SHA-256(context_id)` and carry no pseudonym state.
-            routing: build_routing_for_mode(params.mode, local_pseudonym),
+            routing: create_routing,
         };
 
         // Atomic check-and-insert — eliminates TOCTOU race between
@@ -1903,7 +1970,18 @@ impl ContextManager {
             }
         }
 
-        Ok(PerContextState {
+        // §9.10.4 routing invariant — checked on small `Copy` locals BEFORE
+        // building `per_context`. The returned `PerContextState` is held by the
+        // async governance caller across `.await`s; asserting against its fields
+        // here keeps the whole (large) struct materialized in the caller's
+        // future, tripping `future-size-threshold` (`clippy::large_futures`).
+        let governed_routing = build_routing_for_mode(params.mode, local_pseudonym);
+        debug_assert_routing_consistent(
+            params.mode,
+            governed_routing.is_broadcast(),
+            broadcast_context.is_some(),
+        );
+        let per_context = PerContextState {
             generation: self
                 .next_generation
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -1987,8 +2065,9 @@ impl ContextManager {
             merkle_tree: scp_event_log::EventLog::new(context_id.to_owned()),
             // §9.10.4 / §5.14: governance-path creation threads the real
             // caller-derived pseudonym through. Broadcast mode ignores it.
-            routing: build_routing_for_mode(params.mode, local_pseudonym),
-        })
+            routing: governed_routing,
+        };
+        Ok(per_context)
     }
 
     /// Joins a member to a context.
