@@ -33,18 +33,28 @@
 //! null) { ... }`).
 //!
 //! Active sessions live on the `WasmContextManager` (per ADR-048 §1 —
-//! per-bridge state, not a process-global) keyed by 32-char lowercase
-//! hex `request_id`. Cleanup happens when `next()` returns `None`
-//! (queue drained) or when `outlet_stream_cancel` flips the session to
-//! cancelled (queue cleared, terminated flag set, entry retained until
-//! the next `next()` call evicts it).
+//! per-bridge state, not a process-global) keyed by the composite
+//! `(context_id, request_id_hex)` pair (SCP-OUT-037 W2 — a
+//! `request_id_hex` minted in one context can never address a session
+//! in another). Cleanup happens when `next()` returns `None` (queue
+//! drained) or when a cancel flips the session to cancelled (the next
+//! `next()` pull surfaces a signed synthetic terminal, clears the
+//! queue, and the entry is evicted on the pull after that).
+//!
+//! SCP-OUT-037 W1: the session holds NO secret key material — only the
+//! invoker's public verifying key is pinned. Every chunk / credit-grant
+//! / cancel / terminate signature is produced on-demand via
+//! `crate::identity::with_signing_key`, which materialises a transient
+//! `SigningKey` for one signing op and drops (zeroes) it immediately.
 
 use js_sys::Promise;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::future_to_promise;
 
 use scp_ffi_common::error_codes as codes;
-use scp_ffi_common::validate::{validate_did, validate_outlet_id, validate_ucan_token};
+use scp_ffi_common::validate::{
+    validate_did, validate_outlet_id, validate_request_id_hex, validate_ucan_token,
+};
 
 use scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION;
 use scp_protocol::context::outlets::stream::{
@@ -82,6 +92,11 @@ use crate::manager::with_manager;
 /// calls return `null`.
 #[wasm_bindgen(js_name = "OutletInvocationStream")]
 pub struct WasmOutletInvocationStream {
+    /// Hosting context id pinned at open. SCP-OUT-037 W2: the per-bridge
+    /// session registry is keyed by `(context_id, request_id_hex)`, so
+    /// `next()` / `done` / `Drop` build the full composite key from this
+    /// plus `request_id_hex`.
+    context_id: String,
     /// 16-byte `request_id` rendered as 32-char lowercase hex. Cloned
     /// onto the stream so the SDK can read it without an extra
     /// per-chunk decode.
@@ -93,39 +108,28 @@ impl Drop for WasmOutletInvocationStream {
     /// on drop so a wrapper GC'd by the JS host without being drained
     /// to terminal (exception path, V8 GC, awaiting-only consumption
     /// that never observes a terminal chunk) does NOT leak the
-    /// [`crate::manager::WasmOutletStreamSession`] (which holds the
-    /// invoker's `SigningKey`, the pre-materialised chunk queue, and
-    /// the admission slot held on the per-context
+    /// [`crate::manager::WasmOutletStreamSession`] (the pre-materialised
+    /// chunk queue and the admission slot held on the per-context
     /// `WasmStreamAdmissionTracker`).
     ///
-    /// Performs eviction + admission release atomically under the
-    /// thread-local manager borrow:
-    /// 1. Reads the session's `(context_id, invoker_did, outlet_id)`
-    ///    while it is still in the map, so the admission release uses
-    ///    the same identity triple the open path admitted under.
-    /// 2. Removes the session from the manager's `outlet_streams` map.
-    /// 3. Calls `release_admission_slot()` (which
-    ///    saturating-subtracts so a release that races with the
-    ///    terminal-chunk-evict path is idempotent).
+    /// SCP-OUT-037 W1: the session holds no secret key material (only
+    /// the public verifying key), so this `Drop` is about releasing the
+    /// admission slot and evicting the queue, not scrubbing a key.
     ///
-    /// Idempotent: when [`Self::next`] already drained the queue or
-    /// observed a terminal chunk the manager already removed the
-    /// session and released the slot — this `Drop` becomes a no-op
-    /// (the `get` returns `None`, the `release_admission_slot` short-
-    /// circuits on missing tracker entries).
+    /// SCP-OUT-037 W3: eviction routes through
+    /// [`crate::manager::WasmContextManager::evict_stream_and_release`],
+    /// which removes the session under the composite
+    /// `(context_id, request_id_hex)` key and releases its admission
+    /// slot exactly once (behind the session's `admission_released`
+    /// guard). When [`Self::next`] already drained the queue, observed a
+    /// terminal chunk, or `outlet_stream_terminate` already released the
+    /// slot, this `Drop` becomes a no-op: the `remove` finds nothing (or
+    /// the `admission_released` flag short-circuits the release), so the
+    /// slot is never double-released.
     fn drop(&mut self) {
-        let request_id_hex = self.request_id_hex.clone();
+        let key = (self.context_id.clone(), self.request_id_hex.clone());
         let _ = with_manager(|mgr| {
-            if let Some(session) = mgr.outlet_streams.remove(&request_id_hex) {
-                let ctx = session.context_id.clone();
-                let inv = session.invoker_did.clone();
-                let out = session.outlet_id.clone();
-                // Explicitly drop the session here so its zeroizing
-                // Drop runs before we release admission — keeps the
-                // critical-section ordering stable.
-                drop(session);
-                mgr.release_admission_slot(&ctx, &inv, &out);
-            }
+            mgr.evict_stream_and_release(&key);
             Ok(())
         });
     }
@@ -149,8 +153,10 @@ impl WasmOutletInvocationStream {
     #[must_use]
     #[wasm_bindgen(getter)]
     pub fn done(&self) -> bool {
+        let context_id = self.context_id.clone();
         let request_id_hex = self.request_id_hex.clone();
-        with_manager(|mgr| Ok(mgr.outlet_stream_is_done(&request_id_hex))).unwrap_or(true)
+        with_manager(|mgr| Ok(mgr.outlet_stream_is_done(&context_id, &request_id_hex)))
+            .unwrap_or(true)
     }
 
     /// Asynchronously yields the next chunk, or `null` once the stream
@@ -180,10 +186,12 @@ impl WasmOutletInvocationStream {
     /// for runtime errors emitted as terminal `Error` chunks.
     #[wasm_bindgen]
     pub fn next(&self) -> Promise {
+        let context_id = self.context_id.clone();
         let request_id_hex = self.request_id_hex.clone();
         future_to_promise(async move {
-            let chunk_opt = with_manager(|mgr| Ok(mgr.outlet_stream_next(&request_id_hex)))
-                .map_err(ScpWasmError::into_js)?;
+            let chunk_opt =
+                with_manager(|mgr| Ok(mgr.outlet_stream_next(&context_id, &request_id_hex)))
+                    .map_err(ScpWasmError::into_js)?;
             match chunk_opt {
                 None => Ok(JsValue::NULL),
                 Some(chunk) => Ok(chunk_to_js(&chunk).map_err(ScpWasmError::into_js)?),
@@ -441,20 +449,24 @@ pub fn outlet_invoke_stream(
             .into_js()
         })?;
 
-        let parsed_input: serde_json::Value = serde_json::from_str(&input_json).map_err(|e| {
+        // SCP-OUT-037 W4: do NOT echo the serde error (`{e}`) — it can
+        // reflect raw `input_json` bytes back to the caller (covert
+        // channel / log-injection surface per ADR-049 §4). Surface a
+        // fixed, input-free message and keep the VALID_7000 code so SDK
+        // error handling is unchanged.
+        let parsed_input: serde_json::Value = serde_json::from_str(&input_json).map_err(|_| {
             ScpWasmError::Validation {
-                message: format!("input_json is not valid JSON: {e}"),
+                message: "input_json is not valid JSON".to_owned(),
                 code: codes::VALID_7000.to_owned(),
             }
             .into_js()
         })?;
 
-        // Export the invoker's signing key from the local identity
-        // registry. The key is moved into the per-session record and
-        // dropped (zeroed) when the session is evicted from the
-        // registry.
-        let invoker_signing_key =
-            crate::identity::export_signing_key(&identity_did).map_err(ScpWasmError::into_js)?;
+        // SCP-OUT-037 W1: the invoker signing key is NOT exported here.
+        // `open_outlet_stream` signs the materialised chunks on-demand
+        // via `with_signing_key` (transient key, dropped immediately)
+        // and pins only the public verifying key on the session — no
+        // long-lived `SigningKey` is retained on the streaming path.
 
         // §5.4.5 credit-based backpressure: default to
         // `stream_window_default` (32) when the SDK does not declare an
@@ -471,13 +483,15 @@ pub fn outlet_invoke_stream(
                 identity_did: &identity_did,
                 caveats_binding,
                 stream_epoch: stream_epoch_u64,
-                invoker_signing_key,
                 credit_window: effective_credit_window,
             })
         })
         .map_err(ScpWasmError::into_js)?;
 
-        Ok(JsValue::from(WasmOutletInvocationStream { request_id_hex }))
+        Ok(JsValue::from(WasmOutletInvocationStream {
+            context_id,
+            request_id_hex,
+        }))
     })
 }
 
@@ -486,27 +500,43 @@ pub fn outlet_invoke_stream(
 // ---------------------------------------------------------------------------
 
 /// Signs and applies an `OutletStreamCredit` grant against an active
-/// stream identified by `request_id_hex`.
+/// stream identified by the `(context, request_id_hex)` pair.
 ///
-/// Returns a JS `Promise<number>` resolving to the new running total
-/// of granted credits (`u32`).
+/// SCP-OUT-037 W2: `context` pins the hosting context so a
+/// `request_id_hex` minted in another context cannot address this
+/// stream. Returns a JS `Promise<number>` resolving to the new running
+/// total of granted credits (`u32`).
 ///
 /// # Errors
 ///
+/// * `SCP-VALID-7000` — `request_id_hex` is not 32 lowercase hex
+///   characters, or `caller_did` is not a well-formed DID.
 /// * `SCP-TOOL-6101` — `grant == 0` (uniform `protocol.invalid-grant`
 ///   rule per §5.4.5 round-6).
-/// * `SCP-TOOL-6101` — `request_id_hex` does not match any active
-///   stream registry entry (`protocol.unknown-session`).
+/// * `SCP-TOOL-6101` — `(context, request_id_hex)` does not match any
+///   active stream registry entry (`protocol.unknown-session`).
+/// * `SCP-PERM-3001` — `caller_did` is not the stream's pinned invoker.
 #[wasm_bindgen(js_name = "outletStreamGrantCredit")]
 pub fn outlet_stream_grant_credit(
+    context: &WasmContextHandle,
     request_id_hex: String,
     caller_did: String,
     grant: u32,
 ) -> Promise {
+    // SCP-OUT-037 W4: validate the addressing inputs at the FFI boundary
+    // before they are used to key the registry or echoed in any error.
+    if let Err(e) = validate_request_id_hex(&request_id_hex) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    if let Err(e) = validate_did(&caller_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = context.context_id();
     future_to_promise(async move {
-        let total =
-            with_manager(|mgr| mgr.outlet_stream_grant_credit(&request_id_hex, &caller_did, grant))
-                .map_err(ScpWasmError::into_js)?;
+        let total = with_manager(|mgr| {
+            mgr.outlet_stream_grant_credit(&context_id, &request_id_hex, &caller_did, grant)
+        })
+        .map_err(ScpWasmError::into_js)?;
         Ok(JsValue::from_f64(f64::from(total)))
     })
 }
@@ -515,23 +545,39 @@ pub fn outlet_stream_grant_credit(
 // outletStreamCancel
 // ---------------------------------------------------------------------------
 
-/// Applies an `OutletCancel` to an active stream identified by
-/// `request_id_hex`.
+/// Applies an `OutletCancel` to an active stream identified by the
+/// `(context, request_id_hex)` pair.
 ///
-/// Returns a JS `Promise<number | null>` resolving to the recorded
-/// `cancel_ack_seq` when the cancel was recorded, or `null` if the
-/// stream had already terminated when the cancel arrived (idempotent
-/// per §5.4.5).
+/// SCP-OUT-037 W2: `context` pins the hosting context. Returns a JS
+/// `Promise<number | null>` resolving to the recorded `cancel_ack_seq`
+/// when the cancel was recorded, or `null` if the stream had already
+/// terminated when the cancel arrived (idempotent per §5.4.5).
 ///
 /// # Errors
 ///
-/// * `SCP-TOOL-6101` — `request_id_hex` does not match any active
-///   stream registry entry.
+/// * `SCP-VALID-7000` — `request_id_hex` is not 32 lowercase hex
+///   characters, or `caller_did` is not a well-formed DID.
+/// * `SCP-TOOL-6101` — `(context, request_id_hex)` does not match any
+///   active stream registry entry.
+/// * `SCP-PERM-3001` — `caller_did` is not the stream's pinned invoker.
 #[wasm_bindgen(js_name = "outletStreamCancel")]
-pub fn outlet_stream_cancel(request_id_hex: String, caller_did: String) -> Promise {
+pub fn outlet_stream_cancel(
+    context: &WasmContextHandle,
+    request_id_hex: String,
+    caller_did: String,
+) -> Promise {
+    // SCP-OUT-037 W4: validate the addressing inputs at the FFI boundary.
+    if let Err(e) = validate_request_id_hex(&request_id_hex) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    if let Err(e) = validate_did(&caller_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = context.context_id();
     future_to_promise(async move {
-        let recorded = with_manager(|mgr| mgr.outlet_stream_cancel(&request_id_hex, &caller_did))
-            .map_err(ScpWasmError::into_js)?;
+        let recorded =
+            with_manager(|mgr| mgr.outlet_stream_cancel(&context_id, &request_id_hex, &caller_did))
+                .map_err(ScpWasmError::into_js)?;
         Ok(recorded.map_or(JsValue::NULL, |seq| {
             #[allow(clippy::cast_precision_loss)]
             let seq_js = JsValue::from_f64(seq as f64);
@@ -608,20 +654,33 @@ fn terminate_reason_from_u32(
 ///
 /// # Errors
 ///
-/// * `VALID_7000` — `reason` is not in the closed `TerminateReason` set.
-/// * `SCP-TOOL-6101` — `request_id_hex` does not match any active
-///   stream registry entry (`protocol.unknown-session`).
+/// * `SCP-VALID-7000` — `request_id_hex` is not 32 lowercase hex
+///   characters, `caller_did` is not a well-formed DID, or `reason` is
+///   not in the closed `TerminateReason` set.
+/// * `SCP-TOOL-6101` — `(context, request_id_hex)` does not match any
+///   active stream registry entry (`protocol.unknown-session`).
+/// * `SCP-PERM-3001` — `caller_did` is not the stream's pinned invoker.
 #[wasm_bindgen(js_name = "outletStreamTerminate")]
 pub fn outlet_stream_terminate(
+    context: &WasmContextHandle,
     request_id_hex: String,
     caller_did: String,
     reason: u32,
     message_override: Option<String>,
 ) -> Promise {
+    // SCP-OUT-037 W4: validate the addressing inputs at the FFI boundary.
+    if let Err(e) = validate_request_id_hex(&request_id_hex) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    if let Err(e) = validate_did(&caller_did) {
+        return future_to_promise(async move { Err(ScpWasmError::from(e).into_js().into()) });
+    }
+    let context_id = context.context_id();
     future_to_promise(async move {
         let reason_variant = terminate_reason_from_u32(reason).map_err(ScpWasmError::into_js)?;
         with_manager(|mgr| {
             mgr.outlet_stream_terminate(
+                &context_id,
                 &request_id_hex,
                 &caller_did,
                 reason_variant,
@@ -657,9 +716,12 @@ pub fn verify_chunk_signature(
     caveats_binding: Vec<u8>,
 ) -> Promise {
     future_to_promise(async move {
-        let chunk: OutletStreamChunk = serde_json::from_str(&chunk_json).map_err(|e| {
+        // SCP-OUT-037 W4: do NOT echo the serde error (`{e}`) — it can
+        // reflect raw `chunk_json` bytes (covert channel / log-injection
+        // per ADR-049 §4). Fixed, input-free message; keep VALID_7000.
+        let chunk: OutletStreamChunk = serde_json::from_str(&chunk_json).map_err(|_| {
             ScpWasmError::Validation {
-                message: format!("malformed chunk JSON: {e}"),
+                message: "chunk_json is not a valid OutletStreamChunk".to_owned(),
                 code: codes::VALID_7000.to_owned(),
             }
             .into_js()
@@ -737,17 +799,21 @@ pub fn compute_caveats_binding(
             }
             .into_js()
         })?;
+        // SCP-OUT-037 W4: scrub serde `{e}` echoes — they can reflect
+        // raw `effective_caveats_json` bytes (ADR-049 §4). Fixed,
+        // input-free messages; keep VALID_7000.
         let caveats_value: serde_json::Value = serde_json::from_str(&effective_caveats_json)
-            .map_err(|e| {
+            .map_err(|_| {
                 ScpWasmError::Validation {
-                    message: format!("invalid effective_caveats JSON: {e}"),
+                    message: "effective_caveats_json is not valid JSON".to_owned(),
                     code: codes::VALID_7000.to_owned(),
                 }
                 .into_js()
             })?;
-        let caveats: InvocationCaveats = serde_json::from_value(caveats_value).map_err(|e| {
+        let caveats: InvocationCaveats = serde_json::from_value(caveats_value).map_err(|_| {
             ScpWasmError::Validation {
-                message: format!("effective_caveats does not match InvocationCaveats: {e}"),
+                message: "effective_caveats_json does not match the InvocationCaveats shape"
+                    .to_owned(),
                 code: codes::VALID_7000.to_owned(),
             }
             .into_js()
@@ -781,8 +847,12 @@ pub fn compute_caveats_binding(
 /// `caveats_binding`. Returns `ScpWasmError::Validation` on bad hex /
 /// length.
 fn decode_caveats_binding(hex_str: &str) -> Result<[u8; 32], ScpWasmError> {
-    let bytes = hex::decode(hex_str).map_err(|e| ScpWasmError::Validation {
-        message: format!("caveats_binding_hex must be 64 hex characters: {e}"),
+    // SCP-OUT-037 W4: `hex::FromHexError` Display includes the offending
+    // character / position — echoing it reflects raw input bytes back to
+    // the caller (ADR-049 §4). Surface a fixed, input-free message and
+    // keep VALID_7000.
+    let bytes = hex::decode(hex_str).map_err(|_| ScpWasmError::Validation {
+        message: "caveats_binding_hex must be 64 lowercase hex characters".to_owned(),
         code: codes::VALID_7000.to_owned(),
     })?;
     let len = bytes.len();
@@ -847,3 +917,94 @@ fn validate_stream_epoch(value: f64) -> Result<u64, JsValue> {
 // the import here keeps the streaming bridge module self-documenting
 // about which §5.4.5 error codes are surfaced from this surface.
 const _SESSION_CODE_USED_BY_MANAGER: &str = CODE_PROTOCOL_SESSION;
+
+// ---------------------------------------------------------------------------
+// Tests — SCP-OUT-037 W4 (parse-error scrub on pure helpers)
+// ---------------------------------------------------------------------------
+//
+// The `#[wasm_bindgen]` control-plane functions return JS `Promise`s and
+// require a JS host to drive end-to-end (the request_id_hex / caller_did
+// boundary validation and context-keyed routing are exercised through
+// `bindings/typescript` integration tests against the built WASM
+// package). What IS unit-testable natively here are the pure parse
+// helpers and the shared validator the bridge calls — W4's core
+// guarantee is that none of these echo raw input bytes back to the
+// caller.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    /// W4: a malformed `caveats_binding_hex` is rejected with
+    /// `VALID_7000` and the error message contains NO raw input bytes
+    /// (the previous `: {e}` echo of `hex::FromHexError` reflected the
+    /// offending character/position).
+    #[test]
+    fn w4_decode_caveats_binding_error_is_input_free() {
+        // Non-hex characters that, if echoed, would appear verbatim.
+        let malicious = "ZZZZ<script>alert(1)</script>padpadpadpadpadpadpadpadpadpadpad";
+        let err = decode_caveats_binding(malicious).unwrap_err();
+        match err {
+            ScpWasmError::Validation { code, message } => {
+                assert_eq!(code, codes::VALID_7000);
+                assert!(
+                    !message.contains("script") && !message.contains('Z'),
+                    "W4: error message must NOT echo raw input bytes, got: {message}"
+                );
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    /// W4: the shared `validate_request_id_hex` (called at the top of
+    /// grant/cancel/terminate before the `request_id` is used to key the
+    /// registry) rejects a malformed `request_id`, and the bridge maps
+    /// it to `VALID_7000`. This pins the validator the bridge funnels
+    /// through; the validator's full character/length matrix lives in
+    /// `scp-ffi-common`.
+    #[test]
+    fn w4_request_id_hex_rejection_maps_to_valid_7000() {
+        // Right length (32), wrong alphabet.
+        let bad_alphabet = "g".repeat(REQUEST_ID_HEX_LEN_FOR_TEST);
+        let err = ScpWasmError::from(validate_request_id_hex(&bad_alphabet).unwrap_err());
+        match err {
+            ScpWasmError::Validation { code, .. } => {
+                assert_eq!(
+                    code,
+                    codes::VALID_7000,
+                    "W4: malformed request_id maps to VALID_7000 at the bridge boundary"
+                );
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    /// W4: the length branch of `validate_request_id_hex` reports only a
+    /// character COUNT, never the raw input content — so a too-short
+    /// `request_id` carrying injection-shaped bytes cannot be reflected.
+    /// (The alphabet branch's `{s:?}` echo for a *correct-length* string
+    /// is the shared validator's contract in `scp-ffi-common`, bounded
+    /// to 32 chars and outside the WASM bridge's scope; the WASM W4
+    /// guarantee covers the bridge's own parse helpers and the
+    /// length/control branches it relies on.)
+    #[test]
+    fn w4_request_id_hex_length_branch_is_input_free() {
+        let too_short = "<script>xx"; // 10 chars, wrong length
+        let err = ScpWasmError::from(validate_request_id_hex(too_short).unwrap_err());
+        match err {
+            ScpWasmError::Validation { code, message } => {
+                assert_eq!(code, codes::VALID_7000);
+                assert!(
+                    !message.contains("script"),
+                    "length-branch message must not echo the raw input, got: {message}"
+                );
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
+    }
+
+    /// Local mirror of `scp_ffi_common::validate::REQUEST_ID_HEX_LEN`
+    /// (32) for the alphabet-branch test fixture — keeps the test
+    /// self-contained without re-exporting the const through the bridge.
+    const REQUEST_ID_HEX_LEN_FOR_TEST: usize = 32;
+}

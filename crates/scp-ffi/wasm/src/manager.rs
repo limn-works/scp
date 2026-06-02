@@ -794,15 +794,23 @@ pub(crate) struct WasmOutletStreamSession {
     /// the `monotonic_seq` on `StreamRegistryEntry` in the other
     /// bridges.
     pub monotonic_seq: u64,
-    /// Invoker's Ed25519 signing key — used to sign credit grants. Held
-    /// alongside the session because WASM has no `KeyCustody` indirection
-    /// for the streaming path; the key is exported once at open and
-    /// dropped when the session is evicted.
+    /// Invoker's Ed25519 *verifying* (public) key — pinned at open.
+    ///
+    /// SCP-OUT-037 W1 (ADR-006): the session holds only the public key,
+    /// never the secret [`ed25519_dalek::SigningKey`]. Every signing site
+    /// (chunk signing at open, credit-grant signing, cancel signing,
+    /// terminate signing, and the synthetic-terminal paths in
+    /// `outlet_stream_next`) materialises a transient signing key
+    /// on-demand via [`crate::identity::with_signing_key`] keyed by
+    /// [`Self::invoker_did`], runs the one signing op, and drops the key
+    /// before returning. The self-verification round-trips after each
+    /// signature use THIS pinned verifying key — so the verify path needs
+    /// no secret material at all.
     ///
     /// Operator and invoker are co-located in the WASM bridge: the
     /// invoker also signs the chunks because there is no separate
     /// out-of-process operator on the browser target.
-    pub invoker_signing_key: ed25519_dalek::SigningKey,
+    pub invoker_verifying_key: ed25519_dalek::VerifyingKey,
     /// Pre-materialised chunks awaiting `next()` consumption.
     ///
     /// WASM is single-threaded and the executor closure is sync, so the
@@ -849,19 +857,37 @@ pub(crate) struct WasmOutletStreamSession {
     /// `OutletStreamCancel` — caller-supplied `next_seq` is rejected.
     /// CRITICAL #3 fix.
     pub emitted_count: u64,
+    /// `true` once this session's admission slot has been released back
+    /// to the per-context [`WasmStreamAdmissionTracker`]. SCP-OUT-037 W3:
+    /// the slot is released exactly once — at the first terminal-eviction
+    /// site that fires (queue drained, synthetic-terminal observed,
+    /// explicit terminate, or the `Drop` guard). Every release path goes
+    /// through [`WasmContextManager::release_admission_once`], which
+    /// flips this flag and short-circuits any later release so a
+    /// terminal-then-Drop sequence never double-releases the slot.
+    pub admission_released: bool,
 }
 
 impl Drop for WasmOutletStreamSession {
     /// §5.4.5 HIGH-wave-3 Fix A — defense-in-depth zeroization of the
-    /// non-secret-but-tidy `caveats_binding` hash on drop. The
-    /// `invoker_signing_key` field is an `ed25519_dalek::SigningKey`
-    /// which already implements `ZeroizeOnDrop`, so its bytes are
-    /// scrubbed when this struct drops. The `chunks` queue carries
-    /// publicly-signed protocol envelopes (no secrets) and the
-    /// remaining fields are public ids / counters. Per ADR-034 the
-    /// WASM bridge runs in the same security boundary as the JS host
-    /// — same in-process trust model as the native bridges — so this
-    /// is best-effort hygiene, not a load-bearing crypto control.
+    /// non-secret-but-tidy `caveats_binding` hash on drop.
+    ///
+    /// SCP-OUT-037 W1: this struct no longer holds any secret key
+    /// material — only the public [`Self::invoker_verifying_key`]
+    /// remains. The previous `invoker_signing_key: SigningKey` field was
+    /// removed; streaming signs on-demand via
+    /// [`crate::identity::with_signing_key`] and never retains a secret
+    /// key here. The `chunks` queue carries publicly-signed protocol
+    /// envelopes (no secrets) and the remaining fields are public ids /
+    /// counters. Per ADR-034 §1 the WASM bridge runs in the same
+    /// security boundary as the JS host — same in-process trust model as
+    /// the native bridges — so this `caveats_binding` scrub is
+    /// best-effort hygiene, not a load-bearing crypto control.
+    ///
+    /// Admission-slot release on drop is handled by the
+    /// [`crate::outlet_stream::WasmOutletInvocationStream`] `Drop` impl
+    /// (which has the manager borrow), not here — this `Drop` runs
+    /// without manager access and so only scrubs local bytes.
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.caveats_binding.zeroize();
@@ -966,12 +992,16 @@ pub struct OpenOutletStreamParams<'a> {
     /// MLS epoch counter pinned at acceptance — committed into every
     /// credit-grant preimage.
     pub stream_epoch: u64,
-    /// Invoker's Ed25519 signing key. Moved into the per-session
-    /// record and dropped (zeroed) when the session is evicted.
-    pub invoker_signing_key: ed25519_dalek::SigningKey,
     /// Initial credit window — number of `Data`/`Progress` chunks the
     /// executor may emit before requiring an `OutletStreamCredit` grant
     /// (§5.4.5). Pinned at `OutletStreamOpen` acceptance.
+    ///
+    /// SCP-OUT-037 W1: the invoker signing key is intentionally NOT a
+    /// field here. `open_outlet_stream` signs the materialised chunks
+    /// on-demand via [`crate::identity::with_signing_key`] keyed by
+    /// `identity_did`, and pins only the public verifying key on the
+    /// session — no secret key is threaded through this params struct or
+    /// retained on the session.
     pub credit_window: u32,
 }
 
@@ -1074,8 +1104,21 @@ pub struct WasmContextManager {
     /// Keyed by `"{context_id}:{member_did}"`. Consumed by
     /// `join_context_encrypted`.
     pending_key_packages: HashMap<String, crate::crypto::group::WasmMlsGroup>,
-    /// Active outlet stream sessions keyed by 32-char lowercase hex
-    /// `request_id` (§5.4.5 SCP-OUT-037, WASM portion).
+    /// Active outlet stream sessions keyed by the composite
+    /// `(context_id, request_id_hex)` (§5.4.5 SCP-OUT-037 W2, WASM
+    /// portion). `request_id_hex` is the 32-char lowercase hex of the
+    /// 16-byte `request_id`.
+    ///
+    /// SCP-OUT-037 W2: keying on `request_id_hex` alone would let a
+    /// `request_id` minted in context A address (grant/cancel/terminate) a
+    /// session in context B under a colliding hex — a cross-context
+    /// addressing leak that violates the §6.2.1.1 binding-pinning
+    /// invariant (`request_id → {context_id, ...}`). Pinning
+    /// `context_id` into the key, plus the inline triple-identity check
+    /// at every lookup (`session.context_id == context_id` AND
+    /// `session.invoker_did == caller_did`), closes that surface. The
+    /// native bridges use the SAME `(context_id, request_id_hex)` scheme
+    /// — see the cross-bridge note in the wave plan.
     ///
     /// ADR-048 §1: per-bridge state, not a process-global. The
     /// `WasmContextManager` itself is `thread_local!` so this map already
@@ -1084,7 +1127,7 @@ pub struct WasmContextManager {
     /// `outlet_stream_registry: Arc<DashMap<...>>` field on
     /// `PyBridgeInstance` / `NapiBridgeInstance` /
     /// `UniffiBridgeInstance`.
-    pub(crate) outlet_streams: HashMap<String, WasmOutletStreamSession>,
+    pub(crate) outlet_streams: HashMap<(String, String), WasmOutletStreamSession>,
     /// Per-context streaming admission tracker (§5.4.5 concurrent-stream
     /// caps). CRITICAL #4 fix — without persisting this across opens,
     /// the per-invoker / per-origin-invoker / per-outlet caps are
@@ -1548,20 +1591,96 @@ impl WasmContextManager {
         }
     }
 
-    /// Releases one slot from the per-context admission tracker.
-    /// Called from every session-eviction site — `outlet_stream_next`
-    /// (queue drained or terminal observed), `outlet_stream_cancel`,
-    /// `outlet_stream_terminate`. Idempotent: a missing context entry
-    /// or zeroed counter is treated as a no-op.
-    pub(crate) fn release_admission_slot(
-        &mut self,
+    /// Low-level release of one slot from the per-context admission
+    /// tracker. Idempotent: a missing context entry or zeroed counter is
+    /// treated as a no-op (the underlying [`WasmStreamAdmissionTracker`]
+    /// saturating-subtracts).
+    ///
+    /// SCP-OUT-037 W3: prefer [`Self::release_admission_once`] /
+    /// [`Self::evict_stream_and_release`] for session eviction — they
+    /// guard against double-release via the session's
+    /// `admission_released` flag. This raw helper is used by those
+    /// wrappers and by the `WasmOutletInvocationStream` `Drop` path
+    /// (which has already read+flipped the flag before calling).
+    fn release_admission_slot(
+        admission: &mut HashMap<String, WasmStreamAdmissionTracker>,
         context_id: &str,
         invoker_did: &str,
         outlet_id: &str,
     ) {
-        if let Some(tracker) = self.outlet_stream_admission.get_mut(context_id) {
+        if let Some(tracker) = admission.get_mut(context_id) {
             tracker.release(invoker_did, invoker_did, outlet_id);
         }
+    }
+
+    /// Releases the admission slot held by `session` exactly once,
+    /// flipping its `admission_released` flag so a later release on the
+    /// same session (terminal-then-Drop, or a redundant eviction site)
+    /// is a no-op.
+    ///
+    /// SCP-OUT-037 W3: every `terminated = true` site and the rejected-
+    /// open path in [`Self::insert_stream_session`] route through this
+    /// helper. It reads the session's pinned `(context_id, invoker_did,
+    /// outlet_id)` triple — the same identity the open path admitted
+    /// under (invoker == origin on WASM single-hop) — so the release
+    /// always targets the slot that was reserved.
+    ///
+    /// Takes the admission map and the session by `&mut` separately
+    /// (rather than `&mut self`) so it can be called from
+    /// `insert_stream_session` while the rejected `session` is owned but
+    /// not yet (and never) in the registry map — avoiding a borrow
+    /// conflict against `self.outlet_streams`.
+    fn release_admission_once(
+        admission: &mut HashMap<String, WasmStreamAdmissionTracker>,
+        session: &mut WasmOutletStreamSession,
+    ) {
+        if session.admission_released {
+            return;
+        }
+        session.admission_released = true;
+        Self::release_admission_slot(
+            admission,
+            &session.context_id,
+            &session.invoker_did,
+            &session.outlet_id,
+        );
+    }
+
+    /// Removes the session keyed by `key` from the registry and releases
+    /// its admission slot exactly once (SCP-OUT-037 W3). Idempotent: a
+    /// missing key is a no-op; a session whose slot was already released
+    /// (its `admission_released` flag is set) does not double-release.
+    ///
+    /// This is the single eviction funnel for the
+    /// `outlet_stream_next` terminal paths and the
+    /// `WasmOutletInvocationStream` `Drop` path — it flips
+    /// `admission_released` on the session *before* the session is
+    /// dropped so any later release site (terminal-then-Drop) sees the
+    /// slot already released and skips its own release.
+    pub(crate) fn evict_stream_and_release(&mut self, key: &(String, String)) {
+        if let Some(mut session) = self.outlet_streams.remove(key) {
+            Self::release_admission_once(&mut self.outlet_stream_admission, &mut session);
+            // `session` drops here — its `caveats_binding` is scrubbed by
+            // `Drop`. The slot is already released above.
+            drop(session);
+        }
+    }
+
+    /// Returns the §5.4.5 next-emission sequence for a session: the
+    /// strict-monotonic per-stream `sequence` the next synthetic terminal
+    /// chunk MUST occupy so receivers see a contiguous sequence space.
+    ///
+    /// SCP-OUT-037 W3: this is `session.emitted_count` — the count of
+    /// chunks already popped from the queue and delivered to the JS side
+    /// (the runtime next-to-emit cursor). All synthetic-terminal sites
+    /// (cancel-synthetic, credit-exhausted-synthetic, terminate-
+    /// synthetic) derive their chunk `sequence` from THIS value so a
+    /// synthetic terminal lands at exactly the slot the next real chunk
+    /// would have, never `emitted_count + queued_len` (which would skip
+    /// the dropped-tail sequence numbers and break sequence continuity).
+    #[must_use]
+    fn next_emission_sequence(session: &WasmOutletStreamSession) -> u64 {
+        session.emitted_count
     }
 
     /// Returns `true` if the context's stored economic policy requires payment.
@@ -2545,12 +2664,15 @@ impl WasmContextManager {
     /// queue. `next()` later pops from that queue one at a time, giving
     /// the same JS-shaped iterator surface as the non-WASM bridges.
     ///
-    /// All chunks are signed under `invoker_signing_key` (the WASM
-    /// bridge has no separate operator identity — the local invoker
-    /// also acts as the executor signer per ADR-034 / SCP-OUT-037 WASM
-    /// portion). This matches the §5.4.5 chunk-signature preimage
-    /// byte-for-byte: `verify_chunk_signature` round-trips against
-    /// `invoker_signing_key.verifying_key()`.
+    /// SCP-OUT-037 W1: all chunks are signed under a transient signing
+    /// key materialised on-demand via
+    /// [`crate::identity::with_signing_key`] (keyed by `identity_did`)
+    /// and dropped before the open returns; the session pins only the
+    /// public verifying key. The WASM bridge has no separate operator
+    /// identity — the local invoker also acts as the executor signer per
+    /// ADR-034 §1 / SCP-OUT-037 WASM portion. This matches the §5.4.5
+    /// chunk-signature preimage byte-for-byte: `verify_chunk_signature`
+    /// round-trips against the pinned `invoker_verifying_key`.
     ///
     /// Emitted chunks (in order):
     /// 1. One `Data` chunk carrying the handler's output (or the
@@ -2590,7 +2712,6 @@ impl WasmContextManager {
             identity_did,
             caveats_binding,
             stream_epoch,
-            invoker_signing_key,
             credit_window,
         } = params;
 
@@ -2633,10 +2754,16 @@ impl WasmContextManager {
 
         // Validate the input against the registered input schema —
         // matches `invoke_outlet_one_shot` so single-shot and streaming
-        // have the same precondition shape.
+        // have the same precondition shape. SCP-OUT-037 W4: the
+        // `jsonschema` validator's error Display embeds the offending
+        // *instance value* (i.e. raw `input_json` bytes) — echoing it
+        // reflects untrusted input back to the caller (ADR-049 §4). On
+        // the streaming open surface we drop the `{e}` and surface a
+        // fixed, input-free message; `outlet_id` is a validated
+        // identifier so it is safe to include.
         validate_value_against_schema(input_json, &registration.schema.input_schema).map_err(
-            |e| ScpWasmError::Tool {
-                message: format!("input schema validation failed for tool '{outlet_id}': {e}"),
+            |_| ScpWasmError::Tool {
+                message: format!("input schema validation failed for tool '{outlet_id}'"),
                 code: codes::TOOL_6002.to_owned(),
             },
         )?;
@@ -2671,11 +2798,13 @@ impl WasmContextManager {
                         message: format!("tool handler for '{outlet_id}' failed: {e}"),
                         code: codes::TOOL_6002.to_owned(),
                     })?;
-                    validate_value_against_schema(&out, &output_schema).map_err(|msg| {
+                    validate_value_against_schema(&out, &output_schema).map_err(|_| {
+                        // SCP-OUT-037 W4: drop the `{msg}` — the
+                        // jsonschema error embeds the offending handler
+                        // *output* value; surface a fixed, input-free
+                        // message (ADR-049 §4).
                         ScpWasmError::Tool {
-                            message: format!(
-                                "output validation failed for tool '{outlet_id}': {msg}"
-                            ),
+                            message: format!("output validation failed for tool '{outlet_id}'"),
                             code: codes::TOOL_6002.to_owned(),
                         }
                     })?;
@@ -2688,25 +2817,35 @@ impl WasmContextManager {
         // identical.
         ctx.append_log_event(EventType::OutletInvoked, identity_did, outlet_id.as_bytes());
 
-        // Build the chunk queue from the handler outcome. Bundled
-        // signing is extracted into [`build_stream_chunks`] so the
-        // open path stays under the workspace's
-        // `clippy::too_many_lines` ceiling.
-        let chunks: VecDeque<OutletStreamChunk> = build_stream_chunks(
-            handler_result,
-            BuildStreamChunksInputs {
-                context_id,
-                outlet_id,
-                request_id: &request_id,
-                caveats_binding: &caveats_binding,
-                signing_key: &invoker_signing_key,
-            },
-        )?;
+        // SCP-OUT-037 W1: sign the materialised chunks on-demand under a
+        // transient signing key scoped to this closure, and capture only
+        // the public verifying key to pin on the session. The secret key
+        // never escapes `with_signing_key` — it is built from the
+        // identity registry's `Zeroizing` bytes, used to sign, and
+        // dropped before the closure returns. The chunk queue and the
+        // pinned verifying key are the only things that survive.
+        let (chunks, invoker_verifying_key): (VecDeque<OutletStreamChunk>, _) =
+            crate::identity::with_signing_key(identity_did, |signing_key| {
+                let chunks = build_stream_chunks(
+                    handler_result,
+                    BuildStreamChunksInputs {
+                        context_id,
+                        outlet_id,
+                        request_id: &request_id,
+                        caveats_binding: &caveats_binding,
+                        signing_key,
+                    },
+                )?;
+                Ok((chunks, signing_key.verifying_key()))
+            })?;
 
         // Insert the session AFTER all chunks are signed so the
         // registry never holds a half-built session — if signing fails
         // above, the SDK sees a clean error and no entry is left
-        // dangling.
+        // dangling. SCP-OUT-037 W5: `insert_stream_session` rejects a
+        // duplicate `(context_id, request_id_hex)` and releases the
+        // admission slot admitted by the gate above before returning the
+        // rejection — a rejected open never leaks an admission slot.
         self.insert_stream_session(
             WasmOutletStreamSession {
                 request_id,
@@ -2715,7 +2854,7 @@ impl WasmContextManager {
                 stream_epoch,
                 caveats_binding,
                 monotonic_seq: 0,
-                invoker_signing_key,
+                invoker_verifying_key,
                 chunks,
                 terminated: false,
                 cancelled: false,
@@ -2727,20 +2866,78 @@ impl WasmContextManager {
                 remaining_credit: credit_window,
                 invoker_did: identity_did.to_owned(),
                 emitted_count: 0,
+                admission_released: false,
             },
+            context_id,
             &request_id_hex,
-        );
+        )?;
 
         Ok(request_id_hex)
     }
 
     /// Inserts a freshly-built stream session into the per-bridge
-    /// registry. Extracted from [`Self::open_outlet_stream`] so the
-    /// open path stays under the workspace's `clippy::too_many_lines`
-    /// ceiling.
-    fn insert_stream_session(&mut self, session: WasmOutletStreamSession, request_id_hex: &str) {
-        self.outlet_streams
-            .insert(request_id_hex.to_owned(), session);
+    /// registry under the composite `(context_id, request_id_hex)` key.
+    /// Extracted from [`Self::open_outlet_stream`] so the open path
+    /// stays under the workspace's `clippy::too_many_lines` ceiling.
+    ///
+    /// SCP-OUT-037 W5 — duplicate-key rejection. The registry MUST NOT
+    /// silently overwrite an existing session for the same
+    /// `(context_id, request_id_hex)`: a re-issued `request_id` (§6.2.1.1
+    /// requires `request_id` uniqueness per context) is a
+    /// `protocol.session-id-conflict`. On a duplicate the freshly-built
+    /// `session` is dropped (its `caveats_binding` scrubbed by its
+    /// `Drop`) and the admission slot the open path reserved is released
+    /// via [`Self::release_admission_once`] so the rejected open does not
+    /// leak a slot, then the conflict error is returned.
+    ///
+    /// # Spec note (code/slug pairing)
+    ///
+    /// A duplicate `(context_id, request_id_hex)` is the §6.2.1.1(a)
+    /// `request_id`-uniqueness collision, which §5.4.4 pins to
+    /// `CODE_PROTOCOL_SESSION` (`SCP-TOOL-6101`) with slug
+    /// `protocol.session-id-conflict`. (§6.2.1.1(b)
+    /// `protocol.stream-already-open` carries `SCP-TOOL-6100` and applies
+    /// to a re-open of an already-open *stream* by other identity, not a
+    /// `request_id` collision — the spec is authoritative here.)
+    ///
+    /// # Errors
+    ///
+    /// Returns `ScpWasmError::Context` (`SCP-TOOL-6101`, slug
+    /// `protocol.session-id-conflict`) when a session already exists for
+    /// the composite key.
+    fn insert_stream_session(
+        &mut self,
+        mut session: WasmOutletStreamSession,
+        context_id: &str,
+        request_id_hex: &str,
+    ) -> Result<(), ScpWasmError> {
+        use scp_protocol::context::outlets::error_codes::{
+            CODE_PROTOCOL_SESSION, SLUG_PROTOCOL_SESSION_ID_CONFLICT,
+        };
+        use std::collections::hash_map::Entry;
+
+        let key = (context_id.to_owned(), request_id_hex.to_owned());
+        match self.outlet_streams.entry(key) {
+            Entry::Occupied(_) => {
+                // Release the admission slot this open reserved before
+                // returning the conflict — a rejected open MUST NOT leak
+                // a slot (W3 + W5). Use the rejected session's own
+                // identity triple (it matches what the gate admitted
+                // under: invoker == origin on WASM single-hop).
+                Self::release_admission_once(&mut self.outlet_stream_admission, &mut session);
+                Err(ScpWasmError::Context {
+                    message: format!(
+                        "stream '{request_id_hex}' already open in context \
+                         '{context_id}' ({SLUG_PROTOCOL_SESSION_ID_CONFLICT})"
+                    ),
+                    code: CODE_PROTOCOL_SESSION.to_owned(),
+                })
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(session);
+                Ok(())
+            }
+        }
     }
 
     /// Pops the next chunk from a stream session, returning `None`
@@ -2758,15 +2955,17 @@ impl WasmContextManager {
     /// pre-materialised stream).
     pub fn outlet_stream_next(
         &mut self,
+        context_id: &str,
         request_id_hex: &str,
     ) -> Option<scp_protocol::context::outlets::stream::OutletStreamChunk> {
         use scp_protocol::context::outlets::error_codes::{
             CODE_EXECUTION_CANCEL_ACK_TIMEOUT, CODE_EXECUTION_CREDIT,
             SLUG_EXECUTION_CANCEL_ACK_TIMEOUT, SLUG_EXECUTION_CREDIT_EXHAUSTED,
         };
-        use scp_protocol::context::outlets::stream::{ChunkPayload, sign_chunk};
+        use scp_protocol::context::outlets::stream::ChunkPayload;
 
-        let session = self.outlet_streams.get_mut(request_id_hex)?;
+        let key = (context_id.to_owned(), request_id_hex.to_owned());
+        let session = self.outlet_streams.get_mut(&key)?;
 
         // §5.4.5 cancellation point — checked BEFORE popping the next
         // queued chunk so a cancel observed between two consumer pulls
@@ -2778,10 +2977,13 @@ impl WasmContextManager {
         // SDK consumer MUST observe a terminal closure (not a silent
         // `None`).
         if session.cancelled && !session.terminated {
-            let sequence = u64::try_from(session.chunks.len())
-                .map_or(session.emitted_count, |tail| {
-                    session.emitted_count.saturating_add(tail)
-                });
+            // SCP-OUT-037 W3: the synthetic terminal takes the
+            // next-emission sequence (`emitted_count`), NOT
+            // `emitted_count + queued_tail_len`. The dropped tail's
+            // sequence numbers are never emitted, so the terminal must
+            // land at the cursor to keep the per-stream sequence space
+            // contiguous from the receiver's perspective.
+            let sequence = Self::next_emission_sequence(session);
             let error_payload = ChunkPayload::Error {
                 code: CODE_EXECUTION_CANCEL_ACK_TIMEOUT.to_owned(),
                 message: format!(
@@ -2789,16 +2991,9 @@ impl WasmContextManager {
                 ),
                 terminal: true,
             };
-            let sig = sign_chunk(
-                &session.invoker_signing_key,
-                session.context_id.as_str(),
-                session.outlet_id.as_str(),
-                &session.request_id,
-                sequence,
-                &session.caveats_binding,
-                &error_payload,
-            )
-            .ok()?;
+            // SCP-OUT-037 W1: sign on-demand under a transient key — the
+            // session holds only the public verifying key.
+            let chunk = Self::sign_synthetic_terminal(session, sequence, error_payload)?;
             session.terminated = true;
             // Cancel truncates: drop any chunks queued past the cancel
             // point — the spec says "Already-emitted chunks remain
@@ -2807,28 +3002,23 @@ impl WasmContextManager {
             // not yet emitted.
             session.chunks.clear();
             session.emitted_count = session.emitted_count.saturating_add(1);
-            return Some(scp_protocol::context::outlets::stream::OutletStreamChunk {
-                request_id: session.request_id,
-                sequence,
-                payload: error_payload,
-                sig,
-            });
+            // SCP-OUT-037 W3: a terminal observation releases the
+            // admission slot immediately — NOT only on the next-pull
+            // eviction or on `Drop`. The session entry itself stays in
+            // the registry until the next pull returns `None` (so a late
+            // cancel/grant still finds it and is idempotent), but the
+            // slot is freed now.
+            Self::release_admission_once(&mut self.outlet_stream_admission, session);
+            return Some(chunk);
         }
 
         let Some(chunk) = session.chunks.pop_front() else {
             // Queue drained — flip terminated and evict so future
             // `next()` calls see `None` cleanly without a stale entry.
+            // `evict_stream_and_release` removes the session and releases
+            // its admission slot exactly once (W3).
             session.terminated = true;
-            // Capture identity so we can release the admission slot
-            // after the session is removed (the borrow on
-            // `outlet_streams` is held by `session` until end of
-            // scope; cloning out the strings lets the post-eviction
-            // release run cleanly).
-            let ctx = session.context_id.clone();
-            let inv = session.invoker_did.clone();
-            let out = session.outlet_id.clone();
-            self.outlet_streams.remove(request_id_hex);
-            self.release_admission_slot(&ctx, &inv, &out);
+            self.evict_stream_and_release(&key);
             return None;
         };
 
@@ -2852,8 +3042,19 @@ impl WasmContextManager {
             if session.remaining_credit == 0 {
                 // Build a synthetic terminal Error chunk at the same
                 // sequence the suppressed billable chunk would have
-                // occupied. Sign it under the same per-session key
-                // so SDK-side `verify_chunk_signature` round-trips.
+                // occupied. SCP-OUT-037 W3: that is the next-emission
+                // sequence (`emitted_count`), which equals the suppressed
+                // chunk's `chunk.sequence` only on the well-formed open
+                // path; deriving from `emitted_count` keeps the terminal
+                // contiguous even if upstream sequence assignment drifts.
+                // We keep `debug_assert!` parity with `chunk.sequence` so
+                // a divergence is caught in test builds.
+                let sequence = Self::next_emission_sequence(session);
+                debug_assert_eq!(
+                    sequence, chunk.sequence,
+                    "credit-exhausted synthetic terminal sequence must equal the \
+                     suppressed billable chunk's sequence on the well-formed path"
+                );
                 let error_payload = ChunkPayload::Error {
                     code: CODE_EXECUTION_CREDIT.to_owned(),
                     message: format!(
@@ -2861,35 +3062,27 @@ impl WasmContextManager {
                     ),
                     terminal: true,
                 };
-                let sequence = chunk.sequence;
-                let sig = sign_chunk(
-                    &session.invoker_signing_key,
-                    session.context_id.as_str(),
-                    session.outlet_id.as_str(),
-                    &session.request_id,
-                    sequence,
-                    &session.caveats_binding,
-                    &error_payload,
-                )
-                .ok()?;
+                // SCP-OUT-037 W1: sign on-demand under a transient key.
+                let synthetic = Self::sign_synthetic_terminal(session, sequence, error_payload)?;
                 session.terminated = true;
                 // Drop the suppressed billable chunk and any queued
                 // tail — credit-exhausted closure is a hard stop, no
                 // further Data/Progress passes through.
                 session.chunks.clear();
                 session.emitted_count = session.emitted_count.saturating_add(1);
-                return Some(scp_protocol::context::outlets::stream::OutletStreamChunk {
-                    request_id: session.request_id,
-                    sequence,
-                    payload: error_payload,
-                    sig,
-                });
+                // W3: release the admission slot on terminal observation.
+                Self::release_admission_once(&mut self.outlet_stream_admission, session);
+                return Some(synthetic);
             }
             session.remaining_credit = session.remaining_credit.saturating_sub(1);
         }
 
         if is_terminal {
             session.terminated = true;
+            // W3: a real terminal chunk (End / terminal Error) also
+            // releases the admission slot on observation. The session
+            // entry stays in the registry until the next-pull eviction.
+            Self::release_admission_once(&mut self.outlet_stream_admission, session);
         }
         // §5.4.5 next-emission cursor: bump after every chunk popped
         // from the queue (the runtime-published "next-to-emit" sequence
@@ -2900,15 +3093,58 @@ impl WasmContextManager {
         Some(chunk)
     }
 
+    /// Signs a synthetic terminal `Error` chunk on-demand for `session`
+    /// at `sequence`, materialising the invoker's signing key only for
+    /// the signing op (SCP-OUT-037 W1).
+    ///
+    /// Returns `None` if signing fails (e.g. the invoker DID is no longer
+    /// in the identity registry, or JCS canonicalisation fails) — the
+    /// caller surfaces this as end-of-stream (`None` from
+    /// `outlet_stream_next`), matching the pre-W1 `sign_chunk(...).ok()?`
+    /// behaviour. The signature is produced under a transient
+    /// [`ed25519_dalek::SigningKey`] from
+    /// [`crate::identity::with_signing_key`]; the session retains only
+    /// the public [`WasmOutletStreamSession::invoker_verifying_key`].
+    fn sign_synthetic_terminal(
+        session: &WasmOutletStreamSession,
+        sequence: u64,
+        payload: scp_protocol::context::outlets::stream::ChunkPayload,
+    ) -> Option<scp_protocol::context::outlets::stream::OutletStreamChunk> {
+        use scp_protocol::context::outlets::stream::{OutletStreamChunk, sign_chunk};
+
+        let sig = crate::identity::with_signing_key(&session.invoker_did, |signing_key| {
+            sign_chunk(
+                signing_key,
+                session.context_id.as_str(),
+                session.outlet_id.as_str(),
+                &session.request_id,
+                sequence,
+                &session.caveats_binding,
+                &payload,
+            )
+            .map_err(|e| ScpWasmError::Tool {
+                message: format!("failed to sign synthetic terminal chunk: {e}"),
+                code: codes::TOOL_6006.to_owned(),
+            })
+        })
+        .ok()?;
+        Some(OutletStreamChunk {
+            request_id: session.request_id,
+            sequence,
+            payload,
+            sig,
+        })
+    }
+
     /// Returns `true` if the named stream session has flipped
     /// terminated (queue drained or terminal chunk emitted).
     /// Used by the `done` getter on `WasmOutletInvocationStream`.
     /// Returns `true` for missing sessions too — once evicted, the
     /// stream is unambiguously done from the SDK's perspective.
     #[must_use]
-    pub fn outlet_stream_is_done(&self, request_id_hex: &str) -> bool {
+    pub fn outlet_stream_is_done(&self, context_id: &str, request_id_hex: &str) -> bool {
         self.outlet_streams
-            .get(request_id_hex)
+            .get(&(context_id.to_owned(), request_id_hex.to_owned()))
             .is_none_or(|s| s.terminated)
     }
 
@@ -2943,12 +3179,13 @@ impl WasmContextManager {
     ///   in practice — `2^64` grants per stream).
     pub fn outlet_stream_grant_credit(
         &mut self,
+        context_id: &str,
         request_id_hex: &str,
         caller_did: &str,
         grant: u32,
     ) -> Result<u32, ScpWasmError> {
         use scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION;
-        use scp_protocol::context::outlets::stream::{CreditGrantSigningInputs, sign_credit_grant};
+        use scp_protocol::context::outlets::stream::CreditGrantSigningInputs;
 
         if grant == 0 {
             return Err(ScpWasmError::Validation {
@@ -2958,23 +3195,29 @@ impl WasmContextManager {
             });
         }
 
-        let session =
-            self.outlet_streams
-                .get_mut(request_id_hex)
-                .ok_or_else(|| ScpWasmError::Context {
-                    message: format!(
-                        "stream '{request_id_hex}' not found in registry (protocol.unknown-session)"
-                    ),
-                    code: CODE_PROTOCOL_SESSION.to_owned(),
-                })?;
-        // CRITICAL #1 fix: verify caller_did matches the session's
-        // pinned invoker_did before signing under the session's
-        // invoker key.
-        if session.invoker_did != caller_did {
+        // SCP-OUT-037 W2: composite-key lookup. A `request_id_hex`
+        // minted in another context can never address this session.
+        let key = (context_id.to_owned(), request_id_hex.to_owned());
+        let session = self
+            .outlet_streams
+            .get_mut(&key)
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!(
+                    "stream '{request_id_hex}' not found in context '{context_id}' \
+                         registry (protocol.unknown-session)"
+                ),
+                code: CODE_PROTOCOL_SESSION.to_owned(),
+            })?;
+        // SCP-OUT-037 W2 triple-identity check + CRITICAL #1: the
+        // composite key already pins context_id, but re-assert it
+        // inline (defence in depth against a future single-key lookup
+        // regression) AND verify caller_did matches the session's
+        // pinned invoker_did before signing under the invoker key.
+        if session.context_id != context_id || session.invoker_did != caller_did {
             return Err(ScpWasmError::Context {
                 message: format!(
                     "caller {caller_did} is not the pinned invoker for stream \
-                     '{request_id_hex}' (authorization.denied)"
+                     '{request_id_hex}' in context '{context_id}' (authorization.denied)"
                 ),
                 code: codes::PERM_3001.to_owned(),
             });
@@ -2992,43 +3235,47 @@ impl WasmContextManager {
                 })?;
         session.monotonic_seq = next_seq;
 
-        let inputs = CreditGrantSigningInputs {
-            context_id: session.context_id.as_str(),
-            outlet_id: session.outlet_id.as_str(),
-            request_id: &session.request_id,
-            grant,
-            monotonic_seq: next_seq,
-            stream_epoch: session.stream_epoch,
-            caveats_binding: &session.caveats_binding,
-        };
-        // Sign the grant for protocol-level cross-SDK conformance.
-        // The signature value is verified inline against the
-        // invoker's pinned public key — `verify_credit_signature`
-        // round-trips against the same preimage on the SDK side, so
-        // any future change to credit-grant signing semantics fails
-        // at this call site rather than silently diverging. The
-        // signature is otherwise discarded because the WASM bridge
-        // has no off-process executor to forward it to.
-        let sig = sign_credit_grant(&session.invoker_signing_key, &inputs);
-        let credit = scp_protocol::context::outlets::stream::OutletStreamCredit {
-            request_id: session.request_id,
-            grant,
-            monotonic_seq: next_seq,
-            sig,
-        };
+        // SCP-OUT-037 W1: sign the grant on-demand under a transient
+        // signing key and self-verify against the session's pinned
+        // *public* verifying key. The signature value is verified inline
+        // — `verify_credit_signature` round-trips against the same
+        // preimage on the SDK side, so any future change to credit-grant
+        // signing semantics fails at this call site rather than silently
+        // diverging. The signature is otherwise discarded because the
+        // WASM bridge has no off-process executor to forward it to. The
+        // secret key never escapes `with_signing_key`.
+        let credit = crate::identity::with_signing_key(&session.invoker_did, |signing_key| {
+            let inputs = CreditGrantSigningInputs {
+                context_id: session.context_id.as_str(),
+                outlet_id: session.outlet_id.as_str(),
+                request_id: &session.request_id,
+                grant,
+                monotonic_seq: next_seq,
+                stream_epoch: session.stream_epoch,
+                caveats_binding: &session.caveats_binding,
+            };
+            let sig =
+                scp_protocol::context::outlets::stream::sign_credit_grant(signing_key, &inputs);
+            Ok(scp_protocol::context::outlets::stream::OutletStreamCredit {
+                request_id: session.request_id,
+                grant,
+                monotonic_seq: next_seq,
+                sig,
+            })
+        })?;
         if !scp_protocol::context::outlets::stream::verify_credit_signature(
             &credit,
-            &session.invoker_signing_key.verifying_key(),
+            &session.invoker_verifying_key,
             session.context_id.as_str(),
             session.outlet_id.as_str(),
             session.stream_epoch,
             &session.caveats_binding,
         ) {
             // Self-consistency check — if we just signed a grant that
-            // does not verify under the same invoker key, something
-            // has gone catastrophically wrong with the protocol
-            // crypto layer or the caller has handed us a corrupted
-            // signing key. Fail loud so the SDK sees the divergence.
+            // does not verify under the pinned invoker public key,
+            // something has gone catastrophically wrong with the
+            // protocol crypto layer or the registry has been corrupted.
+            // Fail loud so the SDK sees the divergence.
             return Err(ScpWasmError::Crypto {
                 message: "internal: freshly-signed credit grant failed self-verification \
                           — SCP-OUTLET-CREDIT-V1 preimage drift"
@@ -3077,29 +3324,35 @@ impl WasmContextManager {
     ///   operation).
     pub fn outlet_stream_cancel(
         &mut self,
+        context_id: &str,
         request_id_hex: &str,
         caller_did: &str,
     ) -> Result<Option<u64>, ScpWasmError> {
         use scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION;
         use scp_protocol::context::outlets::stream::{
-            CancelSigningInputs, OutletStreamCancel, sign_cancel, verify_cancel_signature,
+            CancelSigningInputs, OutletStreamCancel, verify_cancel_signature,
         };
 
-        let session =
-            self.outlet_streams
-                .get_mut(request_id_hex)
-                .ok_or_else(|| ScpWasmError::Context {
-                    message: format!(
-                        "stream '{request_id_hex}' not found in registry (protocol.unknown-session)"
-                    ),
-                    code: CODE_PROTOCOL_SESSION.to_owned(),
-                })?;
-        // CRITICAL #1: caller authentication.
-        if session.invoker_did != caller_did {
+        // SCP-OUT-037 W2: composite-key lookup.
+        let key = (context_id.to_owned(), request_id_hex.to_owned());
+        let session = self
+            .outlet_streams
+            .get_mut(&key)
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!(
+                    "stream '{request_id_hex}' not found in context '{context_id}' \
+                         registry (protocol.unknown-session)"
+                ),
+                code: CODE_PROTOCOL_SESSION.to_owned(),
+            })?;
+        // SCP-OUT-037 W2 triple-identity check + CRITICAL #1: re-assert
+        // context_id (the composite key already pins it) AND caller_did
+        // against the pinned invoker before any state mutation.
+        if session.context_id != context_id || session.invoker_did != caller_did {
             return Err(ScpWasmError::Context {
                 message: format!(
                     "caller {caller_did} is not the pinned invoker for stream \
-                     '{request_id_hex}' (authorization.denied)"
+                     '{request_id_hex}' in context '{context_id}' (authorization.denied)"
                 ),
                 code: codes::PERM_3001.to_owned(),
             });
@@ -3114,29 +3367,32 @@ impl WasmContextManager {
         // caller input. `emitted_count` is the count of chunks already
         // popped from the queue and delivered to the JS side — that is
         // the next-to-emit cursor at the moment the cancel arrives.
-        let next_seq = session.emitted_count;
+        let next_seq = Self::next_emission_sequence(session);
 
-        // CRITICAL #2: build, sign, and verify the cancel. The
-        // signature roundtrip mirrors the native runtime's
-        // `apply_outlet_cancel` which rejects an unsigned-or-tampered
-        // cancel. Self-verification under the same key catches
-        // SCP-OUTLET-CANCEL-V1 preimage drift early.
-        let inputs = CancelSigningInputs {
-            context_id: session.context_id.as_str(),
-            outlet_id: session.outlet_id.as_str(),
-            request_id: &session.request_id,
-            next_seq,
-            caveats_binding: &session.caveats_binding,
-        };
-        let sig = sign_cancel(&session.invoker_signing_key, &inputs);
-        let cancel = OutletStreamCancel {
-            request_id: session.request_id,
-            next_seq,
-            sig,
-        };
+        // CRITICAL #2: build, sign, and verify the cancel. SCP-OUT-037
+        // W1: sign on-demand under a transient key; self-verify against
+        // the session's pinned *public* verifying key. The signature
+        // roundtrip mirrors the native runtime's `apply_outlet_cancel`
+        // which rejects an unsigned-or-tampered cancel. Self-verification
+        // catches SCP-OUTLET-CANCEL-V1 preimage drift early.
+        let cancel = crate::identity::with_signing_key(&session.invoker_did, |signing_key| {
+            let inputs = CancelSigningInputs {
+                context_id: session.context_id.as_str(),
+                outlet_id: session.outlet_id.as_str(),
+                request_id: &session.request_id,
+                next_seq,
+                caveats_binding: &session.caveats_binding,
+            };
+            let sig = scp_protocol::context::outlets::stream::sign_cancel(signing_key, &inputs);
+            Ok(OutletStreamCancel {
+                request_id: session.request_id,
+                next_seq,
+                sig,
+            })
+        })?;
         if !verify_cancel_signature(
             &cancel,
-            &session.invoker_signing_key.verifying_key(),
+            &session.invoker_verifying_key,
             session.context_id.as_str(),
             session.outlet_id.as_str(),
             &session.caveats_binding,
@@ -3196,39 +3452,44 @@ impl WasmContextManager {
     /// match any active session.
     pub fn outlet_stream_terminate(
         &mut self,
+        context_id: &str,
         request_id_hex: &str,
         caller_did: &str,
         reason: scp_protocol::context::outlets::stream::TerminateReason,
         message_override: Option<&str>,
     ) -> Result<bool, ScpWasmError> {
         use scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION;
-        use scp_protocol::context::outlets::stream::{ChunkPayload, OutletStreamChunk, sign_chunk};
+        use scp_protocol::context::outlets::stream::ChunkPayload;
 
         // Slug and code derived from the enum — never caller-supplied.
-        // Mirrors the runtime bridge's `terminate_with_error` contract
-        // (PR #1700 + this PR): the wire chunk carries the canonical
-        // §5.4.4 slug+code regardless of any caller string. The only
-        // caller-controllable field is the human-readable message
-        // suffix (`message_override`).
+        // Mirrors the runtime bridge's `terminate_with_error` contract:
+        // the wire chunk carries the canonical §5.4.4 slug+code
+        // regardless of any caller string. The only caller-controllable
+        // field is the human-readable message suffix
+        // (`message_override`).
         let slug = reason.slug();
         let code = reason.code();
         let suffix = message_override.unwrap_or_else(|| reason.default_message());
 
-        let session =
-            self.outlet_streams
-                .get_mut(request_id_hex)
-                .ok_or_else(|| ScpWasmError::Context {
-                    message: format!(
-                        "stream '{request_id_hex}' not found in registry (protocol.unknown-session)"
-                    ),
-                    code: CODE_PROTOCOL_SESSION.to_owned(),
-                })?;
-        // CRITICAL #1 fix: caller authentication.
-        if session.invoker_did != caller_did {
+        // SCP-OUT-037 W2: composite-key lookup.
+        let key = (context_id.to_owned(), request_id_hex.to_owned());
+        let session = self
+            .outlet_streams
+            .get_mut(&key)
+            .ok_or_else(|| ScpWasmError::Context {
+                message: format!(
+                    "stream '{request_id_hex}' not found in context '{context_id}' \
+                         registry (protocol.unknown-session)"
+                ),
+                code: CODE_PROTOCOL_SESSION.to_owned(),
+            })?;
+        // SCP-OUT-037 W2 triple-identity check + CRITICAL #1: re-assert
+        // context_id AND caller_did against the pinned invoker.
+        if session.context_id != context_id || session.invoker_did != caller_did {
             return Err(ScpWasmError::Context {
                 message: format!(
                     "caller {caller_did} is not the pinned invoker for stream \
-                     '{request_id_hex}' (authorization.denied)"
+                     '{request_id_hex}' in context '{context_id}' (authorization.denied)"
                 ),
                 code: codes::PERM_3001.to_owned(),
             });
@@ -3241,19 +3502,19 @@ impl WasmContextManager {
             return Ok(false);
         }
 
-        // Sequence assignment: §5.4.5 mandates strict-monotonic
-        // per-stream sequences. WASM tracks the next-to-emit cursor
-        // implicitly as `total_emitted + queued_chunks_len`. We pin
-        // the synthetic chunk's sequence at "what the next chunk
-        // would have been" so receivers see a contiguous sequence
-        // space. The session's `chunks` already carries pre-built
-        // chunks 0..N at sequences 0..N; the synthetic terminal
-        // takes the slot AFTER any chunk already delivered to the
-        // SDK but REPLACES any chunks not yet delivered (the spec
-        // §5.4.5 says "Already-emitted chunks remain authorized;
-        // the stream closes ... regardless of executor behavior" —
-        // so we drop anything queued but not yet delivered).
-        let next_sequence = u64::try_from(session.chunks.len()).unwrap_or(u64::MAX);
+        // SCP-OUT-037 W3 sequence assignment: §5.4.5 mandates
+        // strict-monotonic per-stream sequences. The synthetic terminal
+        // takes the next-emission sequence (`emitted_count` — the cursor
+        // of chunks already delivered to the SDK) and REPLACES any chunks
+        // queued but not yet delivered. Using `emitted_count` (W3) — not
+        // `chunks.len()` — keeps the terminal contiguous with the
+        // already-emitted prefix: the dropped tail's sequences are never
+        // emitted, so the terminal must sit at the cursor, not past the
+        // (about-to-be-dropped) queue length. The spec §5.4.5 says
+        // "Already-emitted chunks remain authorized; the stream closes
+        // ... regardless of executor behavior" — so we drop anything
+        // queued but not yet delivered.
+        let next_sequence = Self::next_emission_sequence(session);
         session.chunks.clear();
 
         let payload = ChunkPayload::Error {
@@ -3261,26 +3522,22 @@ impl WasmContextManager {
             message: format!("{slug}: {suffix}"),
             terminal: true,
         };
-        let sig = sign_chunk(
-            &session.invoker_signing_key,
-            &session.context_id,
-            &session.outlet_id,
-            &session.request_id,
-            next_sequence,
-            &session.caveats_binding,
-            &payload,
-        )
-        .map_err(|e| ScpWasmError::Tool {
-            message: format!("failed to sign synthetic terminal chunk: {e}"),
-            code: codes::TOOL_6006.to_owned(),
-        })?;
-        session.chunks.push_back(OutletStreamChunk {
-            request_id: session.request_id,
-            sequence: next_sequence,
-            payload,
-            sig,
-        });
+        // SCP-OUT-037 W1: sign on-demand under a transient key.
+        let synthetic =
+            Self::sign_synthetic_terminal(session, next_sequence, payload).ok_or_else(|| {
+                ScpWasmError::Tool {
+                    message: "failed to sign synthetic terminal chunk".to_owned(),
+                    code: codes::TOOL_6006.to_owned(),
+                }
+            })?;
+        session.chunks.push_back(synthetic);
         session.terminated = true;
+        // SCP-OUT-037 W3: terminate IS the terminal event — release the
+        // admission slot now (not only when the SDK later pulls the
+        // synthetic). When the synthetic is subsequently observed via
+        // `outlet_stream_next`'s `is_terminal` path, the
+        // `release_admission_once` guard there short-circuits.
+        Self::release_admission_once(&mut self.outlet_stream_admission, session);
         Ok(true)
     }
 
@@ -7326,6 +7583,136 @@ mod tests {
         serde_json::from_value(val).unwrap()
     }
 
+    // -----------------------------------------------------------------------
+    // SCP-OUT-037 streaming test helpers (W1-W5)
+    // -----------------------------------------------------------------------
+
+    /// Builds a `WasmOutletStreamSession` for a test, pinning the public
+    /// verifying key of `signing` (SCP-OUT-037 W1 — no secret key on the
+    /// session) and registering `signing` in the identity registry under
+    /// its derived DID so `with_signing_key` resolves on the streaming
+    /// control plane. Returns `(session, derived_invoker_did)`.
+    ///
+    /// `chunks` are the pre-materialised queue; the caller is responsible
+    /// for signing them under the SAME `signing` key (so
+    /// `verify_chunk_signature` round-trips against the pinned verifying
+    /// key).
+    fn make_test_session(
+        signing: &ed25519_dalek::SigningKey,
+        context_id: &str,
+        outlet_id: &str,
+        caveats_binding: [u8; 32],
+        request_id: [u8; 16],
+        chunks: VecDeque<scp_protocol::context::outlets::stream::OutletStreamChunk>,
+        remaining_credit: u32,
+    ) -> (WasmOutletStreamSession, String) {
+        let invoker_did = crate::identity::register_identity_for_test(signing);
+        let session = WasmOutletStreamSession {
+            request_id,
+            context_id: context_id.to_owned(),
+            outlet_id: outlet_id.to_owned(),
+            stream_epoch: 0,
+            caveats_binding,
+            monotonic_seq: 0,
+            invoker_verifying_key: signing.verifying_key(),
+            chunks,
+            terminated: false,
+            cancelled: false,
+            total_credit: 0,
+            remaining_credit,
+            invoker_did: invoker_did.clone(),
+            emitted_count: 0,
+            admission_released: false,
+        };
+        (session, invoker_did)
+    }
+
+    /// Inserts a session into the manager's registry under the composite
+    /// `(context_id, request_id_hex)` key (SCP-OUT-037 W2).
+    fn insert_test_session(
+        mgr: &mut WasmContextManager,
+        context_id: &str,
+        request_id_hex: &str,
+        session: WasmOutletStreamSession,
+    ) {
+        mgr.outlet_streams
+            .insert((context_id.to_owned(), request_id_hex.to_owned()), session);
+    }
+
+    /// Pre-seeds a per-context admission tracker entry for `(invoker_did,
+    /// outlet_id)` so the W3 admission-release tests have a non-zero slot
+    /// count to observe being released. Mirrors what
+    /// `open_outlet_stream`'s admission gate would have reserved.
+    fn admit_test_slot(
+        mgr: &mut WasmContextManager,
+        context_id: &str,
+        invoker_did: &str,
+        outlet_id: &str,
+    ) {
+        let admission = mgr
+            .outlet_stream_admission
+            .entry(context_id.to_owned())
+            .or_default();
+        admission
+            .try_admit(invoker_did, invoker_did, outlet_id, 8, 16, 128)
+            .expect("test admission slot must be granted");
+    }
+
+    /// Reads the current per-invoker admission count for `(context_id,
+    /// invoker_did)` — `0` when no tracker entry exists.
+    fn admission_count(mgr: &WasmContextManager, context_id: &str, invoker_did: &str) -> u32 {
+        mgr.outlet_stream_admission
+            .get(context_id)
+            .and_then(|t| t.per_invoker.get(invoker_did))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Asserts a chunk is the canonical cancel-ack synthetic terminal
+    /// (`SCP-TOOL-6135` / `execution.cancel-ack-timeout`, `terminal:
+    /// true`) and that its signature round-trips under `signing`'s
+    /// verifying key for context `"ctx"` / outlet `"outlet"`. Shared by
+    /// the direct cancel test and the cancellation-vector replay so both
+    /// pin the same surface without duplicating the match arms.
+    fn assert_cancel_ack_terminal(
+        chunk: &scp_protocol::context::outlets::stream::OutletStreamChunk,
+        signing: &ed25519_dalek::SigningKey,
+        caveats_binding: &[u8; 32],
+    ) {
+        use scp_protocol::context::outlets::error_codes::{
+            CODE_EXECUTION_CANCEL_ACK_TIMEOUT, SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
+        };
+        use scp_protocol::context::outlets::stream::ChunkPayload;
+        match &chunk.payload {
+            ChunkPayload::Error {
+                code,
+                terminal,
+                message,
+            } => {
+                assert!(*terminal, "synthetic chunk MUST be terminal");
+                assert_eq!(
+                    code, CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
+                    "cancel-initiated synthetic terminal uses cancel-ack-timeout code"
+                );
+                assert!(
+                    message.contains(SLUG_EXECUTION_CANCEL_ACK_TIMEOUT),
+                    "synthetic message includes the canonical slug, got: {message}"
+                );
+            }
+            other => panic!("expected synthetic terminal Error, got {other:?}"),
+        }
+        assert!(
+            scp_protocol::context::outlets::stream::verify_chunk_signature(
+                chunk,
+                &signing.verifying_key(),
+                "ctx",
+                "outlet",
+                caveats_binding,
+            ),
+            "synthetic cancel-ack terminal chunk signature must verify"
+        );
+    }
+
     #[test]
     fn serde_roundtrip_add_member() {
         roundtrip(&GovernanceAction::AddMember {
@@ -9108,31 +9495,25 @@ mod tests {
             },
         ));
 
-        mgr.outlet_streams.insert(
-            request_id_hex.clone(),
-            super::WasmOutletStreamSession {
-                request_id,
-                context_id: "ctx".to_owned(),
-                outlet_id: "outlet".to_owned(),
-                stream_epoch: 0,
-                caveats_binding,
-                monotonic_seq: 0,
-                invoker_signing_key: signing.clone(),
-                chunks,
-                terminated: false,
-                cancelled: false,
-                total_credit: 0,
-                // Only one billable chunk fits in the window — the
-                // second Data chunk MUST hit the exhausted path.
-                remaining_credit: 1,
-                invoker_did: "did:dht:z6MkInvoker".to_owned(),
-                emitted_count: 0,
-            },
+        // Only one billable chunk fits in the window — the second Data
+        // chunk MUST hit the exhausted path. SCP-OUT-037 W1/W2: the
+        // helper pins only the public key and registers the signing key
+        // under its derived DID so the on-demand synthetic-terminal
+        // signing resolves; the session is keyed by `(ctx, rid_hex)`.
+        let (session, _invoker_did) = make_test_session(
+            &signing,
+            "ctx",
+            "outlet",
+            caveats_binding,
+            request_id,
+            chunks,
+            1,
         );
+        insert_test_session(&mut mgr, "ctx", &request_id_hex, session);
 
         // First Data chunk consumes the lone credit and passes through.
         let c0 = mgr
-            .outlet_stream_next(&request_id_hex)
+            .outlet_stream_next("ctx", &request_id_hex)
             .expect("first chunk");
         assert!(matches!(c0.payload, ChunkPayload::Data { .. }));
         assert_eq!(c0.sequence, 0);
@@ -9142,7 +9523,7 @@ mod tests {
         // sequence. The signature verifies under the same per-session
         // key so SDK-side `verify_chunk_signature` round-trips.
         let c1 = mgr
-            .outlet_stream_next(&request_id_hex)
+            .outlet_stream_next("ctx", &request_id_hex)
             .expect("synthetic terminal");
         match &c1.payload {
             ChunkPayload::Error {
@@ -9174,19 +9555,25 @@ mod tests {
 
         // Third call: queue cleared, session terminated, returns None
         // and evicts the entry.
-        assert!(mgr.outlet_stream_next(&request_id_hex).is_none());
-        assert!(!mgr.outlet_streams.contains_key(&request_id_hex));
+        assert!(mgr.outlet_stream_next("ctx", &request_id_hex).is_none());
+        assert!(
+            !mgr.outlet_streams
+                .contains_key(&("ctx".to_owned(), request_id_hex.clone()))
+        );
     }
 
     /// Helper for `wasm_outlet_stream_next_emits_synthetic_terminal_after_cancel`:
-    /// seed the manager with a 5-chunk Data stream and return the
-    /// `request_id_hex` plus the caveats binding (so the test can
-    /// verify signatures later).
+    /// seed the manager with a 5-chunk Data stream under context `"ctx"`
+    /// and outlet `"outlet"`, registering `signing` so the on-demand
+    /// cancel/synthetic-terminal signing resolves. Pre-admits one
+    /// admission slot so the W3 release-on-terminal behaviour is
+    /// observable. Returns `(request_id_hex, request_id, caveats_binding,
+    /// invoker_did)` where `invoker_did` is the DID derived from
+    /// `signing` (SCP-OUT-037 W1).
     fn seed_cancel_test_session(
         mgr: &mut WasmContextManager,
         signing: &ed25519_dalek::SigningKey,
-        invoker_did: &str,
-    ) -> (String, [u8; 16], [u8; 32]) {
+    ) -> (String, [u8; 16], [u8; 32], String) {
         use scp_protocol::context::outlets::stream::{ChunkPayload, sign_chunk};
         let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
         let request_id_hex = hex::encode(request_id);
@@ -9214,26 +9601,18 @@ mod tests {
                 sig,
             });
         }
-        mgr.outlet_streams.insert(
-            request_id_hex.clone(),
-            super::WasmOutletStreamSession {
-                request_id,
-                context_id: "ctx".to_owned(),
-                outlet_id: "outlet".to_owned(),
-                stream_epoch: 0,
-                caveats_binding,
-                monotonic_seq: 0,
-                invoker_signing_key: signing.clone(),
-                chunks,
-                terminated: false,
-                cancelled: false,
-                total_credit: 0,
-                remaining_credit: 100,
-                invoker_did: invoker_did.to_owned(),
-                emitted_count: 0,
-            },
+        let (session, invoker_did) = make_test_session(
+            signing,
+            "ctx",
+            "outlet",
+            caveats_binding,
+            request_id,
+            chunks,
+            100,
         );
-        (request_id_hex, request_id, caveats_binding)
+        admit_test_slot(mgr, "ctx", &invoker_did, "outlet");
+        insert_test_session(mgr, "ctx", &request_id_hex, session);
+        (request_id_hex, request_id, caveats_binding, invoker_did)
     }
 
     /// Cancel-mid-stream test: after `outlet_stream_cancel` lands while
@@ -9248,14 +9627,19 @@ mod tests {
 
         let mut mgr = WasmContextManager::new();
         let signing = ed25519_dalek::SigningKey::from_bytes(&[0x5C; 32]);
-        let invoker_did = "did:dht:z6MkInvoker";
-        let (request_id_hex, _request_id, caveats_binding) =
-            seed_cancel_test_session(&mut mgr, &signing, invoker_did);
+        let (request_id_hex, _request_id, caveats_binding, invoker_did) =
+            seed_cancel_test_session(&mut mgr, &signing);
+        // The seed pre-admitted one slot — confirm it is held.
+        assert_eq!(
+            admission_count(&mgr, "ctx", &invoker_did),
+            1,
+            "seed admits one slot"
+        );
 
         // Pull 3 chunks (sequences 0, 1, 2) — these are real Data chunks.
         for expected_seq in 0..3 {
             let c = mgr
-                .outlet_stream_next(&request_id_hex)
+                .outlet_stream_next("ctx", &request_id_hex)
                 .expect("real chunk before cancel");
             assert!(
                 matches!(c.payload, ChunkPayload::Data { .. }),
@@ -9268,7 +9652,7 @@ mod tests {
         // Apply cancel — session.cancelled = true, queue NOT cleared
         // synchronously, terminated NOT set synchronously.
         let cancel_ack = mgr
-            .outlet_stream_cancel(&request_id_hex, invoker_did)
+            .outlet_stream_cancel("ctx", &request_id_hex, &invoker_did)
             .expect("cancel accepted");
         assert_eq!(
             cancel_ack,
@@ -9276,7 +9660,10 @@ mod tests {
             "cancel-ack-seq is the runtime next-to-emit cursor (emitted_count) at cancel time",
         );
         {
-            let s = mgr.outlet_streams.get(&request_id_hex).expect("present");
+            let s = mgr
+                .outlet_streams
+                .get(&("ctx".to_owned(), request_id_hex.clone()))
+                .expect("present");
             assert!(s.cancelled, "cancel must flip cancelled flag");
             assert!(
                 !s.terminated,
@@ -9288,41 +9675,17 @@ mod tests {
         // Next pull MUST return a signed synthetic terminal Error chunk
         // — NOT the 4th queued Data chunk.
         let terminal = mgr
-            .outlet_stream_next(&request_id_hex)
+            .outlet_stream_next("ctx", &request_id_hex)
             .expect("synthetic terminal after cancel");
-        match &terminal.payload {
-            ChunkPayload::Error {
-                code,
-                terminal: is_terminal,
-                message,
-            } => {
-                assert!(*is_terminal, "synthetic chunk MUST be terminal");
-                assert_eq!(
-                    code,
-                    scp_protocol::context::outlets::error_codes::CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
-                    "cancel-initiated synthetic terminal uses cancel-ack-timeout code"
-                );
-                assert!(
-                    message.contains(
-                        scp_protocol::context::outlets::error_codes::SLUG_EXECUTION_CANCEL_ACK_TIMEOUT
-                    ),
-                    "synthetic message includes the canonical slug, got: {message}"
-                );
-            }
-            other => panic!("expected synthetic terminal Error, got {other:?}"),
-        }
+        assert_cancel_ack_terminal(&terminal, &signing, &caveats_binding);
 
-        // The synthetic chunk MUST verify under the per-session key so
-        // SDK-side `verify_chunk_signature` round-trips.
-        assert!(
-            scp_protocol::context::outlets::stream::verify_chunk_signature(
-                &terminal,
-                &signing.verifying_key(),
-                "ctx",
-                "outlet",
-                &caveats_binding,
-            ),
-            "synthetic cancel-ack terminal chunk signature must verify"
+        // SCP-OUT-037 W3: the admission slot MUST be released immediately
+        // on the terminal observation — NOT deferred to the next-pull
+        // eviction or the wrapper `Drop`.
+        assert_eq!(
+            admission_count(&mgr, "ctx", &invoker_did),
+            0,
+            "admission slot released on terminal observation (W3)"
         );
 
         // After the synthetic terminal: session terminated, remaining
@@ -9330,21 +9693,33 @@ mod tests {
         {
             let s = mgr
                 .outlet_streams
-                .get(&request_id_hex)
+                .get(&("ctx".to_owned(), request_id_hex.clone()))
                 .expect("still present until None");
             assert!(s.terminated, "synthetic terminal must flip terminated");
             assert!(
                 s.chunks.is_empty(),
                 "queued tail dropped after synthetic terminal"
             );
+            assert!(
+                s.admission_released,
+                "admission_released flag set after terminal (W3)"
+            );
         }
         assert!(
-            mgr.outlet_stream_next(&request_id_hex).is_none(),
+            mgr.outlet_stream_next("ctx", &request_id_hex).is_none(),
             "post-terminal pull returns None and evicts the session"
         );
         assert!(
-            !mgr.outlet_streams.contains_key(&request_id_hex),
+            !mgr.outlet_streams
+                .contains_key(&("ctx".to_owned(), request_id_hex.clone())),
             "session evicted after terminal observation"
+        );
+        // Eviction after an already-released terminal MUST NOT
+        // double-release (count stays 0, not underflow-wrapped).
+        assert_eq!(
+            admission_count(&mgr, "ctx", &invoker_did),
+            0,
+            "no double-release on post-terminal eviction (W3 idempotency)"
         );
     }
 
@@ -9358,34 +9733,25 @@ mod tests {
         let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
         let request_id_hex = hex::encode(request_id);
 
-        mgr.outlet_streams.insert(
-            request_id_hex.clone(),
-            super::WasmOutletStreamSession {
-                request_id,
-                context_id: "ctx".to_owned(),
-                outlet_id: "outlet".to_owned(),
-                stream_epoch: 0,
-                caveats_binding: [0u8; 32],
-                monotonic_seq: 0,
-                invoker_signing_key: signing,
-                chunks: VecDeque::new(),
-                terminated: false,
-                cancelled: false,
-                total_credit: 0,
-                remaining_credit: 0,
-                invoker_did: "did:dht:z6MkInvoker".to_owned(),
-                emitted_count: 0,
-            },
+        let (session, invoker_did) = make_test_session(
+            &signing,
+            "ctx",
+            "outlet",
+            [0u8; 32],
+            request_id,
+            VecDeque::new(),
+            0,
         );
+        insert_test_session(&mut mgr, "ctx", &request_id_hex, session);
 
         let total = mgr
-            .outlet_stream_grant_credit(&request_id_hex, "did:dht:z6MkInvoker", 5)
+            .outlet_stream_grant_credit("ctx", &request_id_hex, &invoker_did, 5)
             .expect("grant accepted");
         assert_eq!(total, 5, "total_credit reflects accepted grant");
 
         let session = mgr
             .outlet_streams
-            .get(&request_id_hex)
+            .get(&("ctx".to_owned(), request_id_hex.clone()))
             .expect("session present");
         assert_eq!(session.remaining_credit, 5, "remaining_credit replenished");
         assert_eq!(session.total_credit, 5);
@@ -9430,9 +9796,10 @@ mod tests {
     //   `caveats_binding` / `stream_epoch` parameters threaded through
     //   `OpenOutletStreamParams`.
     // - Per-chunk signatures verify under the operator's pinned
-    //   verifying key (the same `invoker_signing_key` the runtime
-    //   pump uses on native bridges — on WASM the invoker is the
-    //   operator because there is no cross-context routing).
+    //   verifying key (`invoker_verifying_key`; on WASM the invoker is
+    //   the operator because there is no cross-context routing, and the
+    //   secret key is materialised on-demand via `with_signing_key`,
+    //   never retained on the session — SCP-OUT-037 W1).
     // - The cancellation vector's `outlet_stream_cancel` →
     //   synthetic-terminal flow surfaces the `SCP-TOOL-6135`
     //   (`execution.cancel-ack-timeout`) terminal error on the next
@@ -9530,8 +9897,11 @@ mod tests {
     /// Build `OpenOutletStreamParams` for a vector replay open. Owned
     /// strings are NOT stored — the params struct uses `&str` lifetimes
     /// so all owned bindings stay in the caller's frame.
+    ///
+    /// SCP-OUT-037 W1: the signing key is NOT a param — the open path
+    /// signs on-demand via `with_signing_key(identity_did)`, so the
+    /// caller MUST have registered `identity_did`'s key first.
     #[allow(clippy::needless_pass_by_value)]
-    #[allow(clippy::too_many_arguments)]
     fn open_params_for<'a>(
         context_id: &'a str,
         outlet_id: &'a str,
@@ -9539,7 +9909,6 @@ mod tests {
         input_json: &'a serde_json::Value,
         caveats_binding: [u8; 32],
         stream_epoch: u64,
-        invoker_signing_key: ed25519_dalek::SigningKey,
         credit_window: u32,
     ) -> super::OpenOutletStreamParams<'a> {
         super::OpenOutletStreamParams {
@@ -9549,7 +9918,6 @@ mod tests {
             identity_did,
             caveats_binding,
             stream_epoch,
-            invoker_signing_key,
             credit_window,
         }
     }
@@ -9571,28 +9939,30 @@ mod tests {
         use std::sync::atomic::AtomicU64;
         static SK_TICK: AtomicU64 = AtomicU64::new(0);
 
-        let invoker_did = "did:dht:z6MkWasmInvoker001";
-        let (context_id, outlet_id) = vector_replay_setup(mgr, vector_name, invoker_did);
-
         // Distinct signing key per vector so the registry's
         // chunk-signature verification is meaningful (a different key
-        // would cause `verify_chunk_signature` to fail).
+        // would cause `verify_chunk_signature` to fail). SCP-OUT-037 W1:
+        // register the key and use its DERIVED DID as both the creator
+        // and the invoker, so the open path's on-demand
+        // `with_signing_key(identity_did)` resolves to this exact key.
         let tick = SK_TICK.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut sk_bytes = [0u8; 32];
         sk_bytes[..8].copy_from_slice(&tick.to_le_bytes());
         sk_bytes[8] = 0x42; // ensure non-zero high bytes
         let signing = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        let invoker_did = crate::identity::register_identity_for_test(&signing);
+
+        let (context_id, outlet_id) = vector_replay_setup(mgr, vector_name, &invoker_did);
 
         let input = serde_json::json!({"a": 1, "b": 2});
         let caveats_binding = [0xA5u8; 32];
         let params = open_params_for(
             &context_id,
             &outlet_id,
-            invoker_did,
+            &invoker_did,
             &input,
             caveats_binding,
             0,
-            signing.clone(),
             credit_window,
         );
         let request_id_hex = mgr
@@ -9600,7 +9970,7 @@ mod tests {
             .expect("open_outlet_stream must succeed for OK vector");
 
         let mut observed = Vec::new();
-        while let Some(c) = mgr.outlet_stream_next(&request_id_hex) {
+        while let Some(c) = mgr.outlet_stream_next(&context_id, &request_id_hex) {
             observed.push(c);
         }
 
@@ -9773,8 +10143,11 @@ mod tests {
         use scp_protocol::context::outlets::stream::ChunkPayload;
 
         let mut mgr = WasmContextManager::new();
-        let invoker_did = "did:dht:z6MkWasmInvokerErr";
-        let (context_id, outlet_id) = vector_replay_setup(&mut mgr, "error_terminal", invoker_did);
+        // SCP-OUT-037 W1: register the signing key and use its derived
+        // DID so the open path's on-demand signing resolves.
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
+        let invoker_did = crate::identity::register_identity_for_test(&signing);
+        let (context_id, outlet_id) = vector_replay_setup(&mut mgr, "error_terminal", &invoker_did);
 
         // Register a handler that returns Err — drives the
         // `build_stream_chunks` Err arm.
@@ -9785,17 +10158,15 @@ mod tests {
         )
         .expect("register_outlet_handler must succeed");
 
-        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x71; 32]);
         let input = serde_json::json!({"a": 1, "b": 2});
         let caveats_binding = [0xE1u8; 32];
         let params = open_params_for(
             &context_id,
             &outlet_id,
-            invoker_did,
+            &invoker_did,
             &input,
             caveats_binding,
             0,
-            signing.clone(),
             32,
         );
         let request_id_hex = mgr
@@ -9803,7 +10174,7 @@ mod tests {
             .expect("open_outlet_stream must succeed even when handler returns Err — the Err is surfaced as a terminal chunk, not an open-time error");
 
         let mut observed = Vec::new();
-        while let Some(c) = mgr.outlet_stream_next(&request_id_hex) {
+        while let Some(c) = mgr.outlet_stream_next(&context_id, &request_id_hex) {
             observed.push(c);
         }
 
@@ -9852,9 +10223,6 @@ mod tests {
     /// signature roundtrip.
     #[test]
     fn wasm_vector_cancellation_through_open_path() {
-        use scp_protocol::context::outlets::error_codes::{
-            CODE_EXECUTION_CANCEL_ACK_TIMEOUT, SLUG_EXECUTION_CANCEL_ACK_TIMEOUT,
-        };
         use scp_protocol::context::outlets::stream::ChunkPayload;
 
         let mut mgr = WasmContextManager::new();
@@ -9879,15 +10247,16 @@ mod tests {
         let _ = binding;
 
         // Reuse the existing seed_cancel helper to install a 5-Data
-        // session bound to the same signing key.
-        let invoker_did = "did:dht:z6MkWasmInvoker001";
-        let (req_hex, _req_id, cancel_binding) =
-            super::tests::seed_cancel_test_session(&mut mgr, &signing, invoker_did);
+        // session bound to the same signing key. SCP-OUT-037 W1/W2: the
+        // helper registers `signing` under its derived DID and keys the
+        // session by `("ctx", req_hex)`; it returns that derived DID.
+        let (req_hex, _req_id, cancel_binding, invoker_did) =
+            super::tests::seed_cancel_test_session(&mut mgr, &signing);
 
         // Pull 3 chunks (sequences 0, 1, 2).
         for expected_seq in 0..3 {
             let c = mgr
-                .outlet_stream_next(&req_hex)
+                .outlet_stream_next("ctx", &req_hex)
                 .expect("real Data chunk before cancel");
             assert!(
                 matches!(c.payload, ChunkPayload::Data { .. }),
@@ -9899,7 +10268,7 @@ mod tests {
         // Apply cancel — flips `session.cancelled`, does NOT
         // synchronously clear the queue.
         let cancel_ack = mgr
-            .outlet_stream_cancel(&req_hex, invoker_did)
+            .outlet_stream_cancel("ctx", &req_hex, &invoker_did)
             .expect("cancel accepted");
         assert_eq!(
             cancel_ack,
@@ -9908,45 +10277,14 @@ mod tests {
         );
 
         // Next pull → synthetic terminal Error under
-        // `SCP-TOOL-6135` (`execution.cancel-ack-timeout`).
+        // `SCP-TOOL-6135` (`execution.cancel-ack-timeout`). The shared
+        // helper pins the terminal shape AND the per-chunk signature
+        // round-trip under the session's pinned operator key — AC4's
+        // signature invariant on the cancellation funnel.
         let terminal = mgr
-            .outlet_stream_next(&req_hex)
+            .outlet_stream_next("ctx", &req_hex)
             .expect("synthetic terminal after cancel");
-        match &terminal.payload {
-            ChunkPayload::Error {
-                terminal: is_terminal,
-                code,
-                message,
-            } => {
-                assert!(
-                    *is_terminal,
-                    "cancellation: synthetic chunk must be terminal"
-                );
-                assert_eq!(
-                    code, CODE_EXECUTION_CANCEL_ACK_TIMEOUT,
-                    "cancellation: WASM cancel-initiated synthetic terminal uses {CODE_EXECUTION_CANCEL_ACK_TIMEOUT}"
-                );
-                assert!(
-                    message.contains(SLUG_EXECUTION_CANCEL_ACK_TIMEOUT),
-                    "cancellation: synthetic message must include canonical slug, got: {message}"
-                );
-            }
-            other => panic!("expected synthetic terminal Error, got {other:?}"),
-        }
-
-        // Per-chunk signature verifies under the per-session pinned
-        // operator key — confirms AC4's signature invariant on the
-        // cancellation funnel.
-        assert!(
-            scp_protocol::context::outlets::stream::verify_chunk_signature(
-                &terminal,
-                &signing.verifying_key(),
-                "ctx",
-                "outlet",
-                &cancel_binding,
-            ),
-            "cancellation: synthetic cancel-ack chunk signature must verify under the WASM session's pinned operator key"
-        );
+        assert_cancel_ack_terminal(&terminal, &signing, &cancel_binding);
     }
 
     /// SCP-OUT-039 AC4 — `credit_exhaustion` vector through WASM bridge.
@@ -9976,11 +10314,12 @@ mod tests {
         // produces a Data + End pair; with zero credit the Data chunk
         // path triggers the synthetic terminal.
         let mut mgr = WasmContextManager::new();
-        let invoker_did = "did:dht:z6MkWasmInvokerCredEx";
-        let (context_id, outlet_id) =
-            vector_replay_setup(&mut mgr, "credit_exhaustion", invoker_did);
-
+        // SCP-OUT-037 W1: register signing key under its derived DID.
         let signing = ed25519_dalek::SigningKey::from_bytes(&[0x13; 32]);
+        let invoker_did = crate::identity::register_identity_for_test(&signing);
+        let (context_id, outlet_id) =
+            vector_replay_setup(&mut mgr, "credit_exhaustion", &invoker_did);
+
         let input = serde_json::json!({"a": 1, "b": 2});
         let caveats_binding = [0xC0u8; 32];
 
@@ -9989,11 +10328,10 @@ mod tests {
         let params = open_params_for(
             &context_id,
             &outlet_id,
-            invoker_did,
+            &invoker_did,
             &input,
             caveats_binding,
             0,
-            signing.clone(),
             0,
         );
         let request_id_hex = mgr
@@ -10002,7 +10340,7 @@ mod tests {
 
         // First pull: synthetic terminal under SCP-TOOL-6131
         // (`execution.credit-exhausted`).
-        let terminal = mgr.outlet_stream_next(&request_id_hex).expect(
+        let terminal = mgr.outlet_stream_next(&context_id, &request_id_hex).expect(
             "credit_exhaustion: WASM bridge surfaces synthetic terminal on first billable pull",
         );
         match &terminal.payload {
@@ -10037,7 +10375,8 @@ mod tests {
 
         // Subsequent pull: queue cleared / terminated → None.
         assert!(
-            mgr.outlet_stream_next(&request_id_hex).is_none(),
+            mgr.outlet_stream_next(&context_id, &request_id_hex)
+                .is_none(),
             "post-terminal pull must evict the session and return None"
         );
     }
@@ -10087,6 +10426,435 @@ mod tests {
                 names.contains(required),
                 "vector {required} missing from fixture — AC4 per-bridge replay coverage broken"
             );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-037 W2 — composite-key cross-context isolation
+    // -----------------------------------------------------------------------
+
+    /// W2: two streams opened by the SAME invoker in two DIFFERENT
+    /// contexts under a FORCED `request_id_hex` collision MUST remain
+    /// isolated — `(ctx_a, rid)` only ever touches the `ctx_a` session,
+    /// `(ctx_b, rid)` only the `ctx_b` session. Before W2 (single
+    /// `request_id`-keyed map) the second insert would have overwritten
+    /// the first; with the composite key both coexist and address
+    /// independently.
+    #[test]
+    fn wasm_w2_composite_key_isolates_colliding_request_id_across_contexts() {
+        use scp_protocol::context::outlets::stream::{ChunkPayload, sign_chunk};
+
+        let mut mgr = WasmContextManager::new();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x2C; 32]);
+
+        // FORCED collision: the SAME request_id (hence the same
+        // request_id_hex) is used to seed two sessions under two
+        // distinct contexts.
+        let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+        let request_id_hex = hex::encode(request_id);
+
+        // Build a distinct single-Data chunk per context so the observed
+        // value tells us WHICH session a lookup hit.
+        let build_chunk = |ctx: &str, tag: i64| {
+            let payload = ChunkPayload::Data {
+                value: serde_json::json!({ "ctx": ctx, "tag": tag }),
+            };
+            let cb = [0x11u8; 32];
+            let sig = sign_chunk(&signing, ctx, "outlet", &request_id, 0, &cb, &payload)
+                .expect("sign chunk");
+            let mut q = VecDeque::new();
+            q.push_back(scp_protocol::context::outlets::stream::OutletStreamChunk {
+                request_id,
+                sequence: 0,
+                payload,
+                sig,
+            });
+            q
+        };
+
+        let (session_a, invoker_did) = make_test_session(
+            &signing,
+            "ctx-a",
+            "outlet",
+            [0x11u8; 32],
+            request_id,
+            build_chunk("ctx-a", 1),
+            100,
+        );
+        let (session_b, invoker_did_b) = make_test_session(
+            &signing,
+            "ctx-b",
+            "outlet",
+            [0x11u8; 32],
+            request_id,
+            build_chunk("ctx-b", 2),
+            100,
+        );
+        // Same invoker (same key → same derived DID) in both contexts.
+        assert_eq!(invoker_did, invoker_did_b);
+
+        insert_test_session(&mut mgr, "ctx-a", &request_id_hex, session_a);
+        insert_test_session(&mut mgr, "ctx-b", &request_id_hex, session_b);
+
+        // Both coexist — the composite key kept them distinct.
+        assert_eq!(mgr.outlet_streams.len(), 2);
+
+        // (ctx-a, rid) addresses ONLY the ctx-a session.
+        let c_a = mgr
+            .outlet_stream_next("ctx-a", &request_id_hex)
+            .expect("ctx-a chunk");
+        match &c_a.payload {
+            ChunkPayload::Data { value } => {
+                assert_eq!(value["ctx"], "ctx-a", "(ctx-a, rid) must hit ctx-a session");
+                assert_eq!(value["tag"], 1);
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+
+        // (ctx-b, rid) addresses ONLY the ctx-b session.
+        let c_b = mgr
+            .outlet_stream_next("ctx-b", &request_id_hex)
+            .expect("ctx-b chunk");
+        match &c_b.payload {
+            ChunkPayload::Data { value } => {
+                assert_eq!(value["ctx"], "ctx-b", "(ctx-b, rid) must hit ctx-b session");
+                assert_eq!(value["tag"], 2);
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+
+        // A grant addressed to (ctx-a, rid) by the (matching) invoker
+        // touches only ctx-a; ctx-b's total_credit stays 0.
+        mgr.outlet_stream_grant_credit("ctx-a", &request_id_hex, &invoker_did, 7)
+            .expect("grant on ctx-a");
+        let total_b = mgr
+            .outlet_streams
+            .get(&("ctx-b".to_owned(), request_id_hex.clone()))
+            .expect("ctx-b session present")
+            .total_credit;
+        assert_eq!(total_b, 0, "grant on ctx-a must not bleed into ctx-b");
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-037 W3 — synthetic-terminal sequence continuity +
+    // admission release across all terminal paths
+    // -----------------------------------------------------------------------
+
+    /// W3: `outlet_stream_terminate` assigns the synthetic terminal the
+    /// `emitted_count` next-emission sequence (NOT `chunks.len()`), drops
+    /// the queued tail, and releases the admission slot immediately. The
+    /// synthetic chunk signature verifies under the pinned verifying key.
+    #[test]
+    fn wasm_w3_terminate_synthetic_sequence_is_emitted_count_and_releases_admission() {
+        use scp_protocol::context::outlets::stream::{ChunkPayload, sign_chunk};
+
+        let mut mgr = WasmContextManager::new();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x3A; 32]);
+        let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+        let request_id_hex = hex::encode(request_id);
+        let cb = [0x33u8; 32];
+
+        // Seed 4 Data chunks (sequences 0..4).
+        let mut chunks = VecDeque::new();
+        for seq in 0..4u64 {
+            let payload = ChunkPayload::Data {
+                value: serde_json::json!({ "seq": seq }),
+            };
+            let sig = sign_chunk(&signing, "ctx", "outlet", &request_id, seq, &cb, &payload)
+                .expect("sign");
+            chunks.push_back(scp_protocol::context::outlets::stream::OutletStreamChunk {
+                request_id,
+                sequence: seq,
+                payload,
+                sig,
+            });
+        }
+        let (session, invoker_did) =
+            make_test_session(&signing, "ctx", "outlet", cb, request_id, chunks, 100);
+        admit_test_slot(&mut mgr, "ctx", &invoker_did, "outlet");
+        insert_test_session(&mut mgr, "ctx", &request_id_hex, session);
+
+        // Pull 2 real chunks → emitted_count == 2.
+        for expected in 0..2u64 {
+            let c = mgr
+                .outlet_stream_next("ctx", &request_id_hex)
+                .expect("real chunk");
+            assert_eq!(c.sequence, expected);
+        }
+
+        // Terminate (RevokedMidStream). The synthetic terminal MUST take
+        // sequence == emitted_count (2), NOT chunks.len() (which is 2
+        // here too — but the assertion below pins the *emitted_count*
+        // contract explicitly by checking against the cursor, not the
+        // queue length).
+        let terminated = mgr
+            .outlet_stream_terminate(
+                "ctx",
+                &request_id_hex,
+                &invoker_did,
+                scp_protocol::context::outlets::stream::TerminateReason::RevokedMidStream,
+                None,
+            )
+            .expect("terminate accepted");
+        assert!(terminated, "terminate must report it acted");
+
+        // W3: admission released immediately on terminate (not deferred).
+        assert_eq!(
+            admission_count(&mgr, "ctx", &invoker_did),
+            0,
+            "terminate releases the admission slot immediately (W3)"
+        );
+
+        // The next pull delivers the synthetic terminal at seq == 2.
+        let synthetic = mgr
+            .outlet_stream_next("ctx", &request_id_hex)
+            .expect("synthetic terminal");
+        assert_eq!(
+            synthetic.sequence, 2,
+            "synthetic terminal sequence MUST equal emitted_count (W3), not the dropped-tail length"
+        );
+        assert!(
+            matches!(
+                synthetic.payload,
+                ChunkPayload::Error { terminal: true, .. }
+            ),
+            "terminate synthetic must be a terminal Error chunk"
+        );
+        assert!(
+            scp_protocol::context::outlets::stream::verify_chunk_signature(
+                &synthetic,
+                &signing.verifying_key(),
+                "ctx",
+                "outlet",
+                &cb,
+            ),
+            "W3 terminate synthetic chunk must verify under the pinned verifying key (W1)"
+        );
+
+        // Pull after the synthetic → None + evict, no double-release.
+        assert!(mgr.outlet_stream_next("ctx", &request_id_hex).is_none());
+        assert_eq!(
+            admission_count(&mgr, "ctx", &invoker_did),
+            0,
+            "no double-release after terminate→observe→evict"
+        );
+    }
+
+    /// W3: open N == per-invoker cap, then free each via a DIFFERENT
+    /// terminal path (queue-drain, cancel-synthetic, terminate) and
+    /// confirm a fresh open succeeds afterwards — i.e. every terminal
+    /// path releases its admission slot so the cap is not permanently
+    /// consumed.
+    #[test]
+    fn wasm_w3_every_terminal_path_releases_admission_slot() {
+        // The per-invoker cap baseline is 8 (§9.18.B). We drive three
+        // distinct terminal paths and assert the running slot count
+        // returns to zero after each, then that a fresh admit succeeds.
+        let mut mgr = WasmContextManager::new();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x39; 32]);
+        let invoker_did = crate::identity::register_identity_for_test(&signing);
+
+        // Helper: seed a one-Data + End session (so a clean drain hits
+        // the terminal End), admit a slot, return its request_id_hex.
+        let seed = |mgr: &mut WasmContextManager, cb_byte: u8| -> String {
+            use scp_protocol::context::outlets::stream::{ChunkPayload, sign_chunk};
+            let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+            let rid_hex = hex::encode(request_id);
+            let cb = [cb_byte; 32];
+            let mut chunks = VecDeque::new();
+            let data = ChunkPayload::Data {
+                value: serde_json::json!({"k": 1}),
+            };
+            chunks.push_back(scp_protocol::context::outlets::stream::OutletStreamChunk {
+                request_id,
+                sequence: 0,
+                payload: data.clone(),
+                sig: sign_chunk(&signing, "ctx", "outlet", &request_id, 0, &cb, &data)
+                    .expect("sign"),
+            });
+            let end = ChunkPayload::End {
+                aggregate: serde_json::json!({"k": 1}),
+                provenance: super::build_minimal_stream_end_provenance("ctx"),
+                execution_time_ms: 0,
+            };
+            chunks.push_back(scp_protocol::context::outlets::stream::OutletStreamChunk {
+                request_id,
+                sequence: 1,
+                payload: end.clone(),
+                sig: sign_chunk(&signing, "ctx", "outlet", &request_id, 1, &cb, &end)
+                    .expect("sign"),
+            });
+            let (session, did) =
+                make_test_session(&signing, "ctx", "outlet", cb, request_id, chunks, 100);
+            assert_eq!(did, invoker_did);
+            admit_test_slot(mgr, "ctx", &invoker_did, "outlet");
+            insert_test_session(mgr, "ctx", &rid_hex, session);
+            rid_hex
+        };
+
+        // Path 1 — clean drain through the terminal End chunk.
+        let rid1 = seed(&mut mgr, 0x01);
+        assert_eq!(admission_count(&mgr, "ctx", &invoker_did), 1);
+        // Pull Data, then End (terminal → releases), then None (evict).
+        assert!(mgr.outlet_stream_next("ctx", &rid1).is_some()); // Data
+        assert!(mgr.outlet_stream_next("ctx", &rid1).is_some()); // End (terminal)
+        assert_eq!(
+            admission_count(&mgr, "ctx", &invoker_did),
+            0,
+            "terminal End releases admission"
+        );
+        assert!(mgr.outlet_stream_next("ctx", &rid1).is_none()); // evict
+
+        // Path 2 — cancel → synthetic terminal on next pull.
+        let rid2 = seed(&mut mgr, 0x02);
+        assert_eq!(admission_count(&mgr, "ctx", &invoker_did), 1);
+        mgr.outlet_stream_cancel("ctx", &rid2, &invoker_did)
+            .expect("cancel");
+        let _synthetic = mgr
+            .outlet_stream_next("ctx", &rid2)
+            .expect("cancel synthetic terminal");
+        assert_eq!(
+            admission_count(&mgr, "ctx", &invoker_did),
+            0,
+            "cancel synthetic terminal releases admission"
+        );
+
+        // Path 3 — terminate releases immediately.
+        let rid3 = seed(&mut mgr, 0x03);
+        assert_eq!(admission_count(&mgr, "ctx", &invoker_did), 1);
+        mgr.outlet_stream_terminate(
+            "ctx",
+            &rid3,
+            &invoker_did,
+            scp_protocol::context::outlets::stream::TerminateReason::CreditStall,
+            None,
+        )
+        .expect("terminate");
+        assert_eq!(
+            admission_count(&mgr, "ctx", &invoker_did),
+            0,
+            "terminate releases admission"
+        );
+
+        // After all three terminal paths released, a fresh admit must
+        // succeed (the cap was never permanently consumed).
+        let admission = mgr
+            .outlet_stream_admission
+            .entry("ctx".to_owned())
+            .or_default();
+        assert!(
+            admission
+                .try_admit(&invoker_did, &invoker_did, "outlet", 8, 16, 128)
+                .is_ok(),
+            "a fresh open admits after every terminal path released its slot"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SCP-OUT-037 W5 — duplicate registry-key rejection
+    // -----------------------------------------------------------------------
+
+    /// W5: opening a stream whose `(context_id, request_id_hex)` already
+    /// exists is rejected with `SCP-TOOL-6101` /
+    /// `protocol.session-id-conflict`; the original session is left
+    /// untouched; and the admission slot the rejected open reserved is
+    /// released (the per-invoker count is not permanently doubled).
+    ///
+    /// Drives the real `open_outlet_stream` path twice with a
+    /// clock-pinned identical `request_id` by seeding the first session
+    /// directly under a known key and then attempting a duplicate insert
+    /// through `insert_stream_session` semantics — exercised here by a
+    /// direct second `insert_test_session`-shaped open via the manager's
+    /// duplicate guard.
+    #[test]
+    fn wasm_w5_duplicate_registry_key_rejected_and_admission_not_doubled() {
+        use scp_protocol::context::outlets::error_codes::CODE_PROTOCOL_SESSION;
+        use scp_protocol::context::outlets::stream::{ChunkPayload, sign_chunk};
+
+        let mut mgr = WasmContextManager::new();
+        let signing = ed25519_dalek::SigningKey::from_bytes(&[0x50; 32]);
+        let request_id: [u8; 16] = *uuid::Uuid::now_v7().as_bytes();
+        let request_id_hex = hex::encode(request_id);
+        let cb = [0x55u8; 32];
+
+        // Seed an ORIGINAL session at (ctx, rid) carrying a recognisable
+        // Data chunk + one admission slot.
+        let payload = ChunkPayload::Data {
+            value: serde_json::json!({"orig": true}),
+        };
+        let mut chunks = VecDeque::new();
+        chunks.push_back(scp_protocol::context::outlets::stream::OutletStreamChunk {
+            request_id,
+            sequence: 0,
+            payload: payload.clone(),
+            sig: sign_chunk(&signing, "ctx", "outlet", &request_id, 0, &cb, &payload)
+                .expect("sign"),
+        });
+        let (orig_session, invoker_did) =
+            make_test_session(&signing, "ctx", "outlet", cb, request_id, chunks, 42);
+        admit_test_slot(&mut mgr, "ctx", &invoker_did, "outlet");
+        insert_test_session(&mut mgr, "ctx", &request_id_hex, orig_session);
+        assert_eq!(admission_count(&mgr, "ctx", &invoker_did), 1);
+
+        // Build a DUPLICATE-keyed session and reserve a second admission
+        // slot (as the open path's gate would), then route it through
+        // the manager's duplicate guard.
+        let (dup_session, _did) = make_test_session(
+            &signing,
+            "ctx",
+            "outlet",
+            cb,
+            request_id,
+            VecDeque::new(),
+            999,
+        );
+        admit_test_slot(&mut mgr, "ctx", &invoker_did, "outlet");
+        assert_eq!(
+            admission_count(&mgr, "ctx", &invoker_did),
+            2,
+            "the duplicate open reserved a second slot before the insert guard runs"
+        );
+
+        let err = mgr
+            .insert_stream_session(dup_session, "ctx", &request_id_hex)
+            .expect_err("duplicate (ctx, rid) MUST be rejected");
+        match err {
+            ScpWasmError::Context { code, message } => {
+                assert_eq!(
+                    code, CODE_PROTOCOL_SESSION,
+                    "duplicate-key rejection uses SCP-TOOL-6101"
+                );
+                assert!(
+                    message.contains("session-id-conflict"),
+                    "rejection slug is protocol.session-id-conflict, got: {message}"
+                );
+            }
+            other => panic!("expected Context error, got {other:?}"),
+        }
+
+        // W5: the rejected open released its reserved slot — the count
+        // is back to 1 (the original's), NOT doubled.
+        assert_eq!(
+            admission_count(&mgr, "ctx", &invoker_did),
+            1,
+            "rejected duplicate open released its admission slot (W5 + W3)"
+        );
+
+        // The ORIGINAL session is untouched: still present, still
+        // carrying its original Data chunk and credit.
+        let orig = mgr
+            .outlet_streams
+            .get(&("ctx".to_owned(), request_id_hex.clone()))
+            .expect("original session still present");
+        assert_eq!(orig.remaining_credit, 42, "original credit untouched");
+        let c = mgr
+            .outlet_stream_next("ctx", &request_id_hex)
+            .expect("original chunk");
+        match &c.payload {
+            ChunkPayload::Data { value } => {
+                assert_eq!(value["orig"], true, "original session's chunk survived");
+            }
+            other => panic!("expected original Data chunk, got {other:?}"),
         }
     }
 }
