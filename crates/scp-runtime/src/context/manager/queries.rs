@@ -587,6 +587,48 @@ impl ContextManager {
             .get_velocity(member_did, now_secs)
     }
 
+    /// Seeds a peer's pseudonym routing ID into a context's pseudonym
+    /// registry, mimicking a [`PseudonymAnnouncement`] having already landed.
+    ///
+    /// Test-only method for populating the per-member pseudonym registry of an
+    /// encrypted (`Pseudonymous`) context without driving the full MLS
+    /// `PseudonymAnnouncement` exchange across separate managers. An encrypted
+    /// multi-member `send_message` into an empty registry correctly returns
+    /// [`scp_protocol::context::ContextError::PseudonymRegistryEmpty`]
+    /// (§9.10.4) — there is no peer pseudonym to fan out to. Integration tests
+    /// that build a single-manager encrypted context and then send must seed
+    /// the registry so the real fan-out path runs.
+    ///
+    /// No-op if the context is unknown. A `debug_assert` fires if the context
+    /// uses `Broadcast` routing, since broadcast contexts retain no pseudonym
+    /// registry and seeding one would mask a test setup error; in release
+    /// builds the call is a silent no-op for that case.
+    ///
+    /// Production code learns peer pseudonyms exclusively via the
+    /// `PseudonymAnnouncement` MLS application-message path; it MUST NOT use
+    /// this method.
+    #[cfg(feature = "testing")]
+    pub async fn seed_pseudonym_for_test(
+        &self,
+        context_id: &str,
+        member_did: scp_identity::DID,
+        pseudonym: [u8; 32],
+    ) {
+        if let Ok(ctx_arc) = self.get_context_arc(context_id) {
+            let mut guard = ctx_arc.lock().await;
+            let ctx = &mut *guard;
+            if let Some(pseudonym_registry) = ctx.routing.peer_registry_mut() {
+                pseudonym_registry.insert(member_did, pseudonym);
+            } else {
+                debug_assert!(
+                    false,
+                    "seed_pseudonym_for_test called on a Broadcast context \
+                     '{context_id}' — broadcast contexts retain no pseudonym registry"
+                );
+            }
+        }
+    }
+
     /// Returns a clone of the persistent MLS Commit retry queue for a context
     /// (PR #1606 C6).
     ///

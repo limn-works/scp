@@ -634,6 +634,20 @@ async fn restore_write_access_forward_only() {
             ..ContextParams::default()
         },
     );
+    // Seed the pseudonym registry for the surviving members, mimicking the
+    // `PseudonymAnnouncement` exchange that normally runs after a join. Without
+    // a peer pseudonym, an encrypted multi-member `send_message` correctly
+    // returns `PseudonymRegistryEmpty` (§9.10.4) — there is nobody to fan out
+    // to. This test verifies that Dave can send *after* write-access
+    // restoration, so the registry must hold real pseudonyms for the fan-out
+    // path to run.
+    manager
+        .seed_pseudonym_for_test(ctx_id, alice(), [0xA1u8; 32])
+        .await;
+    manager
+        .seed_pseudonym_for_test(ctx_id, dave(), [0xD0u8; 32])
+        .await;
+
     let send_result = manager
         .send_message(
             &handle,
@@ -1292,6 +1306,20 @@ async fn full_content_access_lifecycle() {
     let outcome = propose_and_approve_threshold(&manager, ctx_id, restore_write).await;
     assert_eq!(outcome.status, ProposalStatus::Approved);
     let _ = manager.drain_events(ctx_id).await;
+
+    // Seed the pseudonym registry for the surviving members, mimicking the
+    // `PseudonymAnnouncement` exchange that normally runs after a join. An
+    // encrypted multi-member `send_message` into an empty registry correctly
+    // returns `PseudonymRegistryEmpty` (§9.10.4); the write-capability gate runs
+    // first, so the earlier `send_result.is_err()` assertion (Phase 2) still
+    // fires on the write-revocation denial. Here in Phase 4 the registry must
+    // hold real pseudonyms so the post-restoration fan-out path runs.
+    manager
+        .seed_pseudonym_for_test(ctx_id, alice(), [0xA1u8; 32])
+        .await;
+    manager
+        .seed_pseudonym_for_test(ctx_id, dave(), [0xD0u8; 32])
+        .await;
 
     // Dave should now be able to write again.
     let send_result = manager
