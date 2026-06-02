@@ -420,41 +420,13 @@ impl TransportAdapter for QuicAdapter {
 
             // Spawn a background task to read BLOBs from the QUIC stream
             // and forward them as `TransportEvent`s.
-            tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        biased;
-                        () = cancel_clone.cancelled() => {
-                            // Clean shutdown: finish the send side to signal
-                            // the relay that we are done.
-                            let _ = send.finish();
-                            break;
-                        }
-                        result = Self::read_relay_message(&mut recv) => {
-                            if let Ok(relay_msg) = result {
-                                let Some(event) = map_subscribe_relay_message(
-                                    relay_msg,
-                                    &routing_id_bytes,
-                                ) else {
-                                    continue;
-                                };
-                                if tx.send(event).await.is_err() {
-                                    // Receiver dropped, stop reading.
-                                    break;
-                                }
-                            } else {
-                                // Stream closed or error -- subscription terminated.
-                                let _ = tx
-                                    .send(TransportEvent::Terminated {
-                                        reason: "QUIC stream closed".to_string(),
-                                    })
-                                    .await;
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
+            tokio::spawn(run_subscribe_read_loop(
+                send,
+                recv,
+                cancel_clone,
+                routing_id_bytes,
+                tx,
+            ));
 
             let stream = QuicSubscriptionStream { rx };
             Ok(Box::pin(stream) as SubscriptionStream)
@@ -616,9 +588,57 @@ impl Stream for QuicSubscriptionStream {
     }
 }
 
+/// Background read loop for a QUIC subscription stream.
+///
+/// Reads `RelayMessage`s from `recv`, maps them to [`TransportEvent`]s via
+/// [`map_subscribe_relay_message`], and forwards them on `tx` until the
+/// subscription is cancelled, the stream closes, or the receiver is dropped.
+/// On cancellation the send side is finished so the relay sees a graceful FIN.
+async fn run_subscribe_read_loop(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    cancel: CancellationToken,
+    routing_id_bytes: [u8; 32],
+    tx: tokio::sync::mpsc::Sender<TransportEvent>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                // Clean shutdown: finish the send side to signal
+                // the relay that we are done.
+                let _ = send.finish();
+                break;
+            }
+            result = QuicAdapter::read_relay_message(&mut recv) => {
+                if let Ok(relay_msg) = result {
+                    let Some(event) = map_subscribe_relay_message(
+                        relay_msg,
+                        &routing_id_bytes,
+                    ) else {
+                        continue;
+                    };
+                    if tx.send(event).await.is_err() {
+                        // Receiver dropped, stop reading.
+                        break;
+                    }
+                } else {
+                    // Stream closed or error -- subscription terminated.
+                    let _ = tx
+                        .send(TransportEvent::Terminated {
+                            reason: "QUIC stream closed".to_string(),
+                        })
+                        .await;
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Maps a `RelayMessage` received on a QUIC subscribe stream to the
 /// corresponding `TransportEvent`. Returns `None` for messages the
-/// subscriber should ignore (BLOBs with mismatched routing_id from a
+/// subscriber should ignore (BLOBs with mismatched `routing_id` from a
 /// non-conformant relay, unknown event types, OK/Pong/Bridge messages).
 fn map_subscribe_relay_message(
     relay_msg: RelayMessage,
@@ -640,12 +660,14 @@ fn map_subscribe_relay_message(
         return None;
     }
     match relay_msg {
-        RelayMessage::Blob { blob, .. } => Some(match OuterEnvelope::from_bytes(&blob) {
-            Ok(envelope) => TransportEvent::Envelope(envelope),
-            Err(_) => TransportEvent::Error(TransportError::ProtocolError(
-                "failed to deserialize envelope from blob".to_string(),
-            )),
-        }),
+        RelayMessage::Blob { blob, .. } => Some(OuterEnvelope::from_bytes(&blob).map_or_else(
+            |_| {
+                TransportEvent::Error(TransportError::ProtocolError(
+                    "failed to deserialize envelope from blob".to_string(),
+                ))
+            },
+            TransportEvent::Envelope,
+        )),
         RelayMessage::Event { event_type, .. } => match event_type.as_str() {
             "backfill_complete" => Some(TransportEvent::BackfillComplete),
             _ => None,
@@ -921,7 +943,7 @@ mod tests {
                 // Expected.
             }
             Ok(Some(other)) => panic!("first stream yielded unexpected event: {other:?}"),
-            Err(_) => panic!("first stream did not terminate within 2s"),
+            Err(elapsed) => panic!("first stream did not terminate within 2s: {elapsed}"),
         }
 
         // Publish on this routing ID and confirm the second stream
