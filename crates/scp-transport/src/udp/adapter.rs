@@ -189,8 +189,12 @@ impl UdpDtlsAdapter {
 
         // `RelayMessage::from_bytes` rejects payloads exceeding `MAX_MESSAGE_SIZE`
         // before invoking the MessagePack deserializer, preventing allocation bombs.
-        let response: RelayMessage = RelayMessage::from_bytes(&response_data).map_err(|e| {
-            TransportError::ProtocolError(format!("relay message deserialization failed: {e}"))
+        // The byte payload is relay-supplied and some serde codecs include byte
+        // excerpts in `Display`; do not propagate the serde error into the
+        // surfaced `TransportError`.
+        let response: RelayMessage = RelayMessage::from_bytes(&response_data).map_err(|_| {
+            tracing::warn!("relay message deserialization failed");
+            TransportError::ProtocolError("invalid relay message".to_owned())
         })?;
 
         Ok(response)
@@ -338,10 +342,14 @@ impl TransportAdapter for UdpDtlsAdapter {
                         });
                     }
 
-                    let envelope = OuterEnvelope::from_bytes(&blob).map_err(|e| {
-                        TransportError::ProtocolError(format!(
-                            "failed to deserialize envelope: {e}"
-                        ))
+                    let envelope = OuterEnvelope::from_bytes(&blob).map_err(|_| {
+                        // The blob is relay-supplied; do not propagate the
+                        // serde error into the TransportError -- some codecs
+                        // include byte excerpts in `Display`.
+                        tracing::warn!("envelope deserialization failed");
+                        TransportError::ProtocolError(
+                            "failed to deserialize envelope from blob".to_owned(),
+                        )
                     })?;
 
                     Ok(vec![envelope])

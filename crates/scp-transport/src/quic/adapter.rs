@@ -18,7 +18,6 @@
 //! See section 10.14 in `.docs/specs/10-infrastructure-and-self-hosting.md` and
 //! ADR-037 in `.docs/adrs/phase-2.md` for the full specification.
 
-use std::collections::HashMap;
 use std::pin::Pin;
 
 use futures::Stream;
@@ -30,6 +29,7 @@ use crate::error::TransportError;
 use crate::native::protocol::{ClientMessage, RelayMessage};
 use crate::quic::lifecycle::QuicLifecycleManager;
 use crate::quic::streams::{LENGTH_PREFIX_SIZE, MAX_FRAME_SIZE};
+use crate::subscription::{MAX_TRANSPORT_SUBSCRIPTIONS, TransportSubscriptionMap};
 use crate::traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
 
 /// A boxed, pinned, `Send`-safe future -- the return type for all
@@ -76,7 +76,7 @@ pub struct QuicAdapter {
     lifecycle: RwLock<QuicLifecycleManager>,
 
     /// Active subscription handles keyed by routing ID.
-    subscriptions: RwLock<HashMap<[u8; 32], SubscriptionHandle>>,
+    subscriptions: TransportSubscriptionMap<SubscriptionHandle>,
 }
 
 impl std::fmt::Debug for QuicAdapter {
@@ -126,7 +126,7 @@ impl QuicAdapter {
         Ok(Self {
             connection: RwLock::new(Some(connection)),
             lifecycle: RwLock::new(lifecycle),
-            subscriptions: RwLock::new(HashMap::new()),
+            subscriptions: TransportSubscriptionMap::new(),
         })
     }
 
@@ -138,7 +138,7 @@ impl QuicAdapter {
         Self {
             connection: RwLock::new(Some(connection)),
             lifecycle: RwLock::new(lifecycle),
-            subscriptions: RwLock::new(HashMap::new()),
+            subscriptions: TransportSubscriptionMap::new(),
         }
     }
 
@@ -215,8 +215,10 @@ impl QuicAdapter {
             TransportError::ProtocolError(format!("failed to read message payload: {e}"))
         })?;
 
-        RelayMessage::from_bytes(&buf)
-            .map_err(|e| TransportError::ProtocolError(format!("invalid relay message: {e}")))
+        RelayMessage::from_bytes(&buf).map_err(|_| {
+            tracing::warn!("relay message deserialization failed");
+            TransportError::ProtocolError("invalid relay message".to_owned())
+        })
     }
 }
 
@@ -314,6 +316,25 @@ impl TransportAdapter for QuicAdapter {
         Box::pin(async move {
             let connection = self.get_connection().await?;
 
+            // Best-effort pre-IO cap check: avoid opening a QUIC stream +
+            // sending SUBSCRIBE when we already know the post-IO insert
+            // would reject. The post-IO `insert_or_replace` below is the
+            // authoritative gate; this pre-check is a fast-path
+            // optimization that narrows the relay-side leak window when
+            // the cap is hit. A residual TOCTOU between this check and
+            // `insert_or_replace` is acceptable. (Broader QUIC error-path
+            // leak classes -- e.g., not finishing the send stream on
+            // intermediate failures -- are tracked separately.)
+            if !self
+                .subscriptions
+                .contains(&RoutingId::new(routing_id_bytes))
+                && self.subscriptions.len() >= MAX_TRANSPORT_SUBSCRIPTIONS
+            {
+                return Err(TransportError::SubscriptionFailed(format!(
+                    "subscription map full (max {MAX_TRANSPORT_SUBSCRIPTIONS} entries)"
+                )));
+            }
+
             let msg = ClientMessage::Subscribe {
                 ref_id: None,
                 routing_id: routing_id_bytes,
@@ -356,14 +377,17 @@ impl TransportAdapter for QuicAdapter {
             let cancel = CancellationToken::new();
             let cancel_clone = cancel.clone();
 
-            // Store the subscription handle.
+            // Store the subscription handle, replacing any previous one for
+            // this routing ID (and cancelling the old read loop).
+            let new_handle = SubscriptionHandle { cancel };
+            if let Some(prev) = self
+                .subscriptions
+                .insert_or_replace(RoutingId::new(routing_id_bytes), new_handle)
+                .map_err(|e| {
+                    TransportError::SubscriptionFailed(format!("subscription map full: {e}"))
+                })?
             {
-                let mut subs = self.subscriptions.write().await;
-                // Cancel any existing subscription for this routing ID.
-                if let Some(existing) = subs.remove(&routing_id_bytes) {
-                    existing.cancel.cancel();
-                }
-                subs.insert(routing_id_bytes, SubscriptionHandle { cancel });
+                prev.cancel.cancel();
             }
 
             // Create a channel for the subscription stream.
@@ -383,29 +407,11 @@ impl TransportAdapter for QuicAdapter {
                         }
                         result = Self::read_relay_message(&mut recv) => {
                             if let Ok(relay_msg) = result {
-                                let event = match relay_msg {
-                                    RelayMessage::Blob { blob, .. } => {
-                                        match OuterEnvelope::from_bytes(&blob) {
-                                            Ok(envelope) => TransportEvent::Envelope(envelope),
-                                            Err(e) => TransportEvent::Error(
-                                                TransportError::ProtocolError(format!(
-                                                    "failed to deserialize envelope from blob: {e}"
-                                                )),
-                                            ),
-                                        }
-                                    }
-                                    RelayMessage::Event { event_type, .. } => {
-                                        match event_type.as_str() {
-                                            "backfill_complete" => TransportEvent::BackfillComplete,
-                                            _ => continue,
-                                        }
-                                    }
-                                    RelayMessage::Err { code, msg, .. } => {
-                                        TransportEvent::Error(TransportError::ProtocolError(
-                                            format!("relay error {code}: {msg}"),
-                                        ))
-                                    }
-                                    _ => continue,
+                                let Some(event) = map_subscribe_relay_message(
+                                    relay_msg,
+                                    &routing_id_bytes,
+                                ) else {
+                                    continue;
                                 };
                                 if tx.send(event).await.is_err() {
                                     // Receiver dropped, stop reading.
@@ -442,11 +448,7 @@ impl TransportAdapter for QuicAdapter {
             // Verify we have a connection.
             let _connection = self.get_connection().await?;
 
-            let handle = {
-                let mut subs = self.subscriptions.write().await;
-                subs.remove(&routing_id_bytes)
-            };
-            if let Some(h) = handle {
+            if let Some(h) = self.subscriptions.remove(&RoutingId::new(routing_id_bytes)) {
                 h.cancel.cancel();
             }
             Ok(())
@@ -503,10 +505,13 @@ impl TransportAdapter for QuicAdapter {
                         }
                         match OuterEnvelope::from_bytes(&blob) {
                             Ok(envelope) => envelopes.push(envelope),
-                            Err(e) => {
-                                return Err(TransportError::ProtocolError(format!(
-                                    "failed to deserialize envelope from blob: {e}"
-                                )));
+                            Err(_) => {
+                                // The blob is attacker-controlled. Some serde
+                                // codecs include byte excerpts in their
+                                // `Display`; do not include the inner error.
+                                return Err(TransportError::ProtocolError(
+                                    "failed to deserialize envelope from blob".to_string(),
+                                ));
                             }
                         }
                     }
@@ -583,6 +588,47 @@ impl Stream for QuicSubscriptionStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
+    }
+}
+
+/// Maps a `RelayMessage` received on a QUIC subscribe stream to the
+/// corresponding `TransportEvent`. Returns `None` for messages the
+/// subscriber should ignore (BLOBs with mismatched routing_id from a
+/// non-conformant relay, unknown event types, OK/Pong/Bridge messages).
+fn map_subscribe_relay_message(
+    relay_msg: RelayMessage,
+    expected_routing_id: &[u8; 32],
+) -> Option<TransportEvent> {
+    // Defense against a non-conformant relay that pushes BLOBs from
+    // another routing_id into this subscription's dedicated stream.
+    if let RelayMessage::Blob {
+        routing_id: blob_rid,
+        ..
+    } = &relay_msg
+        && blob_rid != expected_routing_id
+    {
+        tracing::debug!(
+            expected = ?expected_routing_id,
+            received = ?blob_rid,
+            "QUIC subscribe stream received BLOB with mismatched routing_id; dropping"
+        );
+        return None;
+    }
+    match relay_msg {
+        RelayMessage::Blob { blob, .. } => Some(match OuterEnvelope::from_bytes(&blob) {
+            Ok(envelope) => TransportEvent::Envelope(envelope),
+            Err(_) => TransportEvent::Error(TransportError::ProtocolError(
+                "failed to deserialize envelope from blob".to_string(),
+            )),
+        }),
+        RelayMessage::Event { event_type, .. } => match event_type.as_str() {
+            "backfill_complete" => Some(TransportEvent::BackfillComplete),
+            _ => None,
+        },
+        RelayMessage::Err { code, msg, .. } => Some(TransportEvent::Error(
+            TransportError::ProtocolError(format!("relay error {code}: {msg}")),
+        )),
+        _ => None,
     }
 }
 
@@ -815,6 +861,65 @@ mod tests {
         handle.shutdown();
     }
 
+    #[tokio::test]
+    async fn subscribe_twice_to_same_routing_id_replaces_previous() {
+        let (handle, addr, certs, _storage, _subs) = start_test_listener();
+
+        let routing_id_bytes = [0x4A; 32];
+        let routing_id = RoutingId::new(routing_id_bytes);
+
+        let adapter = connect_adapter(addr, &certs).await;
+
+        // First subscription.
+        let mut first_stream = adapter
+            .subscribe(&routing_id, None)
+            .await
+            .expect("first subscribe should succeed");
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Second subscription for the same routing ID. The previous
+        // subscription's read loop must be cancelled and its stream
+        // terminated; the new stream is the one that should receive
+        // subsequent messages.
+        let mut second_stream = adapter
+            .subscribe(&routing_id, None)
+            .await
+            .expect("second subscribe should succeed");
+
+        // The first stream's background read loop was cancelled, which
+        // closes its forwarding channel. It either yields a Terminated
+        // event or simply ends (None). Either is acceptable.
+        let first_outcome = tokio::time::timeout(Duration::from_secs(2), first_stream.next()).await;
+        match first_outcome {
+            Ok(Some(TransportEvent::Terminated { .. }) | None) => {
+                // Expected.
+            }
+            Ok(Some(other)) => panic!("first stream yielded unexpected event: {other:?}"),
+            Err(_) => panic!("first stream did not terminate within 2s"),
+        }
+
+        // Publish on this routing ID and confirm the second stream
+        // receives the envelope.
+        let pub_adapter = connect_adapter(addr, &certs).await;
+        let envelope = test_envelope_with_routing(&routing_id_bytes);
+        pub_adapter
+            .send(&envelope)
+            .await
+            .expect("publish should succeed");
+
+        let event = tokio::time::timeout(Duration::from_secs(5), second_stream.next())
+            .await
+            .expect("timed out waiting for second-stream event")
+            .expect("second stream should not be empty");
+        assert!(
+            matches!(event, TransportEvent::Envelope(_)),
+            "expected Envelope on second stream, got {event:?}"
+        );
+
+        handle.shutdown();
+    }
+
     // -----------------------------------------------------------------------
     // Integration tests: query
     // -----------------------------------------------------------------------
@@ -990,5 +1095,57 @@ mod tests {
         );
 
         handle.shutdown();
+    }
+
+    // -----------------------------------------------------------------------
+    // Routing-id mismatch defense (unit tests on the read-loop helper)
+    // -----------------------------------------------------------------------
+
+    /// A BLOB whose `routing_id` does not match the dedicated subscribe
+    /// stream's expected `routing_id` is silently dropped.
+    #[test]
+    fn map_subscribe_relay_message_drops_blob_with_mismatched_routing_id() {
+        let expected = [0xAAu8; 32];
+        let mismatched = [0xBBu8; 32];
+
+        // Build a well-formed OuterEnvelope so the deserialization path
+        // would succeed if the message were forwarded; the test must
+        // confirm we drop BEFORE deserialization.
+        let envelope = create_outer_envelope(&mismatched, None, 3600, vec![1, 2, 3]).unwrap();
+        let blob = envelope.to_bytes().unwrap();
+        let msg = RelayMessage::Blob {
+            routing_id: mismatched,
+            blob_id: [0xCCu8; 32],
+            recipient_hint: None,
+            blob_ttl: 3600,
+            stored_at: 1_700_000_000,
+            blob,
+        };
+
+        let result = map_subscribe_relay_message(msg, &expected);
+        assert!(
+            result.is_none(),
+            "BLOB with mismatched routing_id must be dropped, got {result:?}"
+        );
+    }
+
+    /// `backfill_complete` events propagate; unknown event types are dropped.
+    #[test]
+    fn map_subscribe_relay_message_event_kinds() {
+        let expected = [0xAAu8; 32];
+        let backfill = RelayMessage::Event {
+            ref_id: None,
+            event_type: "backfill_complete".to_string(),
+        };
+        assert!(matches!(
+            map_subscribe_relay_message(backfill, &expected),
+            Some(TransportEvent::BackfillComplete)
+        ));
+
+        let unknown = RelayMessage::Event {
+            ref_id: None,
+            event_type: "made_up_event".to_string(),
+        };
+        assert!(map_subscribe_relay_message(unknown, &expected).is_none());
     }
 }
