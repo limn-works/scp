@@ -334,7 +334,7 @@ class TestStreamAlreadyClosedDepth:
 
     def test_stream_already_closed_carries_invariant_code_and_slug(self) -> None:
         err = StreamAlreadyClosed()
-        assert err.code == "SCP-TOOL-6102"
+        assert err.code == "SCP-TOOL-6101"
         assert err.slug == "protocol.stream-already-closed"
 
 

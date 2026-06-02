@@ -558,6 +558,61 @@ impl ContextManager {
         ctx.governance.budget_tracker.remaining(member_did)
     }
 
+    /// Returns the spendable balance the streaming-escrow path should reserve
+    /// against for `member_did`, AND-composed with an optional spending-UCAN
+    /// `max_per_action` ceiling (§19.5).
+    ///
+    /// This is the production accessor the native FFI streaming bridges call
+    /// to fill [`crate::context::outlets::dispatch::OpenStreamParams::available_balance`]
+    /// at open and to re-derive the per-grant escrow ceiling at each
+    /// `apply_credit_grant`. It is the streaming analogue of the
+    /// `SpendingCapability ∧ MemberBudgetTracker` AND-fold that
+    /// [`Self::invoke_outlet_with_economy`] runs for the non-streaming path
+    /// (§19.5): the escrow may only reserve against funds the member
+    /// actually has AND that the presented spending UCAN authorizes per
+    /// action.
+    ///
+    /// - When `max_per_action` is `None` (free / zero-cost / no-spending
+    ///   case — the legitimate default for Query and zero-cost outlets), the
+    ///   result is the raw
+    ///   [`scp_protocol::economy::budget::MemberBudgetTracker::remaining`].
+    /// - When `max_per_action` is `Some`, the result is
+    ///   `min(remaining, max_per_action)` so a grant can never escrow more
+    ///   than the spending capability authorizes for a single action.
+    ///
+    /// The bridge parses the presented spending UCAN once at open (surfacing
+    /// a malformed token there via
+    /// [`scp_protocol::crypto::ucan::spending::SpendingCapability::from_ucan_token`])
+    /// and passes the extracted `max_per_action` here. Re-reading the budget
+    /// at grant time (rather than caching the open-time balance) closes the
+    /// window where budget granted-then-spent between open and a later grant
+    /// would otherwise let the per-grant top-up escrow against stale funds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContextError::ContextNotRegistered`] if the context is
+    /// unknown.
+    pub async fn outlet_stream_member_balance(
+        &self,
+        context_id: &str,
+        member_did: &DID,
+        max_per_action: Option<scp_protocol::economy::types::Amount>,
+    ) -> Result<scp_protocol::economy::types::Amount, ContextError> {
+        let arc = self
+            .get_context_arc(context_id)
+            .map_err(|_| ContextError::ContextNotRegistered(context_id.to_owned()))?;
+        let remaining = {
+            let ctx = arc.lock().await;
+            ctx.governance.budget_tracker.remaining(member_did)
+        };
+        // §19.5 AND-composition: the escrow ceiling is the minimum of the
+        // member's remaining budget and the spending capability's per-action
+        // limit (when a spending UCAN was presented).
+        Ok(max_per_action.map_or(remaining, |cap| {
+            scp_protocol::economy::types::Amount::new(remaining.0.min(cap.0))
+        }))
+    }
+
     /// Returns the per-DID velocity (number of recent paid actions) for
     /// a member in a context within the velocity window.
     ///

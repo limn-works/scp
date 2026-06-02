@@ -360,7 +360,13 @@ fn build_open_stream_params(invoker_signing: &SigningKey) -> OpenStreamParams {
         credit_window: 32,
         caveats: scp_protocol::trust::caveats::InvocationCaveats::empty(),
         invoker_pk: invoker_signing.verifying_key(),
-        operator_signing_key: std::sync::Arc::new(operator_signing),
+        // ADR-049 round 8: the runtime signs through a `StreamSigner` trait
+        // object. This in-process test wraps the synthetic operator key in
+        // the `testing`-gated `InProcessStreamSigner` (the analogue of the
+        // native bridges' `CustodyStreamSigner`).
+        operator_signer: std::sync::Arc::new(
+            scp_runtime::context::outlets::signer::InProcessStreamSigner::new(operator_signing),
+        ),
         stream_credit_stall_secs: 30,
         stream_cancel_ack_secs: 30,
         stream_ucan_recheck_secs: 60,

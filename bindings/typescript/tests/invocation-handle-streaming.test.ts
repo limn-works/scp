@@ -149,7 +149,7 @@ describe("StreamAlreadyClosed depth (OUT-038 AC13)", () => {
     // class discriminator) — `instanceof` requires the Class to be in
     // the same realm; classWire is the realm-stable check.
     expect(err.classWire).toBe("protocol");
-    expect(err.code).toBe("SCP-TOOL-6102");
+    expect(err.code).toBe("SCP-TOOL-6101");
     expect(err.slug).toBe("protocol.stream-already-closed");
   });
 

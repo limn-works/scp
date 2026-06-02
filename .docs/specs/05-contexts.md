@@ -423,6 +423,9 @@ OutletError {
 |------|------|-------|--------|
 | `execution.stream-cap-exhausted` | `SCP-TOOL-6131` | Execution | §5.4.5 node-level concurrent-pump ceiling (round 8) |
 | `protocol.context-closed-mid-stream` | `SCP-TOOL-6101` | Protocol | §5.4.5 context evict/leave race during active stream (round 8) |
+| `protocol.stream-already-closed` | `SCP-TOOL-6101` | Protocol | §5.4.5 control-plane method (`grant_credit`/`cancel`/`terminate`) invoked after the stream reached a terminal chunk (round 8) |
+
+`protocol.stream-already-closed` shares `SCP-TOOL-6101` with `protocol.unknown-session` and `protocol.context-closed-mid-stream` — all three are Protocol-class session-lifecycle conditions. A control-plane call against an already-terminal stream is a session-lifecycle violation, not an authorization denial, so it carries the Protocol-session band and MUST NOT collapse onto the Authorization-class `SCP-TOOL-6110`. The SDK lifecycle-guard surface (`StreamAlreadyClosed`) maps to this slug.
 
 `execution.stream-cap-exhausted` shares `SCP-TOOL-6131` with `execution.credit-exhausted` and `execution.stream-gap` — all three are Execution-class resource-exhaustion conditions. It is emitted at `OutletStreamOpen` acceptance when the node-level concurrent-pump ceiling (below) is already saturated; the open is hard-rejected and no stream-table entry, escrow, or admission counter is mutated.
 

@@ -346,6 +346,7 @@ fn every_vector_flows_through_pyo3_py_outlet_invoke_stream() {
                 None,
                 Some(vector.open.credit_window),
                 Some(vector.open.estimated_chunk_count),
+                None,
             );
 
             // Must surface an error — no vector can reach a

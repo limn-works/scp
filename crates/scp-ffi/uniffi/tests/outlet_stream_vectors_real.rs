@@ -263,6 +263,7 @@ async fn every_vector_flows_through_uniffi_outlet_invoke_stream() {
             None,
             Some(vector.open.credit_window),
             Some(vector.open.estimated_chunk_count),
+            None,
         )
         .await;
 
