@@ -387,14 +387,6 @@ impl NapiIdentity {
         self.inner.verifying_key_hex.clone()
     }
 
-    /// Returns the id of the `SCP` instance that minted this handle, as a
-    /// base-10 string (u64 serialized as string to survive JS number limits).
-    #[napi(getter, js_name = "instanceId")]
-    #[must_use]
-    pub fn instance_id_js(&self) -> String {
-        self.inner.instance_id.to_string()
-    }
-
     /// Rotates the active signing key for this identity.
     ///
     /// Generates a new Active Signing Key, updates the DID document on the

@@ -211,14 +211,6 @@ impl NapiTransportManager {
     pub fn relay_url(&self) -> Option<String> {
         self.status.lock().ok().and_then(|s| s.relay_url.clone())
     }
-
-    /// Returns the id of the `SCP` instance that minted this handle, as a
-    /// base-10 string (u64 serialized as string to survive JS number limits).
-    #[napi(getter, js_name = "instanceId")]
-    #[must_use]
-    pub fn instance_id_js(&self) -> String {
-        self.instance_id.to_string()
-    }
 }
 
 impl Drop for NapiTransportManager {

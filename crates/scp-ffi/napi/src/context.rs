@@ -272,14 +272,6 @@ impl NapiContextHandle {
     pub fn economic_policy(&self) -> Option<String> {
         self.economic_policy.clone()
     }
-
-    /// Returns the id of the `SCP` instance that minted this handle, as a
-    /// base-10 string (u64 serialized as string to survive JS number limits).
-    #[napi(getter, js_name = "instanceId")]
-    #[must_use]
-    pub fn instance_id_js(&self) -> String {
-        self.instance_id.to_string()
-    }
 }
 
 impl NapiContextHandle {

@@ -96,14 +96,6 @@ impl NapiMcpServerHandle {
     pub fn handle_id(&self) -> String {
         self.handle_id.clone()
     }
-
-    /// Returns the id of the `SCP` instance that minted this handle, as a
-    /// base-10 string.
-    #[napi(getter, js_name = "instanceId")]
-    #[must_use]
-    pub fn instance_id_js(&self) -> String {
-        self.instance_id.to_string()
-    }
 }
 
 impl Drop for NapiMcpServerHandle {
@@ -127,14 +119,6 @@ impl NapiMcpClientHandle {
     #[must_use]
     pub fn handle_id(&self) -> String {
         self.handle_id.clone()
-    }
-
-    /// Returns the id of the `SCP` instance that minted this handle, as a
-    /// base-10 string.
-    #[napi(getter, js_name = "instanceId")]
-    #[must_use]
-    pub fn instance_id_js(&self) -> String {
-        self.instance_id.to_string()
     }
 }
 

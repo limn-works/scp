@@ -92,13 +92,6 @@ impl NapiFullStackNode {
     pub fn did(&self) -> String {
         self.inner.did.to_string()
     }
-
-    /// Returns the id of the `SCP` instance that minted this node, as a
-    /// base-10 string.
-    #[napi(getter, js_name = "instanceId")]
-    pub fn instance_id_js(&self) -> String {
-        self.instance_id.to_string()
-    }
 }
 
 // ---------------------------------------------------------------------------
