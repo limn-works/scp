@@ -48,8 +48,14 @@ fn setup() {
 }
 
 /// Creates a tokio runtime for async operations in tests.
+///
+/// Uses a multi-thread runtime because the context-creating codepath reaches
+/// `tokio::task::block_in_place`, which panics on a current-thread runtime.
+/// Interim per generic-moseying-lightning §484 until Phase 3's `block_in_place`
+/// elimination; remove (revert to `new_current_thread`) when persistence is async.
 fn test_runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .unwrap()
