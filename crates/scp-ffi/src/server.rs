@@ -29,7 +29,6 @@ use scp_ffi_common::server::{
 };
 use scp_identity::{DidCache, InMemoryDhtClient};
 use scp_node::NodeError;
-use scp_transport::native::NativeRelayAdapter;
 use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
 // ---------------------------------------------------------------------------
@@ -88,8 +87,15 @@ fn auto_wire_context_manager(
     let did_owned = did.to_owned();
     let token2 = bridge_token.clone();
     let profile = scp_transport::profile::TransportProfile::platform_default();
+    // Route through the transport selector for a uniform connect surface (spec
+    // §10.14.3 item 4; ADR-037). Bearer-authenticated relays are WebSocket-only
+    // (QUIC has no bearer-upgrade surface), so the selector connects WebSocket
+    // here — but the routing keeps every connect site flowing through the same
+    // selection layer.
+    let selector = scp_transport::TransportSelector::new();
+    let selector2 = scp_transport::TransportSelector::new();
     match py.allow_threads(|| {
-        rt.block_on(NativeRelayAdapter::connect_sourced_with_bearer(
+        rt.block_on(selector.select_and_connect_with_bearer(
             &sourced,
             Some(bridge_token),
             Some(&profile),
@@ -112,14 +118,14 @@ fn auto_wire_context_manager(
             // a second WebSocket connection because NativeRelayAdapter is not
             // Clone and the first was consumed by RelayTransportProvider.
             match py.allow_threads(|| {
-                rt.block_on(NativeRelayAdapter::connect_sourced_with_bearer(
+                rt.block_on(selector2.select_and_connect_with_bearer(
                     &sourced,
                     Some(token2),
                     Some(&profile),
                 ))
             }) {
                 Ok(relay_adapter) => {
-                    let manager = scp_transport::TransportManager::new(Box::new(relay_adapter));
+                    let manager = scp_transport::TransportManager::new(relay_adapter);
                     let _ = crate::runtime::set_transport_manager(bi, manager);
                 }
                 Err(e) => {
@@ -911,10 +917,11 @@ mod tests {
             url: relay_url,
             source: RelayUrlSource::Explicit,
         };
+        let selector = scp_transport::TransportSelector::new();
         let adapter = rt()
-            .block_on(NativeRelayAdapter::connect_sourced(&sourced, None))
+            .block_on(selector.select_and_connect(&sourced, None, None))
             .expect("should connect to the relay");
-        let manager = scp_transport::TransportManager::new(Box::new(adapter));
+        let manager = scp_transport::TransportManager::new(adapter);
         let bi = bi_setup;
         crate::runtime::set_transport_manager(&bi, manager)
             .expect("should store transport manager in global");

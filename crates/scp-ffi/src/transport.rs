@@ -21,8 +21,10 @@
 //!
 //! # Transport Wiring (SCP-213, #1490)
 //!
-//! `py_transport_connect` creates a [`NativeRelayAdapter`] connected to the
-//! given relay URL, wraps it in a [`scp_transport::TransportManager`], and
+//! `py_transport_connect` connects to the given relay URL via the
+//! [`scp_transport::TransportSelector`] (transparent QUIC↔WebSocket selection,
+//! spec §10.14.3 item 4; ADR-037), wraps the resulting adapter in a
+//! [`scp_transport::TransportManager`], and
 //! stores the manager in the global transport state (see
 //! [`crate::runtime`]). The manager provides multi-relay fanout,
 //! per-context relay set assignment, suppression detection, and reliability
@@ -46,7 +48,6 @@
 use std::sync::Arc;
 
 use pyo3::prelude::*;
-use scp_transport::native::adapter::NativeRelayAdapter;
 use scp_transport::relay::connection::{RelayUrlSource, SourcedRelayUrl};
 
 use crate::error::ScpPyError;
@@ -99,8 +100,9 @@ impl crate::scp::PyScp {
     /// Connects to an SCP relay with provenance-based transport security
     /// validation (§10.12.6).
     ///
-    /// Establishes a WebSocket connection to the specified relay URL using
-    /// [`NativeRelayAdapter::connect_sourced`]. The adapter is stored in the
+    /// Establishes a connection to the specified relay URL via the
+    /// [`scp_transport::TransportSelector`] (transparent QUIC↔WebSocket
+    /// selection, spec §10.14.3 item 4; ADR-037). The adapter is stored in the
     /// bridge instance's relay connection state for use by
     /// `mcp_load_contexts` (context discovery) and future transport
     /// operations.
@@ -153,21 +155,30 @@ impl crate::scp::PyScp {
             source: relay_source,
         };
         let profile = scp_transport::profile::TransportProfile::platform_default();
-        let adapter = rt.block_on(async {
-            NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await
+        // Route through the transport selector for transparent QUIC↔WebSocket
+        // selection (spec §10.14.3 item 4; ADR-037). The advertised-transports
+        // list from `.well-known/scp` is NOT available at this bridge entry
+        // point — `source` is provenance, not the relay's transport binding
+        // list — so the selector degrades to the WebSocket baseline here. When
+        // a `.well-known/scp` transports list is plumbed to this site in a
+        // future change, pass it as the second argument to enable QUIC.
+        let selector = scp_transport::TransportSelector::new();
+        let result = rt.block_on(async {
+            selector
+                .select_and_connect_with_suppression(&sourced, None, Some(&profile))
+                .await
         });
 
-        match adapter {
-            Ok(mut adapter) => {
-                // Extract the suppression event receiver BEFORE moving the adapter
-                // into the TransportManager. The spawned task drains suppression
-                // events and downgrades the relay's reliability score (#1533 AC5).
-                let suppression_rx = adapter.take_suppression_receiver();
+        match result {
+            Ok((adapter, suppression_rx)) => {
+                // The suppression event receiver (drained into reliability
+                // scoring, #1533 AC5) is surfaced by the selector for the
+                // WebSocket branch. Cover traffic is already running —
+                // `connect_sourced` with a profile auto-starts it via
+                // `finalize_connection` (#1532 AC6).
 
                 // Wrap the adapter in a TransportManager for multi-relay support.
-                // Cover traffic is already running — `connect_sourced` with a
-                // profile auto-starts it via `finalize_connection` (#1532 AC6).
-                let manager = scp_transport::TransportManager::new(Box::new(adapter));
+                let manager = scp_transport::TransportManager::new(adapter);
                 crate::runtime::set_transport_manager(bi, manager)?;
 
                 // Register the URL on the bridge's pending-reconnect set so
@@ -305,8 +316,17 @@ impl crate::scp::PyScp {
             source: RelayUrlSource::Explicit,
         };
         let profile = scp_transport::profile::TransportProfile::platform_default();
+        // Route through the transport selector for transparent QUIC↔WebSocket
+        // selection (spec §10.14.3 item 4; ADR-037). No advertised-transports
+        // list is available at this site, so the selector uses the WebSocket
+        // baseline (see `transport_connect` for the plumbing-gap rationale).
+        let selector = scp_transport::TransportSelector::new();
         let adapter = rt
-            .block_on(async { NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await })
+            .block_on(async {
+                selector
+                    .select_and_connect(&sourced, None, Some(&profile))
+                    .await
+            })
             .map_err(|e| {
                 ScpPyError::transport(format!("failed to connect to relay '{relay_url}': {e}"))
             })?;
@@ -372,21 +392,26 @@ impl crate::scp::PyScp {
             source: relay_source,
         };
         let profile = scp_transport::profile::TransportProfile::platform_default();
-        // Cover traffic auto-starts per adapter via `connect_sourced` with a
-        // profile — `finalize_connection` launches the cover traffic background
-        // task based on the profile's tier (#1532 AC6).
-        let mut adapter = rt
-            .block_on(async { NativeRelayAdapter::connect_sourced(&sourced, Some(&profile)).await })
+        // Route through the transport selector for transparent QUIC↔WebSocket
+        // selection (spec §10.14.3 item 4; ADR-037). No advertised-transports
+        // list is available at this site, so the selector uses the WebSocket
+        // baseline (see `transport_connect` for the plumbing-gap rationale).
+        // Cover traffic auto-starts per adapter via the profile —
+        // `finalize_connection` launches the cover traffic background task
+        // based on the profile's tier (#1532 AC6). The selector surfaces the
+        // suppression receiver (drained into reliability scoring, #1533 AC5).
+        let selector = scp_transport::TransportSelector::new();
+        let (adapter, suppression_rx) = rt
+            .block_on(async {
+                selector
+                    .select_and_connect_with_suppression(&sourced, None, Some(&profile))
+                    .await
+            })
             .map_err(ScpPyError::from)?;
-
-        // Extract the suppression event receiver BEFORE moving the adapter into
-        // the TransportManager. The spawned task drains suppression events and
-        // downgrades the relay's reliability score (#1533 AC5).
-        let suppression_rx = adapter.take_suppression_receiver();
         let scoring_url = relay_url.to_owned();
 
         let count = crate::runtime::with_transport_manager_mut(bi, |manager| {
-            let _eviction = manager.add_adapter(Box::new(adapter));
+            let _eviction = manager.add_adapter(adapter);
             Ok(manager.adapter_count())
         })?;
 

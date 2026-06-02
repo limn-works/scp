@@ -51,6 +51,7 @@ pub mod provider;
 pub mod quic;
 pub mod relay;
 pub mod scoring;
+pub mod selection;
 #[cfg(feature = "startup")]
 pub mod startup;
 pub mod subscription;
@@ -83,5 +84,6 @@ pub use pool::{ConnectionPool, PoolKey, TransportType};
 pub use profile::{CoverTrafficTier, TransportProfile};
 pub use provider::RelayTransportProvider;
 pub use scoring::SuppressionWarning;
+pub use selection::TransportSelector;
 pub use subscription::{SubscriptionError, TransportSubscriptionMap};
 pub use traits::{BlobId, RoutingId, SubscriptionStream, TransportAdapter, TransportEvent};
