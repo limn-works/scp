@@ -14233,7 +14233,8 @@ impl Scp {
                                     .into(),
                                 code: codes::IDENT_1054.to_owned(),
                             })?;
-                        let pseudonym_pk = if let Some(ref cb) = importer_identity.callback_custody {
+                        let pseudonym_pk = if let Some(ref cb) = importer_identity.callback_custody
+                        {
                             cb.derive_pseudonym(&identity_key, context_id.as_bytes())
                                 .await
                                 .map_err(|e| ScpError::Identity {
@@ -14246,8 +14247,9 @@ impl Scp {
                             {
                                 let imc = importer_identity.in_memory_custody.as_ref().ok_or_else(
                                     || ScpError::Identity {
-                                        msg: "no custody provider available for pseudonym derivation"
-                                            .into(),
+                                        msg:
+                                            "no custody provider available for pseudonym derivation"
+                                                .into(),
                                         code: codes::IDENT_1056.to_owned(),
                                     },
                                 )?;

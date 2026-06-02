@@ -2494,7 +2494,15 @@ impl Scp {
         data: Vec<u8>,
         importer: &NapiIdentity,
     ) -> napi::Result<String> {
-        crate::context::context_import_on(&self.inner, data, importer).await
+        // `Box::pin` keeps the §9.10.4 pseudonym-derivation future under the
+        // `clippy::large_futures` size threshold (.clippy.toml) — the importer
+        // derivation + announcement path pushes the inline future over 16 KiB.
+        Box::pin(crate::context::context_import_on(
+            &self.inner,
+            data,
+            importer,
+        ))
+        .await
     }
 
     /// Per-instance equivalent of the free-function `context_set_economic_policy`.

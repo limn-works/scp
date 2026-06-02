@@ -762,15 +762,16 @@ pub(crate) async fn context_join_on(
     } else {
         #[cfg(feature = "allow_in_memory_custody")]
         {
-            let (custody, identity_key) = crate::runtime::with_identity(bi, &identity_did, |entry| {
-                Ok((entry.custody.clone(), entry.identity.identity_key))
-            })
-            .map_err(|e| {
-                NapiError::from(ScpNapiError::Identity {
-                    message: format!("identity not registered: {e}"),
-                    code: codes::IDENT_1050.to_owned(),
+            let (custody, identity_key) =
+                crate::runtime::with_identity(bi, &identity_did, |entry| {
+                    Ok((entry.custody.clone(), entry.identity.identity_key))
                 })
-            })?;
+                .map_err(|e| {
+                    NapiError::from(ScpNapiError::Identity {
+                        message: format!("identity not registered: {e}"),
+                        code: codes::IDENT_1050.to_owned(),
+                    })
+                })?;
             let pseudonym = custody
                 .0
                 .derive_pseudonym(&identity_key, context_id.as_bytes())

@@ -1116,6 +1116,24 @@ fn build_core_context_params(
     build_context_params(&common).map_err(PyRuntimeError::new_err)
 }
 
+/// Returns whether the parsed params describe a broadcast context.
+///
+/// Detection is derived from the typed [`ContextMode`] produced by the shared
+/// parser — NOT from a case-sensitive compare against the raw `mode` string.
+/// The shared parser accepts both `"broadcast"` and `"Broadcast"`
+/// ([`scp_ffi_common::context_params`]), so a case-sensitive `== "broadcast"`
+/// would misclassify the title-cased spelling as encrypted and derive a
+/// superfluous (discarded) pseudonym. Matching on the typed enum keeps the
+/// reference bridge consistent with the `UniFFI` and NAPI bridges, which already
+/// derive broadcast-ness from `matches!(mode, ContextMode::Broadcast)`.
+fn params_is_broadcast(py_params: &PyContextParams) -> PyResult<bool> {
+    let core_params = build_core_context_params(py_params)?;
+    Ok(matches!(
+        core_params.mode,
+        scp_core::context::params::ContextMode::Broadcast
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // Economic policy bridge (§19.3, ADR-033)
 // ---------------------------------------------------------------------------
@@ -1233,7 +1251,9 @@ fn export_manager_params(
     let mgr_clone = mgr.clone();
     rt.block_on(async move { mgr_clone.context_params(&ctx_id).await })
         .ok_or_else(|| {
-            PyRuntimeError::new_err(format!("context '{context_id}' not registered after import"))
+            PyRuntimeError::new_err(format!(
+                "context '{context_id}' not registered after import"
+            ))
         })
 }
 
@@ -1746,7 +1766,7 @@ impl crate::scp::PyScp {
         // no cryptographic basis, denying broadcast creation when custody is
         // absent. Encrypted / pseudonymous contexts require a real pseudonym:
         // custody / derivation failure there is a hard error, no silent fallback.
-        let local_pseudonym: [u8; 32] = if parsed.mode == "broadcast" {
+        let local_pseudonym: [u8; 32] = if params_is_broadcast(&parsed)? {
             [0u8; 32]
         } else {
             crate::runtime::with_identity(bi, identity_did, |entry| {
@@ -1837,7 +1857,7 @@ impl crate::scp::PyScp {
         // contexts with existing members the announcement is needed. Skipped
         // for broadcast contexts — spec §5.14 uses a shared routing ID and
         // no per-member pseudonyms.
-        if handle.params.mode != "broadcast"
+        if !params_is_broadcast(&handle.params)?
             && let Ok(sk) = resolve_signing_key(bi, identity_did)
         {
             let rt = crate::runtime()?;
@@ -1862,7 +1882,7 @@ impl crate::scp::PyScp {
         // routing ID (§9.10.4); broadcast contexts use SHA-256(context_id) per
         // spec §5.14 (matching the send path, #1534).
         {
-            let routing_id = if handle.params.mode == "broadcast" {
+            let routing_id = if params_is_broadcast(&handle.params)? {
                 scp_core::context::broadcast_routing_id(&context_id)
             } else {
                 local_pseudonym
@@ -1982,7 +2002,7 @@ impl crate::scp::PyScp {
             // argument, so we skip derivation entirely. Encrypted /
             // pseudonymous contexts require a real pseudonym: custody /
             // derivation failure there is a hard error, no silent fallback.
-            let local_pseudonym: [u8; 32] = if handle.params.mode == "broadcast" {
+            let local_pseudonym: [u8; 32] = if params_is_broadcast(&handle.params)? {
                 [0u8; 32]
             } else {
                 crate::runtime::with_identity(bi, identity_did, |entry| {
@@ -2070,7 +2090,7 @@ impl crate::scp::PyScp {
 
             // §9.10.4: Send pseudonym announcement to inform existing members.
             // Broadcast contexts have no per-member pseudonyms; skip.
-            if handle.params.mode != "broadcast"
+            if !params_is_broadcast(&handle.params)?
                 && let Ok(sk) = resolve_signing_key(bi, identity_did)
             {
                 let sender_did = scp_identity::DID(member_did.clone());
@@ -2509,7 +2529,7 @@ impl crate::scp::PyScp {
     ///
     /// - `RuntimeError` if deserialization, validation, or import fails.
     /// - `ValueError` if the data is malformed.
-    #[pyo3(signature = (data,))]
+    #[pyo3(signature = (data, importer_did))]
     pub fn context_import(&self, data: &[u8], importer_did: &str) -> PyResult<String> {
         let bi = &*self.inner;
         let export = scp_core::context::export_import::deserialize_export(data).map_err(|e| {
